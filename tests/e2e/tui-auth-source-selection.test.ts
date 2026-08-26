@@ -1651,6 +1651,15 @@ profileStoredKeyTmuxTest(
     writeFileSync(stderrPath, "");
     gateway = startFakeGateway([fakeGatewayFinalText(STORED_RESPONSE)]);
 
+    // Starting on a subscription provider proves the save's follow-up: the
+    // key was asked for through the vercel column, so the provider must end
+    // on the gateway.
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }) + "\n",
+      { mode: 0o600 },
+    );
     session = await startFx(home, stderrPath, gateway, undefined, undefined, {
       FX_DISABLE_KEYCHAIN: undefined,
     });
@@ -1658,23 +1667,23 @@ profileStoredKeyTmuxTest(
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
-    await session.sendText("/setup");
-    await session.waitForText("Connections", TIMEOUT);
-    await session.sendKeys("Enter");
-    await session.waitForText("AI Gateway API key", TIMEOUT);
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
-    await session.sendKeys("Enter");
-    await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
+    // Typing the full path exercises both space-advance columns: the space
+    // after "vercel" opens the methods, the space after "api-key" opens the
+    // which-key column, and Enter on "new" opens the masked field.
+    await session.sendText("/provider vercel api-key new");
+    await session.waitForText("Paste or type a key", TIMEOUT);
     await session.sendLiteralText(STORED_TOKEN);
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
-    const returnedConnections = await session.waitForPane(
-      (pane) => pane.includes("Connections") && pane.includes("AI Gateway API key"),
+    await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+    await session.sendText("/provider vercel api-key");
+    const keyColumn = await session.waitForPane(
+      (pane) => pane.includes("saved · saved by fx · current"),
       TIMEOUT,
     );
-    expect(returnedConnections).toMatch(/^› AI Gateway API key\s+stored$/m);
+    expect(keyColumn).toContain("env · AI_GATEWAY_API_KEY");
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
     await session.sendText("/status");
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
