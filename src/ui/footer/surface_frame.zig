@@ -383,7 +383,7 @@ fn buildFooterSurfaceProjection(
     const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_skills_query and !modal_active and !ctx.stream.active and ctx.model_query_active;
     const show_provider_query = !viewer_active and !show_auth_picker and !show_skills_query and !modal_active and !ctx.stream.active and
-        ctx.provider_query_active and !show_model_query;
+        !ctx.queued_editor_active and ctx.provider_query_active and !show_model_query;
     const show_file_query = !viewer_active and !show_skills_query and !modal_active and !stream_suppresses_file_query and
         ctx.file_query_active and !show_model_query and !show_provider_query;
     const geometry = input_presentation.measureRawInputGeometry(

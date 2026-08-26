@@ -1402,7 +1402,7 @@ pub fn Runtime(comptime App: type) type {
                             try input_limit_feedback.report(App, app, .composer, 1);
                         }
                         app.shell.render_requests.request(.footer);
-                    } else if (provider_picker_rt.hasQuery(app)) {
+                    } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
                         if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
                         // Mid-turn: list is hidden — do not autocomplete a hidden index.
@@ -1449,6 +1449,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                     } else if (app.input_runtime.edit_state.selectionRange() == null and
                         !app.stream.active and
+                        !commandSkillsMenuActive(app) and
                         provider_picker_rt.hasQuery(app) and
                         try provider_picker_rt.advanceOnSpace(app))
                     {

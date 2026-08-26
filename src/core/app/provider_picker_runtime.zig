@@ -414,9 +414,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn abandon(app: *App) void {
             if (comptime !supported(App)) return;
+            app.auth.releaseLoadedTeamSelection(app.alloc);
             if (app.input_runtime.picker.provider_picker_stage == .provider) return;
             app.auth.cancelInlineApiKeyEntry(app.alloc);
-            app.auth.releaseLoadedTeamSelection(app.alloc);
             app.input_runtime.picker.clearProviderPickerFlow();
         }
 
@@ -426,6 +426,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !supported(App)) return;
             if (app.input_runtime.picker.provider_picker_stage != .api_key) return;
             if (app.auth.apiKeyInlineActive()) return;
+            // Enter pops the entry stage before the save thread finishes; the
+            // column must outlive the save so the switch-to-gateway gate can
+            // still see where the key came from when the result lands.
+            if (app.auth.apiKeySaveInFlight()) return;
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             app.shell.render_requests.request(.footer);

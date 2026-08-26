@@ -1873,7 +1873,7 @@ fn expectGenericPickerSelectionAtRow(
 
     const selected_row = frame_plan.paint.footer.picker_start + relative_row;
     const selected_style = switch (kind) {
-        .model_stage => ui_render.selected_completion_style,
+        .model_stage, .provider_stage => ui_render.selected_completion_style,
         else => ui_render.approval_button_inactive_style,
     };
     var saw_selected_bottom = false;
