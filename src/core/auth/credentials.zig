@@ -197,7 +197,7 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
@@ -428,8 +428,20 @@ pub fn sourceExists(
             defer session.deinit(alloc);
             break :blk true;
         },
-        .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
-        .grok_subscription => grok_oauth.sourceExists(alloc),
+        .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => blk: {
+                debug_trace.logf("auth", "source probe failed source=chatgpt err={s}", .{@errorName(err)});
+                break :blk false;
+            },
+        },
+        .grok_subscription => grok_oauth.sourceExists(alloc) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => blk: {
+                debug_trace.logf("auth", "source probe failed source=grok err={s}", .{@errorName(err)});
+                break :blk false;
+            },
+        },
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -680,7 +692,7 @@ test "missing credential messages use surface commands in preferred order" {
     try std.testing.expect(cli_setup < cli_env);
 
     const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
-    const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/setup").?;
+    const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/provider").?;
     const tui_env = std.mem.find(u8, missing_interactive_credential_message, "AI_GATEWAY_API_KEY").?;
 
     try std.testing.expect(tui_login < tui_setup);
@@ -820,6 +832,10 @@ const CredentialTestEnv = struct {
 
     /// Installs exactly `entries`, so anything the resolver reads from the real
     /// environment, `HOME` included, is absent for the duration of the test.
+    /// The Keychain is force-disabled: it is keyed by service and account, not
+    /// by `HOME`, so without this a fixture session written under a tmp HOME
+    /// migrates into the developer's real `FX_OAUTH_SESSION_V1` item and
+    /// destroys their fx login.
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
         _ = try stableCredentialTestEnviron();
 
@@ -831,6 +847,7 @@ const CredentialTestEnv = struct {
         };
         errdefer self.map.deinit();
 
+        try self.map.put("FX_DISABLE_KEYCHAIN", "1");
         for (entries) |entry| try self.map.put(entry[0], entry[1]);
         io_mod.setEnvironMap(&self.map);
         return self;

@@ -353,7 +353,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
-                .setup = commandSetup,
+                .provider = commandProvider,
                 .show_status = commandShowStatus,
                 .show_background = commandShowBackground,
                 .stop_background = commandStopBackground,
@@ -680,15 +680,15 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandSetup(ctx: *anyopaque) !void {
+        fn commandProvider(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "openSetupHub")) {
-                try app.openSetupHub();
+            if (comptime @hasDecl(App, "runProviderCommand")) {
+                try app.runProviderCommand();
             } else {
                 try app.writeDomainNotice(.{
-                    .topic = "setup",
+                    .topic = "provider",
                     .tone = .@"error",
-                    .body = "setup is not available in this runtime",
+                    .body = "provider selection is not available in this runtime",
                 }, true);
             }
         }

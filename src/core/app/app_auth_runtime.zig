@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const oauth = @import("../auth/oauth.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -15,6 +16,8 @@ const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const picker_state = @import("../input/picker_state.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -112,9 +115,7 @@ pub fn Runtime(comptime App: type) type {
                 try beginSignIn(app, false);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            try provider_picker_runtime.Runtime(App).open(app, picker_state.login_prefix);
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
@@ -214,7 +215,7 @@ pub fn Runtime(comptime App: type) type {
             try applyLogoutResult(app, result);
         }
 
-        pub fn openSetupHub(app: *App) !void {
+        pub fn runProviderCommand(app: *App) !void {
             if (comptime !runtime_profile.allows(App, .native_auth)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -223,9 +224,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            try provider_picker_runtime.Runtime(App).open(app, picker_state.provider_prefix);
         }
 
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
@@ -274,7 +273,7 @@ pub fn Runtime(comptime App: type) type {
             }
             switch (choice) {
                 .provider => |provider| try switchProvider(app, provider, true, .manual),
-                .source => |source| try applySourceChoice(app, source),
+                .source => |source| _ = try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .connections => unreachable,
                     .login => try beginSignIn(app, true),
@@ -297,7 +296,7 @@ pub fn Runtime(comptime App: type) type {
                     .switch_provider => app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app)),
                     .automatic => try applyAutomaticCredential(app),
                 },
-                .team => |index| try applyTeamChoice(app, index),
+                .team => |index| _ = try applyTeamChoice(app, index),
             }
         }
 
@@ -475,6 +474,9 @@ pub fn Runtime(comptime App: type) type {
         /// Polled from the event loop so a save that blocks on a locked key store
         /// or a slow gateway never stalls rendering.
         pub fn collectApiKeySaveFacts(app: *App) !void {
+            // Runs every tick: the key column has to retire whenever its entry
+            // ended, whether it was saved, cancelled, or replaced.
+            defer provider_picker_runtime.Runtime(App).closeKeyColumn(app);
             const result = app.auth.takeApiKeySaveResult(app.alloc) orelse return;
             try applyApiKeySaveResult(app, result);
         }
@@ -496,6 +498,17 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = body,
                     }, true);
+                    // Only the inline `/provider vercel api-key` path implies
+                    // "use the gateway now": the user named the provider on the
+                    // way in. The staged hub also reaches this save, and there
+                    // adding a key is not a request to switch.
+                    if (comptime provider_runtime.supported(App) and provider_picker_runtime.supported(App)) {
+                        if (app.input_runtime.picker.provider_picker_stage == .api_key and
+                            provider_runtime.provider(app) != .gateway)
+                        {
+                            try switchProvider(app, .gateway, false, .manual);
+                        }
+                    }
                 },
                 .gateway_refused => try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -565,7 +578,10 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn applySourceChoice(app: *App, source: credentials.Source) !void {
+        /// Reports whether the credential actually switched, so callers that
+        /// chain further work (the inline picker's provider switch) can stop
+        /// when it did not. Failure is already explained to the user here.
+        pub fn applySourceChoice(app: *App, source: credentials.Source) !bool {
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Switched credential to {s}.",
@@ -579,7 +595,7 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = "That credential is no longer available. The current source is unchanged.",
                 }, true);
-                return;
+                return false;
             }
 
             rememberCredentialSource(app, source);
@@ -588,6 +604,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
+            return true;
         }
 
         /// An explicit source choice outlives the session. Failing to persist
@@ -771,13 +788,17 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
+            // The active credential is the user's most recent explicit choice
+            // (a team commit, a key selection, a saved key). When it already
+            // authorizes the target provider it must survive the switch;
+            // resolving from scratch would let plain precedence override it.
             const resolution = credentials.resolveForProvider(
                 app.alloc,
                 app.auth.oauthTransport(),
                 app.auth.secretStore(),
                 .refresh_if_needed,
                 target,
-                null,
+                if (target_credential_ready) active_source else null,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -975,6 +996,60 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// What the inline `/provider` picker should do after the user chooses to
+        /// connect with a Vercel account.
+        pub const TeamColumn = enum {
+            /// Teams are loaded and ready to render as the next column.
+            ready,
+            /// No session yet, so the account has to be connected first.
+            needs_sign_in,
+            /// A session exists but its teams could not be listed. The reason
+            /// has already been reported.
+            unavailable,
+        };
+
+        pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+            if (!app.auth.pickerView().fx_login_session_available) return .needs_sign_in;
+            try app.flushBeforeBlockingExternalWork();
+
+            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+                debug_trace.logf("auth", "provider picker team load failed err={s}", .{@errorName(err)});
+                // A session file that exists but can no longer be refreshed is
+                // not a listing failure: there is nothing to list until the
+                // user signs in again.
+                switch (err) {
+                    error.NoSession,
+                    error.NoRefreshToken,
+                    error.SessionChanged,
+                    oauth.OAuthError.InvalidClient,
+                    oauth.OAuthError.ExpiredToken,
+                    oauth.OAuthError.AccessDenied,
+                    => return .needs_sign_in,
+                    else => {},
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = if (err == error.NoTeams) .neutral else .@"error",
+                    .body = switch (err) {
+                        error.NoTeams => "No Vercel teams are available for this account.",
+                        else => "Could not reach Vercel to list teams. The current team is unchanged.",
+                    },
+                }, true);
+                return .unavailable;
+            };
+            defer selection.deinit(app.alloc);
+            if (selection.teams.items.len == 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "No Vercel teams are available for this account.",
+                }, true);
+                return .unavailable;
+            }
+            app.auth.adoptTeamSelection(app.alloc, &selection);
+            return .ready;
+        }
+
         fn beginTeamPicker(app: *App) !void {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();
@@ -997,9 +1072,9 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyTeamChoice(app: *App, index: usize) !void {
-            const selection = app.auth.teamSelection() orelse return;
-            if (index >= selection.teams.items.len) return;
+        pub fn applyTeamChoice(app: *App, index: usize) !bool {
+            const selection = app.auth.loadedTeamSelection() orelse return false;
+            if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
             const body = try std.fmt.allocPrint(
                 app.alloc,
@@ -1019,7 +1094,7 @@ pub fn Runtime(comptime App: type) type {
                         else => "Could not change the Vercel team. The current team is unchanged.",
                     },
                 }, true);
-                return;
+                return false;
             };
             defer selected_team.deinit(app.alloc);
 
@@ -1032,7 +1107,7 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = "Changed the Vercel team, but the fx login credential could not be loaded.",
                 }, true);
-                return;
+                return false;
             }
             rememberCredentialSource(app, .fx_login);
             app.auth.closePicker(app.alloc);
@@ -1041,6 +1116,14 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
+            return true;
+        }
+
+        /// Sign-in launched from the inline `/provider` picker. Esc must close
+        /// the sign-in surface entirely; the legacy staged hub is not the
+        /// screen the user came from.
+        pub fn beginSignInForProviderPicker(app: *App) !void {
+            try beginSignIn(app, false);
         }
 
         fn beginSignIn(app: *App, from_root: bool) !void {
@@ -1602,6 +1685,10 @@ const TestAuth = struct {
         return &self.team_selection;
     }
 
+    fn loadedTeamSelection(self: *TestAuth) ?*TestTeamSelection {
+        return &self.team_selection;
+    }
+
     fn adoptSelectedTeam(self: *TestAuth, _: std.mem.Allocator, _: *TestSelectedTeam) bool {
         self.selected_team_adopted = true;
         return true;
@@ -1730,16 +1817,6 @@ const TestApp = struct {
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 };
-
-test "setup hub projects the selected provider into the auth picker" {
-    var app: TestApp = .{ .selected_provider = .codex };
-    defer app.deinit();
-
-    try Runtime(TestApp).openSetupHub(&app);
-
-    try std.testing.expect(app.auth.picker_opened);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
-}
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {
     const NativeApp = struct {
@@ -1886,7 +1963,7 @@ test "VT-4 unavailable picker source preserves active source and reports unavail
     defer app.deinit();
     app.auth.select_result = null;
 
-    try Runtime(TestApp).applySourceChoice(&app, .stored_key);
+    try std.testing.expect(!try Runtime(TestApp).applySourceChoice(&app, .stored_key));
 
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
@@ -1901,7 +1978,7 @@ test "completed credential switch emits exactly one transcript line" {
     defer app.deinit();
     app.auth.select_result = true;
 
-    try Runtime(TestApp).applySourceChoice(&app, .stored_key);
+    try std.testing.expect(try Runtime(TestApp).applySourceChoice(&app, .stored_key));
 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -1921,7 +1998,7 @@ test "team change from an environment source activates and remembers fx login" {
     defer app.deinit();
     app.auth.select_result = true;
 
-    try Runtime(TestApp).applyTeamChoice(&app, 0);
+    try std.testing.expect(try Runtime(TestApp).applyTeamChoice(&app, 0));
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.team_selection.select_count);
     try std.testing.expect(!app.auth.selected_team_adopted);
@@ -1944,7 +2021,7 @@ test "team change on an active fx login updates and remembers the selected team"
     defer app.deinit();
     app.auth.active_source = .fx_login;
 
-    try Runtime(TestApp).applyTeamChoice(&app, 0);
+    try std.testing.expect(try Runtime(TestApp).applyTeamChoice(&app, 0));
 
     try std.testing.expect(app.auth.selected_team_adopted);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -2036,7 +2113,7 @@ test "team source load failure preserves the environment source and preference" 
     defer app.deinit();
     app.auth.select_result = null;
 
-    try Runtime(TestApp).applyTeamChoice(&app, 0);
+    try std.testing.expect(!try Runtime(TestApp).applyTeamChoice(&app, 0));
 
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);

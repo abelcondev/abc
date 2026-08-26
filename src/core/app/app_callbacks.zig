@@ -927,7 +927,7 @@ pub fn Bindings(comptime App: type) type {
             const label = if (auth_failure != null)
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
-                    "⚠ {s} · Run /setup to choose another source.",
+                    "⚠ {s} · Run /provider to choose another source.",
                     .{message},
                 )
             else

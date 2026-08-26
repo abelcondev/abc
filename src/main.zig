@@ -929,8 +929,8 @@ const App = struct {
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
-    pub fn openSetupHub(self: *App) !void {
-        try AuthAppRuntime.openSetupHub(self);
+    pub fn runProviderCommand(self: *App) !void {
+        try AuthAppRuntime.runProviderCommand(self);
     }
 
     pub fn runLoginCommand(self: *App) !void {

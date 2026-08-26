@@ -42,7 +42,7 @@ pub const SlashKind = enum {
     help,
     login,
     logout,
-    setup,
+    provider,
     status,
     background,
     background_stop,

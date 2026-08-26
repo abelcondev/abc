@@ -120,6 +120,7 @@ const FooterSurfaceProjection = struct {
     show_picker: bool,
     picker_kind: PickerKind,
     picker_items: []const []const u8,
+    picker_annotations: []const []const u8,
     file_picker_items: []const file_index.SearchResult,
     picker_selection_index: usize,
     picker_window_start: usize,
@@ -163,6 +164,7 @@ const FooterSurfaceProjection = struct {
             .show_picker = self.show_picker,
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
+            .picker_annotations = self.picker_annotations,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -372,23 +374,35 @@ fn buildFooterSurfaceProjection(
     };
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
-    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active;
+    // The inline key field is drawn as a `/provider` column, so the staged auth
+    // band must not claim the footer for it.
+    const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
+    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and
+        ctx.auth_picker.active and !inline_api_key;
     const show_skills_query = !viewer_active and !show_auth_picker and !modal_active and ctx.skills_menu.active;
     const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_skills_query and !modal_active and !ctx.stream.active and ctx.model_query_active;
-    const show_file_query = !viewer_active and !show_skills_query and !modal_active and !stream_suppresses_file_query and ctx.file_query_active and !show_model_query;
+    const show_provider_query = !viewer_active and !show_auth_picker and !show_skills_query and !modal_active and !ctx.stream.active and
+        ctx.provider_query_active and !show_model_query;
+    const show_file_query = !viewer_active and !show_skills_query and !modal_active and !stream_suppresses_file_query and
+        ctx.file_query_active and !show_model_query and !show_provider_query;
     const geometry = input_presentation.measureRawInputGeometry(
         ctx,
         shell.layout.cols,
         shell.layout.content_bottom,
         input_visible,
         modal_active,
-        show_model_query,
-        show_file_query,
+        .{ .model = show_model_query, .provider = show_provider_query, .file = show_file_query },
     );
     const show_slash_query = !show_auth_picker and !show_skills_query and geometry.show_slash_query;
-    const show_picker = show_auth_picker or show_skills_query or show_model_query or show_file_query or show_slash_query;
-    const picker_items: []const []const u8 = if (show_model_query) ctx.model_completions else &.{};
+    const show_picker = show_auth_picker or show_skills_query or show_model_query or show_provider_query or show_file_query or show_slash_query;
+    const picker_items: []const []const u8 = if (show_model_query)
+        ctx.model_completions
+    else if (show_provider_query)
+        ctx.provider_picker_completions
+    else
+        &.{};
+    const picker_annotations: []const []const u8 = if (show_provider_query) ctx.provider_picker_annotations else &.{};
     const file_picker_items: []const file_index.SearchResult = if (show_file_query) ctx.file_completions else &.{};
     const picker_selection_index: usize = if (show_skills_query)
         ctx.skills_menu.selected_index
@@ -398,6 +412,8 @@ fn buildFooterSurfaceProjection(
         ctx.auth_picker.selectedIndex()
     else if (show_model_query)
         ctx.model_completion_index
+    else if (show_provider_query)
+        ctx.provider_picker_completion_index
     else if (show_file_query)
         ctx.file_completion_index
     else
@@ -408,6 +424,8 @@ fn buildFooterSurfaceProjection(
         ctx.input.picker.slash_completion_window_start
     else if (show_model_query)
         ctx.model_completion_window_start
+    else if (show_provider_query)
+        ctx.provider_picker_completion_window_start
     else if (show_file_query)
         ctx.file_completion_window_start
     else
@@ -432,6 +450,8 @@ fn buildFooterSurfaceProjection(
         .auth
     else if (show_model_query)
         .model_stage
+    else if (show_provider_query)
+        .provider_stage
     else if (show_file_query)
         .file
     else
@@ -534,6 +554,7 @@ fn buildFooterSurfaceProjection(
         .show_picker = show_picker,
         .picker_kind = picker_kind,
         .picker_items = picker_items,
+        .picker_annotations = picker_annotations,
         .file_picker_items = file_picker_items,
         .picker_selection_index = picker_selection_index,
         .picker_window_start = picker_window_start,
@@ -733,6 +754,7 @@ pub const SurfaceFooterMeasurement = struct {
     show_picker: bool = false,
     picker_kind: PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
+    picker_annotations: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -871,6 +893,7 @@ pub const SurfaceFooterMeasurement = struct {
             .show_picker = self.show_picker,
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
+            .picker_annotations = self.picker_annotations,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -995,6 +1018,7 @@ pub noinline fn measureSurfaceFooter(
     measurement.input_visible = projection.input_visible;
     measurement.show_picker = projection.show_picker;
     measurement.picker_items = projection.picker_items;
+    measurement.picker_annotations = projection.picker_annotations;
     measurement.file_picker_items = projection.file_picker_items;
     measurement.picker_selection_index = projection.picker_selection_index;
     measurement.picker_window_start = projection.picker_window_start;

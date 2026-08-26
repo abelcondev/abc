@@ -9,6 +9,7 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -38,7 +39,7 @@ const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source
 const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
-const max_api_key_mask_glyphs: usize = 32;
+const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
 const max_manual_code_mask_glyphs: usize = 32;
 const max_team_query_bytes: usize = 256;
 
@@ -393,6 +394,7 @@ pub const PickerView = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
+    api_key_inline: bool = false,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -788,6 +790,9 @@ pub const Runtime = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
+    /// The key field is rendered as a `/provider` column instead of the staged
+    /// panel, so the composer keeps showing which path the user walked.
+    api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
 
@@ -1016,7 +1021,8 @@ pub const Runtime = struct {
             .sign_in_source = self.sign_in_source,
             .sign_in_code_visible = self.sign_in_code_visible,
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
-            .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .api_key_mask_count = self.apiKeyMaskCount(),
+            .api_key_inline = self.api_key_inline,
         };
     }
 
@@ -1039,6 +1045,21 @@ pub const Runtime = struct {
             return true;
         }
         return false;
+    }
+
+    /// Frees a team list adopted for the inline `/provider` picker. The staged
+    /// picker owns its list through its stages, so an active staged picker is
+    /// left alone.
+    pub fn releaseLoadedTeamSelection(self: *Self, alloc: Allocator) void {
+        if (self.picker_active) return;
+        self.clearTeamSelection(alloc);
+    }
+
+    /// Takes ownership of a loaded team list without opening the staged picker
+    /// band, so the inline `/provider` picker can render the teams as a column.
+    pub fn adoptTeamSelection(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
+        self.clearTeamSelection(alloc);
+        self.team_selection = selection.take();
     }
 
     pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
@@ -1132,6 +1153,30 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+    }
+
+    /// Opens the key field for the inline `/provider` picker. The stage is the
+    /// same one the staged panel uses, so entry, saving, and cancelling all
+    /// keep working; only the rendering differs.
+    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, false);
+        self.api_key_inline = true;
+    }
+
+    pub fn apiKeyInlineActive(self: *const Self) bool {
+        return self.apiKeyEntryActive() and self.api_key_inline;
+    }
+
+    pub fn apiKeyMaskCount(self: *const Self) usize {
+        return @min(self.api_key_input.items.len, max_api_key_mask_glyphs);
+    }
+
+    /// Leaves the key field without saving, zeroing whatever was typed.
+    pub fn cancelInlineApiKeyEntry(self: *Self, alloc: Allocator) void {
+        if (!self.apiKeyInlineActive()) return;
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.picker_active = false;
+        self.picker_stage = .root;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
@@ -1511,6 +1556,13 @@ pub const Runtime = struct {
 
     pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
         if (!self.picker_active or self.picker_stage != .change_team) return null;
+        return self.loadedTeamSelection();
+    }
+
+    /// The loaded team list regardless of which picker is presenting it. The
+    /// staged picker keeps `teamSelection` gated on its own stage; the inline
+    /// `/provider` picker renders the teams as a column without ever opening it.
+    pub fn loadedTeamSelection(self: *Self) ?*login_flow.TeamSelection {
         return if (self.team_selection) |*selection| selection else null;
     }
 
@@ -1735,6 +1787,7 @@ pub const Runtime = struct {
     }
 
     fn exitApiKeyStage(self: *Self, alloc: Allocator, reason: ApiKeyExitReason) void {
+        self.api_key_inline = false;
         const byte_count = self.api_key_input.items.len;
         if (self.api_key_input.capacity > 0) {
             const allocated = self.api_key_input.allocatedSlice();
@@ -1768,7 +1821,17 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source);
+    // Interactive selection paths run on keypresses; a source whose refresh
+    // the issuer rejects must read as "unavailable" (the callers all explain
+    // that), not ride a `try` chain out of the event loop. `resolve()` keeps
+    // its own error handling for startup status reporting.
+    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source) catch |err| switch (err) {
+        error.OutOfMemory => err,
+        else => {
+            debug_trace.logf("auth", "credential load failed source={t} err={s}", .{ source, @errorName(err) });
+            return null;
+        },
+    };
 }
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
@@ -2530,7 +2593,7 @@ test "auth picker navigation skips disabled hub actions" {
     ));
 }
 
-test "setup picker projects the active Vercel team" {
+test "provider picker projects the active Vercel team" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

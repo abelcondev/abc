@@ -27,7 +27,15 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, file, slash, skills, auth };
+pub const PickerKind = enum { model_stage, provider_stage, file, slash, skills, auth };
+
+/// Which inline picker the footer band is showing. At most one is true; the
+/// slash menu is derived from the rest rather than passed in.
+pub const PickerVisibility = struct {
+    model: bool = false,
+    provider: bool = false,
+    file: bool = false,
+};
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -217,16 +225,17 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
     };
 }
 
-fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) bool {
-    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active or show_model_query or show_file_query) return false;
+fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, visible: PickerVisibility) bool {
+    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active) return false;
+    if (visible.model or visible.provider or visible.file) return false;
     if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return false;
     // Mid-turn model-shaped input owns the footer slot even while the model list is hidden.
     if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return false;
     return slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items).len > 0;
 }
 
-pub fn slashCompletionPickerCount(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) usize {
-    if (!slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query)) return 0;
+pub fn slashCompletionPickerCount(ctx: RenderContext, modal_active: bool, visible: PickerVisibility) usize {
+    if (!slashCompletionPickerActive(ctx, modal_active, visible)) return 0;
     const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
     return picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, prefix, ctx.skills_menu.items);
 }
@@ -244,8 +253,7 @@ pub fn measureRawInputGeometry(
     content_bottom: u16,
     input_visible: bool,
     modal_active: bool,
-    show_model_query: bool,
-    show_file_query: bool,
+    visible: PickerVisibility,
 ) RawInputGeometry {
     const display_input: []const u8 = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items;
     const display_cursor: usize = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor;
@@ -256,9 +264,11 @@ pub fn measureRawInputGeometry(
     const slash_prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
     const raw_anchor: ?usize = if (ctx.queued_editor_active)
         null
-    else if (show_model_query)
+    else if (visible.model)
         ctx.model_completion_anchor
-    else if (show_file_query)
+    else if (visible.provider)
+        ctx.provider_picker_completion_anchor
+    else if (visible.file)
         ctx.file_completion_anchor
     else
         slashRawAnchor(ctx.input.edit_state.input.items, slash_prefix);
@@ -274,12 +284,12 @@ pub fn measureRawInputGeometry(
     }, raw_anchor);
     const capped = cappedInputRows(summary.total_rows, content_bottom, input_visible);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, capped.row_limit);
-    const show_slash_query = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
+    const show_slash_query = slashCompletionPickerActive(ctx, modal_active, visible);
     const slash_completion_count = if (show_slash_query)
-        slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
+        slashCompletionPickerCount(ctx, modal_active, visible)
     else
         0;
-    const picker_start_col = if (show_model_query or show_file_query or show_slash_query)
+    const picker_start_col = if (visible.model or visible.provider or visible.file or show_slash_query)
         visual_layout.projectedAnchorColumn(summary, terminal_cols)
     else
         @as(u16, 1);
@@ -297,6 +307,18 @@ pub fn measureRawInputGeometry(
 
 fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const u8 {
     if (!view.active or view.include_skip) return null;
+
+    if (view.stage == .api_key and view.api_key_inline) {
+        const key_variants = [_][]const u8{
+            "Enter saves     Esc cancels     " ++ credentials.stored_key_backend_label,
+            "Enter saves  Esc cancels",
+            "Enter  Esc",
+        };
+        for (key_variants) |candidate| {
+            if (display_width.visibleWidth(candidate) <= width) return candidate;
+        }
+        return key_variants[key_variants.len - 1];
+    }
 
     const root_variants = [_][]const u8{
         "↑↓ Navigate     Enter Open     Esc Close",
@@ -1152,8 +1174,8 @@ test "footer raw input row composition matches hard newlines and soft wraps" {
     try soft_input.edit_state.input.appendSlice(alloc, "abcdefgh");
     soft_input.edit_state.cursor = soft_input.edit_state.input.items.len;
 
-    const hard = measureRawInputGeometry(testRenderContext(&hard_input), 6, 20, true, false, false, false);
-    const soft = measureRawInputGeometry(testRenderContext(&soft_input), 6, 20, true, false, false, false);
+    const hard = measureRawInputGeometry(testRenderContext(&hard_input), 6, 20, true, false, .{});
+    const soft = measureRawInputGeometry(testRenderContext(&soft_input), 6, 20, true, false, .{});
     try std.testing.expectEqual(@as(u16, 2), hard.total_lines);
     try std.testing.expectEqual(hard.total_lines, soft.total_lines);
 }
@@ -1169,7 +1191,7 @@ test "footer tabs are modeled spaces and anchors use modeled columns" {
     ctx.model_completion_anchor = 1;
     // The tab consumes 6 cells, leaving 4 on row 0; "/model" (6 cells) word
     // wraps whole onto row 1, so the anchor projects to column 3.
-    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, true, false);
+    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, .{ .model = true });
     try std.testing.expectEqual(@as(u16, 3), geometry.picker_start_col);
 }
 
@@ -1179,7 +1201,7 @@ test "footer raw geometry windows capped input around the cursor" {
     defer input.deinit(alloc);
     try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
     input.edit_state.cursor = input.edit_state.input.items.len;
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
+    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, .{});
     try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);
     try std.testing.expect(geometry.window.first_row <= geometry.summary.cursor.row_index);
     try std.testing.expect(geometry.summary.cursor.row_index < geometry.window.first_row + geometry.window.row_count);
@@ -1195,7 +1217,7 @@ test "queued editor keeps standalone composer geometry empty" {
 
     var ctx = testRenderContext(&input);
     ctx.queued_editor_active = true;
-    const geometry = measureRawInputGeometry(ctx, 12, 20, true, false, false, false);
+    const geometry = measureRawInputGeometry(ctx, 12, 20, true, false, .{});
 
     try std.testing.expectEqual(@as(usize, 1), geometry.summary.total_rows);
     try std.testing.expectEqual(@as(u16, 1), geometry.total_lines);
@@ -1221,7 +1243,7 @@ test "footer image badges wrap atomically and close clipped OSC output" {
     ctx.file_query_active = true;
     ctx.file_completion_anchor = "a[Image #5]".len;
 
-    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, false, true);
+    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, .{ .file = true });
     try std.testing.expect(geometry.summary.total_rows > 1);
     try std.testing.expect(geometry.picker_start_col > 1);
 }
@@ -1234,7 +1256,7 @@ test "footer unknown and overflowing placeholders stay literal" {
     try input.edit_state.input.appendSlice(alloc, text);
     input.edit_state.cursor = input.edit_state.input.items.len;
 
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
     try std.testing.expectEqual(text.len, geometry.summary.cursor.raw_offset);
     try std.testing.expectEqual(@as(u16, 1), geometry.picker_start_col);
 }
@@ -1259,11 +1281,11 @@ test "footer picker anchors project raw offsets before inside and after badges" 
     ctx.file_query_active = true;
 
     ctx.file_completion_anchor = 0;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, .{ .file = true }).picker_start_col);
     ctx.file_completion_anchor = 3;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, .{ .file = true }).picker_start_col);
     ctx.file_completion_anchor = "[Image #5]".len;
-    try std.testing.expectEqual(@as(u16, 12), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 12), measureRawInputGeometry(ctx, 80, 20, true, false, .{ .file = true }).picker_start_col);
 }
 
 test "footer model and file anchors on earlier soft rows project to cursor row start" {
@@ -1275,12 +1297,12 @@ test "footer model and file anchors on earlier soft rows project to cursor row s
     var ctx = testRenderContext(&input);
     ctx.model_query_active = true;
     ctx.model_completion_anchor = 1;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, true, false).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, .{ .model = true }).picker_start_col);
 
     ctx.model_query_active = false;
     ctx.file_query_active = true;
     ctx.file_completion_anchor = 1;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, false, true).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, .{ .file = true }).picker_start_col);
 }
 
 test "footer slash anchor contract handles top level and argument completions" {
@@ -1290,7 +1312,7 @@ test "footer slash anchor contract handles top level and argument completions" {
         defer input.deinit(alloc);
         try input.edit_state.input.appendSlice(alloc, text);
         input.edit_state.cursor = input.edit_state.input.items.len;
-        const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+        const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
         try std.testing.expect(geometry.summary.anchor == null);
         try std.testing.expectEqual(@as(u16, 1), geometry.picker_start_col);
     }
@@ -1299,7 +1321,7 @@ test "footer slash anchor contract handles top level and argument completions" {
     defer arg.deinit(alloc);
     try arg.edit_state.input.appendSlice(alloc, "  /permissions ");
     arg.edit_state.cursor = arg.edit_state.input.items.len;
-    const arg_geometry = measureRawInputGeometry(testRenderContext(&arg), 80, 20, true, false, false, false);
+    const arg_geometry = measureRawInputGeometry(testRenderContext(&arg), 80, 20, true, false, .{});
     try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.raw_offset);
     try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.content_column);
     try std.testing.expectEqual(@as(u16, 3 + 2 + "/permissions ".len), arg_geometry.picker_start_col);
@@ -1312,13 +1334,13 @@ test "footer slash completion remains active across capped input rows" {
     defer suppressed.deinit(alloc);
     try suppressed.edit_state.input.appendSlice(alloc, "/mo");
     suppressed.edit_state.cursor = suppressed.edit_state.input.items.len;
-    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&suppressed), false, false, false) > 0);
+    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&suppressed), false, .{}) > 0);
 
     var roomy = InputRuntime{};
     defer roomy.deinit(alloc);
     try roomy.edit_state.input.appendSlice(alloc, "       /mo");
     roomy.edit_state.cursor = roomy.edit_state.input.items.len;
-    const roomy_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 10, true, false, false, false);
+    const roomy_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 10, true, false, .{});
     try std.testing.expect(roomy_geometry.input_extra > 0);
     try std.testing.expect(roomy_geometry.show_slash_query);
     try std.testing.expect(roomy_geometry.slash_completion_count > 0);
@@ -1328,7 +1350,7 @@ test "footer slash completion remains active across capped input rows" {
     try std.testing.expectEqual(@as(u16, 1), capped.total_lines);
     try std.testing.expectEqual(@as(u16, 0), capped.input_extra);
 
-    const tiny_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 4, true, false, false, false);
+    const tiny_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 4, true, false, .{});
     try std.testing.expect(tiny_geometry.show_slash_query);
     try std.testing.expect(tiny_geometry.slash_completion_count > 0);
 }
@@ -1339,17 +1361,17 @@ test "footer slash completion separates query activity from candidate count" {
     defer input.deinit(alloc);
 
     try input.textReplacementState().replace(alloc, "/hezzzzz");
-    const no_match = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    const no_match = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
     try std.testing.expect(no_match.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_match.slash_completion_count);
 
     try input.textReplacementState().replace(alloc, "/resume ");
-    const no_args = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    const no_args = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
     try std.testing.expect(!no_args.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_args.slash_completion_count);
 
     try input.textReplacementState().replace(alloc, "/permissions ");
-    const arguments = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    const arguments = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
     try std.testing.expect(arguments.show_slash_query);
     try std.testing.expectEqual(@as(usize, 6), arguments.slash_completion_count);
 }
@@ -1360,7 +1382,7 @@ test "footer slash completion opens after multiline whitespace" {
     defer input.deinit(alloc);
     try input.textReplacementState().replace(alloc, "\n   /");
 
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 72, 12, true, false, false, false);
+    const geometry = measureRawInputGeometry(testRenderContext(&input), 72, 12, true, false, .{});
     try std.testing.expectEqual(@as(u16, 1), geometry.input_extra);
     try std.testing.expect(geometry.show_slash_query);
     try std.testing.expect(geometry.slash_completion_count > 0);
@@ -1373,11 +1395,11 @@ test "footer slash completion projection honors dismissed input state" {
     try input.edit_state.input.appendSlice(alloc, "/mo");
     input.edit_state.cursor = input.edit_state.input.items.len;
 
-    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&input), false, false, false) > 0);
+    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&input), false, .{}) > 0);
     input.picker.dismissInlinePicker(.slash);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, .{}));
 
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, .{});
     try std.testing.expectEqual(@as(usize, 0), geometry.slash_completion_count);
     try std.testing.expect(!geometry.show_slash_query);
     try std.testing.expectEqualStrings("/mo", input.edit_state.input.items);
@@ -1390,11 +1412,11 @@ test "footer does not reinterpret dismissed model or file input as slash complet
 
     try input.textReplacementState().replace(alloc, "/model ");
     input.picker.dismissInlinePicker(.model);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, .{}));
 
     try input.textReplacementState().replace(alloc, "/help @src");
     input.picker.dismissInlinePicker(.file);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, .{}));
 }
 
 test "footer suppresses slash rows for streaming model-shaped input" {
@@ -1416,8 +1438,8 @@ test "footer suppresses slash rows for streaming model-shaped input" {
         ctx.skills_menu = .{ .items = &skills };
         ctx.stream = .{ .active = true };
 
-        try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(ctx, false, false, false));
-        const geometry = measureRawInputGeometry(ctx, 80, 20, true, false, false, false);
+        try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(ctx, false, .{}));
+        const geometry = measureRawInputGeometry(ctx, 80, 20, true, false, .{});
         try std.testing.expectEqual(@as(usize, 0), geometry.slash_completion_count);
         try std.testing.expect(!geometry.show_slash_query);
     }
@@ -1429,7 +1451,7 @@ test "footer suppresses slash rows for streaming model-shaped input" {
     var generic_ctx = testRenderContext(&generic);
     generic_ctx.skills_menu = .{ .items = &skills };
     generic_ctx.stream = .{ .active = true };
-    try std.testing.expect(slashCompletionPickerCount(generic_ctx, false, false, false) > 0);
+    try std.testing.expect(slashCompletionPickerCount(generic_ctx, false, .{}) > 0);
 }
 
 test "compose hint row keeps model in left hint text" {

@@ -86,6 +86,7 @@ pub const FooterPlannerInput = struct {
     show_picker: bool = false,
     picker_kind: input_presentation.PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
+    picker_annotations: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -915,7 +916,7 @@ pub fn composeFooterFrame(
                     }
                 }
             } else {
-                var status_row = try picker_presentation.composePickerStatusRow(alloc, .slash, ctx.model_picker_stage, false, false, input.picker_start_col, shell.layout.cols);
+                var status_row = try picker_presentation.composePickerStatusRow(alloc, .slash, ctx.model_picker_stage, ctx.provider_picker_stage, false, false, input.picker_start_col, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
             }
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
@@ -934,12 +935,13 @@ pub fn composeFooterFrame(
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.picker_items.len, window_start, input.picker_rows);
             var row = rows.picker_start;
             for (input.picker_items[window.start..window.end], window.start..) |item, i| {
-                var picker_row = try picker_presentation.composePickerOptionRow(alloc, input.picker_kind, input.picker_start_col, item, i == selected, shell.layout.cols);
+                const annotation = if (i < input.picker_annotations.len) input.picker_annotations[i] else "";
+                var picker_row = try picker_presentation.composePickerOptionRow(alloc, input.picker_kind, input.picker_start_col, item, annotation, i == selected, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &picker_row);
                 row += 1;
             }
         } else {
-            var status_row = try picker_presentation.composePickerStatusRow(alloc, input.picker_kind, ctx.model_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
+            var status_row = try picker_presentation.composePickerStatusRow(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
         }
     }
@@ -1388,8 +1390,7 @@ test "footer paints an inline completion suffix without moving the composer curs
         shell.layout.content_bottom,
         true,
         false,
-        false,
-        false,
+        .{},
     );
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
@@ -1770,7 +1771,7 @@ test "current composer renders a white connected rail across its rows" {
     defer shell.deinit(alloc);
 
     const ctx = testContext(&input);
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
+    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, .{});
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
