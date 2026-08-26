@@ -1681,10 +1681,6 @@ const TestAuth = struct {
         self.picker_provider = provider;
     }
 
-    fn teamSelection(self: *TestAuth) ?*TestTeamSelection {
-        return &self.team_selection;
-    }
-
     fn loadedTeamSelection(self: *TestAuth) ?*TestTeamSelection {
         return &self.team_selection;
     }

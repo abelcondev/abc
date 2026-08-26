@@ -1554,14 +1554,9 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
-        if (!self.picker_active or self.picker_stage != .change_team) return null;
-        return self.loadedTeamSelection();
-    }
-
-    /// The loaded team list regardless of which picker is presenting it. The
-    /// staged picker keeps `teamSelection` gated on its own stage; the inline
-    /// `/provider` picker renders the teams as a column without ever opening it.
+    /// The loaded team list regardless of which picker is presenting it: the
+    /// staged picker only shows it during its team stage, while the inline
+    /// `/provider` picker renders it as a column without opening a stage.
     pub fn loadedTeamSelection(self: *Self) ?*login_flow.TeamSelection {
         return if (self.team_selection) |*selection| selection else null;
     }
