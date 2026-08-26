@@ -107,7 +107,13 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .api_key => {
-                    column.labels[0] = provider_picker_catalog.writeKeyField(&column.field, app.auth.apiKeyMaskCount());
+                    // The column outlives the entry while the save thread
+                    // works; an empty ready-looking field there would invite
+                    // pasting the key again, into the composer this time.
+                    column.labels[0] = if (app.auth.apiKeySaveInFlight())
+                        "saving the key..."
+                    else
+                        provider_picker_catalog.writeKeyField(&column.field, app.auth.apiKeyMaskCount());
                     column.annotations[0] = "";
                     column.count = 1;
                     return 1;

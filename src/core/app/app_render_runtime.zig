@@ -1297,6 +1297,10 @@ pub fn Runtime(comptime App: type) type {
             ctx.ctrl_c_pending = view.editor.gestures.ctrlCExitArmed();
             ctx.model_query_active = false;
             ctx.model_completions = &.{};
+            ctx.provider_query_active = false;
+            ctx.provider_picker_completions = &.{};
+            ctx.provider_picker_annotations = &.{};
+            ctx.provider_picker_completion_anchor = 0;
             ctx.file_query_active = false;
             ctx.file_completions = &.{};
             ctx.inline_completion_suffix = "";
