@@ -615,6 +615,7 @@ const ColumnTestApp = struct {
     const TestAuth = struct {
         source: ?credentials.Source = null,
         mask_count: usize = 0,
+        save_in_flight: bool = false,
         available: auth_runtime.SourceSet = .empty,
 
         fn credentialSource(self: *const TestAuth) ?credentials.Source {
@@ -637,6 +638,10 @@ const ColumnTestApp = struct {
 
         fn apiKeyInlineActive(_: *const TestAuth) bool {
             return true;
+        }
+
+        fn apiKeySaveInFlight(self: *const TestAuth) bool {
+            return self.save_in_flight;
         }
 
         fn loadedTeamSelection(_: *TestAuth) ?*@import("../auth/login_flow.zig").TeamSelection {
@@ -727,6 +732,13 @@ test "key column is a masked field, not a list of options" {
     const typed = columnFor(&app, .api_key, "");
     try std.testing.expectEqual(@as(usize, 1), typed.count);
     try std.testing.expect(std.mem.indexOf(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
+
+    // While the save thread works the row says so instead of rendering an
+    // empty ready-looking field.
+    app.auth.save_in_flight = true;
+    const saving = columnFor(&app, .api_key, "");
+    try std.testing.expectEqual(@as(usize, 1), saving.count);
+    try std.testing.expectEqualStrings("saving the key...", saving.labels[0]);
 }
 
 test "key source column offers only detected keys plus new" {
