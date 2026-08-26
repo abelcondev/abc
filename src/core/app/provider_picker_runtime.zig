@@ -215,23 +215,31 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Space in the provider column: an exact token for a provider with a
-        /// method column opens it instead of inserting a literal space. Every
-        /// other row acts (switching, OAuth, key entry) and stays on Enter, so
-        /// a reflexive space never commits.
+        /// Space advances only when the exact typed token opens another column
+        /// with no side effects: a provider that has a method column, or the
+        /// `api-key` method (its next column is local). Everything that acts
+        /// (switching, OAuth, saving) stays on Enter, so a reflexive space
+        /// never commits and never touches the network.
         pub fn advanceOnSpace(app: *App) !bool {
             if (comptime !supported(App)) return false;
             if (!hasQuery(app)) return false;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
-            if (query.stage != .provider) return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
             if (std.mem.trim(u8, query.query, " \t").len == 0) return false;
 
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
             const selected = exactLabel(query.query, &column) orelse return false;
-            const provider = provider_catalog.parse(selected) orelse return false;
-            if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
+            switch (query.stage) {
+                .provider => {
+                    const provider = provider_catalog.parse(selected) orelse return false;
+                    if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
+                },
+                .method => {
+                    if (provider_picker_catalog.parseMethod(selected) != .api_key) return false;
+                },
+                .team, .key_source, .api_key => return false,
+            }
             return try submit(app);
         }
 
