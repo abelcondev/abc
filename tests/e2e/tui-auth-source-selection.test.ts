@@ -1693,9 +1693,10 @@ profileStoredKeyTmuxTest(
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
 
-    const keyPath = join(home, ".fx", "api-key");
-    expect(readFileSync(keyPath, "utf8")).toBe(STORED_TOKEN);
-    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+    const authPath = join(home, ".fx", "auth.json");
+    expect(readCommonAuth(home).credentials.stored_key?.secret).toBe(STORED_TOKEN);
+    expect(statSync(authPath).mode & 0o777).toBe(0o600);
+    expect(existsSync(join(home, ".fx", "api-key"))).toBe(false);
 
     await session.kill();
     session = await startFx(home, stderrPath, gateway, undefined, undefined, {
