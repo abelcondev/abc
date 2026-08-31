@@ -214,9 +214,35 @@ pub const EntryMutation = struct {
             .macos_keychain => try observe_keychain_profile(alloc, &self.profile.fx_dir.dir, self.keychain),
         };
         defer observation.deinit(alloc);
+        try self.migrate_observation(alloc, &observation);
         const document = observation.document orelse return null;
         const value = document.get(self.source) orelse return null;
         return try alloc.dupe(u8, value);
+    }
+
+    fn migrate_observation(
+        self: *EntryMutation,
+        alloc: Allocator,
+        observation: *ProfileObservation,
+    ) !void {
+        switch (auth_store.decide_load(observation.state, .active)) {
+            .missing, .use_current => return,
+            .migrate_legacy => {},
+            .use_legacy, .reject_current => unreachable,
+        }
+        const document = observation.document orelse return error.InvalidAuthDocument;
+        const migrated = switch (self.backend) {
+            .profile_file => publish_profile_migration(&self.profile, alloc, document),
+            .macos_keychain => publish_keychain_migration(
+                alloc,
+                &self.profile.fx_dir.dir,
+                document,
+                self.keychain,
+            ),
+        };
+        if (migrated) {
+            observation.state = .current;
+        }
     }
 
     pub fn save(self: *EntryMutation, alloc: Allocator, value: []const u8) !void {
@@ -350,6 +376,21 @@ fn commit_and_verify(
     if (!document.eql(verified)) return error.AuthDocumentWriteMismatch;
 }
 
+fn publish_profile_migration(
+    mutation: *ProfileMutation,
+    alloc: Allocator,
+    document: auth_store.Document,
+) bool {
+    commit_and_verify(mutation, alloc, document) catch |err| {
+        debug_trace.logf("auth", "common auth migration deferred backend=profile step=publish err={s}", .{@errorName(err)});
+        return false;
+    };
+    delete_legacy_profile_files(&mutation.fx_dir.dir) catch |err| {
+        debug_trace.logf("auth", "common auth migration cleanup incomplete backend=profile err={s}", .{@errorName(err)});
+    };
+    return true;
+}
+
 fn load_profile_document(
     alloc: Allocator,
     home: []const u8,
@@ -373,13 +414,7 @@ fn load_profile_document(
         .use_current => observation.take_document(),
         .migrate_legacy => migrated: {
             const document = observation.document orelse return error.InvalidAuthDocument;
-            commit_and_verify(&mutation, alloc, document) catch |err| {
-                debug_trace.logf("auth", "common auth migration deferred backend=profile step=publish err={s}", .{@errorName(err)});
-                break :migrated observation.take_document();
-            };
-            delete_legacy_profile_files(&mutation.fx_dir.dir) catch |err| {
-                debug_trace.logf("auth", "common auth migration cleanup incomplete backend=profile err={s}", .{@errorName(err)});
-            };
+            _ = publish_profile_migration(&mutation, alloc, document);
             break :migrated observation.take_document();
         },
         .use_legacy, .reject_current => unreachable,
@@ -427,17 +462,7 @@ fn load_keychain_document(
         .use_current => observation.take_document(),
         .migrate_legacy => migrated: {
             const document = observation.document orelse return error.InvalidAuthDocument;
-            commit_and_verify_keychain(alloc, document, keychain) catch |err| {
-                debug_trace.logf("auth", "common auth migration deferred backend=keychain step=publish err={s}", .{@errorName(err)});
-                break :migrated observation.take_document();
-            };
-            delete_keychain_legacy_profile_files(&mutation.fx_dir.dir) catch |err| {
-                debug_trace.logf("auth", "common auth migration cleanup incomplete backend=keychain source=profile err={s}", .{@errorName(err)});
-            };
-            _ = keychain.delete_api_key(alloc) catch |err| failed: {
-                debug_trace.logf("auth", "common auth migration cleanup incomplete backend=keychain source=stored_key err={s}", .{@errorName(err)});
-                break :failed false;
-            };
+            _ = publish_keychain_migration(alloc, &mutation.fx_dir.dir, document, keychain);
             break :migrated observation.take_document();
         },
         .use_legacy, .reject_current => unreachable,
@@ -561,6 +586,26 @@ fn commit_and_verify_keychain(
     var verified = try auth_store.Document.parse(alloc, persisted);
     defer verified.deinit(alloc);
     if (!document.eql(verified)) return error.AuthDocumentWriteMismatch;
+}
+
+fn publish_keychain_migration(
+    alloc: Allocator,
+    fx_dir: *std.Io.Dir,
+    document: auth_store.Document,
+    keychain: KeychainBackend,
+) bool {
+    commit_and_verify_keychain(alloc, document, keychain) catch |err| {
+        debug_trace.logf("auth", "common auth migration deferred backend=keychain step=publish err={s}", .{@errorName(err)});
+        return false;
+    };
+    delete_keychain_legacy_profile_files(fx_dir) catch |err| {
+        debug_trace.logf("auth", "common auth migration cleanup incomplete backend=keychain source=profile err={s}", .{@errorName(err)});
+    };
+    _ = keychain.delete_api_key(alloc) catch |err| failed: {
+        debug_trace.logf("auth", "common auth migration cleanup incomplete backend=keychain source=stored_key err={s}", .{@errorName(err)});
+        break :failed false;
+    };
+    return true;
 }
 
 fn observe_profile(alloc: Allocator, fx_dir: *std.Io.Dir) !ProfileObservation {
@@ -905,6 +950,40 @@ test "source mutations share one document without losing unrelated credentials" 
     )) == null);
 }
 
+test "active entry mutation migrates an unexpired legacy subscription" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var verified_home = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }),
+    };
+    defer verified_home.close();
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.root_dir_name);
+    defer fx_dir.close();
+    const codex =
+        "{\"version\":1,\"access_token\":\"codex-access\",\"refresh_token\":\"codex-refresh\",\"expires_at_ms\":4102444800000,\"account_id\":\"codex-account\"}";
+    try io_mod.durableReplaceVerified(alloc, &fx_dir, profile_paths.chatgpt_auth_file_name, codex);
+
+    var mutation = try begin_profile_entry_mutation(home, .chatgpt_subscription);
+    defer mutation.deinit();
+    const loaded = (try mutation.load(alloc)) orelse return error.TestExpectedLegacyCredential;
+    defer secret.zeroAndFree(alloc, loaded);
+
+    try std.testing.expectEqualStrings(codex, loaded);
+    const persisted = try read_profile_file(alloc, home, profile_paths.auth_file_name);
+    defer secret.zeroAndFree(alloc, persisted);
+    var document = try auth_store.Document.parse(alloc, persisted);
+    defer document.deinit(alloc);
+    try std.testing.expectEqualStrings(codex, document.get(.chatgpt_subscription).?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        fx_dir.dir.statFile(std.testing.io, profile_paths.chatgpt_auth_file_name, .{}),
+    );
+}
+
 test "Keychain migration publishes every source before removing legacy credentials" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -968,11 +1047,15 @@ test "Keychain publication failure keeps legacy credentials authoritative" {
 
     var fake = FakeKeychain{ .alloc = alloc, .fail_store = true };
     defer fake.deinit();
-    var loaded = (try load_keychain_document(alloc, home, .active, fake.backend())) orelse
+    var mutation = try begin_profile_entry_mutation(home, .chatgpt_subscription);
+    defer mutation.deinit();
+    mutation.backend = .macos_keychain;
+    mutation.keychain = fake.backend();
+    const loaded = (try mutation.load(alloc)) orelse
         return error.TestExpectedLegacyDocument;
-    defer loaded.deinit(alloc);
+    defer secret.zeroAndFree(alloc, loaded);
 
-    try std.testing.expectEqualStrings(codex, loaded.get(.chatgpt_subscription).?);
+    try std.testing.expectEqualStrings(codex, loaded);
     try std.testing.expect(fake.document == null);
     _ = try fx_dir.dir.statFile(std.testing.io, profile_paths.chatgpt_auth_file_name, .{});
 }

@@ -8645,6 +8645,14 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
+        const commonAuth = JSON.parse(
+          readFileSync(join(root.home, ".fx", "auth.json"), "utf8"),
+        );
+        expect(commonAuth.version).toBe(2);
+        expect(commonAuth.credentials.chatgpt_subscription.session.account_id).toBe(
+          "acct_acp_e2e",
+        );
+        expect(existsSync(join(root.home, ".fx", "chatgpt-auth.json"))).toBe(false);
         const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
         expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
         expect(codex.requests).toHaveLength(3);
@@ -8701,6 +8709,14 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
+        const commonAuth = JSON.parse(
+          readFileSync(join(root.home, ".fx", "auth.json"), "utf8"),
+        );
+        expect(commonAuth.version).toBe(2);
+        expect(commonAuth.credentials.grok_subscription.session.account_id).toBe(
+          "acct_grok_acp",
+        );
+        expect(existsSync(join(root.home, ".fx", "grok-auth.json"))).toBe(false);
         const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
         expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
 
