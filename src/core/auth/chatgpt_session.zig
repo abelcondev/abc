@@ -1,19 +1,14 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
-const io_mod = @import("../shared/io.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
+const native_auth_store = if (host_target.is_wasm) struct {} else @import("../hosts/native_auth_store.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
-const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
-const mutation_lock_file_name = "chatgpt-auth.lock";
-const mutation_lock_deadline_ms: u64 = 2000;
 
 pub const issuer = "https://auth.openai.com";
-pub const auth_file_name = profile_paths.chatgpt_auth_file_name;
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
@@ -43,82 +38,79 @@ pub const DeleteOutcome = enum {
     deleted_not_durable,
 };
 
-pub const Mutation = struct {
-    fx_dir: io_mod.VerifiedDir,
-    lock: io_mod.TimedAdvisoryLock,
+pub const Mutation = if (host_target.is_wasm) WasmMutation else NativeMutation;
+
+const WasmMutation = struct {
+    pub fn deinit(self: *WasmMutation) void {
+        self.* = undefined;
+    }
+
+    pub fn load(_: *WasmMutation, _: Allocator) !?Session {
+        return null;
+    }
+
+    pub fn save(_: *WasmMutation, _: Allocator, _: Session) !void {
+        return error.ChatGptOAuthUnavailable;
+    }
+
+    pub fn delete(_: *WasmMutation) !DeleteOutcome {
+        return .missing;
+    }
+};
+
+const NativeMutation = struct {
+    inner: native_auth_store.EntryMutation,
 
     pub fn deinit(self: *Mutation) void {
-        self.lock.release();
-        self.fx_dir.close();
+        self.inner.deinit();
         self.* = undefined;
     }
 
     pub fn load(self: *Mutation, alloc: Allocator) !?Session {
-        return loadFromDir(alloc, &self.fx_dir.dir, true);
+        const bytes = (try self.inner.load(alloc)) orelse return null;
+        defer secret.zeroAndFree(alloc, bytes);
+        return parse(alloc, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                debug_trace.logf("auth", "ChatGPT session load failed step=parse_common_mutation err={s}", .{@errorName(err)});
+                return null;
+            },
+        };
     }
 
     pub fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
         const text = try stringify(alloc, session);
         defer secret.zeroAndFree(alloc, text);
-        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
+        try self.inner.save(alloc, text);
     }
 
     pub fn delete(self: *Mutation) !DeleteOutcome {
-        self.fx_dir.dir.deleteFile(io_mod.getIo(), auth_file_name) catch |err| switch (err) {
-            error.FileNotFound => return .missing,
-            else => return err,
+        return switch (try self.inner.delete(std.heap.c_allocator)) {
+            .deleted => .deleted,
+            .missing => .missing,
+            .deleted_not_durable => .deleted_not_durable,
         };
-        const durable: io_mod.DurableOps = .{};
-        durable.sync_dir(durable.ctx, self.fx_dir.dir) catch return .deleted_not_durable;
-        return .deleted;
     }
 };
 
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return null;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
-        debug_trace.logf("auth", "ChatGPT session load failed step=open_home err={s}", .{@errorName(err)});
-        return null;
-    };
-    defer home_dir.close(io_mod.getIo());
-
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch |err| {
-        if (err != error.FileNotFound) {
-            debug_trace.logf("auth", "ChatGPT session load failed step=open_profile err={s}", .{@errorName(err)});
-        }
-        return null;
-    };
-    defer fx_dir.close(io_mod.getIo());
-    return loadFromDir(alloc, &fx_dir, false);
+    return loadNative(alloc, .active);
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool) !?Session {
-    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
+pub fn loadStored(alloc: Allocator) !?Session {
+    if (comptime host_target.is_wasm) return null;
+    return loadNative(alloc, .inspect);
+}
+
+fn loadNative(alloc: Allocator, intent: @import("auth_store.zig").LoadIntent) !?Session {
+    const bytes = (native_auth_store.load_entry(alloc, .chatgpt_subscription, intent) catch |err| switch (err) {
+        error.OutOfMemory => return err,
         else => {
-            debug_trace.logf("auth", "ChatGPT session load failed step=open_file err={s}", .{@errorName(err)});
-            if (report_open_failure) return err;
+            debug_trace.logf("auth", "ChatGPT session load failed step=common_store err={s}", .{@errorName(err)});
             return null;
         },
-    };
-    defer file.close(io_mod.getIo());
-
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
-        debug_trace.logf("auth", "ChatGPT session load failed step=permissions err=InsecureAuthFile", .{});
-        return null;
-    }
-
-    const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
+    }) orelse return null;
     defer secret.zeroAndFree(alloc, bytes);
     return parse(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -131,67 +123,14 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool)
 
 pub fn saveNewSession(alloc: Allocator, session: Session) !void {
     if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
-    var mutation = try beginMutation();
+    var mutation = try beginExistingMutation() orelse return error.HomeNotSet;
     defer mutation.deinit();
     try mutation.save(alloc, session);
 }
 
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
-
-    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    return try lockMutation(fx_dir);
-}
-
-fn beginMutation() !Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
-
-    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-    return lockMutation(fx_dir);
-}
-
-fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
-    var fx_dir = open_fx_dir;
-    errdefer fx_dir.close();
-    var lock = try io_mod.acquireTimedAdvisoryLock(
-        &fx_dir,
-        mutation_lock_file_name,
-        mutation_lock_deadline_ms,
-    );
-    errdefer lock.release();
-    return .{ .fx_dir = fx_dir, .lock = lock };
-}
-
-fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    errdefer dir.close(io_mod.getIo());
-
-    const initial_stat = try dir.stat(io_mod.getIo());
-    if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
-        return error.PrivateStatePermissionsUnsupported;
-    };
-    const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
-        return error.PrivateStatePermissionsUnsupported;
-    }
-    return .{ .dir = dir };
+    return .{ .inner = try native_auth_store.begin_entry_mutation(.chatgpt_subscription) };
 }
 
 pub fn parse(alloc: Allocator, bytes: []const u8) !Session {

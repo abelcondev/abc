@@ -13,7 +13,7 @@ pub const AccountBuffer = [256]u8;
 
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
-const max_oauth_session_bytes: usize = 64 * 1024;
+const max_oauth_session_bytes: usize = 256 * 1024;
 const keychain_process_timeout: std.Io.Timeout = .{
     .duration = .{
         .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
@@ -353,6 +353,10 @@ fn storeMcpCredentialsControlled(
 
 pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
     return deleteMcpValueMac(alloc, mcp_credentials_service_name);
+}
+
+pub fn delete(alloc: std.mem.Allocator) Error!bool {
+    return deleteServiceItem(alloc, service_name);
 }
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {

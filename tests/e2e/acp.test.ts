@@ -199,6 +199,7 @@ function fakeGatewayEnv(
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
+    FX_DISABLE_KEYCHAIN: "1",
   };
 }
 

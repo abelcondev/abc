@@ -350,7 +350,7 @@ pub fn resolvePreferring(
     if (secret_store.isDisabled()) return .{ .fx_login_status = fx_login_status };
 
     var status: StoredKeyReadStatus = .not_found;
-    const stored = loadSource(alloc, transport, secret_store, .stored_key) catch |err| blk: {
+    const stored = loadStoredKeyCredential(alloc, secret_store, mode) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         status = .unavailable;
         debug_trace.logf("auth", "stored key load failed err={s} status={t}", .{ @errorName(err), status });
@@ -394,6 +394,7 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .stored_key => loadStoredKeyCredential(alloc, secret_store, mode),
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -408,7 +409,7 @@ pub fn loadSource(
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
-        .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .stored_key => loadStoredKeyCredential(alloc, secret_store, .refresh_if_needed),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
     };
@@ -423,7 +424,7 @@ pub fn sourceExists(
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
-            const loaded = oauth_session.load(alloc) catch |err| switch (err) {
+            const loaded = oauth_session.loadStored(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     debug_trace.logf("auth", "source probe failed source=fx_login err={s}", .{@errorName(err)});
@@ -438,7 +439,7 @@ pub fn sourceExists(
         .grok_subscription => grok_oauth.sourceExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
-            const stored = secret_store.load(alloc) catch |err| switch (err) {
+            const stored = secret_store.loadStored(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     debug_trace.logf("auth", "source probe failed source=stored_key err={s}", .{@errorName(err)});
@@ -467,9 +468,13 @@ fn loadEnvCredential(
 fn loadStoredKeyCredential(
     alloc: std.mem.Allocator,
     secret_store: host.SecretStore,
+    mode: LoadMode,
 ) !?Credential {
     if (secret_store.isDisabled()) return null;
-    const value = (try secret_store.load(alloc)) orelse return null;
+    const value = (try if (mode == .stored)
+        secret_store.loadStored(alloc)
+    else
+        secret_store.load(alloc)) orelse return null;
     return .{ .token = value, .source = .stored_key };
 }
 
@@ -544,7 +549,7 @@ pub fn loadFxLoginCredential(
 }
 
 fn loadStoredFxLoginCredential(alloc: std.mem.Allocator) !?Credential {
-    var session = (try oauth_session.load(alloc)) orelse return null;
+    var session = (try oauth_session.loadStored(alloc)) orelse return null;
     defer session.deinit(alloc);
     return takeCredentialFromSession(&session, null);
 }
@@ -855,6 +860,7 @@ const SecretStoreFixture = struct {
     disabled: bool = false,
     unreadable: bool = false,
     load_calls: usize = 0,
+    stored_load_calls: usize = 0,
 
     fn provider(self: *@This()) host.SecretStore {
         return .{
@@ -862,6 +868,7 @@ const SecretStoreFixture = struct {
             .backend_label = "test credential store",
             .is_disabled_fn = isDisabled,
             .load_fn = load,
+            .load_stored_fn = loadStored,
             .store_fn = store,
             .store_interactive_fn = storeInteractive,
         };
@@ -878,6 +885,19 @@ const SecretStoreFixture = struct {
     ) host.SecretStoreLoadError!?[]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.load_calls += 1;
+        return self.loadValue(alloc);
+    }
+
+    fn loadStored(
+        raw_context: ?*anyopaque,
+        alloc: std.mem.Allocator,
+    ) host.SecretStoreLoadError!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+        self.stored_load_calls += 1;
+        return self.loadValue(alloc);
+    }
+
+    fn loadValue(self: *@This(), alloc: std.mem.Allocator) host.SecretStoreLoadError!?[]u8 {
         if (self.unreadable) return error.StoredKeyUnreadable;
         const value = self.value orelse return null;
         return try alloc.dupe(u8, value);
@@ -1003,6 +1023,7 @@ test "a disabled stored key is reported as never attempted, not as absent" {
         try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
     }
     try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.stored_load_calls);
 }
 
 test "credential resolution loads a stored key only through the injected host port" {
@@ -1019,7 +1040,8 @@ test "credential resolution loads a stored key only through the injected host po
     );
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 1), store_fixture.stored_load_calls);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
     try std.testing.expectEqual(Source.stored_key, resolution.credential.?.source);
     try std.testing.expectEqualStrings("injected-test-value", resolution.credential.?.token);
@@ -1038,7 +1060,8 @@ test "credential resolution preserves unreadable store classification" {
         .stored,
     );
 
-    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 1), store_fixture.stored_load_calls);
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(StoredKeyReadStatus.unavailable, resolution.stored_key_status);
 }
@@ -1063,6 +1086,7 @@ test "a failed fx-login refresh falls through to the stored key" {
     try std.testing.expectEqualStrings("stored-key-that-works", credential.token);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.stored_load_calls);
 }
 
 test "a failed fx-login refresh is still reported when nothing else resolves" {

@@ -165,6 +165,30 @@ function writeSeededGrokLogin(testHome: string, accessToken: string, accountId =
   chmodSync(authPath, 0o600);
 }
 
+function readCommonAuth(testHome: string): {
+  version: number;
+  credentials: Record<string, { secret?: string; session?: Record<string, unknown> }>;
+} {
+  return JSON.parse(readFileSync(join(testHome, ".fx", "auth.json"), "utf8"));
+}
+
+function commonSession(testHome: string, source: "fx_login" | "chatgpt_subscription" | "grok_subscription") {
+  return readCommonAuth(testHome).credentials[source]?.session;
+}
+
+function persistedSession(
+  testHome: string,
+  source: "fx_login" | "chatgpt_subscription" | "grok_subscription",
+  legacyFile: string,
+) {
+  const commonPath = join(testHome, ".fx", "auth.json");
+  if (existsSync(commonPath)) {
+    const session = commonSession(testHome, source);
+    if (session) return session;
+  }
+  return JSON.parse(readFileSync(join(testHome, ".fx", legacyFile), "utf8"));
+}
+
 function readSingleUsageSnapshot(testHome: string): {
   billing: string;
   next_sequence: number;
@@ -1171,7 +1195,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in with Codex.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -1212,9 +1236,10 @@ tmuxTest(
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(home, ".fx", "auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
+    expect(commonSession(home, "chatgpt_subscription")).toBeDefined();
 
     await session.sendText("/status");
     await session.waitForText(
@@ -1329,7 +1354,7 @@ tmuxTest(
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
     await session.waitForText("Signed out of Codex.", TIMEOUT);
-    expect(existsSync(authPath)).toBe(false);
+    expect(commonSession(home, "chatgpt_subscription")).toBeUndefined();
     await session.sendText("/status");
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
     chatgptOauth.setModels([
@@ -1791,7 +1816,7 @@ tmuxTest(
     await session.waitForText("auth=fx login", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
 
-    const savedAuth = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const savedAuth = commonSession(home, "fx_login") as {
       team_id?: string;
       team_slug?: string;
     };
@@ -1855,12 +1880,13 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    const migratedAuthFile = readFileSync(authPath, "utf8");
+    expect(readCommonAuth(home).version).toBe(2);
     await session.sendText("use the selected login credential");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    expect(readFileSync(authPath, "utf8")).toBe(migratedAuthFile);
 
     const firstRunOutput = await session.captureFullScrollback();
     const firstRunStderr = readFileSync(stderrPath, "utf8");
@@ -1871,7 +1897,7 @@ tmuxTest(
     // The switch above is remembered, so the restart keeps fx login rather than
     // letting AI_GATEWAY_API_KEY reclaim it through precedence.
     await session.waitForText("auth=fx login", TIMEOUT);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    expect(readFileSync(authPath, "utf8")).toBe(migratedAuthFile);
     await session.sendText("use the remembered credential after restart");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
@@ -1893,7 +1919,7 @@ tmuxTest(
     expect(oauth.requests[3].authorization).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(oauth.requests[1].clientId).toBe("test-client");
     expect(oauth.requests[2].clientId).toBe("test-client");
-    const acquiredAuth = JSON.parse(readFileSync(authPath, "utf8")) as {
+    const acquiredAuth = commonSession(home, "fx_login") as {
       issuer: string;
       client_id: string;
       access_token: string;
@@ -1918,7 +1944,7 @@ tmuxTest(
     await session.sendText("/logout");
     const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
     expect(loggedOut).not.toContain("remote session could not be revoked");
-    expect(existsSync(authPath)).toBe(false);
+    expect(commonSession(home, "fx_login")).toBeUndefined();
     expect(
       oauth.requests
         .filter((request) => request.path === "/oauth/revoke")
@@ -2168,7 +2194,7 @@ test(
     expect(tokenRequests).toHaveLength(1);
     expect(tokenRequests[0].clientId).toBe(fallbackClientId);
 
-    const persisted = JSON.parse(readFileSync(authPath, "utf8")) as {
+    const persisted = commonSession(home, "fx_login") as {
       client_id: string;
       access_token: string;
     };
@@ -2207,9 +2233,10 @@ test(
     expect(login.stdout).not.toContain("Code:");
     expect(login.stderr).toBe("");
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(home, ".fx", "auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
+    expect(commonSession(home, "chatgpt_subscription")).toBeDefined();
     const settingsPath = join(home, ".fx", "settings.json");
     const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(selected.provider).toBe("codex");
@@ -2274,7 +2301,7 @@ test(
     const logout = await runFx(["logout", "codex"], { env, timeoutMs: TIMEOUT });
     expect(logout.code).toBe(0);
     expect(logout.stdout).toContain("Signed out of Codex.");
-    expect(existsSync(authPath)).toBe(false);
+    expect(commonSession(home, "chatgpt_subscription")).toBeUndefined();
   },
   60_000,
 );
@@ -2304,9 +2331,10 @@ test(
       expect(login.stdout).toContain("Signed in with Grok.");
       expect(login.stderr).toBe("");
 
-      const authPath = join(home, ".fx", "grok-auth.json");
+      const authPath = join(home, ".fx", "auth.json");
       expect(existsSync(authPath)).toBe(true);
       expect(statSync(authPath).mode & 0o077).toBe(0);
+      expect(commonSession(home, "grok_subscription")).toBeDefined();
       const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
       expect(settings.provider).toBe("grok");
       expect(settings.models.grok).toBe("grok-4.20");
@@ -2365,7 +2393,7 @@ test(
       expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
       expect(logout.stdout).toContain("Signed out of Grok.");
       expect(grok.requests.some((request) => request.path === "/oauth2/revoke")).toBe(true);
-      expect(existsSync(authPath)).toBe(false);
+      expect(commonSession(home, "grok_subscription")).toBeUndefined();
     } finally {
       grok.stop();
     }
@@ -2398,7 +2426,7 @@ test(
       expect(result.stdout).not.toContain("grok-code");
       expect(result.stderr).toBe("");
       expect(grok.tokenCalls()).toBe(1);
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(commonSession(home, "grok_subscription")).toBeDefined();
     } finally {
       grok.stop();
     }
@@ -2416,7 +2444,6 @@ test("Grok logout removes local credentials when remote revocation fails", async
       JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
       { mode: 0o600 },
     );
-    const authPath = join(home, ".fx", "grok-auth.json");
     const result = await runFx(["logout", "grok"], {
       env: {
         HOME: home,
@@ -2429,7 +2456,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("Signed out of Grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
-    expect(existsSync(authPath)).toBe(false);
+    expect(commonSession(home, "grok_subscription")).toBeUndefined();
     expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider)
       .toBe("grok");
     const ask = await runFx(["ask", "--json", "--no-save", "Still Grok?"], {
@@ -2470,7 +2497,7 @@ test("Grok 401 replay refuses a different account before the second provider sen
     });
     expect(ask.code).toBe(1);
     expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
-    const saved = JSON.parse(readFileSync(join(home, ".fx", "grok-auth.json"), "utf8")) as {
+    const saved = persistedSession(home, "grok_subscription", "grok-auth.json") as {
       access_token: string;
       account_id: string;
     };
@@ -2665,7 +2692,7 @@ tmuxTest(
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("grok-code");
       expect(grok.tokenCalls()).toBe(1);
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(commonSession(home, "grok_subscription")).toBeDefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -2915,7 +2942,7 @@ test(
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
     expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
+    expect(commonSession(home, "chatgpt_subscription")).toBeDefined();
     const settingsPath = join(home, ".fx", "settings.json");
     expect(existsSync(settingsPath)).toBe(false);
   },
@@ -2947,7 +2974,7 @@ test(
       expect(login.code).toBe(1);
       expect(login.stdout).not.toContain("Signed in with Grok.");
       expect(login.stderr).toContain("fx login: target model catalog is empty");
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(commonSession(home, "grok_subscription")).toBeDefined();
       expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
     } finally {
       grok.stop();
@@ -3065,7 +3092,7 @@ test(
 );
 
 test(
-  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
+  "saved provider switching uses one common auth document and one profile ledger",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
     const workspace = join(home, "workspace");
@@ -3118,11 +3145,12 @@ test(
       5,
     );
     try {
+      writeSeededFxLogin(home);
       writeSeededChatGptLogin(home, chatgptAccessToken("acct_usage"));
       writeSeededGrokLogin(home, "grok-usage-token", "acct_usage");
       const env = {
         HOME: home,
-        AI_GATEWAY_API_KEY: "gateway-usage-key",
+        AI_GATEWAY_API_KEY: undefined,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
         FX_AUTO_UPGRADE: "0",
@@ -3177,6 +3205,13 @@ test(
       expect(gateway.requests).toHaveLength(1);
       expect(codex.responses).toBe(1);
       expect(grok.responses).toBe(1);
+      const auth = readCommonAuth(home);
+      expect(auth.version).toBe(2);
+      expect(auth.credentials.fx_login?.session).toBeDefined();
+      expect(auth.credentials.chatgpt_subscription?.session).toBeDefined();
+      expect(auth.credentials.grok_subscription?.session).toBeDefined();
+      expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(false);
     } finally {
       codex.stop();
       grok.stop();
@@ -3495,7 +3530,7 @@ tmuxTest(
     expect(
       loggedOut.match(/remote session could not be revoked/g) ?? [],
     ).toHaveLength(1);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(commonSession(home, "fx_login")).toBeUndefined();
 
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -3552,7 +3587,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
     await session.waitForText("Signed out of fx.", TIMEOUT);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(commonSession(home, "fx_login")).toBeUndefined();
 
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -3566,7 +3601,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "logout removes an fx login rejected for unsafe permissions",
+  "logout fails closed for a common auth document with unsafe permissions",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-logout-rejected-login-"));
     stderrPath = join(home, "stderr.log");
@@ -3580,8 +3615,12 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
-    const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
-    expect(existsSync(authPath)).toBe(false);
+    const failed = await session.waitForText(
+      "Could not confirm durable fx logout. The active source was recalculated.",
+      TIMEOUT,
+    );
+    expect(failed).not.toContain("Signed out of fx.");
+    expect(existsSync(authPath)).toBe(true);
 
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -3592,7 +3631,7 @@ tmuxTest(
       "seeded-refresh-token",
       oauth.providerDetail,
     ]) {
-      expect(loggedOut).not.toContain(secret);
+      expect(failed).not.toContain(secret);
     }
   },
   60_000,
