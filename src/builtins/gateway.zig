@@ -517,7 +517,8 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (request.credential.source == .chatgpt_subscription or request.credential.source == .grok_subscription) {
+    const credential_source = request.credential.credentialSource();
+    if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
         return agent_stream_provider_contract.failResult(
             error.SubscriptionCredentialCannotAuthorizeGateway,
         );
@@ -528,8 +529,8 @@ fn streamAgentCompletion(
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
-            .api_key = request.credential.secret,
-            .team = request.credential.tenant,
+            .api_key = request.credential.secret(),
+            .team = request.credential.tenant(),
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
@@ -595,17 +596,17 @@ fn gatewayUsageReference(
     completion: shared_types.ModelCompletion,
 ) ?agent_stream_provider_contract.DeferredUsageReference {
     const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.source orelse return null;
+    const source = request.credential.credentialSource();
     return .{
         .provider = .gateway,
         .generation_id = generation_id,
         .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant,
-        .account_id = request.credential.account_id,
+        .tenant = request.credential.tenant(),
+        .account_id = request.credential.accountId(),
         .credential_source = source,
         .credential_identity = credential_authority.derive(
             source,
-            request.credential.account_id,
+            request.credential.accountId(),
         ),
     };
 }
@@ -885,7 +886,7 @@ fn executeWebSearchProvider(
     progress_ctx: ?*anyopaque,
 ) !Response {
     return executeGatewayWorker(alloc, .{
-        .api_key = inputs.api_key,
+        .api_key = if (inputs.credential_source == .host_managed) null else inputs.api_key,
         .credential_source = inputs.credential_source,
         .team = inputs.gateway_team,
         .model = inputs.worker_model,
@@ -963,7 +964,7 @@ pub const StreamFn = *const fn (
 var default_stream_ctx: u8 = 0;
 
 pub const GatewayWorkerConfig = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     credential_source: ?shared_types.CredentialSource = null,
     team: ?[]const u8 = null,
     model: []const u8,
@@ -991,7 +992,9 @@ pub fn executeGatewayWorker(
     on_progress: ?ProgressFn,
     progress_ctx: ?*anyopaque,
 ) !Response {
-    if (config.api_key.len == 0 or config.model.len == 0 or config.chat_url.len == 0) {
+    if ((config.api_key == null and config.credential_source != .host_managed) or
+        config.model.len == 0 or config.chat_url.len == 0)
+    {
         return error.MissingGatewaySearchConfiguration;
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -1021,7 +1024,7 @@ pub fn executeGatewayWorker(
     var stream = config.stream_fn(
         config.stream_ctx,
         alloc,
-        config.api_key,
+        config.api_key orelse "",
         config.team,
         config.model,
         @max(config.retry_count, 1),
@@ -1051,11 +1054,18 @@ pub fn executeGatewayWorker(
     }
     if (!builtin.is_test and stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) {
         if (config.usage) |ledger| {
-            ledger.startDeferredReconciliation(
-                config.usage_allocator,
-                usage_outcome.deferred,
-                config.api_key,
-            );
+            if (config.api_key) |api_key| {
+                ledger.startDeferredReconciliation(
+                    config.usage_allocator,
+                    usage_outcome.deferred,
+                    api_key,
+                );
+            } else if (config.credential_source == .host_managed) {
+                ledger.startHostManagedDeferredReconciliation(
+                    config.usage_allocator,
+                    usage_outcome.deferred,
+                );
+            }
         }
     }
     if (stream.status != .ok) return error.GatewayRequestFailed;
@@ -1159,7 +1169,7 @@ fn streamGatewayWorker(
     return gateway_client.streamGatewayProviderToolCompletionBounded(
         alloc,
         .{
-            .api_key = api_key,
+            .api_key = if (api_key.len > 0) api_key else null,
             .team = team,
             .model = model,
             .retry_count = request_retry_count,

@@ -94,17 +94,32 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    host_managed,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
+    const source = parseRuntimeCredentialSource(text) orelse return null;
+    return if (source == .host_managed) null else source;
+}
+
+pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
+        if (source == .host_managed) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
+}
+
+test "host-managed authority is runtime-only and cannot be persisted" {
+    try std.testing.expect(parseCredentialSource("host_managed") == null);
+    try std.testing.expectEqual(
+        CredentialSource.host_managed,
+        parseRuntimeCredentialSource("host_managed").?,
+    );
 }
 
 pub const TurnPresentationOutcome = enum {

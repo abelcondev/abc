@@ -758,7 +758,7 @@ pub const View = struct {
 };
 
 pub const GatewayCredential = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
 };
@@ -769,6 +769,7 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
@@ -796,10 +797,20 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) Self {
+        return initWithMode(validator, transport, secret_store, .local);
+    }
+
+    pub fn initWithMode(
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) Self {
         return .{
             .api_key_validator = validator,
             .oauth_transport = transport,
             .secret_store = secret_store,
+            .auth_mode = auth_mode,
         };
     }
 
@@ -811,8 +822,18 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) void {
+        initIntoWithMode(storage, validator, transport, secret_store, .local);
+    }
+
+    pub fn initIntoWithMode(
+        storage: *Self,
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) void {
         comptime {
-            if (std.meta.fields(Self).len != 24) {
+            if (std.meta.fields(Self).len != 25) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -820,6 +841,7 @@ pub const Runtime = struct {
         storage.api_key_validator = validator;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
+        storage.auth_mode = auth_mode;
         storage.selected_credential = null;
         storage.credential_refresh_failure_source = null;
         storage.source_inventory = .empty;
@@ -860,6 +882,11 @@ pub const Runtime = struct {
     }
 
     fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+        if (self.auth_mode == .host_managed) return .{
+            .api_key = null,
+            .gateway_team = null,
+            .source = .host_managed,
+        };
         const credential = self.selected_credential orelse return null;
         if (credential.needsRefreshAt(now_ms)) return null;
         return .{
@@ -874,6 +901,14 @@ pub const Runtime = struct {
         return credential.api_key;
     }
 
+    pub fn isHostManaged(self: *const Self) bool {
+        return self.auth_mode == .host_managed;
+    }
+
+    pub fn authMode(self: *const Self) credentials.AuthMode {
+        return self.auth_mode;
+    }
+
     pub fn oauthTransport(self: *const Self) oauth_transport.Provider {
         return self.oauth_transport;
     }
@@ -883,6 +918,7 @@ pub const Runtime = struct {
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
+        if (self.auth_mode == .host_managed) return .host_managed;
         if (self.credential_refresh_failure_source) |source| {
             return credentials.catalogAccessAfterRefreshFailure(source);
         }
@@ -895,11 +931,13 @@ pub const Runtime = struct {
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
+        if (self.auth_mode == .host_managed) return .host_managed;
         const credential = self.selected_credential orelse return null;
         return credential.source;
     }
 
     pub fn accountId(self: *const Self) ?[]const u8 {
+        if (self.auth_mode == .host_managed) return null;
         const credential = self.selected_credential orelse return null;
         return credential.accountId();
     }
@@ -923,6 +961,12 @@ pub const Runtime = struct {
     }
 
     fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+        if (self.auth_mode == .host_managed) return .{
+            .active_source = .host_managed,
+            .gateway_connected = true,
+            .chatgpt_connected = true,
+            .grok_connected = true,
+        };
         const gateway_connected = self.source_inventory.contains(.vercel_oidc_token) or
             self.source_inventory.contains(.ai_gateway_api_key) or
             self.source_inventory.contains(.fx_login) or
@@ -973,10 +1017,15 @@ pub const Runtime = struct {
     }
 
     pub fn refreshSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) {
+            self.source_inventory = .empty;
+            return;
+        }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
     }
 
     pub fn refreshChatGptSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .chatgpt_subscription)) {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
@@ -985,6 +1034,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
             self.source_inventory.insert(.grok_subscription);
         } else if (self.credentialSource() != .grok_subscription) {
@@ -1617,6 +1667,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         provider: model_provider.ProviderId,
     ) !?bool {
+        if (self.auth_mode == .host_managed) return false;
         return switch (provider) {
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
@@ -1814,6 +1865,33 @@ test "auth in-place initialization preserves empty runtime state" {
     try std.testing.expect(runtime.team_query.items.len == 0);
     try std.testing.expect(runtime.sign_in_code_input.items.len == 0);
     try std.testing.expect(runtime.api_key_input.items.len == 0);
+}
+
+test "host-managed runtime exposes authority without local credential state" {
+    var runtime = Runtime.initWithMode(
+        api_key_validator.unavailable_provider,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .host_managed,
+    );
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(runtime.isHostManaged());
+    try std.testing.expect(runtime.apiKey() == null);
+    try std.testing.expect(runtime.accountId() == null);
+    try std.testing.expect(runtime.gatewayTeam() == null);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.credentialSource().?);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
+    try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
+    const status = runtime.statusSnapshot();
+    try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
+    try std.testing.expect(status.gateway_connected);
+    try std.testing.expect(status.chatgpt_connected);
+    try std.testing.expect(status.grok_connected);
+    try std.testing.expect(!status.refreshable());
+    try runtime.refreshSourceInventory(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), runtime.source_inventory.count());
 }
 
 fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
@@ -2144,7 +2222,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     _ = runtime.adoptCredential(alloc, &credential);
 
     const gateway_credential = runtime.gatewayCredential().?;
-    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key);
+    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key.?);
     try std.testing.expectEqualStrings("team_123", gateway_credential.gateway_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
@@ -2177,7 +2255,7 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
 }
 
 test "auth runtime view preserves missing and loaded states" {

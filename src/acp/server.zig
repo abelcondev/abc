@@ -335,6 +335,15 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    if (state.cfg.auth_mode == .host_managed) {
+        state.credential_source = .host_managed;
+        if (state.active_session) |*active| {
+            active.credential_source = .host_managed;
+            active.api_key = &.{};
+            active.account_id = null;
+        }
+        return true;
+    }
     if (state.active_session) |active| {
         if (credentialMatchesProvider(active.credential_source, provider)) return true;
     }
@@ -1271,21 +1280,24 @@ fn parseInitializeRequest(
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
-            return app_lifecycle.loadEmbeddedStartupState(
+            var startup = try app_lifecycle.loadEmbeddedStartupState(
                 alloc,
                 home_dir,
                 workspace_root,
                 state.cfg.default_model,
                 state.cfg.default_agent_step_limit,
             );
+            startup.auth_mode = state.cfg.auth_mode;
+            return startup;
         }
     }
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateWithAuthMode(
         alloc,
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
+        state.cfg.auth_mode,
     );
 }
 
@@ -1345,34 +1357,53 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.provider = startup.provider;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
-    var startup_credential = startup.takeCredential();
-    defer if (startup_credential) |*credential| credential.deinit(alloc);
-    var routed_credential: ?credentials.Credential = null;
-    defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_model = if (startup_credential) |credential|
-        credentialMatchesProvider(credential.source, state.provider)
-    else
-        false;
-    const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
-        routed_credential = .{
-            .token = try alloc.dupe(u8, state.cfg.credential_override.?),
-            .source = .ai_gateway_api_key,
+    if (state.cfg.auth_mode == .host_managed) {
+        state.api_key = &.{};
+        state.credential_source = .host_managed;
+        state.account_id = null;
+        state.gateway_team = null;
+    } else {
+        var startup_credential = startup.takeCredential();
+        defer if (startup_credential) |*credential| credential.deinit(alloc);
+        var routed_credential: ?credentials.Credential = null;
+        defer if (routed_credential) |*credential| credential.deinit(alloc);
+        const startup_matches_model = if (startup_credential) |credential|
+            credentialMatchesProvider(credential.source, state.provider)
+        else
+            false;
+        const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
+            routed_credential = .{
+                .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+                .source = .ai_gateway_api_key,
+            };
+            break :override &routed_credential.?;
+        } else if (startup_matches_model)
+            &startup_credential.?
+        else routed: {
+            const preferred = if (startup_credential) |value| value.source else null;
+            const resolution = try credentials.resolveForProvider(
+                alloc,
+                state.cfg.gateway_provider.oauth_transport,
+                state.cfg.secret_store,
+                .refresh_if_needed,
+                state.provider,
+                preferred,
+            );
+            routed_credential = resolution.credential;
+            if (routed_credential == null) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = if (state.provider == .codex)
+                        credentials.missing_chatgpt_credential_message
+                    else if (state.provider == .grok)
+                        credentials.missing_grok_credential_message
+                    else
+                        credentials.missing_credential_message,
+                });
+            }
+            break :routed &routed_credential.?;
         };
-        break :override &routed_credential.?;
-    } else if (startup_matches_model)
-        &startup_credential.?
-    else routed: {
-        const preferred = if (startup_credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
-            .refresh_if_needed,
-            state.provider,
-            preferred,
-        );
-        routed_credential = resolution.credential;
-        if (routed_credential == null) {
+        if (credential.token.len == 0) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
@@ -1383,20 +1414,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                     credentials.missing_credential_message,
             });
         }
-        break :routed &routed_credential.?;
-    };
-    if (credential.token.len == 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (state.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
-        });
+        adoptServerCredential(state, credential);
     }
-    adoptServerCredential(state, credential);
 
     state.permission_mode = startup.permission_mode;
     state.permission_rules = startup.takePermissionRules();
@@ -1426,12 +1445,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.alloc,
         startup_catalog,
         .{
-            .access = credentials.catalogAccessForCredentialAndAccount(
-                state.credential_source,
-                state.api_key,
-                state.gateway_team,
-                state.account_id,
-            ),
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
             .endpoint = state.cfg.gateway_models_path,
             .cancel_flag = &catalog_cancel_flag,
         },
@@ -1638,7 +1660,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Subscription provider switching is unavailable in this WASM runtime",
                 });
             }
-            var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
+            var staged_credential: ?credentials.Credential = if (state.cfg.auth_mode == .host_managed)
+                null
+            else if (target == .gateway and state.cfg.credential_override != null)
                 credentials.Credential{
                     .token = try alloc.dupe(u8, state.cfg.credential_override.?),
                     .source = .ai_gateway_api_key,
@@ -1663,24 +1687,27 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                             credentials.missing_credential_message,
                     });
             };
-            defer staged_credential.deinit(alloc);
-            if (!model_provider.authorizesCredential(target, staged_credential.source)) {
+            defer if (staged_credential) |*credential| credential.deinit(alloc);
+            if (staged_credential) |credential| if (!model_provider.authorizesCredential(target, credential.source)) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Credential cannot authorize the selected provider",
                 });
-            }
+            };
             const catalog_provider = catalogProviderFor(state, target) orelse
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Selected provider is unavailable in this host",
                 });
-            const access = credentials.catalogAccessForCredentialAndAccount(
-                staged_credential.source,
-                staged_credential.token,
-                staged_credential.gatewayTeam(),
-                staged_credential.accountId(),
-            );
+            const access: credentials.CatalogAccess = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    staged_credential.?.source,
+                    staged_credential.?.token,
+                    staged_credential.?.gatewayTeam(),
+                    staged_credential.?.accountId(),
+                );
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
                 .endpoint = state.cfg.gateway_models_path,
@@ -1732,7 +1759,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 });
             };
             state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
-            adoptServerCredential(state, &staged_credential);
+            if (staged_credential) |*credential| {
+                adoptServerCredential(state, credential);
+            } else {
+                state.credential_source = .host_managed;
+                session.credential_source = .host_managed;
+                session.api_key = &.{};
+                session.account_id = null;
+            }
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
         if (state.active_session) |*session| {

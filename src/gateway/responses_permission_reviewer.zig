@@ -40,12 +40,13 @@ pub fn review(
     request: permission_auto_classifier.ReviewRequest,
     adapter: Adapter,
 ) !permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) return .invalid;
-    if (adapter.require_account and input.account_id == null) return .invalid;
-    adapter.validate_fn(alloc, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .invalid;
-    };
+    if (!reviewInputAuthorized(input, adapter.require_account)) return .invalid;
+    if (input.credential_source != .host_managed) {
+        adapter.validate_fn(alloc, input) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .invalid;
+        };
+    }
     var runtime = Runtime{ .input = input, .adapter = adapter };
     return permission_auto_classifier.Reviewer.withTransportModel(
         .{
@@ -57,6 +58,15 @@ pub fn review(
         permission_auto_classifier.Reviewer.default_timeout_ms,
         adapter.model,
     ).review(alloc, request);
+}
+
+fn reviewInputAuthorized(
+    input: permission_auto_classifier.ProviderInput,
+    require_account: bool,
+) bool {
+    if (input.credential_source == .host_managed) return true;
+    if (input.credential.len == 0) return false;
+    return !require_account or input.account_id != null;
 }
 
 fn buildReviewPayload(
@@ -122,6 +132,12 @@ pub fn buildPayloadForTest(
 
 fn validateUnavailable(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
 
+test "host-managed permission review accepts absent local credential metadata" {
+    try std.testing.expect(reviewInputAuthorized(.{
+        .credential_source = .host_managed,
+    }, true));
+}
+
 const OwnedResult = struct {
     result: stream_provider.Result,
 };
@@ -171,12 +187,15 @@ fn sendReview(
     };
     var callback_context: u8 = 0;
     var result = runtime.adapter.send_fn(alloc, .{
-        .credential = .{
-            .secret = runtime.input.credential,
-            .source = runtime.adapter.source,
-            .account_id = runtime.input.account_id,
-            .tenant = runtime.input.tenant,
-        },
+        .credential = if (runtime.input.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = runtime.input.credential,
+                .source = runtime.adapter.source,
+                .account_id = runtime.input.account_id,
+                .tenant_context = runtime.input.tenant,
+            } },
         .model = model,
         .retry_count = 1,
         .messages = &.{},

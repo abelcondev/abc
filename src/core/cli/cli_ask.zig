@@ -219,6 +219,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
 };
 
 pub const Config = struct {
+    auth_mode: credentials.AuthMode = .local,
     command_usage: []const u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -395,6 +396,7 @@ const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -417,6 +419,7 @@ const RunDeps = struct {
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
     load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
@@ -1074,6 +1077,7 @@ const AskContext = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .credential_source = self.credential_source,
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
@@ -1425,13 +1429,23 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = try options.deps.load_startup_state(
-        alloc,
-        cfg.gateway_provider.oauth_transport,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-    );
+    var startup = if (cfg.auth_mode == .host_managed)
+        try options.deps.load_startup_state_with_auth_mode(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+        )
+    else
+        try options.deps.load_startup_state(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+        );
     defer startup.deinit(alloc);
     try checkHeadlessCancellation(options.deps);
 
@@ -1465,7 +1479,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
+    if (cfg.auth_mode == .local and
+        !options.continue_recovery and options.resume_target == null and startup.credential == null)
+    {
         return missingCredentialResult(alloc, options, startup.provider);
     }
 
@@ -1545,48 +1561,63 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_final_model = if (startup.credential) |credential|
-        model_provider.authorizesCredential(ctx.provider, credential.source)
-    else
-        false;
-    const credential: *const credentials.Credential = if (startup_matches_final_model)
-        &startup.credential.?
-    else routed: {
-        const preferred = if (startup.credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            .refresh_if_needed,
-            ctx.provider,
-            preferred,
-        );
-        routed_credential = resolution.credential;
-        if (routed_credential == null) {
-            return missingCredentialResult(alloc, options, ctx.provider);
+    if (cfg.auth_mode == .host_managed) {
+        ctx.api_key = "";
+        ctx.gateway_team = null;
+        ctx.credential_source = .host_managed;
+        ctx.account_id = null;
+        ctx.model_catalog_access = .host_managed;
+        if (comptime @import("builtin").os.tag != .wasi) {
+            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
+                ctx.session.usage.replaceHostManagedReconciliationAuthority(
+                    ctx.alloc,
+                    ctx.provider,
+                );
+            }
         }
-        break :routed &routed_credential.?;
-    };
-    const api_key = credential.token;
-    ctx.api_key = api_key;
-    ctx.gateway_team = credential.gatewayTeam();
-    ctx.credential_source = credential.source;
-    ctx.account_id = credential.accountId();
-    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
-        credential.source,
-        api_key,
-        credential.gatewayTeam(),
-        credential.accountId(),
-    );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-            ctx.session.usage.replaceProviderReconciliationCredential(
+    } else {
+        const startup_matches_final_model = if (startup.credential) |credential|
+            model_provider.authorizesCredential(ctx.provider, credential.source)
+        else
+            false;
+        const credential: *const credentials.Credential = if (startup_matches_final_model)
+            &startup.credential.?
+        else routed: {
+            const preferred = if (startup.credential) |value| value.source else null;
+            const resolution = try credentials.resolveForProvider(
                 alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
+                .refresh_if_needed,
                 ctx.provider,
-                credential.source,
-                credential.accountId(),
-                credential.token,
+                preferred,
             );
+            routed_credential = resolution.credential;
+            if (routed_credential == null) {
+                return missingCredentialResult(alloc, options, ctx.provider);
+            }
+            break :routed &routed_credential.?;
+        };
+        ctx.api_key = credential.token;
+        ctx.gateway_team = credential.gatewayTeam();
+        ctx.credential_source = credential.source;
+        ctx.account_id = credential.accountId();
+        ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+            credential.source,
+            credential.token,
+            credential.gatewayTeam(),
+            credential.accountId(),
+        );
+        if (comptime @import("builtin").os.tag != .wasi) {
+            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
+                ctx.session.usage.replaceProviderReconciliationCredential(
+                    alloc,
+                    ctx.provider,
+                    credential.source,
+                    credential.accountId(),
+                    credential.token,
+                );
+            }
         }
     }
 
@@ -1739,10 +1770,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .images = current_images,
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
-        .api_key = api_key,
-        .gateway_team = if (credential.gatewayTeam()) |team| @constCast(team) else null,
-        .credential_source = credential.source,
-        .account_id = if (credential.accountId()) |account_id| @constCast(account_id) else null,
+        .api_key = @constCast(ctx.api_key),
+        .gateway_team = if (ctx.gateway_team) |team| @constCast(team) else null,
+        .credential_source = ctx.credential_source,
+        .account_id = if (ctx.account_id) |account_id| @constCast(account_id) else null,
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,

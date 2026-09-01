@@ -7,6 +7,7 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const model_provider = @import("../config/model_provider.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const credentials = @import("../auth/credentials.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -148,12 +149,15 @@ pub const ToolSelection = struct {
     }
 };
 
-pub const CredentialLease = struct {
-    secret: []const u8,
-    source: ?types.CredentialSource = null,
-    account_id: ?[]const u8 = null,
-    tenant: ?[]const u8 = null,
-};
+pub const CredentialLease = credentials.RequestAuth;
+
+test "host-managed credential lease exposes no secret or account metadata" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource());
+}
 
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
@@ -391,7 +395,7 @@ test "stream provider accepts one typed request and emits ordered neutral events
         .context = &fake,
         .stream_fn = Fake.stream,
     }).stream(std.testing.allocator, .{
-        .credential = .{ .secret = "key" },
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
         .model = "model",
         .retry_count = 1,
         .messages = &.{},

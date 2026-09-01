@@ -1726,6 +1726,23 @@ pub const Usage = struct {
         );
     }
 
+    pub fn startHostManagedDeferredReconciliation(
+        self: *Usage,
+        alloc: Allocator,
+        reference: stream_provider.DeferredUsageReference,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
+            .{
+                .provider = reference.provider,
+                .credential_identity = reference.credential_identity,
+            },
+            false,
+            null,
+        );
+    }
+
     /// Installs the host's authoritative credential regardless of the prior key.
     pub fn replaceReconciliationCredential(
         self: *Usage,
@@ -1783,6 +1800,23 @@ pub const Usage = struct {
         );
     }
 
+    pub fn replaceHostManagedReconciliationAuthority(
+        self: *Usage,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
+        self.startReconciliationWithCredential(
+            alloc,
+            null,
+            .{
+                .provider = provider,
+                .credential_identity = credential_authority.derive(.host_managed, null),
+            },
+            true,
+            null,
+        );
+    }
+
     /// Replaces a producer's key only while that key is still authoritative.
     pub fn refreshReconciliationCredential(
         self: *Usage,
@@ -1819,13 +1853,16 @@ pub const Usage = struct {
     fn startReconciliationWithCredential(
         self: *Usage,
         alloc: Allocator,
-        api_key: []const u8,
+        credential: ?[]const u8,
         authority: ReconciliationAuthority,
         replace_existing: bool,
         expected_api_key: ?[]const u8,
     ) void {
-        if (api_key.len == 0) return;
-        const key_digest = reconciliationKeyDigest(api_key);
+        if (credential) |api_key| if (api_key.len == 0) return;
+        const key_digest = if (credential) |api_key|
+            reconciliationKeyDigest(api_key)
+        else
+            hostManagedReconciliationDigest();
         const expected_digest = if (expected_api_key) |expected|
             reconciliationKeyDigest(expected)
         else
@@ -1876,21 +1913,24 @@ pub const Usage = struct {
         self.mutex.unlock(io_mod.getIo());
         if (!still_has_pending) return;
 
-        const api_key_copy = alloc.dupe(u8, api_key) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage reconciliation start failed reason={s}",
-                .{@errorName(err)},
-            );
-            return;
-        };
+        const credential_copy = if (credential) |api_key|
+            alloc.dupe(u8, api_key) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "usage reconciliation start failed reason={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            }
+        else
+            null;
         self.reconciliation_cancel.store(false, .seq_cst);
         self.reconciliation_done.store(false, .seq_cst);
         self.reconciliation_key_digest = key_digest;
         self.reconciliation_thread = std.Thread.spawn(
             .{},
             reconciliationThreadMain,
-            .{ self, alloc, api_key_copy, authority, self.generation_usage_providers },
+            .{ self, alloc, credential_copy, authority, self.generation_usage_providers },
         ) catch |err| {
             self.reconciliation_done.store(true, .seq_cst);
             debug_trace.logf(
@@ -1898,7 +1938,7 @@ pub const Usage = struct {
                 "usage reconciliation start failed reason={s}",
                 .{@errorName(err)},
             );
-            secret.zeroAndFree(alloc, api_key_copy);
+            if (credential_copy) |api_key| secret.zeroAndFree(alloc, api_key);
             return;
         };
     }
@@ -2949,18 +2989,18 @@ fn writeOptionalU64(writer: *std.Io.Writer, value: ?u64) !void {
 fn reconciliationThreadMain(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []u8,
+    credential: ?[]u8,
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
 ) void {
-    defer secret.zeroAndFree(alloc, api_key);
+    defer if (credential) |api_key| secret.zeroAndFree(alloc, api_key);
     defer usage.reconciliation_done.store(true, .seq_cst);
     var observed_epoch = usage.reconciliation_work_epoch.load(.seq_cst);
     while (!usage.reconciliation_cancel.load(.seq_cst)) {
         reconcilePendingBlocking(
             usage,
             alloc,
-            api_key,
+            credential,
             &usage.reconciliation_cancel,
             authority,
             providers,
@@ -2987,16 +3027,21 @@ fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
     return digest;
 }
 
+fn hostManagedReconciliationDigest() [Sha256.digest_length]u8 {
+    return reconciliationKeyDigest("fx-host-managed-auth-v1");
+}
+
 fn reconcilePendingBlocking(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []const u8,
+    credential: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     authority: ReconciliationAuthority,
     providers: generation_usage.Set,
     max_attempts: usize,
 ) void {
-    if (api_key.len == 0 or cancel_flag.load(.seq_cst)) return;
+    if (credential) |api_key| if (api_key.len == 0) return;
+    if (cancel_flag.load(.seq_cst)) return;
     var attempt: usize = 0;
     while (attempt < max_attempts and !cancel_flag.load(.seq_cst)) : (attempt += 1) {
         var current = usage.snapshot(alloc) catch |err| {
@@ -3026,7 +3071,7 @@ fn reconcilePendingBlocking(
                 continue;
             };
             var outcome = provider.lookup(alloc, .{
-                .credential = api_key,
+                .credential = credential,
                 .tenant = pending.team,
                 .origin = pending.origin,
                 .generation_id = pending.id,
@@ -4570,7 +4615,8 @@ const TestGenerationUsageProvider = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.calls += 1;
         self.saw_expected_input =
-            std.mem.eql(u8, input.credential, "credential") and
+            input.credential != null and
+            std.mem.eql(u8, input.credential.?, "credential") and
             std.mem.eql(
                 u8,
                 input.generation_id,
@@ -5728,4 +5774,18 @@ test "resumed provider reconciliation uses Gateway credential slot identity" {
     try std.testing.expect(usage.reconciliation_key_digest == null);
     try std.testing.expect(usage.reconciliation_authority == null);
     try std.testing.expect(usage.reconciliation_credential_blocked);
+}
+
+test "host-managed reconciliation records authority without credential bytes" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.replaceHostManagedReconciliationAuthority(std.testing.allocator, .gateway);
+
+    try std.testing.expect(usage.reconciliation_key_digest != null);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, usage.reconciliation_authority.?.provider);
+    try std.testing.expect(usage.reconciliation_authority.?.credential_identity.?.eql(
+        credential_authority.derive(.host_managed, null).?,
+    ));
+    try std.testing.expect(!usage.reconciliation_credential_blocked);
 }

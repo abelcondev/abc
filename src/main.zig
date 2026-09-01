@@ -595,7 +595,11 @@ const App = struct {
         return null;
     }
 
-    pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
+    pub fn init(
+        alloc: Allocator,
+        launch: *cli_surface.InteractiveLaunch,
+        auth_mode: credentials.AuthMode,
+    ) !Self {
         var app = Self{
             .alloc = alloc,
             .auth = undefined,
@@ -613,11 +617,12 @@ const App = struct {
             else
                 background_process.provider),
         };
-        auth_runtime.Runtime.initInto(
+        auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,
             app_oauth_transport,
             app_secret_store,
+            auth_mode,
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
@@ -1395,7 +1400,10 @@ const App = struct {
         errdefer std.heap.c_allocator.free(model_copy);
 
         const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
+        const api_key_copy = if (gateway_credential.api_key) |api_key|
+            try std.heap.c_allocator.dupe(u8, api_key)
+        else
+            @constCast(&[_]u8{});
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
         const gateway_team_copy = if (gateway_credential.gateway_team) |team|
@@ -3129,7 +3137,7 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
-    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch);
+    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
     switch (outcome) {
         .returned => {},
         .exit => |code| if (code != 0) return error.WasmTerminalExited,
@@ -3266,12 +3274,16 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     io_mod.setRawEnviron(raw_env);
 
     const alloc = processAllocator();
+    const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
+        try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+        exitFast(1);
+    };
     const cfg = if (cli_args.len == 0)
-        emptyEntryConfig()
+        emptyEntryConfig(auth_mode)
     else if (needsFullEntryConfig(cli_args))
-        fullEntryConfig()
+        fullEntryConfig(auth_mode)
     else
-        localEntryConfig();
+        localEntryConfig(auth_mode);
 
     var early_threaded: ?std.Io.Threaded = null;
     defer if (early_threaded) |*threaded| threaded.deinit();
@@ -3301,7 +3313,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             defer owned_launch.deinit(alloc);
             defer debug_trace.shutdown();
 
-            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch);
+            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode);
             switch (outcome) {
                 .returned => return,
                 .exit => |code| std.process.exit(code),
@@ -3607,11 +3619,12 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
-fn fullEntryConfig() app_entry_runtime.Config {
+fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
@@ -3645,11 +3658,12 @@ fn fullEntryConfig() app_entry_runtime.Config {
     };
 }
 
-fn localEntryConfig() app_entry_runtime.Config {
+fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
@@ -3683,11 +3697,12 @@ fn localEntryConfig() app_entry_runtime.Config {
     };
 }
 
-fn emptyEntryConfig() app_entry_runtime.Config {
+fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = "",
         .default_agent_step_limit = 0,
