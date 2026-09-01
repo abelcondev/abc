@@ -3453,7 +3453,7 @@ fn parseCredentialSourceOptional(value: ?std.json.Value) !?types.CredentialSourc
     const actual = value orelse return error.InvalidUsageSnapshot;
     return switch (actual) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidUsageSnapshot,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidUsageSnapshot,
         else => error.InvalidUsageSnapshot,
     };
 }
@@ -3540,6 +3540,34 @@ test "usage snapshot JSON round trips" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(snapshot.billing, decoded.billing);
     try std.testing.expectEqual(snapshot.wall_duration_ms, decoded.wall_duration_ms);
+}
+
+test "host-managed deferred usage authority round trips" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const identity = credential_authority.derive(.host_managed, null).?;
+    const observation = try InvocationObservation.begin(&usage);
+    try observation.complete(alloc, .{}, .{ .deferred = .{
+        .provider = .gateway,
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .scope = "https://ai-gateway.vercel.sh",
+        .credential_source = .host_managed,
+        .credential_identity = identity,
+    } });
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeSnapshot(&encoded.writer, snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    var decoded = try parseSnapshotValue(alloc, parsed.value);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(types.CredentialSource.host_managed, decoded.pending[0].credential_source.?);
+    try std.testing.expect(decoded.pending[0].credential_identity.?.eql(identity));
 }
 
 test "profile recovery hint follows unresolved durable usage" {
