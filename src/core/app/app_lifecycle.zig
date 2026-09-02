@@ -187,7 +187,11 @@ pub const StartupState = struct {
 
     pub fn modelCatalogAccess(self: *const StartupState) credentials.CatalogAccess {
         if (self.auth_mode == .host_managed) return .host_managed;
-        return credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
+        const access = credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
+        return if (self.credential_source_preference == null)
+            access
+        else
+            access.withExplicitAuthority();
     }
 
     pub fn gatewayTeam(self: *const StartupState) ?[]const u8 {

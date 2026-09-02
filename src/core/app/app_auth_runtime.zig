@@ -871,7 +871,7 @@ pub fn Runtime(comptime App: type) type {
             var credential: ?credentials.Credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);
             if (!hostManagesAuth(app)) {
-                var preparation = auth_runtime.prepareCredential(
+                credential = (auth_runtime.prepareCredential(
                     app.alloc,
                     app.auth.oauthTransport(),
                     app.auth.secretStore(),
@@ -889,9 +889,7 @@ pub fn Runtime(comptime App: type) type {
                         ),
                     }, true);
                     return;
-                };
-                defer preparation.deinit(app.alloc);
-                credential = preparation.takeReady() orelse {
+                }) orelse {
                     if (target == .codex and allow_login) {
                         try beginCodexSignInForProviderSwitch(app);
                         return;

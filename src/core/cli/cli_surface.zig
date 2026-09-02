@@ -671,18 +671,16 @@ fn activateProviderSelection(
     defer settings.deinit(alloc);
 
     const preferred_source = exact_source orelse settings.credential_source;
-    var preparation: auth_runtime.CredentialPreparation = .blocked;
-    defer preparation.deinit(alloc);
-    if (cfg.auth_mode == .local) {
-        preparation = try auth_runtime.prepareCredential(
+    var prepared_credential = if (cfg.auth_mode == .host_managed)
+        null
+    else
+        try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
             target,
             preferred_source,
         );
-    }
-    var prepared_credential = preparation.takeReady();
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
@@ -705,15 +703,13 @@ fn activateProviderSelection(
             return false;
         };
         performed_login = .codex;
-        preparation.deinit(alloc);
-        preparation = try auth_runtime.prepareCredential(
+        prepared_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
             target,
             preferred_source,
         );
-        prepared_credential = preparation.takeReady();
     }
     if (cfg.auth_mode == .local and prepared_credential == null and target == .grok and caller == .provider_command) {
         grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
@@ -722,15 +718,13 @@ fn activateProviderSelection(
             return false;
         };
         performed_login = .grok;
-        preparation.deinit(alloc);
-        preparation = try auth_runtime.prepareCredential(
+        prepared_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
             target,
             preferred_source,
         );
-        prepared_credential = preparation.takeReady();
     }
 
     const credential = if (cfg.auth_mode == .host_managed)
@@ -762,10 +756,12 @@ fn activateProviderSelection(
         .access = if (cfg.auth_mode == .host_managed)
             .host_managed
         else
-            credentials.catalogAccessAt(credential.?.*, io_mod.milliTimestamp()),
+            credentials.catalogAccessAt(
+                credential.?.*,
+                io_mod.milliTimestamp(),
+            ).withExplicitAuthority(),
         .endpoint = cfg.models_path,
         .view = .picker,
-        .allow_public_fallback = false,
     });
     var loaded = switch (fetch_result) {
         .loaded => |loaded| blk: {
@@ -1282,7 +1278,6 @@ fn runNonInteractiveWithDeps(
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
                 .endpoint = cfg.models_path,
-                .allow_public_fallback = startup.credential_source_preference == null,
             })) {
                 .loaded => |loaded| loaded,
                 .failure => |failure| {

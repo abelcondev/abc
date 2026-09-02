@@ -432,15 +432,13 @@ pub fn selectCredentialForProvider(
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        var preparation = try auth_runtime.prepareCredential(
+        break :blk (try auth_runtime.prepareCredential(
             state.alloc,
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
             provider,
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
-        );
-        defer preparation.deinit(state.alloc);
-        break :blk preparation.takeReady() orelse return false;
+        )) orelse return false;
     };
     defer credential.deinit(state.alloc);
     adoptServerCredential(state, &credential);
@@ -1829,15 +1827,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         } else if (startup_credential_is_final)
             &startup_credential.?
         else routed: {
-            var preparation = try auth_runtime.prepareCredential(
+            routed_credential = try auth_runtime.prepareCredential(
                 alloc,
                 state.cfg.gateway_provider.oauth_transport,
                 state.cfg.secret_store,
                 state.provider,
                 if (state.provider == .gateway) startup.credential_source_preference else null,
             );
-            defer preparation.deinit(alloc);
-            routed_credential = preparation.takeReady();
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -1851,6 +1847,17 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             }
             break :routed &routed_credential.?;
         };
+        if (credential.token.len == 0) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = if (state.provider == .codex)
+                    credentials.missing_chatgpt_credential_message
+                else if (state.provider == .grok)
+                    credentials.missing_grok_credential_message
+                else
+                    credentials.missing_credential_message,
+            });
+        }
         adoptServerCredential(state, credential);
     }
 
@@ -2122,15 +2129,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                var preparation = try auth_runtime.prepareCredential(
+                break :credential (try auth_runtime.prepareCredential(
                     alloc,
                     state.cfg.gateway_provider.oauth_transport,
                     state.cfg.secret_store,
                     target,
                     if (target == .gateway) state.gateway_source_preference else null,
-                );
-                defer preparation.deinit(alloc);
-                break :credential preparation.takeReady() orelse
+                )) orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (target == .codex)

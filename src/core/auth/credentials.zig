@@ -76,6 +76,11 @@ pub const CatalogAuthenticatedSource = enum {
     }
 };
 
+const CatalogAuthority = enum {
+    automatic,
+    explicit,
+};
+
 /// A borrowed authorization decision for one model-catalog request. Public-only
 /// states cannot carry credential or team bytes; authenticated states carry the
 /// only values the request is allowed to send.
@@ -86,6 +91,7 @@ pub const CatalogAccess = union(enum) {
         credential: []const u8,
         team_context: ?[]const u8,
         account_id: ?[]const u8 = null,
+        authority: CatalogAuthority = .automatic,
     },
     host_managed,
 
@@ -112,7 +118,9 @@ pub const CatalogAccess = union(enum) {
     pub fn publicFallbackAfterRejection(self: CatalogAccess) ?CatalogAccess {
         return switch (self) {
             .public_only => null,
-            .authenticated => |access| if (access.source == .chatgpt_subscription or access.source == .grok_subscription)
+            .authenticated => |access| if (access.authority == .explicit or
+                access.source == .chatgpt_subscription or
+                access.source == .grok_subscription)
                 null
             else
                 .{
@@ -121,6 +129,20 @@ pub const CatalogAccess = union(enum) {
                     },
                 },
             .host_managed => null,
+        };
+    }
+
+    pub fn withExplicitAuthority(self: CatalogAccess) CatalogAccess {
+        return switch (self) {
+            .public_only => |access| .{ .public_only = access },
+            .authenticated => |access| .{ .authenticated = .{
+                .source = access.source,
+                .credential = access.credential,
+                .team_context = access.team_context,
+                .account_id = access.account_id,
+                .authority = .explicit,
+            } },
+            .host_managed => .host_managed,
         };
     }
 
@@ -942,6 +964,9 @@ test "authenticated catalog access carries source and permitted request context"
         try std.testing.expect(fallback.authorizationCredential() == null);
         try std.testing.expect(fallback.teamContext() == null);
         try std.testing.expect(fallback.publicFallbackAfterRejection() == null);
+
+        const explicit = authenticated.withExplicitAuthority();
+        try std.testing.expect(explicit.publicFallbackAfterRejection() == null);
     }
 }
 
