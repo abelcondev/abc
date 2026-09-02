@@ -155,7 +155,7 @@ test "host-managed credential lease exposes no secret or account metadata" {
     try std.testing.expect(lease.secret() == null);
     try std.testing.expect(lease.accountId() == null);
     try std.testing.expect(lease.tenant() == null);
-    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource());
+    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource().?);
 }
 
 /// Pure provider input used by request serializers and permission reviewers.

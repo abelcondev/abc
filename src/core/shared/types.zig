@@ -99,7 +99,7 @@ pub const CredentialSource = enum {
 
 pub const DirectCredentialLease = struct {
     secret_bytes: []const u8 = "",
-    source: CredentialSource = .ai_gateway_api_key,
+    source: ?CredentialSource = null,
     account_id: ?[]const u8 = null,
     tenant_context: ?[]const u8 = null,
 };
@@ -117,7 +117,7 @@ pub const CredentialLease = union(enum) {
         };
     }
 
-    pub fn credentialSource(self: CredentialLease) CredentialSource {
+    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
         return switch (self) {
             .direct => |direct| direct.source,
             .host_managed => .host_managed,
@@ -144,7 +144,13 @@ test "host-managed credential lease carries no local authority bytes" {
     try std.testing.expect(lease.secret() == null);
     try std.testing.expect(lease.accountId() == null);
     try std.testing.expect(lease.tenant() == null);
-    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource());
+    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
+}
+
+test "empty direct credential lease preserves absent authority" {
+    const lease = CredentialLease{ .direct = .{} };
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.credentialSource() == null);
 }
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {

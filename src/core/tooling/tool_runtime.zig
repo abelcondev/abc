@@ -6657,6 +6657,8 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
+        const credential_source = request.credential.credentialSource() orelse
+            return error.MissingCredentialSource;
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -6669,9 +6671,9 @@ const VisionGatewayFixture = struct {
                 .generation_id = response.generation_id orelse "gen_test",
                 .scope = "https://ai-gateway.vercel.sh",
                 .tenant = request.credential.tenant(),
-                .credential_source = request.credential.credentialSource(),
+                .credential_source = credential_source,
                 .credential_identity = credential_authority.derive(
-                    request.credential.credentialSource(),
+                    credential_source,
                     request.credential.accountId(),
                 ),
             } },

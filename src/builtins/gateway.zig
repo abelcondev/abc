@@ -596,7 +596,7 @@ fn gatewayUsageReference(
     completion: shared_types.ModelCompletion,
 ) ?agent_stream_provider_contract.DeferredUsageReference {
     const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource();
+    const source = request.credential.credentialSource() orelse return null;
     return .{
         .provider = .gateway,
         .generation_id = generation_id,

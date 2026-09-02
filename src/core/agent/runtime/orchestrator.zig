@@ -4015,7 +4015,7 @@ fn activeCredentialLease(
     if (job.credential_source == .host_managed) return .host_managed;
     return .{ .direct = .{
         .secret_bytes = secret_value,
-        .source = job.credential_source orelse .ai_gateway_api_key,
+        .source = job.credential_source,
         .account_id = job.account_id,
         .tenant_context = job.gateway_team,
     } };
