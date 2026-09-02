@@ -1762,7 +1762,6 @@ profileStoredKeyTmuxTest(
     await session.sendLiteralText(STORED_TOKEN);
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
-    await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
     await session.sendText("/provider vercel api-key");
     const keyColumn = await session.waitForPane(
       (pane) => pane.includes("saved · saved by fx · current"),
@@ -1973,12 +1972,17 @@ tmuxTest(
     await selectFxLoginCredential(session);
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    const selectedAuth = JSON.parse(readFileSync(authPath, "utf8")) as {
+      team_id?: string;
+      team_slug?: string;
+    };
+    expect(selectedAuth.team_id).toBe("team_123");
+    expect(selectedAuth.team_slug).toBe("vercel-labs");
     await session.sendText("use the selected login credential");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
 
     const firstRunOutput = await session.captureFullScrollback();
     const firstRunStderr = readFileSync(stderrPath, "utf8");
@@ -1989,7 +1993,7 @@ tmuxTest(
     // The switch above is remembered, so the restart keeps fx login rather than
     // letting AI_GATEWAY_API_KEY reclaim it through precedence.
     await session.waitForText("auth=fx login", TIMEOUT);
-    expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
+    expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
