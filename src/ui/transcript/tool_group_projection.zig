@@ -4,6 +4,7 @@ const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
+const tool_presentation = @import("../../core/tooling/tool_presentation.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -480,10 +481,16 @@ fn formatGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
 
-        const phrase = switch (entry) {
+        const raw_phrase = switch (entry) {
             .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
             else => null,
         } orelse if (detail) |record| record.tool_name else "tool activity";
+        const phrase = try reprojectTruncatedCommandPhrase(
+            scratch,
+            raw_phrase,
+            detail,
+            cols,
+        ) orelse raw_phrase;
         static_index += 1;
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
@@ -508,6 +515,33 @@ fn formatGroupBlock(
         terminal.deinit(scratch);
     }
     return out.toOwnedSlice();
+}
+
+fn reprojectTruncatedCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+    cols: u16,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (!record.isCapturedCommand() or record.outcome != .completed) return null;
+    const arguments_json = record.arguments_json orelse return null;
+    const action = "Ran";
+    const prefix = action ++ " ";
+    if (!std.mem.startsWith(u8, phrase, prefix) or
+        !std.mem.endsWith(u8, phrase, "...") or
+        std.mem.find(u8, phrase, "./") != null)
+    {
+        return null;
+    }
+    const detail_width = @as(usize, cols) -| action.len -| 2;
+    const command = (try tool_presentation.formatRunCommandDetailForWidth(
+        scratch,
+        arguments_json,
+        "",
+        detail_width,
+    )) orelse return null;
+    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
 fn formatExpandedChild(
@@ -1248,6 +1282,80 @@ test "minimal command details expose running completed and failed process states
             "└ Ran zig build test",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "minimal completed command rows reproject stored arguments at the current width" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = arguments_json,
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+
+    var narrow = try build(alloc, &entries, &details, 80);
+    defer narrow.deinit(alloc);
+    const narrow_row = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
+
+    var wide = try build(alloc, &entries, &details, 240);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        wide.entry_actions.items[0].override.bytes,
+    );
+
+    const legacy_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .completed,
+        },
+    };
+    var legacy = try build(alloc, &entries, &legacy_details, 240);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
+
+    const workspace_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran cd ./packages/cli && printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-...\n",
+            .class = .tool_status,
+        } },
+    };
+    var workspace = try build(alloc, &workspace_entries, &details, 240);
+    defer workspace.deinit(alloc);
+    try std.testing.expect(std.mem.find(
+        u8,
+        workspace.entry_actions.items[0].override.bytes,
+        "cd ./packages/cli",
+    ) != null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        workspace.entry_actions.items[0].override.bytes,
+        "...",
+    ));
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {

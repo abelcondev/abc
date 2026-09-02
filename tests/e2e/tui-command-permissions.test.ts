@@ -1283,6 +1283,47 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI reprojects completed command summaries after widening",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "command-summary-width-stderr.log");
+      const command =
+        "printf ok && printf '%s' alpha-beta-gamma-delta-epsilon-zeta-eta-theta-iota-kappa-lambda-mu-nu-xi-omicron-pi-rho-sigma-tau-upsilon-phi-chi-psi-omega >/dev/null";
+      const gateway = startFakeGateway([
+        toolCall(command, {}, "command_summary_width"),
+        finalText("COMMAND_SUMMARY_WIDTH_COMPLETE"),
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          FX_PERMISSION_MODE: "yolo",
+        }),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the prepared command.");
+      await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+
+      const narrow = await activeSession.captureFullScrollback();
+      const narrowRow = narrow.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      expect(narrowRow).toBeDefined();
+      expect(narrowRow).toEndWith("…");
+      expect(narrowRow).not.toContain("omega >/dev/null");
+
+      await activeSession.resizeWindow(240, 32);
+      const wide = await activeSession.captureFullScrollback();
+      const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      expect(wideRow).toBe(`└ Ran ${command}`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI user-profile printf keeps compact output hidden and Ctrl-O complete",
     async () => {
       const root = createIsolatedRoot();
