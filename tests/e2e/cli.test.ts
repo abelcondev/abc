@@ -68,20 +68,6 @@ function doctorSessionDiagnosticsLimit(): number {
 }
 
 const SEEDED_GATEWAY_TOKEN = "seeded-access-token";
-const OAUTH_KEYCHAIN_SERVICE = "FX_OAUTH_SESSION_V1";
-
-function commonCredential(home: string, source: string) {
-  const path = join(home, ".fx", "auth.json");
-  if (!existsSync(path)) return undefined;
-  const parsed = JSON.parse(readFileSync(path, "utf8"));
-  return parsed.version === 2 ? parsed.credentials?.[source] : parsed;
-}
-
-function fxLoginPresentAtPath(path: string): boolean {
-  if (!existsSync(path)) return false;
-  const parsed = JSON.parse(readFileSync(path, "utf8"));
-  return parsed.version === 2 ? parsed.credentials?.fx_login !== undefined : true;
-}
 
 function writeSeededFxAuth(
   home: string,
@@ -186,7 +172,7 @@ function startLogoutIssuer(
             typeof tokenTypeHint === "string" ? tokenTypeHint : "missing",
           validForm,
           ...(authPath
-            ? { localSessionPresent: fxLoginPresentAtPath(authPath) }
+            ? { localSessionPresent: existsSync(authPath) }
             : {}),
         });
         const configuredStatus = revokeStatuses[revokeAttempt] ?? 200;
@@ -1563,7 +1549,7 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(0);
         expect(logout.stdout).toBe("Signed out of fx.\n");
         expect(logout.stderr).toBe("");
-        expect(commonCredential(home, "fx_login")).toBeUndefined();
+        expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
           {
@@ -1619,7 +1605,7 @@ describe("cli: logout", () => {
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
-        expect(commonCredential(home, "fx_login")).toBeUndefined();
+        expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -1655,7 +1641,7 @@ describe("cli: logout", () => {
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
-        expect(commonCredential(home, "fx_login")).toBeUndefined();
+        expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
         ]);
@@ -1669,7 +1655,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout fails closed for a common auth document with unsafe permissions",
+    "fx logout removes a saved login rejected for unsafe permissions",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-rejected-login-"));
       const issuer = startLogoutIssuer([200, 200]);
@@ -1686,13 +1672,10 @@ describe("cli: logout", () => {
           },
         });
 
-        expect(logout.code).toBe(1);
-        expect(logout.stdout).toBe("");
-        expect(logout.stderr).toBe(
-          "fx logout: failed to durably remove saved fx login\n" +
-            "Warning: signed out locally, but the remote session could not be revoked.\n",
-        );
-        expect(existsSync(authPath)).toBe(true);
+        expect(logout.code).toBe(0);
+        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stderr).toBe("");
+        expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([]);
         for (const secret of [
           SEEDED_GATEWAY_TOKEN,
@@ -1719,8 +1702,7 @@ describe("cli: logout", () => {
       const authPath = join(fxDir, "auth.json");
       try {
         writeSeededFxAuth(home, undefined, issuer.issuerUrl);
-        rmSync(authPath);
-        mkdirSync(authPath, { mode: 0o700 });
+        chmodSync(fxDir, 0o500);
 
         const env = {
           ...NO_GATEWAY_AUTH,
@@ -1733,14 +1715,13 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(1);
         expect(logout.stdout).toBe("");
         expect(logout.stderr).toBe(
-          "fx logout: failed to durably remove saved fx login\n" +
-            "Warning: signed out locally, but the remote session could not be revoked.\n",
+          "fx logout: failed to durably remove saved fx login\n",
         );
         expect(existsSync(authPath)).toBe(true);
-        expect(JSON.parse(status.stdout).auth).toBe("missing");
+        expect(JSON.parse(status.stdout).auth).toBe("fx login");
         expect(issuer.requests).toEqual([]);
       } finally {
-        rmSync(authPath, { recursive: true, force: true });
+        chmodSync(fxDir, 0o700);
         issuer.stop();
         rmSync(home, { recursive: true, force: true });
       }
@@ -1771,7 +1752,7 @@ describe("cli: logout", () => {
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
-        expect(commonCredential(home, "fx_login")).toBeUndefined();
+        expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
           {
@@ -1864,7 +1845,7 @@ describe("cli: logout", () => {
   );
 
   test.skipIf(platform() !== "darwin")(
-    "fx logout preserves the macOS Keychain API key in the common store",
+    "fx logout leaves the macOS Keychain API key untouched",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
       const account = `fx-e2e-logout-${runId}`;
@@ -1904,8 +1885,9 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(0);
         expect(logout.stderr).toBe("");
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
-        expect(stored.status).not.toBe(0);
-        expect(JSON.parse(status.stdout).auth).toBe("stored API key (macOS Keychain)");
+        expect(stored.status).toBe(0);
+        expect(stored.stdout.trim()).toBe(keychainToken);
+        expect(JSON.parse(status.stdout).auth).not.toBe("fx login");
         expect(logout.stdout).not.toContain(keychainToken);
         expect(status.stdout).not.toContain(keychainToken);
       } finally {
@@ -1913,11 +1895,6 @@ describe("cli: logout", () => {
         spawnSync(
           "/usr/bin/security",
           ["delete-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE],
-          { encoding: "utf8" },
-        );
-        spawnSync(
-          "/usr/bin/security",
-          ["delete-generic-password", "-a", account, "-s", OAUTH_KEYCHAIN_SERVICE],
           { encoding: "utf8" },
         );
         rmSync(root, { recursive: true, force: true });
@@ -1990,7 +1967,6 @@ describe("cli: stored key file backend", () => {
       mkdirSync(fxDir, { recursive: true, mode: 0o700 });
       chmodSync(fxDir, 0o700);
       const keyPath = join(fxDir, "api-key");
-      const authPath = join(fxDir, "auth.json");
       writeFileSync(keyPath, "vca_file_backend_key", { mode: 0o600 });
       chmodSync(keyPath, 0o600);
       const env = { ...NO_GATEWAY_AUTH, HOME: realpathSync(home) };
@@ -2002,8 +1978,6 @@ describe("cli: stored key file backend", () => {
         expect(readableJson.auth).toBe("stored API key (profile file)");
         expect(readableJson.auth_help).toBeUndefined();
         expect(readable.stdout).not.toContain("vca_file_backend_key");
-        expect(existsSync(keyPath)).toBe(true);
-        expect(existsSync(authPath)).toBe(false);
 
         chmodSync(keyPath, 0o644);
         const refused = await runFx(["status", "--json"], { env });
@@ -2117,21 +2091,7 @@ describe("cli: Keychain authentication", () => {
           "Keychain ask complete",
         );
         expect(result.stdout).not.toContain(fakeKey);
-        expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
-        const legacy = spawnSync(
-          "/usr/bin/security",
-          ["find-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE, "-w"],
-          { encoding: "utf8", env: { ...process.env, HOME: realpathSync(home), USER: account } },
-        );
-        expect(legacy.status).not.toBe(0);
-        const status = await runFx(["status", "--json"], {
-          env: {
-            ...NO_GATEWAY_AUTH,
-            HOME: realpathSync(home),
-            USER: account,
-          },
-        });
-        expect(JSON.parse(status.stdout).auth).toBe("stored API key (macOS Keychain)");
+        expect(existsSync(join(home, ".fx"))).toBe(false);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.headers.get("authorization")).toBe(
           `Bearer ${fakeKey}`,
@@ -2146,17 +2106,6 @@ describe("cli: Keychain authentication", () => {
             account,
             "-s",
             KEYCHAIN_SERVICE,
-          ],
-          { encoding: "utf8" },
-        );
-        spawnSync(
-          "/usr/bin/security",
-          [
-            "delete-generic-password",
-            "-a",
-            account,
-            "-s",
-            OAUTH_KEYCHAIN_SERVICE,
           ],
           { encoding: "utf8" },
         );

@@ -383,7 +383,7 @@ pub fn logout() !chatgpt_session.DeleteOutcome {
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {
-    var session = (try chatgpt_session.loadStored(alloc)) orelse return false;
+    var session = (try chatgpt_session.load(alloc)) orelse return false;
     defer session.deinit(alloc);
     return true;
 }
@@ -394,7 +394,7 @@ pub fn loadAccess(
     mode: RefreshMode,
 ) !?Access {
     if (mode == .stored) {
-        var session = (try chatgpt_session.loadStored(alloc)) orelse return null;
+        var session = (try chatgpt_session.load(alloc)) orelse return null;
         defer session.deinit(alloc);
         return takeAccess(&session);
     }
@@ -439,15 +439,13 @@ fn refreshSession(
     defer token.deinit(alloc);
 
     const account_id = try extractAccountId(alloc, token.access_token);
-    var account_id_owned = true;
-    errdefer if (account_id_owned) alloc.free(account_id);
+    errdefer alloc.free(account_id);
     if (!std.mem.eql(u8, account_id, session.account_id)) {
         return error.ChatGptAccountChanged;
     }
     const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
-    var refresh_token_owned = true;
-    errdefer if (refresh_token_owned) secret.zeroAndFree(alloc, refresh_token);
     if (token.refresh_token != null) token.refresh_token = null;
+    errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_at_ms = if (token.expires_in) |expires_in| blk: {
         const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
             return error.InvalidChatGptOAuthResponse;
@@ -461,8 +459,6 @@ fn refreshSession(
         .account_id = account_id,
     };
     token.access_token = &.{};
-    account_id_owned = false;
-    refresh_token_owned = false;
     errdefer replacement.deinit(alloc);
     try mutation.save(alloc, replacement);
 

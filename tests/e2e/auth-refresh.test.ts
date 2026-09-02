@@ -202,10 +202,7 @@ test(
       ).toBe(0);
       expect(logoutResult.stdout).toBe("Signed out of fx.\n");
       expect(tokenRequestCount).toBe(1);
-      const afterLogout = JSON.parse(
-        readFileSync(join(home, ".fx", "auth.json"), "utf8"),
-      );
-      expect(afterLogout.credentials.fx_login).toBeUndefined();
+      expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
       const revocations = oauth.requests.filter(
         (request) => request.path === "/oauth/revoke",
       );
@@ -286,9 +283,7 @@ test(
       const persisted = JSON.parse(
         readFileSync(join(home, ".fx", "auth.json"), "utf8"),
       );
-      expect(persisted.credentials.fx_login.session.access_token).toBe(
-        RETRY_REFRESH_TOKEN,
-      );
+      expect(persisted.access_token).toBe(RETRY_REFRESH_TOKEN);
       expect(result.stdout).not.toContain(EXPIRED_REFRESH_TOKEN);
       expect(result.stdout).not.toContain(RETRY_REFRESH_TOKEN);
       expect(result.stderr).not.toContain(EXPIRED_REFRESH_TOKEN);
@@ -579,7 +574,7 @@ test(
       const persisted = JSON.parse(
         readFileSync(join(home, ".fx", "auth.json"), "utf8"),
       );
-      expect(persisted.credentials.fx_login.session).toMatchObject({
+      expect(persisted).toMatchObject({
         issuer: issuerA.issuerUrl,
         access_token: ISSUER_A_ACCESS_TOKEN,
         refresh_token: "rotated-refresh-token",

@@ -102,10 +102,6 @@ pub const SecretStore = struct {
         ?*anyopaque,
         std.mem.Allocator,
     ) SecretStoreLoadError!?[]u8,
-    load_stored_fn: ?*const fn (
-        ?*anyopaque,
-        std.mem.Allocator,
-    ) SecretStoreLoadError!?[]u8 = null,
     store_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
@@ -132,15 +128,6 @@ pub const SecretStore = struct {
         alloc: std.mem.Allocator,
     ) SecretStoreLoadError!?[]u8 {
         return self.load_fn(self.context, alloc);
-    }
-
-    pub fn loadStored(
-        self: SecretStore,
-        alloc: std.mem.Allocator,
-    ) SecretStoreLoadError!?[]u8 {
-        // Hosts with migration-sensitive storage provide a read-only path.
-        const load_stored = self.load_stored_fn orelse self.load_fn;
-        return load_stored(self.context, alloc);
     }
 
     /// Borrows `value` for this call. The caller retains ownership.
@@ -397,7 +384,6 @@ test "unavailable URL opener keeps the manual fallback available" {
 test "unavailable secret store reports absence and refuses writes" {
     try std.testing.expect(!unavailable_secret_store.isDisabled());
     try std.testing.expect((try unavailable_secret_store.load(std.testing.allocator)) == null);
-    try std.testing.expect((try unavailable_secret_store.loadStored(std.testing.allocator)) == null);
     try std.testing.expectError(
         error.StoredKeyWriteFailed,
         unavailable_secret_store.store(std.testing.allocator, "secret"),

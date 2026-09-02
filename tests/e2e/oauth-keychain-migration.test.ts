@@ -221,8 +221,14 @@ keychainTest(
       const first = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
       expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
       expect(JSON.parse(first.stdout).auth).toBe("fx login");
-      expect(existsSync(join(home, ".fx", "auth.json"))).toBe(true);
-      expect(loadKeychainItem(account, home)).toBeNull();
+      expect(
+        existsSync(join(home, ".fx", "auth.json")),
+        readFileSync(join(home, "oauth-keychain-trace.log"), "utf8"),
+      ).toBe(false);
+
+      const stored = loadKeychainItem(account, home);
+      expect(stored).not.toBeNull();
+      expect(JSON.parse(stored!).access_token).toBe(`keychain-access-${account}`);
 
       const refreshed = await runFx(
         ["ask", "--json", "--no-save", "Refresh the saved login."],
@@ -235,17 +241,10 @@ keychainTest(
       expect(JSON.parse(refreshed.stdout).output).toContain(
         "Keychain refresh complete",
       );
-      expect(
-        existsSync(join(home, ".fx", "auth.json")),
-        readFileSync(join(home, "oauth-keychain-trace.log"), "utf8"),
-      ).toBe(false);
-
-      const stored = loadKeychainItem(account, home);
-      expect(stored).not.toBeNull();
-      expect(JSON.parse(stored!).credentials.fx_login.session.access_token).toBe(
+      expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+      expect(JSON.parse(loadKeychainItem(account, home)!).access_token).toBe(
         "keychain-refreshed-access",
       );
-      expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
       expect(
         issuer.requests.filter((request) => request.path === "/oauth/token"),
       ).toHaveLength(1);
@@ -259,7 +258,7 @@ keychainTest(
       const logout = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
       expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
       expect(logout.stdout).toBe("Signed out of fx.\n");
-      expect(JSON.parse(loadKeychainItem(account, home)!).credentials.fx_login).toBeUndefined();
+      expect(loadKeychainItem(account, home)).toBeNull();
       expect(issuer.requests.filter((request) => request.path === "/oauth/revoke")).toHaveLength(2);
     } finally {
       cleanup();
@@ -282,7 +281,6 @@ keychainTest(
     const home = mkdtempSync(join(tmpdir(), "fx-oauth-keychain-failure-"));
     attachSystemKeychain(home);
     const issuer = startOAuthIssuer();
-    const gateway = startFakeGateway([fakeGatewayFinalText("migration complete")]);
     const cleanup = () => deleteKeychainItem(account);
     activeCleanups.add(cleanup);
     cleanup();
@@ -290,13 +288,8 @@ keychainTest(
 
     let injectedFailureObserved = false;
     try {
-      const status = await runFx(["ask", "--json", "--no-save", "Migrate auth."], {
-        env: {
-          ...keychainEnv(home, account, issuer.issuer),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
-        },
+      const status = await runFx(["status", "--json"], {
+        env: keychainEnv(home, account, issuer.issuer),
         timeoutMs: TIMEOUT,
       });
       expect(status.code).toBe(0);
@@ -308,7 +301,6 @@ keychainTest(
     } finally {
       cleanup();
       activeCleanups.delete(cleanup);
-      gateway.stop();
       issuer.stop();
     }
 
