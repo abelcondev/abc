@@ -517,6 +517,22 @@ fn formatGroupBlock(
     return out.toOwnedSlice();
 }
 
+fn actionForTruncatedCommandPhrase(
+    phrase: []const u8,
+    command: []const u8,
+) ?[]const u8 {
+    const marker = "...";
+    if (!std.mem.endsWith(u8, phrase, marker)) return null;
+    const truncated = phrase[0 .. phrase.len - marker.len];
+    for (truncated, 0..) |byte, index| {
+        if (byte != ' ' or index == 0 or index + 1 == truncated.len) continue;
+        if (std.mem.startsWith(u8, command, truncated[index + 1 ..])) {
+            return truncated[0..index];
+        }
+    }
+    return null;
+}
+
 fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
@@ -526,20 +542,13 @@ fn reprojectTruncatedCommandPhrase(
     const record = detail orelse return null;
     if (!record.isCapturedCommand() or record.outcome != .completed) return null;
     const arguments_json = record.arguments_json orelse return null;
-    const action = "Ran";
-    const prefix = action ++ " ";
-    if (!std.mem.startsWith(u8, phrase, prefix) or
-        !std.mem.endsWith(u8, phrase, "..."))
-    {
-        return null;
-    }
-    const detail_width = @as(usize, cols) -| action.len -| 2;
     const command = (try tool_presentation.formatRunCommandDetailForWidth(
         scratch,
         arguments_json,
         "",
-        detail_width,
+        cols,
     )) orelse return null;
+    const action = actionForTruncatedCommandPhrase(phrase, command) orelse return null;
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
@@ -1366,6 +1375,20 @@ test "minimal completed command rows reproject stored arguments at the current w
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
         relative.entry_actions.items[0].override.bytes,
+    );
+
+    const compatibility_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Installed skill printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\n",
+            .class = .tool_status,
+        } },
+    };
+    var compatibility = try build(alloc, &compatibility_entries, &details, 240);
+    defer compatibility.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        compatibility.entry_actions.items[0].override.bytes,
     );
 }
 
