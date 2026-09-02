@@ -4110,7 +4110,7 @@ tmuxTest(
     const failed = await session.waitForPane(
       (pane) =>
         pane.includes("AI_GATEWAY_API_KEY authentication failed · HTTP 401") &&
-        pane.includes("Run /provider to choose another source."),
+        pane.includes("Run /provider to repair this source."),
       TIMEOUT,
     );
 
