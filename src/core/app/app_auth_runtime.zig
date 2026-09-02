@@ -128,7 +128,7 @@ pub fn Runtime(comptime App: type) type {
                 try beginSignIn(app, false);
                 return;
             }
-            try beginProviderPickerInventoryRefresh(app, picker_state.login_prefix);
+            try beginProviderPickerInventoryRefresh(app, .provider_picker_login);
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
@@ -237,7 +237,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try beginProviderPickerInventoryRefresh(app, picker_state.provider_prefix);
+            try beginProviderPickerInventoryRefresh(app, .provider_picker_command);
         }
 
         pub fn openSetupHub(app: *App) !void {
@@ -266,19 +266,15 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn beginProviderPickerInventoryRefresh(app: *App, prefix: []const u8) !void {
+        fn beginProviderPickerInventoryRefresh(
+            app: *App,
+            destination: auth_runtime.InventoryRefreshDestination,
+        ) !void {
             switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
                 .provider = provider_runtime.provider(app),
-                .destination = .provider_picker,
+                .destination = destination,
             })) {
-                .started => {
-                    if (comptime @hasField(App, "input_runtime")) {
-                        // Preserve the command spelling while the inventory worker runs.
-                        // Completion only reveals the inline picker after refreshed facts land.
-                        try app.input_runtime.textReplacementState().replace(app.alloc, prefix);
-                        app.input_runtime.picker.dismissInlinePicker(.provider);
-                    }
-                },
+                .started => {},
                 .busy => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
@@ -298,9 +294,15 @@ pub fn Runtime(comptime App: type) type {
                 .ready => |action| {
                     switch (action.destination) {
                         .auth_picker => app.auth.openPickerForProvider(app.alloc, action.provider),
-                        .provider_picker => if (comptime @hasField(App, "input_runtime")) {
+                        .provider_picker_login, .provider_picker_command => if (comptime @hasField(App, "input_runtime")) {
                             app.input_runtime.picker.clearProviderPickerFlow();
                             app.input_runtime.picker.resetInlinePickerEpisode();
+                            const prefix = switch (action.destination) {
+                                .provider_picker_login => picker_state.login_prefix,
+                                .provider_picker_command => picker_state.provider_prefix,
+                                .auth_picker => unreachable,
+                            };
+                            try app.input_runtime.textReplacementState().replace(app.alloc, prefix);
                         },
                     }
                     app.shell.render_requests.request(.footer);

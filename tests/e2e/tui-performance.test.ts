@@ -826,22 +826,17 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
-        session.sendKeysImmediate(["C-u"]);
+        await session.sendKeys("C-u");
         await session.waitForComposer(TIMEOUT);
-        await session.sendLiteralText("/login");
         const open = await measureAction(
           fixture.tapePath,
-          () => session!.sendKeysImmediate(["Enter"]),
+          () => session!.sendLiteralImmediate("/login "),
           () => session!.waitForPane(
             (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
             TIMEOUT,
           ),
           "vercel",
         );
-        session.sendKeysImmediate(["Escape"]);
-        await session.waitForComposer(TIMEOUT);
-        session.sendKeysImmediate(["C-u"]);
-        await session.waitForComposer(TIMEOUT);
         if (cycle >= WARMUPS) appendMeasured(samples.loginOpen, open);
       }
 
@@ -1113,7 +1108,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
 
       session.sendKeysImmediate(["C-u"]);
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/login");
+      await session.sendLiteralText("/login ");
       await session.waitForPane(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
         TIMEOUT,

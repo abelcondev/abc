@@ -495,7 +495,8 @@ const ApiKeySaveRuntime = struct {
 
 pub const InventoryRefreshDestination = enum {
     auth_picker,
-    provider_picker,
+    provider_picker_login,
+    provider_picker_command,
 };
 
 pub const InventoryRefreshAction = struct {
