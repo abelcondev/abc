@@ -4164,10 +4164,7 @@ tmuxTest(
 
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
-    await openSwitchCredential(session);
-    await session.sendKeys("Up");
-    await session.sendKeys("Enter");
-    await session.waitForText("Switched credential to AI_GATEWAY_API_KEY", TIMEOUT);
+    await selectEnvKeyCredential(session);
     await session.waitForComposer(TIMEOUT);
     await session.sendLiteral(`${promptHead}${promptTail}`);
     await session.sendKeys("Enter");
