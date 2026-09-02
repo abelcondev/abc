@@ -19,6 +19,7 @@ const StoreError = host.SecretStoreWriteError;
 pub const provider: host.SecretStore = .{
     .backend_label = backend_label,
     .is_disabled_fn = isDisabledCallback,
+    .presence_fn = presenceCallback,
     .load_fn = loadCallback,
     .load_stored_fn = loadStoredCallback,
     .store_fn = storeCallback,
@@ -81,6 +82,11 @@ fn storeInteractive() StoreError!bool {
 
 fn isDisabledCallback(_: ?*anyopaque) bool {
     return isDisabled();
+}
+
+fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
+    if (isDisabled()) return .missing;
+    return native_auth_store.entry_presence(.stored_key);
 }
 
 fn loadCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {

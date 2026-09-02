@@ -47,7 +47,6 @@ TRAINING_E2E_TESTS = (
     "tui-resume-brutal.test.ts",
     "tui-permissions.test.ts",
     "tui-interrupt-recovery.test.ts",
-    "tui-subagent-manager.test.ts",
     "tui-terminal-tool.test.ts",
     "tui-native-clear-recovery.test.ts",
     "tui-gateway-stream-lifecycle.test.ts",
@@ -82,6 +81,7 @@ EXCLUDED_E2E_TESTS = (
     "tui-command-permissions.test.ts",
     "tui-direct-write-audit.test.ts",
     "tui-keybindings.test.ts",
+    "tui-performance.test.ts",
     "tui-render-lab.test.ts",
     "tui-render-live-stress.test.ts",
     "web-fetch-live.test.ts",
@@ -112,7 +112,6 @@ class PgsoCorpusTests(unittest.TestCase):
             ("direct-help", ("help",)),
             ("direct-version", ("--version",)),
             ("direct-status", ("status", "--json")),
-            ("direct-background", ("background", "--json")),
             ("direct-doctor", ("doctor", "--json")),
             ("direct-sessions", ("sessions", "--json")),
         )
@@ -176,12 +175,12 @@ class PgsoCorpusTests(unittest.TestCase):
 
         corpus = load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-        self.assertEqual(6, len(corpus.scenarios))
+        self.assertEqual(5, len(corpus.scenarios))
         self.assertEqual(
             ("e2e-new-feature",),
             tuple(scenario.name for scenario in corpus.verification_scenarios),
         )
-        self.assertEqual(7, len(corpus.candidate_scenarios))
+        self.assertEqual(6, len(corpus.candidate_scenarios))
 
     def test_load_rejects_duplicate_test_files_across_phases(self) -> None:
         test_file = "shared.test.ts"
@@ -365,8 +364,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(54, len(corpus.candidate_scenarios))
+        self.assertEqual(35, len(corpus.scenarios))
+        self.assertEqual(52, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

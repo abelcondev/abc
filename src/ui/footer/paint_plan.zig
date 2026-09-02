@@ -1004,9 +1004,6 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
                 }
-            } else {
-                var status_row = try picker_presentation.composePickerStatusRow(alloc, .slash, ctx.model_picker_stage, false, false, input.picker_start_col, shell.layout.cols);
-                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
             }
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
@@ -1300,11 +1297,6 @@ fn testContext(input: *const InputRuntime) render_input.RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -2091,11 +2083,6 @@ test "footer paint plan keeps cursor visible during transient activity when inpu
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2127,7 +2114,7 @@ test "approval footer composition hides cursor while rendering command prompt" {
 
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
-    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "terminal.exec echo permission test" }));
+    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "shell.run echo permission test" }));
 
     var shell = TranscriptRuntime{
         .layout = .{
@@ -2151,11 +2138,6 @@ test "approval footer composition hides cursor while rendering command prompt" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
     const request = approval.request.?.view();
@@ -2252,11 +2234,6 @@ test "footer paint plan keeps compact transient activity adjacent to footer" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
     const selection: ViewportSelection = .{
@@ -2332,11 +2309,6 @@ test "footer paint plan owns reserved idle gap row without invalidation" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2388,11 +2360,6 @@ test "footer paint plan uses transcript preview for idle reservation" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2470,11 +2437,6 @@ test "footer paint plan keeps active tool in the transient band" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = status_id,
             .fallback_label = "running read-only tools",
@@ -2539,11 +2501,6 @@ test "footer paint plan suppresses transient activity when footer clamps into it
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 

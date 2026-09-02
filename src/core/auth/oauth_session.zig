@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_auth_store = if (host_target.is_wasm) struct {} else @import("../hosts/native_auth_store.zig");
 const io_mod = @import("../shared/io.zig");
@@ -14,6 +15,16 @@ pub const default_client_id = "cl_zzh5hiOZbwJ9bfqEcYqPIJv3TaPaEYL0";
 const e2e_issuer_url_env = "FX_E2E_OAUTH_ISSUER_URL";
 const schema_version: i64 = 1;
 const expiry_skew_ms: i64 = 60 * 1000;
+pub fn presence() host_contract.SecretStorePresence {
+    if (comptime host_target.is_wasm) {
+        const alloc = std.heap.c_allocator;
+        var stored = (js_host_auth.oauth_session_store.load(alloc) catch return .unavailable) orelse
+            return .missing;
+        defer stored.deinit(alloc);
+        return .present;
+    }
+    return native_auth_store.entry_presence(.fx_login);
+}
 
 pub fn refresh_deadline_ms(expires_at_ms: i64) i64 {
     return expires_at_ms -| expiry_skew_ms;

@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const chatgpt_session = @import("chatgpt_session.zig");
 const grok_oauth = @import("grok_oauth.zig");
+const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -9,6 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -28,52 +31,13 @@ pub fn parseAuthMode(value: ?[]const u8) AuthModeError!AuthMode {
     return error.InvalidAuthMode;
 }
 
-pub const DirectRequestAuth = struct {
-    secret_bytes: []const u8,
-    source: Source = .ai_gateway_api_key,
-    account_id: ?[]const u8 = null,
-    tenant_context: ?[]const u8 = null,
-};
-
-/// Borrowed authorization decision for one provider request. Host-managed
-/// requests deliberately carry no local credential or account metadata.
-pub const RequestAuth = union(enum) {
-    direct: DirectRequestAuth,
-    host_managed,
-
-    pub fn secret(self: RequestAuth) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| direct.secret_bytes,
-            .host_managed => null,
-        };
-    }
-
-    pub fn credentialSource(self: RequestAuth) Source {
-        return switch (self) {
-            .direct => |direct| direct.source,
-            .host_managed => .host_managed,
-        };
-    }
-
-    pub fn accountId(self: RequestAuth) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| direct.account_id,
-            .host_managed => null,
-        };
-    }
-
-    pub fn tenant(self: RequestAuth) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| direct.tenant_context,
-            .host_managed => null,
-        };
-    }
-};
+pub const RequestAuth = types.CredentialLease;
 
 pub const CatalogPublicOnly = union(enum) {
     no_credential,
     fx_login_team_required,
     fx_login_refresh_required,
+    credential_refresh_required: Source,
     credential_refresh_failed: Source,
     authenticated_credential_rejected: Source,
     chatgpt_subscription,
@@ -83,6 +47,7 @@ pub const CatalogPublicOnly = union(enum) {
         return switch (self) {
             .no_credential => null,
             .fx_login_team_required, .fx_login_refresh_required => .fx_login,
+            .credential_refresh_required => |source| source,
             .credential_refresh_failed => |source| source,
             .authenticated_credential_rejected => |source| source,
             .chatgpt_subscription => .chatgpt_subscription,
@@ -192,6 +157,9 @@ pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     const selected = credential orelse return .{ .public_only = .no_credential };
     if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .fx_login_refresh_required };
+    }
+    if (sourceRefreshable(selected.source) and selected.needsRefreshAt(now_ms)) {
+        return .{ .public_only = .{ .credential_refresh_required = selected.source } };
     }
     return catalogAccessForCredentialAndAccount(
         selected.source,
@@ -309,6 +277,25 @@ pub const Credential = struct {
     team_slug: ?[]u8 = null,
     refresh_after_ms: ?i64 = null,
 
+    pub fn clone(self: Credential, alloc: std.mem.Allocator) !Credential {
+        const token = try alloc.dupe(u8, self.token);
+        errdefer secret.zeroAndFree(alloc, token);
+        const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const team_id = if (self.team_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (team_id) |value| alloc.free(value);
+        const team_slug = if (self.team_slug) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (team_slug) |value| alloc.free(value);
+        return .{
+            .token = token,
+            .source = self.source,
+            .account_id = account_id,
+            .team_id = team_id,
+            .team_slug = team_slug,
+            .refresh_after_ms = self.refresh_after_ms,
+        };
+    }
+
     pub fn deinit(self: *Credential, alloc: std.mem.Allocator) void {
         secret.zeroAndFree(alloc, self.token);
         if (self.account_id) |account_id| alloc.free(account_id);
@@ -399,10 +386,10 @@ pub fn resolveForProvider(
     );
 }
 
-/// `preferred` is the source the user last chose in the hub. It wins over the
-/// precedence order below, including over the environment, because it is an
-/// explicit choice rather than a default. A preferred source that no longer
-/// resolves falls through to precedence instead of failing.
+/// `preferred` is the source the user last chose in the hub. It is an exact
+/// authority choice, not a precedence hint: absence or refresh failure must not
+/// silently select a different billing, account, or team boundary. Only null
+/// runs automatic precedence.
 pub fn resolvePreferring(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -411,15 +398,19 @@ pub fn resolvePreferring(
     preferred: ?Source,
 ) !Resolution {
     if (preferred) |source| {
-        if (source != .stored_key or !secret_store.isDisabled()) {
-            const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
-                if (err == error.OutOfMemory) return err;
-                debug_trace.logf("auth", "preferred source load failed source={t} err={s}", .{ source, @errorName(err) });
-                break :blk null;
-            };
-            if (chosen) |credential| return .{ .credential = credential };
-            debug_trace.logf("auth", "preferred source unavailable source={t}; using precedence", .{source});
+        if (source == .stored_key and secret_store.isDisabled()) {
+            debug_trace.logf("auth", "explicit source unavailable source={t} reason=disabled", .{source});
+            return .{};
         }
+
+        const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "explicit source load failed source={t} err={s}", .{ source, @errorName(err) });
+            return unavailableExplicitResolution(source);
+        };
+        if (chosen) |credential| return .{ .credential = credential };
+        debug_trace.logf("auth", "explicit source unavailable source={t}", .{source});
+        return missingExplicitResolution(source);
     }
 
     if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return .{ .credential = credential };
@@ -449,6 +440,22 @@ pub fn resolvePreferring(
     };
     if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
     return .{ .stored_key_status = status, .fx_login_status = fx_login_status };
+}
+
+fn missingExplicitResolution(source: Source) Resolution {
+    return switch (source) {
+        .fx_login => .{ .fx_login_status = .absent },
+        .stored_key => .{ .stored_key_status = .not_found },
+        else => .{},
+    };
+}
+
+fn unavailableExplicitResolution(source: Source) Resolution {
+    return switch (source) {
+        .fx_login => .{ .fx_login_status = .unavailable },
+        .stored_key => .{ .stored_key_status = .unavailable },
+        else => .{},
+    };
 }
 
 fn loadFxLoginForPrecedence(
@@ -531,18 +538,44 @@ pub fn sourceExists(
         .grok_subscription => grok_oauth.sourceExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
-            const stored = secret_store.loadStored(alloc) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    debug_trace.logf("auth", "source probe failed source=stored_key err={s}", .{@errorName(err)});
-                    break :blk false;
+            break :blk switch (secret_store.presence()) {
+                .present => true,
+                .missing => false,
+                .unavailable => {
+                    debug_trace.logf(
+                        "auth",
+                        "source probe failed source=stored_key err=StoredKeyUnreadable",
+                        .{},
+                    );
+                    return error.StoredKeyUnreadable;
                 },
             };
-            const value = stored orelse break :blk false;
-            secret.zeroAndFree(alloc, value);
-            break :blk true;
         },
         .host_managed => false,
+    };
+}
+
+pub fn sourcePresence(
+    secret_store: host.SecretStore,
+    source: Source,
+) host.SecretStorePresence {
+    return switch (source) {
+        .vercel_oidc_token => if (nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null)
+            .present
+        else
+            .missing,
+        .ai_gateway_api_key => if (nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null)
+            .present
+        else
+            .missing,
+        .fx_login => oauth_session.presence(),
+        .stored_key => if (secret_store.isDisabled())
+            .missing
+        else
+            secret_store.presence(),
+        .chatgpt_subscription => chatgpt_session.presence(),
+        .grok_subscription => grok_session.presence(),
+        .host_managed => .missing,
     };
 }
 
@@ -877,6 +910,27 @@ test "fx login catalog access requires a fresh credential and selected team" {
     try std.testing.expect(missing_team.teamContext() == null);
 }
 
+test "subscription catalog access never sends refresh-due credentials" {
+    for ([_]Source{ .chatgpt_subscription, .grok_subscription }) |source| {
+        var credential = Credential{
+            .token = try std.testing.allocator.dupe(u8, "expired-subscription-token"),
+            .source = source,
+            .account_id = try std.testing.allocator.dupe(u8, "acct_123"),
+            .refresh_after_ms = 10,
+        };
+        defer credential.deinit(std.testing.allocator);
+
+        const access = catalogAccessAt(credential, 10);
+        try std.testing.expectEqual(
+            CatalogPublicOnlyReason.credential_refresh_required,
+            access.publicOnlyReason().?,
+        );
+        try std.testing.expectEqual(source, access.credentialSource().?);
+        try std.testing.expect(access.authorizationCredential() == null);
+        try std.testing.expect(access.accountId() == null);
+    }
+}
+
 test "authenticated catalog access carries source and permitted request context" {
     for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
         var credential = Credential{
@@ -905,6 +959,29 @@ test "fresh short-lived credential remains ready for its admitted action" {
     try std.testing.expectEqual(@as(i64, 70_000), credentialRefreshAfterMs(130_000, null));
     try std.testing.expectEqual(@as(i64, 130_000), credentialRefreshAfterMs(130_000, 100_000));
     try std.testing.expectEqual(@as(i64, 140_000), credentialRefreshAfterMs(200_000, 100_000));
+}
+
+test "credential clone owns every secret and authority field independently" {
+    const alloc = std.testing.allocator;
+    var original = Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .account_id = try alloc.dupe(u8, "acct_1"),
+        .team_id = try alloc.dupe(u8, "team_1"),
+        .team_slug = try alloc.dupe(u8, "team-one"),
+        .refresh_after_ms = 100,
+    };
+    defer original.deinit(alloc);
+    var cloned = try original.clone(alloc);
+    defer cloned.deinit(alloc);
+
+    try std.testing.expectEqualStrings(original.token, cloned.token);
+    try std.testing.expect(original.token.ptr != cloned.token.ptr);
+    try std.testing.expectEqualStrings(original.account_id.?, cloned.account_id.?);
+    try std.testing.expect(original.account_id.?.ptr != cloned.account_id.?.ptr);
+    try std.testing.expectEqualStrings(original.team_id.?, cloned.team_id.?);
+    try std.testing.expectEqualStrings(original.team_slug.?, cloned.team_slug.?);
+    try std.testing.expectEqual(original.refresh_after_ms, cloned.refresh_after_ms);
 }
 
 var stable_credential_test_environ: ?*std.process.Environ.Map = null;
@@ -955,12 +1032,14 @@ const SecretStoreFixture = struct {
     unreadable: bool = false,
     load_calls: usize = 0,
     stored_load_calls: usize = 0,
+    presence_calls: usize = 0,
 
     fn provider(self: *@This()) host.SecretStore {
         return .{
             .context = self,
             .backend_label = "test credential store",
             .is_disabled_fn = isDisabled,
+            .presence_fn = presence,
             .load_fn = load,
             .load_stored_fn = loadStored,
             .store_fn = store,
@@ -971,6 +1050,13 @@ const SecretStoreFixture = struct {
     fn isDisabled(raw_context: ?*anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         return self.disabled;
+    }
+
+    fn presence(raw_context: ?*anyopaque) host.SecretStorePresence {
+        const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+        self.presence_calls += 1;
+        if (self.unreadable) return .unavailable;
+        return if (self.value == null) .missing else .present;
     }
 
     fn load(
@@ -1073,18 +1159,18 @@ test "a remembered fx login never refreshes in stored mode" {
     try std.testing.expect((try loadPreferredSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .vercel_oidc_token)) == null);
 }
 
-test "a remembered choice that no longer resolves falls back to precedence" {
+test "a remembered choice that no longer resolves never crosses to precedence" {
     const alloc = std.testing.allocator;
     const env = try CredentialTestEnv.install(alloc, &.{
         .{ "AI_GATEWAY_API_KEY", "api-key" },
     });
     defer env.deinit();
 
-    // fx_login is remembered but no session exists, so precedence must still answer.
-    const resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .fx_login);
-    var credential = resolution.credential orelse return error.TestExpectedCredential;
-    defer credential.deinit(alloc);
-    try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
+    // fx_login is an explicit authority choice. Its absence must not authorize
+    // an environment key from a different billing or team boundary.
+    var resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .fx_login);
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expect(resolution.credential == null);
 }
 
 test "no remembered choice resolves exactly as plain precedence" {
@@ -1139,6 +1225,63 @@ test "credential resolution loads a stored key only through the injected host po
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
     try std.testing.expectEqual(Source.stored_key, resolution.credential.?.source);
     try std.testing.expectEqualStrings("injected-test-value", resolution.credential.?.token);
+}
+
+test "stored key existence never loads secret bytes" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{});
+    defer env.deinit();
+    var store_fixture = SecretStoreFixture{ .value = "presence-only-secret" };
+
+    try std.testing.expect(try sourceExists(
+        alloc,
+        store_fixture.provider(),
+        .stored_key,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 1), store_fixture.presence_calls);
+}
+
+test "credential source presence reads common slot metadata without validating session secrets" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+    const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+    defer env.deinit();
+
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/auth.json", .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(
+        io_mod.getIo(),
+        "{\"version\":2,\"credentials\":{" ++
+            "\"fx_login\":{\"session\":{\"version\":1}}," ++
+            "\"chatgpt_subscription\":{\"session\":{\"version\":1}}," ++
+            "\"grok_subscription\":{\"session\":{\"version\":1}}}}",
+    );
+
+    const sources = [_]Source{ .fx_login, .chatgpt_subscription, .grok_subscription };
+    for (sources) |source| {
+        try std.testing.expectEqual(
+            host.SecretStorePresence.present,
+            sourcePresence(host.unavailable_secret_store, source),
+        );
+    }
+    try file.setPermissions(
+        io_mod.getIo(),
+        std.Io.File.Permissions.fromMode(0o644),
+    );
+    for (sources) |source| {
+        try std.testing.expectEqual(
+            host.SecretStorePresence.unavailable,
+            sourcePresence(host.unavailable_secret_store, source),
+        );
+    }
 }
 
 test "credential resolution preserves unreadable store classification" {

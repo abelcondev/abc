@@ -417,7 +417,7 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
             .pending_assistant = pending,
             .target_call_id = "call_1",
             .origin = .root,
-            .current_root_request = "User asked to inspect the repository.",
+            .trusted_root_context = "User asked to inspect the repository.",
         },
         .targets = &.{},
         .action = .{ .tool = .{
@@ -445,7 +445,7 @@ test "gateway automatic reviewer transport is single-attempt" {
 
     switch (outcome) {
         .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
-        .invalid => return error.TestExpectedEqual,
+        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);

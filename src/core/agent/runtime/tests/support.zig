@@ -6,7 +6,6 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
-const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -38,6 +37,7 @@ else
 const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
+const runtime_agent = @import("../agent.zig");
 const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
@@ -70,12 +70,10 @@ pub const VisionAgentToolRuntime = struct {
     execution_count: usize = 0,
     result_count: usize = 0,
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
 
     pub fn deinit(self: *VisionAgentToolRuntime) void {
         self.worker.deinit(self.alloc);
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
     }
 
@@ -127,7 +125,6 @@ pub const VisionAgentToolRuntime = struct {
             .permission_grants = &.{},
             .permission_rules = .{},
             .worker = &self.worker,
-            .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
             .context_limits = .{ .image_adapter_output_bytes = .{
@@ -142,8 +139,6 @@ pub const VisionAgentToolRuntime = struct {
             },
             .output_chunk_ctx = undefined,
             .on_output_chunk = discardVisionToolOutput,
-            .background_url_ctx = undefined,
-            .on_background_url_ready = discardVisionBackgroundUrl,
         };
     }
 };
@@ -155,18 +150,15 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-fn discardVisionBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
-
 const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
     builtin_tools.write_file,
     builtin_tools.edit_file,
-    builtin_tools.memory,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
-    builtin_tools.terminal,
+    builtin_tools.shell,
     builtin_tools.capability_search,
     builtin_tools.skill,
     builtin_tools.install_skill,
@@ -178,15 +170,14 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
-    if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
-    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+    if (!std.mem.eql(u8, call.name, "shell")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"run\"") == null) {
         return .ordinary;
     }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .background = false,
             .target_os = builtin.os.tag,
         },
         .source = .interactive_once,
@@ -464,9 +455,11 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    if (review_turn.current_root_request.len > 0) {
-        try captured.appendSlice(alloc, review_turn.current_root_request);
-        try captured.append(alloc, '\n');
+    if (review_turn.trusted_root_context.len > 0) {
+        try captured.appendSlice(alloc, review_turn.trusted_root_context);
+        if (!std.mem.endsWith(u8, review_turn.trusted_root_context, "\n")) {
+            try captured.append(alloc, '\n');
+        }
     }
     return captured.toOwnedSlice(alloc);
 }
@@ -510,6 +503,8 @@ pub const FakeAgentRuntimeDeps = struct {
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
+    last_permission_credential: ?[]u8 = null,
+    last_execute_credential: ?[]u8 = null,
     last_execute_root_user_intent_context: ?[]u8 = null,
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
@@ -652,7 +647,7 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
-    last_credential_refresh_expected_account: ?[]const u8 = null,
+    last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -697,6 +692,8 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        if (self.last_execute_credential) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.last_execute_root_user_messages);
         freeGrantList(self.alloc, &self.propagated_grants);
@@ -722,6 +719,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
     }
@@ -842,7 +840,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
-        self.last_credential_refresh_expected_account = expected_account_id;
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
+        self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
+            try self.alloc.dupe(u8, account_id)
+        else
+            null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
@@ -1060,7 +1062,7 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
         try self.permission_review_root_authority_counts.append(
             self.alloc,
-            @intFromBool(review_turn.current_root_request.len > 0),
+            @intFromBool(review_turn.trusted_root_context.len > 0),
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
@@ -1069,6 +1071,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_pending_call_counts.append(
             self.alloc,
             review_turn.pending_assistant.tool_calls.len,
+        );
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        self.last_permission_credential = try self.alloc.dupe(
+            u8,
+            review_turn.credential.secret() orelse "",
         );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
@@ -1356,6 +1363,8 @@ pub const FakeAgentRuntimeDeps = struct {
             );
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
+            if (self.last_execute_credential) |value| self.alloc.free(value);
+            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret() orelse "");
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
             self.last_execute_root_user_intent_context = try self.alloc.dupe(
                 u8,
@@ -1530,11 +1539,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.history_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                 try self.record("history:assistant", .{});
             },
-            .background_command => |entry| {
-                if (self.background_history_log_path) |value| self.alloc.free(value);
-                self.background_history_log_path = try self.alloc.dupe(u8, entry.log_path);
-                try self.record("history:background", .{});
-            },
             .interrupted => |entry| {
                 self.interrupted_history_count += 1;
                 if (entry.tool_call) |tool_call| {
@@ -1575,10 +1579,6 @@ pub const FakeAgentRuntimeDeps = struct {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
-                    },
-                    .background_command => |entry| {
-                        if (self.background_event_log_path) |value| self.alloc.free(value);
-                        self.background_event_log_path = try self.alloc.dupe(u8, entry.log_path);
                     },
                     .interrupted => self.interrupted_event_count += 1,
                     .compacted_summary => {},
@@ -1932,7 +1932,11 @@ pub fn runFakePromptWithLifecycle(
             set_provider(delegate.ctx, deps.agent_stream_provider);
         }
     }
-    try runtime_orchestrator.processQueuedPrompt(
+    var agent: runtime_agent.Agent = .{};
+    defer agent.deinit(hooks.alloc);
+    try agent.restoreHistory(hooks.alloc, job.history);
+    try runtime_orchestrator.processAgentPrompt(
+        &agent,
         &deps,
         null,
         lifecycle,

@@ -209,6 +209,10 @@ fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !
                 try alloc.dupe(u8, account)
             else
                 try chatgpt_oauth.extractAccountId(alloc, direct.secret_bytes);
+            errdefer alloc.free(account_id);
+            if (!types.validCredentialAccountId(account_id)) {
+                return error.InvalidChatGptSubscriptionAccount;
+            }
             break :blk .{
                 .authorization = authorization,
                 .account_id = account_id,

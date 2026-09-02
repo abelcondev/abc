@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -211,7 +212,6 @@ const SnapshotFileOwnershipState = struct {
 fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
     return switch (turn) {
         .assistant => |value| value.user.images,
-        .background_command => |value| value.user.images,
         .interrupted => |value| value.user.images,
         .compacted_summary => &.{},
     };
@@ -524,6 +524,7 @@ pub const WorkerEvent = union(enum) {
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
     api_status_text: []u8,
+    credential_refreshed: credentials.Credential,
     command_output: CommandOutputChunk,
     command_output_complete: ?types.ToolLifecycleId,
     tool_lifecycle: types.ToolLifecycleEvent,
@@ -573,6 +574,7 @@ pub const WorkerRuntime = struct {
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
+    active_prompt_is_root_authority: bool = false,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
 
@@ -1221,6 +1223,21 @@ pub const WorkerRuntime = struct {
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
+    }
+
+    /// Marks an agent turn that is executed directly rather than dequeued by
+    /// the interactive worker loop. The caller must pair a successful begin
+    /// with `finishProcessing`.
+    pub fn beginDirectProcessing(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_processing or self.worker_stop_requested) return false;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_recovery_pause_requested.store(false, .seq_cst);
+        self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        return true;
     }
 
     pub fn waitUntilIdle(self: *WorkerRuntime) void {
@@ -2839,6 +2856,9 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
+        .credential_refreshed => |credential| .{
+            .credential_refreshed = try credential.clone(alloc),
+        },
         .command_output => |chunk| .{ .command_output = .{
             .lifecycle_id = if (chunk.lifecycle_id) |id| .{
                 .turn_id = id.turn_id,
@@ -2913,6 +2933,10 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .api_status_text => |text| alloc.free(text),
+        .credential_refreshed => |credential| {
+            var owned = credential;
+            owned.deinit(alloc);
+        },
         .command_output => |chunk| {
             if (chunk.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
             alloc.free(chunk.text);
@@ -4583,7 +4607,7 @@ test "submitted text only queues while a prompt is active" {
     runtime.pending_permission_request_shared =
         try permission_request.OwnedPermissionRequest.dupe(
             alloc,
-            .{ .id = 1, .label = "terminal.exec launch chrome" },
+            .{ .id = 1, .label = "shell.run launch chrome" },
         );
     const question_options = [_]types.QuestionOption{.{ .label = "Wait", .description = null }};
     const question_entries = [_]types.QuestionBatchEntry{.{
@@ -5027,6 +5051,24 @@ test "dupeWorkerEvent clones canonical diff payload and full detail" {
     try std.testing.expectEqualStrings("call-9", full.lifecycle_id.call_id);
     try std.testing.expect(source.diff_block.full.?.content.ptr != full.content.ptr);
     try std.testing.expect(source.diff_block.full.?.lifecycle_id.call_id.ptr != full.lifecycle_id.call_id.ptr);
+}
+
+test "dupeWorkerEvent owns a complete refreshed credential publication" {
+    const alloc = std.testing.allocator;
+    const source: WorkerEvent = .{ .credential_refreshed = .{
+        .token = @constCast("fresh-token"),
+        .source = .fx_login,
+        .team_id = @constCast("team_123"),
+        .refresh_after_ms = 100,
+    } };
+    var owned = try dupeWorkerEvent(alloc, source);
+    defer freeWorkerEvent(alloc, owned);
+
+    const credential = &owned.credential_refreshed;
+    try std.testing.expectEqualStrings("fresh-token", credential.token);
+    try std.testing.expect(credential.token.ptr != source.credential_refreshed.token.ptr);
+    try std.testing.expectEqualStrings("team_123", credential.team_id.?);
+    try std.testing.expectEqual(@as(?i64, 100), credential.refresh_after_ms);
 }
 
 test "pushEvent clones every semantic notice field into the queue allocator" {

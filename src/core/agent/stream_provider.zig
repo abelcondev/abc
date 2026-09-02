@@ -7,7 +7,6 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const model_provider = @import("../config/model_provider.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
-const credentials = @import("../auth/credentials.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -149,7 +148,7 @@ pub const ToolSelection = struct {
     }
 };
 
-pub const CredentialLease = credentials.RequestAuth;
+pub const CredentialLease = types.CredentialLease;
 
 test "host-managed credential lease exposes no secret or account metadata" {
     const lease: CredentialLease = .host_managed;
@@ -177,7 +176,7 @@ pub const RequestData = struct {
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
-    credential: CredentialLease,
+    credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,

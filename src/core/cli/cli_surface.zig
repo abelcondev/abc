@@ -2,8 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
-const background_record_liveness = @import("../background/background_record_liveness.zig");
-const background_store = @import("../background/background_store.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
@@ -19,9 +18,7 @@ const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
-);
+const execution_process_provider = @import("../execution/process_provider.zig");
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
@@ -32,6 +29,7 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
+const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
@@ -74,7 +72,6 @@ pub const Command = union(enum) {
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
-    background: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
     sessions: []const [:0]const u8,
@@ -164,8 +161,7 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
     provider_set: provider_set.Set,
-    background_process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    process_provider: execution_process_provider.Provider = execution_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
@@ -236,18 +232,6 @@ const WorkspaceOptions = struct {
     action: ?workspace_commands.Action = null,
 };
 
-const PersistedRecordTarget = union(enum) {
-    last,
-    id: u64,
-};
-
-const PersistedRecordOptions = struct {
-    format: output_contracts.OutputFormat = .text,
-    target: ?PersistedRecordTarget = null,
-};
-
-// `fx session` reads one saved session, so it names its target and never
-// reaches for the picker that `ResumeTarget` carries.
 const SessionDetailTarget = union(enum) {
     last,
     id: []u8,
@@ -309,7 +293,6 @@ const WorkflowOptions = struct {
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
@@ -329,7 +312,6 @@ const RunDeps = struct {
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
-    load_catalog_startup_state: LoadCatalogStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
@@ -458,10 +440,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
         },
-        'b' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .background)) return .{ .background = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
-        },
+        'b' => if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] },
         'c' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
         },
@@ -626,6 +605,34 @@ const ProviderActivationCaller = enum {
     provider_login,
 };
 
+const CliTeamValidationContext = struct {
+    alloc: Allocator,
+    cfg: *const Config,
+};
+
+fn validateCliTeamCredential(
+    raw: ?*anyopaque,
+    candidate: credentials.Credential,
+) std.mem.Allocator.Error!login_flow.TeamValidationResult {
+    const context: *CliTeamValidationContext = @ptrCast(@alignCast(raw.?));
+    const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
+    if (access.authorizationCredential() == null) return .rejected;
+    const provider = context.cfg.provider_set.gateway.model_catalog orelse return .rejected;
+    const fetched = try provider.fetch(context.alloc, .{
+        .access = access,
+        .endpoint = context.cfg.models_path,
+        .view = .picker,
+    });
+    return switch (fetched) {
+        .failure => .rejected,
+        .catalog => |catalog_value| result: {
+            var catalog = catalog_value;
+            defer model_catalog.freeModelCatalog(context.alloc, &catalog);
+            break :result if (catalog.items.len > 0) .accepted else .rejected;
+        },
+    };
+}
+
 fn writeProviderActivationError(
     alloc: Allocator,
     deps: RunDeps,
@@ -652,6 +659,7 @@ fn activateProviderSelection(
     deps: RunDeps,
     target: model_provider.ProviderId,
     caller: ProviderActivationCaller,
+    exact_source: ?credentials.Source,
 ) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
@@ -662,22 +670,24 @@ fn activateProviderSelection(
     };
     defer settings.deinit(alloc);
 
-    var resolution = if (cfg.auth_mode == .host_managed)
-        credentials.Resolution{}
-    else
-        try credentials.resolveForProvider(
+    const preferred_source = exact_source orelse settings.credential_source;
+    var preparation: auth_runtime.CredentialPreparation = .blocked;
+    defer preparation.deinit(alloc);
+    if (cfg.auth_mode == .local) {
+        preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             target,
-            settings.credential_source,
+            preferred_source,
         );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    }
+    var prepared_credential = preparation.takeReady();
+    defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
     if (caller == .provider_command and already_selected and
-        (cfg.auth_mode == .host_managed or resolution.credential != null))
+        (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
@@ -688,42 +698,44 @@ fn activateProviderSelection(
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and resolution.credential == null and target == .codex and caller == .provider_command) {
+    if (cfg.auth_mode == .local and prepared_credential == null and target == .codex and caller == .provider_command) {
         chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
             return false;
         };
         performed_login = .codex;
-        resolution = try credentials.resolveForProvider(
+        preparation.deinit(alloc);
+        preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             target,
-            settings.credential_source,
+            preferred_source,
         );
+        prepared_credential = preparation.takeReady();
     }
-    if (cfg.auth_mode == .local and resolution.credential == null and target == .grok and caller == .provider_command) {
+    if (cfg.auth_mode == .local and prepared_credential == null and target == .grok and caller == .provider_command) {
         grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
             return false;
         };
         performed_login = .grok;
-        resolution = try credentials.resolveForProvider(
+        preparation.deinit(alloc);
+        preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             target,
-            settings.credential_source,
+            preferred_source,
         );
+        prepared_credential = preparation.takeReady();
     }
 
     const credential = if (cfg.auth_mode == .host_managed)
         null
-    else if (resolution.credential) |*value|
+    else if (prepared_credential) |*value|
         value
     else {
         try writeProviderActivationError(
@@ -753,9 +765,25 @@ fn activateProviderSelection(
             credentials.catalogAccessAt(credential.?.*, io_mod.milliTimestamp()),
         .endpoint = cfg.models_path,
         .view = .picker,
+        .allow_public_fallback = false,
     });
     var loaded = switch (fetch_result) {
-        .loaded => |loaded| loaded,
+        .loaded => |loaded| blk: {
+            if (loaded.provenance.access.level != .authenticated or
+                loaded.provenance.anonymous_fallback_used)
+            {
+                var rejected = loaded.catalog;
+                model_catalog.freeModelCatalog(alloc, &rejected);
+                try writeProviderActivationError(
+                    alloc,
+                    deps,
+                    caller,
+                    "target credential did not produce an authenticated model catalog",
+                );
+                return false;
+            }
+            break :blk loaded;
+        },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
             const detail = try std.fmt.allocPrint(
@@ -777,6 +805,7 @@ fn activateProviderSelection(
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .provider = target,
         .model_preference = .{ .provider = target, .model = selected_model },
+        .credential_source = exact_source,
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -891,7 +920,7 @@ fn runNonInteractiveWithDeps(
                 .gateway_models_path = cfg.models_path,
                 .gateway_provider = cfg.gateway_provider,
                 .provider_set = cfg.provider_set,
-                .background_process_provider = cfg.background_process_provider,
+                .process_provider = cfg.process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
@@ -926,19 +955,31 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
-                .gateway => login_flow.runLogin(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.url_opener,
-                ) catch |err| {
-                    const message = switch (err) {
-                        error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                        error.AccessDenied => "fx login: authorization denied\n",
-                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                        else => "fx login: failed to sign in\n",
+                .gateway => {
+                    login_flow.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                            error.AccessDenied => "fx login: authorization denied\n",
+                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                            else => "fx login: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
                     };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
+                    if (!try activateProviderSelection(
+                        alloc,
+                        cfg,
+                        deps,
+                        .gateway,
+                        .provider_login,
+                        .fx_login,
+                    )) return .handled_failure;
+                    try writeStdout(deps, "Signed in to Vercel.\n");
+                    try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
                 },
                 .codex => {
                     chatgpt_oauth.runLogin(
@@ -954,7 +995,7 @@ fn runNonInteractiveWithDeps(
                         try writeStderr(deps, message);
                         return .handled_failure;
                     };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Codex.\n");
@@ -969,7 +1010,7 @@ fn runNonInteractiveWithDeps(
                         try writeStderr(deps, "fx login: failed to sign in with Grok\n");
                         return .handled_failure;
                     };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
@@ -1037,6 +1078,25 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
+            if (!result.local_durability_failed) {
+                var preference = config_runtime.attemptUserPreferences(
+                    alloc,
+                    .{ .clear_credential_source = true },
+                );
+                defer preference.deinit(alloc);
+                switch (preference) {
+                    .outcome => {},
+                    .failure => |failure| {
+                        debug_trace.logf(
+                            "auth",
+                            "logout credential preference clear failed err={s}",
+                            .{@errorName(failure.err)},
+                        );
+                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
+                        return .handled_failure;
+                    },
+                }
+            }
             if (result.local_durability_failed) {
                 try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
             } else {
@@ -1060,18 +1120,35 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            login_flow.runTeams(alloc, cfg.gateway_provider.oauth_transport) catch |err| {
+            var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
+            login_flow.runTeams(
+                alloc,
+                cfg.gateway_provider.oauth_transport,
+                .{
+                    .context = &validation_context,
+                    .validate_fn = validateCliTeamCredential,
+                },
+            ) catch |err| {
                 const message = switch (err) {
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
                     error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
                     error.InvalidTeamSelection => "fx teams: no team selected\n",
                     error.AccessDenied => "fx teams: authorization denied\n",
+                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
                     else => "fx teams: failed to switch team\n",
                 };
                 try writeStderr(deps, message);
                 return .handled_failure;
             };
+            if (!try activateProviderSelection(
+                alloc,
+                cfg,
+                deps,
+                .gateway,
+                .provider_login,
+                .fx_login,
+            )) return .handled_failure;
             return .handled_success;
         },
         .provider => |rest| {
@@ -1083,7 +1160,7 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
                 return .handled_failure;
             };
-            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
+            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
                 .handled_success
             else
                 .handled_failure;
@@ -1183,8 +1260,9 @@ fn runNonInteractiveWithDeps(
                     cfg.auth_mode,
                 )
             else
-                try deps.load_catalog_startup_state(
+                try deps.load_startup_state(
                     alloc,
+                    cfg.gateway_provider.oauth_transport,
                     cfg.secret_store,
                     cfg.default_model,
                     cfg.default_agent_step_limit,
@@ -1204,6 +1282,7 @@ fn runNonInteractiveWithDeps(
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
                 .endpoint = cfg.models_path,
+                .allow_public_fallback = startup.credential_source_preference == null,
             })) {
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
@@ -1273,72 +1352,6 @@ fn runNonInteractiveWithDeps(
             }
 
             const text = try output_snapshot.render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
-        },
-        .background => |rest| {
-            const opts = parsePersistedRecordArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .background, "background", err, rest);
-                return .handled_failure;
-            };
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-
-            if (opts.target) |target| {
-                switch (target) {
-                    .id => |id| {
-                        var record = loadWorkspaceBackgroundRecord(
-                            alloc,
-                            cfg.background_process_provider,
-                            workspace_root,
-                            id,
-                        ) catch |err| {
-                            try writeLookupFailure(alloc, deps, "background", err, opts.format);
-                            return .handled_failure;
-                        };
-                        defer record.deinit(alloc);
-                        const text = try (output_contracts.BackgroundDetailSnapshot{ .record = record }).render(alloc, opts.format);
-                        defer alloc.free(text);
-                        try writeFormattedOutput(deps, text, opts.format);
-                        return .handled_success;
-                    },
-                    .last => {},
-                }
-            }
-
-            var records = loadWorkspaceBackgroundRecords(
-                alloc,
-                cfg.background_process_provider,
-                workspace_root,
-            ) catch |err| {
-                try writeLookupFailure(alloc, deps, "background", err, opts.format);
-                return .handled_failure;
-            };
-            defer {
-                for (records.items) |*entry| entry.deinit(alloc);
-                records.deinit(alloc);
-            }
-
-            if (opts.target) |target| {
-                switch (target) {
-                    .last => {
-                        const record = findBackgroundRecord(records.items, target) orelse {
-                            const err = if (records.items.len == 0) error.NoBackgroundRecords else error.BackgroundRecordNotFound;
-                            try writeLookupFailure(alloc, deps, "background", err, opts.format);
-                            return .handled_failure;
-                        };
-                        const text = try (output_contracts.BackgroundDetailSnapshot{ .record = record }).render(alloc, opts.format);
-                        defer alloc.free(text);
-                        try writeFormattedOutput(deps, text, opts.format);
-                        return .handled_success;
-                    },
-                    .id => unreachable,
-                }
-            }
-
-            const text = try (output_contracts.BackgroundListSnapshot{ .records = records.items }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
@@ -1460,7 +1473,10 @@ fn runNonInteractiveWithDeps(
 
             switch (target) {
                 .last => {
-                    var summary = store.latestReadOnlyWorkspaceSummary(alloc) catch |err| {
+                    var summary = subagent_resume_admission.latestVisibleWorkspaceSummary(
+                        store,
+                        alloc,
+                    ) catch |err| {
                         try writeLookupFailure(alloc, deps, "session", err, opts.format);
                         return .handled_failure;
                     };
@@ -1474,7 +1490,8 @@ fn runNonInteractiveWithDeps(
                     return .handled_success;
                 },
                 .id => |id| {
-                    var detail = store.loadReadOnlyDetail(
+                    var detail = subagent_resume_admission.loadVisibleReadOnlyDetail(
+                        store,
                         alloc,
                         id,
                         .{},
@@ -1514,7 +1531,8 @@ fn runNonInteractiveWithDeps(
             };
             defer store.deinit(alloc);
 
-            var page = store.listSessionPage(
+            var page = subagent_resume_admission.listVisiblePage(
+                store,
                 alloc,
                 opts.scope,
                 opts.continuation,
@@ -2747,325 +2765,6 @@ fn loadLatestWorkspaceSessionSummary(
     return store.latestReadOnlyWorkspaceSummary(alloc);
 }
 
-fn loadWorkspaceBackgroundRecords(
-    alloc: Allocator,
-    process_provider: background_process_provider.Provider,
-    workspace_root: []const u8,
-) !std.ArrayList(background_store.Record) {
-    var session_store_value = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| switch (err) {
-        error.HomeNotSet => return .empty,
-        else => return err,
-    };
-    defer session_store_value.deinit(alloc);
-
-    var sessions = try session_store_value.listManagedChildCandidatesForWorkspace(alloc);
-    defer {
-        for (sessions.items) |*summary| summary.deinit(alloc);
-        sessions.deinit(alloc);
-    }
-
-    var sourced: std.ArrayList(SourcedBackgroundRecord) = .empty;
-    errdefer {
-        for (sourced.items) |*record| record.deinit(alloc);
-        sourced.deinit(alloc);
-    }
-
-    for (sessions.items) |summary| {
-        var capability = try session_store_value.openListedChildCapabilityReadOnly(
-            alloc,
-            summary.id,
-        );
-        defer capability.deinit();
-        var store = background_store.Store.initManaged(&capability);
-        defer store.deinit(alloc);
-
-        var session_records = try store.list(alloc);
-        defer {
-            for (session_records.items) |*record| record.deinit(alloc);
-            session_records.deinit(alloc);
-        }
-
-        for (session_records.items) |*record| {
-            if (!background_store.recordBelongsToWorkspace(record.*, workspace_root)) continue;
-            try background_record_liveness.refreshPersistedRecordLiveness(
-                alloc,
-                process_provider,
-                record,
-            );
-            try appendSourcedBackgroundRecord(
-                alloc,
-                &sourced,
-                summary.id,
-                record.*,
-            );
-        }
-    }
-
-    sortSourcedBackgroundRecords(sourced.items);
-
-    var records: std.ArrayList(background_store.Record) = .empty;
-    errdefer {
-        for (records.items) |*record| record.deinit(alloc);
-        records.deinit(alloc);
-    }
-    try records.ensureTotalCapacity(alloc, sourced.items.len);
-    for (sourced.items) |record| {
-        records.appendAssumeCapacity(try cloneBackgroundRecord(
-            alloc,
-            record.record,
-        ));
-    }
-    for (sourced.items) |*record| record.deinit(alloc);
-    sourced.deinit(alloc);
-    return records;
-}
-
-fn loadWorkspaceBackgroundRecord(
-    alloc: Allocator,
-    process_provider: background_process_provider.Provider,
-    workspace_root: []const u8,
-    id: u64,
-) !background_store.Record {
-    var session_store_value = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| switch (err) {
-        error.HomeNotSet => return error.NoBackgroundRecords,
-        else => return err,
-    };
-    defer session_store_value.deinit(alloc);
-
-    var sessions = try session_store_value.listManagedChildCandidatesForWorkspace(alloc);
-    defer {
-        for (sessions.items) |*summary| summary.deinit(alloc);
-        sessions.deinit(alloc);
-    }
-
-    var matched_workspace = false;
-    for (sessions.items) |summary| {
-        matched_workspace = true;
-
-        var capability = try session_store_value.openListedChildCapabilityReadOnly(
-            alloc,
-            summary.id,
-        );
-        defer capability.deinit();
-        var store = background_store.Store.initManaged(&capability);
-        defer store.deinit(alloc);
-
-        var record = store.load(alloc, id) catch |err| switch (err) {
-            error.BackgroundRecordNotFound => continue,
-            else => return err,
-        };
-        errdefer record.deinit(alloc);
-        if (!background_store.recordBelongsToWorkspace(record, workspace_root)) {
-            record.deinit(alloc);
-            continue;
-        }
-        try background_record_liveness.refreshPersistedRecordLiveness(
-            alloc,
-            process_provider,
-            &record,
-        );
-        return record;
-    }
-    return if (matched_workspace)
-        error.BackgroundRecordNotFound
-    else
-        error.NoBackgroundRecords;
-}
-
-const SourcedBackgroundRecord = struct {
-    source_session_id: []u8,
-    record: background_store.Record,
-
-    fn deinit(self: *SourcedBackgroundRecord, alloc: Allocator) void {
-        alloc.free(self.source_session_id);
-        self.record.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-fn appendSourcedBackgroundRecord(
-    alloc: Allocator,
-    records: *std.ArrayList(SourcedBackgroundRecord),
-    source_session_id: []const u8,
-    record: background_store.Record,
-) !void {
-    const owned_source_session_id = try alloc.dupe(u8, source_session_id);
-    errdefer alloc.free(owned_source_session_id);
-    var owned_record = try cloneBackgroundRecord(alloc, record);
-    errdefer owned_record.deinit(alloc);
-    try records.append(alloc, .{
-        .source_session_id = owned_source_session_id,
-        .record = owned_record,
-    });
-}
-
-fn sortSourcedBackgroundRecords(records: []SourcedBackgroundRecord) void {
-    var i: usize = 1;
-    while (i < records.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and sourcedBackgroundRanksBefore(
-            records[j],
-            records[j - 1],
-        )) : (j -= 1) {
-            std.mem.swap(
-                SourcedBackgroundRecord,
-                &records[j - 1],
-                &records[j],
-            );
-        }
-    }
-}
-
-fn sourcedBackgroundRanksBefore(
-    left: SourcedBackgroundRecord,
-    right: SourcedBackgroundRecord,
-) bool {
-    if (left.record.updated_at_ms != right.record.updated_at_ms) {
-        return left.record.updated_at_ms > right.record.updated_at_ms;
-    }
-    const source_order = std.mem.order(
-        u8,
-        left.source_session_id,
-        right.source_session_id,
-    );
-    if (source_order != .eq) return source_order == .gt;
-    return if (left.record.background_record_id) |left_id| blk: {
-        if (right.record.background_record_id) |right_id| {
-            break :blk std.mem.order(u8, &left_id, &right_id) == .gt;
-        }
-        break :blk true;
-    } else false;
-}
-
-fn cloneBackgroundRecord(alloc: Allocator, record: background_store.Record) !background_store.Record {
-    const pid = try alloc.dupe(u8, record.pid);
-    errdefer alloc.free(pid);
-    const command = try alloc.dupe(u8, record.command);
-    errdefer alloc.free(command);
-    const cwd = try alloc.dupe(u8, record.cwd);
-    errdefer alloc.free(cwd);
-    const log_path = try alloc.dupe(u8, record.log_path);
-    errdefer alloc.free(log_path);
-
-    var process_token: ?[]u8 = null;
-    errdefer if (process_token) |token| alloc.free(token);
-    if (record.process_token) |token| {
-        process_token = try alloc.dupe(u8, token);
-    }
-
-    var log_storage: ?background_store.LogStorage = null;
-    errdefer if (log_storage) |*storage| storage.deinit(alloc);
-    if (record.log_storage) |storage| {
-        log_storage = switch (storage) {
-            .managed_session => |managed| .{ .managed_session = .{
-                .managed_log_name = try alloc.dupe(
-                    u8,
-                    managed.managed_log_name,
-                ),
-            } },
-            .external => |external| .{ .external = .{
-                .path = try alloc.dupe(u8, external.path),
-            } },
-        };
-    }
-
-    var server_url: ?[]u8 = null;
-    errdefer if (server_url) |url| alloc.free(url);
-    if (record.server_url) |url| {
-        server_url = try alloc.dupe(u8, url);
-    }
-
-    var diagnostic: ?[]u8 = null;
-    errdefer if (diagnostic) |value| alloc.free(value);
-    if (record.diagnostic) |value| {
-        diagnostic = try alloc.dupe(u8, value);
-    }
-
-    return .{
-        .id = record.id,
-        .background_record_id = record.background_record_id,
-        .process_token = process_token,
-        .pid = pid,
-        .command = command,
-        .cwd = cwd,
-        .log_path = log_path,
-        .log_storage = log_storage,
-        .expect_url = record.expect_url,
-        .server_url = server_url,
-        .started_at_ms = record.started_at_ms,
-        .updated_at_ms = record.updated_at_ms,
-        .exit_code = record.exit_code,
-        .state = record.state,
-        .diagnostic = diagnostic,
-    };
-}
-
-test "direct background ranking uses updated time source session and stable id" {
-    const low_stable = background_store.StableBackgroundRecordId{
-        0x00, 0, 0, 0, 0, 0, 0, 0,
-        0,    0, 0, 0, 0, 0, 0, 1,
-    };
-    const high_stable = background_store.StableBackgroundRecordId{
-        0xff, 0, 0, 0, 0, 0, 0, 0,
-        0,    0, 0, 0, 0, 0, 0, 2,
-    };
-    const base = background_store.Record{
-        .id = 7,
-        .pid = @constCast("1"),
-        .command = @constCast("cmd"),
-        .cwd = @constCast("/tmp"),
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
-        .started_at_ms = 1,
-        .updated_at_ms = 10,
-        .state = .running,
-    };
-
-    var older = base;
-    older.updated_at_ms = 9;
-    try std.testing.expect(sourcedBackgroundRanksBefore(
-        .{ .source_session_id = @constCast("a"), .record = base },
-        .{ .source_session_id = @constCast("z"), .record = older },
-    ));
-
-    try std.testing.expect(sourcedBackgroundRanksBefore(
-        .{ .source_session_id = @constCast("z"), .record = base },
-        .{ .source_session_id = @constCast("a"), .record = base },
-    ));
-
-    var low = base;
-    low.background_record_id = low_stable;
-    var high = base;
-    high.background_record_id = high_stable;
-    try std.testing.expect(sourcedBackgroundRanksBefore(
-        .{ .source_session_id = @constCast("same"), .record = high },
-        .{ .source_session_id = @constCast("same"), .record = low },
-    ));
-    try std.testing.expect(sourcedBackgroundRanksBefore(
-        .{ .source_session_id = @constCast("same"), .record = low },
-        .{ .source_session_id = @constCast("same"), .record = base },
-    ));
-}
-
-fn findBackgroundRecord(records: []const background_store.Record, target: PersistedRecordTarget) ?background_store.Record {
-    return switch (target) {
-        .last => if (records.len == 0) null else records[0],
-        .id => |id| blk: {
-            for (records) |record| {
-                if (record.id == id) break :blk record;
-            }
-            break :blk null;
-        },
-    };
-}
-
-fn loadBackgroundRecord(alloc: Allocator, store: background_store.Store, target: PersistedRecordTarget) !background_store.Record {
-    return switch (target) {
-        .last => store.loadLatest(alloc),
-        .id => |id| store.load(alloc, id),
-    };
-}
-
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {
         .authentication => "AuthenticationRejected",
@@ -3132,21 +2831,6 @@ fn writeLookupFailure(
     }
 
     switch (err) {
-        error.NoBackgroundRecords => {
-            try writeStderr(deps, "fx ");
-            try writeStderr(deps, kind);
-            try writeStderr(deps, ": no persisted records for this workspace\n");
-        },
-        error.BackgroundRecordNotFound => {
-            try writeStderr(deps, "fx ");
-            try writeStderr(deps, kind);
-            try writeStderr(deps, ": record not found\n");
-        },
-        error.InvalidBackgroundRecord, error.UnsupportedBackgroundSchema => {
-            try writeStderr(deps, "fx ");
-            try writeStderr(deps, kind);
-            try writeStderr(deps, ": record is unreadable or from an unsupported version\n");
-        },
         error.NoSavedSessions => {
             try writeStderr(deps, "fx session: no saved sessions for this workspace\n");
         },
@@ -3318,7 +3002,6 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.InvalidLocalSurfaceArgs,
         error.InvalidUsageArgs,
-        error.InvalidPersistedRecordArgs,
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
@@ -3330,9 +3013,6 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
 
 fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.NoBackgroundRecords => "no persisted records for this workspace",
-        error.BackgroundRecordNotFound => "record not found",
-        error.InvalidBackgroundRecord, error.UnsupportedBackgroundSchema => "record is unreadable or from an unsupported version",
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
@@ -3474,7 +3154,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
         .provider_set = cfg.provider_set,
-        .background_process_provider = cfg.background_process_provider,
+        .process_provider = cfg.process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
         .skill_root_policy = cfg.skill_root_policy,
@@ -3737,35 +3417,12 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     return error.InvalidWorkspaceArgs;
 }
 
-fn parsePersistedRecordArgs(args: []const [:0]const u8) !PersistedRecordOptions {
-    var options = PersistedRecordOptions{};
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
-            options.format = .json;
-            continue;
-        }
-
-        if (options.target != null) return error.InvalidPersistedRecordArgs;
-
-        const trimmed = std.mem.trim(u8, arg, " \t\r\n");
-        if (trimmed.len == 0) return error.InvalidPersistedRecordArgs;
-        if (std.mem.eql(u8, trimmed, "last")) {
-            options.target = .last;
-            continue;
-        }
-
-        options.target = .{
-            .id = std.fmt.parseUnsigned(u64, trimmed, 10) catch
-                return error.InvalidPersistedRecordArgs,
-        };
-    }
-    return options;
-}
-
-fn parseSessionDetailArgs(alloc: Allocator, args: []const [:0]const u8) !SessionDetailOptions {
+fn parseSessionDetailArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionDetailOptions {
     var options = SessionDetailOptions{};
     errdefer options.deinit(alloc);
-
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -3773,34 +3430,31 @@ fn parseSessionDetailArgs(alloc: Allocator, args: []const [:0]const u8) !Session
             options.format = .json;
             continue;
         }
-
         if (options.target != null) return error.InvalidSessionDetailArgs;
-
         const exact_id = std.mem.eql(u8, arg, "--id");
         if (exact_id) {
             i += 1;
             if (i >= args.len) return error.InvalidSessionDetailArgs;
         }
-
         const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
         if (trimmed.len == 0) return error.InvalidSessionDetailArgs;
         if (!exact_id and std.mem.eql(u8, trimmed, "last")) {
             options.target = .last;
             continue;
         }
-
         options.target = .{ .id = try alloc.dupe(u8, trimmed) };
     }
-
     return options;
 }
 
-fn parseSessionMigrationArgs(alloc: Allocator, args: []const [:0]const u8) !SessionMigrationOptions {
+fn parseSessionMigrationArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionMigrationOptions {
     var format: output_contracts.OutputFormat = .text;
     var allow_large = false;
     var session_id: ?[]u8 = null;
     errdefer if (session_id) |id| alloc.free(id);
-
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -3813,18 +3467,15 @@ fn parseSessionMigrationArgs(alloc: Allocator, args: []const [:0]const u8) !Sess
             continue;
         }
         if (session_id != null) return error.InvalidSessionMigrationArgs;
-
         const exact_id = std.mem.eql(u8, arg, "--id");
         if (exact_id) {
             i += 1;
             if (i >= args.len) return error.InvalidSessionMigrationArgs;
         }
-
         const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
         if (trimmed.len == 0) return error.InvalidSessionMigrationArgs;
         session_id = try alloc.dupe(u8, trimmed);
     }
-
     return .{
         .format = format,
         .session_id = session_id orelse return error.InvalidSessionMigrationArgs,
@@ -3994,7 +3645,7 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("background")})) {
-        .background => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        .unknown => |command| try std.testing.expectEqualStrings("background", command),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("session"), @constCast("last") })) {
@@ -4346,26 +3997,6 @@ test "parse session list args supports bounded canonical pagination" {
         error.InvalidLocalSurfaceArgs,
         parseSessionListArgs(&.{ @constCast("--cursor"), @constCast("v1:20:../unsafe") }),
     );
-}
-
-test "parse persisted record args supports empty last numeric id and json" {
-    const empty = try parsePersistedRecordArgs(&.{});
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, empty.format);
-    try std.testing.expect(empty.target == null);
-
-    const latest = try parsePersistedRecordArgs(&.{ @constCast("last"), @constCast("--json") });
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, latest.format);
-    try std.testing.expectEqual(PersistedRecordTarget.last, latest.target.?);
-
-    const specific = try parsePersistedRecordArgs(&.{@constCast(" 7 ")});
-    switch (specific.target.?) {
-        .id => |value| try std.testing.expectEqual(@as(u64, 7), value),
-        else => return error.TestExpectedEqual,
-    }
-
-    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{ @constCast("7"), @constCast("8") }));
-    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{@constCast("abc")}));
-    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{@constCast("   ")}));
 }
 
 test "parse session detail args owns string ids and frees through deinit" {
@@ -5349,8 +4980,7 @@ test "runIfRequested model fetch failure is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = failingStartupState;
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -5368,7 +4998,7 @@ test "runIfRequested model fetch failure preserves json output" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
@@ -5392,7 +5022,7 @@ test "runIfRequested model provider cancellation is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -5410,7 +5040,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
@@ -5902,15 +5532,6 @@ fn failingStartupStateWithoutCredentials(
     _: usize,
 ) !app_lifecycle.StartupState {
     return error.StartupShouldNotRun;
-}
-
-fn stubLoadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_agent_step_limit: usize,
-) !app_lifecycle.StartupState {
-    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_agent_step_limit);
 }
 
 fn stubLoadStartupStatus(

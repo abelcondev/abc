@@ -40,7 +40,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -198,6 +198,11 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeReasoning(chunk)) catch |err| {
             debug_trace.logf("agent", "token progress publication failed source=reasoning err={s}", .{@errorName(err)});
+        };
+    }
+    if (stream_ctx.hooks.push_reasoning_delta) |push| {
+        push(stream_ctx.hooks.ctx, chunk) catch |err| {
+            debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
         };
     }
 }
@@ -904,7 +909,7 @@ test "provider callbacks publish each activity phase transition once" {
     onStreamReasoningChunk(&stream_ctx, " continues");
     onStreamContentChunk(&stream_ctx, "response");
     onStreamContentChunk(&stream_ctx, " continues\n");
-    onStreamToolStart(&stream_ctx, "command_1", "terminal", null);
+    onStreamToolStart(&stream_ctx, "command_1", "shell", null);
 
     try std.testing.expectEqualSlices(
         types.TurnPhase,

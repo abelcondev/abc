@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const auth_store = @import("../auth/auth_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const native_keychain = @import("native_keychain.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -334,6 +335,25 @@ pub fn load_entry(
             break :blk try alloc.dupe(u8, value);
         },
     };
+}
+
+/// Reports whether one slot exists in the common auth document. The document
+/// is inspected without migration, and all loaded credential bytes are zeroed
+/// before returning this metadata-only result.
+pub fn entry_presence(source: auth_store.StoredSource) host.SecretStorePresence {
+    const alloc = std.heap.c_allocator;
+    const home = io_mod.getenv("HOME") orelse return .unavailable;
+    var document = (switch (storage_backend()) {
+        .profile_file => load_profile_document(alloc, home, .inspect),
+        .macos_keychain => load_keychain_document(
+            alloc,
+            home,
+            .inspect,
+            native_keychain_backend,
+        ),
+    } catch return .unavailable) orelse return .missing;
+    defer document.deinit(alloc);
+    return if (document.get(source) != null) .present else .missing;
 }
 
 pub fn begin_entry_mutation(source: auth_store.StoredSource) !EntryMutation {

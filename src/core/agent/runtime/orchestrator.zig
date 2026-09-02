@@ -16,6 +16,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
+const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -27,12 +28,12 @@ const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_environment = @import("../../execution/command_environment.zig");
-const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
+const subagent_model_contract = @import("../../subagent/model_contract.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_finalization = @import("finalization.zig");
@@ -47,7 +48,7 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
-const runtime_stop_policy = @import("stop_policy.zig");
+const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
@@ -67,10 +68,12 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const post_tool_decision_prompt =
-    "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+const assistant_prefill_recovery_prompt =
+    "Continue from the preceding tool result.";
 const repeated_terminal_validation_notice =
-    "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
+    "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
+const repeated_shell_execution_failure_notice =
+    "Repeated identical shell failures stopped the tool loop. The failed action was not retried again; inspect the environment or change the action before continuing.";
 const repeated_malformed_arguments_notice =
     "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
 const Config = runtime_config.Config;
@@ -80,45 +83,12 @@ const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
-fn append_post_tool_decision_prompt(
-    alloc: Allocator,
-    messages: []const ChatMessage,
-    pending: bool,
-) ![]const ChatMessage {
-    if (!pending) return messages;
-    const projected = try alloc.alloc(ChatMessage, messages.len + 1);
-    @memcpy(projected[0..messages.len], messages);
-    projected[messages.len] = .{
-        .role = .user,
-        .content = post_tool_decision_prompt,
-        .cache_policy = .no_cache,
-    };
-    return projected;
-}
-
-test "append_post_tool_decision_prompt appends one no-cache user message only when pending" {
-    const alloc = std.testing.allocator;
-    const source = [_]ChatMessage{.{ .role = .system, .content = "system" }};
-
-    const unchanged = try append_post_tool_decision_prompt(alloc, &source, false);
-    try std.testing.expectEqual(@as(usize, 1), unchanged.len);
-
-    const projected = try append_post_tool_decision_prompt(alloc, &source, true);
-    defer alloc.free(projected);
-    try std.testing.expectEqual(@as(usize, 2), projected.len);
-    try std.testing.expectEqual(types.ChatRole.user, projected[1].role);
-    try std.testing.expectEqualStrings(
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
-        projected[1].content.?,
-    );
-    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, projected[1].cache_policy);
-}
-
-fn terminal_request_schema_advertised(
+fn request_union_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
+    tool_name: []const u8,
 ) bool {
     for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, "terminal")) continue;
+        if (!std.mem.eql(u8, function.name, tool_name)) continue;
         return model_tool_schema.isSingleRequiredObjectUnionField(
             function.input_schema,
             "request",
@@ -127,11 +97,46 @@ fn terminal_request_schema_advertised(
     return false;
 }
 
+fn subagent_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    for (advertised_functions) |function| {
+        if (!std.mem.eql(u8, function.name, "subagent")) continue;
+        return model_tool_schema.isSingleRequiredObjectUnionField(
+            function.input_schema,
+            "request",
+        );
+    }
+    return false;
+}
+
+fn terminal_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    return request_union_schema_advertised(advertised_functions, "shell");
+}
+
+fn read_tool_result_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    return request_union_schema_advertised(
+        advertised_functions,
+        "read_tool_result",
+    );
+}
+
 fn terminal_request_normalization_eligible(
     base_nested_terminal_advertised: bool,
     vision_mode: runtime_gateway_step.VisionToolMode,
 ) bool {
     return base_nested_terminal_advertised and vision_mode != .required;
+}
+
+fn subagent_request_normalization_eligible(
+    base_nested_subagent_advertised: bool,
+    vision_mode: runtime_gateway_step.VisionToolMode,
+) bool {
+    return base_nested_subagent_advertised and vision_mode != .required;
 }
 
 fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
@@ -257,22 +262,152 @@ fn projected_terminal_request_arguments(
     return try out.toOwnedSlice();
 }
 
+fn projected_read_tool_result_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.count() == 1 and
+        parsed.value.object.get("request") != null)
+    {
+        return null;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
 fn free_terminal_request_projection(
     alloc: Allocator,
     source: []const ChatMessage,
     projected: []const ChatMessage,
 ) void {
     if (source.ptr == projected.ptr) return;
-    for (projected, source) |message, original| {
-        if (message.tool_calls.ptr == original.tool_calls.ptr) continue;
-        for (message.tool_calls, original.tool_calls) |call, original_call| {
-            if (call.arguments_json.ptr != original_call.arguments_json.ptr) {
-                alloc.free(@constCast(call.arguments_json));
-            }
+    for (projected) |message| {
+        if (message.content) |content| alloc.free(@constCast(content));
+        for (message.tool_calls) |call| {
+            alloc.free(@constCast(call.arguments_json));
         }
-        alloc.free(@constCast(message.tool_calls));
+        if (message.tool_calls.len != 0) {
+            alloc.free(@constCast(message.tool_calls));
+        }
     }
     alloc.free(@constCast(projected));
+}
+
+const LegacyTerminalCall = struct {
+    id: []const u8,
+    action: []const u8,
+    mapped: bool,
+};
+
+fn legacyTerminalAction(arguments_json: []const u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const action = parsed.value.object.get("action") orelse return null;
+    if (action != .string) return null;
+    for ([_][]const u8{
+        "exec",
+        "start",
+        "read",
+        "screen",
+        "write",
+        "wait",
+        "monitor",
+        "inspect",
+        "list",
+        "resize",
+        "signal",
+        "close",
+    }) |known| {
+        if (std.mem.eql(u8, action.string, known)) return known;
+    }
+    return "unknown";
+}
+
+fn projectLegacyTerminalExecArguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const action = parsed.value.object.get("action") orelse return null;
+    if (action != .string or !std.mem.eql(u8, action.string, "exec")) return null;
+    const command = parsed.value.object.get("command") orelse return null;
+    if (command != .string) return null;
+    var request = std.json.Value{ .object = .empty };
+    errdefer request.object.deinit(alloc);
+    try request.object.put(alloc, "action", .{ .string = "run" });
+    try request.object.put(alloc, "command", command);
+    for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
+        if (parsed.value.object.get(name)) |value| {
+            try request.object.put(alloc, name, value);
+        }
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn findLegacyCall(
+    calls: []const LegacyTerminalCall,
+    id: []const u8,
+) ?LegacyTerminalCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return call;
+    }
+    return null;
+}
+
+fn legacyToolSummary(
+    alloc: Allocator,
+    action: []const u8,
+    content: ?[]const u8,
+) Allocator.Error![]u8 {
+    const body = content orelse "";
+    const bounded = text_utils.utf8PrefixByBytes(body, 4096);
+    return if (bounded.len == 0)
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior terminal {s} action completed.]",
+            .{action},
+        )
+    else
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior terminal {s} action completed. Stored result follows.]\n{s}",
+            .{ action, bounded },
+        );
 }
 
 fn project_terminal_request_messages(
@@ -282,36 +417,545 @@ fn project_terminal_request_messages(
     source: []const ChatMessage,
 ) Allocator.Error![]const ChatMessage {
     if (!attempt_eligible) return source;
+    if (registry.lookup("shell") == null) return source;
 
-    var projected: ?[]ChatMessage = null;
-    errdefer if (projected) |messages| {
-        free_terminal_request_projection(alloc, source, messages);
+    var legacy_calls: std.ArrayList(LegacyTerminalCall) = .empty;
+    defer legacy_calls.deinit(alloc);
+    var needs_projection = false;
+    for (source) |message| {
+        if (message.role != .assistant) continue;
+        var has_legacy_exec = false;
+        var has_removed_legacy_action = false;
+        for (message.tool_calls) |call| {
+            if (call.argument_integrity != .valid or
+                !std.mem.eql(u8, call.name, "terminal")) continue;
+            const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+            if (std.mem.eql(u8, action, "exec")) {
+                has_legacy_exec = true;
+            } else {
+                has_removed_legacy_action = true;
+            }
+        }
+        const mixed_legacy_batch = has_legacy_exec and has_removed_legacy_action;
+        for (message.tool_calls) |call| {
+            if (call.argument_integrity != .valid) continue;
+            if (std.mem.eql(u8, call.name, "terminal")) {
+                const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+                try legacy_calls.append(alloc, .{
+                    .id = call.id,
+                    .action = action,
+                    .mapped = std.mem.eql(u8, action, "exec") and
+                        !mixed_legacy_batch,
+                });
+                needs_projection = true;
+                continue;
+            }
+            const tool = registry.lookup(call.name) orelse continue;
+            if (tool.executor_kind != .terminal) continue;
+            if (try projected_terminal_request_arguments(alloc, call.arguments_json)) |arguments| {
+                alloc.free(arguments);
+                needs_projection = true;
+            }
+        }
+    }
+    if (!needs_projection) return source;
+
+    const projected = try alloc.alloc(ChatMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projected[0..initialized]) |message| {
+            if (message.content) |content| alloc.free(@constCast(content));
+            for (message.tool_calls) |call| {
+                alloc.free(@constCast(call.arguments_json));
+            }
+            if (message.tool_calls.len != 0) {
+                alloc.free(@constCast(message.tool_calls));
+            }
+        }
+        alloc.free(projected);
+    }
+    for (source, projected) |message, *target| {
+        target.* = message;
+        target.content = null;
+        target.tool_calls = &.{};
+        initialized += 1;
+        target.content = if (message.content) |content|
+            try alloc.dupe(u8, content)
+        else
+            null;
+
+        if (message.role == .tool and message.tool_call_id != null) {
+            if (findLegacyCall(legacy_calls.items, message.tool_call_id.?)) |legacy| {
+                if (legacy.mapped) {
+                    target.tool_name = "shell";
+                } else {
+                    if (target.content) |content| {
+                        alloc.free(@constCast(content));
+                        target.content = null;
+                    }
+                    target.role = .assistant;
+                    target.content = try legacyToolSummary(
+                        alloc,
+                        legacy.action,
+                        message.content,
+                    );
+                    target.tool_call_id = null;
+                    target.tool_name = null;
+                }
+            }
+        }
+
+        if (message.tool_calls.len != 0) {
+            var calls: std.ArrayList(ToolCall) = .empty;
+            errdefer {
+                for (calls.items) |call| alloc.free(@constCast(call.arguments_json));
+                calls.deinit(alloc);
+            }
+            for (message.tool_calls) |call| {
+                if (call.argument_integrity == .valid and
+                    std.mem.eql(u8, call.name, "terminal"))
+                {
+                    const legacy = findLegacyCall(legacy_calls.items, call.id) orelse continue;
+                    if (!legacy.mapped) continue;
+                    const arguments = try projectLegacyTerminalExecArguments(
+                        alloc,
+                        call.arguments_json,
+                    ) orelse continue;
+                    var mapped = call;
+                    mapped.name = "shell";
+                    mapped.arguments_json = arguments;
+                    calls.append(alloc, mapped) catch |err| {
+                        alloc.free(arguments);
+                        return err;
+                    };
+                    continue;
+                }
+                const registered_terminal = if (registry.lookup(call.name)) |tool|
+                    tool.executor_kind == .terminal
+                else
+                    false;
+                const arguments = if (call.argument_integrity == .valid and
+                    registered_terminal)
+                    (try projected_terminal_request_arguments(
+                        alloc,
+                        call.arguments_json,
+                    )) orelse try alloc.dupe(u8, call.arguments_json)
+                else
+                    try alloc.dupe(u8, call.arguments_json);
+                var copied = call;
+                copied.arguments_json = arguments;
+                calls.append(alloc, copied) catch |err| {
+                    alloc.free(arguments);
+                    return err;
+                };
+            }
+            target.tool_calls = try calls.toOwnedSlice(alloc);
+        }
+        if (message.role == .assistant and
+            message.tool_calls.len != 0 and
+            target.tool_calls.len == 0 and
+            target.content == null)
+        {
+            target.content = try alloc.dupe(
+                u8,
+                "Prior terminal actions are represented as completed history summaries below.",
+            );
+        }
+    }
+    return projected;
+}
+
+const SubagentHistoryDisposition = enum {
+    current,
+    inert,
+};
+
+const SubagentHistoryCall = struct {
+    id: []const u8,
+    action: []const u8,
+    disposition: SubagentHistoryDisposition,
+};
+
+fn find_subagent_history_call(
+    calls: []const SubagentHistoryCall,
+    id: []const u8,
+) ?SubagentHistoryCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return call;
+    }
+    return null;
+}
+
+fn legacy_subagent_action(arguments_json: []const u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const command = parsed.value.object.get("command") orelse return null;
+    if (command != .object or command.object.count() != 1) return "unknown";
+    const branch = command.object.keys()[0];
+    for ([_][]const u8{ "create", "inspect", "message", "relationship", "configure", "lifecycle" }) |known| {
+        if (std.mem.eql(u8, branch, known)) return known;
+    }
+    return "unknown";
+}
+
+fn project_subagent_result_content(
+    alloc: Allocator,
+    content: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    if (object.count() == 3 and object.get("ok") != null and
+        object.get("result") != null and object.get("error_code") != null)
+    {
+        return null;
+    }
+    const ok = object.get("ok") orelse return null;
+    const error_code = object.get("error_code") orelse return null;
+    const result = object.get("result") orelse .null;
+    if (ok != .bool or (error_code != .null and error_code != .string) or
+        (result != .null and result != .string))
+    {
+        return null;
+    }
+
+    const arena = parsed.arena.allocator();
+    var compact = std.json.Value{ .object = .empty };
+    try compact.object.put(arena, "ok", ok);
+    try compact.object.put(arena, "result", result);
+    try compact.object.put(arena, "error_code", error_code);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn subagent_history_summary(
+    alloc: Allocator,
+    action: []const u8,
+    content: ?[]const u8,
+) Allocator.Error![]u8 {
+    const bounded = text_utils.utf8PrefixByBytes(content orelse "", 4096);
+    return if (bounded.len == 0)
+        std.fmt.allocPrint(alloc, "[Prior subagent {s} action completed.]", .{action})
+    else
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior subagent {s} action completed. Stored result follows.]\n{s}",
+            .{ action, bounded },
+        );
+}
+
+fn project_subagent_request_messages(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (!attempt_eligible or registry.lookup("subagent") == null) return source;
+
+    var calls: std.ArrayList(SubagentHistoryCall) = .empty;
+    defer calls.deinit(alloc);
+    var needs_projection = false;
+    for (source) |message| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls) |call| {
+            if (!std.mem.eql(u8, call.name, "subagent")) continue;
+            if (call.argument_integrity != .valid) {
+                try calls.append(alloc, .{
+                    .id = call.id,
+                    .action = "malformed",
+                    .disposition = .inert,
+                });
+                needs_projection = true;
+                continue;
+            }
+            if (legacy_subagent_action(call.arguments_json)) |action| {
+                try calls.append(alloc, .{
+                    .id = call.id,
+                    .action = action,
+                    .disposition = .inert,
+                });
+                needs_projection = true;
+                continue;
+            }
+            try calls.append(alloc, .{
+                .id = call.id,
+                .action = "managed",
+                .disposition = .current,
+            });
+            if (try normalized_subagent_request_arguments(
+                alloc,
+                call.arguments_json,
+            )) |arguments| {
+                alloc.free(arguments);
+                needs_projection = true;
+            }
+        }
+    }
+    for (source) |message| {
+        if (message.role != .tool or message.tool_call_id == null) continue;
+        const call = find_subagent_history_call(calls.items, message.tool_call_id.?) orelse continue;
+        if (call.disposition == .inert) {
+            needs_projection = true;
+            continue;
+        }
+        if (message.content) |content| {
+            if (try project_subagent_result_content(alloc, content)) |projected| {
+                alloc.free(projected);
+                needs_projection = true;
+            }
+        }
+    }
+    if (!needs_projection) return source;
+
+    const projected = try alloc.alloc(ChatMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projected[0..initialized]) |message| {
+            if (message.content) |content| alloc.free(@constCast(content));
+            for (message.tool_calls) |call| alloc.free(@constCast(call.arguments_json));
+            if (message.tool_calls.len != 0) alloc.free(@constCast(message.tool_calls));
+        }
+        alloc.free(projected);
+    }
+    for (source, projected) |message, *target| {
+        target.* = message;
+        target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
+        target.tool_calls = &.{};
+        initialized += 1;
+
+        if (message.role == .tool and message.tool_call_id != null) {
+            if (find_subagent_history_call(calls.items, message.tool_call_id.?)) |call| {
+                if (call.disposition == .inert) {
+                    if (target.content) |content| alloc.free(@constCast(content));
+                    target.content = null;
+                    target.role = .assistant;
+                    target.content = try subagent_history_summary(
+                        alloc,
+                        call.action,
+                        message.content,
+                    );
+                    target.tool_call_id = null;
+                    target.tool_name = null;
+                } else if (message.content) |content| {
+                    if (try project_subagent_result_content(alloc, content)) |compact| {
+                        if (target.content) |owned| alloc.free(@constCast(owned));
+                        target.content = compact;
+                    }
+                }
+            }
+        }
+
+        if (message.tool_calls.len != 0) {
+            var projected_calls: std.ArrayList(ToolCall) = .empty;
+            errdefer {
+                for (projected_calls.items) |call| alloc.free(@constCast(call.arguments_json));
+                projected_calls.deinit(alloc);
+            }
+            for (message.tool_calls) |call| {
+                const history_call = if (std.mem.eql(u8, call.name, "subagent"))
+                    find_subagent_history_call(calls.items, call.id)
+                else
+                    null;
+                if (history_call) |known| {
+                    if (known.disposition == .inert) continue;
+                    const arguments = (try normalized_subagent_request_arguments(
+                        alloc,
+                        call.arguments_json,
+                    )) orelse try alloc.dupe(u8, call.arguments_json);
+                    var copied = call;
+                    copied.arguments_json = arguments;
+                    projected_calls.append(alloc, copied) catch |err| {
+                        alloc.free(arguments);
+                        return err;
+                    };
+                    continue;
+                }
+                var copied = call;
+                copied.arguments_json = try alloc.dupe(u8, call.arguments_json);
+                projected_calls.append(alloc, copied) catch |err| {
+                    alloc.free(@constCast(copied.arguments_json));
+                    return err;
+                };
+            }
+            target.tool_calls = try projected_calls.toOwnedSlice(alloc);
+        }
+        if (message.role == .assistant and message.tool_calls.len != 0 and
+            target.tool_calls.len == 0 and target.content == null)
+        {
+            target.content = try alloc.dupe(
+                u8,
+                "Prior removed subagent actions are represented as completed history summaries below.",
+            );
+        }
+    }
+    return projected;
+}
+
+test "subagent history makes every removed manager action inert" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
+    const calls = [_]ToolCall{
+        .{
+            .id = "legacy-create",
+            .name = "subagent",
+            .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
+        },
+        .{
+            .id = "legacy-configure",
+            .name = "subagent",
+            .arguments_json = "{\"command\":{\"configure\":{\"id\":\"child-1\",\"name\":\"renamed\"}}}",
+        },
+        .{
+            .id = "current-run",
+            .name = "subagent",
+            .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"current\"}}",
+        },
+    };
+    const stored_result =
+        "{\"ok\":true,\"operation_id\":\"fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000\",\"child_id\":\"1788212822437-1788212822437350000-0924a40611358d88\",\"status\":\"idle\",\"error_code\":null,\"retryable\":false}";
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "legacy-create", .tool_name = "subagent", .content = stored_result },
+        .{ .role = .tool, .tool_call_id = "legacy-configure", .tool_name = "subagent", .content = "configured" },
+        .{ .role = .tool, .tool_call_id = "current-run", .tool_name = "subagent", .content = stored_result },
     };
 
+    const projected = try project_subagent_request_messages(
+        arena,
+        registry,
+        true,
+        &messages,
+    );
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
+    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[1].content.?,
+        "Prior subagent create action completed",
+    ) != null);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[2].content.?,
+        "Prior subagent configure action completed",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, projected[3].content.?, "operation_id") == null);
+    try std.testing.expectEqualStrings(calls[0].arguments_json, messages[0].tool_calls[0].arguments_json);
+
+    const idempotent = try project_subagent_request_messages(
+        arena,
+        registry,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_subagent_request_messages(
+        arena,
+        registry,
+        false,
+        &messages,
+    );
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void {
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
+    const calls = [_]ToolCall{.{
+        .id = "legacy",
+        .name = "subagent",
+        .arguments_json = "{\"command\":{\"message\":{\"send\":{\"id\":\"child-1\",\"content\":\"next\"}}}}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy",
+            .tool_name = "subagent",
+            .content = "{\"ok\":true,\"operation_id\":\"internal\",\"child_id\":\"child-1\",\"status\":\"message_sent\",\"error_code\":null,\"retryable\":false}",
+        },
+    };
+    const projected = try project_subagent_request_messages(
+        alloc,
+        registry,
+        true,
+        &messages,
+    );
+    if (projected.ptr == messages[0..].ptr) return error.TestUnexpectedResult;
+    defer free_terminal_request_projection(alloc, &messages, projected);
+}
+
+test "subagent history projection cleans every partial allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_subagent_history_projection_allocation_failures,
+        .{},
+    );
+}
+
+fn project_read_tool_result_request_messages(
+    arena: Allocator,
+    eligible: bool,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (!eligible) return source;
+
+    var projected: ?[]ChatMessage = null;
     for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         for (message.tool_calls, 0..) |call, call_index| {
-            if (call.argument_integrity != .valid) continue;
-            const tool = registry.lookup(call.name) orelse continue;
-            if (tool.executor_kind != .terminal) continue;
-            const arguments_json = try projected_terminal_request_arguments(
-                alloc,
+            if (call.argument_integrity != .valid or
+                !std.mem.eql(u8, call.name, "read_tool_result")) continue;
+            const arguments_json = try projected_read_tool_result_arguments(
+                arena,
                 call.arguments_json,
             ) orelse continue;
-
             if (projected == null) {
-                projected = alloc.dupe(ChatMessage, source) catch |err| {
-                    alloc.free(arguments_json);
-                    return err;
-                };
+                projected = try arena.dupe(ChatMessage, source);
             }
             if (projected.?[message_index].tool_calls.ptr == message.tool_calls.ptr) {
-                projected.?[message_index].tool_calls = alloc.dupe(ToolCall, message.tool_calls) catch |err| {
-                    alloc.free(arguments_json);
-                    return err;
-                };
+                projected.?[message_index].tool_calls = try arena.dupe(
+                    ToolCall,
+                    message.tool_calls,
+                );
             }
-            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json = arguments_json;
+            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json =
+                arguments_json;
         }
     }
     return projected orelse source;
@@ -340,19 +984,58 @@ fn normalized_terminal_request_arguments(
     return try out.toOwnedSlice();
 }
 
-const AgentTerminalLeaseTransition = union(enum) {
-    track: []const u8,
-    remove: []const u8,
-    atomic: []const u8,
-};
+fn managed_subagent_action(action: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "run", "message" }) |known| {
+        if (std.mem.eql(u8, action, known)) return known;
+    }
+    return null;
+}
 
-fn agent_terminal_lease_transition(
+fn normalized_subagent_request_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+
+    if (parsed.value.object.getPtr("request")) |request| {
+        if (parsed.value.object.count() != 1 or request.* != .object) return null;
+        const action = request.object.getPtr("action") orelse return null;
+        if (action.* != .string) return null;
+        const canonical = managed_subagent_action(action.string) orelse return null;
+        if (std.mem.eql(u8, canonical, action.string)) return null;
+        action.* = .{ .string = canonical };
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        std.json.Stringify.value(parsed.value, .{}, &out.writer) catch return error.OutOfMemory;
+        return try out.toOwnedSlice();
+    }
+
+    const action = parsed.value.object.getPtr("action") orelse return null;
+    if (action.* != .string) return null;
+    const canonical = managed_subagent_action(action.string) orelse return null;
+    action.* = .{ .string = canonical };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    _ = arena;
+    return try out.toOwnedSlice();
+}
+
+fn agentShellWriteLeaseSessionId(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
-) !?AgentTerminalLeaseTransition {
+) !?[]const u8 {
     const tool = registry.lookup(call.name) orelse return null;
-    if (tool.executor_kind != .terminal) return null;
+    if (tool.executor_kind != .terminal or
+        !std.mem.eql(u8, tool.name, "shell")) return null;
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -365,125 +1048,44 @@ fn agent_terminal_lease_transition(
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
     const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const is_write = std.mem.eql(u8, action.string, "write");
-    const is_close = std.mem.eql(u8, action.string, "close");
-    if (!is_write and !is_close) return null;
+    if (!std.mem.eql(u8, action.string, "write")) return null;
     const session_id = parsed.object.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
-    if (session_id != .string) {
+    if (session_id != .string or session_id.string.len == 0) {
         return error.InvalidTerminalLeaseTrackingInput;
     }
-    if (is_close) return .{ .remove = session_id.string };
-    const lease_value = parsed.object.get("lease");
-    const lease_absent = lease_value == null or terminal_lease_is_absent(lease_value.?);
-    if (lease_absent) {
-        const write = parsed.object.get("write") orelse
-            return error.InvalidTerminalLeaseTrackingInput;
-        if (write == .null) return error.InvalidTerminalLeaseTrackingInput;
-        return .{ .atomic = session_id.string };
-    }
-    const concrete_lease = lease_value.?;
-    if (concrete_lease != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const lease = std.meta.stringToEnum(
-        terminal_contracts.WriteLeaseIntent,
-        concrete_lease.string,
-    ) orelse return error.InvalidTerminalLeaseTrackingInput;
-    return switch (lease) {
-        .acquire, .use => .{ .track = session_id.string },
-        .release, .revoke => .{ .remove = session_id.string },
-    };
+    return session_id.string;
 }
 
-test "agent terminal lease transitions derive from normalized validated actions" {
+test "shell write retains one internal finalization lease safety edge" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
-    const cases = [_]struct {
-        lease: []const u8,
-        track: bool,
-    }{
-        .{ .lease = "acquire", .track = true },
-        .{ .lease = "use", .track = true },
-        .{ .lease = "release", .track = false },
-        .{ .lease = "revoke", .track = false },
-    };
-    for (cases) |case| {
-        const arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"{s}\",\"write\":null}}",
-            .{case.lease},
-        );
-        const transition = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{ .id = "call", .name = "terminal", .arguments_json = arguments_json },
-        )).?;
-        switch (transition) {
-            .track => |session_id| {
-                try std.testing.expect(case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .remove => |session_id| {
-                try std.testing.expect(!case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .atomic => unreachable,
-        }
-    }
-    const atomic_arguments = [_][]const u8{
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":null,\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"null\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-    };
-    for (atomic_arguments) |arguments_json| {
-        const atomic = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{
-                .id = "atomic",
-                .name = "terminal",
-                .arguments_json = arguments_json,
-            },
-        )).?;
-        switch (atomic) {
-            .atomic => |session_id| try std.testing.expectEqualStrings(
-                "terminal-one",
-                session_id,
-            ),
-            .track, .remove => unreachable,
-        }
-    }
-    const close = (try agent_terminal_lease_transition(
+    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
+    const session_id = (try agentShellWriteLeaseSessionId(
         arena,
         registry,
         .{
-            .id = "close",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-one\",\"close_policy\":\"force\"}",
+            .id = "write",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"shell-one\",\"input\":{\"kind\":\"text\",\"text\":\"input\"}}",
         },
     )).?;
-    switch (close) {
-        .remove => |session_id| try std.testing.expectEqualStrings(
-            "terminal-one",
-            session_id,
-        ),
-        .track, .atomic => unreachable,
-    }
-    try std.testing.expect((try agent_terminal_lease_transition(
+    try std.testing.expectEqualStrings("shell-one", session_id);
+    try std.testing.expect((try agentShellWriteLeaseSessionId(
         arena,
         registry,
-        .{ .id = "list", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "list", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
     )) == null);
 }
 
@@ -524,13 +1126,113 @@ fn normalize_terminal_request_tool_calls(
     return normalized orelse source;
 }
 
-test "terminal request normalization follows effective attempt advertisement" {
+fn normalize_subagent_request_tool_calls(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    source: []const ToolCall,
+) Allocator.Error![]const ToolCall {
+    if (!attempt_eligible) return source;
+
+    var normalized: ?[]ToolCall = null;
+    errdefer if (normalized) |calls| {
+        for (calls, source) |call, original| {
+            if (call.arguments_json.ptr != original.arguments_json.ptr) {
+                alloc.free(@constCast(call.arguments_json));
+            }
+        }
+        alloc.free(calls);
+    };
+
+    for (source, 0..) |call, index| {
+        if (call.argument_integrity != .valid) continue;
+        const tool = registry.lookup(call.name) orelse continue;
+        if (tool.executor_kind != .subagent) continue;
+        const arguments_json = try normalized_subagent_request_arguments(
+            alloc,
+            call.arguments_json,
+        ) orelse continue;
+        if (normalized == null) {
+            normalized = alloc.dupe(ToolCall, source) catch |err| {
+                alloc.free(arguments_json);
+                return err;
+            };
+        }
+        normalized.?[index].arguments_json = arguments_json;
+    }
+    return normalized orelse source;
+}
+
+test "subagent request normalization follows effective attempt advertisement" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     const nested = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
+        .name = "subagent",
+        .description = "subagent",
         .model_schema = .{
-            .name = "terminal",
-            .description = "terminal",
+            .name = "subagent",
+            .description = "subagent",
+            .input_schema = .{
+                .properties = &.{.{
+                    .name = "request",
+                    .json_type = .object,
+                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
+                }},
+                .required = &.{"request"},
+                .additional_properties = false,
+            },
+        },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{nested} };
+    const calls = [_]ToolCall{
+        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
+        .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
+        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"canonical\"}}" },
+        .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
+    };
+
+    try std.testing.expect(subagent_request_schema_advertised(&.{nested.model_schema}));
+    try std.testing.expect(subagent_request_normalization_eligible(true, .optional));
+    try std.testing.expect(!subagent_request_normalization_eligible(true, .required));
+    const normalized = try normalize_subagent_request_tool_calls(
+        arena,
+        registry,
+        true,
+        &calls,
+    );
+    try std.testing.expect(normalized.ptr != calls[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"action\":\"run\",\"task\":\"review\"}}",
+        normalized[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        calls[1].arguments_json,
+        normalized[1].arguments_json,
+    );
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+    const ineligible = try normalize_subagent_request_tool_calls(
+        arena,
+        registry,
+        false,
+        &calls,
+    );
+    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
+}
+
+test "shell request normalization follows effective attempt advertisement" {
+    const nested = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{
+            .name = "shell",
+            .description = "shell",
             .input_schema = .{
                 .properties = &.{.{
                     .name = "request",
@@ -547,9 +1249,9 @@ test "terminal request normalization follows effective attempt advertisement" {
         .irreversible_fn = undefined,
     };
     const flat = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
@@ -604,15 +1306,15 @@ test "terminal inferred model input round trips every atomic write payload" {
     }
 }
 
-test "terminal request projection wraps eligible flat objects without changing source messages" {
+test "shell request projection wraps eligible flat objects without changing source messages" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -646,21 +1348,21 @@ test "terminal request projection wraps eligible flat objects without changing s
     };
     var calls: [cases.len + 3]ToolCall = undefined;
     for (cases, 0..) |case, index| {
-        calls[index] = .{ .id = case.id, .name = "terminal", .arguments_json = case.input };
+        calls[index] = .{ .id = case.id, .name = "shell", .arguments_json = case.input };
     }
-    calls[cases.len] = .{ .id = "malformed", .name = "terminal", .arguments_json = "{", .argument_integrity = .malformed_json };
+    calls[cases.len] = .{ .id = "malformed", .name = "shell", .arguments_json = "{", .argument_integrity = .malformed_json };
     calls[cases.len + 1] = .{ .id = "unknown-tool", .name = "missing", .arguments_json = "{}" };
     calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
         .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]", .cache_policy = .no_cache },
-        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "terminal" },
+        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
     };
 
     const projected = try project_terminal_request_messages(arena, registry, true, &messages);
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
-    try std.testing.expectEqual(messages[0].tool_calls.ptr, projected[0].tool_calls.ptr);
+    try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
     try std.testing.expectEqualStrings("assistant", projected[1].content.?);
     try std.testing.expectEqualStrings("[]", projected[1].provider_state_json.?);
     try std.testing.expectEqual(.no_cache, projected[1].cache_policy);
@@ -679,11 +1381,180 @@ test "terminal request projection wraps eligible flat objects without changing s
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
 
+test "legacy read_tool_result history gains one nested request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const calls = [_]ToolCall{
+        .{ .id = "legacy", .name = "read_tool_result", .arguments_json = "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}" },
+        .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
+    };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+
+    const projected = try project_read_tool_result_request_messages(
+        arena,
+        true,
+        &messages,
+    );
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}}",
+        projected[0].tool_calls[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        calls[1].arguments_json,
+        projected[0].tool_calls[1].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}",
+        messages[0].tool_calls[0].arguments_json,
+    );
+
+    const idempotent = try project_read_tool_result_request_messages(
+        arena,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_read_tool_result_request_messages(
+        arena,
+        false,
+        &messages,
+    );
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+test "mixed legacy terminal batches become inert in every order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
+    const calls = [_]ToolCall{
+        .{
+            .id = "legacy-exec",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\",\"timeout_ms\":1000}",
+        },
+        .{
+            .id = "legacy-start",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"start\",\"command\":\"sleep 5\"}",
+        },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-exec",
+            .tool_name = "terminal",
+            .content = "exit_code=0",
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-start",
+            .tool_name = "terminal",
+            .content = "session started",
+        },
+    };
+
+    const projected = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &messages,
+    );
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[1].content.?,
+        "Prior terminal exec action completed",
+    ) != null);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
+    try std.testing.expect(projected[2].tool_call_id == null);
+    try std.testing.expect(projected[2].tool_name == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[2].content.?,
+        "Prior terminal start action completed",
+    ) != null);
+    try std.testing.expectEqualStrings("terminal", messages[0].tool_calls[0].name);
+
+    const idempotent = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+
+    const reversed_calls = [_]ToolCall{ calls[1], calls[0] };
+    const reversed_messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &reversed_calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-start",
+            .tool_name = "terminal",
+            .content = "session started",
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-exec",
+            .tool_name = "terminal",
+            .content = "exit_code=0",
+        },
+    };
+    const reversed = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &reversed_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 0), reversed[0].tool_calls.len);
+    try std.testing.expectEqual(types.ChatRole.assistant, reversed[1].role);
+    try std.testing.expectEqual(types.ChatRole.assistant, reversed[2].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        reversed[1].content.?,
+        "Prior terminal start action completed",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        reversed[2].content.?,
+        "Prior terminal exec action completed",
+    ) != null);
+
+    const exec_only_messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        messages[1],
+    };
+    const exec_only = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &exec_only_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), exec_only[0].tool_calls.len);
+    try std.testing.expectEqualStrings("shell", exec_only[0].tool_calls[0].name);
+    try std.testing.expectEqual(types.ChatRole.tool, exec_only[1].role);
+    try std.testing.expectEqualStrings("shell", exec_only[1].tool_name.?);
+}
+
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
     const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -693,12 +1564,12 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const tools = [_]tool_dispatch.Tool{terminal_tool};
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const first_calls = [_]ToolCall{
-        .{ .id = "one", .name = "terminal", .arguments_json = "{}" },
-        .{ .id = "two", .name = "terminal", .arguments_json = "{\"action\":null}" },
-        .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
+        .{ .id = "one", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "two", .name = "shell", .arguments_json = "{\"action\":null}" },
+        .{ .id = "atomic", .name = "shell", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
     };
     const second_calls = [_]ToolCall{
-        .{ .id = "three", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "three", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
     };
     const source = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = &first_calls },
@@ -1369,7 +2240,51 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     return .{
         .status = if (provider_status == .success) .success else .failure,
         .model_output = provider_result,
+        .inner_usage = if (runtime_tool_presentation.isProviderSearchAlias(call.name))
+            .{ .web_search_requests = 1 }
+        else
+            null,
     };
+}
+
+fn reportProviderExecutedUsage(
+    deps: *const AgentRuntimeDeps,
+    calls: []const ToolCall,
+) void {
+    for (calls) |call| {
+        const execution = providerExecutedResult(call) orelse continue;
+        runtime_parallel_execution.reportInnerToolUsage(deps, call.name, execution);
+    }
+}
+
+test "provider executed result reports one observed request only for search aliases" {
+    const aliases = [_][]const u8{
+        "exa_search",
+        "parallel_search",
+        "perplexity_search",
+    };
+    for (aliases) |name| {
+        const result = providerExecutedResult(.{
+            .id = "provider_call",
+            .name = name,
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        }) orelse return error.TestExpectedProviderResult;
+        const usage = result.inner_usage orelse return error.TestExpectedSearchUsage;
+        try std.testing.expectEqual(@as(u32, 1), usage.web_search_requests);
+        try std.testing.expectEqual(@as(u64, 0), usage.input_tokens);
+        try std.testing.expectEqual(@as(u64, 0), usage.output_tokens);
+    }
+
+    const non_search = providerExecutedResult(.{
+        .id = "provider_call",
+        .name = "provider_tool",
+        .arguments_json = "{}",
+        .provider_result = "{}",
+        .provenance = .provider_executed,
+    }) orelse return error.TestExpectedProviderResult;
+    try std.testing.expectEqual(@as(?types.ToolUsage, null), non_search.inner_usage);
 }
 
 fn hasToolResult(messages: []const ChatMessage, call_id: []const u8) bool {
@@ -1394,15 +2309,12 @@ fn appendProviderExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
 ) !void {
-    const provider_result = call.provider_result orelse
+    const execution = providerExecutedResult(call) orelse
         return error.MalformedProviderResultIdentity;
+    const provider_result = execution.model_output;
     const provider_status = runtime_execution_memory.classifyProviderExecutedResultStatus(
         provider_result,
     );
-    const execution: ToolExecutionResult = .{
-        .status = if (provider_status == .success) .success else .failure,
-        .model_output = provider_result,
-    };
     const prepared = try runtime_execution_memory.prepareToolModelOutput(
         arena,
         config,
@@ -1516,6 +2428,7 @@ fn materializeConfirmedProviderTools(
         completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
+    reportProviderExecutedUsage(deps, novel_calls);
     for (novel_calls) |call| {
         try appendProviderExecutedToolResult(
             deps,
@@ -2176,6 +3089,22 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     };
 }
 
+fn isPostVisionAssistantPrefillRejection(
+    status: std.http.Status,
+    detail: []const u8,
+    messages: []const ChatMessage,
+) bool {
+    if (status != .bad_request or messages.len == 0) return false;
+    const tail = messages[messages.len - 1];
+    if (tail.role != .tool or
+        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
+    {
+        return false;
+    }
+    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
+        std.mem.find(u8, detail, "must end with a user message") != null;
+}
+
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return .{
@@ -2626,7 +3555,8 @@ fn traceRouteFailure(
     );
 }
 
-pub fn processQueuedPrompt(
+pub fn processAgentPrompt(
+    agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
@@ -2648,6 +3578,7 @@ pub fn processQueuedPrompt(
     {
         effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
     }
+    agent.startTurn();
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
@@ -2655,7 +3586,7 @@ pub fn processQueuedPrompt(
     );
     defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -2762,9 +3693,23 @@ fn processQueuedPromptInner(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    borrowed_job: QueuedPrompt,
     finalization: *TurnFinalizationGuard,
+    agent: *runtime_agent.Agent,
 ) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var job = borrowed_job;
+    job.account_id = if (borrowed_job.account_id) |account_id|
+        try arena.dupe(u8, account_id)
+    else
+        null;
+    job.gateway_team = if (borrowed_job.gateway_team) |gateway_team|
+        try arena.dupe(u8, gateway_team)
+    else
+        null;
+
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
         if (config.origin == .root) job.prompt else "",
@@ -2780,12 +3725,16 @@ fn processQueuedPromptInner(
         }
     }
 
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const base_nested_terminal_advertised = terminal_request_schema_advertised(
         config.advertised_functions,
     );
+    const base_nested_subagent_advertised = subagent_request_schema_advertised(
+        config.advertised_functions,
+    );
+    const base_nested_read_tool_result_advertised =
+        read_tool_result_request_schema_advertised(
+            config.advertised_functions,
+        );
 
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     defer stable_prefix.deinit(arena);
@@ -2920,6 +3869,8 @@ fn processQueuedPromptInner(
         job,
         request_capabilities,
         base_nested_terminal_advertised,
+        base_nested_subagent_advertised,
+        base_nested_read_tool_result_advertised,
         finalization,
         arena,
         turn_id,
@@ -2934,6 +3885,7 @@ fn processQueuedPromptInner(
         &interrupted_persisted,
         current_user_message,
         &stop_state,
+        agent,
     ) catch |err| {
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
@@ -3025,51 +3977,40 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 fn buildReviewTurnContext(
     config: Config,
     model: []const u8,
-    current_prompt: []const u8,
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     pending_assistant: ChatMessage,
+    credential: types.CredentialLease,
     target_call_id: []const u8,
 ) permission_auto_classifier.ReviewTurnContext {
-    const current_root_request = currentRootRequest(
-        config,
-        current_prompt,
+    const trusted_root_context = auto_classifier_context.rootUserRequestContext(
         root_user_intent_context,
-    );
+    ) orelse "";
     return .{
         .model = model,
         .pending_assistant = pending_assistant,
+        .credential = credential,
         .target_call_id = target_call_id,
         .origin = switch (config.origin) {
             .root => .root,
             .subagent => .subagent,
         },
-        .current_root_request = current_root_request,
+        .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
     };
 }
 
-fn currentRootRequest(
-    config: Config,
-    current_prompt: []const u8,
-    root_user_intent_context: []const u8,
-) []const u8 {
-    return if (root_user_intent_context.len > 0)
-        auto_classifier_context.currentRootUserRequest(
-            root_user_intent_context,
-        ) orelse root_user_intent_context
-    else if (config.origin == .root)
-        current_prompt
-    else if (config.current_prompt_is_root_authority)
-        current_prompt
-    else if (auto_classifier_context.currentRootUserRequest(
-        config.root_user_intent_context,
-    )) |request|
-        request
-    else if (config.root_user_messages.len > 0)
-        config.root_user_messages[config.root_user_messages.len - 1]
-    else
-        "";
+fn activeCredentialLease(
+    secret_value: []const u8,
+    job: QueuedPrompt,
+) types.CredentialLease {
+    if (job.credential_source == .host_managed) return .host_managed;
+    return .{ .direct = .{
+        .secret_bytes = secret_value,
+        .source = job.credential_source orelse .ai_gateway_api_key,
+        .account_id = job.account_id,
+        .tenant_context = job.gateway_team,
+    } };
 }
 
 fn appendTrustedPermissionFeedback(
@@ -3203,6 +4144,8 @@ fn processQueuedPromptLoop(
     job: QueuedPrompt,
     request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
+    base_nested_subagent_advertised: bool,
+    base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
@@ -3217,6 +4160,7 @@ fn processQueuedPromptLoop(
     interrupted_persisted_ptr: *bool,
     current_user_message: ChatMessage,
     stop_state: *CommonStopState,
+    agent: *runtime_agent.Agent,
 ) !void {
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
@@ -3231,6 +4175,8 @@ fn processQueuedPromptLoop(
     defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
+    var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
+    defer shell_execution_failure_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
@@ -3240,7 +4186,24 @@ fn processQueuedPromptLoop(
         .{};
     defer context_delivery_state.deinit(arena);
     const root_user_intent_context = switch (config.origin) {
-        .subagent => config.root_user_intent_context,
+        .subagent => if (config.current_prompt_is_root_authority)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                job.prompt,
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else if (config.root_user_intent_context.len > 0)
+            config.root_user_intent_context
+        else if (config.root_user_messages.len > 0)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                config.root_user_messages[config.root_user_messages.len - 1],
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else
+            "",
         .root => if (job.root_user_intent_context.len > 0)
             job.root_user_intent_context
         else
@@ -3268,6 +4231,12 @@ fn processQueuedPromptLoop(
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try selected_dynamic_tool_names.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
+    try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
+    for (config.initial_dynamic_tools) |tool| {
+        selected_dynamic_tool_names.appendAssumeCapacity(tool.name);
+        selected_dynamic_tools.appendAssumeCapacity(tool);
+    }
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
@@ -3276,6 +4245,7 @@ fn processQueuedPromptLoop(
     }
     var pending_image_ids: []const usize = initial_pending_image_ids;
     var configured_first_tool_choice_pending = true;
+    var return_to_user_pending = false;
     var active_presentation_group_id: ?types.ToolPresentationGroupId = null;
     const restored_attempts = if (job.recovery_checkpoint) |checkpoint|
         restoredConsumedAttempts(checkpoint)
@@ -3340,10 +4310,6 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
-    var post_tool_decision_pending = if (job.recovery_checkpoint) |checkpoint|
-        checkpoint.execution.tool_steps.len > 0
-    else
-        false;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -3382,9 +4348,7 @@ fn processQueuedPromptLoop(
             &ephemeral_overlay,
         );
         var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
-        const initial_decision_pending = post_tool_decision_pending or
-            recovery_strategy == .continue_after_confirmed_tool;
-        last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
+        last_gateway_message_count = gateway_messages.items.len;
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
         const current_user_message_index = history_start_index + history_messages.items.len;
 
@@ -3425,6 +4389,7 @@ fn processQueuedPromptLoop(
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
         var auth_retry_used = false;
+        var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
@@ -3591,20 +4556,14 @@ fn processQueuedPromptLoop(
                     stream_ctx.raw_text.items,
                 ),
             );
-            const decision_source_messages = try append_post_tool_decision_prompt(
-                overlay_arena,
-                recovery_source_messages,
-                post_tool_decision_pending or
-                    recovery_strategy == .continue_after_confirmed_tool,
-            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
-                    break :blk decision_source_messages;
+                    break :blk recovery_source_messages;
                 }
                 break :blk switch (vision_policy.route) {
                     .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
-                        decision_source_messages,
+                        recovery_source_messages,
                         current_user_message_index,
                     ),
                     .fallback => fallback: {
@@ -3613,7 +4572,7 @@ fn processQueuedPromptLoop(
                         }
                         break :fallback try runtime_vision_contracts.project_text_only_messages(
                             overlay_arena,
-                            decision_source_messages,
+                            recovery_source_messages,
                             current_user_message_index,
                             job.authorized_image_catalog,
                         );
@@ -3629,16 +4588,38 @@ fn processQueuedPromptLoop(
                 base_nested_terminal_advertised,
                 vision_mode,
             );
-            const request_messages = try project_terminal_request_messages(
+            const subagent_request_eligible = subagent_request_normalization_eligible(
+                base_nested_subagent_advertised,
+                vision_mode,
+            );
+            const read_tool_result_request_eligible =
+                terminal_request_normalization_eligible(
+                    base_nested_read_tool_result_advertised,
+                    vision_mode,
+                );
+            const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
             );
+            const subagent_request_messages = try project_subagent_request_messages(
+                overlay_arena,
+                deps.tool_registry,
+                subagent_request_eligible,
+                terminal_request_messages,
+            );
+            const request_messages = try project_read_tool_result_request_messages(
+                overlay_arena,
+                read_tool_result_request_eligible,
+                subagent_request_messages,
+            );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
+                .none
+            else if (return_to_user_pending)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
@@ -4085,13 +5066,16 @@ fn processQueuedPromptLoop(
             );
             stream_result_set = true;
             const first_failure = streamFailure(stream_result);
-            if (job.provider != .gateway and
-                first_failure != null and first_failure.?.kind == .unauthorized and
-                !auth_retry_used and
-                stream_ctx.raw_text.items.len == 0 and
-                !stream_ctx.saw_tool_start and
-                streamCompletion(stream_result).tool_calls.len == 0)
-            {
+            const auth_replay = auth_transition.decideAuthReplay(.{
+                .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
+                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
+                .delivery_safe = stream_ctx.raw_text.items.len == 0 and
+                    !stream_ctx.saw_tool_start and
+                    streamCompletion(stream_result).tool_calls.len == 0,
+                .authority_stable = true,
+                .already_replayed = auth_retry_used,
+            });
+            if (auth_replay == .refresh_and_replay) {
                 if (try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
@@ -4121,7 +5105,7 @@ fn processQueuedPromptLoop(
                     );
                     debug_trace.eventf(
                         "auth",
-                        "subscription_request_replayed",
+                        "authenticated_request_replayed",
                         step_ctx,
                         "semantic_attempt={d}",
                         .{semantic_attempt + 1},
@@ -4133,6 +5117,12 @@ fn processQueuedPromptLoop(
                     arena,
                     deps.tool_registry,
                     terminal_request_eligible,
+                    completion.tool_calls,
+                );
+                completion.tool_calls = try normalize_subagent_request_tool_calls(
+                    arena,
+                    deps.tool_registry,
+                    subagent_request_eligible,
                     completion.tool_calls,
                 );
             }
@@ -4238,34 +5228,38 @@ fn processQueuedPromptLoop(
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
-            if (response_failure != null and response_failure.?.kind == .unauthorized and
-                job.provider == .gateway and
-                !auth_retry_used and
-                semantic_attempt + 1 < semantic_limit)
-            {
-                if (try refreshGatewayCredentialForJob(
-                    deps,
-                    std.heap.c_allocator,
-                    job,
-                    .force,
-                    &active_api_key,
-                    &owned_refreshed_api_key,
-                    step_ctx,
-                )) {
-                    auth_retry_used = true;
-                    stream_result.deinit(arena);
-                    stream_result_set = false;
-                    semantic_attempt += 1;
-                    recovery_strategy = .retry_request;
-                    recovery_cause = .authentication;
-                    retry_pacing = .idle;
-                    reset_stream_for_next_attempt = true;
-                    skip_next_preflight_refresh = true;
-                    continue;
-                }
-            }
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
+
+            if (!assistant_prefill_recovery_used and
+                semantic_attempt + 1 < semantic_limit and
+                streamReplaySafe(&stream_ctx) and
+                isPostVisionAssistantPrefillRejection(
+                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failure.detail orelse "" else "",
+                    request_messages,
+                ))
+            {
+                try within_turn_suffix.append(arena, .{
+                    .role = .user,
+                    .content = assistant_prefill_recovery_prompt,
+                    .cache_policy = .no_cache,
+                });
+                debug_trace.eventf(
+                    "gateway",
+                    "assistant_prefill_recovery",
+                    step_ctx,
+                    "tool_name=vision provider_attempt={d}/{d}",
+                    .{ semantic_attempt + 1, semantic_limit },
+                );
+                stream_result.deinit(arena);
+                stream_result_set = false;
+                assistant_prefill_recovery_used = true;
+                semantic_attempt += 1;
+                retry_pacing = .idle;
+                reset_stream_for_next_attempt = true;
+                continue;
+            }
 
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
@@ -4693,9 +5687,9 @@ fn processQueuedPromptLoop(
             successful_recovery_strategy = recovery_strategy;
             retainCompletedResultInTurnArena(&stream_result);
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
+            return_to_user_pending = false;
             break;
         }
-        post_tool_decision_pending = false;
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
@@ -4729,7 +5723,6 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
-                    post_tool_decision_pending = true;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -4901,11 +5894,12 @@ fn processQueuedPromptLoop(
                 report_fn(deps.ctx, completion.usage);
             }
         }
+        agent.observeUsage(completion.usage);
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
             switch (admission) {
-                .admitted => {},
+                .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure=duplicate", .{});
@@ -5341,7 +6335,6 @@ fn processQueuedPromptLoop(
                         .idempotent = prepareNoIdempotentTerminal,
                         .validation = prepareValidationTerminal,
                         .availability = prepareAvailabilityTerminal,
-                        .stop_policy = prepareNoIdempotentTerminal,
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
@@ -5549,6 +6542,7 @@ fn processQueuedPromptLoop(
 
         var step_batch = runtime_tool_batch.StepBatchState{};
         terminal_validation_retry.beginBatch();
+        shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
         for (effective_tool_calls) |tool_call| {
             malformed_arguments_retry.observe(tool_call);
@@ -5566,11 +6560,23 @@ fn processQueuedPromptLoop(
                 null,
             );
 
-            const parallel_candidate_len = if (successful_vision_mode != .required and
+            const parallel_group = if (successful_vision_mode != .required and
                 !context_delta and
-                (root_action_permission_mode == .auto or root_action_permission_mode == .yolo) and
                 deps.live_tool_authority == null)
-                runtime_parallel_execution.parallelReadOnlyPrefixLen(deps.tool_registry, effective_tool_calls[tool_call_index..])
+                runtime_parallel_execution.leadingParallelGroup(
+                    deps.tool_registry,
+                    effective_tool_calls[tool_call_index..],
+                )
+            else
+                runtime_parallel_execution.LeadingGroup{};
+            const parallel_permission_eligible = switch (parallel_group.kind) {
+                .none => false,
+                .read_only => root_action_permission_mode == .auto or
+                    root_action_permission_mode == .yolo,
+                .subagent => true,
+            };
+            const parallel_candidate_len = if (parallel_permission_eligible)
+                parallel_group.len
             else
                 0;
             const parallel_len = if (parallel_candidate_len > 1) parallel: {
@@ -5714,10 +6720,10 @@ fn processQueuedPromptLoop(
                     const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
-                        job.prompt,
                         root_user_intent_context,
                         within_turn_suffix.items,
                         pending_assistant,
+                        activeCredentialLease(active_api_key, job),
                         parallel_call.id,
                     );
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
@@ -5860,7 +6866,13 @@ fn processQueuedPromptLoop(
                             };
                         }
                     }
-                    debug_trace.eventf("tool", "parallel_read_only_start", step_ctx, "count={d}", .{executable_calls.items.len});
+                    debug_trace.eventf(
+                        "tool",
+                        "parallel_tool_group_start",
+                        step_ctx,
+                        "kind={s} count={d}",
+                        .{ @tagName(parallel_group.kind), executable_calls.items.len },
+                    );
                     const parallel_execution_root_user_context = try buildToolExecutionRootUserContext(
                         arena,
                         root_user_intent_context,
@@ -5879,7 +6891,7 @@ fn processQueuedPromptLoop(
                         .classification_complete = executable_classification_complete.items,
                     };
                     if (comptime host_target.is_wasm) {
-                        parallel_run = try runtime_parallel_execution.runSequentialReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -5887,7 +6899,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                         });
                     } else {
-                        parallel_run = try runtime_parallel_execution.runParallelReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -5935,10 +6947,13 @@ fn processQueuedPromptLoop(
                 );
                 debug_trace.eventf(
                     "tool",
-                    "parallel_read_only_finish",
+                    "parallel_tool_group_finish",
                     step_ctx,
-                    "count={d}",
-                    .{if (parallel_run) |run| run.attempts.len else 0},
+                    "kind={s} count={d}",
+                    .{
+                        @tagName(parallel_group.kind),
+                        if (parallel_run) |run| run.attempts.len else 0,
+                    },
                 );
                 if (config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
@@ -6210,49 +7225,6 @@ fn processQueuedPromptLoop(
                                     tool_call,
                                     safe_output,
                                     prepared_terminal.memory,
-                                    .{ .increment_error = true },
-                                );
-                            },
-                            .stop_policy => {
-                                const defer_auto_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
-                                    deps.tool_registry,
-                                    arena,
-                                    tool_call,
-                                    root_action_permission_mode,
-                                    lifecycle.scope.kind == .interactive,
-                                );
-                                const status_started = if (runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
-                                    !defer_auto_lifecycle)
-                                    false
-                                else
-                                    try runtime_tool_presentation.startToolVisibleLifecycle(
-                                        deps,
-                                        arena,
-                                        turn_id,
-                                        stream_ctx.provisional_statuses.presentation_group_id,
-                                        tool_call,
-                                        tool_display_target,
-                                        advertised_dynamic_tool_names,
-                                    );
-                                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                                    deps,
-                                    stream_ctx.alloc,
-                                    arena,
-                                    turn_id,
-                                    tool_call,
-                                    status_started,
-                                    tool_display_target,
-                                    "Blocked",
-                                    advertised_dynamic_tool_names,
-                                );
-                                try runtime_tool_batch.appendToolResultContent(
-                                    arena,
-                                    &within_turn_suffix,
-                                    &completed_tool_names,
-                                    &step_batch,
-                                    tool_call,
-                                    safe_output,
-                                    null,
                                     .{ .increment_error = true },
                                 );
                             },
@@ -6670,43 +7642,6 @@ fn processQueuedPromptLoop(
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
             }
 
-            if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(
-                arena,
-                successful_source_messages,
-                tool_call,
-                job.prompt,
-            )) |blocked_output| {
-                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                    deps,
-                    stream_ctx.alloc,
-                    arena,
-                    turn_id,
-                    tool_call,
-                    status_started,
-                    tool_display_target,
-                    "Blocked",
-                    advertised_dynamic_tool_names,
-                );
-                debug_trace.eventf(
-                    "tool",
-                    "execution_result",
-                    step_ctx,
-                    "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}",
-                    .{ tool_call.id, tool_call.name, blocked_output.len },
-                );
-                try runtime_tool_batch.appendToolResultContent(
-                    arena,
-                    &within_turn_suffix,
-                    &completed_tool_names,
-                    &step_batch,
-                    tool_call,
-                    blocked_output,
-                    null,
-                    .{ .increment_error = true },
-                );
-                continue;
-            }
-
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
             if (is_file_mutation) {
                 file_call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -6723,10 +7658,10 @@ fn processQueuedPromptLoop(
             const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
-                job.prompt,
                 root_user_intent_context,
                 within_turn_suffix.items,
                 pending_assistant,
+                activeCredentialLease(active_api_key, job),
                 execution_call.id,
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
@@ -6743,12 +7678,12 @@ fn processQueuedPromptLoop(
                 turn_file_mutation_denials.preservedOutcome(identity)
             else
                 null;
-            const preserved_review_caution = if (action_permission_mode == .auto)
-                turn_review_cache.cachedCaution(execution_call)
+            const preserved_review_hold = if (action_permission_mode == .auto)
+                turn_review_cache.cached(execution_call)
             else
                 null;
             const effective_preserved_denial = preserved_denial orelse
-                preserved_review_caution;
+                preserved_review_hold;
             if (effective_preserved_denial != null) {
                 debug_trace.eventf(
                     "permission",
@@ -6999,13 +7934,13 @@ fn processQueuedPromptLoop(
                 }
                 const reason = permission_outcome.denial_reason orelse
                     decision.denialReason() orelse .user_denied;
-                try turn_review_cache.rememberCaution(
+                try turn_review_cache.remember(
                     arena,
                     tool_call,
                     permission_outcome,
                 );
                 const denied_output = switch (reason) {
-                    .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                    .review_caution, .review_evidence_incomplete, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
                         arena,
                         tool_call.name,
                         reason,
@@ -7219,16 +8154,14 @@ fn processQueuedPromptLoop(
             else
                 null;
 
-            const terminal_lease_transition = try agent_terminal_lease_transition(
+            const terminal_write_lease_session_id = try agentShellWriteLeaseSessionId(
                 arena,
                 deps.tool_registry,
                 execution_call,
             );
-            if (terminal_lease_transition) |transition| switch (transition) {
-                .track => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .atomic => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .remove => {},
-            };
+            if (terminal_write_lease_session_id) |session_id| {
+                try finalization.track_agent_terminal_lease(session_id);
+            }
 
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
@@ -7251,6 +8184,7 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
+                .credential = activeCredentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},
@@ -7282,9 +8216,17 @@ fn processQueuedPromptLoop(
                 execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
+            var result_commit_pending = execution.result_commit != null;
+            defer if (result_commit_pending) {
+                execution.result_commit.?.cancel();
+            };
 
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
+                if (execution.result_commit) |commit| {
+                    try commit.commit();
+                    result_commit_pending = false;
+                }
                 var replay_handed_off = execution.command_replay_capture == null;
                 defer if (!replay_handed_off) {
                     execution.command_replay_capture.?.discard(arena);
@@ -7363,11 +8305,9 @@ fn processQueuedPromptLoop(
             }
 
             if (execution.status == .success) {
-                if (terminal_lease_transition) |transition| switch (transition) {
-                    .track => {},
-                    .atomic => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                    .remove => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                };
+                if (terminal_write_lease_session_id) |session_id| {
+                    finalization.remove_agent_terminal_lease(session_id);
+                }
             }
 
             if (deps.tool_activity_recorder) |recorder| {
@@ -7462,7 +8402,7 @@ fn processQueuedPromptLoop(
                 execution.command_replay_capture,
             ) catch |err| switch (err) {
                 error.CommandOutputCaptureFailed => {
-                    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+                    const capture_failure = try command_result_mapping.Command.outputCaptureFailure(arena);
                     execution.status = .failure;
                     execution.model_output = capture_failure.model_output;
                     prepared.model_output = capture_failure.model_output;
@@ -7476,6 +8416,11 @@ fn processQueuedPromptLoop(
                 else => return err,
             };
             const safe_tool_output = prepared.model_output;
+            try shell_execution_failure_retry.observe(
+                arena,
+                tool_call,
+                execution,
+            );
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,
                 call_allocator,
@@ -7516,6 +8461,10 @@ fn processQueuedPromptLoop(
                         ),
                     },
                 );
+                if (execution.result_commit) |commit| {
+                    try commit.commit();
+                    result_commit_pending = false;
+                }
                 replay_handed_off = true;
                 if (permission_outcome.feedback) |feedback| {
                     try appendPermissionFeedbackAfterToolResult(
@@ -7589,6 +8538,13 @@ fn processQueuedPromptLoop(
                 prepared.memory,
                 execution,
             );
+            if (execution.result_commit) |commit| {
+                try commit.commit();
+                result_commit_pending = false;
+            }
+            if (execution.turn_control) |control| switch (control) {
+                .return_to_user => return_to_user_pending = true,
+            };
             replay_handed_off = true;
             if (execution.system_notice) |notice| {
                 try within_turn_suffix.append(arena, .{ .role = .system, .content = notice });
@@ -7631,7 +8587,6 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
-        post_tool_decision_pending = true;
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",
@@ -7680,6 +8635,28 @@ fn processQueuedPromptLoop(
                 null,
                 &finish_trace,
                 "terminal_validation_retry",
+            );
+            return;
+        }
+        if (shell_execution_failure_retry.finishBatch()) {
+            debug_trace.eventf(
+                "agent",
+                "repeated_shell_execution_failure",
+                step_ctx,
+                "tool_call_count={d}",
+                .{effective_tool_calls.len},
+            );
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                repeated_shell_execution_failure_notice,
+                "repeated_shell_execution_failure",
             );
             return;
         }

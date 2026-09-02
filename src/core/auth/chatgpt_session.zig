@@ -2,6 +2,8 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
 const native_auth_store = if (host_target.is_wasm) struct {} else @import("../hosts/native_auth_store.zig");
+const host = @import("../hosts/host.zig");
+const types = @import("../shared/types.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -9,6 +11,11 @@ const schema_version: i64 = 1;
 const expiry_skew_ms: i64 = 60 * 1000;
 
 pub const issuer = "https://auth.openai.com";
+
+pub fn presence() host.SecretStorePresence {
+    if (comptime host_target.is_wasm) return .missing;
+    return native_auth_store.entry_presence(.chatgpt_subscription);
+}
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
@@ -147,6 +154,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const account_id = try dupeRequiredString(alloc, object, "account_id");
     errdefer alloc.free(account_id);
+    if (!types.validCredentialAccountId(account_id)) return error.InvalidChatGptAuthSession;
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
     return .{
         .access_token = access_token,
@@ -205,4 +213,16 @@ test "ChatGPT auth session round trips without exposing token fields to structur
 test "ChatGPT session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+}
+
+test "ChatGPT auth session rejects account identifiers unsafe for HTTP headers" {
+    var session = parse(
+        std.testing.allocator,
+        "{\"version\":1,\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":1000,\"account_id\":\"acct\\r\\ninjected\"}",
+    ) catch |err| {
+        try std.testing.expectEqual(error.InvalidChatGptAuthSession, err);
+        return;
+    };
+    defer session.deinit(std.testing.allocator);
+    return error.TestExpectedInvalidChatGptAuthSession;
 }
