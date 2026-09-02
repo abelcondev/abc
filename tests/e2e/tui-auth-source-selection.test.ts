@@ -1703,7 +1703,14 @@ async function selectFxLoginCredential(pickerSession: TmuxSession): Promise<void
     TIMEOUT,
   );
   await pickerSession.sendKeys("Enter");
-  await pickerSession.waitForText("Switched credential to fx login", TIMEOUT);
+  const outcome = await pickerSession.waitForPane(
+    (pane) => pane.includes("Switched credential to fx login") || pane.includes("vercel-labs"),
+    TIMEOUT,
+  );
+  if (!outcome.includes("Switched credential to fx login")) {
+    await pickerSession.sendKeys("Enter");
+    await pickerSession.waitForText("Changed Vercel team", TIMEOUT);
+  }
 }
 
 // Selecting the environment key goes through the api-key method's which-key
