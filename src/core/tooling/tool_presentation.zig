@@ -176,7 +176,7 @@ pub fn formatRunCommandActivity(
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     const detail = (try formatRunCommandDetailBounded(
         alloc,
-        call.arguments_json,
+        command,
         workspace_root,
         max_run_command_activity_bytes,
     )) orelse return null;
@@ -188,20 +188,16 @@ pub fn formatRunCommandActivity(
 
 fn formatRunCommandDetailBounded(
     alloc: Allocator,
-    arguments_json: []const u8,
+    command: []const u8,
     workspace_root: []const u8,
     max_encoded_bytes: usize,
 ) !?[]u8 {
     if (max_encoded_bytes == 0) return try alloc.dupe(u8, "");
-
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-    const args = tool_args.parseToolArgsObject(scratch, arguments_json) catch return null;
-    const command = tool_args.optionalStringArg(args, "command") orelse return null;
     if (workspace_root.len == 0 and containsUnresolvedAbsolutePath(command)) return null;
+
     const effective_max = @min(max_encoded_bytes, max_run_command_activity_source_bytes - 1);
-    const projected_storage = try scratch.alloc(u8, effective_max + 1);
+    const projected_storage = try alloc.alloc(u8, effective_max + 1);
+    defer alloc.free(projected_storage);
     const projected = projectRunCommandActivitySource(command, workspace_root, projected_storage);
     const encoded = try text_utils.encodeTerminalSafe(alloc, projected, effective_max);
     return encoded.bytes;
@@ -215,11 +211,15 @@ pub fn formatRunCommandDetailForWidth(
     workspace_root: []const u8,
     max_visible_width: usize,
 ) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
     const max_encoded_bytes = std.math.mul(usize, max_visible_width, 4) catch
         max_run_command_activity_source_bytes;
     return formatRunCommandDetailBounded(
         alloc,
-        arguments_json,
+        command,
         workspace_root,
         @min(max_encoded_bytes, max_run_command_activity_source_bytes),
     );
@@ -737,7 +737,7 @@ test "run command detail uses the caller bound without changing activity labels"
     defer alloc.free(detail);
     try std.testing.expectEqualStrings(command, detail);
 
-    const bounded = (try formatRunCommandDetailBounded(alloc, arguments_json, "", 80)) orelse
+    const bounded = (try formatRunCommandDetailBounded(alloc, command, "", 80)) orelse
         return error.TestExpectedEqual;
     defer alloc.free(bounded);
     try std.testing.expect(bounded.len <= 80);

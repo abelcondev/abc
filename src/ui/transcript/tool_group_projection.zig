@@ -529,8 +529,7 @@ fn reprojectTruncatedCommandPhrase(
     const action = "Ran";
     const prefix = action ++ " ";
     if (!std.mem.startsWith(u8, phrase, prefix) or
-        !std.mem.endsWith(u8, phrase, "...") or
-        std.mem.find(u8, phrase, "./") != null)
+        !std.mem.endsWith(u8, phrase, "..."))
     {
         return null;
     }
@@ -1337,25 +1336,37 @@ test "minimal completed command rows reproject stored arguments at the current w
     defer legacy.deinit(alloc);
     try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
 
-    const workspace_entries = [_]TranscriptEntry{
+    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
+    const relative_arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(relative_command, .{})},
+    );
+    defer alloc.free(relative_arguments_json);
+    const relative_entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
-            .bytes = "● Ran cd ./packages/cli && printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-...\n",
+            .bytes = "● Ran cd ./packages/cli && printf relative-path printf relative-path printf relative-path printf relative-path printf relative-path pri...\n",
             .class = .tool_status,
         } },
     };
-    var workspace = try build(alloc, &workspace_entries, &details, 240);
-    defer workspace.deinit(alloc);
-    try std.testing.expect(std.mem.find(
-        u8,
-        workspace.entry_actions.items[0].override.bytes,
-        "cd ./packages/cli",
-    ) != null);
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        workspace.entry_actions.items[0].override.bytes,
-        "...",
-    ));
+    const relative_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = relative_arguments_json,
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+    var relative = try build(alloc, &relative_entries, &relative_details, 240);
+    defer relative.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        relative.entry_actions.items[0].override.bytes,
+    );
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {
