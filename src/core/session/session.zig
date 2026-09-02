@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -3074,7 +3075,22 @@ fn appendExecutionMemoryMessages(
     messages: *std.ArrayList(message.Message),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, message.Message.userText(steering.text));
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -3101,9 +3117,15 @@ fn appendExecutionMemoryMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, message.Message.userOwned(text));
     }
-    for (execution.steering) |text| {
-        if (text.len == 0) continue;
-        try messages.append(alloc, message.Message.userText(text));
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, message.Message.userText(steering.text));
     }
 }
 
@@ -3112,7 +3134,22 @@ pub fn appendExecutionMemoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, .{ .role = .user, .content = steering.text });
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -3144,9 +3181,15 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
-    for (execution.steering) |text| {
-        if (text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = text });
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, .{ .role = .user, .content = steering.text });
     }
 }
 
@@ -3229,48 +3272,19 @@ fn appendHistoryChatMessagesImpl(
 }
 /// Infers a conversation language tag from text using core's script-counting heuristic.
 pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguage) ConversationLanguage {
-    var counts: ScriptCounts = .{};
-    var i: usize = 0;
-    while (i < text.len) {
-        const width = std.unicode.utf8ByteSequenceLength(text[i]) catch {
-            i += 1;
-            continue;
-        };
-        if (i + width > text.len) break;
-        const codepoint = std.unicode.utf8Decode(text[i .. i + width]) catch {
-            i += width;
-            continue;
-        };
-        classifyCodepoint(&counts, codepoint);
-        i += width;
-    }
-    if (counts.hiragana + counts.katakana > 0) return ConversationLanguage.literal("ja");
-    if (counts.hangul > 0) return ConversationLanguage.literal("ko");
-    const scores = [_]struct { count: usize, tag: ConversationLanguage }{
-        .{ .count = counts.han, .tag = ConversationLanguage.literal("und-Hani") },
-        .{ .count = counts.arabic, .tag = ConversationLanguage.literal("und-Arab") },
-        .{ .count = counts.hebrew, .tag = ConversationLanguage.literal("und-Hebr") },
-        .{ .count = counts.cyrillic, .tag = ConversationLanguage.literal("und-Cyrl") },
-        .{ .count = counts.greek, .tag = ConversationLanguage.literal("und-Grek") },
-        .{ .count = counts.devanagari, .tag = ConversationLanguage.literal("und-Deva") },
-        .{ .count = counts.thai, .tag = ConversationLanguage.literal("und-Thai") },
-        .{ .count = counts.latin, .tag = ConversationLanguage.literal("und-Latn") },
+    const script = language_script.profile(text).script orelse return fallback;
+    return switch (script) {
+        .japanese => ConversationLanguage.literal("ja"),
+        .hangul => ConversationLanguage.literal("ko"),
+        .han => ConversationLanguage.literal("und-Hani"),
+        .arabic => ConversationLanguage.literal("und-Arab"),
+        .hebrew => ConversationLanguage.literal("und-Hebr"),
+        .cyrillic => ConversationLanguage.literal("und-Cyrl"),
+        .greek => ConversationLanguage.literal("und-Grek"),
+        .devanagari => ConversationLanguage.literal("und-Deva"),
+        .thai => ConversationLanguage.literal("und-Thai"),
+        .latin => ConversationLanguage.literal("und-Latn"),
     };
-    var best_count: usize = 0;
-    var best_tag = fallback;
-    var tied = false;
-    for (scores) |entry| {
-        if (entry.count == 0) continue;
-        if (entry.count > best_count) {
-            best_count = entry.count;
-            best_tag = entry.tag;
-            tied = false;
-            continue;
-        }
-        if (entry.count == best_count) tied = true;
-    }
-    if (best_count == 0 or tied) return fallback;
-    return best_tag;
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
@@ -3938,112 +3952,6 @@ fn compactLineText(arena: Allocator, text: []const u8, max_bytes: usize) ![]cons
     return if (written.len == 0) arena.dupe(u8, "") else arena.dupe(u8, written);
 }
 
-const ScriptCounts = struct {
-    latin: usize = 0,
-    cyrillic: usize = 0,
-    arabic: usize = 0,
-    hebrew: usize = 0,
-    devanagari: usize = 0,
-    thai: usize = 0,
-    greek: usize = 0,
-    hangul: usize = 0,
-    hiragana: usize = 0,
-    katakana: usize = 0,
-    han: usize = 0,
-};
-fn classifyCodepoint(counts: *ScriptCounts, codepoint: u21) void {
-    if (isLatinCodepoint(codepoint)) {
-        counts.latin += 1;
-        return;
-    }
-    if (isCyrillicCodepoint(codepoint)) {
-        counts.cyrillic += 1;
-        return;
-    }
-    if (isArabicCodepoint(codepoint)) {
-        counts.arabic += 1;
-        return;
-    }
-    if (isHebrewCodepoint(codepoint)) {
-        counts.hebrew += 1;
-        return;
-    }
-    if (isDevanagariCodepoint(codepoint)) {
-        counts.devanagari += 1;
-        return;
-    }
-    if (isThaiCodepoint(codepoint)) {
-        counts.thai += 1;
-        return;
-    }
-    if (isGreekCodepoint(codepoint)) {
-        counts.greek += 1;
-        return;
-    }
-    if (isHangulCodepoint(codepoint)) {
-        counts.hangul += 1;
-        return;
-    }
-    if (codepoint >= 0x3040 and codepoint <= 0x309F) {
-        counts.hiragana += 1;
-        return;
-    }
-    if ((codepoint >= 0x30A0 and codepoint <= 0x30FF) or (codepoint >= 0x31F0 and codepoint <= 0x31FF) or (codepoint >= 0xFF66 and codepoint <= 0xFF9F)) {
-        counts.katakana += 1;
-        return;
-    }
-    if (isHanCodepoint(codepoint)) {
-        counts.han += 1;
-    }
-}
-fn isLatinCodepoint(codepoint: u21) bool {
-    return (codepoint >= 'A' and codepoint <= 'Z') or
-        (codepoint >= 'a' and codepoint <= 'z') or
-        (codepoint >= 0x00C0 and codepoint <= 0x024F) or
-        (codepoint >= 0x1E00 and codepoint <= 0x1EFF);
-}
-fn isCyrillicCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0400 and codepoint <= 0x052F) or
-        (codepoint >= 0x2DE0 and codepoint <= 0x2DFF) or
-        (codepoint >= 0xA640 and codepoint <= 0xA69F);
-}
-fn isArabicCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0600 and codepoint <= 0x06FF) or
-        (codepoint >= 0x0750 and codepoint <= 0x077F) or
-        (codepoint >= 0x08A0 and codepoint <= 0x08FF) or
-        (codepoint >= 0xFB50 and codepoint <= 0xFDFF) or
-        (codepoint >= 0xFE70 and codepoint <= 0xFEFF);
-}
-fn isHebrewCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x0590 and codepoint <= 0x05FF;
-}
-fn isDevanagariCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0900 and codepoint <= 0x097F) or
-        (codepoint >= 0xA8E0 and codepoint <= 0xA8FF);
-}
-fn isThaiCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x0E00 and codepoint <= 0x0E7F;
-}
-fn isGreekCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0370 and codepoint <= 0x03FF) or
-        (codepoint >= 0x1F00 and codepoint <= 0x1FFF);
-}
-fn isHangulCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x1100 and codepoint <= 0x11FF) or
-        (codepoint >= 0x3130 and codepoint <= 0x318F) or
-        (codepoint >= 0xA960 and codepoint <= 0xA97F) or
-        (codepoint >= 0xAC00 and codepoint <= 0xD7AF) or
-        (codepoint >= 0xD7B0 and codepoint <= 0xD7FF);
-}
-fn isHanCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x3400 and codepoint <= 0x4DBF) or
-        (codepoint >= 0x4E00 and codepoint <= 0x9FFF) or
-        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or
-        (codepoint >= 0x20000 and codepoint <= 0x2A6DF) or
-        (codepoint >= 0x2A700 and codepoint <= 0x2B73F) or
-        (codepoint >= 0x2B740 and codepoint <= 0x2B81F) or
-        (codepoint >= 0x2B820 and codepoint <= 0x2CEAF);
-}
 test "resume-history-to-request conversion preserves user assistant ordering" {
     const alloc = std.testing.allocator;
     var history = try alloc.alloc(HistoryTurn, 2);
@@ -4186,9 +4094,9 @@ test "history projection keeps system role only for leading summaries" {
 
 test "resume history projects steering before the final assistant" {
     const alloc = std.testing.allocator;
-    var steering = [_][]u8{
-        @constCast("use file B instead"),
-        @constCast("keep the result concise"),
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("use file B instead"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("keep the result concise"), .after_tool_step_count = 0 },
     };
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("modify file A") },
@@ -4222,6 +4130,73 @@ test "resume history projects steering before the final assistant" {
         try std.testing.expectEqualStrings(text, projected.content.?.asText());
         try std.testing.expectEqualStrings(text, chat.content.?);
     }
+}
+
+test "resume history preserves steering between tool episodes" {
+    const alloc = std.testing.allocator;
+    var first_calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"first\"}",
+    }};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result"),
+        .output_bytes = "first result".len,
+        .stored_output_bytes = "first result".len,
+    }};
+    var second_calls = [_]ToolCall{.{
+        .id = "call_second",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"second\"}",
+    }};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_second"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("second result"),
+        .output_bytes = "second result".len,
+        .stored_output_bytes = "second result".len,
+    }};
+    var steps = [_]ToolExecutionStep{
+        .{ .tool_calls = &first_calls, .tool_results = &first_results },
+        .{ .tool_calls = &second_calls, .tool_results = &second_results },
+    };
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after second"), .after_tool_step_count = 2 },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both") },
+        .assistant = @constCast("finished"),
+        .execution = .{
+            .tool_steps = &steps,
+            .steering = &steering,
+        },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 8), messages.items.len);
+    const expected_roles = [_]message.Role{
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+    };
+    for (messages.items, expected_roles) |projected, role| {
+        try std.testing.expectEqual(role, projected.role);
+    }
+    try std.testing.expectEqualStrings("after first", messages.items[3].content.?.asText());
+    try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {
