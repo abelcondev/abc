@@ -2769,6 +2769,96 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask retries a clear response language mismatch without persisting it", async () => {
+    const root = createFixtureRoot("response-language-retry");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const accepted = "I will inspect the lockfile next.";
+    const resumedText = "The saved session contains only accepted English output.";
+    const responses = [
+      fakeGatewayFinalText(rejected),
+      fakeGatewayFinalText(accepted),
+      fakeGatewayFinalText(resumedText),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const first = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "The lockfile is broken again. Say what you will inspect next.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, firstTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
+        session_id: string;
+      };
+      const sessionPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "session.json",
+      );
+      const eventsPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "events.jsonl",
+      );
+
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("");
+      expect(firstJson.output).toContain(accepted);
+      expect(firstJson.output).not.toContain(rejected);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[0]!.body).toContain(
+        "Use the response language requested by the current external human.",
+      );
+      expect(gateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(readFileSync(sessionPath, "utf8")).not.toContain(rejected);
+      expect(readFileSync(eventsPath, "utf8")).not.toContain(rejected);
+
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          firstJson.session_id,
+          "Confirm what the saved session contains.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).output).toContain(resumedText);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[2]!.body).toContain(accepted);
+      expect(gateway.requests[2]!.body).not.toContain(rejected);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -2990,6 +3080,8 @@ describe("gateway stream lifecycle", () => {
         tool_calls: Array<{
           name: string;
           status: string;
+          action?: string;
+          error?: { category?: string; code?: string };
           command_result?: { termination_indeterminate?: boolean };
         }>;
       };
@@ -3009,11 +3101,151 @@ describe("gateway stream lifecycle", () => {
       expect(json.tool_calls[0]).toMatchObject({
         name: "shell",
         status: "error",
+        action: "run",
+        error: {
+          category: "command_failed",
+          code: "termination_indeterminate",
+        },
         command_result: { termination_indeterminate: true },
       });
       expect(readFileSync(tracePath, "utf8")).toContain(
         "command termination became indeterminate",
       );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("incomplete shell output preserves process status without replaying effects", async () => {
+    const root = createFixtureRoot("shell-incomplete-output");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "shell_incomplete_output_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(
+            callId,
+            "printf 'effect\\n' >> command-effect.txt; printf 'partial output\\n'",
+            { timeout_ms: 30_000 },
+          );
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Incomplete output acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: {
+            exit_code?: number;
+            output_incomplete?: boolean;
+          };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(JSON.parse(observedFailure)).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_incomplete: true,
+      });
+      expect(observedFailure).toContain("partial output");
+      expect(observedFailure).toContain("do not blindly rerun");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        command_result: {
+          exit_code: 0,
+          output_incomplete: true,
+        },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command output drain incomplete reason=injected_after_exit",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("shell runtime failure keeps action and typed JSON diagnostics", async () => {
+    const root = createFixtureRoot("shell-runtime-diagnostic");
+    const tracePath = join(root.root, "trace.log");
+    const callId = "shell_runtime_diagnostic_1";
+    let step = 0;
+    const gateway = startGateway(() => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "shell", {
+            request: {
+              action: "interact",
+              session_id: "shell-missing",
+            },
+          });
+        case 1:
+          return fakeGatewayFinalText("Shell failure recorded.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Observe the missing shell handle."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        tool_calls: Array<Record<string, unknown>>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        action: "interact",
+        error: {
+          category: "tool_failed",
+          code: "ExecutionNotFound",
+        },
+      });
       expect(result.stderr).not.toContain("Unexpected");
       expect(result.stderr).not.toContain("error.Unexpected");
     } finally {

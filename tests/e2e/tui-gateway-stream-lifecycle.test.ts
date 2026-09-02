@@ -1392,6 +1392,43 @@ async function launchRouteRecoveryTui(
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
+    "clear response language mismatch never reaches TUI scrollback",
+    async () => {
+      const rejected = "我会先检查锁文件和依赖清单。";
+      const accepted = "I will inspect the lockfile next.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-response-language-retry-",
+        [
+          fakeGatewayFinalText(rejected),
+          fakeGatewayFinalText(accepted),
+        ],
+      );
+
+      await session!.sendText(
+        "The lockfile is broken again. Say what you will inspect next.",
+      );
+      await session!.waitForText(accepted, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      const scrollback = await session!.captureFullScrollback();
+      expect(scrollback).toContain(accepted);
+      expect(scrollback).not.toContain(rejected);
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(queuedGateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "full-window output limit is omitted from the agent request",
     async () => {
       const model = "meta/muse-spark-1.2-contributor";
@@ -2682,6 +2719,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
+      const preEnterGrid = await session.capturePaneGrid();
       session.sendKeysImmediate(["Enter"]);
       session.sendLiteralImmediate(newerDraft);
       await waitForCondition(
@@ -2690,6 +2728,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
+      const thinkingGrid = await session.capturePaneGrid();
+      const rowContaining = (grid: string[], needle: string) => {
+        const row = grid.findIndex((line) => line.includes(needle));
+        expect(row).toBeGreaterThanOrEqual(0);
+        return row;
+      };
+      expect(rowContaining(thinkingGrid, submittedPrompt)).toBe(
+        rowContaining(preEnterGrid, submittedPrompt),
+      );
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
 
@@ -3013,6 +3060,132 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "steering waits across streamed tool handoff before authoritative start",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-tool-handoff-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "session.fxtape");
+      const toolHandoff: HoldState = { started: false, cancelled: false };
+      const toolOutput = "TOOL_HANDOFF_EXECUTED";
+      const steering = "Respond exactly TOOL_HANDOFF_STEERING_COMPLETE.";
+      const finalText = "TOOL_HANDOFF_STEERING_COMPLETE";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      const handoffGateway = startFakeGateway([
+        () => heldGatewayResponse(
+          toolHandoff,
+          [
+            { type: "tool-input-start", id: "handoff_tool", toolName: "shell" },
+            { type: "text-start", id: "handoff_text" },
+            {
+              type: "text-delta",
+              id: "handoff_text",
+              delta: "Preparing the tool handoff.",
+            },
+          ],
+          [
+            { type: "text-end", id: "handoff_text" },
+            { type: "tool-input-end", id: "handoff_tool" },
+            {
+              type: "tool-call",
+              toolCallId: "handoff_tool",
+              toolName: "shell",
+              input: {
+                request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 30_000,
+                  command: `printf ${toolOutput}`,
+                },
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: {
+                inputTokens: { total: 11 },
+                outputTokens: { total: 17 },
+              },
+            },
+          ],
+        ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = handoffGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 500,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steering-tool-handoff-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: handoffGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the streamed tool handoff fixture.");
+      await waitForCondition(
+        () => handoffGateway.requests.length === 1 && toolHandoff.started,
+        "held tool handoff response",
+      );
+      await session.waitForText("Generating", TIMEOUT);
+
+      await session.sendText(steering);
+      await Bun.sleep(150);
+      const pendingPane = await session.capturePane();
+      expect(toolHandoff.cancelled).toBe(false);
+      expect(pendingPane).toContain(`${steering} · Esc to steer now`);
+      expect(handoffGateway.requests).toHaveLength(1);
+
+      toolHandoff.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => handoffGateway.requests.length === 2,
+        "steering request after tool handoff",
+      );
+
+      const continuedBody = handoffGateway.requests[1]!.body;
+      expect(continuedBody.indexOf(toolOutput)).toBeGreaterThanOrEqual(0);
+      expect(continuedBody.indexOf(steering)).toBeGreaterThan(
+        continuedBody.indexOf(toolOutput),
+      );
+      expect(continuedBody).toContain("<user_steering>");
+      expect(await session.captureFullScrollback()).not.toContain("Cancelled");
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=prompt_steering_consumed",
+      );
+      const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
+        encoding: "utf8",
+      });
+      expect(replay).toContain(finalText);
+      expect(replay).not.toContain("Cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
   );

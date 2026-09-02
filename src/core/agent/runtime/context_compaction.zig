@@ -63,7 +63,9 @@ pub fn validateUnversionedHistoryResults(
         };
         for (execution.tool_steps) |step| {
             for (step.tool_results) |result| {
-                if (result.output_handle == null) return error.AmbiguousCompactionResult;
+                if (result.output_handle == null and result.truncated) {
+                    return error.AmbiguousCompactionResult;
+                }
             }
         }
     }
@@ -297,16 +299,20 @@ fn runSummaryCall(
         .clock = .awake,
         .raw = .fromMilliseconds(provider_timeout_ms),
     });
+    const credential: agent_stream_provider.CredentialLease = if (request.credential_source == .host_managed)
+        .host_managed
+    else
+        .{ .direct = .{
+            .secret_bytes = request.api_key,
+            .source = request.credential_source,
+            .account_id = request.account_id,
+            .tenant_context = request.gateway_team,
+        } };
     var streamed = try runtime_gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
-            .credential = .{
-                .secret = request.api_key,
-                .source = request.credential_source,
-                .account_id = request.account_id,
-                .tenant = request.gateway_team,
-            },
+            .credential = credential,
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
@@ -414,6 +420,8 @@ const FakeProvider = struct {
     saw_only_summary_prompt: bool = true,
     max_output_tokens: ?u32 = null,
     observed_model: ?[]const u8 = null,
+    observed_credential_source: ?types.CredentialSource = null,
+    observed_secret: ?[]const u8 = null,
 
     fn provider(self: *FakeProvider) agent_stream_provider.Provider {
         return .{ .context = self, .stream_fn = stream };
@@ -447,6 +455,8 @@ const FakeProvider = struct {
             std.mem.startsWith(u8, system, "Summarize only conversation goals");
         self.max_output_tokens = request.max_output_tokens;
         self.observed_model = request.model;
+        self.observed_credential_source = request.credential.credentialSource();
+        self.observed_secret = request.credential.secret();
         try request.admission.admit();
         request.delivery.markPossiblySent();
         request.events.emit(.{ .content_delta = self.response });
@@ -464,6 +474,35 @@ const FakeProvider = struct {
 
 test "compaction result exposes only caller-consumed state" {
     try std.testing.expect(!@hasField(Result, "usage"));
+}
+
+test "host-managed compaction carries authority without secret bytes" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Preserve this decision." },
+        .{ .role = .assistant, .content = "Decision preserved." },
+        .{ .role = .user, .content = "Continue." },
+    };
+    var provider = FakeProvider{ .response = "Preserve the decision." };
+    var cancel = std.atomic.Value(bool).init(false);
+    var result = try compact(alloc, &messages, .{
+        .stream_provider = provider.provider(),
+        .model = "provider/compactor",
+        .api_key = "",
+        .credential_source = .host_managed,
+        .retry_count = 0,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 256,
+        .generation_tokens = 128,
+        .trace_ctx = .{},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(
+        types.CredentialSource.host_managed,
+        provider.observed_credential_source.?,
+    );
+    try std.testing.expect(provider.observed_secret == null);
 }
 
 test "semantic compaction summarizes once while runtime truth remains authoritative" {
@@ -631,21 +670,33 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "compaction result retention promotes only corrected history" {
+test "compaction result retention promotes complete unversioned history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    var results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call-promote"),
-        .tool_name = @constCast("read_file"),
-        .status = .success,
-        .output = @constCast("complete redacted output"),
-        .output_bytes = 24,
-        .stored_output_bytes = 24,
-    }};
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call-promote"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("complete redacted output"),
+            .output_bytes = 24,
+            .stored_output_bytes = 24,
+        },
+        .{
+            .tool_call_id = @constCast("call-handled"),
+            .tool_name = @constCast("grep_files"),
+            .status = .success,
+            .output = @constCast("truncated preview"),
+            .output_handle = @constCast("result-call-handled-grep_files.txt"),
+            .output_bytes = 128,
+            .stored_output_bytes = 128,
+            .truncated = true,
+        },
+    };
     var steps = [_]types.ToolExecutionStep{.{ .tool_results = &results }};
     var history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("read it") },
@@ -653,7 +704,7 @@ test "compaction result retention promotes only corrected history" {
         .execution = .{ .tool_steps = &steps },
     } }};
 
-    try validateUnversionedHistoryResults(&history, 0);
+    try validateUnversionedHistoryResults(&history, 1);
     var messages = [_]types.ChatMessage{.{
         .role = .tool,
         .content = results[0].output,
@@ -671,6 +722,7 @@ test "compaction result retention promotes only corrected history" {
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "complete redacted output") != null);
 
+    results[0].truncated = true;
     try std.testing.expectError(
         error.AmbiguousCompactionResult,
         validateUnversionedHistoryResults(&history, 1),

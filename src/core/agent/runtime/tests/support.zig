@@ -262,7 +262,7 @@ pub const FakeGateway = struct {
         defer if (request.prepared_request_body == null) alloc.free(payload);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
@@ -482,6 +482,7 @@ pub const FakeAgentRuntimeDeps = struct {
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
+    assistant_sources: std.ArrayList([]u8) = .empty,
     system_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
@@ -679,6 +680,7 @@ pub const FakeAgentRuntimeDeps = struct {
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
+        freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
@@ -786,8 +788,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
-            .take_steering = if (self.steering_messages.len > 0) takeSteering else null,
-            .take_immediate_steering = if (self.immediate_steering_messages.len > 0) takeImmediateSteering else null,
+            .take_steering_boundary = if (self.steering_messages.len > 0 or
+                self.immediate_steering_messages.len > 0)
+                takeSteeringBoundary
+            else
+                null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
@@ -868,23 +873,30 @@ pub const FakeAgentRuntimeDeps = struct {
         return try alloc.dupe(u8, token);
     }
 
-    fn takeSteering(raw: *anyopaque, arena: Allocator, _: u64) ![]const []const u8 {
+    fn takeSteeringBoundary(
+        raw: *anyopaque,
+        arena: Allocator,
+        _: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.steering_take_count += 1;
-        if (self.steering_take_count != self.steering_take_at) return &.{};
-        const messages = try arena.alloc([]const u8, self.steering_messages.len);
-        @memcpy(messages, self.steering_messages);
-        return messages;
-    }
-
-    fn takeImmediateSteering(raw: *anyopaque, arena: Allocator, _: u64) ![]const []const u8 {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.immediate_steering_take_count += 1;
-        if (self.immediate_steering_take_count != 1) return &.{};
-        const messages = try arena.alloc([]const u8, self.immediate_steering_messages.len);
-        @memcpy(messages, self.immediate_steering_messages);
-        if (self.immediate_steering_cancel_flag) |flag| flag.store(false, .seq_cst);
-        return messages;
+        const source = switch (kind) {
+            .model => blk: {
+                self.steering_take_count += 1;
+                if (self.steering_take_count != self.steering_take_at) return .none;
+                break :blk self.steering_messages;
+            },
+            .cancelled => blk: {
+                self.immediate_steering_take_count += 1;
+                if (self.immediate_steering_take_count != 1) return .interrupt;
+                if (self.immediate_steering_cancel_flag) |flag| flag.store(false, .seq_cst);
+                break :blk self.immediate_steering_messages;
+            },
+        };
+        if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
+        const messages = try arena.alloc([]u8, source.len);
+        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        return .{ .continue_turn = messages };
     }
 
     fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
@@ -1110,7 +1122,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_permission_credential) |value| self.alloc.free(value);
         self.last_permission_credential = try self.alloc.dupe(
             u8,
-            review_turn.credential.secret,
+            review_turn.credential.secret() orelse "",
         );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
@@ -1399,7 +1411,7 @@ pub const FakeAgentRuntimeDeps = struct {
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
             if (self.last_execute_credential) |value| self.alloc.free(value);
-            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret);
+            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret() orelse "");
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
             self.last_execute_root_user_intent_context = try self.alloc.dupe(
                 u8,
@@ -1646,7 +1658,10 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const text = switch (emission) {
-            .assistant_source => return,
+            .assistant_source => |text| {
+                try self.assistant_sources.append(self.alloc, try self.alloc.dupe(u8, text));
+                return;
+            },
             .assistant_rendered => |text| text,
             .operational => |text| text,
         };

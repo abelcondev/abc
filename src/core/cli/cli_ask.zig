@@ -12,6 +12,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const workspace_diagnostics = @import("../workspace/diagnostics.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -97,6 +98,12 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const WorkerEvent = worker_runtime.WorkerEvent;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const McpHasToolFn = tool_mcp_runtime.HasToolFn;
+
+const ShellAction = enum {
+    run,
+    interact,
+    stop,
+};
 
 const supports_headless_interrupt = switch (std_builtin.os.tag) {
     .windows, .wasi, .freestanding => false,
@@ -214,6 +221,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
 };
 
 pub const Config = struct {
+    auth_mode: credentials.AuthMode = .local,
     command_usage: []const u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -348,6 +356,9 @@ const AskOptions = struct {
 const ToolCallRecord = struct {
     name: []u8,
     status: []u8,
+    action: ?ShellAction = null,
+    error_category: ?workspace_diagnostics.ToolCallOutcome = null,
+    error_code: ?[]u8 = null,
     command_result_json: ?[]u8 = null,
     ask_question_text: ?[]u8 = null,
     web_search_completion: ?types.WebSearchCompletion = null,
@@ -370,6 +381,7 @@ const PendingToolProgress = struct {
 fn freeToolCallRecord(alloc: Allocator, record: ToolCallRecord) void {
     alloc.free(record.name);
     alloc.free(record.status);
+    if (record.error_code) |code| alloc.free(code);
     if (record.command_result_json) |json| alloc.free(json);
     if (record.ask_question_text) |text| alloc.free(text);
 }
@@ -389,6 +401,7 @@ const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -411,6 +424,7 @@ const RunDeps = struct {
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
     load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
@@ -1068,6 +1082,7 @@ const AskContext = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .credential_source = self.credential_source,
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
@@ -1419,13 +1434,23 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = try options.deps.load_startup_state(
-        alloc,
-        cfg.gateway_provider.oauth_transport,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-    );
+    var startup = if (cfg.auth_mode == .host_managed)
+        try options.deps.load_startup_state_with_auth_mode(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+        )
+    else
+        try options.deps.load_startup_state(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+        );
     defer startup.deinit(alloc);
     try checkHeadlessCancellation(options.deps);
 
@@ -1459,7 +1484,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
+    if (cfg.auth_mode == .local and
+        !options.continue_recovery and options.resume_target == null and startup.credential == null)
+    {
         return missingCredentialResult(alloc, options, startup.provider);
     }
 
@@ -1539,47 +1566,62 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_final_model = if (startup.credential) |credential|
-        model_provider.authorizesCredential(ctx.provider, credential.source)
-    else
-        false;
-    const startup_credential_is_final = startup_matches_final_model and
-        !credentials.sourceRefreshable(startup.credential.?.source);
-    const credential: *const credentials.Credential = if (startup_credential_is_final)
-        &startup.credential.?
-    else routed: {
-        routed_credential = try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            ctx.provider,
-            if (ctx.provider == .gateway) startup.credential_source_preference else null,
-        );
-        if (routed_credential == null) {
-            return missingCredentialResult(alloc, options, ctx.provider);
+    if (cfg.auth_mode == .host_managed) {
+        ctx.api_key = "";
+        ctx.gateway_team = null;
+        ctx.credential_source = .host_managed;
+        ctx.account_id = null;
+        ctx.model_catalog_access = .host_managed;
+        if (comptime @import("builtin").os.tag != .wasi) {
+            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
+                ctx.session.usage.replaceHostManagedReconciliationAuthority(
+                    ctx.alloc,
+                    ctx.provider,
+                );
+            }
         }
-        break :routed &routed_credential.?;
-    };
-    const api_key = credential.token;
-    ctx.api_key = api_key;
-    ctx.gateway_team = credential.gatewayTeam();
-    ctx.credential_source = credential.source;
-    ctx.account_id = credential.accountId();
-    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
-        credential.source,
-        api_key,
-        credential.gatewayTeam(),
-        credential.accountId(),
-    );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-            ctx.session.usage.replaceProviderReconciliationCredential(
+    } else {
+        const startup_matches_final_model = if (startup.credential) |credential|
+            model_provider.authorizesCredential(ctx.provider, credential.source)
+        else
+            false;
+        const startup_credential_is_final = startup_matches_final_model and
+            !credentials.sourceRefreshable(startup.credential.?.source);
+        const credential: *const credentials.Credential = if (startup_credential_is_final)
+            &startup.credential.?
+        else routed: {
+            routed_credential = try auth_runtime.prepareCredential(
                 alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
                 ctx.provider,
-                credential.source,
-                credential.accountId(),
-                credential.token,
+                if (ctx.provider == .gateway) startup.credential_source_preference else null,
             );
+            if (routed_credential == null) {
+                return missingCredentialResult(alloc, options, ctx.provider);
+            }
+            break :routed &routed_credential.?;
+        };
+        ctx.api_key = credential.token;
+        ctx.gateway_team = credential.gatewayTeam();
+        ctx.credential_source = credential.source;
+        ctx.account_id = credential.accountId();
+        ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+            credential.source,
+            credential.token,
+            credential.gatewayTeam(),
+            credential.accountId(),
+        );
+        if (comptime @import("builtin").os.tag != .wasi) {
+            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
+                ctx.session.usage.replaceProviderReconciliationCredential(
+                    alloc,
+                    ctx.provider,
+                    credential.source,
+                    credential.accountId(),
+                    credential.token,
+                );
+            }
         }
     }
 
@@ -1736,10 +1778,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .images = current_images,
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
-        .api_key = api_key,
-        .gateway_team = if (credential.gatewayTeam()) |team| @constCast(team) else null,
-        .credential_source = credential.source,
-        .account_id = if (credential.accountId()) |account_id| @constCast(account_id) else null,
+        .api_key = @constCast(ctx.api_key),
+        .gateway_team = if (ctx.gateway_team) |team| @constCast(team) else null,
+        .credential_source = ctx.credential_source,
+        .account_id = if (ctx.account_id) |account_id| @constCast(account_id) else null,
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
@@ -2526,10 +2568,17 @@ fn executeToolCallAuthorized(
 fn captureToolExecutionError(
     ctx: *AskContext,
     request: agent_runtime.ToolExecutionRequest,
-    _: anyerror,
+    err: anyerror,
 ) void {
     if (ctx.output_mode.capturesJson()) {
-        appendToolCallRecordBestEffort(ctx, request.call, "error", null);
+        appendToolCallRecordBestEffort(
+            ctx,
+            request.call,
+            "error",
+            null,
+            .runtime_failed,
+            @errorName(err),
+        );
     }
 }
 
@@ -2544,6 +2593,11 @@ fn captureToolExecutionResult(
             request.call,
             if (result.status == .failure) "error" else "success",
             result,
+            if (result.status == .failure)
+                if (result.command_result_json != null) .command_failed else .tool_failed
+            else
+                null,
+            null,
         );
     }
     if (result.status == .failure and result.finish_turn) {
@@ -2568,11 +2622,18 @@ fn recordToolCallRejected(
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (!ctx.output_mode.capturesJson()) return;
-    appendToolCallRecordBestEffort(ctx, call, "error", .{
-        .status = .failure,
-        .model_output = model_output,
-        .command_result_json = command_result_json,
-    });
+    appendToolCallRecordBestEffort(
+        ctx,
+        call,
+        "error",
+        .{
+            .status = .failure,
+            .model_output = model_output,
+            .command_result_json = command_result_json,
+        },
+        .rejected,
+        "rejected",
+    );
 }
 
 fn appendToolCallRecordBestEffort(
@@ -2580,8 +2641,17 @@ fn appendToolCallRecordBestEffort(
     call: ToolCall,
     status: []const u8,
     result: ?ToolExecutionResult,
+    error_category: ?workspace_diagnostics.ToolCallOutcome,
+    error_code: ?[]const u8,
 ) void {
-    appendToolCallRecord(ctx, call, status, result) catch |err| {
+    appendToolCallRecord(
+        ctx,
+        call,
+        status,
+        result,
+        error_category,
+        error_code,
+    ) catch |err| {
         debug_trace.logf(
             "cli_ask",
             "tool-call capture dropped name={s} status={s} err={s}",
@@ -2595,6 +2665,8 @@ fn appendToolCallRecord(
     call: ToolCall,
     status: []const u8,
     result: ?ToolExecutionResult,
+    error_category: ?workspace_diagnostics.ToolCallOutcome,
+    explicit_error_code: ?[]const u8,
 ) !void {
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
@@ -2603,6 +2675,26 @@ fn appendToolCallRecord(
     errdefer ctx.alloc.free(name);
     const owned_status = try ctx.alloc.dupe(u8, status);
     errdefer ctx.alloc.free(owned_status);
+    var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const is_shell = std.mem.eql(u8, call.name, "shell");
+    const action = if (is_shell and error_category != null)
+        shell_action_for_call(scratch, call)
+    else
+        null;
+    const error_code = if (is_shell and error_category != null)
+        try ctx.alloc.dupe(
+            u8,
+            explicit_error_code orelse shell_failure_code(
+                scratch,
+                error_category.?,
+                result,
+            ),
+        )
+    else
+        null;
+    errdefer if (error_code) |code| ctx.alloc.free(code);
     const command_result_json = if (result) |execution|
         if (execution.command_result_json) |json|
             try ctx.alloc.dupe(u8, json)
@@ -2617,11 +2709,128 @@ fn appendToolCallRecord(
     try ctx.tool_call_records.append(ctx.alloc, .{
         .name = name,
         .status = owned_status,
+        .action = action,
+        .error_category = if (is_shell) error_category else null,
+        .error_code = error_code,
         .command_result_json = command_result_json,
         .ask_question_text = ask_question_text,
         .web_search_completion = if (result) |execution| execution.web_search_completion else null,
         .web_fetch_completion = if (result) |execution| execution.web_fetch_completion else null,
     });
+}
+
+fn shell_action_for_call(arena: Allocator, call: ToolCall) ?ShellAction {
+    if (!std.mem.eql(u8, call.name, "shell")) return null;
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        call.arguments_json,
+        .{},
+    ) catch return null;
+    const root = switch (parsed) {
+        .object => |object| object,
+        else => return null,
+    };
+    const request = if (root.get("request")) |value| switch (value) {
+        .object => |object| object,
+        else => return null,
+    } else root;
+    const action = switch (request.get("action") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    return std.meta.stringToEnum(ShellAction, action);
+}
+
+fn shell_failure_code(
+    arena: Allocator,
+    category: workspace_diagnostics.ToolCallOutcome,
+    result: ?ToolExecutionResult,
+) []const u8 {
+    return switch (category) {
+        .succeeded => "tool_failed",
+        .rejected => "rejected",
+        .runtime_failed => "runtime_failed",
+        .command_failed => command_failure_code(arena, result),
+        .tool_failed => shell_tool_failure_code(arena, result),
+    };
+}
+
+fn command_failure_code(
+    arena: Allocator,
+    result: ?ToolExecutionResult,
+) []const u8 {
+    const json = (result orelse return "command_failed").command_result_json orelse
+        return "command_failed";
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch
+        return "command_failed";
+    const object = switch (parsed) {
+        .object => |value| value,
+        else => return "command_failed",
+    };
+    if (json_bool(object, "termination_indeterminate")) return "termination_indeterminate";
+    if (json_bool(object, "output_incomplete")) return "output_incomplete";
+    if (json_bool(object, "timed_out")) return "timeout";
+    if (json_has_value(object, "signal")) return "signal";
+    if (json_nonzero_int(object, "exit_code")) return "nonzero_exit";
+    return "command_failed";
+}
+
+fn shell_tool_failure_code(
+    arena: Allocator,
+    result: ?ToolExecutionResult,
+) []const u8 {
+    const body = (result orelse return "tool_failed").model_output;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
+        return "tool_failed";
+    const root = switch (parsed) {
+        .object => |value| value,
+        else => return "tool_failed",
+    };
+    const failure = switch (root.get("error") orelse return "tool_failed") {
+        .object => |value| value,
+        else => return "tool_failed",
+    };
+    const tool = switch (failure.get("tool") orelse return "tool_failed") {
+        .string => |value| value,
+        else => return "tool_failed",
+    };
+    if (!std.mem.eql(u8, tool, "shell")) return "tool_failed";
+    const code = switch (failure.get("code") orelse return "tool_failed") {
+        .string => |value| value,
+        else => return "tool_failed",
+    };
+    if (!safe_error_code(code)) return "tool_failed";
+    return code;
+}
+
+fn safe_error_code(code: []const u8) bool {
+    if (code.len == 0 or code.len > 64) return false;
+    for (code) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
+fn json_bool(object: std.json.ObjectMap, name: []const u8) bool {
+    return switch (object.get(name) orelse return false) {
+        .bool => |value| value,
+        else => false,
+    };
+}
+
+fn json_has_value(object: std.json.ObjectMap, name: []const u8) bool {
+    return switch (object.get(name) orelse return false) {
+        .null => false,
+        else => true,
+    };
+}
+
+fn json_nonzero_int(object: std.json.ObjectMap, name: []const u8) bool {
+    return switch (object.get(name) orelse return false) {
+        .integer => |value| value != 0,
+        else => false,
+    };
 }
 
 fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
@@ -2914,7 +3123,7 @@ fn settlePendingToolProgress(ctx: *AskContext, call_id: []const u8, outcome: typ
     var pending = takePendingToolProgressLocked(ctx, call_id) orelse return;
     defer pending.deinit(ctx.alloc);
     const context_deferred = outcome.kind == .deferred and
-        std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ ": ");
+        std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ " ");
     const legacy_deferred = outcome.kind == .denied and
         std.mem.startsWith(u8, outcome.summary, types.deferred_tool_result_output ++ ": ");
     if (!context_deferred and !legacy_deferred) return;
@@ -3611,6 +3820,21 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try std.json.Stringify.value(tc.name, .{}, &out.writer);
         try out.writer.writeAll(",\"status\":");
         try std.json.Stringify.value(tc.status, .{}, &out.writer);
+        if (tc.action) |action| {
+            try out.writer.writeAll(",\"action\":");
+            try std.json.Stringify.value(@tagName(action), .{}, &out.writer);
+        }
+        if (tc.error_category) |category| {
+            try out.writer.writeAll(",\"error\":{\"category\":");
+            try std.json.Stringify.value(@tagName(category), .{}, &out.writer);
+            try out.writer.writeAll(",\"code\":");
+            try std.json.Stringify.value(
+                tc.error_code orelse "tool_failed",
+                .{},
+                &out.writer,
+            );
+            try out.writer.writeByte('}');
+        }
         if (tc.command_result_json) |json| {
             try out.writer.writeAll(",\"command_result\":");
             try out.writer.writeAll(json);
@@ -5503,9 +5727,10 @@ test "fx ask automatic review observes worker cancellation" {
             input: permission_auto_classifier.ProviderInput,
             _: permission_auto_classifier.ReviewRequest,
         ) anyerror!permission_auto_classifier.ParseOutcome {
-            const cancel_flag = input.cancel_flag orelse return .invalid;
+            const cancel_flag = input.cancel_flag orelse
+                return .{ .invalid = .provider_context_missing };
             if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-            return .invalid;
+            return .{ .invalid = .provider_failed };
         }
     };
 
@@ -8059,6 +8284,150 @@ test "fx ask JSON records permission-denied tool calls as error status" {
     );
 }
 
+test "fx ask JSON preserves shell action and runtime error identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var ctx = AskContext.init(alloc, testConfig(), .{
+        .context_registry = test_no_context_registry,
+        .tool_set = builtin_tools.advertisement_set,
+        .load_mcp_runtime = testNoMcpRuntime,
+    }, root);
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+
+    captureToolExecutionError(&ctx, .{
+        .call_allocator = alloc,
+        .result_allocator = alloc,
+        .call = .{
+            .id = "shell-runtime-error",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-missing\"}",
+        },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 4096,
+    }, error.ExecutionNotFound);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try recordToolCallRejected(@ptrCast(&ctx), arena_state.allocator(), .{
+        .id = "shell-invalid-action",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"legacy\"}",
+    }, "Invalid shell action", null);
+
+    const records = try takeToolCallRecords(&ctx, alloc);
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .tool_calls = records,
+    };
+    defer result.deinit(alloc);
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object.get("tool_calls").?.array.items[0].object;
+    const action = record.get("action") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("interact", action.string);
+    const failure = (record.get("error") orelse return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings("runtime_failed", failure.get("category").?.string);
+    try std.testing.expectEqualStrings("ExecutionNotFound", failure.get("code").?.string);
+
+    const rejected = parsed.value.object.get("tool_calls").?.array.items[1].object;
+    try std.testing.expect(rejected.get("action") == null);
+    const rejected_failure = (rejected.get("error") orelse
+        return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings(
+        "rejected",
+        rejected_failure.get("category").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "rejected",
+        rejected_failure.get("code").?.string,
+    );
+}
+
+test "shell diagnostic action projection accepts only current actions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct {
+        arguments_json: []const u8,
+        expected: ShellAction,
+    }{
+        .{ .arguments_json = "{\"action\":\"run\"}", .expected = .run },
+        .{ .arguments_json = "{\"action\":\"interact\"}", .expected = .interact },
+        .{ .arguments_json = "{\"request\":{\"action\":\"stop\"}}", .expected = .stop },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            shell_action_for_call(arena, .{
+                .id = "shell-action",
+                .name = "shell",
+                .arguments_json = case.arguments_json,
+            }).?,
+        );
+    }
+    try std.testing.expect(shell_action_for_call(arena, .{
+        .id = "shell-action-invalid",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"legacy\"}",
+    }) == null);
+}
+
+test "shell diagnostic codes remain bounded semantic identifiers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "termination_indeterminate",
+        shell_failure_code(arena, .command_failed, .{
+            .status = .failure,
+            .model_output = "failure",
+            .command_result_json = "{\"termination_indeterminate\":true}",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "nonzero_exit",
+        shell_failure_code(arena, .command_failed, .{
+            .status = .failure,
+            .model_output = "failure",
+            .command_result_json = "{\"exit_code\":7}",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "command_failed",
+        shell_failure_code(arena, .command_failed, .{
+            .status = .failure,
+            .model_output = "failure",
+            .command_result_json = "{\"exit_code\":0}",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "ExecutionNotFound",
+        shell_failure_code(arena, .tool_failed, .{
+            .status = .failure,
+            .model_output = "{\"error\":{\"tool\":\"shell\",\"code\":\"ExecutionNotFound\"}}",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "tool_failed",
+        shell_failure_code(arena, .tool_failed, .{
+            .status = .failure,
+            .model_output = "{\"error\":{\"tool\":\"shell\",\"code\":\"secret value\"}}",
+        }),
+    );
+}
+
 test "fx ask JSON permission-denied capture is best effort under allocation failure" {
     var failing = std.testing.FailingAllocator.init(
         std.testing.allocator,
@@ -8201,6 +8570,8 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
             .model_output = "contents",
             .command_result_json = "{\"ok\":true}",
         },
+        null,
+        null,
     );
 
     const result = try takePromptRunResult(&ctx, alloc);
@@ -8282,6 +8653,8 @@ test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
             .arguments_json = arguments_json,
         },
         "success",
+        null,
+        null,
         null,
     );
 
@@ -8873,7 +9246,7 @@ test "CLI command output completion terminates only an open display line" {
     );
 }
 
-test "CLI nonterminal progress preserves distinct deferred labels without duplicates" {
+test "CLI nonterminal progress preserves distinct not-run labels without duplicates" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8901,7 +9274,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
     } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
@@ -8918,7 +9291,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
     } });
 
     try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{

@@ -275,6 +275,7 @@ pub const Context = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .credential_source = self.credential_source,
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
@@ -428,26 +429,83 @@ pub fn executeToolCallAuthorized(
             .name = request.call.name,
             .arguments_json = request.call.arguments_json,
             .model_output = "",
-            .ok = false,
+            .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
-    };
-    const ok = switch (result.status) {
-        .success => true,
-        else => false,
     };
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .ok = ok,
+        .outcome = classifyReturnedToolCallOutcome(
+            uses_file_mutation_contract,
+            result,
+        ),
         .started_at_ms = started_at_ms,
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
+    return switch (err) {
+        error.CancelledBeforeExecution => .rejected,
+        error.Cancelled => .tool_failed,
+        else => .runtime_failed,
+    };
+}
+
+fn classifyReturnedToolCallOutcome(
+    uses_file_mutation_contract: bool,
+    result: ToolExecutionResult,
+) diagnostics.ToolCallOutcome {
+    if (result.status == .success) return .succeeded;
+    if (result.command_result_json != null) return .command_failed;
+    if (uses_file_mutation_contract) return .rejected;
+    return .tool_failed;
+}
+
+test "returned tool results retain diagnostic outcome identity" {
+    const success = ToolExecutionResult{ .model_output = "ok" };
+    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const command_failure = ToolExecutionResult{
+        .model_output = "exit 7",
+        .status = .failure,
+        .command_result_json = "{\"exit_code\":7}",
+    };
+    const tool_failure = ToolExecutionResult{ .model_output = "missing", .status = .failure };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.succeeded,
+        classifyReturnedToolCallOutcome(false, success),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(true, rejection),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.command_failed,
+        classifyReturnedToolCallOutcome(false, command_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(false, tool_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyToolExecutionError(error.CancelledBeforeExecution),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyToolExecutionError(error.Cancelled),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.runtime_failed,
+        classifyToolExecutionError(error.Unexpected),
+    );
 }
 
 pub fn executeHostToolCallAuthorized(
@@ -3436,7 +3494,7 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     const n = diagnostics.snapshotToolCalls(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqualStrings("web_fetch", buf[0].name());
-    try std.testing.expect(buf[0].ok);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.succeeded, buf[0].outcome);
     try std.testing.expectEqualStrings("", buf[0].args());
     try std.testing.expectEqualStrings("", buf[0].result());
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
@@ -3452,7 +3510,7 @@ test "non-web_fetch tool-call metrics retain bounded args and result" {
         .name = "read_file",
         .arguments_json = "{\"path\":\"README.md\"}",
         .model_output = "<path>README.md</path>\n<content>\n# fx\nnormal result\n</content>",
-        .ok = true,
+        .outcome = .succeeded,
         .started_at_ms = 1000,
     });
 
@@ -5599,12 +5657,16 @@ test "browser run_command maps host cancellation and deadline without signal or 
     try expectCommandResultNull(timeout_json, "signal");
 }
 
-test "run_command propagates output callback failure" {
+test "run_command preserves result when presentation callback fails" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const FailOutput = struct {
-        fn write(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{OutOfMemory}!void {
-            return error.OutOfMemory;
+        calls: usize = 0,
+
+        fn write(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{Unexpected}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            return error.Unexpected;
         }
     };
 
@@ -5616,17 +5678,20 @@ test "run_command propagates output callback failure" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
+    var presentation = FailOutput{};
     var ctx = rt.context();
-    ctx.output_chunk_ctx = @ptrCast(&rt);
+    ctx.output_chunk_ctx = @ptrCast(&presentation);
     ctx.on_output_chunk = FailOutput.write;
-    try std.testing.expectError(
-        error.OutOfMemory,
-        executeTestRunCommand(ctx, arena_state.allocator(), .{
-            .id = "cmd",
-            .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
-        }),
-    );
+    const result = try executeTestRunCommand(ctx, arena_state.allocator(), .{
+        .id = "cmd",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'handoff\\\\nsecond\\\\n'\",\"timeout_ms\":600000}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), presentation.calls);
+    try expectContains(result.model_output, "handoff\nsecond");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultInt(structured, "exit_code", 0);
 }
 
 test "run_command returns model output and structured metadata" {
@@ -6651,8 +6716,8 @@ const VisionGatewayFixture = struct {
         const payload = try test_builtin_gateway.buildAgentRequest(self.alloc, request.data());
         defer self.alloc.free(payload);
         try self.payloads.append(self.alloc, try self.alloc.dupe(u8, payload));
-        self.last_api_key = request.credential.secret;
-        self.last_team = request.credential.tenant;
+        self.last_api_key = request.credential.secret() orelse "";
+        self.last_team = request.credential.tenant();
         self.last_model = request.model;
         self.last_retry_count = request.retry_count;
         if (self.cancel_after_call == self.call_count) request.cancel_flag.store(true, .seq_cst);
@@ -6661,6 +6726,8 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
+        const credential_source = request.credential.credentialSource() orelse
+            return error.MissingCredentialSource;
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -6672,11 +6739,11 @@ const VisionGatewayFixture = struct {
                 .provider = .gateway,
                 .generation_id = response.generation_id orelse "gen_test",
                 .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant,
-                .credential_source = request.credential.source orelse .ai_gateway_api_key,
+                .tenant = request.credential.tenant(),
+                .credential_source = credential_source,
                 .credential_identity = credential_authority.derive(
-                    request.credential.source orelse .ai_gateway_api_key,
-                    request.credential.account_id,
+                    credential_source,
+                    request.credential.accountId(),
                 ),
             } },
         } };

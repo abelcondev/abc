@@ -92,6 +92,15 @@ const ResumeInvocation = struct {
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
 
+pub const UpgradeRelaunch = struct {
+    previous_revision: ?[]u8 = null,
+
+    pub fn deinit(self: *UpgradeRelaunch, alloc: Allocator) void {
+        if (self.previous_revision) |revision| alloc.free(revision);
+        self.* = undefined;
+    }
+};
+
 // The one resume alias that asks which session to open. Every other spelling
 // names its target, so it resumes without a prompt.
 const resume_picker_alias = "-r";
@@ -129,11 +138,12 @@ pub const LaunchModifiers = struct {
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
-    upgrade_relaunch: bool = false,
+    upgrade_relaunch: ?UpgradeRelaunch = null,
     modifiers: LaunchModifiers = .{},
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
         if (self.requested_resume) |*target| target.deinit(alloc);
+        if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
         self.* = undefined;
     }
@@ -152,6 +162,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -294,6 +305,9 @@ const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
@@ -310,6 +324,9 @@ const RunDeps = struct {
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
+    load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
+    load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
     getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
     self_exe_path: SelfExePathFn = selfExePathDefault,
@@ -531,22 +548,31 @@ pub fn parseInteractiveLaunch(
         } },
         .resume_session => |invocation| {
             const resume_args = invocation.args;
-            const upgrade_relaunch = !invocation.top_level_alias and
-                resume_args.len == 2 and
+            const has_upgrade_relaunch = !invocation.top_level_alias and
+                resume_args.len >= 2 and
                 std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
-            const target_args = if (upgrade_relaunch)
-                resume_args[0..1]
-            else
-                resume_args;
+            if (has_upgrade_relaunch and resume_args.len > 3) return error.InvalidResumeArgs;
+            var upgrade_relaunch: ?UpgradeRelaunch = null;
+            errdefer if (upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
+            if (has_upgrade_relaunch) {
+                const previous_revision = if (resume_args.len == 3) revision: {
+                    if (!update_target.isValidRevision(resume_args[2])) return error.InvalidResumeArgs;
+                    break :revision try alloc.dupe(u8, resume_args[2]);
+                } else null;
+                upgrade_relaunch = .{ .previous_revision = previous_revision };
+            }
+            const target_args = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
             const target = try parseResumeArgs(
                 alloc,
                 command_catalog,
                 target_args,
                 invocation.top_level_alias,
             );
+            const relaunch = upgrade_relaunch;
+            upgrade_relaunch = null;
             return .{ .interactive = .{
                 .requested_resume = target,
-                .upgrade_relaunch = upgrade_relaunch,
+                .upgrade_relaunch = relaunch,
                 .modifiers = global_args.takeModifiers(),
             } };
         },
@@ -641,6 +667,11 @@ fn writeProviderActivationError(
     try writeStderr(deps, message);
 }
 
+fn writeHostManagedAuthResult(deps: RunDeps) !void {
+    try writeStdout(deps, credentials.host_managed_auth_message);
+    try writeStdout(deps, "\n");
+}
+
 fn activateProviderSelection(
     alloc: Allocator,
     cfg: Config,
@@ -659,17 +690,22 @@ fn activateProviderSelection(
     defer settings.deinit(alloc);
 
     const preferred_source = exact_source orelse settings.credential_source;
-    var prepared_credential = try auth_runtime.prepareCredential(
-        alloc,
-        cfg.gateway_provider.oauth_transport,
-        cfg.secret_store,
-        target,
-        preferred_source,
-    );
+    var prepared_credential = if (cfg.auth_mode == .host_managed)
+        null
+    else
+        try auth_runtime.prepareCredential(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            target,
+            preferred_source,
+        );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
-    if (caller == .provider_command and already_selected and prepared_credential != null) {
+    if (caller == .provider_command and already_selected and
+        (cfg.auth_mode == .host_managed or prepared_credential != null))
+    {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
@@ -679,7 +715,7 @@ fn activateProviderSelection(
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (prepared_credential == null and target == .codex and caller == .provider_command) {
+    if (cfg.auth_mode == .local and prepared_credential == null and target == .codex and caller == .provider_command) {
         chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
@@ -694,7 +730,7 @@ fn activateProviderSelection(
             preferred_source,
         );
     }
-    if (prepared_credential == null and target == .grok and caller == .provider_command) {
+    if (cfg.auth_mode == .local and prepared_credential == null and target == .grok and caller == .provider_command) {
         grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
@@ -710,7 +746,11 @@ fn activateProviderSelection(
         );
     }
 
-    const credential = if (prepared_credential) |*value| value else {
+    const credential = if (cfg.auth_mode == .host_managed)
+        null
+    else if (prepared_credential) |*value|
+        value
+    else {
         try writeProviderActivationError(
             alloc,
             deps,
@@ -732,10 +772,13 @@ fn activateProviderSelection(
         return false;
     };
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-        .access = credentials.catalogAccessAt(
-            credential.*,
-            io_mod.milliTimestamp(),
-        ).withExplicitAuthority(),
+        .access = if (cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessAt(
+                credential.?.*,
+                io_mod.milliTimestamp(),
+            ).withExplicitAuthority(),
         .endpoint = cfg.models_path,
         .view = .picker,
     });
@@ -884,6 +927,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
+                .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
@@ -919,6 +963,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
                 return .handled_failure;
             };
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
@@ -990,6 +1038,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
@@ -1079,6 +1131,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx teams\n");
                 return .handled_failure;
             }
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
             login_flow.runTeams(
                 alloc,
@@ -1129,6 +1185,10 @@ fn runNonInteractiveWithDeps(
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
+            if (cfg.auth_mode == .host_managed) {
+                try writeHostManagedAuthResult(deps);
+                return .handled_success;
+            }
             return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
@@ -1136,12 +1196,21 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .status, "status", err, rest);
                 return .handled_failure;
             };
-            var startup = try deps.load_startup_status(
-                alloc,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_startup_status_with_auth_mode(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_status(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             var mcp_inspection = try cfg.inspect_mcp_local_config(
@@ -1197,13 +1266,22 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            var startup = try deps.load_startup_state(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_catalog_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
@@ -1555,13 +1633,23 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
                 return .handled_failure;
             };
-            var startup = try deps.load_startup_state(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            );
+            var startup = if (cfg.auth_mode == .host_managed)
+                try deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                try deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
@@ -1569,7 +1657,12 @@ fn runNonInteractiveWithDeps(
                 gateway_provider.unavailable_credits_provider;
             var snapshot = credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
-                .credential_source = if (startup.credential) |credential| credential.source else null,
+                .credential_source = if (startup.auth_mode == .host_managed)
+                    .host_managed
+                else if (startup.credential) |credential|
+                    credential.source
+                else
+                    null,
                 .tenant = startup.gatewayTeam(),
             });
             defer snapshot.deinit(alloc);
@@ -3066,6 +3159,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
 
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
+        .auth_mode = cfg.auth_mode,
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -4117,6 +4211,55 @@ test "parse resume args treats last after id flag as exact id" {
         .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
+}
+
+test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+    const revision = "abcdef0123456789abcdef0123456789abcdef01";
+
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        expected_revision: ?[]const u8,
+    }{
+        .{
+            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch") },
+            .expected_revision = null,
+        },
+        .{
+            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch"), @constCast(revision) },
+            .expected_revision = revision,
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
+        switch (parsed) {
+            .interactive => |value| {
+                var launch = value;
+                defer launch.deinit(alloc);
+                const relaunch = launch.upgrade_relaunch orelse return error.TestExpectedUpgradeRelaunch;
+                if (case.expected_revision) |expected| {
+                    try std.testing.expectEqualStrings(expected, relaunch.previous_revision.?);
+                } else try std.testing.expect(relaunch.previous_revision == null);
+            },
+            .noninteractive => |value| {
+                var noninteractive = value;
+                defer noninteractive.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+
+    try std.testing.expectError(
+        error.InvalidResumeArgs,
+        parseInteractiveLaunch(alloc, &.{
+            @constCast("resume"),
+            @constCast("session-123"),
+            @constCast("--upgrade-relaunch"),
+            @constCast("not-a-revision"),
+        }, command_catalog),
+    );
 }
 
 test "parseInteractiveLaunch shares native resume grammar" {

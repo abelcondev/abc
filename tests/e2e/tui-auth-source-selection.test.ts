@@ -2371,7 +2371,9 @@ test(
     expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
     expect(savedCredentialSource(home)).toBe("fx_login");
-    const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const persisted = JSON.parse(
+      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+    ) as {
       team_id?: string;
       team_slug?: string;
     };
@@ -2421,7 +2423,9 @@ test(
     expect(result.stdout).not.toContain("Selected Vercel team");
     expect(result.stderr).toContain("selected team could not access AI Gateway");
     expect(savedCredentialSource(home)).toBeUndefined();
-    const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const persisted = JSON.parse(
+      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+    ) as {
       team_id?: string;
     };
     expect(persisted.team_id).toBe("team_old");
