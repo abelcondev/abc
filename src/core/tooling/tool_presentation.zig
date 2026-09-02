@@ -34,7 +34,8 @@ pub const RunCommandActivity = struct {
 };
 
 pub fn isProviderSearchAlias(name: []const u8) bool {
-    return std.mem.eql(u8, name, "perplexity_search") or
+    return std.mem.eql(u8, name, "exa_search") or
+        std.mem.eql(u8, name, "perplexity_search") or
         std.mem.eql(u8, name, "parallel_search");
 }
 
@@ -133,8 +134,8 @@ pub fn formatRunCommandPermissionLabel(
         command,
         max_run_command_activity_bytes,
     );
-    const suffix = try commandApprovalLabelSuffix(scratch, "terminal", command);
-    return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
+    const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
+    return std.fmt.allocPrint(alloc, "shell.run {s}{s}", .{ encoded.bytes, suffix });
 }
 
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
@@ -325,9 +326,6 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (spec.executor_kind == .web_search) {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
-    if (try copyRenameLabel(scratch, call.name, args)) |value| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
-    }
     const value = input.display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
@@ -358,9 +356,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             "{s} {s}",
             .{ call.name, spec.label_arg_default },
         );
-    }
-    if (try copyRenameLabel(scratch, call.name, args)) |value| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
     }
     const value = tool_dispatch.toolLabelValue(spec.*, args) orelse return try alloc.dupe(u8, call.name);
 
@@ -432,7 +427,8 @@ fn appendWebSearchDomains(writer: *std.Io.Writer, label: []const u8, value: ?std
 
 fn commandApprovalLabelSuffix(alloc: Allocator, tool_name: []const u8, command: []const u8) ![]const u8 {
     if (!std.mem.eql(u8, tool_name, "run_command") and
-        !std.mem.eql(u8, tool_name, "terminal")) return "";
+        !std.mem.eql(u8, tool_name, "terminal") and
+        !std.mem.eql(u8, tool_name, "shell")) return "";
     const risk = command_policy.command_risk_note_for(command);
     const safer = command_policy.command_safer_alternative_for(command);
     if (risk == null and safer == null) return "";
@@ -488,20 +484,6 @@ fn isCapturedCommandCall(
     return std.mem.eql(u8, action, expected);
 }
 
-fn copyRenameLabel(alloc: Allocator, tool_name: []const u8, args: std.json.ObjectMap) !?[]const u8 {
-    if (std.mem.eql(u8, tool_name, "copy_file")) {
-        const source = tool_args.optionalStringArg(args, "source") orelse return null;
-        const destination = tool_args.optionalStringArg(args, "destination") orelse return null;
-        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ source, destination });
-    }
-    if (std.mem.eql(u8, tool_name, "rename_file")) {
-        const old_path = tool_args.optionalStringArg(args, "old_path") orelse return null;
-        const new_path = tool_args.optionalStringArg(args, "new_path") orelse return null;
-        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ old_path, new_path });
-    }
-    return null;
-}
-
 fn matchesTestSkillInstall(command: []const u8) bool {
     return std.mem.startsWith(u8, command, "npx skills add ");
 }
@@ -547,18 +529,15 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.rename_file,
-    test_builtin_tools.copy_file,
     test_web_search,
-    test_builtin_tools.terminal,
-    test_builtin_tools.memory,
+    test_builtin_tools.shell,
     test_builtin_tools.skill,
     test_install_skill,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_presentation_tool = blk: {
-    var tool = test_builtin_tools.memory;
+    var tool = test_builtin_tools.read_file;
     tool.name = "custom_presentation";
     tool.action_label = "Inspecting";
     tool.label_arg_kind = .name;
@@ -747,7 +726,7 @@ test "run command activity abbreviates only active workspace paths" {
     });
     defer alloc.free(permission);
     try std.testing.expectEqualStrings(
-        "terminal.exec cd /Users/example/workspace/packages/cli && pwd",
+        "shell.run cd /Users/example/workspace/packages/cli && pwd",
         permission,
     );
 }
@@ -786,7 +765,7 @@ test "run command activity hides only a leading no-op current directory prefix" 
         .arguments_json = "{\"command\":\"cd . && zig build\"}",
     });
     defer alloc.free(permission);
-    try std.testing.expectEqualStrings("terminal.exec cd . && zig build", permission);
+    try std.testing.expectEqualStrings("shell.run cd . && zig build", permission);
 }
 
 test "tool presentation formats bounded web search action detail" {
@@ -833,7 +812,7 @@ test "tool presentation formats permission labels" {
         .arguments_json = "{\"command\":\"npm test\",\"cwd\":\"/tmp/fx\"}",
     });
     defer alloc.free(cwd);
-    try std.testing.expectEqualStrings("terminal.exec npm test", cwd);
+    try std.testing.expectEqualStrings("shell.run npm test", cwd);
 
     const risk = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "risk",
@@ -854,11 +833,9 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
-        .{ .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"save\"}" }, .expected = "Remembering save" },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
+        .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
-        .{ .call = .{ .id = "copy", .name = "copy_file", .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}" }, .expected = "Copying src/a.zig -> src/b.zig" },
-        .{ .call = .{ .id = "rename", .name = "rename_file", .arguments_json = "{\"old_path\":\"src/a.zig\",\"new_path\":\"src/b.zig\"}" }, .expected = "Renaming src/a.zig -> src/b.zig" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
 
@@ -889,9 +866,9 @@ test "terminal display target is call-local across a cold inspect projection upd
     );
 
     const inspect_call = ToolCall{
-        .id = "inspect",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+        .id = "interact",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
     };
     var cold_snapshot = try projection.snapshot(alloc);
     const current_target = try resolveTerminalDisplayTargetFromRows(
@@ -924,9 +901,9 @@ test "terminal display target is call-local across a cold inspect projection upd
         test_tool_registry,
         "/tmp/workspace",
         .{
-            .id = "read",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"read\",\"session_id\":\"terminal-cold-session\"}",
+            .id = "interact-next",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
         },
         learned_snapshot.rows,
     ) orelse return error.TestExpectedEqual;
@@ -952,24 +929,13 @@ test "tool presentation frees all formatted output with a normal allocator" {
         .tool_registry = test_tool_registry,
         .call = .{
             .id = "provider_search",
-            .name = "perplexity_search",
+            .name = "exa_search",
             .arguments_json = "{}",
             .provenance = .provider_executed,
         },
     });
     defer alloc.free(provider_search);
     try std.testing.expectEqualStrings("Searching web", provider_search);
-
-    const copy = try formatPlainAction(alloc, .{
-        .tool_registry = test_tool_registry,
-        .call = .{
-            .id = "copy",
-            .name = "copy_file",
-            .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}",
-        },
-    });
-    defer alloc.free(copy);
-    try std.testing.expectEqualStrings("Copying src/a.zig -> src/b.zig", copy);
 
     const command = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "command",
@@ -978,14 +944,6 @@ test "tool presentation frees all formatted output with a normal allocator" {
     });
     defer alloc.free(command);
     try expectContains(command, "risk: command may discard version-control state");
-
-    const fallback = try formatPermissionLabel(alloc, test_tool_registry, .{
-        .id = "malformed",
-        .name = "memory",
-        .arguments_json = "{",
-    });
-    defer alloc.free(fallback);
-    try std.testing.expectEqualStrings("memory", fallback);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"query\":\"current Zig release\",\"blocked_domains\":[\"spam.example\"]}", .{});
     defer parsed.deinit();

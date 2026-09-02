@@ -1,7 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
-const subagent_input = @import("../subagent/input_action.zig");
 
 /// Describes a mouse-wheel direction after terminal input has been decoded by UI.
 pub const MouseWheel = enum {
@@ -110,7 +109,6 @@ pub const RawTerminalInput = struct {
     composer_shortcut: ?ShortcutAction = null,
     approval_action: ?approval_decision.Action = null,
     question_action: ?question_prompt.Action = null,
-    subagent_action: ?subagent_input.Action = null,
 };
 
 /// A decoded terminal action plus the state captured when its leading Escape
@@ -120,7 +118,6 @@ pub const DecodedTerminalAction = struct {
     composer_shortcut: ?ShortcutAction = null,
     approval_focused_edit: ?approval_decision.DraftAction = null,
     question_action: ?question_prompt.Action = null,
-    subagent_action: ?subagent_input.Action = null,
     cancel_pending: bool = false,
 };
 
@@ -136,7 +133,6 @@ pub const TerminalDecodeContext = struct {
     now_ms: i64,
     paste_active: bool,
     cancel_pending: bool,
-    child_route_active: bool,
     question_freeform_selected: bool = false,
 };
 

@@ -17,14 +17,9 @@ pub const ParsedCommand = union(enum) {
     logout: []const u8,
     provider,
     status,
-    background,
-    background_stop: []const u8,
-    background_open: []const u8,
-    background_logs: []const u8,
     image: []const u8,
     images: []const u8,
     model: []const u8,
-    models,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -61,14 +56,9 @@ pub const CommandHandlers = struct {
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     provider: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
-    show_background: *const fn (ctx: *anyopaque) anyerror!void,
-    stop_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    open_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    show_background_logs: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
-    show_models: *const fn (ctx: *anyopaque) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -111,14 +101,9 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .logout => .{ .logout = payload },
         .provider => .provider,
         .status => .status,
-        .background => .background,
-        .background_stop => .{ .background_stop = payload },
-        .background_open => .{ .background_open = payload },
-        .background_logs => .{ .background_logs = payload },
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
-        .models => .models,
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -169,14 +154,9 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
         .provider => try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
-        .background => try handlers.show_background(handlers.ctx),
-        .background_stop => |target| try handlers.stop_background(handlers.ctx, target),
-        .background_open => |target| try handlers.open_background(handlers.ctx, target),
-        .background_logs => |target| try handlers.show_background_logs(handlers.ctx, target),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
-        .models => try handlers.show_models(handlers.ctx),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -221,11 +201,8 @@ test "parse extracts an optional logout provider" {
     }
 }
 
-test "parse recognizes models" {
-    switch (parse(testSlashRegistry(), "/models")) {
-        .unknown => return error.TestExpectedModelsCommand,
-        else => {},
-    }
+test "parse rejects removed plural model command" {
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
 }
 
 test "provider arguments belong to the inline picker, not the router" {
@@ -277,25 +254,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/review"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
-}
-
-test "parse extracts background stop target" {
-    const parsed = parse(testSlashRegistry(), "/background stop last");
-    switch (parsed) {
-        .background_stop => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "parse extracts background open and logs targets" {
-    switch (parse(testSlashRegistry(), "/background open 3")) {
-        .background_open => |target| try std.testing.expectEqualStrings("3", target),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/background logs last")) {
-        .background_logs => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
 }
 
 test "parse extracts image commands" {
@@ -492,11 +451,6 @@ fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
-fn recordModels(ctx: *anyopaque) anyerror!void {
-    const test_context = testContext(ctx);
-    test_context.called = "models";
-}
-
 fn failStatus(ctx: *anyopaque) anyerror!void {
     _ = ctx;
     return error.TestRouteFailure;
@@ -516,14 +470,9 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .logout = unexpectedPayload,
         .provider = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
-        .show_background = unexpectedNoPayload,
-        .stop_background = unexpectedPayload,
-        .open_background = unexpectedPayload,
-        .show_background_logs = unexpectedPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
-        .show_models = unexpectedNoPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,
@@ -558,16 +507,6 @@ test "route calls expected no-payload handler" {
 
     try std.testing.expectEqualStrings("copy", ctx.called);
     try std.testing.expectEqualStrings("", ctx.payload);
-}
-
-test "route calls models handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.show_models = recordModels;
-
-    try route(testSlashRegistry(), &handlers, "/models");
-
-    try std.testing.expectEqualStrings("models", ctx.called);
 }
 
 test "route calls interactive resume handler" {

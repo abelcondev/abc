@@ -400,8 +400,8 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         .role = .assistant,
         .tool_calls = &.{.{
             .id = "call_1",
-            .name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         }},
     };
     return .{
@@ -410,12 +410,12 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
             .pending_assistant = pending,
             .target_call_id = "call_1",
             .origin = .root,
-            .current_root_request = "User asked to inspect the repository.",
+            .trusted_root_context = "User asked to inspect the repository.",
         },
         .targets = &.{},
         .action = .{ .tool = .{
-            .tool_name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .tool_name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         } },
     };
 }
@@ -438,7 +438,7 @@ test "gateway automatic reviewer transport is single-attempt" {
 
     switch (outcome) {
         .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
-        .invalid => return error.TestExpectedEqual,
+        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);

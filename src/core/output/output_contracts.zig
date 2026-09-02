@@ -1,9 +1,10 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_health = @import("../mcp/health.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -393,6 +394,70 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (!wrote_provider) try writer.writeAll("none");
 }
 
+pub const McpLocalSnapshot = struct {
+    servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
+    configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
+    inspection_error: ?[]const u8 = null,
+
+    fn writeText(self: McpLocalSnapshot, writer: *std.Io.Writer, alloc: Allocator, prefix: []const u8) !void {
+        try writer.print("[{s}] mcp_connection_check=not_checked\n", .{prefix});
+        try writer.print(
+            "[{s}] mcp_servers={d} mcp_configuration_issues={d}\n",
+            .{ prefix, self.servers.len, self.configuration_issues.len },
+        );
+        for (self.servers) |server| {
+            try writer.print("[{s}] mcp_server=", .{prefix});
+            try writeTerminalSafe(writer, alloc, server.configured_name);
+            try writer.print(
+                " source={s} scope={s} admission={s} transport={s} connection=not_checked authentication=not_checked\n",
+                .{
+                    @tagName(server.source),
+                    @tagName(server.scope),
+                    if (server.workspace_admission) |admission| @tagName(admission) else "not_applicable",
+                    @tagName(server.transport),
+                },
+            );
+        }
+        for (self.configuration_issues) |issue| {
+            try writer.print("[{s}] mcp_configuration_issue=", .{prefix});
+            try writeTerminalSafe(writer, alloc, issue.message);
+            try writer.writeByte('\n');
+        }
+        if (self.inspection_error) |error_name| {
+            try writer.print("[{s}] mcp_inspection_error={s}\n", .{ prefix, error_name });
+        }
+    }
+
+    fn writeJson(self: McpLocalSnapshot, writer: *std.Io.Writer) !void {
+        try writer.writeAll("{\"connection_check\":\"not_checked\",\"servers\":[");
+        for (self.servers, 0..) |server, index| {
+            if (index > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(.{
+                .name = server.configured_name,
+                .source = server.source,
+                .scope = server.scope,
+                .admission = server.workspace_admission,
+                .required = server.required,
+                .transport = server.transport,
+                .connection = "not_checked",
+                .authentication = "not_checked",
+            }, .{}, writer);
+        }
+        try writer.writeAll("],\"configuration_issues\":[");
+        for (self.configuration_issues, 0..) |issue, index| {
+            if (index > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(issue.message, .{}, writer);
+        }
+        try writer.writeAll("],\"inspection_error\":");
+        if (self.inspection_error) |error_name| {
+            try std.json.Stringify.value(error_name, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeByte('}');
+    }
+};
+
 pub const StatusSnapshot = struct {
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
@@ -401,7 +466,9 @@ pub const StatusSnapshot = struct {
     build_revision: []const u8 = "",
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
+    mcp: ?McpLocalSnapshot = null,
     mcp_config_error: ?[]const u8 = null,
+    mcp_config_warning: ?mcp_contract.ProfileConfigWarning = null,
     permission_mode: types.PermissionMode,
     workspace_root: []const u8,
     history_turns: usize,
@@ -431,6 +498,20 @@ pub const StatusSnapshot = struct {
         if (self.mcp_config_error) |error_name| {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
         }
+        if (self.mcp_config_warning) |warning| {
+            try out.writer.print(
+                "[status] mcp_config_warning={s}",
+                .{@tagName(warning.cause)},
+            );
+            if (warning.key()) |key| {
+                try out.writer.writeAll(" key=");
+                try writeTerminalSafe(&out.writer, alloc, key);
+            }
+            try out.writer.print(
+                " additional_matches={d}\n",
+                .{warning.additional_matches},
+            );
+        }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
@@ -450,6 +531,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
+        if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "status");
         return try out.toOwnedSlice();
     }
 
@@ -509,6 +591,20 @@ pub const StatusSnapshot = struct {
             try writer.writeAll(",\"mcp_config_error\":");
             try std.json.Stringify.value(error_name, .{}, writer);
         }
+        if (self.mcp_config_warning) |warning| {
+            try writer.writeAll(",\"mcp_config_warning\":{\"cause\":");
+            try std.json.Stringify.value(@tagName(warning.cause), .{}, writer);
+            try writer.writeAll(",\"key\":");
+            if (warning.key()) |key| {
+                try std.json.Stringify.value(key, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.print(
+                ",\"additional_matches\":{d}}}",
+                .{warning.additional_matches},
+            );
+        }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
         if (self.provider != .gateway) {
@@ -546,6 +642,10 @@ pub const StatusSnapshot = struct {
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
+        if (self.mcp) |mcp| {
+            try writer.writeAll(",\"mcp\":");
+            try mcp.writeJson(writer);
+        }
         try writer.writeByte('}');
     }
 };
@@ -761,6 +861,7 @@ pub const ModelListSnapshot = struct {
             .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
             .fx_login_team_required => "Choose a Vercel team to load its private models.",
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
@@ -1209,6 +1310,7 @@ pub const DoctorSnapshot = struct {
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
     checks: []const doctor_runtime.Check,
+    mcp: ?McpLocalSnapshot = null,
 
     pub fn render(self: DoctorSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1239,9 +1341,14 @@ pub const DoctorSnapshot = struct {
         }
         try out.writer.print("[doctor] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
         try out.writer.print("[doctor] agent_step_limit={d}\n", .{self.agent_step_limit});
+        if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
 
         for (self.checks) |entry| {
-            try out.writer.print("[{s}] {s}: {s}\n", .{ checkStatusLabel(entry.status), entry.name, entry.detail });
+            try out.writer.print("[{s}] ", .{checkStatusLabel(entry.status)});
+            try writeTerminalSafe(&out.writer, alloc, entry.name);
+            try out.writer.writeAll(": ");
+            try writeTerminalSafe(&out.writer, alloc, entry.detail);
+            try out.writer.writeByte('\n');
         }
 
         return try out.toOwnedSlice();
@@ -1292,148 +1399,12 @@ pub const DoctorSnapshot = struct {
             try writer.writeByte('}');
         }
 
-        try writer.writeAll("]}");
-    }
-};
-
-pub const BackgroundListSnapshot = struct {
-    records: []const background_store.Record,
-
-    pub fn render(self: BackgroundListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.records.len == 0) {
-            return std.fmt.allocPrint(alloc, "[background] no persisted background records\n", .{});
+        try writer.writeByte(']');
+        if (self.mcp) |mcp| {
+            try writer.writeAll(",\"mcp\":");
+            try mcp.writeJson(writer);
         }
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] {d} saved\n", .{self.records.len});
-        for (self.records) |entry| {
-            try out.writer.print(" - #{d} [{s}] {s}\n", .{ entry.id, @tagName(entry.state), entry.command });
-            try out.writer.print("   cwd: {s}\n", .{entry.cwd});
-            try out.writer.print("   log: {s}\n", .{entry.log_path});
-            if (entry.server_url) |url| {
-                try out.writer.print("   url: {s}\n", .{url});
-            }
-            if (entry.diagnostic) |diagnostic| {
-                try out.writer.print("   diagnostic: {s}\n", .{diagnostic});
-            }
-        }
-
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background\",\"count\":{d},\"records\":[", .{self.records.len});
-        for (self.records, 0..) |entry, i| {
-            if (i > 0) try out.writer.writeByte(',');
-            try out.writer.print("{{\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ entry.id, entry.started_at_ms, entry.updated_at_ms });
-            try out.writer.writeAll(",\"pid\":");
-            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
-            try out.writer.writeAll(",\"command\":");
-            try std.json.Stringify.value(entry.command, .{}, &out.writer);
-            try out.writer.writeAll(",\"cwd\":");
-            try std.json.Stringify.value(entry.cwd, .{}, &out.writer);
-            try out.writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, &out.writer);
-            try out.writer.writeAll(",\"state\":");
-            try std.json.Stringify.value(@tagName(entry.state), .{}, &out.writer);
-            try out.writer.writeAll(",\"server_url\":");
-            if (entry.server_url) |url| {
-                try std.json.Stringify.value(url, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll(",\"diagnostic\":");
-            if (entry.diagnostic) |diagnostic| {
-                try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll("}");
-        }
-        try out.writer.writeAll("]}");
-        return try out.toOwnedSlice();
-    }
-};
-
-pub const BackgroundDetailSnapshot = struct {
-    record: background_store.Record,
-
-    pub fn render(self: BackgroundDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] #{d} [{s}] {s}\n", .{ self.record.id, @tagName(self.record.state), self.record.command });
-        try out.writer.print("pid: {s}\n", .{self.record.pid});
-        try out.writer.print("cwd: {s}\n", .{self.record.cwd});
-        try out.writer.print("log: {s}\n", .{self.record.log_path});
-        try out.writer.print("started_at_ms: {d}\n", .{self.record.started_at_ms});
-        try out.writer.print("updated_at_ms: {d}\n", .{self.record.updated_at_ms});
-        try out.writer.print("expect_url: {s}\n", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.print("server_url: {s}\n", .{self.record.server_url orelse "(none)"});
-        try out.writer.print("diagnostic: {s}\n", .{self.record.diagnostic orelse "(none)"});
-        if (self.record.exit_code) |code| {
-            try out.writer.print("exit_code: {d}\n", .{code});
-        } else {
-            try out.writer.writeAll("exit_code: (none)\n");
-        }
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background_detail\",\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ self.record.id, self.record.started_at_ms, self.record.updated_at_ms });
-        try out.writer.writeAll(",\"pid\":");
-        try std.json.Stringify.value(self.record.pid, .{}, &out.writer);
-        try out.writer.writeAll(",\"command\":");
-        try std.json.Stringify.value(self.record.command, .{}, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try std.json.Stringify.value(self.record.cwd, .{}, &out.writer);
-        try out.writer.writeAll(",\"log_path\":");
-        try std.json.Stringify.value(self.record.log_path, .{}, &out.writer);
-        try out.writer.writeAll(",\"state\":");
-        try std.json.Stringify.value(@tagName(self.record.state), .{}, &out.writer);
-        try out.writer.print(",\"expect_url\":{s}", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.writeAll(",\"server_url\":");
-        if (self.record.server_url) |url| {
-            try std.json.Stringify.value(url, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"diagnostic\":");
-        if (self.record.diagnostic) |diagnostic| {
-            try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"exit_code\":");
-        if (self.record.exit_code) |code| {
-            try out.writer.print("{d}", .{code});
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeByte('}');
-        return try out.toOwnedSlice();
+        try writer.writeByte('}');
     }
 };
 
@@ -1742,23 +1713,6 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("[assistant]\n");
             try writeTextBlock(writer, entry.assistant);
         },
-        .background_command => |entry| {
-            try writeSessionUserTurnText(writer, entry.user);
-            try writeSessionExecutionText(writer, entry.execution);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll("[assistant]\n");
-                try writeTextBlock(writer, assistant);
-            }
-            try writer.writeAll("[background]\n");
-            try writer.print("log: {s}\n", .{entry.log_path});
-            try writer.print("expect_url: {s}\n", .{if (entry.expect_url) "true" else "false"});
-            try writer.print("url: {s}\n", .{entry.url orelse "(none)"});
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll("record_id: ");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('\n');
-            }
-        },
         .interrupted => |entry| {
             try writeSessionUserTurnText(writer, entry.user);
             try writeSessionExecutionText(writer, entry.execution);
@@ -1854,33 +1808,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeSessionUserTurnJson(writer, entry.user);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll(",\"assistant\":");
-                try std.json.Stringify.value(assistant, .{}, writer);
-            }
-            if (!entry.execution.isEmpty()) {
-                try writer.writeAll(",\"execution\":");
-                try session_json.writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, writer);
-            try writer.print(",\"expect_url\":{s}", .{if (entry.expect_url) "true" else "false"});
-            try writer.writeAll(",\"url\":");
-            if (entry.url) |url| {
-                try std.json.Stringify.value(url, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll(",\"background_record_id\":\"");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('"');
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeSessionUserTurnJson(writer, entry.user);
@@ -1959,7 +1886,7 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
         .workspace_root = "/tmp/fx",
         .history_turns = 3,
@@ -1970,14 +1897,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -2064,6 +1991,93 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
     const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
     defer std.testing.allocator.free(interactive);
     try std.testing.expect(std.mem.find(u8, interactive, "mcp_config_error") == null);
+}
+
+test "MCP config warning renders bounded status text and JSON" {
+    const snapshot = StatusSnapshot{
+        .model = "test-model",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/project",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 10,
+        .mcp_config_warning = mcp_contract.ProfileConfigWarning.init(
+            .suspicious_server_key,
+            "MCP-Servers",
+            1,
+        ),
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] mcp_config_warning=suspicious_server_key key=MCP-Servers additional_matches=1\n",
+    ) != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"mcp_config_warning\":{") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"key\":\"MCP-Servers\"") != null);
+}
+
+test "status and doctor share a side-effect-free MCP inspection contract" {
+    const servers = [_]mcp_health.ConfiguredServerSnapshot{.{
+        .configured_name = @constCast("project-docs"),
+        .source = .workspace,
+        .scope = .profile,
+        .workspace_admission = .pending,
+        .required = false,
+        .transport = .http,
+    }};
+    const issues = [_]mcp_health.ConfigurationIssue{.{
+        .message = @constCast("broken entry was ignored"),
+    }};
+    const mcp = McpLocalSnapshot{
+        .servers = &servers,
+        .configuration_issues = &issues,
+    };
+    const status = StatusSnapshot{
+        .model = "alpha",
+        .permission_mode = .auto,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .mcp = mcp,
+    };
+    const status_text = try status.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(status_text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        status_text,
+        "[status] mcp_server=project-docs source=workspace scope=profile admission=pending transport=http connection=not_checked authentication=not_checked",
+    ) != null);
+    const status_json = try status.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(status_json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        status_json,
+        "\"mcp\":{\"connection_check\":\"not_checked\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, status_json, "\"connection\":\"not_checked\"") != null);
+    try std.testing.expect(std.mem.find(u8, status_json, "broken entry was ignored") != null);
+
+    const doctor = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "alpha",
+        .permission_mode = .auto,
+        .agent_step_limit = 24,
+        .checks = &.{},
+        .mcp = mcp,
+    };
+    const doctor_json = try doctor.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(doctor_json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        doctor_json,
+        "\"mcp\":{\"connection_check\":\"not_checked\"",
+    ) != null);
 }
 
 test "core permissions snapshot text and json stay stable" {
@@ -2450,10 +2464,6 @@ test "core session detail snapshot preserves history variant shapes" {
         .action = .read,
         .status = .success,
     }};
-    const record_id = types.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("summary"),
@@ -2464,14 +2474,10 @@ test "core session detail snapshot preserves history variant shapes" {
             .user = .{ .text = @constCast("hola"), .images = @constCast(&images) },
             .assistant = @constCast("que tal"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("npm run dev") },
-            .assistant = @constCast("The server is starting."),
+            .assistant = @constCast("The historical command is no longer owned."),
             .execution = .{ .files = files[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("inspect") },
@@ -2511,20 +2517,18 @@ test "core session detail snapshot preserves history variant shapes" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "[compacted] removed_turns=3 compactions=1") != null);
     try std.testing.expect(std.mem.find(u8, text, "[user]\nhola\n[images] 1\n - /tmp/a.png (image/png)\n[assistant]\nque tal\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe server is starting.\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[background]\nlog: /tmp/server.log\nexpect_url: true\nurl: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "record_id: 00112233445566778899aabbccddeeff") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe historical command is no longer owned.\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[background]") == null);
     try std.testing.expect(std.mem.find(u8, text, "[assistant]\nI inspected the entry point.\n[interrupted]") != null);
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"compacted_summary\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "{\"path\":\"/tmp/a.png\",\"media_type\":\"image/png\"}") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The historical command is no longer owned.\"") != null);
     try std.testing.expect(std.mem.count(u8, json, "\"execution\"") >= 2);
 }
 
@@ -2555,7 +2559,16 @@ test "core session detail JSON includes assistant execution memory" {
     const history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("fetch pdf") },
         .assistant = @constCast("artifact saved"),
-        .execution = .{ .tool_steps = steps[0..] },
+        .execution = .{
+            .tool_steps = steps[0..],
+            .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .thinking_duration_ms = 40,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            },
+        },
     } }};
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
@@ -2588,11 +2601,17 @@ test "core session detail JSON includes assistant execution memory" {
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"turn_summary\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_fetch\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "artifact-file.pdf") != null);
     try std.testing.expect(std.mem.find(u8, json, "command_output_replay") == null);
     try std.testing.expect(std.mem.find(u8, json, "command_process_presentation") == null);
     try std.testing.expect(std.mem.find(u8, json, "fx-command-replay-private-sentinel.bin") == null);
+
+    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "started_at_ms") == null);
+    try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);
 }
 
 test "core session migration snapshot text and json stay stable" {
@@ -2711,46 +2730,36 @@ test "core doctor snapshot text and json stay stable" {
     );
 }
 
-test "background output contracts import background store" {
-    try std.testing.expect(background_store.Record == @import("../background/background_store.zig").Record);
-    try std.testing.expect(background_store.TaskState == @import("../background/background_store.zig").TaskState);
-}
-
-test "core background list and detail snapshots preserve persisted fields" {
-    const records = [_]background_store.Record{
-        .{
-            .id = 7,
-            .pid = @constCast("100"),
-            .command = @constCast("npm run dev"),
-            .cwd = @constCast("/tmp/fx"),
-            .log_path = @constCast("/tmp/fx.log"),
-            .expect_url = false,
-            .server_url = @constCast("http://localhost:3000"),
-            .started_at_ms = 1,
-            .updated_at_ms = 2,
-            .state = .running,
-        },
+test "doctor text escapes hostile check details while json preserves data" {
+    const checks = [_]doctor_runtime.Check{.{
+        .name = "mcp_config",
+        .status = .warn,
+        .detail = "warning key=bad\n\x1b]0;pwn\x07",
+    }};
+    const snapshot = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "alpha",
+        .permission_mode = .ask,
+        .agent_step_limit = 24,
+        .checks = &checks,
     };
 
-    const list_json = try (BackgroundListSnapshot{ .records = &records }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(list_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background\",\"count\":1,\"records\":[{\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"server_url\":\"http://localhost:3000\",\"diagnostic\":null}]}",
-        list_json,
-    );
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "warning key=bad\\x0a\\x1b]0;pwn\\x07",
+    ) != null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
 
-    const detail_text = try (BackgroundDetailSnapshot{ .record = records[0] }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(detail_text);
-    try std.testing.expect(std.mem.find(u8, detail_text, "expect_url: false\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "server_url: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "exit_code: (none)\n") != null);
-
-    const detail_json = try (BackgroundDetailSnapshot{ .record = records[0] }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(detail_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background_detail\",\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"expect_url\":false,\"server_url\":\"http://localhost:3000\",\"diagnostic\":null,\"exit_code\":null}",
-        detail_json,
-    );
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"detail\":\"warning key=bad\\n\\u001b]0;pwn\\u0007\"",
+    ) != null);
 }
 
 test "core credits snapshot renders error output" {

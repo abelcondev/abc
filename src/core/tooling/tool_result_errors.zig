@@ -106,12 +106,6 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
     "Unsupported tool:",
     "read_file failed:",
     "edit_file failed:",
-    "delete_file failed:",
-    "rename_file failed:",
-    "copy_file failed:",
-    "create_folder failed:",
-    "file_info failed:",
-    "open_file not supported",
     "open_url not supported",
     "failed to open ",
 };
@@ -119,7 +113,7 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
 pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason: types.ToolPermissionDenialReason) Allocator.Error![]u8 {
     switch (reason) {
         .user_denied, .auto_denied, .policy_denied, .permission_required => {},
-        .review_caution, .review_unavailable => unreachable,
+        .review_caution, .review_evidence_incomplete, .review_unavailable => unreachable,
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -142,7 +136,7 @@ pub fn toolReviewHeldJson(
     advice: ?[]const u8,
 ) Allocator.Error![]u8 {
     switch (reason) {
-        .review_caution, .review_unavailable => {},
+        .review_caution, .review_evidence_incomplete, .review_unavailable => {},
         .user_denied, .auto_denied, .policy_denied, .permission_required => unreachable,
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -181,13 +175,15 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
         .review_caution => "Action held after safety review",
+        .review_evidence_incomplete => "Safety review evidence incomplete; action held",
         .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied => if (is_network_tool(tool_name))
             "Network or browser access was denied by configured policy"
         else
             "Tool access was denied by configured policy",
         .permission_required => if (std.mem.eql(u8, tool_name, "run_command") or
-            std.mem.eql(u8, tool_name, "terminal"))
+            std.mem.eql(u8, tool_name, "terminal") or
+            std.mem.eql(u8, tool_name, "shell"))
             "Shell command approval is required before this tool can run"
         else if (is_network_tool(tool_name))
             "Network or browser approval is required before this tool can run"
@@ -203,6 +199,7 @@ fn permissionDeniedSuggestion(
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
         .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
+        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; remove literal secret material, use a symbolic reference, or choose a materially different action.",
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
@@ -248,7 +245,7 @@ pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenia
         reason_value,
     ) orelse return null;
     const review_reason = switch (reason) {
-        .review_caution, .review_unavailable => true,
+        .review_caution, .review_evidence_incomplete, .review_unavailable => true,
         .user_denied, .auto_denied, .policy_denied, .permission_required => false,
     };
     if (review_held != review_reason) return null;
@@ -301,6 +298,7 @@ pub fn formatToolExecutionErrorJson(
 pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "MCP elicitation timed out while user input was pending",
+        error.McpAuthorityChanged => "MCP configuration or authority changed before execution",
         else => null,
     };
 }
@@ -308,6 +306,7 @@ pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
 pub fn executionErrorSuggestion(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "Tell the user the form timed out with input pending, then retry only if they want to complete it again.",
+        error.McpAuthorityChanged => "Retry the tool on the next model step so fx can validate it against the current MCP runtime.",
         else => null,
     };
 }
@@ -452,7 +451,7 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
 }
 
-test "review hold JSON distinguishes caution and unavailable from permission denial" {
+test "review hold JSON preserves typed reasons apart from permission denial" {
     const alloc = std.testing.allocator;
     const caution = try toolReviewHeldJson(
         alloc,
@@ -468,6 +467,13 @@ test "review hold JSON distinguishes caution and unavailable from permission den
         null,
     );
     defer alloc.free(unavailable);
+    const incomplete = try toolReviewHeldJson(
+        alloc,
+        "edit_file",
+        .review_evidence_incomplete,
+        null,
+    );
+    defer alloc.free(incomplete);
 
     try std.testing.expect(std.mem.find(u8, caution, "\"type\":\"tool_review_held\"") != null);
     try std.testing.expect(std.mem.find(u8, caution, "\"reason\":\"review_caution\"") != null);
@@ -488,6 +494,12 @@ test "review hold JSON distinguishes caution and unavailable from permission den
     try std.testing.expectEqual(
         @as(?types.ToolPermissionDenialReason, .review_unavailable),
         toolPermissionDenialReason(unavailable),
+    );
+    try std.testing.expect(std.mem.find(u8, incomplete, "\"reason\":\"review_evidence_incomplete\"") != null);
+    try std.testing.expect(std.mem.find(u8, incomplete, "Do not retry unchanged") != null);
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_evidence_incomplete),
+        toolPermissionDenialReason(incomplete),
     );
     try std.testing.expect(toolPermissionDenialReason(
         "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"auto_denied\"}}",
@@ -605,12 +617,25 @@ test "MCP input timeout tells the model that user input was pending" {
     try std.testing.expect(std.mem.find(u8, payload, "form timed out with input pending") != null);
 }
 
+test "MCP authority change tells the model to retry on the next step" {
+    const alloc = std.testing.allocator;
+    const payload = try formatToolExecutionErrorJson(
+        alloc,
+        "mcp_server_tool",
+        error.McpAuthorityChanged,
+    );
+    defer alloc.free(payload);
+
+    try std.testing.expect(std.mem.find(u8, payload, "MCP configuration or authority changed before execution") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "next model step") != null);
+}
+
 test "filesystem access denial JSON preserves recovery details" {
     const alloc = std.testing.allocator;
     const errors = [_]anyerror{ error.AccessDenied, error.PermissionDenied };
 
     for (errors) |err| {
-        const payload = try filesystemAccessDeniedJson(alloc, "list_files", "/tmp/blocked", err);
+        const payload = try filesystemAccessDeniedJson(alloc, "glob_files", "/tmp/blocked", err);
         defer alloc.free(payload);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -620,7 +645,7 @@ test "filesystem access denial JSON preserves recovery details" {
         const details = error_obj.get("details").?.object;
         const suggestion = error_obj.get("suggestion").?.string;
         try std.testing.expectEqualStrings("tool_execution_failed", error_obj.get("type").?.string);
-        try std.testing.expectEqualStrings("list_files", error_obj.get("tool_name").?.string);
+        try std.testing.expectEqualStrings("glob_files", error_obj.get("tool_name").?.string);
         try std.testing.expectEqualStrings("/tmp/blocked", details.get("path").?.string);
         try std.testing.expectEqualStrings(@errorName(err), details.get("error").?.string);
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);
@@ -657,12 +682,6 @@ test "tool output classification preserves structured and legacy categories" {
         "Unsupported tool: legacy_tool",
         "read_file failed: missing.txt",
         "edit_file failed: old_string not found",
-        "delete_file failed: path not found: missing.txt",
-        "rename_file failed: source.txt",
-        "copy_file failed: source.txt",
-        "create_folder failed: target exists",
-        "file_info failed: not found: missing.txt",
-        "open_file not supported on this OS",
         "open_url not supported on this OS",
         "failed to open https://example.test",
     };

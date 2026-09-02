@@ -186,6 +186,10 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
     };
 }
 
+pub fn entrySnapshotRetainedBytes(entry: TranscriptEntry) usize {
+    return @sizeOf(TranscriptEntry) +| entryRetainedBytes(entry);
+}
+
 fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) ![]SkillTokenSpan {
     if (skill_tokens.len == 0) return &.{};
     const copy = try alloc.alloc(SkillTokenSpan, skill_tokens.len);
@@ -438,6 +442,10 @@ fn pruneOrphanedCommandOutputBlocks(
     var changed = false;
     var i: usize = 0;
     while (i < self.command_output_blocks.items.len) {
+        if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
+            i += 1;
+            continue;
+        }
         if (self.command_output_display.open_command_block) |open| {
             if (open == i) {
                 i += 1;
@@ -962,7 +970,9 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
 
     for (self.entries.items) |entry| {
         if (entry != .raw_bytes or !entry.raw_bytes.lifecycle_pinned) continue;
-        replacement_entries.appendAssumeCapacity(try cloneEntry(alloc, entry));
+        replacement_entries.appendAssumeCapacity(
+            try cloneEntryForSnapshot(alloc, entry),
+        );
     }
 
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
@@ -1360,7 +1370,10 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
 
     var shadow = try cloneRecordedMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    const dirty_entry_id = command_output_runtime.openCommandOutputDirtyEntryId(&shadow);
+    const dirty_entry_id = command_output_runtime.commandOutputDirtyEntryIdForLifecycle(
+        &shadow,
+        lifecycle_id,
+    );
     const retention_changed = try command_output_runtime.flushCommandOutputSummaryUncommitted(
         &shadow,
         alloc,
@@ -1962,12 +1975,12 @@ fn cloneEntries(
     }
     try result.ensureTotalCapacity(alloc, source.len);
     for (source) |entry| {
-        result.appendAssumeCapacity(try cloneEntry(alloc, entry));
+        result.appendAssumeCapacity(try cloneEntryForSnapshot(alloc, entry));
     }
     return result;
 }
 
-fn cloneEntry(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
+pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
     return switch (entry) {
         .raw_bytes => |raw| .{ .raw_bytes = .{
             .id = raw.id,
@@ -2043,12 +2056,12 @@ fn cloneToolDetails(
     const reserved_slot: usize = @intFromBool(source.capacity > source.items.len);
     try result.ensureTotalCapacityPrecise(alloc, source.items.len + reserved_slot);
     for (source.items) |detail| {
-        result.appendAssumeCapacity(try cloneToolDetail(alloc, detail));
+        result.appendAssumeCapacity(try cloneToolDetailForSnapshot(alloc, detail));
     }
     return result;
 }
 
-fn cloneToolDetail(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord {
+pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord {
     const tool_name = try alloc.dupe(u8, source.tool_name);
     errdefer alloc.free(tool_name);
     const arguments_json = if (source.arguments_json) |value|
@@ -2086,6 +2099,7 @@ fn cloneToolDetail(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord
 
     return .{
         .entry_id = source.entry_id,
+        .created_at_ms = source.created_at_ms,
         .tool_name = tool_name,
         .captured_command = source.captured_command,
         .activity_kind = source.activity_kind,

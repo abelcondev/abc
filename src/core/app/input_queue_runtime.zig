@@ -105,7 +105,7 @@ pub const PromptAdmission = enum {
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn requestCancelAndOpen(app: *App) bool {
-            return openAfterPause(app, app.worker.requestCancelWithQueueReview());
+            return openAfterPause(app, app.worker.requestInteractiveCancel());
         }
 
         pub fn pauseAndOpenAfterModalCancel(app: *App) bool {
@@ -558,6 +558,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 commits[filled] = .{
                     .turn_id = entry.draft.turn_id,
+                    .kind = entry.draft.kind,
                     .prompt = prompt_copy,
                     .images = images_copy,
                     .skill_display_spans = spans_copy,

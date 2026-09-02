@@ -41,6 +41,7 @@ pub const SessionStarted = struct {
     conversation_language: session.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
     usage: ?session_usage.Snapshot = null,
+    subagent_child: bool = false,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
         alloc.free(self.id);
@@ -269,20 +270,35 @@ pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+inline fn failEnvelope(err: anytype) @TypeOf(err)!Envelope {
+    return @errorCast(failEnvelopeDynamic(err));
+}
+
+noinline fn failEnvelopeDynamic(err: anyerror) anyerror!Envelope {
+    return err;
+}
+
+test "session envelope failures preserve exact error types and identities" {
+    const invalid = failEnvelope(error.InvalidEventFrame);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidEventFrame}!Envelope);
+    try std.testing.expectError(error.InvalidEventFrame, invalid);
+    try std.testing.expectError(error.OutOfMemory, failEnvelope(error.OutOfMemory));
+}
+
 pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
-    if (line.len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
     if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line[0 .. line.len - 1], .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEventFrame,
+        error.OutOfMemory => return failEnvelope(error.OutOfMemory),
+        else => return failEnvelope(error.InvalidEventFrame),
     };
     defer parsed.deinit();
     const root = try exactObject(parsed.value, &.{
@@ -294,15 +310,15 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
         "kind",
         "payload",
     });
-    if (try requireU64(root, "schema_version") != 1) return error.UnsupportedEventSchema;
+    if (try requireU64(root, "schema_version") != 1) return failEnvelope(error.UnsupportedEventSchema);
     const kind = std.meta.stringToEnum(Kind, try requireString(root, "kind")) orelse
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     var envelope = Envelope{
         .log_generation = try parseIdentifier(try requireString(root, "log_generation")),
         .seq = try requireU64(root, "seq"),
         .event_id = try parseIdentifier(try requireString(root, "event_id")),
         .timestamp_ms = try requireI64(root, "timestamp_ms"),
-        .event = try parsePayload(alloc, kind, root.get("payload") orelse return error.InvalidEventFrame),
+        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame)),
     };
     errdefer envelope.deinit(alloc);
     try validateEnvelope(envelope);
@@ -433,6 +449,23 @@ pub fn applyEventFrame(
     return reductionBoundary(envelope, frame_bytes);
 }
 
+inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
+    return @errorCast(failReductionDynamic(err));
+}
+
+noinline fn failReductionDynamic(err: anyerror) anyerror!Reduction {
+    return err;
+}
+
+test "session event reduction failures preserve exact error types and identities" {
+    const invalid = failReduction(error.InvalidReductionStart);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidReductionStart}!Reduction,
+    );
+    try std.testing.expectError(error.InvalidReductionStart, invalid);
+    try std.testing.expectError(error.MissingSessionStarted, failReduction(error.MissingSessionStarted));
+}
+
 pub fn reduceJsonlFrom(
     alloc: Allocator,
     source: *std.Io.Reader,
@@ -444,7 +477,7 @@ pub fn reduceJsonlFrom(
     if (start.next_seq == 0 or
         (state == null and (start.generation != null or start.next_seq != 1)))
     {
-        return error.InvalidReductionStart;
+        return failReduction(error.InvalidReductionStart);
     }
     var validator = SequenceValidator{
         .generation = start.generation,
@@ -467,7 +500,7 @@ pub fn reduceJsonlFrom(
         try validator.validate(envelope);
 
         if (envelope.kind() == .state_replacement_started) {
-            if (state == null) return error.InvalidReplacement;
+            if (state == null) return failReduction(error.InvalidReplacement);
             const replacement = try reduceReplacement(
                 alloc,
                 source,
@@ -493,14 +526,14 @@ pub fn reduceJsonlFrom(
         if (envelope.kind() == .state_replacement_chunk or
             envelope.kind() == .state_replacement_committed)
         {
-            return error.InvalidReplacement;
+            return failReduction(error.InvalidReplacement);
         }
         try applyDelta(alloc, &state, envelope);
         through = reductionBoundary(envelope, byte_offset);
     }
 
     return .{
-        .state = state orelse return error.MissingSessionStarted,
+        .state = state orelse return failReduction(error.MissingSessionStarted),
         .through = through,
         .bytes_consumed = byte_offset,
     };
@@ -887,6 +920,7 @@ fn applyDelta(
                 .history = &.{},
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
+                .subagent_child = payload.subagent_child,
             };
             errdefer alloc.free(next.id);
             next.origin_workspace_root = try alloc.dupe(u8, payload.origin_workspace_root);
@@ -963,6 +997,9 @@ fn applyDelta(
                 current.history = try alloc.realloc(current.history, current.history.len + 1);
             }
             current.history[current.history.len - 1] = turn;
+            if (payload.turn == .compacted_summary) {
+                current.context_history_start = current.history.len - 1;
+            }
             current.conversation_language = payload.conversation_language;
             current.total_input_tokens = payload.total_input_tokens;
             current.total_output_tokens = payload.total_output_tokens;
@@ -1019,6 +1056,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .usage = payload.usage,
+                .subagent_child = payload.subagent_child,
             };
             try session_codec.validateState(state);
         },
@@ -1115,6 +1153,9 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
                 try writer.writeAll(",\"usage\":");
                 try session_usage.writeSnapshot(writer, usage);
             }
+            if (payload.subagent_child) {
+                try writer.writeAll(",\"subagent_child\":true");
+            }
             try writer.writeByte('}');
         },
         .preferences_changed => |payload| {
@@ -1210,25 +1251,20 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
-            const object = if (source.count() == 6)
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                })
-            else
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                    "usage",
-                });
+            if (source.count() < 6 or source.count() > 8) {
+                return error.InvalidEventFrame;
+            }
+            try rejectUnknownKeys(source, &.{
+                "id",
+                "created_at_ms",
+                "origin_workspace_root",
+                "workspace_root",
+                "conversation_language",
+                "preferences",
+                "usage",
+                "subagent_child",
+            });
+            const object = source;
             const id = try dupeString(alloc, object, "id");
             errdefer alloc.free(id);
             const origin = try dupeString(alloc, object, "origin_workspace_root");
@@ -1251,6 +1287,13 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             else
                 null;
             errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+            const subagent_child = if (object.get("subagent_child")) |raw|
+                if (raw == .bool and raw.bool)
+                    true
+                else
+                    return error.InvalidEventFrame
+            else
+                false;
             break :blk .{ .session_started = .{
                 .id = id,
                 .created_at_ms = try requireI64(object, "created_at_ms"),
@@ -1261,6 +1304,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 ) catch return error.InvalidEventFrame,
                 .preferences = preferences,
                 .usage = usage,
+                .subagent_child = subagent_child,
             } };
         },
         .preferences_changed => blk: {
@@ -1612,6 +1656,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
                 .effort = types.ReasoningEffort.literal("medium"),
                 .fast_mode = false,
             },
+            .subagent_child = true,
         } },
     };
 
@@ -1625,6 +1670,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
     var decoded = try decodeFrame(alloc, first);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(Kind.session_started, decoded.kind());
+    try std.testing.expect(decoded.event.session_started.subagent_child);
     try std.testing.expectEqualSlices(u8, &generation, &decoded.log_generation);
     try std.testing.expectEqual(@as(u64, 1), decoded.seq);
 
@@ -2087,6 +2133,51 @@ test "single event application updates caller-owned state without replaying its 
     try std.testing.expectEqual(@as(u64, 100), state.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 50), state.total_output_tokens);
     try std.testing.expectEqual(@as(i64, 30), state.updated_at_ms);
+}
+
+test "compacted summary event advances the durable replacement boundary" {
+    const alloc = std.testing.allocator;
+    var state: ?session_codec.DurableSessionState = try singleEventTestState(
+        "session-compaction-checkpoint",
+    ).dupe(alloc);
+    defer if (state) |*current| current.deinit(alloc);
+
+    const generation = identifier(0xb0);
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = identifier(0xb1),
+        .timestamp_ms = 30,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 10,
+            .total_output_tokens = 5,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("exact prompt") },
+                .assistant = @constCast("exact reply"),
+            } },
+        } },
+    });
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = identifier(0xb2),
+        .timestamp_ms = 40,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 20,
+            .total_output_tokens = 10,
+            .turn = .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>\nsummary\n</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.?.history.len);
+    try std.testing.expectEqual(@as(usize, 1), state.?.context_history_start);
+    try std.testing.expectEqualStrings("exact prompt", state.?.history[0].assistant.user.text);
 }
 
 test "single event application preserves caller-owned state on allocation failure" {

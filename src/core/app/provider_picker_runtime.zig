@@ -159,16 +159,6 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) != null;
         }
 
-        /// Entry point for `/provider`, `/setup`, and `/login`: seeds the composer so the
-        /// provider column is showing and the user can type to filter.
-        pub fn open(app: *App, prefix: []const u8) !void {
-            if (comptime !supported(App)) return;
-            app.input_runtime.picker.clearProviderPickerFlow();
-            try app.auth.refreshSourceInventory(app.alloc);
-            try app.input_runtime.textReplacementState().replace(app.alloc, prefix);
-            app.shell.render_requests.request(.footer);
-        }
-
         pub fn navigate(app: *App, delta: i32) void {
             if (comptime !supported(App)) return;
             if (!hasQuery(app)) return;
