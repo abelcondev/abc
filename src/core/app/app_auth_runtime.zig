@@ -2055,7 +2055,7 @@ test "setup hub projects the selected provider into the auth picker" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
 }
 
-test "login opens only after its asynchronous inventory refresh completes" {
+test "login queues the inline picker until its asynchronous inventory refresh completes" {
     var app: TestApp = .{ .selected_provider = .grok };
     defer app.deinit();
 
@@ -2063,9 +2063,11 @@ test "login opens only after its asynchronous inventory refresh completes" {
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+    const action = app.auth.inventory_refresh_action orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(model_provider.ProviderId.grok, action.provider);
+    try std.testing.expectEqual(auth_runtime.InventoryRefreshDestination.provider_picker_login, action.destination);
     try Runtime(TestApp).collectSourceInventoryFacts(&app);
-    try std.testing.expect(app.auth.picker_opened);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, app.auth.picker_provider);
+    try std.testing.expect(!app.auth.picker_opened);
     try std.testing.expect(app.shell.render_requests.footer_requested);
 }
 
