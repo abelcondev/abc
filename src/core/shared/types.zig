@@ -286,6 +286,7 @@ pub const RouteRecoveryStatusTone = enum {
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -320,6 +321,7 @@ pub const ModelFailureDiagnostic = struct {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
             .response_interrupted => "StreamInterrupted",
+            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
@@ -466,6 +468,7 @@ pub const RouteRecoveryStatus = struct {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -539,6 +542,20 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Connection unavailable · recovery paused";
         }
+        if (cause == .provider_stream_timeout) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Gateway stream timed out · automatic retry paused";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
+                .{ self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Gateway stream timed out · automatic retry paused";
+        }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -556,6 +573,7 @@ pub const RouteRecoveryStatus = struct {
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -1109,6 +1127,10 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+pub const ProviderFailureCause = enum {
+    gateway_stream_timeout,
+};
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
@@ -1119,6 +1141,7 @@ pub const ModelCompletion = struct {
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,

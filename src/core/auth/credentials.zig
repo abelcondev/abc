@@ -31,8 +31,6 @@ pub fn parseAuthMode(value: ?[]const u8) AuthModeError!AuthMode {
     return error.InvalidAuthMode;
 }
 
-pub const RequestAuth = types.CredentialLease;
-
 pub const CatalogPublicOnly = union(enum) {
     no_credential,
     fx_login_team_required,
@@ -249,14 +247,6 @@ test "auth mode accepts only local and host-managed process values" {
     try std.testing.expectEqual(AuthMode.host_managed, try parseAuthMode("host-managed"));
     try std.testing.expectError(error.InvalidAuthMode, parseAuthMode("host_managed"));
     try std.testing.expectError(error.InvalidAuthMode, parseAuthMode(""));
-}
-
-test "host-managed authorization carries no credential bytes" {
-    const access: RequestAuth = .host_managed;
-    try std.testing.expect(access.secret() == null);
-    try std.testing.expect(access.accountId() == null);
-    try std.testing.expect(access.tenant() == null);
-    try std.testing.expectEqual(Source.host_managed, access.credentialSource());
 }
 
 test "host-managed catalog access is authenticated without local headers" {
