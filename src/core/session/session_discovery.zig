@@ -304,12 +304,15 @@ fn classifyConversationCandidate(
         defer event_file.close(io_mod.getIo());
         var offset: u64 = 0;
         while (offset < event_stat.size) {
-            const line = try session_replay.readLineAt(
+            const line = session_replay.readLineAt(
                 alloc,
                 event_file,
                 offset,
                 event_stat.size,
-            ) orelse break;
+            ) catch |err| switch (err) {
+                error.TruncatedEventFrame => break,
+                else => return err,
+            } orelse break;
             defer alloc.free(line.bytes);
             var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
             defer decoded.deinit();

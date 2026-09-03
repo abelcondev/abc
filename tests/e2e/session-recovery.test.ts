@@ -70,14 +70,14 @@ async function continueSession(
   fixture: ReturnType<typeof createFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
   sessionId: string,
+  latest = false,
 ) {
   return runFx(
     [
       "ask",
       "--json",
       "--auto",
-      "--resume-id",
-      sessionId,
+      ...(latest ? ["--resume", "last"] : ["--resume-id", sessionId]),
       "Continue after recovery.",
     ],
     {
@@ -89,7 +89,7 @@ async function continueSession(
 }
 
 describe("session recovery", () => {
-  test("writable resume truncates a partial final JSONL record", async () => {
+  test("latest resume discovers and repairs a partial final JSONL record", async () => {
     const fixture = createFixture("fx-session-partial-record-");
     const gateway = startFakeGateway([
       fakeGatewayFinalText("FIRST_TURN_SAVED"),
@@ -102,9 +102,21 @@ describe("session recovery", () => {
       const committed = readFileSync(eventsPath, "utf8");
       appendFileSync(eventsPath, '{"schema_version":1,"partial-tail"');
 
-      const resumed = await continueSession(fixture, gateway, sessionId);
+      const listed = await runFx(["sessions", "--json"], {
+        cwd: fixture.workspace,
+        env: gatewayEnv(fixture, gateway),
+        timeoutMs: TIMEOUT,
+      });
+      expect(listed.code).toBe(0);
+      expect(listed.stderr).toBe("");
+      expect(JSON.parse(listed.stdout).sessions.map((entry: { id: string }) => entry.id))
+        .toContain(sessionId);
+      expect(readFileSync(eventsPath, "utf8")).toBe(committed + '{"schema_version":1,"partial-tail"');
+
+      const resumed = await continueSession(fixture, gateway, sessionId, true);
       expect(resumed.code).toBe(0);
       expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).session_id).toBe(sessionId);
       expect(JSON.parse(resumed.stdout).output).toBe("PARTIAL_RECORD_RECOVERED");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).not.toContain("partial-tail");
