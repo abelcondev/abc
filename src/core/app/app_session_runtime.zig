@@ -2649,10 +2649,10 @@ pub fn Runtime(comptime App: type) type {
                 return .committed;
             }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else {
+                app.session_persistence.write_mutex.unlock(io_mod.getIo());
                 if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
                     app.session.commitPreparedHistoryEntry(app.alloc, prepared);
                     prepared_owned = false;
@@ -2664,6 +2664,7 @@ pub fn Runtime(comptime App: type) type {
                 commitJsHostSnapshot(app, "history_turn");
                 return .committed;
             };
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             try subagent_resume_admission.retainExternalRootUserTurn(
                 app.session_persistence.store,
                 app.alloc,
