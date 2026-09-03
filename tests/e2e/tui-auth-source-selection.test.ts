@@ -217,7 +217,11 @@ afterEach(async () => {
   stderrPath = null;
 });
 
-function writeSeededChatGptLogin(testHome: string, accessToken = chatgptAccessToken()): void {
+function writeSeededChatGptLogin(
+  testHome: string,
+  accessToken = chatgptAccessToken(),
+  expiresAtMs = Date.now() + 60 * 60 * 1000,
+): void {
   const fxDir = join(testHome, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -226,13 +230,18 @@ function writeSeededChatGptLogin(testHome: string, accessToken = chatgptAccessTo
     version: 1,
     access_token: accessToken,
     refresh_token: "chatgpt-refresh",
-    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    expires_at_ms: expiresAtMs,
     account_id: "acct_e2e",
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
 }
 
-function writeSeededGrokLogin(testHome: string, accessToken: string, accountId = "acct_grok_e2e"): void {
+function writeSeededGrokLogin(
+  testHome: string,
+  accessToken: string,
+  accountId = "acct_grok_e2e",
+  expiresAtMs = Date.now() + 60 * 60 * 1000,
+): void {
   const fxDir = join(testHome, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -241,7 +250,7 @@ function writeSeededGrokLogin(testHome: string, accessToken: string, accountId =
     version: 1,
     access_token: accessToken,
     refresh_token: "grok-refresh",
-    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    expires_at_ms: expiresAtMs,
     account_id: accountId,
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
@@ -398,6 +407,7 @@ function startFakeOAuth(
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
     rejectRefreshGrant?: boolean;
+    beforeRefreshResponse?: () => void | Promise<void>;
     teams?: Array<{ id: string; slug: string; name: string }>;
   } = {},
 ) {
@@ -461,6 +471,9 @@ function startFakeOAuth(
           recordedRequest.clientId = typeof clientId === "string" ? clientId : undefined;
           const grantType = form.get("grant_type");
           recordedRequest.grantType = typeof grantType === "string" ? grantType : undefined;
+          if (grantType === "refresh_token") {
+            await options.beforeRefreshResponse?.();
+          }
           tokenResponseCount += 1;
           if (
             (options.rejectRefreshGrant && grantType === "refresh_token") ||
@@ -531,6 +544,8 @@ function startFakeChatGptOAuth(
     tokenDelayMs?: number;
     responseDelayMs?: number;
     unauthorizedResponses?: number;
+    rejectRefresh?: boolean;
+    beforeRefreshResponse?: () => void | Promise<void>;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
@@ -571,6 +586,11 @@ function startFakeChatGptOAuth(
       }
       if (url.pathname === "/chatgpt/token") {
         if (options.tokenDelayMs) await Bun.sleep(options.tokenDelayMs);
+        const refresh = body?.includes('"grant_type":"refresh_token"') ?? false;
+        if (refresh) await options.beforeRefreshResponse?.();
+        if (options.rejectRefresh && refresh) {
+          return Response.json({ error: { code: "refresh_token_reused" } }, { status: 401 });
+        }
         return Response.json({
           access_token: accessToken,
           refresh_token: "chatgpt-refresh",
@@ -620,6 +640,8 @@ function startFakeChatGptOAuth(
 
 function startFakeGrokOAuth(options: {
   unauthorizedResponses?: number;
+  rejectRefresh?: boolean;
+  beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
   userinfoSub?: string;
 } = {}) {
@@ -691,6 +713,10 @@ function startFakeGrokOAuth(options: {
         tokenCalls += 1;
         const form = new URLSearchParams(body ?? "");
         const refresh = form.get("grant_type") === "refresh_token";
+        if (refresh) await options.beforeRefreshResponse?.();
+        if (refresh && options.rejectRefresh) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
         return Response.json({
           access_token: refresh ? refreshedAccessToken : initialAccessToken,
           refresh_token: refresh ? "grok-refresh-next" : "grok-refresh",
@@ -1529,6 +1555,173 @@ tmuxTest(
   },
   60_000,
 );
+
+tmuxTest(
+  "a rejected Codex refresh retires the session without using Gateway credentials",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-rejected-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ rejectRefresh: true });
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken, Date.now() - 60_000);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_MODEL: undefined },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("retire the rejected Codex login");
+    await session.waitForPane(
+      (pane) =>
+        pane.includes("Codex subscription sign-in expired.") &&
+        pane.includes("Press Enter to sign in again."),
+      TIMEOUT,
+    );
+
+    const refreshRequests = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/token" && request.body?.includes('"grant_type":"refresh_token"'),
+    );
+    expect(refreshRequests).toHaveLength(1);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a rejected Grok refresh retires the session without using Gateway credentials",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-grok-rejected-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth({ rejectRefresh: true });
+    writeSeededGrokLogin(home, grok.initialAccessToken, "acct_grok_e2e", Date.now() - 60_000);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    try {
+      session = await startFx(
+        home,
+        stderrPath,
+        gateway,
+        undefined,
+        undefined,
+        { ...grok.env, FX_MODEL: undefined },
+      );
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("retire the rejected Grok login");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("Grok subscription sign-in expired.") &&
+          pane.includes("Press Enter to sign in again."),
+        TIMEOUT,
+      );
+
+      expect(grok.requests.filter(
+        (request) => request.path === "/oauth2/token" && request.body?.includes("grant_type=refresh_token"),
+      )).toHaveLength(1);
+      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(false);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test("Codex refresh save failure retires the consumed session", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-chatgpt-refresh-save-failure-"));
+  gateway = startFakeGateway([]);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  chatgptOauth = startFakeChatGptOAuth({
+    beforeRefreshResponse() {
+      chmodSync(authPath, 0o400);
+    },
+  });
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken, Date.now() - 60_000);
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+    { mode: 0o600 },
+  );
+
+  const result = await runFx(["ask", "--json", "--no-save", "do not use another credential"], {
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      ...chatgptOauth.env,
+    },
+    timeoutMs: TIMEOUT,
+  });
+
+  expect(
+    result.code,
+    `signal: ${result.signal}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+  ).toBe(1);
+  expect(existsSync(authPath)).toBe(false);
+  expect(gateway.requests).toHaveLength(0);
+});
+
+test("Grok refresh save failure retires the consumed session", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-refresh-save-failure-"));
+  gateway = startFakeGateway([]);
+  const authPath = join(home, ".fx", "grok-auth.json");
+  const grok = startFakeGrokOAuth({
+    beforeRefreshResponse() {
+      chmodSync(authPath, 0o400);
+    },
+  });
+  writeSeededGrokLogin(home, grok.initialAccessToken, "acct_grok_e2e", Date.now() - 60_000);
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+    { mode: 0o600 },
+  );
+
+  try {
+    const result = await runFx(["ask", "--json", "--no-save", "do not use another credential"], {
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        ...grok.env,
+      },
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(
+      result.code,
+      `signal: ${result.signal}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    ).toBe(1);
+    expect(existsSync(authPath)).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    grok.stop();
+  }
+});
 
 tmuxTest(
   "provider picker walks every column and Left steps back",
@@ -2824,12 +3017,7 @@ test("Grok 401 replay refuses a different account before the second provider sen
     });
     expect(ask.code).toBe(1);
     expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
-    const saved = JSON.parse(readFileSync(join(home, ".fx", "grok-auth.json"), "utf8")) as {
-      access_token: string;
-      account_id: string;
-    };
-    expect(saved.access_token).toBe(grok.initialAccessToken);
-    expect(saved.account_id).toBe("acct_grok_e2e");
+    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(false);
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toContain("grok-");
     }
@@ -4316,15 +4504,55 @@ tmuxTest(
 );
 
 tmuxTest(
-  "explicit login replaces a saved session rejected during team loading",
+  "refresh save failure retires the session and starts a fresh sign-in",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-refresh-save-failure-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const authPath = join(home, ".fx", "auth.json");
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      tokenDelayMs: 5_000,
+      beforeRefreshResponse() {
+        chmodSync(authPath, 0o400);
+      },
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    expect(existsSync(authPath)).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a rejected saved session is retired before a later explicit login",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-rejected-session-login-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
-    gateway = startFakeGateway([]);
+    gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
       rejectRefreshGrant: true,
-      tokenDelayMs: 1_000,
+      tokenDelayMs: 5_000,
       teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
     });
     writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
@@ -4346,11 +4574,41 @@ tmuxTest(
 
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) => !pane.includes("Waiting for authorization"),
+      TIMEOUT,
+    );
+    await session.sendKeys("C-u");
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
     await session.waitForText("Team Harness", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
-    expect(gateway.requests).toHaveLength(0);
+
+    await session.sendText("use the repaired login after retiring the rejected token");
+    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.headers.get("authorization")).toBe(
+      `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
+    );
+    expect(gateway.requests[0]!.headers.get("authorization")).not.toBe(
+      `Bearer ${ENV_TOKEN}`,
+    );
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4588,7 +4846,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "immediately expired refresh keeps model discovery anonymous and later prompts blocked",
+  "an invalid refreshed lifetime retires the login and keeps model discovery anonymous",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-refresh-models-"));
     stderrPath = join(home, "stderr.log");
@@ -4619,14 +4877,15 @@ tmuxTest(
     const firstFailure = await session.waitForPane(
       (pane) =>
         pane.includes(firstPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Check your connection and press Enter to retry.") &&
+        pane.includes("fx login sign-in expired.") &&
+        pane.includes("Press Enter to sign in again.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(firstFailure).not.toContain("Choose another source");
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
@@ -4644,22 +4903,9 @@ tmuxTest(
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
-
-    const secondPrompt = "a subsequent prompt remains blocked";
-    await session.sendText(secondPrompt);
-    await session.waitForPane(
-      (pane) =>
-        pane.includes(secondPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Check your connection and press Enter to retry.") &&
-        !pane.includes("Model provider"),
-      TIMEOUT,
-    );
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
-      "GET /.well-known/openid-configuration",
-      "POST /oauth/token",
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);

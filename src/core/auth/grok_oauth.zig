@@ -535,38 +535,76 @@ fn refreshSession(
     try form.append(&body.writer, "grant_type", "refresh_token");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "refresh_token", session.refresh_token);
-    var token = try requestRefreshToken(alloc, transport, body.written());
+    var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
+        error.CredentialRefreshRejected,
+        error.InvalidGrokOAuthResponse,
+        => {
+            debug_trace.logf("auth", "retiring terminal Grok session reason={s}", .{@errorName(err)});
+            try retire_refresh_session(mutation);
+            return error.CredentialRefreshRejected;
+        },
+        else => return err,
+    };
     defer token.deinit(alloc);
 
-    const account_id = try fetchAccountId(alloc, transport, token.access_token);
-    errdefer alloc.free(account_id);
-    if (!std.mem.eql(u8, account_id, session.account_id)) {
-        return error.GrokAccountChanged;
-    }
-    const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
-    if (token.refresh_token != null) token.refresh_token = null;
-    errdefer secret.zeroAndFree(alloc, refresh_token);
-    const expires_at_ms = if (token.expires_in) |expires_in| blk: {
-        const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
-            return error.InvalidGrokOAuthResponse;
-        break :blk std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
-            return error.InvalidGrokOAuthResponse;
-    } else return error.InvalidGrokOAuthResponse;
-    var replacement = grok_session.Session{
-        .access_token = token.access_token,
-        .refresh_token = refresh_token,
-        .expires_at_ms = expires_at_ms,
-        .account_id = account_id,
+    var replacement = refresh_replacement(alloc, transport, &token, session.*) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("auth", "retiring unusable Grok refresh reason={s}", .{@errorName(err)});
+        try retire_refresh_session(mutation);
+        if (err == error.GrokAccountChanged) return err;
+        return error.CredentialRefreshRejected;
     };
-    token.access_token = &.{};
     errdefer replacement.deinit(alloc);
-    try mutation.save(alloc, replacement);
+    mutation.save(alloc, replacement) catch |err| {
+        debug_trace.logf("auth", "retiring Grok session after refresh save failed err={s}", .{@errorName(err)});
+        retire_refresh_session(mutation) catch |cleanup_err| {
+            debug_trace.logf("auth", "Grok session retirement failed err={s}", .{@errorName(cleanup_err)});
+        };
+        return error.CredentialRefreshPersistenceUncertain;
+    };
 
     session.deinit(alloc);
     session.* = replacement;
     replacement.access_token = &.{};
     replacement.refresh_token = &.{};
     replacement.account_id = &.{};
+}
+
+fn refresh_replacement(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    token: *RefreshTokenResponse,
+    current: grok_session.Session,
+) !grok_session.Session {
+    const account_id = try fetchAccountId(alloc, transport, token.access_token);
+    errdefer alloc.free(account_id);
+    if (!std.mem.eql(u8, account_id, current.account_id)) {
+        return error.GrokAccountChanged;
+    }
+    const refresh_token = if (token.refresh_token) |rotated|
+        rotated
+    else
+        try alloc.dupe(u8, current.refresh_token);
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    const expires_in = token.expires_in orelse return error.InvalidGrokOAuthResponse;
+    const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
+        return error.InvalidGrokOAuthResponse;
+    const expires_at_ms = std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
+        return error.InvalidGrokOAuthResponse;
+    const replacement = grok_session.Session{
+        .access_token = token.access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = expires_at_ms,
+        .account_id = account_id,
+    };
+    token.access_token = &.{};
+    if (token.refresh_token != null) token.refresh_token = null;
+    return replacement;
+}
+
+fn retire_refresh_session(mutation: *grok_session.Mutation) !void {
+    const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
+    if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
 }
 
 const RefreshTokenResponse = struct {
@@ -588,13 +626,20 @@ fn requestRefreshToken(
 ) !RefreshTokenResponse {
     const endpoint_url = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
     defer alloc.free(endpoint_url);
-    const bytes = try requestAccepted(
-        alloc,
-        transport,
-        .post_form,
-        endpoint_url,
-        payload,
-    );
+    var response = try transport.execute(alloc, .{
+        .method = .post_form,
+        .url = endpoint_url,
+        .payload = payload,
+    });
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) {
+        debug_trace.logf("auth", "Grok refresh request rejected", .{});
+        if (std.mem.find(u8, response.body, "\"invalid_grant\"") != null) {
+            return error.CredentialRefreshRejected;
+        }
+        return error.GrokOAuthRequestFailed;
+    }
+    const bytes = response.takeBody();
     defer secret.zeroAndFree(alloc, bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();

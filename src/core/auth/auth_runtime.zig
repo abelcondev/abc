@@ -82,6 +82,8 @@ pub fn classifyCredentialFailure(
             error.AccessDenied,
             error.ExpiredToken,
             error.InvalidClient,
+            error.NoRefreshToken,
+            error.CredentialRefreshRejected,
             error.CredentialRefreshUnavailable,
             => .invalid_credential,
             error.InvalidAuthSession,
@@ -92,6 +94,7 @@ pub fn classifyCredentialFailure(
             error.KeychainWriteFailed,
             error.OAuthSessionKeychainWriteMismatch,
             error.OAuthSessionCleanupUncertain,
+            error.CredentialRefreshPersistenceUncertain,
             => .persistence_uncertain,
             error.CredentialAuthorityChanged,
             error.ChatGptAccountChanged,
@@ -2656,8 +2659,11 @@ test "credential refresh failures preserve repair and retry semantics" {
         expected_retryable: bool,
     }{
         .{ .err = error.InvalidGrant, .expected_reason = .invalid_credential, .expected_retryable = false },
+        .{ .err = error.NoRefreshToken, .expected_reason = .invalid_credential, .expected_retryable = false },
+        .{ .err = error.CredentialRefreshRejected, .expected_reason = .invalid_credential, .expected_retryable = false },
         .{ .err = error.InvalidAuthSession, .expected_reason = .invalid_storage, .expected_retryable = false },
         .{ .err = error.OAuthSessionKeychainWriteMismatch, .expected_reason = .persistence_uncertain, .expected_retryable = false },
+        .{ .err = error.CredentialRefreshPersistenceUncertain, .expected_reason = .persistence_uncertain, .expected_retryable = false },
         .{ .err = error.CredentialAuthorityChanged, .expected_reason = .authority_changed, .expected_retryable = false },
         .{ .err = error.ConnectionResetByPeer, .expected_reason = .temporary_unavailable, .expected_retryable = true },
     };
