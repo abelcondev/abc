@@ -1193,14 +1193,15 @@ export async function createFxAgent(options = {}) {
         const errorName = error instanceof Error ? error.name : "Error";
         const elapsedMs = performance.now() - startedAt;
         emit("transport.error", { attempt, elapsedMs, error: errorName });
-        if (attemptIndex === 1 || init.signal?.aborted) throw error;
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (attemptIndex === 1) throw error;
         emit("transport.retry", {
           attempt,
           nextAttempt: attempt + 1,
           elapsedMs,
           error: errorName,
         });
-        if (init.signal?.aborted) throw error;
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
       }
     }
     throw new Error("transport retry exhausted");

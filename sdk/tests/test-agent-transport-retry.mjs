@@ -135,7 +135,7 @@ try {
   const turn = retryBoundaryAgent.prompt("cancel from the retry event", {
     signal: retryBoundaryController.signal,
   });
-  await turn.result.catch(() => {});
+  assert.equal((await turn.result).stopReason, "cancelled");
   assert.equal(retryBoundaryFetchCalls, 1, "cancellation from transport.retry must prevent the second fetch");
   assert.deepEqual(
     retryBoundaryEvents.filter((event) => event.type === "transport.start").map((event) => event.attempt),
