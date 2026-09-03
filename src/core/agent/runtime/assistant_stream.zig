@@ -73,7 +73,7 @@ pub const StreamChunkContext = struct {
     markdown: assistant_presentation.MarkdownProcessor = .{},
     raw_text: std.ArrayList(u8) = .empty,
     interrupted_source: std.ArrayList(u8) = .empty,
-    source_started: bool = false,
+    response_started: bool = false,
     published_phase: ?types.TurnPhase = null,
     initial_line_prefix: std.ArrayList(u8) = .empty,
     provisional_statuses: runtime_tool_presentation.ProvisionalToolStatuses = .{},
@@ -122,6 +122,12 @@ pub const StreamChunkContext = struct {
         self.provisional_statuses.deinit(self.alloc);
     }
 
+    pub fn start_response(self: *StreamChunkContext) !void {
+        if (self.response_started) return;
+        try self.hooks.push_text(self.hooks.ctx, .assistant_started);
+        self.response_started = true;
+    }
+
     pub fn beginRecoveryAttempt(self: *StreamChunkContext) !void {
         if (self.response_language_staging()) {
             self.drop_staged_response_language_candidate();
@@ -142,7 +148,7 @@ pub const StreamChunkContext = struct {
         self.markdown = .{};
         self.initial_line_prefix.clearRetainingCapacity();
         self.saw_visible_text = false;
-        self.source_started = false;
+        self.response_started = false;
         self.last_byte_was_newline = false;
         self.trailing_newline_count = 0;
         self.response_language_accepted = false;
@@ -371,10 +377,7 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
 fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
-    if (!stream_ctx.source_started) {
-        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .assistant_started);
-        stream_ctx.source_started = true;
-    }
+    try stream_ctx.start_response();
     try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_source = chunk });
     if (!stream_ctx.hooks.render_assistant_text) {
         if (std.mem.trim(u8, chunk, " \t\r\n").len > 0) stream_ctx.saw_visible_text = true;

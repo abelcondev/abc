@@ -6745,6 +6745,7 @@ fn processQueuedPromptLoop(
                     " \t\r\n",
                 ).len > 0;
                 if (!has_novel_content) {
+                    try stream_ctx.start_response();
                     if (successful_recovery_strategy != null) {
                         try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
                     }
@@ -6966,6 +6967,7 @@ fn processQueuedPromptLoop(
                 },
             }
         }
+        if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
         for (completion.tool_calls) |call| {
             if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;

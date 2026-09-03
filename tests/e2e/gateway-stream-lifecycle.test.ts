@@ -6755,7 +6755,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         })}\n\n`,
       ),
       ...Array.from({ length: 9 }, () => unavailableResponse("0")),
-      fakeGatewayFinalText(`${partialText}${finalText}`),
+      fakeGatewayFinalText(finalText),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -6772,6 +6772,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const paused = parseAskJson(first.stdout);
       expect(first.code).toBe(1);
       expect(paused.output).toBe(partialText);
+      expect(paused.final_output).toBe("");
       expect(paused.recovery?.state).toBe("paused");
       expect(gateway.requestCount()).toBe(10);
 
@@ -6792,17 +6793,103 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
-      expect(recovered.output).toBe(`${partialText}${finalText}`);
+      expect(recovered.output).toBe(finalText);
+      expect(recovered.final_output).toBe(finalText);
       expect(recovered.recovery?.state).toBe("recovered");
       expect(recovered.recovery?.message).not.toContain(
         "provider temporarily unavailable",
       );
       expect(gateway.requestCount()).toBe(11);
+      expect(gateway.requests[10]!.body).not.toContain(partialText);
+      expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("accepted tool-only replacement discards only the obsolete JSON preview", async () => {
+    const root = createFixtureRoot("tool-only-replacement");
+    const tracePath = join(root.root, "trace.log");
+    const commentary = "Completed tool commentary.";
+    const partialText = "OBSOLETE_PREVIEW";
+    writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const responses = [
+      fakeGatewaySerializedToolCall("first_read", "read_file", '{"path":"fixture.txt"}', commentary),
+      sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`),
+      fakeGatewayToolCall("replacement_read", "read_file", { path: "fixture.txt" }),
+      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the fixture."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.output).toBe(commentary);
+      expect(json.final_output).toBe("");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requestCount()).toBe(12);
+      expect(gateway.requests[3]!.body).not.toContain(partialText);
+      expect(toolResultOutput(gateway.requests[3]!.body, "replacement_read")).toContain("settled evidence");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  for (const variant of ["duplicate-provider", "empty-completion"] as const) {
+    test(`accepted ${variant} response discards an obsolete JSON preview`, async () => {
+      const root = createFixtureRoot(`empty-replacement-${variant}`);
+      const tracePath = join(root.root, "trace.log");
+      const partialText = `OBSOLETE_${variant}`;
+      writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+      const partial = sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`);
+      const responses = variant === "duplicate-provider"
+        ? [
+          providerToolResultResponse("provider_error"),
+          partial,
+          providerToolResultResponse("tool-calls"),
+          ...Array.from({ length: 8 }, () => unavailableResponse("0")),
+        ]
+        : [
+          fakeGatewayToolCall("silent_read_1", "read_file", { path: "fixture.txt" }),
+          fakeGatewayToolCall("silent_read_2", "read_file", { path: "fixture.txt" }),
+          partial,
+          fakeGatewayFinalText(""),
+          ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+        ];
+      const gateway = startGateway(() =>
+        responses.shift() ?? new Response("unexpected request", { status: 500 })
+      );
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Inspect the available evidence."],
+          { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+        );
+        const json = parseAskJson(result.stdout);
+        expect(result.code).toBe(1);
+        expect(json.output).toBe("");
+        expect(json.final_output).toBe("");
+        expect(gateway.requestCount()).toBe(variant === "duplicate-provider" ? 11 : 13);
+        expect(readFileSync(tracePath, "utf8")).toContain(
+          variant === "duplicate-provider"
+            ? "event=provider_tool_recovery_duplicate_suppressed"
+            : "injecting continuation after 2 silent tool steps",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("content filter does not retry or offer route recovery", async () => {
     const root = createFixtureRoot("content-filter-terminal");

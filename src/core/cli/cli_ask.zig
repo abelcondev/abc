@@ -582,6 +582,7 @@ const AskContext = struct {
     pending_tool_progress_mutex: std.Io.Mutex = .init,
     raw_boundary_pending: bool = false,
     response_output_start: usize = 0,
+    response_restart_pending: bool = false,
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
     command_output_line_open: bool = false,
@@ -2179,6 +2180,7 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
+    if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -3013,21 +3015,13 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     switch (emission) {
         .assistant_started => {
+            discard_restarted_json_preview(ctx);
             ctx.response_output_start = ctx.assistant_output.items.len;
         },
         .assistant_restarted => |text| switch (ctx.output_mode) {
             .raw => try writeRawAssistantBytes(ctx, text),
             .json => {
-                debug_trace.logf("agent", "discarding interrupted JSON preview bytes={d}", .{ctx.assistant_output.items.len - ctx.response_output_start});
-                ctx.assistant_output.shrinkRetainingCapacity(ctx.response_output_start);
-                ctx.raw_has_output = ctx.assistant_output.items.len > 0;
-                ctx.raw_boundary_pending = ctx.raw_has_output;
-                ctx.raw_trailing_newlines = if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n\n"))
-                    2
-                else if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n"))
-                    1
-                else
-                    0;
+                ctx.response_restart_pending = true;
                 try ctx.writeStderr(text);
             },
             .quiet => try ctx.writeStderr(text),
@@ -3046,6 +3040,21 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             .quiet, .json, .raw => try ctx.writeStderr(text),
         },
     }
+}
+
+fn discard_restarted_json_preview(ctx: *AskContext) void {
+    if (!ctx.response_restart_pending) return;
+    debug_trace.logf("agent", "discarding interrupted JSON preview bytes={d}", .{ctx.assistant_output.items.len - ctx.response_output_start});
+    ctx.assistant_output.shrinkRetainingCapacity(ctx.response_output_start);
+    ctx.response_restart_pending = false;
+    ctx.raw_has_output = ctx.assistant_output.items.len > 0;
+    ctx.raw_boundary_pending = ctx.raw_has_output;
+    ctx.raw_trailing_newlines = if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n\n"))
+        2
+    else if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n"))
+        1
+    else
+        0;
 }
 
 fn pushRawAssistantText(ctx: *AskContext, text: []const u8) !void {
@@ -9200,6 +9209,7 @@ test "CLI response restart preserves completed output and removes only the faile
     try deps.push_text(deps.ctx, .assistant_started);
     try deps.push_text(deps.ctx, .{ .assistant_source = "DISCARDED partial" });
     try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart notice\n" });
+    try std.testing.expectEqualStrings("Completed tool commentary.DISCARDED partial", ctx.assistant_output.items);
     try deps.push_text(deps.ctx, .assistant_started);
     try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
     try std.testing.expectEqualStrings("Completed tool commentary.\n\nReplacement.", ctx.assistant_output.items);
@@ -9211,6 +9221,37 @@ test "CLI response restart preserves completed output and removes only the faile
     try deps.push_text(deps.ctx, .{ .assistant_restarted = "\n\nRestart notice\n\n" });
     try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
     try std.testing.expectEqualStrings("partial\n\nRestart notice\n\nReplacement.", stdout_capture.bytes.items);
+}
+
+test "CLI keeps an unreplaced preview on failure and discards it on completion" {
+    const alloc = std.testing.allocator;
+    for ([_]types.TurnPresentationOutcome{ .paused, .failed, .interrupted, .completed }) |outcome| {
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var ctx = AskContext.init(
+            alloc,
+            testConfig(),
+            testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+            "/tmp/workspace",
+        );
+        defer ctx.deinit();
+        ctx.output_mode = .json;
+        const deps = agentRuntimeDeps(&ctx);
+        try deps.push_text(deps.ctx, .assistant_started);
+        try deps.push_text(deps.ctx, .{ .assistant_source = "Completed commentary.\n\n" });
+        try deps.push_text(deps.ctx, .assistant_started);
+        try deps.push_text(deps.ctx, .{ .assistant_source = "Retained preview." });
+        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+        try deps.finalize_turn(deps.ctx, 1, outcome, null);
+        try std.testing.expectEqualStrings(
+            if (outcome == .completed) "Completed commentary.\n\n" else "Completed commentary.\n\nRetained preview.",
+            ctx.assistant_output.items,
+        );
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+    }
 }
 
 test "CLI final output admits only completed assistant finish prompts" {
