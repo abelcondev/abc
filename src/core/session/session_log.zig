@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const model_provider = @import("../config/model_provider.zig");
 const session = @import("session.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
@@ -228,6 +229,467 @@ pub const ConversationWriter = struct {
         self.last_seq = seq;
     }
 };
+
+fn createConversationStorage(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    metadata: session_codec.SessionMetadata,
+) !ConversationWriter {
+    const metadata_bytes = try session_codec.encodeSessionMetadata(alloc, metadata);
+    defer alloc.free(metadata_bytes);
+    try io_mod.durableReplaceVerified(alloc, dir, manifest_file, metadata_bytes);
+    errdefer {
+        dir.dir.deleteFile(io_mod.getIo(), manifest_file) catch {};
+        io_mod.syncVerifiedDir(dir.dir) catch {};
+    }
+
+    const file = createManagedFile(dir, events_file) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.SessionAlreadyExists,
+        else => return err,
+    };
+    errdefer file.close(io_mod.getIo());
+    return ConversationWriter.init(alloc, file);
+}
+
+fn loadConversationStateIfPresent(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    expected_session_id: []const u8,
+) !?session_codec.DurableSessionState {
+    const metadata_bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        manifest_file,
+        session_codec.max_session_metadata_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(metadata_bytes);
+    var probe = std.json.parseFromSlice(std.json.Value, alloc, metadata_bytes, .{
+        .parse_numbers = false,
+    }) catch return null;
+    defer probe.deinit();
+    const object = if (probe.value == .object) probe.value.object else return null;
+    const version_value = object.get("schema_version") orelse return null;
+    if (version_value != .number_string or
+        !std.mem.eql(u8, version_value.number_string, "4"))
+    {
+        return null;
+    }
+
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    if (!std.mem.eql(u8, metadata.value.id, expected_session_id)) {
+        return error.InvalidSessionMetadata;
+    }
+    var event_file = try openManagedFile(dir, events_file, .read_only);
+    defer event_file.close(io_mod.getIo());
+    const history = try replayConversationHistory(alloc, event_file);
+    errdefer session.freeHistoryTurnSlice(alloc, history);
+    const id = try alloc.dupe(u8, metadata.value.id);
+    errdefer alloc.free(id);
+    const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, metadata.value.workspace_root);
+    errdefer alloc.free(workspace);
+    const model = try alloc.dupe(u8, metadata.value.model);
+    errdefer alloc.free(model);
+    const language = session.ConversationLanguage.fromSlice(
+        metadata.value.conversation_language,
+    ) catch return error.InvalidSessionMetadata;
+    const provider = model_provider.parse(metadata.value.provider) orelse
+        return error.InvalidSessionMetadata;
+    const effort = types.ReasoningEffort.parse(metadata.value.effort) orelse
+        return error.InvalidSessionMetadata;
+    return .{
+        .id = id,
+        .origin_workspace_root = origin,
+        .workspace_root = workspace,
+        .created_at_ms = metadata.value.created_at_ms,
+        .updated_at_ms = metadata.value.updated_at_ms,
+        .conversation_language = language,
+        .preferences = .{
+            .provider = provider,
+            .model = model,
+            .effort = effort,
+            .fast_mode = metadata.value.fast_mode,
+        },
+        .history = history,
+        .context_history_start = latestConversationCheckpointIndex(history),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .subagent_child = metadata.value.subagent_child,
+    };
+}
+
+fn hasConversationMetadata(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !bool {
+    const bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        manifest_file,
+        session_codec.max_session_metadata_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .parse_numbers = false,
+    }) catch return false;
+    defer parsed.deinit();
+    const object = if (parsed.value == .object) parsed.value.object else return false;
+    const version = object.get("schema_version") orelse return false;
+    return version == .number_string and std.mem.eql(u8, version.number_string, "4");
+}
+
+fn openConversationWritableSession(
+    alloc: Allocator,
+    writable: *WritableSessionDir,
+) !LoadedWritableSession {
+    var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
+    var conversation_writer = ConversationWriter.init(alloc, event_file) catch |err| {
+        event_file.close(io_mod.getIo());
+        return err;
+    };
+    errdefer conversation_writer.deinit();
+    var state = (try loadConversationStateIfPresent(
+        alloc,
+        &writable.dir,
+        writable.session_id,
+    )) orelse return error.InvalidSessionMetadata;
+    errdefer state.deinit(alloc);
+    const active_id = try alloc.dupe(u8, writable.session_id);
+    errdefer alloc.free(active_id);
+    const generation = randomIdentifier();
+    const position = CommitPosition{
+        .log_generation = generation,
+        .through_seq = conversation_writer.last_seq,
+        .through_event_id = randomIdentifier(),
+        .through_event_log_bytes = conversation_writer.committed_bytes,
+    };
+    const result = LoadedWritableSession{
+        .active_id = active_id,
+        .state = state,
+        .conversation_writer = conversation_writer,
+        .log = writable.*,
+        .position = position,
+        .authority_id = randomIdentifier(),
+        .generation_base_seq = position.through_seq,
+        .generation_base_bytes = position.through_event_log_bytes,
+    };
+    writable.* = undefined;
+    return result;
+}
+
+fn replayConversationHistory(
+    alloc: Allocator,
+    file: std.Io.File,
+) ![]session.HistoryTurn {
+    const length = try file.length(io_mod.getIo());
+    var offset: u64 = 0;
+    var history: std.ArrayList(session.HistoryTurn) = .empty;
+    errdefer {
+        for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
+        history.deinit(alloc);
+    }
+    var turn = ConversationTurnBuilder.init(alloc);
+    defer turn.deinit();
+    var compaction_count: usize = 0;
+
+    while (offset < length) {
+        const line = try session_replay.readLineAt(alloc, file, offset, length) orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        switch (decoded.value.event) {
+            .user => |value| try turn.begin(value.text),
+            .assistant => |value| try turn.appendAssistant(value.text),
+            .tool_call => |value| try turn.appendToolCall(value),
+            .tool_result => |value| try turn.appendToolResult(value),
+            .steering => |value| try turn.appendSteering(value.text),
+            .turn_completed => {
+                const completed = try turn.finishAssistant();
+                errdefer session.freeHistoryTurn(alloc, completed);
+                try history.append(alloc, completed);
+            },
+            .interrupted => |value| {
+                const completed = try turn.finishInterrupted(value);
+                errdefer session.freeHistoryTurn(alloc, completed);
+                try history.append(alloc, completed);
+            },
+            .context_checkpoint => |value| {
+                if (!turn.isIdle()) return error.InvalidConversationFrame;
+                compaction_count += 1;
+                try history.append(alloc, .{ .compacted_summary = .{
+                    .summary = try alloc.dupe(u8, value.summary),
+                    .removed_turn_count = rawConversationTurnCount(history.items),
+                    .compaction_count = compaction_count,
+                    .root_user_messages_complete = false,
+                    .permission_feedback_complete = false,
+                } });
+            },
+        }
+        offset = line.next_offset;
+    }
+    if (!turn.isIdle()) return error.InvalidConversationFrame;
+    return history.toOwnedSlice(alloc);
+}
+
+const ConversationTurnBuilder = struct {
+    alloc: Allocator,
+    user: ?[]u8 = null,
+    pending_assistant: ?[]u8 = null,
+    calls: std.ArrayList(types.ToolCall) = .empty,
+    results: std.ArrayList(types.PersistedToolResult) = .empty,
+    steps: std.ArrayList(types.ToolExecutionStep) = .empty,
+    steering: std.ArrayList(types.PersistedSteering) = .empty,
+
+    fn init(alloc: Allocator) ConversationTurnBuilder {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *ConversationTurnBuilder) void {
+        if (self.user) |text| self.alloc.free(text);
+        if (self.pending_assistant) |text| self.alloc.free(text);
+        types.freeToolCallSlice(self.alloc, self.calls.items);
+        types.freePersistedToolResults(self.alloc, self.results.items);
+        for (self.steps.items) |step| {
+            if (step.assistant) |text| self.alloc.free(text);
+            types.freeToolCallSlice(self.alloc, step.tool_calls);
+            types.freePersistedToolResults(self.alloc, step.tool_results);
+        }
+        for (self.steering.items) |item| {
+            self.alloc.free(item.text);
+            if (item.assistant_prefix) |text| self.alloc.free(text);
+        }
+        self.steps.deinit(self.alloc);
+        self.steering.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn isIdle(self: *const ConversationTurnBuilder) bool {
+        return self.user == null and
+            self.pending_assistant == null and
+            self.calls.items.len == 0 and
+            self.results.items.len == 0 and
+            self.steps.items.len == 0 and
+            self.steering.items.len == 0;
+    }
+
+    fn begin(self: *ConversationTurnBuilder, text: []const u8) !void {
+        if (!self.isIdle()) return error.InvalidConversationFrame;
+        self.user = try self.alloc.dupe(u8, text);
+    }
+
+    fn appendAssistant(self: *ConversationTurnBuilder, text: []const u8) !void {
+        if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        self.pending_assistant = try self.alloc.dupe(u8, text);
+    }
+
+    fn appendToolCall(
+        self: *ConversationTurnBuilder,
+        value: session_event.ConversationToolCall,
+    ) !void {
+        if (self.user == null or self.results.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        for (self.calls.items) |call| {
+            if (std.mem.eql(u8, call.id, value.call_id)) return error.InvalidConversationFrame;
+        }
+        const call = try types.dupeToolCall(self.alloc, .{
+            .id = value.call_id,
+            .name = value.tool_name,
+            .arguments_json = value.arguments_json,
+        });
+        errdefer types.freeToolCall(self.alloc, call);
+        try self.calls.append(self.alloc, call);
+    }
+
+    fn appendToolResult(
+        self: *ConversationTurnBuilder,
+        value: session_event.ConversationToolResult,
+    ) !void {
+        if (self.user == null or self.calls.items.len == 0) {
+            return error.InvalidConversationFrame;
+        }
+        var matching_call = false;
+        for (self.calls.items) |call| {
+            if (!std.mem.eql(u8, call.id, value.call_id)) continue;
+            if (!std.mem.eql(u8, call.name, value.tool_name)) {
+                return error.InvalidConversationFrame;
+            }
+            matching_call = true;
+            break;
+        }
+        if (!matching_call) return error.InvalidConversationFrame;
+        for (self.results.items) |result| {
+            if (std.mem.eql(u8, result.tool_call_id, value.call_id)) {
+                return error.InvalidConversationFrame;
+            }
+        }
+
+        const result = try dupeConversationToolResult(self.alloc, value);
+        errdefer freeConversationToolResult(self.alloc, result);
+        try self.results.append(self.alloc, result);
+        if (self.results.items.len == self.calls.items.len) try self.finishStep();
+    }
+
+    fn finishStep(self: *ConversationTurnBuilder) !void {
+        try self.steps.ensureUnusedCapacity(self.alloc, 1);
+        const calls = try self.calls.toOwnedSlice(self.alloc);
+        errdefer types.freeToolCallSlice(self.alloc, calls);
+        const results = try self.results.toOwnedSlice(self.alloc);
+        errdefer types.freePersistedToolResults(self.alloc, results);
+        self.steps.appendAssumeCapacity(.{
+            .assistant = self.pending_assistant,
+            .tool_calls = calls,
+            .tool_results = results,
+        });
+        self.pending_assistant = null;
+    }
+
+    fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
+        if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        const owned = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(owned);
+        try self.steering.append(self.alloc, .{
+            .text = owned,
+            .assistant_prefix = self.pending_assistant,
+            .after_tool_step_count = self.steps.items.len,
+        });
+        self.pending_assistant = null;
+    }
+
+    fn finishAssistant(self: *ConversationTurnBuilder) !session.HistoryTurn {
+        if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        const assistant = if (self.pending_assistant) |text|
+            text
+        else
+            try self.alloc.dupe(u8, "");
+        const execution = try self.takeExecution();
+        const user = self.user.?;
+        self.user = null;
+        self.pending_assistant = null;
+        return .{ .assistant = .{
+            .user = .{ .text = user },
+            .assistant = assistant,
+            .execution = execution,
+        } };
+    }
+
+    fn finishInterrupted(
+        self: *ConversationTurnBuilder,
+        value: session_event.ConversationInterruption,
+    ) !session.HistoryTurn {
+        if (self.user == null or self.results.items.len != 0 or self.calls.items.len > 1) {
+            return error.InvalidConversationFrame;
+        }
+        const tool_call = if (self.calls.items.len == 1)
+            self.calls.orderedRemove(0)
+        else
+            null;
+        errdefer if (tool_call) |call| types.freeToolCall(self.alloc, call);
+        if (self.pending_assistant) |text| {
+            self.alloc.free(text);
+            self.pending_assistant = null;
+        }
+        const assistant = if (value.partial_text) |text|
+            try self.alloc.dupe(u8, text)
+        else
+            null;
+        errdefer if (assistant) |text| self.alloc.free(text);
+        const execution = try self.takeExecution();
+        const user = self.user.?;
+        self.user = null;
+        return .{ .interrupted = .{
+            .user = .{ .text = user },
+            .assistant = assistant,
+            .tool_call = tool_call,
+            .execution = execution,
+            .terminal_reason = value.reason,
+        } };
+    }
+
+    fn takeExecution(self: *ConversationTurnBuilder) !types.ExecutionMemory {
+        const steps = try self.steps.toOwnedSlice(self.alloc);
+        errdefer {
+            for (steps) |step| {
+                if (step.assistant) |text| self.alloc.free(text);
+                types.freeToolCallSlice(self.alloc, step.tool_calls);
+                types.freePersistedToolResults(self.alloc, step.tool_results);
+            }
+            if (steps.len > 0) self.alloc.free(steps);
+        }
+        const steering = try self.steering.toOwnedSlice(self.alloc);
+        return .{ .tool_steps = steps, .steering = steering };
+    }
+};
+
+fn dupeConversationToolResult(
+    alloc: Allocator,
+    value: session_event.ConversationToolResult,
+) !types.PersistedToolResult {
+    const call_id = try alloc.dupe(u8, value.call_id);
+    errdefer alloc.free(call_id);
+    const tool_name = try alloc.dupe(u8, value.tool_name);
+    errdefer alloc.free(tool_name);
+    const output = try alloc.dupe(u8, value.preview orelse "");
+    errdefer alloc.free(output);
+    const handle = try alloc.dupe(u8, value.artifact_ref);
+    errdefer alloc.free(handle);
+    const preview = if (value.preview) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (preview) |text| alloc.free(text);
+    const stored_bytes = std.math.cast(usize, value.stored_bytes) orelse
+        return error.ConversationSizeOverflow;
+    return .{
+        .tool_call_id = call_id,
+        .tool_name = tool_name,
+        .status = value.status,
+        .output = output,
+        .output_handle = handle,
+        .preview = preview,
+        .output_bytes = stored_bytes,
+        .stored_output_bytes = stored_bytes,
+        .truncated = value.completeness != .complete,
+    };
+}
+
+fn freeConversationToolResult(
+    alloc: Allocator,
+    result: types.PersistedToolResult,
+) void {
+    alloc.free(result.tool_call_id);
+    alloc.free(result.tool_name);
+    alloc.free(result.output);
+    if (result.output_handle) |handle| alloc.free(handle);
+    if (result.preview) |preview| alloc.free(preview);
+}
+
+fn rawConversationTurnCount(history: []const session.HistoryTurn) usize {
+    var count: usize = 0;
+    for (history) |turn| if (turn != .compacted_summary) {
+        count += 1;
+    };
+    return count;
+}
+
+fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize {
+    var index: usize = 0;
+    for (history, 0..) |turn, candidate| {
+        if (turn == .compacted_summary) index = candidate;
+    }
+    return index;
+}
 
 pub const Boundary = enum {
     after_event_append,
@@ -742,6 +1204,7 @@ pub const LoadedWritableSession = struct {
 
     active_id: []u8,
     state: session_codec.DurableSessionState,
+    conversation_writer: ?ConversationWriter = null,
     log: WritableSessionDir,
     freshly_started: bool = false,
     state_replacement_pending: bool = false,
@@ -768,6 +1231,7 @@ pub const LoadedWritableSession = struct {
     external_root_user_evidence_complete: bool = false,
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
+        if (self.conversation_writer) |*writer| writer.deinit();
         if (self.degraded_tail) |*tail| tail.deinit(alloc);
         if (self.commit_lifecycle) |*lifecycle| lifecycle.deinit(alloc);
         if (self.child_capability) |capability| {
@@ -826,6 +1290,14 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
+        if (self.conversation_writer != null) switch (event) {
+            .history_turn_committed => return self.appendConversationHistoryEvent(
+                alloc,
+                event,
+                timestamp_ms,
+            ),
+            else => {},
+        };
         const preserves_pristine_start = switch (event) {
             .usage_checkpointed,
             .recovery_checkpoint_set,
@@ -892,6 +1364,58 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending =
                 self.state_replacement_pending and replacement_was_pending;
         }
+        return self.position;
+    }
+
+    fn appendConversationHistoryEvent(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        event: session_event.Event,
+        timestamp_ms: i64,
+    ) !CommitPosition {
+        const payload = switch (event) {
+            .history_turn_committed => |value| value,
+            else => return error.InvalidConversationEvent,
+        };
+        const next_seq = std.math.add(u64, self.position.through_seq, 1) catch
+            return error.ConversationSequenceOverflow;
+        const event_id = randomIdentifier();
+        const frame = try session_event.encodeFrame(alloc, .{
+            .log_generation = self.position.log_generation,
+            .seq = next_seq,
+            .event_id = event_id,
+            .timestamp_ms = timestamp_ms,
+            .event = event,
+        });
+        defer alloc.free(frame);
+        var next_state = try self.state.dupe(alloc);
+        errdefer next_state.deinit(alloc);
+        _ = try session_event.applyEventFrame(
+            alloc,
+            &next_state,
+            frame,
+            .{
+                .generation = self.position.log_generation,
+                .next_seq = next_seq,
+            },
+            event_id,
+        );
+
+        try self.conversation_writer.?.appendHistoryTurn(
+            alloc,
+            timestamp_ms,
+            payload.turn,
+        );
+        self.state.deinit(alloc);
+        self.state = next_state;
+        self.position = .{
+            .log_generation = self.position.log_generation,
+            .through_seq = next_seq,
+            .through_event_id = event_id,
+            .through_event_log_bytes = self.conversation_writer.?.committed_bytes,
+        };
+        self.freshly_started = false;
+        self.state_replacement_pending = false;
         return self.position;
     }
 
@@ -1492,6 +2016,12 @@ pub const Root = struct {
             session_id,
             options.session_lock_deadline_ms,
         );
+        if (try hasConversationMetadata(alloc, &writable.dir)) {
+            return openConversationWritableSession(alloc, &writable) catch |err| {
+                writable.deinit(alloc);
+                return err;
+            };
+        }
         return openWritableSession(alloc, &writable, options) catch |err| {
             writable.deinit(alloc);
             return err;
@@ -1570,6 +2100,16 @@ pub const Root = struct {
         session_id: []const u8,
         options: Options,
     ) !session_codec.DurableSessionState {
+        if (self.sessions == null) return error.SessionNotFound;
+        var session_dir = openSessionDir(&self.sessions.?, session_id, .read_only) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer session_dir.close();
+        if (try loadConversationStateIfPresent(alloc, &session_dir, session_id)) |state| {
+            return state;
+        }
+
         var boundary = try self.captureReadBoundary(alloc, session_id, options);
         defer boundary.deinit();
         var state = try session_replay.replayBoundary(
@@ -2428,6 +2968,73 @@ fn deleteAndSync(
 }
 
 fn createNativeSession(
+    alloc: Allocator,
+    writable: *WritableSessionDir,
+    initial_state: session_codec.DurableSessionState,
+    _: Options,
+) !LoadedWritableSession {
+    var synthesized_usage: ?session_usage.Snapshot = null;
+    if (initial_state.usage == null) {
+        var fresh_usage = session_usage.Usage.initFresh();
+        defer fresh_usage.deinit(alloc);
+        synthesized_usage = try fresh_usage.snapshot(alloc);
+    }
+    defer if (synthesized_usage) |*usage| usage.deinit(alloc);
+
+    var conversation_writer = try createConversationStorage(alloc, &writable.dir, .{
+        .id = initial_state.id,
+        .origin_workspace_root = initial_state.origin_workspace_root,
+        .workspace_root = initial_state.workspace_root,
+        .created_at_ms = initial_state.created_at_ms,
+        .updated_at_ms = initial_state.updated_at_ms,
+        .conversation_language = initial_state.conversation_language.view(),
+        .provider = @tagName(initial_state.preferences.provider),
+        .model = initial_state.preferences.model,
+        .effort = initial_state.preferences.effort.label(),
+        .fast_mode = initial_state.preferences.fast_mode,
+        .subagent_child = initial_state.subagent_child,
+    });
+    errdefer conversation_writer.deinit();
+    for (initial_state.history) |turn| {
+        if (turn == .compacted_summary and conversation_writer.last_seq == 0) continue;
+        try conversation_writer.appendHistoryTurn(
+            alloc,
+            initial_state.updated_at_ms,
+            turn,
+        );
+    }
+
+    var state = try initial_state.dupe(alloc);
+    errdefer state.deinit(alloc);
+    if (state.usage == null) {
+        state.usage = synthesized_usage;
+        synthesized_usage = null;
+    }
+    const active_id = try alloc.dupe(u8, writable.session_id);
+    errdefer alloc.free(active_id);
+    const generation = randomIdentifier();
+    const position = CommitPosition{
+        .log_generation = generation,
+        .through_seq = conversation_writer.last_seq,
+        .through_event_id = randomIdentifier(),
+        .through_event_log_bytes = conversation_writer.committed_bytes,
+    };
+    const result = LoadedWritableSession{
+        .active_id = active_id,
+        .state = state,
+        .conversation_writer = conversation_writer,
+        .log = writable.*,
+        .freshly_started = true,
+        .position = position,
+        .authority_id = randomIdentifier(),
+        .generation_base_seq = position.through_seq,
+        .generation_base_bytes = position.through_event_log_bytes,
+    };
+    writable.* = undefined;
+    return result;
+}
+
+fn createLegacyNativeSession(
     alloc: Allocator,
     writable: *WritableSessionDir,
     initial_state: session_codec.DurableSessionState,
@@ -8055,4 +8662,226 @@ test "conversation writer flattens a canonical history turn" {
     try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, bytes, "\n"));
     try std.testing.expectEqual(@as(u64, 6), writer.last_seq);
     try std.testing.expectEqual(@as(usize, 0), writer.pendingToolCallCount());
+}
+
+test "conversation storage creates only metadata and event log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var directory = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }),
+    };
+    defer directory.close();
+
+    var writer = try createConversationStorage(alloc, &directory, .{
+        .id = "session-1",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+        .conversation_language = "en",
+        .provider = "gateway",
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+    });
+    defer writer.deinit();
+
+    var count: usize = 0;
+    var saw_events = false;
+    var saw_metadata = false;
+    var iterator = directory.dir.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        count += 1;
+        if (std.mem.eql(u8, entry.name, "events.jsonl")) saw_events = true;
+        if (std.mem.eql(u8, entry.name, "session.json")) saw_metadata = true;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expect(saw_events);
+    try std.testing.expect(saw_metadata);
+}
+
+test "root starts a cache-free conversation session" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "cache-free-session", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    var count: usize = 0;
+    var saw_events = false;
+    var saw_metadata = false;
+    var saw_writer_lock = false;
+    var iterator = loaded.log.dir.dir.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        count += 1;
+        if (std.mem.eql(u8, entry.name, "events.jsonl")) saw_events = true;
+        if (std.mem.eql(u8, entry.name, "session.json")) saw_metadata = true;
+        if (std.mem.eql(u8, entry.name, "session.lock")) saw_writer_lock = true;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expect(saw_events);
+    try std.testing.expect(saw_metadata);
+    try std.testing.expect(saw_writer_lock);
+}
+
+test "cache-free session appends history through the conversation writer" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-append", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const turn = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("question") },
+        .assistant = @constCast("answer"),
+    } };
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = turn,
+        } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+    try std.testing.expectEqual(@as(u64, 3), loaded.conversation_writer.?.last_seq);
+    var count: usize = 0;
+    var iterator = loaded.log.dir.dir.iterate();
+    while (try iterator.next(std.testing.io)) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "cache-free conversation session resumes from metadata and JSONL" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-resume", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 1,
+                .total_output_tokens = 1,
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("question") },
+                    .assistant = @constCast("answer"),
+                } },
+            } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
+    try std.testing.expectEqualStrings("question", resumed.history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("answer", resumed.history[0].assistant.assistant);
+}
+
+test "cache-free writable resume continues the conversation sequence" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-write-resume", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("first question") },
+                .assistant = @constCast("first answer"),
+            } },
+        } }, 20, .retry_expected_tail, .{});
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 3), resumed.conversation_writer.?.last_seq);
+        _ = try resumed.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 2,
+            .total_output_tokens = 2,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("second question") },
+                .assistant = @constCast("second answer"),
+            } },
+        } }, 30, .retry_expected_tail, .{});
+    }
+
+    var loaded = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
+    try std.testing.expectEqualStrings("second answer", loaded.history[1].assistant.assistant);
+}
+
+test "cache-free resume rebuilds tool calls and external result references" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-tool-resume", 10);
+    defer initial.deinit(alloc);
+    var calls = [_]types.ToolCall{.{
+        .id = "call-shell",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"printf done\"}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_handle = @constCast("result-shell.txt"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Running it."),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("Run it.") },
+                .assistant = @constCast("Done."),
+                .execution = .{ .tool_steps = &steps },
+            } },
+        } }, 20, .retry_expected_tail, .{});
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
+    const execution = resumed.history[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings("call-shell", execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings(
+        "result-shell.txt",
+        execution.tool_steps[0].tool_results[0].output_handle.?,
+    );
 }

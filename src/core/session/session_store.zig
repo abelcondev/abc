@@ -641,19 +641,10 @@ pub const Store = struct {
         options: session_log.Options,
     ) !LoadedWritableSession {
         var root = self.canonical_root;
-        const lifecycle: ?session_log.CommitLifecycle = if (state.subagent_child)
-            null
-        else
-            try self.makeLatestCacheLifecycle(
-                alloc,
-                initialIndexEffect(state),
-                options.test_controls,
-            );
-        var loaded = try root.startWritableSessionWithLifecycle(
+        var loaded = try root.startWritableSession(
             alloc,
             state,
             options,
-            lifecycle,
         );
         errdefer loaded.deinit(alloc);
         try self.attachWritableChildCapability(alloc, &loaded);
@@ -6419,6 +6410,27 @@ test "fresh session usage survives the initial durable event" {
         session_usage.Availability.complete,
         loaded.usage.?.billing,
     );
+}
+
+test "store start does not publish session caches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "cache-free-store", ctx.workspace);
+    defer state.deinit(alloc);
+
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    defer writable.deinit(alloc);
+
+    var count: usize = 0;
+    var iterator = ctx.store.canonical_root.sessions.?.dir.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("cache-free-store", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "workspace latest pointer is materialized on session creation" {
