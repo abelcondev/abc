@@ -291,7 +291,17 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
                     }
                 }
             }
-            if (std.json.parseFromValueLeaky(field.type, arena, value, .{})) |_| {} else |err| {
+            if (std.json.parseFromValueLeaky(field.type, arena, value, .{})) |_| {
+                if (comptime T == ShellInput) {
+                    var shell: std.json.ObjectMap = .empty;
+                    inline for (@typeInfo(ShellInput).@"struct".fields) |member| {
+                        if (value.object.get(member.name)) |supplied| {
+                            try shell.put(arena, member.name, supplied);
+                        }
+                    }
+                    value = .{ .object = shell };
+                }
+            } else |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (!type_reported) try problems.append(arena, "request." ++ field.name ++ " must be " ++ expected ++ ".");
                 repairable = false;
@@ -1838,8 +1848,8 @@ test "shell request correction suggests only unambiguous repairs without executi
     }
 }
 
-fn check_request_correction_allocations(alloc: Allocator) !void {
-    const result = try decode(.{ .allocator = alloc }, "{\"request\":{\"command\":\"true\"},\"yield_time_ms\":\"30000\"}");
+fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {
+    const result = try decode(.{ .allocator = alloc }, args_json);
     switch (result) {
         .failure => |failure| alloc.free(failure),
         .input => |input| {
@@ -1850,7 +1860,30 @@ fn check_request_correction_allocations(alloc: Allocator) !void {
 }
 
 test "shell request correction releases partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+        "{\"request\":{\"command\":\"true\"},\"yield_time_ms\":\"30000\"}",
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+        "{\"command\":\"true\",\"tty\":true,\"shell\":{\"path\":\"/bin/bash\",\"kind\":\"executable\"}}",
+    });
+}
+
+test "shell request correction canonicalizes nested shell members" {
+    const alloc = std.testing.allocator;
+    const first = try request_correction(alloc,
+        \\{"command":"true","tty":true,"shell":{"kind":"executable","path":"/bin/bash","clean_start":false}}
+    , true);
+    defer alloc.free(first);
+    const reordered = try request_correction(alloc,
+        \\{"shell":{"clean_start":false,"path":"/bin/bash","kind":"executable"},"tty":true,"command":"true"}
+    , true);
+    defer alloc.free(reordered);
+    try std.testing.expectEqualStrings(first, reordered);
+    const omitted = try request_correction(alloc,
+        \\{"command":"true","tty":true,"shell":{"path":"/bin/bash","kind":"executable"}}
+    , true);
+    defer alloc.free(omitted);
+    try std.testing.expect(std.mem.find(u8, omitted, "clean_start") == null);
 }
 
 test "shell request correction bounds feedback and preserves input bytes" {
