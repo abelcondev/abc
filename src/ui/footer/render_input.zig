@@ -844,7 +844,6 @@ test "pending prompt projects thinking before the worker stream starts" {
         .pending_prompt_activity = true,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .input = &input,
     };
 

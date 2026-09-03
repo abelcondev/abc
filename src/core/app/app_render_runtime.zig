@@ -162,6 +162,27 @@ const PendingCardPaintContext = struct {
     row: u16,
     max_rows: u16,
 
+    fn init(
+        card: PendingCardProjection,
+        band: render_engine.paint_plan.FrameBand,
+        canonical_cursor_row: ?u16,
+        activity_visible: bool,
+    ) ?PendingCardPaintContext {
+        if (band.isEmpty()) return null;
+        const row = if (canonical_cursor_row) |base|
+            @max(base +| card.leading_advance_rows, band.top)
+        else
+            band.top;
+        if (row > band.bottom) return null;
+        const blank_rows: u16 = @intFromBool(activity_visible and band.bottom > row);
+        const bottom = band.bottom - blank_rows;
+        const max_rows = @min(card.paint_row_count, bottom - row + 1);
+        if (max_rows == 0) return null;
+        var lines = std.mem.splitScalar(u8, card.bytes, '\n');
+        for (0..card.paint_row_count - max_rows) |_| _ = lines.next();
+        return .{ .bytes = lines.rest(), .row = row, .max_rows = max_rows };
+    }
+
     fn paint(
         raw: *anyopaque,
         surface: *render_engine.frame_surface.FrameSurface,
@@ -1549,14 +1570,15 @@ pub fn Runtime(comptime App: type) type {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
-            var pending_paint_ctx: ?PendingCardPaintContext = if (pending_card) |card| .{
-                .bytes = card.bytes,
-                .row = (if (prepared_transcript) |*prepared|
-                    prepared.cursor.cursor_row
-                else
-                    presentation_shell.cursor_row) +| card.leading_advance_rows,
-                .max_rows = card.paint_row_count,
-            } else null;
+            var pending_paint_ctx = if (pending_card) |card|
+                PendingCardPaintContext.init(
+                    card,
+                    footer_frame.paint.transcript_band,
+                    if (prepared_transcript) |*prepared| prepared.cursor.cursor_row else null,
+                    !footer_frame.paint.activity_band.isEmpty(),
+                )
+            else
+                null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
                 .paint => {},
                 .retain => |retained_source| {
@@ -1711,7 +1733,7 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                .pending_prompt_presented = pending_card != null,
+                .pending_prompt_presented = pending_paint_ctx != null,
             };
         }
 
@@ -2476,6 +2498,55 @@ test "pending prompt uses the canonical user turn boundary" {
         @as(u16, 1),
         pendingCardLeadingAdvanceRows(19, 47, 20),
     );
+}
+
+test "pending prompt painting fits the solved transcript band" {
+    const card: PendingCardProjection = .{
+        .bytes = @constCast("first\r\nsecond\r\nlast"),
+        .paint_row_count = 3,
+        .row_count = 5,
+        .leading_advance_rows = 2,
+    };
+    const clipped = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 3,
+        .owner = .transcript,
+    }, null, true).?;
+    try std.testing.expectEqual(@as(u16, 1), clipped.row);
+    try std.testing.expectEqual(@as(u16, 2), clipped.max_rows);
+    try std.testing.expectEqualStrings("second\r\nlast", clipped.bytes);
+
+    const tiny = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 1,
+        .owner = .transcript,
+    }, null, false).?;
+    try std.testing.expectEqual(@as(u16, 1), tiny.max_rows);
+    try std.testing.expectEqualStrings("last", tiny.bytes);
+    try std.testing.expect(PendingCardPaintContext.init(
+        card,
+        .empty(.transcript),
+        null,
+        true,
+    ) == null);
+
+    const following = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 8,
+        .owner = .transcript,
+    }, 3, true).?;
+    try std.testing.expectEqual(@as(u16, 5), following.row);
+    try std.testing.expectEqual(@as(u16, 3), following.max_rows);
+    try std.testing.expectEqualStrings(card.bytes, following.bytes);
+
+    const last_row = PendingCardPaintContext.init(card, .{
+        .top = 1,
+        .bottom = 8,
+        .owner = .transcript,
+    }, 6, true).?;
+    try std.testing.expectEqual(@as(u16, 8), last_row.row);
+    try std.testing.expectEqual(@as(u16, 1), last_row.max_rows);
+    try std.testing.expectEqualStrings("last", last_row.bytes);
 }
 
 test "assistant tail writability changes remain traceable" {
