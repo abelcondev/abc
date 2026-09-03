@@ -37,6 +37,7 @@ pub const PendingPromptDraft = struct {
 pub const PendingSubmission = struct {
     draft: PendingPromptDraft,
     phase: PendingPhase = .awaiting_frame,
+    credential_admitted: bool = false,
     skill_refresh_generation: ?u64 = null,
 
     fn init(draft: PendingPromptDraft) PendingSubmission {
@@ -250,16 +251,36 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
             if (pending.phase != .adopted) return;
 
-            if (comptime @hasDecl(App, "collectPendingPromptCredential")) {
-                const readiness = App.collectPendingPromptCredential(app) catch |err| {
-                    finishPendingSubmissionFailure(app, err);
-                    return;
-                };
-                switch (readiness) {
-                    .pending => return,
-                    .current => {},
-                    .rejected => {
-                        pending = &app.submission.pending.?;
+            if (!pending.credential_admitted) {
+                if (comptime @hasDecl(App, "collectPendingPromptCredential")) {
+                    const readiness = App.collectPendingPromptCredential(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    switch (readiness) {
+                        .pending => return,
+                        .current => {},
+                        .rejected => {
+                            pending = &app.submission.pending.?;
+                            pending.phase = .awaiting_auth;
+                            requestPromptRetryAfterAuth(app);
+                            debug_trace.eventf(
+                                "input",
+                                "pending_prompt_awaiting_auth",
+                                .{ .turn_id = pending.draft.turn_id },
+                                "",
+                                .{},
+                            );
+                            return;
+                        },
+                    }
+                } else if (comptime @hasDecl(App, "ensurePromptCredential")) {
+                    const admitted = preflightPrompt(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    pending = &app.submission.pending.?;
+                    if (!admitted) {
                         pending.phase = .awaiting_auth;
                         requestPromptRetryAfterAuth(app);
                         debug_trace.eventf(
@@ -270,26 +291,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                             .{},
                         );
                         return;
-                    },
+                    }
                 }
-            } else if (comptime @hasDecl(App, "ensurePromptCredential")) {
-                const admitted = preflightPrompt(app) catch |err| {
-                    finishPendingSubmissionFailure(app, err);
-                    return;
-                };
+                app.submission.pending.?.credential_admitted = true;
                 pending = &app.submission.pending.?;
-                if (!admitted) {
-                    pending.phase = .awaiting_auth;
-                    requestPromptRetryAfterAuth(app);
-                    debug_trace.eventf(
-                        "input",
-                        "pending_prompt_awaiting_auth",
-                        .{ .turn_id = pending.draft.turn_id },
-                        "",
-                        .{},
-                    );
-                    return;
-                }
             }
 
             if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
@@ -2127,6 +2132,8 @@ test "pending draft construction frees every partial allocation" {
 }
 
 const PendingLifecycleFake = struct {
+    const CredentialReadiness = enum { pending, current, rejected };
+
     alloc: std.mem.Allocator,
     submission: State = .{},
     worker: struct {
@@ -2171,6 +2178,7 @@ const PendingLifecycleFake = struct {
     finalization_count: usize = 0,
     finalization_error: bool = false,
     notice_count: usize = 0,
+    credential_checks: usize = 0,
     skill_refresh: enum { pending, current, failed } = .current,
     skill_refresh_checks: usize = 0,
 
@@ -2196,6 +2204,13 @@ const PendingLifecycleFake = struct {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
         self.worker.queued_turn_id = draft.turn_id;
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *PendingLifecycleFake,
+    ) !CredentialReadiness {
+        self.credential_checks += 1;
+        return .current;
     }
 
     pub fn collectPendingSkillRefresh(
@@ -2310,13 +2325,18 @@ test "pending submission waits for its skill catalog generation before queueing"
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
     try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
     try std.testing.expectEqual(@as(?u64, 1), app.submission.pending.?.skill_refresh_generation);
+
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
 
     app.skill_refresh = .current;
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
     try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 }
 
