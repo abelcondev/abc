@@ -8952,7 +8952,7 @@ test "authoritative cancelled replay survives history insertion failure" {
     try std.testing.expect(std.mem.find(u8, page, "externally owned") != null);
 }
 
-test "appendHistoryTurn commits canonical history event and totals" {
+test "appendHistoryTurn commits conversation without copying runtime counters" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8989,8 +8989,8 @@ test "appendHistoryTurn commits canonical history event and totals" {
     try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
     try std.testing.expectEqualStrings("question", loaded.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("answer", loaded.history[0].assistant.assistant);
-    try std.testing.expectEqual(@as(u64, 7), loaded.total_input_tokens);
-    try std.testing.expectEqual(@as(u64, 11), loaded.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 0), loaded.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), loaded.total_output_tokens);
 }
 
 const SnapshotOwnershipProbe = struct {

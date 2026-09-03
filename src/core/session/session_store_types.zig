@@ -15,6 +15,7 @@ pub const automatic_legacy_max_bytes: u64 = 256 * 1024 * 1024;
 
 /// On-disk storage format a readable session was found in.
 pub const StorageFormat = enum {
+    conversation,
     schema_v3,
     legacy_v1,
     legacy_v2,
@@ -23,6 +24,7 @@ pub const StorageFormat = enum {
 /// Storage format of a discovery candidate (kept distinct from `StorageFormat`
 /// so discovery and read APIs can evolve independently).
 pub const CandidateStorage = enum {
+    conversation,
     schema_v3,
     legacy_v1,
     legacy_v2,

@@ -1456,18 +1456,20 @@ pub const Store = struct {
             options,
         );
         errdefer loaded.deinit(alloc);
-        self.repairLatestPointer(
-            alloc,
-            loaded.state,
-            loaded.position,
-            options.log,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event=latest_cache_repair_failed err={s}",
-                .{@errorName(err)},
-            );
-        };
+        if (!loaded.usesConversationStorage()) {
+            self.repairLatestPointer(
+                alloc,
+                loaded.state,
+                loaded.position,
+                options.log,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=latest_cache_repair_failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
         return loaded;
     }
 
@@ -1970,6 +1972,22 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
+        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
+            var root = self.canonical_root;
+            var state = try root.loadReadOnly(alloc, session_id, options.log);
+            errdefer state.deinit(alloc);
+            try resolveSessionSnapshotLocators(
+                alloc,
+                state.history,
+                self.sessions_dir,
+                session_id,
+            );
+            return .{
+                .summary = try summaryFromState(alloc, state),
+                .state = state,
+                .storage_format = .conversation,
+            };
+        }
         const authority = try classifyAuthority(alloc, &session_dir, session_id);
         return switch (authority) {
             .schema_v3 => {
@@ -3327,6 +3345,17 @@ pub const Store = struct {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
+        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
+            var root = self.canonical_root;
+            const loaded = try root.resumeForWrite(alloc, session_id, options.log);
+            return self.finishWorkspaceResume(
+                alloc,
+                loaded,
+                workspace_root,
+                allow_rebind,
+                options,
+            );
+        }
         const authority = classifyAuthority(
             alloc,
             &session_dir,
@@ -3393,7 +3422,10 @@ pub const Store = struct {
             loaded.active_id,
         );
 
-        if (loaded.commit_lifecycle == null and !loaded.state.subagent_child) {
+        if (!loaded.usesConversationStorage() and
+            loaded.commit_lifecycle == null and
+            !loaded.state.subagent_child)
+        {
             try self.installLatestCacheLifecycle(
                 alloc,
                 &loaded,
@@ -3543,6 +3575,22 @@ pub const Store = struct {
     ) !WritableCandidate {
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
+        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
+            var candidate = try classifyReadOnlyCandidate(
+                alloc,
+                &session_dir,
+                session_id,
+            );
+            defer candidate.deinit(alloc);
+            return dupeWritableCandidate(
+                alloc,
+                candidate.summary.id,
+                candidate.summary.workspace_root orelse self.workspace_root,
+                candidate.summary.updated_at_ms,
+                candidate.storage,
+                candidate.projection_state,
+            );
+        }
         return switch (try classifyAuthority(alloc, &session_dir, session_id)) {
             .legacy => {
                 var candidate = try classifyLegacyCandidate(

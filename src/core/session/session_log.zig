@@ -51,6 +51,8 @@ pub const ConversationWriter = struct {
         var writer = ConversationWriter{ .alloc = alloc, .file = file };
         errdefer writer.deinit();
         var offset: u64 = 0;
+        var open_turn_offset: ?u64 = null;
+        var open_turn_prior_seq: u64 = 0;
         while (offset < length) {
             const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
                 error.TruncatedEventFrame => {
@@ -69,9 +71,33 @@ pub const ConversationWriter = struct {
                 .latest_checkpoint_coverage = writer.latest_checkpoint_coverage,
                 .pending_tool_calls = writer.pending_tool_calls.items,
             }, decoded.value);
+            switch (decoded.value.event) {
+                .user => {
+                    if (open_turn_offset != null) return error.InvalidConversationFrame;
+                    open_turn_offset = offset;
+                    open_turn_prior_seq = writer.last_seq;
+                },
+                .turn_completed, .interrupted => {
+                    if (open_turn_offset == null) return error.InvalidConversationFrame;
+                    open_turn_offset = null;
+                },
+                .context_checkpoint => if (open_turn_offset != null) {
+                    return error.InvalidConversationFrame;
+                },
+                .assistant, .tool_call, .tool_result, .steering => if (open_turn_offset == null) {
+                    return error.InvalidConversationFrame;
+                },
+            }
             try writer.applyReplayedEvent(decoded.value.seq, decoded.value.event);
             offset = line.next_offset;
             writer.committed_bytes = offset;
+        }
+        if (open_turn_offset) |truncate_from| {
+            try file.setLength(io_mod.getIo(), truncate_from);
+            try file.sync(io_mod.getIo());
+            writer.clearPendingToolCalls();
+            writer.committed_bytes = truncate_from;
+            writer.last_seq = open_turn_prior_seq;
         }
         return writer;
     }
@@ -148,6 +174,7 @@ pub const ConversationWriter = struct {
             self.alloc.free(@constCast(completed.call_id));
             self.alloc.free(@constCast(completed.tool_name));
         }
+        if (event == .interrupted) self.clearPendingToolCalls();
         if (event == .context_checkpoint) {
             self.latest_checkpoint_coverage = event.context_checkpoint.covers_through_seq;
         }
@@ -178,9 +205,7 @@ pub const ConversationWriter = struct {
         var events: std.ArrayList(session_event.ConversationEvent) = .empty;
         defer events.deinit(alloc);
         try session_event.appendHistoryTurnConversationEvents(alloc, &events, turn);
-        for (events.items) |event| {
-            _ = try self.append(alloc, timestamp_ms, event);
-        }
+        try self.appendBatch(alloc, timestamp_ms, events.items);
     }
 
     pub fn readAllForTest(self: *const ConversationWriter, alloc: Allocator) ![]u8 {
@@ -198,6 +223,85 @@ pub const ConversationWriter = struct {
             if (std.mem.eql(u8, pending.call_id, call_id)) return index;
         }
         return null;
+    }
+
+    fn appendBatch(
+        self: *ConversationWriter,
+        alloc: Allocator,
+        timestamp_ms: i64,
+        events: []const session_event.ConversationEvent,
+    ) !void {
+        if (events.len == 0) return;
+        if (self.pending_tool_calls.items.len != 0) return error.UnresolvedToolCall;
+
+        var pending: std.ArrayList(session_event.PendingToolCall) = .empty;
+        defer pending.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var seq = self.last_seq;
+        var checkpoint_coverage = self.latest_checkpoint_coverage;
+        for (events) |event| {
+            seq = std.math.add(u64, seq, 1) catch
+                return error.ConversationSequenceOverflow;
+            const envelope = session_event.ConversationEnvelope{
+                .seq = seq,
+                .timestamp_ms = timestamp_ms,
+                .event = event,
+            };
+            try session_event.validateConversationTransition(.{
+                .last_seq = seq - 1,
+                .latest_checkpoint_coverage = checkpoint_coverage,
+                .pending_tool_calls = pending.items,
+            }, envelope);
+            switch (event) {
+                .tool_call => |call| try pending.append(alloc, .{
+                    .call_id = call.call_id,
+                    .tool_name = call.tool_name,
+                    .seq = seq,
+                }),
+                .tool_result => |result| {
+                    for (pending.items, 0..) |call, index| {
+                        if (std.mem.eql(u8, call.call_id, result.call_id)) {
+                            _ = pending.orderedRemove(index);
+                            break;
+                        }
+                    }
+                },
+                .interrupted => pending.clearRetainingCapacity(),
+                .context_checkpoint => |checkpoint| checkpoint_coverage =
+                    checkpoint.covers_through_seq,
+                else => {},
+            }
+            const frame = try session_event.encodeConversationFrame(alloc, envelope);
+            defer alloc.free(frame);
+            try out.writer.writeAll(frame);
+        }
+        if (pending.items.len != 0) return error.UnresolvedToolCall;
+        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
+            try self.file.setLength(io_mod.getIo(), self.committed_bytes);
+            try self.file.sync(io_mod.getIo());
+        }
+        try self.file.writePositionalAll(
+            io_mod.getIo(),
+            out.written(),
+            self.committed_bytes,
+        );
+        try self.file.sync(io_mod.getIo());
+        self.committed_bytes = std.math.add(
+            u64,
+            self.committed_bytes,
+            out.written().len,
+        ) catch return error.ConversationSizeOverflow;
+        self.last_seq = seq;
+        self.latest_checkpoint_coverage = checkpoint_coverage;
+    }
+
+    fn clearPendingToolCalls(self: *ConversationWriter) void {
+        for (self.pending_tool_calls.items) |pending| {
+            self.alloc.free(@constCast(pending.call_id));
+            self.alloc.free(@constCast(pending.tool_name));
+        }
+        self.pending_tool_calls.clearRetainingCapacity();
     }
 
     fn applyReplayedEvent(
@@ -227,7 +331,8 @@ pub const ConversationWriter = struct {
             .context_checkpoint => |checkpoint| {
                 self.latest_checkpoint_coverage = checkpoint.covers_through_seq;
             },
-            .user, .assistant, .steering, .turn_completed, .interrupted => {},
+            .interrupted => self.clearPendingToolCalls(),
+            .user, .assistant, .steering, .turn_completed => {},
         }
         self.last_seq = seq;
     }
@@ -443,7 +548,7 @@ fn loadConversationStateIfPresent(
     };
 }
 
-fn hasConversationMetadata(
+pub fn hasConversationMetadata(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
 ) !bool {
@@ -555,7 +660,9 @@ fn replayConversationHistory(
         }
         offset = line.next_offset;
     }
-    if (!turn.isIdle()) return error.InvalidConversationFrame;
+    // A concurrent writer may have exposed a complete-record prefix of its
+    // final batched turn before sync. The next writable open truncates that
+    // incomplete turn; read-only replay returns the preceding complete turns.
     return history.toOwnedSlice(alloc);
 }
 
@@ -1392,6 +1499,10 @@ pub const LoadedWritableSession = struct {
             capability
         else
             error.SessionChildCapabilityUnavailable;
+    }
+
+    pub fn usesConversationStorage(self: *const LoadedWritableSession) bool {
+        return self.conversation_writer != null;
     }
 
     pub fn installCommitLifecycle(
@@ -8839,7 +8950,10 @@ test "conversation writer repairs only a partial final record and continues" {
         });
         var writer = try ConversationWriter.init(alloc, file);
         defer writer.deinit();
-        _ = try writer.append(alloc, 10, .{ .user = .{ .text = "first" } });
+        try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+            .user = .{ .text = @constCast("first") },
+            .assistant = @constCast("answer"),
+        } });
     }
     const valid_bytes = blk: {
         const file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
@@ -8860,14 +8974,51 @@ test "conversation writer repairs only a partial final record and continues" {
     });
     var resumed = try ConversationWriter.init(alloc, file);
     defer resumed.deinit();
-    try std.testing.expectEqual(@as(u64, 1), resumed.last_seq);
+    try std.testing.expectEqual(@as(u64, 3), resumed.last_seq);
     try std.testing.expectEqual(valid_bytes, resumed.committed_bytes);
     try std.testing.expectEqual(valid_bytes, try resumed.file.length(std.testing.io));
-    try std.testing.expectEqual(@as(u64, 2), try resumed.append(
-        alloc,
-        11,
-        .{ .assistant = .{ .text = "continued" } },
-    ));
+    try resumed.appendHistoryTurn(alloc, 11, .{ .assistant = .{
+        .user = .{ .text = @constCast("continued") },
+        .assistant = @constCast("done"),
+    } });
+    try std.testing.expectEqual(@as(u64, 6), resumed.last_seq);
+}
+
+test "conversation writer truncates a complete-record partial turn" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var valid_bytes: u64 = 0;
+    {
+        const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{
+            .read = true,
+            .truncate = true,
+        });
+        var writer = try ConversationWriter.init(alloc, file);
+        defer writer.deinit();
+        try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+            .user = .{ .text = @constCast("complete") },
+            .assistant = @constCast("answer"),
+        } });
+        valid_bytes = writer.committed_bytes;
+        const dangling = try session_event.encodeConversationFrame(alloc, .{
+            .seq = 4,
+            .timestamp_ms = 11,
+            .event = .{ .user = .{ .text = "dangling" } },
+        });
+        defer alloc.free(dangling);
+        try writer.file.writePositionalAll(std.testing.io, dangling, valid_bytes);
+        try writer.file.sync(std.testing.io);
+    }
+
+    const file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{
+        .mode = .read_write,
+    });
+    var resumed = try ConversationWriter.init(alloc, file);
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(u64, 3), resumed.last_seq);
+    try std.testing.expectEqual(valid_bytes, resumed.committed_bytes);
+    try std.testing.expectEqual(valid_bytes, try resumed.file.length(std.testing.io));
 }
 
 test "conversation writer flattens a canonical history turn" {

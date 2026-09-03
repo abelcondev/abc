@@ -4,10 +4,12 @@ const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
+const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
@@ -500,9 +502,76 @@ pub fn classifyReadOnlyCandidate(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !ReadOnlyCandidate {
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
+        return classifyConversationCandidate(alloc, session_dir, session_id);
+    }
     return switch (try classifyAuthority(alloc, session_dir, session_id)) {
         .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
         .legacy => classifyLegacyCandidate(alloc, session_dir, session_id),
+    };
+}
+
+fn classifyConversationCandidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !ReadOnlyCandidate {
+    const metadata_bytes = (try readOptionalSessionFile(
+        alloc,
+        session_dir,
+        "session.json",
+        session_codec.max_session_metadata_bytes,
+    )) orelse return error.SessionNotFound;
+    defer alloc.free(metadata_bytes);
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    if (!std.mem.eql(u8, metadata.value.id, session_id)) {
+        return error.InvalidSessionFormat;
+    }
+
+    var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
+    defer event_file.close(io_mod.getIo());
+    const length = try event_file.length(io_mod.getIo());
+    var offset: u64 = 0;
+    var history_len: usize = 0;
+    while (offset < length) {
+        const line = try session_replay.readLineAt(alloc, event_file, offset, length) orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        switch (decoded.value.event) {
+            .turn_completed, .interrupted => history_len = std.math.add(
+                usize,
+                history_len,
+                1,
+            ) catch return error.InvalidSessionFormat,
+            else => {},
+        }
+        offset = line.next_offset;
+    }
+
+    const id = try alloc.dupe(u8, metadata.value.id);
+    errdefer alloc.free(id);
+    const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, metadata.value.workspace_root);
+    errdefer alloc.free(workspace);
+    const title = if (metadata.value.title) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .summary = .{
+            .id = id,
+            .workspace_root = workspace,
+            .origin_workspace_root = origin,
+            .title = title,
+            .created_at_ms = metadata.value.created_at_ms,
+            .updated_at_ms = metadata.value.updated_at_ms,
+            .conversation_language = session.ConversationLanguage.fromSlice(
+                metadata.value.conversation_language,
+            ) catch return error.InvalidSessionFormat,
+            .history_len = history_len,
+        },
+        .storage = .conversation,
+        .projection_state = .current,
     };
 }
 

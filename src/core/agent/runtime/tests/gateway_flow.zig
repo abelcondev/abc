@@ -3037,15 +3037,12 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     try std.testing.expect(std.mem.find(
         u8,
         hooks.history_turns.items[0].compacted_summary.summary,
-        "result_handle=",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        hooks.history_turns.items[0].compacted_summary.summary,
-        "truncated=true",
+        "Finish after the verified read",
     ) != null);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
+    try expectBodyContains(&gateway, 0, "Result handle:");
+    try expectBodyContains(&gateway, 0, "AUTO_RESTORED_AVAILABLE_BYTES");
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
     try expectBodyContains(&gateway, 0, "\"tools\":[]");
     try expectBodyContains(&gateway, 1, "context_handoff");
@@ -3152,6 +3149,7 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
+        .{ .content = "The read completed successfully; its exact result remains available by handle." },
         .{ .content = "Mid-turn compaction complete." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -3183,18 +3181,19 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyNotContains(&gateway, 0, "context_handoff");
-    try expectBodyContains(&gateway, 1, "context_handoff");
-    try expectBodyContains(&gateway, 1, "status=success");
-    try expectBodyContains(&gateway, 1, "result_handle=");
-    try expectBodyNotContains(&gateway, 1, "MIDTURN_RESULT_SENTINEL");
+    try expectBodyNotContains(&gateway, 1, "context_handoff");
+    try expectBodyContains(&gateway, 1, "Tool read_file (success)");
+    try expectBodyContains(&gateway, 1, "Result handle:");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyContains(&gateway, 2, "exact result remains available by handle");
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
     try std.testing.expect(hooks.history_turns.items[1] == .assistant);
     const persisted_result = hooks.history_turns.items[1].assistant.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(persisted_result.output_handle == null);
+    try std.testing.expect(persisted_result.output_handle != null);
     const replay = persisted_result.command_output_replay orelse
         return error.TestExpectedEqual;
     switch (replay) {
