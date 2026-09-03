@@ -2185,6 +2185,7 @@ pub const Runtime = struct {
         credential: *credentials.Credential,
     ) auth_transition.CredentialChange {
         const change = self.preparedCredentialChange(credential.*);
+        self.cancelPromptCredentialRefresh();
         const source = credential.source;
         if (self.selected_credential) |*selected| selected.deinit(alloc);
 

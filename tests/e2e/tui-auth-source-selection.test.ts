@@ -1305,6 +1305,48 @@ tmuxTest(
 );
 
 tmuxTest(
+  "provider switch before the first prompt discards the previous credential prewarm",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-prewarm-provider-switch-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(null);
+    chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ credential_source: "fx_login" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      ...chatgptOauth.env,
+      FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await waitForTrace(tracePath, "prompt credential prewarm start outcome=started");
+    await openProviderPicker(session);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to Codex subscription", TIMEOUT);
+
+    await session.sendText("Use the selected subscription for the first prompt.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", 10_000);
+    const responses = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses",
+    );
+    expect(responses).toHaveLength(1);
+    expect(responses[0]!.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "provider switch reauthenticates current Codex and replaces an unavailable model",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-success-"));
