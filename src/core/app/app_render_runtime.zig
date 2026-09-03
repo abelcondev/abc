@@ -260,6 +260,12 @@ fn buildPendingCardProjection(
     };
 }
 
+fn pendingPromptActivityVisible(app: anytype) bool {
+    if (comptime !@hasField(@TypeOf(app.*), "submission")) return false;
+    const pending = app.submission.pending orelse return false;
+    return pending.phase != .awaiting_auth;
+}
+
 fn pendingCardTerminalWireBytes(
     alloc: std.mem.Allocator,
     logical: []const u8,
@@ -604,6 +610,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
+                .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
                 .has_api_key = app.auth.credentialSource() != null,

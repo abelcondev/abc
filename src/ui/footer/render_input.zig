@@ -408,6 +408,7 @@ const max_static_status_activity_rows: u16 = 3;
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
     // Pacer emitting visible text, including the post-finish tail drain.
     writing_response: bool = false,
@@ -617,6 +618,9 @@ fn turnActivityProjection(
 ) ActivityProjection {
     _ = shell;
     if (!ctx.stream.active) {
+        if (ctx.pending_prompt_activity) {
+            return .{ .turn_thinking = .{ .label = "• Thinking" } };
+        }
         if (!ctx.writing_response and !ctx.completed_assistant_presentation_tail) return .none;
         return .{ .turn_thinking = .{
             .label = activity_status.buildCompletedTurnLabel(buf, ctx.stream),
@@ -825,6 +829,27 @@ test "frame-owned thinking activity projects the thinking label" {
 
     var dot_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&dot_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}
+
+test "pending prompt projects thinking before the worker stream starts" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{},
+        .pending_prompt_activity = true,
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+
+    var label_buf: [128]u8 = undefined;
+    switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

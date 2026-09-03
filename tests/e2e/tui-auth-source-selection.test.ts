@@ -4445,6 +4445,10 @@ tmuxTest(
     const prompt = "PRESERVE_DURING_LOGIN_REPAIR";
     await session.sendText(prompt);
     await waitForTrace(tracePath, "event=pending_prompt_frame_committed", 1_000);
+    await session.waitForPane(
+      (pane) => pane.includes(prompt) && pane.includes("Thinking"),
+      1_000,
+    );
     const responsiveDraft = "TERMINAL_RESPONSIVE_DURING_CREDENTIAL_REFRESH";
     await session.sendLiteral(responsiveDraft);
     await session.waitForPane(
@@ -4453,7 +4457,10 @@ tmuxTest(
     );
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
-    await session.waitForText("fx login sign-in expired.", TIMEOUT);
+    await session.waitForPane(
+      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("Thinking"),
+      TIMEOUT,
+    );
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
     await session.sendKeys("Enter");
