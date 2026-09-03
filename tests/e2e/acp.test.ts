@@ -259,6 +259,32 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+function expectRestartedAcpResponse(
+  previousMessages: any[],
+  resumedMessages: any[],
+  partialText: string,
+  replacementText: string,
+): void {
+  const preview = previousMessages.find((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk" &&
+    message.params.update.content.text === partialText
+  )?.params.update;
+  expect(preview).toBeDefined();
+  const resumed = resumedMessages.filter((message) =>
+    message.params?.update?.sessionUpdate === "agent_message_chunk"
+  ).map((message) => message.params.update);
+  expect(resumed.map((update) => update.content.text)).toEqual([
+    "\n\n[Response interrupted. Restarting.]\n\n",
+    replacementText,
+  ]);
+  const ids = [preview.messageId, ...resumed.map((update) => update.messageId)];
+  for (const id of ids) {
+    expect(typeof id).toBe("string");
+    expect(id.length).toBeGreaterThan(0);
+  }
+  expect(new Set(ids).size).toBe(3);
+}
+
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
     .map((message) => acpContentText(message.content))
@@ -1241,11 +1267,11 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
-      const finalTextSuffix = "ACP recovery completed.";
+      const replacementText = `${partialText} ACP recovery completed.`;
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1281,8 +1307,11 @@ describe("acp: model-independent", () => {
           "Preserve this ACP prompt through recovery.",
         );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
-        expect(occurrenceCount(allUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(1);
+        expectRestartedAcpResponse(paused.messages, resumed.messages, partialText, replacementText);
+        expect(occurrenceCount(allUpdates, partialText)).toBe(2);
+        expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[10]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1645,7 +1674,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
       const toolEvidence = "ACP_RESTART_TOOL_EVIDENCE";
       const partialText = "ACP_RESTART_PARTIAL_SENTINEL";
-      const finalTextSuffix = "ACP_RESTART_FINAL_SENTINEL";
+      const replacementText = "ACP_RESTART_FINAL_SENTINEL";
       writeFileSync(join(root.workspace, "recovery-fixture.txt"), `${toolEvidence}\n`);
       const gateway = startFakeGateway([
         fakeGatewayToolCall("recovery_read_1", "read_file", {
@@ -1653,7 +1682,7 @@ describe("acp: model-independent", () => {
         }),
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(`${partialText}${finalTextSuffix}`),
+        finalText(replacementText),
       ]);
       try {
         client = await AcpClient.create({
@@ -1711,8 +1740,11 @@ describe("acp: model-independent", () => {
           ...loadMessages,
           ...resumed.messages,
         ]);
+        expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
+        expect(gateway.requests[11]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
 
         await client.close();
         client = await AcpClient.create({
@@ -1740,8 +1772,8 @@ describe("acp: model-independent", () => {
         const completedLoadUpdates = JSON.stringify(completedLoadMessages);
         expect(completedLoadUpdates).not.toContain("modelResponseRecovery");
         expect(occurrenceCount(completedLoadUpdates, toolEvidence)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(0);
+        expect(occurrenceCount(completedLoadUpdates, replacementText)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

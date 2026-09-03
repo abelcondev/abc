@@ -4707,7 +4707,7 @@ test "processQueuedPrompt pauses gateway stream timeout without retry" {
     );
 }
 
-test "processQueuedPrompt keeps recovery system last after post-tool provider error" {
+test "processQueuedPrompt retries post-tool provider error without synthetic recovery message" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -4727,9 +4727,9 @@ test "processQueuedPrompt keeps recovery system last after post-tool provider er
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    const retry_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .system };
+    const retry_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
-    try expectGatewayPromptTailText(&gateway, 2, .system, "<network_recovery>");
+    try expectBodyNotContains(&gateway, 2, "network_recovery");
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
@@ -5367,7 +5367,7 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
 
     try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_models.items.len);
     try expectBodyContains(&continued_gateway, 0, "call_first");
-    try expectBodyContains(&continued_gateway, 0, "Re-run the response for the same user request.");
+    try expectBodyNotContains(&continued_gateway, 0, "Re-run the response for the same user request.");
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 
@@ -5415,7 +5415,8 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
 
     try std.testing.expectEqual(@as(usize, 1), second_gateway.request_models.items.len);
-    try expectBodyContains(&second_gateway, 0, "<partial_assistant>\\npartial\\n</partial_assistant>");
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    try expectGatewayPromptTextCount(&second_gateway, 0, "partial", 0);
     try std.testing.expectEqualStrings("partial response finished", second_hooks.history_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
 }
@@ -5929,7 +5930,7 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 1/3");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 2/3");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
-    try expectBodyContains(&gateway, 1, "did not execute the incomplete tool call");
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyContains(&gateway, 2, "call_read_recovered");
     try expectBodyContains(&gateway, 2, "\"output\":{\"type\":\"text\",\"value\":\"ok\"}");
     try expectFailedLifecycleContains(
@@ -6116,18 +6117,18 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
-test "processQueuedPrompt continues provider error after visible text without duplication" {
+test "processQueuedPrompt restarts failed response without committing its partial preview" {
     const alloc = std.testing.allocator;
-    const chunks = [_][]const u8{"partial"};
-    const recovered_chunks = [_][]const u8{"partial response"};
+    const chunks = [_][]const u8{"DISCARDED_PREVIEW software"};
+    const recovered_chunks = [_][]const u8{"A complete replacement response."};
     const completions = [_]FakeCompletion{
         .{
             .chunks = &chunks,
-            .content = "partial",
+            .content = "DISCARDED_PREVIEW software",
             .finish_reason = .provider_error,
             .provider_failure_detail = "failed after text",
         },
-        .{ .chunks = &recovered_chunks, .content = "partial response" },
+        .{ .chunks = &recovered_chunks, .content = "A complete replacement response." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -6141,14 +6142,16 @@ test "processQueuedPrompt continues provider error after visible text without du
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Restart that response from the beginning");
+    try expectBodyNotContains(&gateway, 1, "DISCARDED_PREVIEW");
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
-    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "partial"));
+    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "DISCARDED_PREVIEW software"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · continuing response · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · continuing response · attempt 2/2");
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 1/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 2/2");
     try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
-    try std.testing.expectEqualStrings("partial response", hooks.history_turns.items[0].assistant.assistant);
+    try std.testing.expectEqualStrings("A complete replacement response.", hooks.history_turns.items[0].assistant.assistant);
 }
 
 test "processQueuedPrompt recovers provider error after streamed tool start" {

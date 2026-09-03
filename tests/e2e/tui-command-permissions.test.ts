@@ -3188,6 +3188,17 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
+      const classifierPrompt = JSON.parse(
+        gateway.classifierRequests[0]!.body,
+      ).prompt as Array<{ role: string }>;
+      const firstConversationIndex = classifierPrompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(classifierPrompt[0]?.role).toBe("system");
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        classifierPrompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
         "openai/gpt-5.6-luna",
       );
