@@ -3383,6 +3383,127 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("shell request correction repairs one call before its only execution", async () => {
+    const root = createFixtureRoot("shell-request-correction");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "executions.txt");
+    const command = "printf 'once\\n' >> executions.txt; printf REPAIRED_SHELL_OK";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("repair_invalid", "shell", {
+            request: { command, profile: "clean" },
+            yield_time_ms: "1000",
+          });
+        case 1: {
+          expect(existsSync(marker)).toBe(false);
+          const correction = JSON.parse(toolResultOutput(body, "repair_invalid")).error;
+          expect(correction.code).toBe("invalid_shell_request");
+          expect(correction.executed).toBe(false);
+          expect(correction.problems).toContain("request.action is required.");
+          expect(correction.retry_with).toEqual({
+            request: { action: "run", command, profile: "clean", yield_time_ms: 1000 },
+          });
+          return fakeGatewayToolCall("repair_valid", "shell", correction.retry_with);
+        }
+        case 2:
+          expect(shellResult(body, "repair_valid")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "REPAIRED_SHELL_OK",
+          });
+          return fakeGatewayFinalText("SHELL_REPAIR_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Run the marker command once."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("SHELL_REPAIR_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("once\n");
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("call_id=repair_invalid");
+      expect(trace.split("\n").filter((line) =>
+        line.includes("call_id=repair_invalid") &&
+        (line.includes("permission_request") || line.includes("execution_start"))
+      )).toHaveLength(0);
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("shell request correction stops repeated failures after both batch results", async () => {
+    const root = createFixtureRoot("shell-correction-repeat");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "must-not-run.txt");
+    writeFileSync(join(root.workspace, "neighbor.txt"), "NEIGHBOR_OK\n");
+    let step = 0;
+    const gateway = startGateway((body) => {
+      const batch = ++step;
+      if (batch > 2) return new Response("unexpected third request", { status: 500 });
+      if (batch === 2) {
+        expect(JSON.parse(toolResultOutput(body, "invalid_1")).error.code).toBe("invalid_shell_request");
+        expect(toolResultOutput(body, "neighbor_1")).toContain("NEIGHBOR_OK");
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: `invalid_${batch}`, toolName: "shell", input: {
+          request: { command: "printf unexpected > must-not-run.txt", profile: "clean" },
+          yield_time_ms: "1000",
+        } },
+        { type: "tool-call", toolCallId: `neighbor_${batch}`, toolName: "read_file", input: { path: "neighbor.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Check the correction and read the neighbor."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(existsSync(marker)).toBe(false);
+      const json = parseAskJson(result.stdout);
+      expect(json.tool_calls.filter((call) => call.name === "shell" && call.status === "error")).toHaveLength(2);
+      expect(json.tool_calls.filter((call) => call.name === "read_file" && call.status === "success")).toHaveLength(2);
+      const saved = await runFx(["session", "--id", json.session_id, "--json"], {
+        cwd: root.workspace, env: { HOME: root.home },
+      });
+      expect(saved.code).toBe(0);
+      const history = JSON.parse(saved.stdout).history;
+      const results = history.flatMap((turn: any) =>
+        (turn.execution?.tool_steps ?? []).flatMap((step: any) => step.tool_results));
+      for (const batch of [1, 2]) {
+        const invalid = results.find((item: any) => item.tool_call_id === `invalid_${batch}`);
+        expect(invalid.status).toBe("failure");
+        expect(JSON.parse(invalid.output).error.executed).toBe(false);
+        const neighbor = results.find((item: any) => item.tool_call_id === `neighbor_${batch}`);
+        expect(neighbor.status).toBe("success");
+        expect(neighbor.output).toContain("NEIGHBOR_OK");
+      }
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("terminal_validation_retry");
+      expect(trace).toContain("call_id=invalid_2");
+      expect(trace.split("\n").filter((line) =>
+        /call_id=invalid_[12]\b/.test(line) &&
+        (line.includes("permission_request") || line.includes("execution_start"))
+      )).toHaveLength(0);
+      expect(result.stderr).toContain("Repeated shell validation failures stopped the tool loop.");
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("no-save shell timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");
     const tracePath = join(root.root, "trace.log");
@@ -3401,7 +3522,7 @@ describe("gateway stream lifecycle", () => {
           });
         case 1: {
           const correction = toolResultOutput(body, invalidCallId);
-          expect(correction).toContain("missing_fields");
+          expect(correction).toContain("invalid_shell_request");
           expect(correction).toContain("command");
           expect(existsSync(markerPath)).toBe(false);
           return fakeShellRun(
