@@ -1224,7 +1224,16 @@ pub const Store = struct {
                 &migration_state,
             );
         }
+        const converted_storage = !loaded.usesConversationStorage();
         try loaded.convertToConversationStorage(alloc);
+        if (converted_storage) {
+            try resolveSessionSnapshotLocators(
+                alloc,
+                loaded.state.history,
+                self.sessions_dir,
+                loaded.active_id,
+            );
+        }
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
     }
@@ -6247,6 +6256,9 @@ test "durable resume repairs legacy zero image ids without changing valid ids" {
         second_path,
         resumed.state.history[1].assistant.user.images[0].path,
     );
+    try std.testing.expect(std.fs.path.isAbsolute(
+        resumed.state.history[1].assistant.user.images[0].snapshot_path.?,
+    ));
 
     const catalog = try session.collect_image_catalog(alloc, resumed.state.history, &.{});
     defer session.freeImageAttachmentSlice(alloc, catalog);
