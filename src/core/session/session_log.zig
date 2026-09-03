@@ -615,7 +615,8 @@ fn replayConversationHistory(
     file: std.Io.File,
 ) ![]session.HistoryTurn {
     const length = try file.length(io_mod.getIo());
-    var offset: u64 = 0;
+    const window = try findConversationReplayWindow(alloc, file, length);
+    var offset = window.offset;
     var history: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
@@ -623,10 +624,13 @@ fn replayConversationHistory(
     }
     var turn = ConversationTurnBuilder.init(alloc);
     defer turn.deinit();
-    var compaction_count: usize = 0;
+    var compaction_count = window.compaction_count -| 1;
 
     while (offset < length) {
-        const line = try session_replay.readLineAt(alloc, file, offset, length) orelse break;
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
         defer alloc.free(line.bytes);
         var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
         defer decoded.deinit();
@@ -651,7 +655,7 @@ fn replayConversationHistory(
                 compaction_count += 1;
                 try history.append(alloc, .{ .compacted_summary = .{
                     .summary = try alloc.dupe(u8, value.summary),
-                    .removed_turn_count = rawConversationTurnCount(history.items),
+                    .removed_turn_count = window.prior_turn_count,
                     .compaction_count = compaction_count,
                     .root_user_messages_complete = false,
                     .permission_feedback_complete = false,
@@ -664,6 +668,128 @@ fn replayConversationHistory(
     // final batched turn before sync. The next writable open truncates that
     // incomplete turn; read-only replay returns the preceding complete turns.
     return history.toOwnedSlice(alloc);
+}
+
+pub fn loadConversationHistoryRange(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    start: usize,
+    end: usize,
+) ![]session.HistoryTurn {
+    if (start > end) return error.InvalidHistoryPageCursor;
+    var file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const length = try file.length(io_mod.getIo());
+    var offset: u64 = 0;
+    var turn_index: usize = 0;
+    var turns: std.ArrayList(session.HistoryTurn) = .empty;
+    errdefer {
+        for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
+        turns.deinit(alloc);
+    }
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    while (offset < length and turn_index < end) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        const completed: ?session.HistoryTurn = switch (decoded.value.event) {
+            .user => |value| blk: {
+                try builder.begin(value.text);
+                break :blk null;
+            },
+            .assistant => |value| blk: {
+                try builder.appendAssistant(value.text);
+                break :blk null;
+            },
+            .tool_call => |value| blk: {
+                try builder.appendToolCall(value);
+                break :blk null;
+            },
+            .tool_result => |value| blk: {
+                try builder.appendToolResult(value);
+                break :blk null;
+            },
+            .steering => |value| blk: {
+                try builder.appendSteering(value.text);
+                break :blk null;
+            },
+            .turn_completed => try builder.finishAssistant(),
+            .interrupted => |value| try builder.finishInterrupted(value),
+            .context_checkpoint => blk: {
+                if (!builder.isIdle()) return error.InvalidConversationFrame;
+                break :blk null;
+            },
+        };
+        if (completed) |turn| {
+            if (turn_index >= start) {
+                errdefer session.freeHistoryTurn(alloc, turn);
+                try turns.append(alloc, turn);
+            } else {
+                session.freeHistoryTurn(alloc, turn);
+            }
+            turn_index += 1;
+        }
+        offset = line.next_offset;
+    }
+    return turns.toOwnedSlice(alloc);
+}
+
+const ConversationReplayWindow = struct {
+    offset: u64 = 0,
+    prior_turn_count: usize = 0,
+    compaction_count: usize = 0,
+};
+
+fn findConversationReplayWindow(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+) !ConversationReplayWindow {
+    var window: ConversationReplayWindow = .{};
+    var offset: u64 = 0;
+    var turn_count: usize = 0;
+    var last_seq: u64 = 0;
+    var compaction_count: usize = 0;
+    while (offset < length) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        const expected_seq = std.math.add(u64, last_seq, 1) catch
+            return error.InvalidConversationFrame;
+        if (decoded.value.seq != expected_seq) return error.InvalidConversationFrame;
+        last_seq = decoded.value.seq;
+        switch (decoded.value.event) {
+            .turn_completed, .interrupted => turn_count = std.math.add(
+                usize,
+                turn_count,
+                1,
+            ) catch return error.InvalidConversationFrame,
+            .context_checkpoint => {
+                compaction_count = std.math.add(
+                    usize,
+                    compaction_count,
+                    1,
+                ) catch return error.InvalidConversationFrame;
+                window = .{
+                    .offset = offset,
+                    .prior_turn_count = turn_count,
+                    .compaction_count = compaction_count,
+                };
+            },
+            else => {},
+        }
+        offset = line.next_offset;
+    }
+    return window;
 }
 
 const ConversationTurnBuilder = struct {
@@ -902,20 +1028,42 @@ fn freeConversationToolResult(
     if (result.preview) |preview| alloc.free(preview);
 }
 
-fn rawConversationTurnCount(history: []const session.HistoryTurn) usize {
-    var count: usize = 0;
-    for (history) |turn| if (turn != .compacted_summary) {
-        count += 1;
-    };
-    return count;
-}
-
 fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize {
     var index: usize = 0;
     for (history, 0..) |turn, candidate| {
         if (turn == .compacted_summary) index = candidate;
     }
     return index;
+}
+
+fn isCurrentConversationCheckpoint(turn: session.HistoryTurn) bool {
+    return switch (turn) {
+        .compacted_summary => |entry| std.mem.startsWith(
+            u8,
+            entry.summary,
+            types.context_handoff_open,
+        ),
+        else => false,
+    };
+}
+
+fn retainLatestCheckpointHistory(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+) !void {
+    if (state.history.len == 0 or
+        !isCurrentConversationCheckpoint(state.history[state.history.len - 1]))
+    {
+        return error.InvalidConversationEvent;
+    }
+    const retained = try alloc.alloc(session.HistoryTurn, 1);
+    retained[0] = state.history[state.history.len - 1];
+    for (state.history[0 .. state.history.len - 1]) |turn| {
+        session.freeHistoryTurn(alloc, turn);
+    }
+    alloc.free(state.history);
+    state.history = retained;
+    state.context_history_start = 0;
 }
 
 pub const Boundary = enum {
@@ -1647,6 +1795,9 @@ pub const LoadedWritableSession = struct {
             },
             event_id,
         );
+        if (isCurrentConversationCheckpoint(payload.turn)) {
+            try retainLatestCheckpointHistory(alloc, &next_state);
+        }
 
         try self.conversation_writer.?.appendHistoryTurn(
             alloc,
@@ -9456,4 +9607,62 @@ test "cache-free resume rebuilds tool calls and external result references" {
         "result-shell.txt",
         execution.tool_steps[0].tool_results[0].output_handle.?,
     );
+}
+
+test "cache-free resume loads only the latest checkpoint and suffix" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-checkpoint", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("old question") },
+                .assistant = @constCast("old answer"),
+            } },
+        } }, 20, .retry_expected_tail, .{});
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 2,
+            .total_output_tokens = 2,
+            .turn = .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>summary</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+        } }, 30, .retry_expected_tail, .{});
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 3,
+            .total_output_tokens = 3,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("new question") },
+                .assistant = @constCast("new answer"),
+            } },
+        } }, 40, .retry_expected_tail, .{});
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.history.len);
+    try std.testing.expect(resumed.history[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("new question", resumed.history[1].assistant.user.text);
+
+    var session_dir = try temp.root.sessions.?.dir.openDir(
+        std.testing.io,
+        initial.id,
+        .{},
+    );
+    defer session_dir.close(std.testing.io);
+    var event_file = try session_dir.openFile(std.testing.io, "events.jsonl", .{});
+    defer event_file.close(std.testing.io);
+    const bytes = try io_mod.readFileToEnd(alloc, &event_file, 1024 * 1024);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "old question") != null);
 }

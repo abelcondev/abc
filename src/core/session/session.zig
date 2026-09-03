@@ -1858,7 +1858,31 @@ pub const SessionRuntime = struct {
     }
 
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
-        try self.agent.appendHistoryEntry(alloc, turn);
+        const prepared = try self.prepareHistoryEntry(alloc, turn);
+        self.commitPreparedHistoryEntry(alloc, prepared);
+    }
+
+    pub fn prepareHistoryEntry(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        turn: HistoryTurn,
+    ) !HistoryTurn {
+        try self.agent.history.ensureUnusedCapacity(alloc, 1);
+        return dupeHistoryTurn(alloc, turn);
+    }
+
+    pub fn commitPreparedHistoryEntry(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        turn: HistoryTurn,
+    ) void {
+        if (isCurrentCompactionCheckpoint(turn)) {
+            self.agent.clearHistory(alloc);
+            self.context_history_start = 0;
+            self.unversioned_history_len = 0;
+        }
+        self.agent.history.appendAssumeCapacity(turn);
+        self.agent.fresh = false;
         if (turn == .compacted_summary) {
             self.context_history_start = self.agent.history.items.len - 1;
             if (isCurrentCompactionCheckpoint(turn)) {
@@ -5255,7 +5279,7 @@ test "SessionRuntime preserves canonical turns and derives a bounded request win
     try std.testing.expectEqualStrings("five", context[3].assistant.user.text);
 }
 
-test "accepted semantic checkpoint is append-only and becomes the canonical model window" {
+test "accepted semantic checkpoint releases summarized model memory" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
@@ -5268,13 +5292,13 @@ test "accepted semantic checkpoint is append-only and becomes the canonical mode
         .compaction_count = 1,
     } });
 
-    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
-    try std.testing.expectEqual(@as(usize, 2), runtime.contextHistoryStart());
-    try std.testing.expectEqualStrings("first exact prompt", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expectEqual(@as(usize, 0), runtime.contextHistoryStart());
+    try std.testing.expect(runtime.agent.history.items[0] == .compacted_summary);
 
     const compacted = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, compacted);
-    try std.testing.expectEqual(@as(usize, 3), compacted.len);
+    try std.testing.expectEqual(@as(usize, 1), compacted.len);
     var projected_messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer projected_messages.deinit(alloc);
     try appendActiveContextHistoryChatMessages(
@@ -5289,9 +5313,9 @@ test "accepted semantic checkpoint is append-only and becomes the canonical mode
     try runtime.appendAssistantHistoryTurn(alloc, "post-checkpoint prompt", "post-checkpoint reply");
     const continued = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, continued);
-    try std.testing.expectEqual(@as(usize, 4), continued.len);
-    try std.testing.expect(continued[2] == .compacted_summary);
-    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[3].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 2), continued.len);
+    try std.testing.expect(continued[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[1].assistant.user.text);
 }
 
 test "restored history keeps an in-memory unversioned prefix boundary" {

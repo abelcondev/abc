@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
+const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
@@ -169,6 +170,53 @@ const HistoryPageCursor = struct {
     prefix_digest: [32]u8,
     start: usize,
 };
+
+const ConversationHistoryPageCursor = struct {
+    session_id: []const u8,
+    history_len: usize,
+    start: usize,
+};
+
+fn parseConversationHistoryPageCursor(
+    raw: []const u8,
+) LoadHistoryPageError!ConversationHistoryPageCursor {
+    if (raw.len == 0 or raw.len > 512) return error.InvalidHistoryPageCursor;
+    var fields = std.mem.splitScalar(u8, raw, ':');
+    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidHistoryPageCursor, "v3")) {
+        return error.InvalidHistoryPageCursor;
+    }
+    const session_id = fields.next() orelse return error.InvalidHistoryPageCursor;
+    const history_len = std.fmt.parseInt(
+        usize,
+        fields.next() orelse return error.InvalidHistoryPageCursor,
+        10,
+    ) catch return error.InvalidHistoryPageCursor;
+    const start = std.fmt.parseInt(
+        usize,
+        fields.next() orelse return error.InvalidHistoryPageCursor,
+        10,
+    ) catch return error.InvalidHistoryPageCursor;
+    if (fields.next() != null or start > history_len) {
+        return error.InvalidHistoryPageCursor;
+    }
+    validateSessionId(session_id) catch return error.InvalidHistoryPageCursor;
+    return .{
+        .session_id = session_id,
+        .history_len = history_len,
+        .start = start,
+    };
+}
+
+fn formatConversationHistoryPageCursor(
+    buffer: []u8,
+    cursor: ConversationHistoryPageCursor,
+) ![]u8 {
+    return std.fmt.bufPrint(buffer, "v3:{s}:{d}:{d}", .{
+        cursor.session_id,
+        cursor.history_len,
+        cursor.start,
+    });
+}
 
 fn parseHistoryPageCursor(raw: []const u8) LoadHistoryPageError!HistoryPageCursor {
     if (raw.len == 0 or raw.len > 512) return error.InvalidHistoryPageCursor;
@@ -1452,6 +1500,68 @@ pub const Store = struct {
     ) LoadHistoryPageError!store_types.HistoryPage {
         validateSessionId(session_id) catch return error.InvalidSessionId;
         if (limit == 0 or limit > 100) return error.InvalidHistoryPageLimit;
+        var session_dir = self.openSessionDir(session_id) catch |err|
+            return mapHistoryPageLoadError(err);
+        defer session_dir.close();
+        if (session_log.hasConversationMetadata(alloc, &session_dir) catch |err|
+            return mapHistoryPageLoadError(err))
+        {
+            var candidate = classifyReadOnlyCandidate(
+                alloc,
+                &session_dir,
+                session_id,
+            ) catch |err| return mapHistoryPageLoadError(err);
+            defer candidate.deinit(alloc);
+            const snapshot = if (cursor) |raw|
+                try parseConversationHistoryPageCursor(raw)
+            else
+                ConversationHistoryPageCursor{
+                    .session_id = candidate.summary.id,
+                    .history_len = candidate.summary.history_len,
+                    .start = candidate.summary.history_len,
+                };
+            if (!std.mem.eql(u8, snapshot.session_id, session_id)) {
+                return error.InvalidHistoryPageCursor;
+            }
+            if (snapshot.history_len > candidate.summary.history_len) {
+                return error.StaleHistoryPageCursor;
+            }
+            const window = selectHistoryPageWindow(
+                snapshot.history_len,
+                snapshot.start,
+                limit,
+            );
+            const turns = session_log.loadConversationHistoryRange(
+                alloc,
+                &session_dir,
+                window.start,
+                window.end,
+            ) catch |err| return mapHistoryPageLoadError(err);
+            errdefer session.freeHistoryTurnSlice(alloc, turns);
+            resolveSessionSnapshotLocators(
+                alloc,
+                turns,
+                self.sessions_dir,
+                session_id,
+            ) catch |err| return mapHistoryPageLoadError(err);
+            const next_cursor = if (window.start > 0) blk: {
+                var encoded: [512]u8 = undefined;
+                const raw = formatConversationHistoryPageCursor(&encoded, .{
+                    .session_id = session_id,
+                    .history_len = snapshot.history_len,
+                    .start = window.start,
+                }) catch return error.SessionStoreUnavailable;
+                break :blk try alloc.dupe(u8, raw);
+            } else null;
+            errdefer if (next_cursor) |value| alloc.free(value);
+            return .{
+                .session_id = try alloc.dupe(u8, session_id),
+                .revision_ms = candidate.summary.updated_at_ms,
+                .history_len = snapshot.history_len,
+                .turns = turns,
+                .next_cursor = next_cursor,
+            };
+        }
         const position = if (cursor) |raw| try parseHistoryPageCursor(raw) else null;
         if (position) |value| {
             if (!std.mem.eql(u8, value.session_id, session_id)) return error.InvalidHistoryPageCursor;
@@ -1662,6 +1772,16 @@ pub const Store = struct {
         return .{
             .name = name,
             .preferences = switch (candidate.storage) {
+                .conversation => self.loadConversationPreferences(
+                    alloc,
+                    &session_dir,
+                    session_id,
+                ) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.SessionNotFound => error.SessionNotFound,
+                    error.SessionPathUnsafe => error.SessionPathUnsafe,
+                    else => error.SessionMetadataUnavailable,
+                },
                 .schema_v3 => self.loadSubagentManifestPreferences(
                     alloc,
                     &session_dir,
@@ -1680,6 +1800,40 @@ pub const Store = struct {
                     else => error.SessionMetadataUnavailable,
                 },
             },
+        };
+    }
+
+    fn loadConversationPreferences(
+        self: Store,
+        alloc: Allocator,
+        session_dir: *io_mod.VerifiedDir,
+        session_id: []const u8,
+    ) !session_codec.DurableSessionPreferences {
+        _ = self;
+        var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return err,
+        };
+        defer file.close(io_mod.getIo());
+        const bytes = try io_mod.readFileToEnd(
+            alloc,
+            &file,
+            session_codec.max_session_metadata_bytes,
+        );
+        defer alloc.free(bytes);
+        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
+        defer metadata.deinit();
+        if (!std.mem.eql(u8, metadata.value.id, session_id)) {
+            return error.InvalidSessionMetadata;
+        }
+        return .{
+            .provider = model_provider.parse(metadata.value.provider) orelse
+                return error.InvalidSessionMetadata,
+            .model = try alloc.dupe(u8, metadata.value.model),
+            .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
+                return error.InvalidSessionMetadata,
+            .fast_mode = metadata.value.fast_mode,
         };
     }
 
@@ -6439,6 +6593,66 @@ test "resume last selects conversation metadata without cache files" {
             .{},
         ),
     );
+}
+
+test "conversation history pages remain complete after model compaction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "cache-free-pages", ctx.workspace);
+    defer state.deinit(alloc);
+    {
+        var writable = try ctx.store.startWritableSession(alloc, state);
+        defer writable.deinit(alloc);
+        const turns = [_]session.HistoryTurn{
+            .{ .assistant = .{
+                .user = .{ .text = @constCast("old question") },
+                .assistant = @constCast("old answer"),
+            } },
+            .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>summary</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+            .{ .assistant = .{
+                .user = .{ .text = @constCast("new question") },
+                .assistant = @constCast("new answer"),
+            } },
+        };
+        for (turns, 0..) |turn, index| {
+            _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = @intCast(index + 1),
+                .total_output_tokens = @intCast(index + 1),
+                .turn = turn,
+            } }, @intCast(20 + index), .retry_expected_tail, .{});
+        }
+    }
+
+    var newest = try ctx.store.loadHistoryPage(
+        alloc,
+        state.id,
+        null,
+        1,
+    );
+    defer newest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), newest.history_len);
+    try std.testing.expectEqual(@as(usize, 1), newest.turns.len);
+    try std.testing.expectEqualStrings("new question", newest.turns[0].assistant.user.text);
+    try std.testing.expect(newest.next_cursor != null);
+
+    var older = try ctx.store.loadHistoryPage(
+        alloc,
+        state.id,
+        newest.next_cursor,
+        1,
+    );
+    defer older.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), older.turns.len);
+    try std.testing.expectEqualStrings("old question", older.turns[0].assistant.user.text);
+    try std.testing.expect(older.next_cursor == null);
 }
 
 test "workspace latest pointer is materialized on session creation" {

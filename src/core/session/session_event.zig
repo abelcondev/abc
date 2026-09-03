@@ -138,7 +138,10 @@ pub fn validateConversationTransition(
                 }
             }
         },
-        .user, .assistant, .steering, .turn_completed, .interrupted => {},
+        .turn_completed => if (state.pending_tool_calls.len != 0) {
+            return error.UnresolvedToolCall;
+        },
+        .user, .assistant, .steering, .interrupted => {},
     }
 }
 
@@ -3313,6 +3316,11 @@ test "conversation transition validates sequence tool identity and checkpoint sa
         .seq = 3,
         .timestamp_ms = 10,
         .event = .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "checkpoint" } },
+    }));
+    try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .turn_completed = {} },
     }));
     try validateConversationTransition(state, .{
         .seq = 3,

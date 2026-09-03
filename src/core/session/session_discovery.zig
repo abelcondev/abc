@@ -531,6 +531,7 @@ fn classifyConversationCandidate(
 
     var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
     defer event_file.close(io_mod.getIo());
+    const event_stat = try event_file.stat(io_mod.getIo());
     const length = try event_file.length(io_mod.getIo());
     var offset: u64 = 0;
     var history_len: usize = 0;
@@ -564,7 +565,13 @@ fn classifyConversationCandidate(
             .origin_workspace_root = origin,
             .title = title,
             .created_at_ms = metadata.value.created_at_ms,
-            .updated_at_ms = metadata.value.updated_at_ms,
+            .updated_at_ms = @max(
+                metadata.value.updated_at_ms,
+                std.math.cast(
+                    i64,
+                    @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
+                ) orelse std.math.maxInt(i64),
+            ),
             .conversation_language = session.ConversationLanguage.fromSlice(
                 metadata.value.conversation_language,
             ) catch return error.InvalidSessionFormat,

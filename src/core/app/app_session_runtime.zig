@@ -2707,24 +2707,34 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
         ) !HistoryAppendOutcome {
-            app.session.appendHistoryEntry(app.alloc, turn) catch |err| {
+            const prepared = app.session.prepareHistoryEntry(app.alloc, turn) catch |err| {
                 return switch (mode) {
                     .strict => err,
                     .visual_epoch => .uncommitted,
                 };
             };
-            if (snapshot_file_ownership) |ownership| ownership.transfer();
-            // The footer title freezes at the first usable prompt, matching the
-            // sidecar derivation the resume picker shows.
-            ensureCachedSessionTitle(app) catch {};
-            commitJsHostSnapshot(app, "history_turn");
-            if (comptime !@hasField(App, "session_persistence")) return .committed;
+            var prepared_owned = true;
+            defer if (prepared_owned) types.freeHistoryTurn(app.alloc, prepared);
+            if (comptime !@hasField(App, "session_persistence")) {
+                app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                prepared_owned = false;
+                if (snapshot_file_ownership) |ownership| ownership.transfer();
+                ensureCachedSessionTitle(app) catch {};
+                commitJsHostSnapshot(app, "history_turn");
+                return .committed;
+            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value|
                 value
-            else
+            else {
+                app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                prepared_owned = false;
+                if (snapshot_file_ownership) |ownership| ownership.transfer();
+                ensureCachedSessionTitle(app) catch {};
+                commitJsHostSnapshot(app, "history_turn");
                 return .committed;
+            };
             try subagent_resume_admission.retainExternalRootUserTurn(
                 app.session_persistence.store,
                 app.alloc,
@@ -2757,34 +2767,24 @@ pub fn Runtime(comptime App: type) type {
                 io_mod.milliTimestamp(),
                 .retry_expected_tail,
                 .{},
-            ) catch |err| switch (err) {
-                error.EventFrameTooLarge => {
-                    commitCurrentStateReplacement(
-                        app,
-                        loaded,
-                        .compaction,
-                        .{},
-                        true,
-                    ) catch |replacement_err| {
-                        return switch (mode) {
-                            .strict => replacement_err,
-                            .visual_epoch => .committed_degraded,
-                        };
-                    };
-                    return .committed;
-                },
-                else => {
-                    switch (mode) {
-                        .strict => try warnDegraded(app, err),
-                        .visual_epoch => debug_trace.logf(
+            ) catch |err| {
+                return switch (mode) {
+                    .strict => err,
+                    .visual_epoch => blk: {
+                        debug_trace.logf(
                             "session",
-                            "visual epoch history committed with degraded persistence err={s}",
+                            "visual epoch history not committed err={s}",
                             .{@errorName(err)},
-                        ),
-                    }
-                    return .committed_degraded;
-                },
+                        );
+                        break :blk .uncommitted;
+                    },
+                };
             };
+            app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+            prepared_owned = false;
+            if (snapshot_file_ownership) |ownership| ownership.transfer();
+            ensureCachedSessionTitle(app) catch {};
+            commitJsHostSnapshot(app, "history_turn");
             return .committed;
         }
 
@@ -8991,6 +8991,110 @@ test "appendHistoryTurn commits conversation without copying runtime counters" {
     try std.testing.expectEqualStrings("answer", loaded.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(u64, 0), loaded.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 0), loaded.total_output_tokens);
+}
+
+test "context checkpoint persists before releasing summarized model memory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const session_id = app.session_persistence.writable.?.active_id;
+
+    const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
+    defer session_runtime.freeHistoryTurn(alloc, first);
+    const second = try session_runtime.makeAssistantTurn(alloc, "second", "two");
+    defer session_runtime.freeHistoryTurn(alloc, second);
+    try Runtime(TestApp).appendHistoryTurn(&app, first);
+    try Runtime(TestApp).appendHistoryTurn(&app, second);
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .compacted_summary = .{
+        .summary = @constCast("<context_handoff>both turns</context_handoff>"),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.session_persistence.writable.?.state.history.len,
+    );
+    var resumed = try app.session_persistence.store.?.loadReadOnly(alloc, session_id);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
+    try std.testing.expect(resumed.history[0] == .compacted_summary);
+    var page = try app.session_persistence.store.?.loadHistoryPage(
+        alloc,
+        session_id,
+        null,
+        10,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), page.turns.len);
+    try std.testing.expectEqualStrings("first", page.turns[0].assistant.user.text);
+    try std.testing.expectEqualStrings("second", page.turns[1].assistant.user.text);
+}
+
+test "rejected conversation append leaves live history unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    var calls = [_]types.ToolCall{.{
+        .id = "missing-artifact",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"printf done\"}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("missing-artifact"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+
+    try std.testing.expectError(
+        error.ConversationArtifactRequired,
+        Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+            .user = .{ .text = @constCast("run it") },
+            .assistant = @constCast("done"),
+            .execution = .{ .tool_steps = &steps },
+        } }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.session_persistence.writable.?.state.history.len,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        app.session_persistence.writable.?.conversation_writer.?.committed_bytes,
+    );
 }
 
 const SnapshotOwnershipProbe = struct {

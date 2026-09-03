@@ -4514,29 +4514,6 @@ fn latestCompactionCount(history: []const HistoryTurn) usize {
     return count;
 }
 
-fn retainedHistoryTailLimit(
-    history: []const HistoryTurn,
-    has_active_suffix: bool,
-) usize {
-    if (has_active_suffix) return 0;
-    if (history.len > 0 and history[history.len - 1] == .interrupted) return 0;
-    return 2;
-}
-
-test "interrupted history is compactable on the next prompt" {
-    const completed = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("completed") },
-        .assistant = @constCast("done"),
-    } }};
-    const interrupted = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("interrupted") },
-    } }};
-
-    try std.testing.expectEqual(@as(usize, 2), retainedHistoryTailLimit(&completed, false));
-    try std.testing.expectEqual(@as(usize, 0), retainedHistoryTailLimit(&interrupted, false));
-    try std.testing.expectEqual(@as(usize, 0), retainedHistoryTailLimit(&completed, true));
-}
-
 fn commitContextCompaction(
     deps: *const AgentRuntimeDeps,
     summary: types.CompactedSummaryHistoryTurn,
@@ -5363,61 +5340,15 @@ fn processQueuedPromptLoop(
                                 .{ .legacy_dir = dir }
                             else
                                 .unavailable;
-                        const retained_tail_limit = retainedHistoryTailLimit(
-                            job.history,
-                            within_turn_suffix.items.len > 0,
-                        );
-                        const retained_history_tail = if (retained_tail_limit == 0)
-                            session_runtime.RetainedHistoryTail{ .turn_count = 0, .message_count = 0 }
-                        else
-                            try session_runtime.retainedHistoryTailForMessageCount(
-                                arena,
-                                job.history,
-                                retained_tail_limit,
-                            );
-                        const retained_message_count = retained_history_tail.message_count;
-                        const compaction_source_message_count =
-                            compaction_messages.items.len - retained_message_count;
-                        const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                            compaction_messages.items[compaction_messages.items.len - retained_message_count ..],
-                        );
+                        const compaction_source_message_count = compaction_messages.items.len;
                         const prompt_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                             &.{current_user_effective},
                         );
-                        const compactable_suffix_start = @min(
-                            compacted_suffix_len,
-                            within_turn_suffix.items.len,
-                        );
-                        const compactable_suffix_message_count =
-                            within_turn_suffix.items.len - compactable_suffix_start;
-                        const retained_active_messages = @min(
-                            retained_message_count,
-                            compactable_suffix_message_count,
-                        );
-                        const retained_history_messages =
-                            retained_message_count - retained_active_messages;
-                        const history_message_count = compaction_messages.items.len -
-                            compactable_suffix_message_count;
-                        if (retained_history_messages > history_message_count) {
-                            return error.InvalidContextHistoryStart;
-                        }
-                        const next_compaction_history_tail = try arena.dupe(
-                            ChatMessage,
-                            compaction_messages.items[history_message_count - retained_history_messages .. history_message_count],
-                        );
-                        const next_compacted_suffix_len = within_turn_suffix.items.len -
-                            retained_active_messages;
-                        const retained_history_turns = try session_runtime.retainedHistoryTurnCountForMessageTail(
-                            arena,
-                            job.history,
-                            retained_history_messages,
-                        );
+                        const next_compaction_history_tail: []const ChatMessage = &.{};
+                        const next_compacted_suffix_len = within_turn_suffix.items.len;
                         const raw_history_turns = session_runtime.rawHistoryTurnCount(
                             job.history,
                         );
-                        if (retained_history_turns > raw_history_turns) {
-                            return error.InvalidContextHistoryStart;
-                        }
                         const next_compaction_count = compaction_count + 1;
                         const transaction_result = compactContextTransaction(arena, deps, .{
                             .trigger = .automatic,
@@ -5425,7 +5356,7 @@ fn processQueuedPromptLoop(
                             .working_capabilities = request_capabilities,
                             .request_tokens = request_cost.estimated_input_tokens,
                             .source_tokens = request_cost.estimated_input_tokens,
-                            .protected_tokens = prompt_tokens +| retained_tokens,
+                            .protected_tokens = prompt_tokens,
                             .source_messages = compaction_messages.items[0..compaction_source_message_count],
                             .uncertain_source_message_count = @min(
                                 uncertain_message_count,
@@ -5440,7 +5371,7 @@ fn processQueuedPromptLoop(
                             .retry_count = config.gateway_retry_count,
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
-                            .removed_turn_count = raw_history_turns - retained_history_turns,
+                            .removed_turn_count = raw_history_turns,
                             .compaction_count = next_compaction_count,
                         }) catch |err| {
                             if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {

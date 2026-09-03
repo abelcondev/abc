@@ -1089,22 +1089,9 @@ pub fn Runtime(comptime App: type) type {
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,
             );
-            const retained_tail = try session_runtime.retainedHistoryTailForMessageCount(
-                arena,
-                job.history,
-                2,
-            );
-            const retained_message_count = retained_tail.message_count;
-            const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                messages.items[messages.items.len - retained_message_count ..],
-            );
             const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
-            const retained_turn_count = retained_tail.turn_count;
-            if (retained_turn_count > raw_turn_count) {
-                return error.InvalidContextHistoryStart;
-            }
             var compaction_count: usize = 0;
             for (job.history) |turn| switch (turn) {
                 .compacted_summary => |summary| {
@@ -1121,12 +1108,9 @@ pub fn Runtime(comptime App: type) type {
                 .working_capabilities = capabilities,
                 .request_tokens = source_tokens,
                 .source_tokens = source_tokens,
-                .protected_tokens = retained_tokens,
-                .source_messages = messages.items[0 .. messages.items.len - retained_message_count],
-                .uncertain_source_message_count = @min(
-                    uncertain_message_count,
-                    messages.items.len - retained_message_count,
-                ),
+                .protected_tokens = 0,
+                .source_messages = messages.items,
+                .uncertain_source_message_count = uncertain_message_count,
                 .result_storage = result_storage,
                 .api_key = job.api_key,
                 .credential_source = job.credential_source,
@@ -1136,7 +1120,7 @@ pub fn Runtime(comptime App: type) type {
                 .retry_count = gateway_retry_count,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .trace_ctx = .{ .turn_id = job.turn_id },
-                .removed_turn_count = raw_turn_count - retained_turn_count,
+                .removed_turn_count = raw_turn_count,
                 .compaction_count = compaction_count + 1,
             }) catch |err| {
                 if (err == error.Cancelled and
