@@ -26,6 +26,7 @@ const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
+  export const libfxApiVersion = 2;
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
 const nativeUrl = pathToFileURL(nativePath);
@@ -124,7 +125,7 @@ try {
 
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export function createCore() { throw new Error("unused createCore"); }
 `);
 await assert.rejects(
@@ -135,7 +136,7 @@ await assert.rejects(
 
 const incompatiblePath = resolve(dir, "incompatible.mjs");
 await writeFile(incompatiblePath, `
-  export const libfxApiVersion = 3;
+  export const libfxApiVersion = 4;
   export async function createFxAgent() {}
 `);
 await assert.rejects(
@@ -149,7 +150,7 @@ for (const [name, source] of [
     export function createCore() { throw new Error("missing-version createCore invoked"); }
   `],
   ["unequal-version", `
-    export const libfxApiVersion = 3;
+    export const libfxApiVersion = 4;
     export function createCore() { throw new Error("unequal-version createCore invoked"); }
   `],
 ]) {
@@ -166,7 +167,7 @@ for (const [name, source] of [
 
 const matchingVersionPath = resolve(dir, "matching-version.mjs");
 await writeFile(matchingVersionPath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export function createCore() {
     const error = new Error("matching-version createCore invoked");
     error.code = "MATCHING_VERSION_INVOKED";
@@ -176,7 +177,7 @@ await writeFile(matchingVersionPath, `
 await assert.rejects(
   createFxAgent({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native", apiKey: "loader-key" }),
   (error) => error?.code === "MATCHING_VERSION_INVOKED",
-  "matching v2 low-level addon must reach createCore",
+  "matching v3 low-level addon must reach createCore",
 );
 
 console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, semantic errors, and strict low-level API validation");

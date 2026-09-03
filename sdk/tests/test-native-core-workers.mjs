@@ -18,7 +18,7 @@ function runWorker(index) {
         apiKey: "worker-test-key",
         home: process.cwd(),
         workspaceRoot: process.cwd(),
-      });
+      }, () => {});
       addon.writeCore(core, Buffer.from(JSON.stringify({
         jsonrpc: "2.0",
         id: workerData.index + 1,
@@ -46,18 +46,19 @@ const outputs = await Promise.all(Array.from({ length: 4 }, (_, index) => runWor
 for (const output of outputs) assert.match(output, /"result"/);
 
 const addon = require(addonPath);
+const noop = () => {};
 const localCores = Array.from({ length: 3 }, () => addon.createCore({
   apiKey: "same-env-test-key",
   home: process.cwd(),
   workspaceRoot: process.cwd(),
-}));
+}, noop));
 for (const core of localCores) addon.closeCore(core);
 for (const core of localCores) addon.destroyCore(core);
 
 let finalized = false;
 const registry = new FinalizationRegistry(() => { finalized = true; });
 {
-  let abandoned = addon.createCore({ apiKey: "gc-test-key", home: process.cwd(), workspaceRoot: process.cwd() });
+  let abandoned = addon.createCore({ apiKey: "gc-test-key", home: process.cwd(), workspaceRoot: process.cwd() }, noop);
   registry.register(abandoned, "abandoned");
   abandoned = null;
 }

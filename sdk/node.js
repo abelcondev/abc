@@ -15,6 +15,7 @@ import {
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
+const nativeCoreApiVersion = 3;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -63,10 +64,10 @@ async function loadNativeCandidate(candidate) {
 function validateNativeBackend(backend) {
   if (!backend) return null;
   const hasLowLevelCore = typeof backend.createCore === "function";
-  if ((hasLowLevelCore && backend.libfxApiVersion !== libfxApiVersion) ||
-    (!hasLowLevelCore && backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion)) {
+  const expectedVersion = hasLowLevelCore ? nativeCoreApiVersion : libfxApiVersion;
+  if ((hasLowLevelCore || backend.libfxApiVersion !== undefined) && backend.libfxApiVersion !== expectedVersion) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
-    throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
+    throw new Error(`native addon API version ${actualVersion} is incompatible with expected API version ${expectedVersion}`);
   }
   if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
     throw new Error("native addon must export createCore() or createFxTerminal()");
@@ -128,10 +129,11 @@ function createNativeCoreRuntime(addon, options) {
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
-  });
+  }, drainReady);
   let exitedResolve;
   let lineHandler = null;
   let lineBuffer = "";
+  const decoder = new TextDecoder();
   let settled = false;
   let fetchState = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
@@ -142,7 +144,6 @@ function createNativeCoreRuntime(addon, options) {
   const finish = (code) => {
     if (settled) return;
     settled = true;
-    clearInterval(timer);
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
     exitedResolve(code);
@@ -189,10 +190,14 @@ function createNativeCoreRuntime(addon, options) {
         } catch {}
       }
     } finally {
-      if (fetchState === state) fetchState = null;
+      if (fetchState === state) {
+        fetchState = null;
+        queueMicrotask(drainReady);
+      }
     }
   };
-  const timer = setInterval(() => {
+  function drainReady() {
+    if (settled) return;
     try {
       if (fetchState) {
         if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
@@ -202,9 +207,10 @@ function createNativeCoreRuntime(addon, options) {
         const fetchRequest = addon.takeCoreFetch(core);
         if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
       }
-      const chunk = addon.drainCore(core);
-      if (chunk.length && lineHandler) {
-        lineBuffer += chunk.toString("utf8");
+      for (;;) {
+        const chunk = addon.drainCore(core);
+        if (!chunk.length) break;
+        lineBuffer += decoder.decode(chunk, { stream: true });
         for (;;) {
           const newline = lineBuffer.indexOf("\n");
           if (newline < 0) break;
@@ -217,7 +223,7 @@ function createNativeCoreRuntime(addon, options) {
     } catch {
       finish(1);
     }
-  }, 2);
+  }
 
   return {
     exited,

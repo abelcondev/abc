@@ -1415,6 +1415,11 @@ export async function createFxAgent(options = {}) {
       },
       [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
     };
+    if (signal?.aborted) {
+      finished = true;
+      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      return turn;
+    }
     activeTurn = turn;
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });

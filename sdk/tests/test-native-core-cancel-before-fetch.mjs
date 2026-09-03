@@ -14,7 +14,7 @@ const core = addon.createCore({
   home: "/tmp",
   workspaceRoot: "/tmp",
   gatewayChatUrl: "http://127.0.0.1:31337/chat",
-});
+}, () => {});
 
 let nextId = 1;
 let buffered = "";

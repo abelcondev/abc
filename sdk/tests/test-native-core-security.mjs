@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addonPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
 const addon = require(addonPath);
+const noop = () => {};
 
 function fdCount() {
   try { return readdirSync("/dev/fd").length; } catch { return null; }
@@ -21,7 +22,7 @@ for (let index = 0; index < 1000; index += 1) {
     model: 42,
     home: process.cwd(),
     workspaceRoot: process.cwd(),
-  }));
+  }, noop));
 }
 const afterFds = fdCount();
 if (beforeFds !== null && afterFds !== null) assert.ok(afterFds - beforeFds < 4, `fd leak: ${beforeFds} -> ${afterFds}`);
@@ -30,15 +31,15 @@ const runtimeLimitProbe = Array.from({ length: 64 }, () => addon.createCore({
   apiKey: "runtime-limit-key",
   home: process.cwd(),
   workspaceRoot: process.cwd(),
-}));
+}, noop));
 assert.throws(
-  () => addon.createCore({ apiKey: "runtime-limit-key", home: process.cwd(), workspaceRoot: process.cwd() }),
+  () => addon.createCore({ apiKey: "runtime-limit-key", home: process.cwd(), workspaceRoot: process.cwd() }, noop),
   (error) => error.code === "LIBFX_NATIVE_LIMIT",
 );
 for (const handle of runtimeLimitProbe) addon.closeCore(handle);
 for (const handle of runtimeLimitProbe) addon.destroyCore(handle);
 
-const core = addon.createCore({ apiKey: "security-test-key", home: process.cwd(), workspaceRoot: process.cwd() });
+const core = addon.createCore({ apiKey: "security-test-key", home: process.cwd(), workspaceRoot: process.cwd() }, noop);
 let nextId = 1;
 function send(method, params) {
   const id = nextId++;

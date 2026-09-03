@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addonPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
 const addon = require(addonPath);
-const core = addon.createCore({ apiKey: "exit-code-test-key", home: "/tmp", workspaceRoot: "/tmp" });
+const core = addon.createCore({ apiKey: "exit-code-test-key", home: "/tmp", workspaceRoot: "/tmp" }, () => {});
 
 try {
   addon.writeCore(core, Buffer.from("{}\n".repeat(180_000)));

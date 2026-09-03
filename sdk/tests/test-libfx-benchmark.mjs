@@ -1,11 +1,21 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { benchmarkInstructionsBytes } from "../../benchmarks/libfx/workload.mjs";
+import { benchmarkInstructionsBytes, sampleStats } from "../../benchmarks/libfx/workload.mjs";
+
+assert.deepEqual(sampleStats([4, 1, 3, 2]), { count: 4, mean: 2.5, p50: 2, p95: 4, max: 4 });
+assert.equal(sampleStats(Array.from({ length: 100 }, (_, index) => index + 1)).p99, 99);
+for (const invalid of [[], [NaN], [Infinity], [null], [-1]]) assert.throws(() => sampleStats(invalid), TypeError);
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const benchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-fx.mjs", import.meta.url));
+const runtimeBenchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-runtime.mjs", import.meta.url));
+const capacityBenchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-capacity.mjs", import.meta.url));
+const benchmarkCheck = fileURLToPath(new URL("../../benchmarks/libfx/check-results.mjs", import.meta.url));
 const runtime = process.versions.bun ? "bun" : "node";
 const command = process.execPath;
 
@@ -32,6 +42,106 @@ for (const backend of ["native", "wasm"]) {
   assert.ok(sample.request_bytes > 0);
   assert.equal(sample.system_context_bytes, benchmarkInstructionsBytes);
   assert.equal(sample.system_context_overhead_bytes, 0);
+
+  const runtimeResult = spawnSync(command, [
+    ...(runtime === "node" && backend === "wasm" ? ["--experimental-wasm-jspi"] : []),
+    runtimeBenchmark,
+    "--backend", backend,
+    "--warm-samples", "2",
+    "--stream-samples", "1",
+  ], { cwd: repoRoot, encoding: "utf8", timeout: 20_000 });
+  assert.equal(runtimeResult.status, 0, `${runtime} ${backend} runtime benchmark failed:\n${runtimeResult.stderr}`);
+  const runtimeReport = JSON.parse(runtimeResult.stdout);
+  assert.equal(runtimeReport.backend, backend);
+  assert.equal(runtimeReport.first_prompt.text, "hello");
+  assert.equal(runtimeReport.warm.prompt_to_first_text_ms.count, 2);
+  assert.deepEqual(runtimeReport.streams.map(({ chunks, bytes, samples }) => ({ chunks, bytes, samples })), [
+    { chunks: 1, bytes: 1, samples: 1 },
+    { chunks: 1000, bytes: 1, samples: 1 },
+    { chunks: 16, bytes: 65_536, samples: 1 },
+  ]);
+
+  const capacityResult = spawnSync(command, [
+    ...(runtime === "node" ? ["--expose-gc"] : []),
+    ...(runtime === "node" && backend === "wasm" ? ["--experimental-wasm-jspi"] : []),
+    capacityBenchmark,
+    "--backend", backend,
+    "--count", "2",
+  ], { cwd: repoRoot, encoding: "utf8", timeout: 20_000 });
+  assert.equal(capacityResult.status, 0, `${runtime} ${backend} capacity benchmark failed:\n${capacityResult.stderr}`);
+  const capacityReport = JSON.parse(capacityResult.stdout);
+  assert.equal(capacityReport.backend, backend);
+  assert.equal(capacityReport.count, 2);
+  assert.deepEqual(capacityReport.failures, []);
+  assert.deepEqual(capacityReport.snapshots.map(({ stage }) => stage), [
+    "baseline", "created", "prompted", "closing", "closed", "server_closed",
+  ]);
+}
+
+const checkDir = await mkdtemp(resolve(tmpdir(), "libfx-benchmark-check-"));
+try {
+  const write = (name, value) => writeFile(resolve(checkDir, name), `${JSON.stringify(value)}\n`);
+  for (const runtimeName of ["node", "bun"]) {
+    for (const [backend, warmP50, bridgeMs] of [["native", 0.6, 0.5], ["wasm", 0.4, 0.3]]) {
+      await write(`runtime-${runtimeName}-${backend}.json`, {
+        warm: { prompt_to_first_text_ms: { count: 100, p50: warmP50 } },
+        streams: [{ samples: 30 }, { samples: 30 }, { samples: 30 }],
+      });
+      await write(`bridge-${runtimeName}-${backend}.json`, {
+        samples: Array.from({ length: 100 }, () => ({ tool_round_trip_ms: bridgeMs })),
+      });
+      await write(`capacity-${runtimeName}-${backend}.json`, {
+        count: 25,
+        failures: [],
+        snapshots: [
+          { stage: "baseline", thread_count: 8, descriptor_count: 14, active_handles: 2, external_bytes: 4_000_000 },
+          { stage: "created", external_bytes: backend === "wasm" ? 50_000_000 : 4_000_000 },
+          { stage: "prompted", thread_count: backend === "native" ? 33 : 12 },
+          { stage: "closing", thread_count: backend === "native" ? 33 : 12 },
+          { stage: "closed", thread_count: backend === "native" ? 8 : 12 },
+          { stage: "server_closed", thread_count: backend === "native" ? 8 : 12, descriptor_count: 13, active_handles: 1, external_bytes: 5_000_000 },
+        ],
+      });
+    }
+    await write(`competitive-${runtimeName}.json`, {
+      rounds: [
+        { order: ["libfx", "pi"], libfx_request_count: 103, pi_request_count: 103 },
+        { order: ["pi", "libfx"], libfx_request_count: 103, pi_request_count: 103 },
+        { order: ["libfx", "pi"], libfx_request_count: 103, pi_request_count: 103 },
+      ],
+      libfx: { prompt_to_first_text_ms: { count: 300, p50: 0.5, p95: 0.8, p99: 1.2 } },
+      pi: { prompt_to_first_text_ms: { count: 300, p50: 0.7, p95: 1.0, p99: 1.5 } },
+    });
+  }
+  const passed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+  assert.equal(passed.status, 0, passed.stderr || passed.stdout);
+
+  await write("runtime-node-native.json", {
+    warm: { prompt_to_first_text_ms: { count: 100, p50: 5 } },
+    streams: [{ samples: 30 }, { samples: 30 }, { samples: 30 }],
+  });
+  const failed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /Node native warm p50/);
+
+  await write("runtime-node-native.json", {
+    warm: { prompt_to_first_text_ms: { count: 100, p50: 0.6 } },
+    streams: [{ samples: 30 }, { samples: 30 }, { samples: 30 }],
+  });
+  await write("competitive-node.json", {
+    rounds: [
+      { order: ["libfx", "pi"], libfx_request_count: 103, pi_request_count: 103 },
+      { order: ["pi", "libfx"], libfx_request_count: 103, pi_request_count: 103 },
+      { order: ["libfx", "pi"], libfx_request_count: 103, pi_request_count: 103 },
+    ],
+    libfx: { prompt_to_first_text_ms: { count: 300, p50: 1.1, p95: 1.4, p99: 1.8 } },
+    pi: { prompt_to_first_text_ms: { count: 300, p50: 0.7, p95: 1.0, p99: 1.5 } },
+  });
+  const competitorFailed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+  assert.notEqual(competitorFailed.status, 0);
+  assert.match(competitorFailed.stderr, /Node native versus Pi p50/);
+} finally {
+  await rm(checkDir, { recursive: true, force: true });
 }
 
 console.log(`${runtime} libfx benchmark integration passed`);

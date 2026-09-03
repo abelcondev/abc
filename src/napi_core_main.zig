@@ -34,6 +34,45 @@ const runtime_handle_type_tag = c.napi_type_tag{
     .upper = 0xa71d7c52e9314b08,
 };
 
+const ReadyNotifier = struct {
+    function: c.napi_threadsafe_function,
+
+    fn init(env: c.napi_env, callback: c.napi_value) !ReadyNotifier {
+        var callback_type: c.napi_valuetype = undefined;
+        if (c.napi_typeof(env, callback, &callback_type) != c.napi_ok or callback_type != c.napi_function) {
+            return error.InvalidReadyCallback;
+        }
+        var resource_name: c.napi_value = undefined;
+        if (c.napi_create_string_utf8(env, "libfx core ready", c.NAPI_AUTO_LENGTH, &resource_name) != c.napi_ok) {
+            return error.ReadyCallbackFailed;
+        }
+        var function: c.napi_threadsafe_function = undefined;
+        if (c.napi_create_threadsafe_function(
+            env,
+            callback,
+            null,
+            resource_name,
+            1,
+            1,
+            null,
+            null,
+            null,
+            null,
+            &function,
+        ) != c.napi_ok) return error.ReadyCallbackFailed;
+        return .{ .function = function };
+    }
+
+    fn notify(self: *const ReadyNotifier) void {
+        // A full one-slot queue already carries a wake; the data stays in its owner.
+        _ = c.napi_call_threadsafe_function(self.function, null, c.napi_tsfn_nonblocking);
+    }
+
+    fn abort(self: *ReadyNotifier) void {
+        _ = c.napi_release_threadsafe_function(self.function, c.napi_tsfn_abort);
+    }
+};
+
 comptime {
     if (build_options.napi_surface != .core) {
         @compileError("libfx N-API core requires -Dnapi-surface=core");
@@ -102,6 +141,7 @@ const OutputQueue = struct {
     mutex: std.Io.Mutex = .init,
     bytes: std.ArrayList(u8) = .empty,
     offset: usize = 0,
+    ready: ?*ReadyNotifier = null,
 
     fn write(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
         const io = io_mod.getIo();
@@ -115,6 +155,7 @@ const OutputQueue = struct {
             self.offset = 0;
         }
         try self.bytes.appendSlice(alloc, data);
+        if (queued == 0) self.ready.?.notify();
     }
 
     fn drain(self: *OutputQueue, destination: []u8) usize {
@@ -154,6 +195,7 @@ const FetchBridge = struct {
     phase: fetch_state.Phase = .idle,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
+    ready: ?*ReadyNotifier = null,
 
     fn clearPendingRequest(self: *FetchBridge) void {
         if (self.request.items.len == 0) return;
@@ -206,6 +248,7 @@ const FetchBridge = struct {
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
+        self.ready.?.notify();
         return handle;
     }
 
@@ -283,6 +326,7 @@ const FetchBridge = struct {
         self.response.clearRetainingCapacity();
         self.response_offset = 0;
         self.wake.broadcast(io);
+        self.ready.?.notify();
     }
 
     fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
@@ -387,6 +431,7 @@ const Runtime = struct {
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
+    ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(0),
@@ -450,6 +495,7 @@ const Runtime = struct {
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
+        self.ready.notify();
     }
 
     fn closeInput(self: *Runtime) void {
@@ -464,6 +510,7 @@ const Runtime = struct {
         self.closeInput();
         self.fetch.shutdown();
         self.thread.join();
+        self.ready.abort();
         self.fetch.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
@@ -480,6 +527,16 @@ const Runtime = struct {
 const RuntimeHandle = struct {
     mutex: std.Io.Mutex = .init,
     runtime: ?*Runtime,
+    cleanup_hook_registered: bool,
+
+    fn unregisterCleanup(self: *RuntimeHandle, env: c.napi_env) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        const registered = self.cleanup_hook_registered;
+        self.cleanup_hook_registered = false;
+        self.mutex.unlock(io);
+        if (registered) _ = c.napi_remove_env_cleanup_hook(env, cleanupRuntimeHandle, self);
+    }
 
     fn destroy(self: *RuntimeHandle) void {
         const io = io_mod.getIo();
@@ -490,6 +547,15 @@ const RuntimeHandle = struct {
         if (runtime) |value| value.deinit();
     }
 };
+
+fn cleanupRuntimeHandle(data: ?*anyopaque) callconv(.c) void {
+    const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
+    const io = io_mod.getIo();
+    handle.mutex.lockUncancelable(io);
+    handle.cleanup_hook_registered = false;
+    handle.mutex.unlock(io);
+    handle.destroy();
+}
 
 var threaded_io: ?std.Io.Threaded = null;
 var threaded_io_state: std.atomic.Value(u8) = .init(0);
@@ -523,6 +589,11 @@ fn ensureThreadedIo() void {
 
 fn throw(env: c.napi_env, code: [*:0]const u8, message: [*:0]const u8) c.napi_value {
     _ = c.napi_throw_error(env, code, message);
+    return null;
+}
+
+fn throwType(env: c.napi_env, code: [*:0]const u8, message: [*:0]const u8) c.napi_value {
+    _ = c.napi_throw_type_error(env, code, message);
     return null;
 }
 
@@ -591,7 +662,7 @@ const CreateError = error{
     ThreadFailed,
 };
 
-fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
+fn createRuntime(env: c.napi_env, options: c.napi_value, ready: ReadyNotifier) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
@@ -641,8 +712,11 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
+        .ready = ready,
         .thread = undefined,
     };
+    runtime.fetch.ready = &runtime.ready;
+    runtime.output.ready = &runtime.ready;
     runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
@@ -668,24 +742,43 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     };
 }
 
-fn finalizeRuntimeHandle(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+fn finalizeRuntimeHandle(env: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
+    handle.unregisterCleanup(env);
     handle.destroy();
     std.heap.c_allocator.destroy(handle);
 }
 
 fn createCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [1]c.napi_value = undefined;
+    var argv: [2]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
 
-    const runtime = createRuntime(env, argv[0]) catch |err| return throwCreateError(env, err);
+    var ready = ReadyNotifier.init(env, argv[1]) catch |err| return switch (err) {
+        error.InvalidReadyCallback => throwType(env, "LIBFX_INVALID_ARGUMENT", "ready callback must be a function"),
+        error.ReadyCallbackFailed => throw(env, "LIBFX_NAPI", "could not create ready callback"),
+    };
+    var ready_owned = true;
+    defer if (ready_owned) ready.abort();
+
+    const runtime = createRuntime(env, argv[0], ready) catch |err| return throwCreateError(env, err);
+    ready_owned = false;
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit();
     const handle = std.heap.c_allocator.create(RuntimeHandle) catch
         return throw(env, "LIBFX_NATIVE_OOM", "could not allocate runtime handle");
     var handle_owned = true;
-    defer if (handle_owned) std.heap.c_allocator.destroy(handle);
-    handle.* = .{ .runtime = runtime };
+    defer if (handle_owned) {
+        handle.unregisterCleanup(env);
+        std.heap.c_allocator.destroy(handle);
+    };
+    handle.* = .{ .runtime = runtime, .cleanup_hook_registered = false };
+
+    if (!statusOk(
+        env,
+        c.napi_add_env_cleanup_hook(env, cleanupRuntimeHandle, handle),
+        "could not register native runtime cleanup",
+    )) return null;
+    handle.cleanup_hook_registered = true;
 
     var result: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_object(env, &result), "could not create runtime handle")) return null;
@@ -914,6 +1007,7 @@ fn coreExitCode(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi
 fn destroyCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    handle.unregisterCleanup(env);
     handle.destroy();
     var value: c.napi_value = undefined;
     _ = c.napi_get_undefined(env, &value);
@@ -929,7 +1023,7 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 2, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;

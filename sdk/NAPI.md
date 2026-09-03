@@ -31,7 +31,7 @@ JavaScript createFxAgent()
 sdk/node.js selects native backend
         |
         v
-createCore(options) in libfx.node
+createCore(options, onReady) in libfx.node
         |
         v
 Zig Runtime thread runs acp_server.runWithTransport()
@@ -57,7 +57,7 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-The adapter checks fetch control and drains ACP output on its existing timer. While no body pump exists it may call `takeCoreFetch()`; while a pump exists it calls only `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next callback that observes it. No exact callback latency is guaranteed. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+The adapter supplies one readiness callback when it creates the core. The runtime schedules that callback when a fetch request becomes pending, output changes from empty to non-empty, or the core exits. The callback carries no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. While a body pump exists it calls `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next readiness callback. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
 
@@ -67,8 +67,8 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 
 | Export | Purpose |
 | --- | --- |
-| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `2`. Low-level `createCore` backends must declare this exact version. |
-| `createCore(options)` | Allocates a runtime and starts its ACP thread. |
+| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `3`. Low-level `createCore` backends must declare this exact version. |
+| `createCore(options, onReady)` | Allocates a runtime, installs its readiness callback, and starts its ACP thread. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
@@ -83,6 +83,8 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
+
+The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `3`.
 
 Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. The addon does not write ambient diagnostics for these outcomes; the JavaScript adapter observes the numeric result and owns any explicit host reporting.
 
@@ -101,7 +103,7 @@ Creating a core performs these steps:
 5. Spawn one native thread.
 6. Run `acp_server.runWithTransport()` on that thread using callback-backed ACP queues and the shared host-stream provider.
 
-The runtime thread never calls N-API. It blocks on the fetch bridge while the Node event-loop poller owns `fetch`, response-body iteration, and `AbortController`. Destruction marks the bridge shutting down and wakes every wait before joining the runtime thread, so worker teardown does not depend on further JavaScript callbacks.
+The runtime thread never reads or mutates JavaScript values. It blocks on the fetch bridge while Node owns `fetch`, response-body iteration, and `AbortController`; its only Node-API effect is scheduling the thread-safe readiness callback. Queue state remains authoritative when callbacks coalesce. An environment cleanup hook shuts down and joins every runtime before Node tears down its callback handle, including worker termination. Explicit destruction unregisters that hook. Destruction marks the bridge shutting down, wakes every wait, joins the runtime thread, and then releases the callback and native memory.
 
 The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
@@ -174,7 +176,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 
 Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output overflow causes the ACP runtime to exit with a failure status rather than allowing unbounded native memory growth. Limits must remain checked with overflow-safe subtraction before append operations.
 
-The JavaScript adapter continuously drains output while a runtime is active. Changes that reduce polling or pause consumption must account for the fixed output bound.
+The JavaScript adapter drains output to quiescence on every readiness callback. Changes that pause notification or consumption must account for the fixed output bound.
 
 ## Argument and handle safety
 

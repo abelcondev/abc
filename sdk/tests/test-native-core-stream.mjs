@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 
 const events = [];
+const unicodeText = "😀界".repeat(200_000);
 let requestCount = 0;
 let firstResponse;
 let firstConnectionClosedResolve;
@@ -35,7 +36,11 @@ const server = createServer((request, response) => {
       events.push("first-finish-sent");
       return;
     }
-    assert.equal(requestCount, 2, "only two Gateway requests are expected");
+    if (requestCount === 3) {
+      response.end(`data: ${JSON.stringify({ type: "text-delta", delta: unicodeText })}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n`);
+      return;
+    }
+    assert.equal(requestCount, 2, "unexpected Gateway request");
     response.write('data: {"type":"text-delta","delta":"native two"}\n\n');
     response.write('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n');
     response.end("data: [DONE]\n\n");
@@ -58,9 +63,10 @@ try {
   agent = await createFxAgent({
     nativeAddon: addon,
     backend: "native",
-    fetch(input, init) {
+    async fetch(input, init) {
       fetchCalls += 1;
-      if (fetchCalls === 1) {
+      const first = fetchCalls === 1;
+      if (first) {
         init.signal.addEventListener("abort", () => {
           events.push("first-abort");
           firstAbortResolve();
@@ -68,7 +74,23 @@ try {
       } else if (fetchCalls === 2) {
         events.push("second-fetch");
       }
-      return fetch(input, init);
+      const response = await fetch(input, init);
+      if (!first) return response;
+      const reader = response.body.getReader();
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          try {
+            const chunk = await reader.read();
+            if (chunk.done) controller.close();
+            else controller.enqueue(chunk.value);
+          } catch (error) {
+            // Cleanup can settle after the next prompt has already become ready.
+            await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+            controller.error(error);
+          }
+        },
+        cancel(reason) { return reader.cancel(reason); },
+      }), { status: response.status, headers: response.headers });
     },
     apiKey: "native-core-stream-key",
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
@@ -92,11 +114,14 @@ try {
     timeout("first response abort or connection close"),
   ]);
   let secondText = "";
-  for await (const update of secondTurn) {
-    if (update.type === "text_delta") {
-      secondText += update.delta;
-    }
-  }
+  await Promise.race([
+    (async () => {
+      for await (const update of secondTurn) {
+        if (update.type === "text_delta") secondText += update.delta;
+      }
+    })(),
+    timeout("second prompt after delayed first pump cleanup"),
+  ]);
   assert.equal(secondText.trimEnd(), "native two");
   assert.equal((await secondTurn.result).stopReason, "end_turn");
   assert.equal(fetchCalls, 2, "both prompts must use the Node-owned fetch option");
@@ -104,6 +129,11 @@ try {
     .filter((index) => index >= 0);
   assert.ok(releaseEvents.length > 0, "the first response must be aborted or closed");
   assert.ok(events.indexOf("second-fetch") > Math.min(...releaseEvents), "request two must start after response one releases the pump slot");
+  const unicodeTurn = agent.prompt("large Unicode response");
+  let unicodeOutput = "";
+  for await (const update of unicodeTurn) if (update.type === "text_delta") unicodeOutput += update.delta;
+  assert.equal((await unicodeTurn.result).stopReason, "end_turn");
+  assert.ok(unicodeOutput === unicodeText, "native drain boundaries must preserve every UTF-8 character");
   assert.equal(await agent.close(), undefined);
   agent = null;
   console.log("native core stream passed: split terminal tail, matching abort, prompt reuse, and graceful close");
