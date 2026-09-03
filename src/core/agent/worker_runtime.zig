@@ -779,6 +779,13 @@ pub const WorkerRuntime = struct {
         return self.worker_cancel_requested.load(.seq_cst);
     }
 
+    pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.worker_cancel_requested.load(.seq_cst) and
+            self.steering_cancel_turn_id != self.active_turn_id;
+    }
+
     pub fn isConnectivityWaitActive(self: *const WorkerRuntime) bool {
         return self.worker_connectivity_wait_active.load(.seq_cst);
     }
@@ -3833,6 +3840,7 @@ test "immediate steering owns and clears only its cancellation" {
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
     try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(!runtime.cancellationStopsTurn());
     var steering_snapshot = try runtime.snapshotState(alloc);
     defer steering_snapshot.deinit(alloc);
     try std.testing.expect(steering_snapshot.cancel_requested);
@@ -3861,6 +3869,7 @@ test "explicit interrupt overrides immediate steering cancellation" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
     _ = runtime.requestInteractiveCancel();
+    try std.testing.expect(runtime.cancellationStopsTurn());
     var interrupt_snapshot = try runtime.snapshotState(alloc);
     defer interrupt_snapshot.deinit(alloc);
     try std.testing.expect(interrupt_snapshot.cancel_requested);

@@ -6651,15 +6651,20 @@ test.skipIf(!tmuxAvailable())(
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      const resumed = stripAnsi(await waitForScrollback(active, "● System: cancelled", timeout));
+      const resumed = stripAnsi(await waitForScrollback(
+        active,
+        "What can fx do differently?",
+        timeout,
+      ));
       const cancelledIndex = resumed.indexOf("Cancelled");
-      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(cancellationNoticeIndex).toBeGreaterThan(cancelledIndex);
-      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
+      expect(resumed).toContain("■ Cancelled");
+      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(resumed).not.toContain("System: cancelled");
+      expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
-      const restoredPresentation = resumed.slice(cancelledIndex, cancellationNoticeIndex);
+      const restoredPresentation = resumed.slice(cancelledIndex);
       expect(
         restoredPresentation.split("\n").some((line) => line.trimStart().startsWith("│")),
       ).toBe(false);

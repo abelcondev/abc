@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readTrace } from "./tui-render-assertions";
+import { findFooterBlocks, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -220,7 +220,18 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendKeys("Escape");
       await waitForCondition(() => held.cancelled, "gateway stream cancellation");
       await waitForTrace(tracePath, "event=interrupt_persisted", TIMEOUT);
-      await session.waitForText("cancelled", TIMEOUT);
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      const cancelledGrid = await session.capturePaneGrid();
+      const footer = findFooterBlocks(cancelledGrid).at(-1);
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      expect(footer).toBeDefined();
+      expect(cancelledRow).toBeGreaterThanOrEqual(0);
+      expect(cancelledRow).toBeLessThan(footer!.topDivider);
+      const gapRows = cancelledGrid.slice(cancelledRow + 1, footer!.topDivider);
+      expect(gapRows.length).toBeGreaterThanOrEqual(1);
+      expect(gapRows.map((row) => row.trim())).toEqual(
+        Array.from({ length: gapRows.length }, () => ""),
+      );
       await session.sendText(`/model ${FOLLOW_UP_MODEL}`);
       await waitForCondition(
         () => JSON.parse(readFileSync(settingsPath, "utf8")).models?.gateway === FOLLOW_UP_MODEL,
@@ -231,7 +242,11 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       for (const chunk of VISIBLE_PARTIAL_CHUNKS) {
         expect(interruptedScrollback).toContain(chunk.trim());
       }
-      expect(countOccurrences(interruptedScrollback, "cancelled")).toBe(1);
+      expect(
+        countOccurrences(interruptedScrollback, "What can fx do differently?"),
+      ).toBe(1);
+      expect(interruptedScrollback).not.toContain("System: cancelled");
+      expect(interruptedScrollback).not.toContain("Cancelling");
 
       await session.waitForText(FOLLOW_UP_RESPONSE, TIMEOUT);
       await waitForCondition(
@@ -244,7 +259,11 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(finalScrollback).toContain(chunk.trim());
       }
       expect(finalScrollback).toContain(FOLLOW_UP_RESPONSE);
-      expect(countOccurrences(finalScrollback, "cancelled")).toBe(1);
+      expect(
+        countOccurrences(finalScrollback, "What can fx do differently?"),
+      ).toBe(1);
+      expect(finalScrollback).not.toContain("System: cancelled");
+      expect(finalScrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(2);
       expect(held.cancelCount).toBe(1);
       expect(countOccurrences(readTrace(tracePath), "event=interrupt_persisted")).toBe(1);
@@ -391,7 +410,16 @@ while :; do sleep 1; done
       );
 
       const command = `/workspace add ${sharedRoot}`;
+      const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
+      const immediateCancellation = await session.waitForText(
+        "What can fx do differently?",
+        TIMEOUT,
+      );
+      expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+      expect(immediateCancellation).toContain("■ Cancelled");
+      expect(immediateCancellation).not.toContain("System: cancelled");
+      expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
         tracePath,
         "event=cancel_requested source=input_active_stream",

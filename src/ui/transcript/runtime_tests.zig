@@ -14797,6 +14797,43 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     ));
 }
 
+test "active tool cancellation is presented immediately without closing lifecycle state" {
+    const alloc = std.testing.allocator;
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+
+    const ids = [_]types.ToolLifecycleId{
+        lifecycleId(1, "read"),
+        lifecycleId(1, "command"),
+    };
+    for (ids) |id| {
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = if (std.mem.eql(u8, id.call_id, "read")) "read_file" else "run_command",
+            .activity_kind = if (std.mem.eql(u8, id.call_id, "read")) .read else .command,
+        } });
+    }
+
+    try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+    try std.testing.expectEqual(@as(usize, 2), runtime.activeToolActivityCount());
+
+    var rendered = try runtime.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = ids[1],
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
+}
+
 fn expectRawEntryBytes(
     runtime: *const TranscriptRuntime,
     entry_id: u32,

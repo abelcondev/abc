@@ -674,6 +674,25 @@ pub fn Runtime(comptime App: type) type {
             const settings_snapshot = app_commands.settingsCatalogSnapshot(app);
             const now_ms = io_mod.milliTimestamp();
             var visible_stream = app.stream;
+            if (visible_stream.active) {
+                const cancel_requested = if (comptime @hasField(App, "worker"))
+                    if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested"))
+                        app.worker.isCancelRequested()
+                    else
+                        false
+                else
+                    false;
+                if (cancel_requested) {
+                    const stops_turn = if (comptime @hasDecl(
+                        @TypeOf(app.worker),
+                        "cancellationStopsTurn",
+                    ))
+                        app.worker.cancellationStopsTurn()
+                    else
+                        true;
+                    if (stops_turn) visible_stream.active = false;
+                }
+            }
             if (!visible_stream.active) {
                 if (app.pacer.completedAssistantPresentationTokenProgress()) |progress| {
                     visible_stream.token_progress = progress;
@@ -3196,9 +3215,19 @@ const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
     queued_count: usize = 0,
     paused: bool = false,
+    cancel_requested: bool = false,
+    cancel_continues_turn: bool = false,
 
     pub fn queuePreview(self: *@This()) worker_runtime.QueuePreview {
         return .{ .count = self.queued_count, .paused = self.paused };
+    }
+
+    pub fn isCancelRequested(self: *const @This()) bool {
+        return self.cancel_requested;
+    }
+
+    pub fn cancellationStopsTurn(self: *const @This()) bool {
+        return self.cancel_requested and !self.cancel_continues_turn;
     }
 
     pub fn submitPermissionResponse(
@@ -3464,6 +3493,66 @@ test "core.app_render_runtime keeps final token progress during paced response t
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "core.app_render_runtime hides loading after active tool cancellation" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .stream = .{ .active = true },
+    };
+    defer app.deinit();
+    app.worker.cancel_requested = true;
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "command" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+    } });
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    try std.testing.expect(!ctx.stream.active);
+    var activity_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        render_input.frameOwnedActivityProjection(
+            &activity_buf,
+            &app.shell,
+            ctx,
+            null,
+        ) == .none,
+    );
+}
+
+test "core.app_render_runtime keeps loading while cancellation continues the turn" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .stream = .{ .active = true },
+    };
+    defer app.deinit();
+    app.worker.cancel_requested = true;
+    app.worker.cancel_continues_turn = true;
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    try std.testing.expect(ctx.stream.active);
 }
 
 test "core.app_render_runtime keeps configured controls visible while model capabilities load" {

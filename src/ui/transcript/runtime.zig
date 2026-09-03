@@ -4600,6 +4600,67 @@ pub const TranscriptRuntime = struct {
         return self.lifecycle_state.activeCount();
     }
 
+    /// Publishes the terminal cancellation presentation immediately while the
+    /// worker retains lifecycle ownership until each tool actually settles.
+    pub fn presentActiveToolCancellation(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+    ) !bool {
+        const focused = self.lifecycle_state.focusedRecord() orelse return false;
+        const active = try self.lifecycle_state.collectFallbackRecords(
+            alloc,
+            focused.id.turn_id,
+        );
+        defer alloc.free(active);
+        if (active.len == 0) return false;
+
+        const line = try lifecycleTerminalLine(alloc, .cancelled, "Cancelled");
+        defer alloc.free(line);
+        const updates = try alloc.alloc(transcript_store.LifecycleEntryUpdate, active.len);
+        defer alloc.free(updates);
+        var detail_starts: std.ArrayList(PendingToolDetailStart) = .empty;
+        defer {
+            for (detail_starts.items) |*detail_start| detail_start.deinit(alloc);
+            detail_starts.deinit(alloc);
+        }
+        try detail_starts.ensureTotalCapacity(alloc, active.len);
+        var missing_detail_count: usize = 0;
+        for (active, 0..) |entry, index| {
+            if (self.toolDetailPtr(entry.record.entry_id) == null) {
+                missing_detail_count += 1;
+            }
+            detail_starts.appendAssumeCapacity(try self.prepareToolDetailStart(
+                alloc,
+                entry.record.entry_id,
+                entry.record.id,
+                entry.record.tool_name orelse "tool",
+                entry.record.activity_kind,
+                null,
+            ));
+            updates[index] = .{
+                .entry_id = entry.record.entry_id,
+                .bytes = line,
+            };
+        }
+        try transcript_store.replacePinnedToolStatusesAtomic(
+            self,
+            alloc,
+            updates,
+            missing_detail_count,
+        );
+        for (active, detail_starts.items) |entry, *detail_start| {
+            self.commitToolDetailStart(
+                alloc,
+                entry.record.entry_id,
+                detail_start,
+            );
+            const detail = self.toolDetailPtr(entry.record.entry_id).?;
+            detail.outcome = .cancelled;
+            detail.fallback_disposition = null;
+        }
+        return true;
+    }
+
     pub fn finalizedToolTurnWatermark(self: *const TranscriptRuntime) u64 {
         return self.lifecycle_state.finalized_turn_watermark;
     }
@@ -9203,6 +9264,24 @@ pub const TranscriptRuntime = struct {
             line,
             record,
             .tool_status,
+        );
+    }
+
+    pub fn writeTurnCancellation(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        metrics: *Metrics,
+        record: bool,
+    ) !void {
+        const line = try lifecycleTerminalLine(alloc, .cancelled, "Cancelled");
+        defer alloc.free(line);
+        try transcript_writer.writeTranscriptClassified(
+            self,
+            alloc,
+            metrics,
+            line,
+            record,
+            .turn_cancellation,
         );
     }
 

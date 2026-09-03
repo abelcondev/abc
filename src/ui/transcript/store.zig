@@ -2919,6 +2919,7 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         .tool_status,
         .diff_block,
         .question_resolution,
+        .turn_cancellation,
         .subagent_status,
         => true,
         .command_output, .unknown_raw => false,
