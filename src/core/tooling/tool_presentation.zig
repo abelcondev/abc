@@ -219,28 +219,6 @@ pub fn formatRunCommandDetailBounded(
     return encoded.bytes;
 }
 
-/// Returns an owned terminal-safe command detail for one visible transcript row.
-/// The caller owns the returned allocation and must free it with `alloc`.
-pub fn formatRunCommandDetailForWidth(
-    alloc: Allocator,
-    arguments_json: []const u8,
-    workspace_root: []const u8,
-    max_visible_width: usize,
-) !?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
-    const max_encoded_bytes = std.math.mul(usize, max_visible_width, 4) catch
-        max_run_command_activity_source_bytes;
-    return formatRunCommandDetailBounded(
-        alloc,
-        command,
-        workspace_root,
-        @min(max_encoded_bytes, max_run_command_activity_source_bytes),
-    );
-}
-
 /// The caller owns the returned allocation and must free it with `alloc`.
 fn resolveTerminalDisplayTargetFromRows(
     alloc: Allocator,
@@ -748,8 +726,12 @@ test "run command detail uses the caller bound without changing activity labels"
     );
     defer alloc.free(arguments_json);
 
-    const detail = (try formatRunCommandDetailForWidth(alloc, arguments_json, "", 240)) orelse
-        return error.TestExpectedEqual;
+    const detail = (try formatRunCommandDetailBounded(
+        alloc,
+        command,
+        "",
+        max_run_command_reflow_bytes,
+    )) orelse return error.TestExpectedEqual;
     defer alloc.free(detail);
     try std.testing.expectEqualStrings(command, detail);
 
@@ -768,25 +750,15 @@ test "run command detail uses the caller bound without changing activity labels"
     try std.testing.expect(activity.detail.len <= max_run_command_activity_bytes);
     try std.testing.expect(std.mem.endsWith(u8, activity.detail, "..."));
 
-    try std.testing.expectEqual(
-        @as(?[]u8, null),
-        try formatRunCommandDetailForWidth(alloc, "{}", "", 80),
-    );
-    try std.testing.expectEqual(
-        @as(?[]u8, null),
-        try formatRunCommandDetailForWidth(alloc, "{", "", 80),
-    );
-
     const hidden_workspace_path = "printf " ++ ("prefix-" ** 20) ++ " /Users/example/workspace/file";
-    const hidden_workspace_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"command\":{f}}}",
-        .{std.json.fmt(hidden_workspace_path, .{})},
-    );
-    defer alloc.free(hidden_workspace_json);
     try std.testing.expectEqual(
         @as(?[]u8, null),
-        try formatRunCommandDetailForWidth(alloc, hidden_workspace_json, "", 240),
+        try formatRunCommandDetailBounded(
+            alloc,
+            hidden_workspace_path,
+            "",
+            max_run_command_reflow_bytes,
+        ),
     );
 }
 
