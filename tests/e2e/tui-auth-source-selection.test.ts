@@ -1547,9 +1547,15 @@ tmuxTest(
     await Bun.sleep(300);
     const cancelStarted = Date.now();
     await session.sendKeys("C-c");
-    await session.waitForText("System: cancelled", TIMEOUT);
+    const cancelledPane = await session.waitForText(
+      "What can fx do differently?",
+      TIMEOUT,
+    );
     await session.waitForComposer(TIMEOUT);
-    expect(Date.now() - cancelStarted).toBeLessThan(3_000);
+    expect(Date.now() - cancelStarted).toBeLessThan(500);
+    expect(cancelledPane).toContain("■ Cancelled");
+    expect(cancelledPane).not.toContain("System: cancelled");
+    expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },

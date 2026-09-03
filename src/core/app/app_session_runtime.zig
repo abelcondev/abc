@@ -3280,6 +3280,20 @@ pub fn Runtime(comptime App: type) type {
                     try self.app.writeTranscript(text, true);
                 }
 
+                fn appendTurnCancellation(self: *Self) !void {
+                    const line = try transcript_runtime.formatHistoricalToolStatusLine(
+                        self.app.alloc,
+                        .cancelled,
+                        "Cancelled",
+                    );
+                    defer self.app.alloc.free(line);
+                    try self.app.writeTranscriptClassified(
+                        line,
+                        true,
+                        .turn_cancellation,
+                    );
+                }
+
                 fn appendToolStatus(
                     self: *Self,
                     kind: types.ToolOutcomeKind,
@@ -3515,6 +3529,19 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendRaw(self: *Self, text: []const u8) !void {
                     _ = try self.projection.appendRawClassified(text, .unknown_raw);
+                }
+
+                fn appendTurnCancellation(self: *Self) !void {
+                    const line = try transcript_runtime.formatHistoricalToolStatusLine(
+                        self.projection.alloc,
+                        .cancelled,
+                        "Cancelled",
+                    );
+                    defer self.projection.alloc.free(line);
+                    _ = try self.projection.appendRawClassified(
+                        line,
+                        .turn_cancellation,
+                    );
                 }
 
                 fn appendToolStatus(
@@ -3810,7 +3837,14 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
                         }
-                        try sink.appendNotice(session_runtime.interruptedTurnNotice(entry));
+                        switch (entry.terminal_reason) {
+                            .cancelled => if (entry.cancelled_command == null) {
+                                try sink.appendTurnCancellation();
+                            },
+                            .failed => try sink.appendNotice(
+                                session_runtime.interruptedTurnNotice(entry),
+                            ),
+                        }
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
@@ -5242,6 +5276,7 @@ const TestApp = struct {
     notices: std.ArrayList([]u8) = .empty,
     cards: std.ArrayList(PromptCard) = .empty,
     transcript: std.ArrayList(u8) = .empty,
+    raw_transcript_classes: std.ArrayList(transcript_runtime.RawEntryClass) = .empty,
     completed_tool_statuses: std.ArrayList([]u8) = .empty,
     completed_tool_outcomes: std.ArrayList(types.ToolOutcomeKind) = .empty,
     next_transcript_entry_id: u32 = 1,
@@ -5343,6 +5378,7 @@ const TestApp = struct {
         for (self.cards.items) |*card| card.deinit(self.alloc);
         self.cards.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.raw_transcript_classes.deinit(self.alloc);
         for (self.completed_tool_statuses.items) |status| self.alloc.free(status);
         self.completed_tool_statuses.deinit(self.alloc);
         self.completed_tool_outcomes.deinit(self.alloc);
@@ -5419,14 +5455,20 @@ const TestApp = struct {
     }
 
     fn writeTranscript(self: *TestApp, text: []const u8, record: bool) !void {
-        _ = record;
-        try self.transcript.appendSlice(self.alloc, text);
-        try self.replay_events.append(self.alloc, .raw_transcript);
-        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
+        try self.writeTranscriptClassified(text, record, .unknown_raw);
     }
 
-    fn writeTranscriptClassified(self: *TestApp, text: []const u8, record: bool, _: anytype) !void {
-        try self.writeTranscript(text, record);
+    fn writeTranscriptClassified(
+        self: *TestApp,
+        text: []const u8,
+        record: bool,
+        class: transcript_runtime.RawEntryClass,
+    ) !void {
+        _ = record;
+        try self.transcript.appendSlice(self.alloc, text);
+        try self.raw_transcript_classes.append(self.alloc, class);
+        try self.replay_events.append(self.alloc, .raw_transcript);
+        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
     }
 
     fn writeCompletedToolStatus(
@@ -8212,6 +8254,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         .code_block,
         .thematic_rule,
         .text,
+        .raw_transcript,
     };
     try std.testing.expectEqualSlices(
         AssistantPresentationEvent,
@@ -8235,9 +8278,15 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         app.assistant_code_blocks.items[0].code,
     );
     try std.testing.expectEqual(@as(usize, 1), app.assistant_thematic_rule_count);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.turn_cancellation,
+        app.raw_transcript_classes.getLast(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
 
 test "resume Markdown replay releases undelivered table payloads once" {
@@ -8361,10 +8410,12 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
 
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("inspect the browser", app.cards.items[0].text);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("● Session resumed: inspect the browser", app.notices.items[0]);
-    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
 }
 

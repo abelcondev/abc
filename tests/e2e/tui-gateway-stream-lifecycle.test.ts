@@ -2342,12 +2342,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await session!.sendKeys("Escape");
-      await session!.waitForText("cancelled", TIMEOUT);
+      await session!.waitForText("What can fx do differently?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(3);
-      expect(scrollback).toContain("cancelled");
+      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("Cancelling");
       expect(scrollback).not.toContain("request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2738,7 +2740,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         rowContaining(preEnterGrid, submittedPrompt),
       );
       await session.sendKeys("C-c");
-      const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
+      const cancelledPane = await session.waitForText(
+        "What can fx do differently?",
+        TIMEOUT,
+      );
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
@@ -2822,7 +2827,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
       await session.sendKeys("C-c");
-      await session.waitForText("cancelled", TIMEOUT);
+      await session.waitForText("What can fx do differently?", TIMEOUT);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
@@ -3920,13 +3925,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
 
       await session.sendKeys("C-c");
-      const afterFirst = await session.waitForText("cancelled", TIMEOUT);
+      const afterFirst = await session.waitForText(
+        "What can fx do differently?",
+        TIMEOUT,
+      );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
-      expect(afterFirst).toContain("cancelled");
+      expect(afterFirst).toContain("■ Cancelled");
+      expect(afterFirst).not.toContain("System: cancelled");
+      expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
       const scrollbackAfterFirst = await session.captureFullScrollbackEscapes();
-      expect(countOccurrences(scrollbackAfterFirst, "cancelled")).toBe(1);
+      expect(
+        countOccurrences(scrollbackAfterFirst, "What can fx do differently?"),
+      ).toBe(1);
 
       await session.sendKeys("C-c");
       await waitForCondition(
@@ -3937,8 +3949,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollback = await session.captureFullScrollback();
       const trace = readFileSync(tracePath, "utf8");
-      expect(scrollback).toContain("cancelled");
-      expect(countOccurrences(scrollback, "cancelled")).toBe(1);
+      expect(scrollback).toContain("What can fx do differently?");
+      expect(
+        countOccurrences(scrollback, "What can fx do differently?"),
+      ).toBe(1);
+      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("Cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
