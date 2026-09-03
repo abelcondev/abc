@@ -455,11 +455,11 @@ describe("@ file picker", () => {
         expect(gateway?.requests).toHaveLength(1);
         held.release("IN_FLIGHT_FILE_PICKER_COMPLETE");
         await active.waitForText("IN_FLIGHT_FILE_PICKER_COMPLETE", TIMEOUT);
+        expectCleanRuntime(current, active);
         await clearComposer(active);
         await active.sendText("/quit");
         expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
         session = null;
-        expectCleanRuntime(current, active);
       } finally {
         held.dispose();
       }
