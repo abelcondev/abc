@@ -334,12 +334,13 @@ fn applyResolvedBottomReservation(
 
 fn queuedBannerRowsForLayout(
     ctx: RenderContext,
+    terminal_cols: u16,
     terminal_rows: u16,
     input_visible: bool,
     composer_top_chrome_rows: u16,
     input_extra: u16,
 ) u16 {
-    const requested = render_input.queuedBannerRows(ctx);
+    const requested = render_input.queuedBannerRows(ctx, terminal_cols);
     return clampQueuedBannerRows(
         requested,
         terminal_rows,
@@ -515,6 +516,7 @@ fn buildFooterSurfaceProjection(
     const file_request = if (sizing_request) |request| request.file else null;
     const banner_rows = if (viewer_active) 0 else queuedBannerRowsForLayout(
         ctx,
+        shell.layout.cols,
         shell.layout.rows,
         input_visible,
         composer_top_chrome_rows,
@@ -1264,6 +1266,7 @@ pub noinline fn resolveSurfaceFooterReservation(
     const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
     const banner_rows_for_transient = queuedBannerRowsForLayout(
         ctx,
+        shell.layout.cols,
         shell.layout.rows,
         input_visible_for_transient,
         composer_top_chrome_rows_for_transient,
@@ -1363,6 +1366,7 @@ fn prepareSurfaceFooterFrameInternal(
         const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
         const banner_rows_for_transient = queuedBannerRowsForLayout(
             ctx,
+            shell.layout.cols,
             shell.layout.rows,
             input_visible_for_transient,
             composer_top_chrome_rows_for_transient,
