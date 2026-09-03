@@ -268,6 +268,9 @@ pub const ReviewTurnContext = struct {
     pending_assistant: types.ChatMessage,
     target_call_id: []const u8,
     origin: ReviewOrigin,
+    /// Host-owned current-turn I/O gate. False short-circuits only if
+    /// deterministic admission reaches remote model review.
+    review_attempt_available: bool = true,
     credential: types.CredentialLease = .{},
     /// Canonical root-user context for contextual security review. Assistant,
     /// tool, repository, attachment, and permission-feedback text never become

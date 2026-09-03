@@ -2409,7 +2409,7 @@ describe("effect-aware command permissions", () => {
         trace.match(/decision=unavailable fallback_reason=completion_text/g),
       ).toHaveLength(1);
       expect(trace.match(/event=auto_review_budget_exhausted/g)).toHaveLength(3);
-      expect(trace.match(/event=turn_permission_denial_preserved/g)).toHaveLength(3);
+      expect(trace).not.toContain("event=turn_permission_denial_preserved");
       expect(trace).not.toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
