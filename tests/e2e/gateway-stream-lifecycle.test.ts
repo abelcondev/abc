@@ -7012,6 +7012,47 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
   }
 
+  test("malformed duplicate-provider response retains the interrupted JSON preview", async () => {
+    const root = createFixtureRoot("malformed-duplicate-replacement");
+    const tracePath = join(root.root, "trace.log");
+    const partialText = "LAST_INTERRUPTED_PREVIEW";
+    const validReplay = await providerToolResultResponse("tool-calls").text();
+    const repeatedResult = `data: ${JSON.stringify({
+      type: "tool-result",
+      toolCallId: "provider_search_recovery_1",
+      result: { content: "exact provider-side result" },
+    })}\n\n`;
+    const responses = [
+      providerToolResultResponse("provider_error"),
+      sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`),
+      sse(validReplay.replace('data: {"type":"finish"', `${repeatedResult}data: {"type":"finish"`)),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? unavailableResponse("0"));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the available evidence."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(result.code).toBe(1);
+      expect(json.output).toBe(partialText);
+      expect(json.final_output).toBe("");
+      expect(json.error).toBe("MalformedProviderResultIdentity");
+      expect(gateway.requestCount()).toBe(3);
+      expect(trace).toContain("event=authoritative_tool_admission_rejected");
+      expect(trace).toContain("failure=duplicate_result provenance=provider_executed");
+      expect(trace).not.toContain("event=provider_tool_recovery_duplicate_suppressed");
+      expect(trace).not.toContain("event=before_tool_execution");
+      expect(gateway.requests[2]!.body).not.toContain(partialText);
+      expect(toolResultOutput(gateway.requests[2]!.body, "provider_search_recovery_1"))
+        .toContain("exact provider-side result");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("content filter does not retry or offer route recovery", async () => {
     const root = createFixtureRoot("content-filter-terminal");
     const tracePath = join(root.root, "trace.log");

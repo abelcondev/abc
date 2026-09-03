@@ -6722,11 +6722,12 @@ fn processQueuedPromptLoop(
                 };
             }
         }
-        const filtered_provider_calls = try filterMaterializedProviderCalls(
+        const tool_admission = types.authoritativeToolAdmission(completion);
+        const filtered_provider_calls: FilteredProviderCalls = if (tool_admission == .admitted) try filterMaterializedProviderCalls(
             arena,
             within_turn_suffix.items,
             completion.tool_calls,
-        );
+        ) else .{ .calls = completion.tool_calls, .removed = 0 };
         completion.tool_calls = filtered_provider_calls.calls;
         if (filtered_provider_calls.removed > 0) {
             debug_trace.eventf(
@@ -6927,8 +6928,7 @@ fn processQueuedPromptLoop(
         agent.observeUsage(completion.usage);
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
-            const admission = types.authoritativeToolAdmission(completion);
-            switch (admission) {
+            switch (tool_admission) {
                 .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
