@@ -5083,8 +5083,6 @@ tmuxTest(
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
-      "GET /.well-known/openid-configuration",
-      "POST /oauth/token",
     ]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
