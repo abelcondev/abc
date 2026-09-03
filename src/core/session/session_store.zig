@@ -257,6 +257,14 @@ fn duplicateHistoryPage(alloc: Allocator, turns: []const session.HistoryTurn) ![
     return copy;
 }
 
+fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
+    var result: usize = 0;
+    for (history, 0..) |turn, index| {
+        if (turn == .compacted_summary) result = index;
+    }
+    return result;
+}
+
 fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft }![32]u8 {
     var buffer: [256]u8 = undefined;
     var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
@@ -2051,6 +2059,13 @@ pub const Store = struct {
             var root = self.canonical_root;
             var state = try root.loadReadOnly(alloc, session_id, options.log);
             errdefer state.deinit(alloc);
+            const archive = try session_log.loadConversationArchive(
+                alloc,
+                &session_dir,
+            );
+            session.freeHistoryTurnSlice(alloc, state.history);
+            state.history = archive;
+            state.context_history_start = latestCheckpointHistoryIndex(archive);
             try resolveSessionSnapshotLocators(
                 alloc,
                 state.history,
@@ -2448,21 +2463,8 @@ pub const Store = struct {
     }
 
     /// Lists session candidates for workspace-owned managed children. Child
-    /// payloads remain the authority when the global index update is pending.
+    /// payloads remain the authority for child ownership.
     pub fn listManagedChildCandidatesForWorkspace(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
-        if (self.canonical_root.sessions) |*sessions| {
-            const summaries = readSessionIndexWorkspaceCandidates(
-                alloc,
-                sessions,
-                self.workspace_root,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => null,
-            };
-            if (summaries) |index| {
-                return index;
-            }
-        }
         return self.listForWorkspace(alloc);
     }
 
@@ -2497,30 +2499,6 @@ pub const Store = struct {
             .current_workspace => self.workspace_root,
             .all_workspaces => null,
         };
-        if (self.canonical_root.sessions) |*sessions| {
-            var indexed_page = summary_codec.readSessionIndexPage(alloc, sessions, .{
-                .workspace_root = workspace_root,
-                .continuation = continuation,
-                .limit = limit,
-                .resumable_only = false,
-            }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => null,
-            };
-            if (indexed_page) |*bounded| {
-                defer bounded.deinit(alloc);
-                var page: SessionListPage = .{
-                    .summaries = bounded.summaries,
-                    .has_more = bounded.has_more,
-                };
-                bounded.summaries = .empty;
-                if (!summariesMissingDisplayMetadata(page.summaries.items)) {
-                    return page;
-                }
-                page.deinit(alloc);
-            }
-        }
-
         var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionStoreUnavailable,
@@ -2601,12 +2579,6 @@ pub const Store = struct {
         active_id: ?[]const u8,
         continuation: ?ResumableSessionContinuation,
     ) !ResumableSessionPage {
-        if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |page| {
-            return page;
-        }
-        if (self.canonical_root.mode == .writable) {
-            return self.backfillResumablePageForScope(alloc, scope, active_id, continuation);
-        }
         return self.listResumablePageFromDiscoveryForScope(alloc, scope, active_id, continuation);
     }
 

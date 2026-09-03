@@ -127,8 +127,12 @@ pub fn validateConversationTransition(
             }
         },
         .context_checkpoint => |checkpoint| {
-            if (checkpoint.covers_through_seq <= state.latest_checkpoint_coverage or
-                checkpoint.covers_through_seq > state.last_seq)
+            const initial_empty_checkpoint = state.last_seq == 0 and
+                state.latest_checkpoint_coverage == 0 and
+                checkpoint.covers_through_seq == 0;
+            if (!initial_empty_checkpoint and
+                (checkpoint.covers_through_seq <= state.latest_checkpoint_coverage or
+                    checkpoint.covers_through_seq > state.last_seq))
             {
                 return error.InvalidCheckpointCoverage;
             }
@@ -3285,6 +3289,14 @@ const TestIdentifierSource = struct {
 };
 
 test "conversation transition validates sequence tool identity and checkpoint safety" {
+    try validateConversationTransition(.{}, .{
+        .seq = 1,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{
+            .covers_through_seq = 0,
+            .summary = "first-turn checkpoint",
+        } },
+    });
     const pending = [_]PendingToolCall{.{ .call_id = "call-shell", .tool_name = "shell", .seq = 2 }};
     const state = ConversationStateView{ .last_seq = 2, .pending_tool_calls = &pending };
     try validateConversationTransition(state, .{

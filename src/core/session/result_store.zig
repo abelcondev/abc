@@ -142,6 +142,8 @@ fn prepareExternallyBackedInlineResult(
     errdefer alloc.free(handle);
     const model_output = try alloc.dupe(u8, durable_output);
     errdefer alloc.free(model_output);
+    const preview = try previewText(alloc, durable_output, preview_bytes);
+    errdefer alloc.free(preview);
     switch (target) {
         .legacy_dir => |dir| try storeLargeResultAtHandle(
             alloc,
@@ -160,6 +162,7 @@ fn prepareExternallyBackedInlineResult(
         .model_output = model_output,
         .memory = .{
             .output_handle = handle,
+            .preview = preview,
             .output_bytes = output_bytes,
             .stored_output_bytes = durable_output.len,
             .truncated = false,

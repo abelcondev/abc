@@ -192,7 +192,6 @@ pub const ConversationWriter = struct {
         turn: types.HistoryTurn,
     ) !void {
         if (turn == .compacted_summary) {
-            if (self.last_seq == 0) return error.InvalidCheckpointCoverage;
             _ = try self.append(alloc, timestamp_ms, .{
                 .context_checkpoint = .{
                     .covers_through_seq = self.last_seq,
@@ -733,6 +732,76 @@ pub fn loadConversationHistoryRange(
                 session.freeHistoryTurn(alloc, turn);
             }
             turn_index += 1;
+        }
+        offset = line.next_offset;
+    }
+    return turns.toOwnedSlice(alloc);
+}
+
+pub fn loadConversationArchive(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) ![]session.HistoryTurn {
+    var file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const length = try file.length(io_mod.getIo());
+    var offset: u64 = 0;
+    var turns: std.ArrayList(session.HistoryTurn) = .empty;
+    errdefer {
+        for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
+        turns.deinit(alloc);
+    }
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    var raw_turn_count: usize = 0;
+    var compaction_count: usize = 0;
+    while (offset < length) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+        defer decoded.deinit();
+        const completed: ?session.HistoryTurn = switch (decoded.value.event) {
+            .user => |value| blk: {
+                try builder.begin(value.text);
+                break :blk null;
+            },
+            .assistant => |value| blk: {
+                try builder.appendAssistant(value.text);
+                break :blk null;
+            },
+            .tool_call => |value| blk: {
+                try builder.appendToolCall(value);
+                break :blk null;
+            },
+            .tool_result => |value| blk: {
+                try builder.appendToolResult(value);
+                break :blk null;
+            },
+            .steering => |value| blk: {
+                try builder.appendSteering(value.text);
+                break :blk null;
+            },
+            .turn_completed => try builder.finishAssistant(),
+            .interrupted => |value| try builder.finishInterrupted(value),
+            .context_checkpoint => |value| blk: {
+                if (!builder.isIdle()) return error.InvalidConversationFrame;
+                compaction_count += 1;
+                break :blk .{ .compacted_summary = .{
+                    .summary = try alloc.dupe(u8, value.summary),
+                    .removed_turn_count = raw_turn_count,
+                    .compaction_count = compaction_count,
+                    .root_user_messages_complete = false,
+                    .permission_feedback_complete = false,
+                } };
+            },
+        };
+        if (completed) |turn| {
+            errdefer session.freeHistoryTurn(alloc, turn);
+            try turns.append(alloc, turn);
+            if (turn != .compacted_summary) raw_turn_count += 1;
         }
         offset = line.next_offset;
     }
@@ -1654,6 +1723,45 @@ pub const LoadedWritableSession = struct {
         return self.conversation_writer != null;
     }
 
+    pub fn renameConversation(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        title: []const u8,
+    ) !bool {
+        if (self.conversation_writer == null) return false;
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &self.log.dir,
+            manifest_file,
+            session_codec.max_session_metadata_bytes,
+        );
+        defer alloc.free(bytes);
+        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
+        defer metadata.deinit();
+        const encoded = try session_codec.encodeSessionMetadata(alloc, .{
+            .id = metadata.value.id,
+            .origin_workspace_root = metadata.value.origin_workspace_root,
+            .workspace_root = metadata.value.workspace_root,
+            .created_at_ms = metadata.value.created_at_ms,
+            .updated_at_ms = metadata.value.updated_at_ms,
+            .conversation_language = metadata.value.conversation_language,
+            .provider = metadata.value.provider,
+            .model = metadata.value.model,
+            .effort = metadata.value.effort,
+            .fast_mode = metadata.value.fast_mode,
+            .title = title,
+            .subagent_child = metadata.value.subagent_child,
+        });
+        defer alloc.free(encoded);
+        try io_mod.durableReplaceVerified(
+            alloc,
+            &self.log.dir,
+            manifest_file,
+            encoded,
+        );
+        return true;
+    }
+
     pub fn installCommitLifecycle(
         self: *LoadedWritableSession,
         lifecycle: CommitLifecycle,
@@ -2065,6 +2173,7 @@ pub const LoadedWritableSession = struct {
         current_state: session_codec.DurableSessionState,
         options: Options,
     ) !void {
+        if (self.conversation_writer != null) return;
         return retryDegradedWithStateReplacementImpl(
             self,
             alloc,
@@ -2078,6 +2187,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         options: Options,
     ) !void {
+        if (self.conversation_writer != null) return;
         return compactCanonicalLogIfDueImpl(self, alloc, options);
     }
 
@@ -2087,6 +2197,7 @@ pub const LoadedWritableSession = struct {
         ensure_present: bool,
         options: Options,
     ) !void {
+        if (self.conversation_writer != null) return;
         try confirmWritableNamespace(self, alloc, options);
         if (!checkpointDue(self, options.checkpoint_interval) and
             !(ensure_present and !self.hasCurrentCheckpoint()))
@@ -2106,6 +2217,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         options: Options,
     ) !void {
+        if (self.conversation_writer != null) return;
         try confirmWritableNamespace(self, alloc, options);
         _ = try validateLivePosition(
             alloc,
@@ -2122,6 +2234,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         options: Options,
     ) !void {
+        if (self.conversation_writer != null) return;
         try confirmWritableNamespace(self, alloc, options);
         options.test_controls.lock(.commit);
         var commit_lock = acquireLockWithDeadline(

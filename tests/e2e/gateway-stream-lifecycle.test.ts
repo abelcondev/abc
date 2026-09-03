@@ -4495,6 +4495,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(beforeResume.code).toBe(0);
+        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
+        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
+        expect(sessionFiles).not.toContain("checkpoint.json");
+        expect(sessionFiles).not.toContain("display.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("index.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("latest.lock");
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
           history: Array<{
@@ -4516,21 +4523,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(canonical.history.at(-1)?.summary).toContain(
           "Continue the compacted session.",
         );
-        const inlineSummary = canonical.history.at(-1)?.summary
-          ?.split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(inlineSummary).toContain("result_handle=");
-        expect(inlineSummary).toContain("truncated=true");
-
         expect(gateway.requests).toHaveLength(5);
         const compactRequest = JSON.parse(gateway.requests[4].body) as {
           tools?: unknown[];
           toolChoice?: { type?: string };
           responseFormat?: unknown;
+          prompt?: Array<{ role: string; content: unknown }>;
         };
         expect(compactRequest.tools).toEqual([]);
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
+        const compactSource = JSON.stringify(compactRequest.prompt);
+        expect(compactSource).toContain(callId);
+        expect(compactSource).toContain(inlineCallId);
+        expect(compactSource).toContain("Result handle:");
 
         const resumed = await runFx(
           [
@@ -4563,7 +4569,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         const requestText = JSON.stringify(request);
         expect(requestText).toContain("context_handoff");
-        expect(requestText).toContain("manual-compaction-large.txt");
+        expect(requestText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(requestText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -4611,7 +4618,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).not.toContain("context_handoff");
+        expect(secondCompactText).toContain("context_handoff");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -4623,13 +4630,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           history: Array<{ kind: string; summary?: string }>;
         };
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
-        expect(secondSummary).toContain(callId);
-        expect(secondSummary).toContain(inlineCallId);
-        const secondInlineSummary = secondSummary
-          .split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(secondInlineSummary).toContain("result_handle=");
-        expect(secondInlineSummary).toContain("truncated=true");
+        expect(secondSummary).toContain("Second compaction preserved the restored session.");
+        expect(secondSummary).not.toContain("operation sequence");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

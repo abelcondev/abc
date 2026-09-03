@@ -3025,6 +3025,7 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
 
             const loaded = &app.session_persistence.writable.?;
+            if (try loaded.renameConversation(app.alloc, title)) return;
             var display = session_display_metadata.readSidecarOrFallback(
                 app.alloc,
                 &loaded.log.dir,
@@ -9028,7 +9029,8 @@ test "context checkpoint persists before releasing summarized model memory" {
         @as(usize, 1),
         app.session_persistence.writable.?.state.history.len,
     );
-    var resumed = try app.session_persistence.store.?.loadReadOnly(alloc, session_id);
+    var root = app.session_persistence.store.?.canonical_root;
+    var resumed = try root.loadReadOnly(alloc, session_id, .{});
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     try std.testing.expect(resumed.history[0] == .compacted_summary);
@@ -10166,7 +10168,7 @@ test "renameActiveSession requires an active session" {
     );
 }
 
-test "renameActiveSession persists the title to the sidecar and session index" {
+test "renameActiveSession persists the title only in session metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10198,12 +10200,34 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     // And carried to the terminal tab.
     try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
-    // Durable in the sidecar.
     const loaded = &app.session_persistence.writable.?;
-    var display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
-    defer display.deinit(alloc);
-    try std.testing.expect(display.present);
-    try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+    var metadata_file = try loaded.log.dir.dir.openFile(
+        std.testing.io,
+        "session.json",
+        .{},
+    );
+    defer metadata_file.close(std.testing.io);
+    const metadata_bytes = try io_mod.readFileToEnd(
+        alloc,
+        &metadata_file,
+        session_codec.max_session_metadata_bytes,
+    );
+    defer alloc.free(metadata_bytes);
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    try std.testing.expectEqualStrings("deploy pipeline fix", metadata.value.title.?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        loaded.log.dir.dir.statFile(std.testing.io, "display.json", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        app.session_persistence.store.?.canonical_root.sessions.?.dir.statFile(
+            std.testing.io,
+            "index.json",
+            .{},
+        ),
+    );
 }
 
 const ReconciliationOriginUsage = struct {
