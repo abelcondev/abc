@@ -5509,7 +5509,7 @@ fn processQueuedPromptLoop(
                     arena,
                     job,
                     within_turn_suffix.items,
-                    stream_ctx.accepted_source(),
+                    stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,

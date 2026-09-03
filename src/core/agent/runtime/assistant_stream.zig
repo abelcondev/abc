@@ -203,9 +203,8 @@ pub const StreamChunkContext = struct {
     }
 
     /// Restores durable partial source before a restarted turn sends anything.
-    /// The following attempt can then suppress an exact repeated prefix
-    /// against these same raw bytes. Interactive surfaces that already show
-    /// the partial source restore presentation state without emitting it again.
+    /// The next attempt retains it as interruption evidence and starts fresh.
+    /// Surfaces that already show the preview do not emit it again here.
     pub fn restoreRecoverySource(
         self: *StreamChunkContext,
         source: []const u8,

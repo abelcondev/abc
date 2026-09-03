@@ -5204,6 +5204,35 @@ test "processQueuedPrompt carries one durable budget across transport recovery" 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
+test "processQueuedPrompt retains interrupted source in the next reservation" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"retained interrupted preview"};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .stream_error_after_chunks = error.ReadFailed },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    const settled = hooks.recovery_checkpoints.items[1];
+    const reserved = hooks.recovery_checkpoints.items[2];
+    try std.testing.expectEqualStrings("retained interrupted preview", settled.assistant_source);
+    try std.testing.expectEqualStrings("retained interrupted preview", reserved.assistant_source);
+    try std.testing.expect(reserved.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 1), reserved.consumed_provider_attempts);
+    try expectBodyNotContains(&gateway, 1, "retained interrupted preview");
+    try std.testing.expectEqualStrings("Recovered", hooks.history_turns.items[0].assistant.assistant);
+}
+
 test "processQueuedPrompt preserves fallback route and budget until selection changes" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
@@ -5250,6 +5279,7 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         const reserved = hooks.recovery_checkpoints.items[0];
         try std.testing.expectEqual(@as(usize, 10), reserved.max_provider_attempts);
         try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
+        try std.testing.expectEqualStrings("partial", reserved.assistant_source);
         try std.testing.expect(reserved.requested_fast_mode);
         try std.testing.expect(!reserved.fast_mode);
     }
