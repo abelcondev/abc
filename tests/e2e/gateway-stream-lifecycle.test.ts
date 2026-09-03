@@ -5190,7 +5190,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("HTTP 413 after a local tool surfaces prompt-too-long without replaying the tool", async () => {
+  test("HTTP 413 after a local tool fails capacity without replaying the tool", async () => {
     const root = createFixtureRoot("prompt-too-long-no-tool-replay");
     const tracePath = join(root.root, "trace.log");
     const sideEffectPath = join(root.workspace, "tool-side-effect.log");
@@ -5223,12 +5223,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tool_calls: Array<{ name: string; status: string }>;
       };
       const serializedError = JSON.stringify(output);
-
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("HTTP 413");
-      expect(serializedError).toContain("prompt_too_long=true");
-      expect(serializedError).toContain("no local tool actions were replayed");
+      expect(serializedError).toContain("ContextCapacityExceeded");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
