@@ -218,10 +218,6 @@ const FetchBridge = struct {
         const handle = self.next_handle;
         const decision = fetch_state.decide(self.phase, .{ .open = handle });
         switch (decision.action) {
-            .cancelled => {
-                self.phase = decision.phase;
-                return error.Cancelled;
-            },
             .unavailable, .shutting_down => return error.HostStreamUnavailable,
             .applied => {},
             else => unreachable,

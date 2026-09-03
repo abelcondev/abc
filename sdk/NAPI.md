@@ -77,7 +77,7 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
 | `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
 | `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
-| `abortCoreFetch(runtime)` | Wakes the Zig worker while Node aborts the current matching `AbortController`. |
+| `abortCoreFetch(runtime)` | Aborts the current fetch and wakes the Zig worker. Idle calls do not cancel a future fetch; ACP owns turn cancellation. |
 | `coreExited(handle)` | Reports whether the ACP thread has exited. |
 | `coreExitCode(handle)` | Returns the ACP thread's numeric exit status. |
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
