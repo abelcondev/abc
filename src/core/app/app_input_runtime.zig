@@ -1486,7 +1486,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
-                    if (!queueReviewOwnsComposer(app) and
+                    if (!queue_rt.ownsComposer(app) and
                         app.input_runtime.edit_state.selectionRange() == null and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
@@ -1519,7 +1519,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
-                    const queue_review_owns_composer = queueReviewOwnsComposer(app);
+                    const queue_review_owns_composer = queue_rt.ownsComposer(app);
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
@@ -2223,13 +2223,6 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn queueReviewOwnsComposer(app: *const App) bool {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                return app.queued_prompt_review.visible;
-            }
-            return false;
-        }
-
         fn closeSkillsMenu(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
@@ -2664,7 +2657,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
             const prefix = command_specs.slashCompletionPrefix(
@@ -2724,7 +2717,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             parsed: ExplicitModelSelectionParse,
         ) !bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             switch (parsed) {
                 .none => return false,
                 .invalid => {

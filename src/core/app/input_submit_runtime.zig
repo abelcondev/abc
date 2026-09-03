@@ -489,30 +489,25 @@ pub fn SubmitRuntime(comptime App: type) type {
             const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
 
-            const queue_review_owns_composer = queueReviewOwnsComposer(app);
-            if (!queue_review_owns_composer) {
+            if (!queue_rt.ownsComposer(app)) {
                 if (directCommand(expanded.text)) |command| {
                     if (comptime @hasDecl(App, "submitDirectTerminal")) {
                         try App.submitDirectTerminal(app, command);
                         return;
                     }
                 }
-            }
 
-            const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
-            const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
-            if (!queue_review_owns_composer) {
+                const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
+                const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
                 if (knownSlashCommand(app, resolved_slash_submission)) |command| {
                     if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
                     try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                     return;
                 }
-            }
-            if (!queue_review_owns_composer and shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
-                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
-                return;
-            }
-            if (!queue_review_owns_composer) {
+                if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
+                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+                    return;
+                }
                 if (pendingImagesPrefixEnd(
                     app.input_runtime.edit_state.input.items,
                     expanded.text,
@@ -876,13 +871,6 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn resolvedSlashSubmission(app: *App, text: []const u8) []const u8 {
             if (completion_rt.visibleSlashCompletionCount(app) == 0) return text;
             return resolveSlashSubmission(app.slashRegistry(), text, app.input_runtime.picker.slash_completion_index);
-        }
-
-        fn queueReviewOwnsComposer(app: *const App) bool {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                return app.queued_prompt_review.visible;
-            }
-            return false;
         }
 
         fn enqueuePromptForSubmit(

@@ -140,7 +140,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime @hasField(App, "approval_prompt")) {
                 if (app.approval_prompt.isActive()) return null;
             }
-            if (queueReviewOwnsComposer(app)) {
+            if (queue_rt.ownsComposer(app)) {
                 return if (hasFileQuery(app)) .file else null;
             }
             if (comptime @hasField(App, "stream")) {
@@ -384,7 +384,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 return true;
             }
             if (hasModelQuery(app)) {
-                if (queueReviewOwnsComposer(app)) return false;
+                if (queue_rt.ownsComposer(app)) return false;
                 navigateModelPicker(app, delta);
                 return true;
             }
@@ -715,14 +715,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (app.approval_prompt.isActive()) return false;
             }
             if (catalogMenuOwnsSurface(app)) return false;
-            return !queueReviewOwnsComposer(app);
-        }
-
-        fn queueReviewOwnsComposer(app: *App) bool {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                return app.queued_prompt_review.visible;
-            }
-            return false;
+            return !queue_rt.ownsComposer(app);
         }
 
         fn catalogMenuOwnsSurface(app: *App) bool {
@@ -895,7 +888,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn navigateModelPicker(app: *App, delta: i32) void {
-            if (queueReviewOwnsComposer(app)) return;
+            if (queue_rt.ownsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => navigateModelCompletion(app, query.query, delta),
@@ -979,7 +972,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn autocompleteModelPickerSelection(app: *App) !void {
-            if (queueReviewOwnsComposer(app)) return;
+            if (queue_rt.ownsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => {
@@ -1016,7 +1009,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn advanceModelPickerOnSpace(app: *App) !bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
 
@@ -1055,7 +1048,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn submitModelPicker(app: *App) !bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
                     if (app.isModelCacheLoading()) {
@@ -1116,7 +1109,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn openCurrentModelPicker(app: *App) !void {
-            if (queueReviewOwnsComposer(app)) return;
+            if (queue_rt.ownsComposer(app)) return;
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
             app.input_runtime.picker.model_completion_anchor_current = true;
             app.shell.render_requests.request(.footer);
@@ -1156,7 +1149,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn stepBackModelPicker(app: *App) !bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (query.stage == .model) return false;
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
@@ -1213,13 +1206,13 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn shouldPreserveModelPickerInsert(app: *App) bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
 
         pub fn shouldPreserveModelPickerBackspace(app: *App) bool {
-            if (queueReviewOwnsComposer(app)) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and query.query.len > 0 and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
