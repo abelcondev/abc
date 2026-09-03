@@ -75,17 +75,18 @@ const ReadyNotifier = struct {
     }
 
     fn deliver(env: c.napi_env, callback: c.napi_value, context: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        // Node can discard queued calls after finalize has freed their context.
+        if (env == null or callback == null) return;
         const self: *ReadyNotifier = @ptrCast(@alignCast(context.?));
         // Disarm before draining: a producer can queue one more wake while this callback runs.
         self.pending.store(false, .release);
-        if (env == null or callback == null) return;
         var receiver: c.napi_value = undefined;
         if (c.napi_get_undefined(env, &receiver) != c.napi_ok) return;
         _ = c.napi_call_function(env, receiver, callback, 0, null, null);
     }
 
     fn finalize(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        // Queued callbacks can outlive Runtime; the thread-safe function owns this allocation.
+        // Teardown callbacks do not dereference this context after it is released.
         const self: *ReadyNotifier = @ptrCast(@alignCast(data.?));
         std.heap.c_allocator.destroy(self);
     }

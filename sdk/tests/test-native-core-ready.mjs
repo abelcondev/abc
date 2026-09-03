@@ -84,4 +84,12 @@ try {
   addon.destroyCore(core);
 }
 
+// Exit wakes remain queued when a core is destroyed before JavaScript yields.
+for (let index = 0; index < 32; index++) {
+  const closing = addon.createCore({ apiKey: "ready-close-key", home: "/tmp", workspaceRoot: "/tmp" }, () => {});
+  addon.closeCore(closing);
+  addon.destroyCore(closing);
+}
+await new Promise((resolveReady) => setImmediate(resolveReady));
+
 console.log("native core readiness notification passed");

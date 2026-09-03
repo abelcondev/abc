@@ -109,7 +109,7 @@ The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state 
 
 Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
 
-Readiness uses one atomic pending flag, cleared before JavaScript drains the queues. This permits one queued wake while the current callback runs without losing a producer's notification. The thread-safe function owns the notifier until its finalizer runs, so queued callbacks cannot reference a freed runtime.
+Readiness uses one atomic pending flag, cleared before JavaScript drains the queues. This permits one queued wake while the current callback runs without losing a producer's notification. The thread-safe function owns the notifier until its finalizer runs. Discarded teardown callbacks return without accessing that context.
 
 The runtime handle has a separate mutex that serializes access to the runtime pointer against destruction. Destruction removes the pointer first, then closes input and joins the thread. No runtime allocation is freed while its thread is still running.
 
