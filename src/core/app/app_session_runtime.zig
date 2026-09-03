@@ -33,6 +33,7 @@ const legacy_background_migration = @import("../session/legacy_background_migrat
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
+const tooling_presentation = @import("../tooling/tool_presentation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -3420,6 +3421,22 @@ pub fn Runtime(comptime App: type) type {
                     return self.app.historicalToolActivityKind(call);
                 }
 
+                fn attachCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    var parsed = std.json.parseFromSlice(std.json.Value, self.projection.alloc, call.arguments_json, .{}) catch return;
+                    defer parsed.deinit();
+                    if (parsed.value != .object) return;
+                    const command_value = parsed.value.object.get("command") orelse return;
+                    if (command_value != .string) return;
+                    const display = (tooling_presentation.formatRunCommandDetailBounded(
+                        self.projection.alloc,
+                        command_value.string,
+                        self.app.workspace_root,
+                        tooling_presentation.max_run_command_reflow_bytes,
+                    ) catch null) orelse return;
+                    defer self.projection.alloc.free(display);
+                    self.projection.setHistoricalToolCommandDisplay(entry_id, display) catch {};
+                }
+
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
                     _ = try self.projection.appendNotice(notice);
                 }
@@ -3476,6 +3493,7 @@ pub fn Runtime(comptime App: type) type {
                         self.activityKind(call),
                         result,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolDetailWithLifecycle(
@@ -3492,6 +3510,7 @@ pub fn Runtime(comptime App: type) type {
                         result,
                         lifecycle_id,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolDetailAfterCommandOutput(
@@ -3506,6 +3525,7 @@ pub fn Runtime(comptime App: type) type {
                         self.activityKind(call),
                         result,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolCallWithoutResult(

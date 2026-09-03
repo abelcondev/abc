@@ -498,6 +498,33 @@ pub fn Bindings(comptime App: type) type {
                 try app.shell.applyToolLifecyclePreservingNormalBufferAnchor(alloc, event)
             else
                 try app.shell.applyToolLifecycle(alloc, event);
+            if (comptime @hasField(App, "workspace_root")) switch (event) {
+                .authoritative_started => |started| if (started.arguments_json) |arguments_json| {
+                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch null;
+                    if (parsed) |*value| {
+                        defer value.deinit();
+                        if (value.value == .object) {
+                            if (value.value.object.get("command")) |command_value| {
+                                if (command_value == .string) {
+                                    const display = tool_presentation.formatRunCommandDetailBounded(
+                                        alloc,
+                                        command_value.string,
+                                        app.workspace_root,
+                                        tool_presentation.max_run_command_reflow_bytes,
+                                    ) catch null;
+                                    defer if (display) |bytes| alloc.free(bytes);
+                                    if (display) |bytes| app.shell.setToolCommandDisplay(
+                                        alloc,
+                                        started.id,
+                                        bytes,
+                                    ) catch {};
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            };
             return .{
                 .previous_focused_entry_id = previous_focused_entry_id,
                 .snapshot = worker_tool_lifecycle_snapshot(raw_ctx),

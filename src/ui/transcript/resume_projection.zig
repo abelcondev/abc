@@ -244,6 +244,18 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn setHistoricalToolCommandDisplay(
+        self: *ResumeProjection,
+        entry_id: u32,
+        display: []const u8,
+    ) !void {
+        try self.runtime.setToolCommandDisplayForEntry(
+            self.alloc,
+            entry_id,
+            display,
+        );
+    }
+
     pub fn attachHistoricalToolDetailWithLifecycle(
         self: *ResumeProjection,
         entry_id: u32,

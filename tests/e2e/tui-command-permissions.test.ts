@@ -1289,9 +1289,13 @@ describe("effect-aware command permissions", () => {
       const stderrPath = join(root.root, "command-summary-width-stderr.log");
       const command =
         "printf ok && printf '%s' alpha-beta-gamma-delta-epsilon-zeta-eta-theta-iota-kappa-lambda-mu-nu-xi-omicron-pi-rho-sigma-tau-upsilon-phi-chi-psi-omega >/dev/null";
+      const workspaceCommand =
+        `printf '%s' ${"absolute-path-prefix-".repeat(7)} ${root.workspace}/file >/dev/null`;
       const gateway = startFakeGateway([
         toolCall(command, {}, "command_summary_width"),
         finalText("COMMAND_SUMMARY_WIDTH_COMPLETE"),
+        toolCall(workspaceCommand, {}, "workspace_command_summary_width"),
+        finalText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE"),
       ]);
 
       activeSession = await TmuxSession.create({
@@ -1318,6 +1322,15 @@ describe("effect-aware command permissions", () => {
       const wide = await activeSession.captureFullScrollback();
       const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
       expect(wideRow).toBe(`└ Ran ${command}`);
+
+      await activeSession.sendText("Run the next prepared command.");
+      await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      const workspaceWide = await activeSession.captureFullScrollback();
+      const workspaceRow = workspaceWide.split("\n").find((line) =>
+        line.includes("└ Ran printf '%s' absolute-path-prefix-"),
+      );
+      expect(workspaceRow).toContain(" ./file >/dev/null");
+      expect(workspaceRow).not.toContain(root.workspace);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

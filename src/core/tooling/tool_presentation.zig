@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
 const max_run_command_activity_bytes = 120;
 const max_run_command_activity_source_bytes = max_run_command_activity_bytes * max_run_command_activity_bytes;
+pub const max_run_command_reflow_bytes = max_run_command_activity_source_bytes;
 pub const max_auto_permission_reason_presentation_bytes: usize = 160;
 
 pub const ToolActionInput = struct {
@@ -186,7 +187,7 @@ pub fn formatRunCommandActivity(
     };
 }
 
-fn formatRunCommandDetailBounded(
+pub fn formatRunCommandDetailBounded(
     alloc: Allocator,
     command: []const u8,
     workspace_root: []const u8,

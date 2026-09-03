@@ -4,7 +4,6 @@ const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
-const tool_presentation = @import("../../core/tooling/tool_presentation.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -489,7 +488,6 @@ fn formatGroupBlock(
             scratch,
             raw_phrase,
             detail,
-            cols,
         ) orelse raw_phrase;
         static_index += 1;
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
@@ -537,17 +535,10 @@ fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
     detail: ?*const ToolDetailRecord,
-    cols: u16,
 ) !?[]const u8 {
     const record = detail orelse return null;
     if (!record.isCapturedCommand() or record.outcome != .completed) return null;
-    const arguments_json = record.arguments_json orelse return null;
-    const command = (try tool_presentation.formatRunCommandDetailForWidth(
-        scratch,
-        arguments_json,
-        "",
-        cols,
-    )) orelse return null;
+    const command = record.command_display orelse return null;
     const action = actionForTruncatedCommandPhrase(phrase, command) orelse return null;
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
@@ -1315,6 +1306,7 @@ test "minimal completed command rows reproject stored arguments at the current w
             .captured_command = true,
             .activity_kind = .command,
             .arguments_json = arguments_json,
+            .command_display = @constCast(command),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -1366,6 +1358,7 @@ test "minimal completed command rows reproject stored arguments at the current w
             .captured_command = true,
             .activity_kind = .command,
             .arguments_json = relative_arguments_json,
+            .command_display = @constCast(relative_command),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },

@@ -2069,6 +2069,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     else
         null;
     errdefer if (arguments_json) |value| alloc.free(value);
+    const command_display = if (source.command_display) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (command_display) |value| alloc.free(value);
     const result = if (source.result) |value|
         try alloc.dupe(u8, value)
     else
@@ -2104,6 +2109,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .captured_command = source.captured_command,
         .activity_kind = source.activity_kind,
         .arguments_json = arguments_json,
+        .command_display = command_display,
         .result = result,
         .result_handle = result_handle,
         .command_artifact_handle = command_artifact_handle,
