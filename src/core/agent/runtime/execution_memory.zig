@@ -54,6 +54,28 @@ pub fn classifyProviderExecutedResultStatus(output: []const u8) types.PersistedT
     return if (tool_result_errors.isToolOutputError(output)) .failure else .success;
 }
 
+pub const CompactedExecutionBoundary = struct {
+    tool_steps: usize = 0,
+    steering: usize = 0,
+
+    /// Borrows execution payloads; only the rebased steering slice uses arena.
+    pub fn project(self: CompactedExecutionBoundary, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
+        std.debug.assert(self.tool_steps <= execution.tool_steps.len);
+        std.debug.assert(self.steering <= execution.steering.len);
+        var projected = execution;
+        projected.tool_steps = execution.tool_steps[self.tool_steps..];
+        projected.steering = execution.steering[self.steering..];
+        if (self.tool_steps > 0 and projected.steering.len > 0) {
+            projected.steering = try arena.dupe(types.PersistedSteering, projected.steering);
+            for (projected.steering) |*item| {
+                std.debug.assert(item.after_tool_step_count >= self.tool_steps);
+                item.after_tool_step_count -= self.tool_steps;
+            }
+        }
+        return projected;
+    }
+};
+
 pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMessage) !types.ExecutionMemory {
     var execution = try execution_memory_helpers.buildNormalChatExecutionMemory(
         alloc,
@@ -140,10 +162,19 @@ pub fn buildInterruptedExecutionMemory(
         allocated_call_slices.deinit(alloc);
     }
 
+    var active_group_index: ?usize = null;
+    if (active_tool_call) |active| {
+        for (current_turn_messages, 0..) |message, index| {
+            for (message.tool_calls) |call| {
+                if (std.mem.eql(u8, call.id, active.id)) active_group_index = index;
+            }
+        }
+    }
     var i: usize = 0;
     while (i < current_turn_messages.len) {
         const item = current_turn_messages[i];
         if (item.role != .assistant or item.tool_calls.len == 0) {
+            try filtered.append(alloc, item);
             i += 1;
             continue;
         }
@@ -162,7 +193,7 @@ pub fn buildInterruptedExecutionMemory(
         var completed_count: usize = 0;
         for (item.tool_calls) |call| {
             if (active_tool_call) |active| {
-                if (std.mem.eql(u8, call.id, active.id)) continue;
+                if (active_group_index == i and std.mem.eql(u8, call.id, active.id)) continue;
             }
             if (hasToolResultForCall(result_messages, call.id)) {
                 completed_count += 1;
@@ -177,7 +208,7 @@ pub fn buildInterruptedExecutionMemory(
             var completed_index: usize = 0;
             for (item.tool_calls) |call| {
                 if (active_tool_call) |active| {
-                    if (std.mem.eql(u8, call.id, active.id)) continue;
+                    if (active_group_index == i and std.mem.eql(u8, call.id, active.id)) continue;
                 }
                 if (!hasToolResultForCall(result_messages, call.id)) continue;
                 calls[completed_index] = call;
@@ -239,6 +270,29 @@ pub fn retainCancelledCommandReplay(
     else
         null;
     return if (replay) |value| .{ .output_replay = value } else null;
+}
+
+test "interrupted execution preserves a compacted prefix when later calls reuse an id" {
+    const alloc = std.testing.allocator;
+    const guidance = try steeringMessage(alloc, "Keep the original constraint.");
+    defer alloc.free(guidance);
+    const call = toolCall("reused", "read_file", "{\"path\":\"first.txt\"}");
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = guidance },
+        .{ .role = .assistant, .tool_calls = &.{call} },
+        .{ .role = .tool, .content = "completed", .tool_call_id = call.id, .tool_name = call.name, .tool_result_status = .success },
+        .{ .role = .assistant, .tool_calls = &.{call} },
+    };
+    const interrupted = try buildInterruptedExecutionMemory(alloc, &messages, call);
+    defer types.freeExecutionMemory(alloc, interrupted);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.steering.len);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const boundary = CompactedExecutionBoundary{ .tool_steps = 1, .steering = 1 };
+    const suffix = try boundary.project(arena.allocator(), interrupted);
+    try std.testing.expectEqual(@as(usize, 0), suffix.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 0), suffix.steering.len);
 }
 
 test "interrupted execution memory retains marked feedback through mixed user tail" {
@@ -367,8 +421,7 @@ pub fn applyToolResultMemory(
         source_covers_full_file and
         !source_memory.truncated and
         source_memory.output_handle == null and
-        !prepared.truncated and
-        prepared.output_handle == null;
+        !prepared.truncated;
 }
 
 /// Finalizes tentative command capture after bounded model output is prepared.
@@ -1043,6 +1096,45 @@ test "saved preparation externalizes complete redacted output without cap loss" 
     );
 }
 
+test "saved inline read retains full file evidence with its external copy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const call = toolCall("complete-read", "read_file", "{\"path\":\"small.txt\"}");
+    var prepared = try prepareToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .cancel_flag = &cancel,
+        .tool_result_dir = result_dir,
+    }, call, "all file contents");
+    applyToolResultMemory(&prepared.memory, .{ .model_view_covers_full_file = true });
+    try std.testing.expect(prepared.memory.output_handle != null);
+    try std.testing.expectEqualStrings("all file contents", prepared.model_output);
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{call} },
+        .{
+            .role = .tool,
+            .content = prepared.model_output,
+            .tool_call_id = call.id,
+            .tool_name = call.name,
+            .tool_result_status = .success,
+            .tool_result_memory = prepared.memory,
+        },
+    };
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 1), execution.files.len);
+    try std.testing.expect(execution.files[0].model_view_covers_full_file);
+}
+
 test "common execution memory does not mark stored read previews as full" {
     const session_runtime = @import("../../session/session.zig");
     const alloc = std.testing.allocator;
@@ -1248,6 +1340,19 @@ test "execution memory records each steering tool boundary" {
     try std.testing.expectEqualStrings("after first", execution.steering[0].text);
     try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
     try std.testing.expectEqualStrings("after second", execution.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering[1].after_tool_step_count);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const boundary = CompactedExecutionBoundary{ .tool_steps = 1, .steering = 1 };
+    const remaining = try boundary.project(arena.allocator(), execution);
+    try std.testing.expectEqual(@as(usize, 1), remaining.tool_steps.len);
+    try std.testing.expectEqualStrings("call_second", remaining.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 1), remaining.steering.len);
+    try std.testing.expectEqualStrings("after second", remaining.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), remaining.steering[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 2), remaining.files.len);
+    try std.testing.expect(remaining.files.ptr == execution.files.ptr);
     try std.testing.expectEqual(@as(usize, 2), execution.steering[1].after_tool_step_count);
 }
 

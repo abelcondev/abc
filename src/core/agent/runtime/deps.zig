@@ -39,6 +39,7 @@ pub const ContextCompactionCommitEffect = struct {
     commit: *const fn (
         ctx: *anyopaque,
         summary: types.CompactedSummaryHistoryTurn,
+        active_prefix: ?types.AssistantHistoryTurn,
     ) anyerror!void,
 };
 

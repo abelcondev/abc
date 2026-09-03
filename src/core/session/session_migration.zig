@@ -164,53 +164,69 @@ pub const SchemaV3Import = struct {
     }
 };
 
-/// Reads only the committed manifest prefix of a schema-v3 session. Any later
-/// uncommitted bytes are ignored and the source directory is never mutated.
+/// Reads the schema-v3 watermark's committed prefix. The manifest is only a
+/// derived projection and may lag an acknowledged commit or be absent.
 pub fn loadSchemaV3ReadOnly(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !SchemaV3Import {
-    var manifest_file = try openSessionFile(session_dir, "session.json", .read_only);
-    defer manifest_file.close(io_mod.getIo());
-    const manifest_stat = try manifest_file.stat(io_mod.getIo());
-    if (manifest_stat.size > session_projection.manifest_max_bytes) {
-        return error.InvalidSessionFormat;
-    }
-    const manifest_bytes = try readExactLegacyFile(
+    var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
+    defer events.close(io_mod.getIo());
+    const generation = try session_replay.readFirstGeneration(alloc, events);
+    const watermark_name = try std.fmt.allocPrint(alloc, "commit.{s}.json", .{
+        std.fmt.bytesToHex(generation, .lower),
+    });
+    defer alloc.free(watermark_name);
+    const watermark_bytes = try authority_module.readOptionalSessionFile(
         alloc,
-        &manifest_file,
-        manifest_stat.size,
-    );
-    defer alloc.free(manifest_bytes);
-    var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch |err| switch (err) {
+        session_dir,
+        watermark_name,
+        16 * 1024,
+    ) orelse return error.InvalidSessionFormat;
+    defer alloc.free(watermark_bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, watermark_bytes, .{
+        .parse_numbers = false,
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidSessionFormat,
     };
-    defer manifest.deinit(alloc);
-    if (!std.mem.eql(u8, manifest.id, session_id)) {
+    defer parsed.deinit();
+    const object = try authority_module.exactJsonObject(parsed.value, &.{
+        "schema_version",   "session_id",              "log_generation", "through_seq",
+        "through_event_id", "through_event_log_bytes",
+    });
+    const recorded_generation = try authority_module.parseIdentifier(
+        try authority_module.objectString(object, "log_generation"),
+    );
+    if (try authority_module.jsonU64(object, "schema_version") != 1 or
+        !std.mem.eql(u8, try authority_module.objectString(object, "session_id"), session_id) or
+        !std.mem.eql(u8, &recorded_generation, &generation))
+    {
         return error.InvalidSessionFormat;
     }
-
-    var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
-    defer events.close(io_mod.getIo());
-    const event_stat = try events.stat(io_mod.getIo());
-    if (event_stat.size < manifest.event_log_bytes) {
-        return error.InvalidSessionFormat;
-    }
+    const event_id = try authority_module.parseIdentifier(
+        try authority_module.objectString(object, "through_event_id"),
+    );
+    const committed_bytes = try authority_module.jsonU64(object, "through_event_log_bytes");
     var replayed = try session_replay.replayCommittedPrefix(
         alloc,
         events,
-        manifest.log_generation,
-        manifest.last_event_seq,
-        manifest.event_log_bytes,
+        generation,
+        try authority_module.jsonU64(object, "through_seq"),
+        committed_bytes,
     );
     errdefer replayed.deinit(alloc);
+    if (!std.mem.eql(u8, replayed.state.id, session_id) or
+        !std.mem.eql(u8, &replayed.position.through_event_id, &event_id))
+    {
+        return error.InvalidSessionFormat;
+    }
     const state = replayed.takeState();
     return .{
         .state = state,
-        .source_bytes = manifest.event_log_bytes,
-        .generation = manifest.log_generation,
+        .source_bytes = committed_bytes,
+        .generation = generation,
     };
 }
 
@@ -335,4 +351,120 @@ fn loadMigrationPreferences(
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,
     };
+}
+
+test "schema v3 import follows the committed watermark beyond a stale manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const id = "legacy-committed-prefix";
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try @import("session_store.zig").Store.initFromHome(alloc, home, "/workspace");
+    defer store.deinit(alloc);
+    try store.canonical_root.sessions.?.dir.createDir(std.testing.io, id, .fromMode(0o700));
+    var dir = io_mod.VerifiedDir{ .dir = try store.canonical_root.sessions.?.dir.openDir(std.testing.io, id, .{}) };
+    defer dir.close();
+    const generation = [_]u8{1} ** 16;
+    const event_id = [_]u8{2} ** 16;
+    const language = try session.ConversationLanguage.fromSlice("en");
+    var usage = @import("session_usage.zig").Usage.initFresh();
+    defer usage.deinit(alloc);
+    var usage_snapshot = try usage.snapshot(alloc);
+    defer usage_snapshot.deinit(alloc);
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = [_]u8{1} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast(id),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/workspace"),
+            .workspace_root = @constCast("/workspace"),
+            .conversation_language = language,
+            .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+            .usage = usage_snapshot,
+        } },
+    });
+    defer alloc.free(started);
+    const committed = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = event_id,
+        .timestamp_ms = 20,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("acknowledged request") },
+                .assistant = @constCast("acknowledged answer"),
+            } },
+        } },
+    });
+    defer alloc.free(committed);
+    const events = try std.mem.concat(alloc, u8, &.{ started, committed, "uncommitted tail" });
+    defer alloc.free(events);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
+    const manifest = try session_projection.encodeManifest(alloc, .{
+        .id = @constCast(id),
+        .authority_id = [_]u8{3} ** 16,
+        .log_generation = generation,
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .conversation_language = language,
+        .history_len = 0,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .last_event_seq = 1,
+        .event_log_bytes = started.len,
+        .event_log_stat_fingerprint = [_]u8{0} ** 32,
+        .generation_base_seq = 1,
+        .generation_base_bytes = started.len,
+        .checkpoint_seq = null,
+        .checkpoint_sha256 = null,
+        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+    });
+    defer alloc.free(manifest);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
+    const watermark_name = "commit.01010101010101010101010101010101.json";
+    const watermark = try std.fmt.allocPrint(
+        alloc,
+        "{{\"schema_version\":1,\"session_id\":\"{s}\",\"log_generation\":\"{s}\",\"through_seq\":2,\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}\n",
+        .{ id, std.fmt.bytesToHex(generation, .lower), std.fmt.bytesToHex(event_id, .lower), started.len + committed.len },
+    );
+    defer alloc.free(watermark);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = watermark_name, .data = watermark });
+    {
+        var imported = try loadSchemaV3ReadOnly(alloc, &dir, id);
+        defer imported.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+        try std.testing.expectEqualStrings("acknowledged answer", imported.state.history[0].assistant.assistant);
+        try std.testing.expectEqual(started.len + committed.len, imported.source_bytes);
+    }
+    try dir.dir.deleteFile(std.testing.io, "session.json");
+    {
+        var imported = try loadSchemaV3ReadOnly(alloc, &dir, id);
+        defer imported.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+    }
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = watermark_name, .data = "{}" });
+    try std.testing.expectError(error.InvalidSessionFormat, loadSchemaV3ReadOnly(alloc, &dir, id));
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "authority.json",
+        .data = "{\"schema_version\":1,\"storage_format\":\"event_log_v1\",\"session_id\":\"legacy-committed-prefix\",\"authority_id\":\"03030303030303030303030303030303\",\"source\":\"native_create\"}",
+    });
+    var recovered = try store.recoverSessionCopy(alloc, id, .{});
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), recovered.history_len);
+    var restored = try store.canonical_root.loadReadOnly(alloc, recovered.recovered_session_id, .{});
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), restored.history.len);
+    const source_after = try authority_module.readOptionalSessionFile(alloc, &dir, "events.jsonl", events.len + 1);
+    defer if (source_after) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings(events, source_after.?);
 }

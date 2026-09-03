@@ -4239,6 +4239,31 @@ describe("cli: ask success", () => {
         const workspaceRoot = realpathSync(workspace);
         const sessionId = "legacy-ask-convert";
         writeLegacySession(home, workspaceRoot, sessionId);
+        const sessionDir = join(home, ".fx", "sessions", sessionId);
+        const legacyPath = join(sessionDir, "session.json");
+        const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
+        const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
+        legacy.history_len = 1;
+        legacy.history = [{
+          kind: "assistant",
+          user: { text: "LEGACY_ORIGINAL_REQUEST", images: [] },
+          assistant: "LEGACY_ORIGINAL_ANSWER",
+          execution: {
+            schema_version: 2,
+            tool_steps: [{
+              assistant: null,
+              tool_calls: [{ id: "legacy-read", name: "read_file", arguments_json: '{"path":"past.txt"}', provider_result: null }],
+              tool_results: [{
+                tool_call_id: "legacy-read", tool_name: "read_file", status: "success",
+                output: legacyOutput, output_handle: null, preview: null,
+                output_bytes: legacyOutput.length, stored_output_bytes: legacyOutput.length,
+                truncated: false, provider_native: false, created_at_ms: 2, permission_feedback: [],
+              }],
+            }],
+            files: [], steering: [],
+          },
+        }];
+        writeFileSync(legacyPath, JSON.stringify(legacy) + "\n", { mode: 0o600 });
         const env = {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-legacy-convert-key",
@@ -4261,7 +4286,6 @@ describe("cli: ask success", () => {
           final_output: "LEGACY_CONVERTED_OK",
         });
 
-        const sessionDir = join(home, ".fx", "sessions", sessionId);
         const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
         expect(metadata.schema_version).toBe(4);
         expect(Object.hasOwn(metadata, "history")).toBe(false);
@@ -4279,11 +4303,17 @@ describe("cli: ask success", () => {
           session_id: sessionId,
           final_output: "LEGACY_RESTART_OK",
         });
-        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
+        const records = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
           .trim()
           .split("\n")
-          .map((line) => Object.keys(JSON.parse(line).event)[0]);
+          .map((line) => JSON.parse(line));
+        const events = records.map((record) => Object.keys(record.event)[0]);
         expect(events).toEqual([
+          "user",
+          "tool_call",
+          "tool_result",
+          "assistant",
+          "turn_completed",
           "user",
           "assistant",
           "turn_completed",
@@ -4292,6 +4322,15 @@ describe("cli: ask success", () => {
           "turn_completed",
         ]);
         expect(gateway.requests).toHaveLength(2);
+        for (const request of gateway.requests) {
+          expect(request.body).toContain("LEGACY_ORIGINAL_REQUEST");
+          expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
+          expect(request.body).toContain(legacyOutput);
+        }
+        const preserved = records.find((record) => record.event.tool_result)?.event.tool_result;
+        expect(preserved.call_id).toBe("legacy-read");
+        expect(preserved.completeness).not.toBe("complete");
+        expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });

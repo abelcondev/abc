@@ -165,6 +165,7 @@ pub const ActivePromptSnapshotOwnership = struct {
         alloc: std.mem.Allocator,
     ) !?types.SnapshotFileOwnership {
         if (self.images.len == 0) return null;
+        if (self.state == .preserved or self.state == .discarded) return null;
         if (self.shared_ownership) |ownership| return ownership;
         const ownership = (try SnapshotFileOwnershipState.create(alloc, self.images)).handle();
         self.shared_ownership = ownership;
@@ -185,7 +186,11 @@ pub const ActivePromptSnapshotOwnership = struct {
         if (self.images.len == 0) return false;
         switch (self.state) {
             .active => {
-                if (self.shared_ownership) |ownership| ownership.transfer();
+                if (self.shared_ownership) |ownership| {
+                    ownership.transfer();
+                    ownership.release();
+                    self.shared_ownership = null;
+                }
                 self.state = .preserved;
                 return true;
             },
@@ -409,6 +414,64 @@ pub const PendingQuestionBatchSnapshot = struct {
     }
 };
 
+pub const ContextCompaction = struct {
+    turn_id: u64 = 0,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn = null,
+    max_history_turns: usize = 0,
+};
+
+pub const ContextCompactionHandler = *const fn (*anyopaque, ContextCompaction) anyerror!void;
+
+pub const FreshPromptPreparation = struct {
+    turn_id: u64 = 0,
+    user: types.UserTurn,
+    prior_turn: types.HistoryTurn,
+};
+
+pub const FreshPromptHistory = struct {
+    history: []types.HistoryTurn,
+    authorized_image_catalog: []types.ImageAttachment,
+    root_user_intent_context: []u8,
+    unversioned_history_count: usize,
+
+    pub fn deinit(self: *FreshPromptHistory, alloc: std.mem.Allocator) void {
+        types.freeHistoryTurnSlice(alloc, self.history);
+        types.freeImageAttachmentSlice(alloc, self.authorized_image_catalog);
+        alloc.free(self.root_user_intent_context);
+        self.* = undefined;
+    }
+};
+
+pub const FreshPromptHandler = *const fn (*anyopaque, FreshPromptPreparation) anyerror!FreshPromptHistory;
+
+const HistoryPublication = struct {
+    ctx: *anyopaque,
+    commit_fn: *const fn (*anyopaque) anyerror!void,
+
+    fn commit(self: HistoryPublication) !void {
+        try self.commit_fn(self.ctx);
+    }
+};
+
+const ContextCompactionPublication = struct {
+    ctx: *anyopaque,
+    handler: ContextCompactionHandler,
+    event: ContextCompaction,
+
+    fn commit(raw: *anyopaque) !void {
+        const self: *ContextCompactionPublication = @ptrCast(@alignCast(raw));
+        try self.handler(self.ctx, self.event);
+    }
+};
+
+const HistoryPublicationResponse = union(enum) {
+    idle,
+    waiting: u64,
+    committed: ?FreshPromptHistory,
+    failed: anyerror,
+};
+
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
@@ -429,7 +492,8 @@ pub const WorkerEvent = union(enum) {
     turn_token_update: types.TurnTokenProgress,
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
-    context_compaction: types.HistoryTurn,
+    context_compaction: ContextCompaction,
+    prepare_fresh_prompt: FreshPromptPreparation,
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
@@ -451,6 +515,7 @@ pub const WorkerRuntime = struct {
     queued_history: []types.HistoryTurn = &.{},
     queued_context_compaction: ?ContextCompactionTask = null,
     active_context_compaction: bool = false,
+    history_publication_response: HistoryPublicationResponse = .idle,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
@@ -550,6 +615,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     pub fn requestInteractiveCancel(self: *WorkerRuntime) void {
@@ -572,6 +638,7 @@ pub const WorkerRuntime = struct {
         });
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     pub fn cancelApprovalTurn(self: *WorkerRuntime) void {
@@ -797,6 +864,7 @@ pub const WorkerRuntime = struct {
         }
         if (self.active_context_compaction) {
             self.worker_cancel_requested.store(true, .seq_cst);
+            self.worker_cond.broadcast(io_mod.getIo());
             self.worker_mutex.unlock(io_mod.getIo());
             debug_trace.eventf(
                 "context_compaction",
@@ -1526,30 +1594,178 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns, null);
     }
 
     pub fn commitContextCompaction(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
-        turn: types.HistoryTurn,
+        summary: types.CompactedSummaryHistoryTurn,
+        active_prefix: ?types.AssistantHistoryTurn,
         max_history_turns: usize,
     ) !void {
-        std.debug.assert(turn == .compacted_summary);
-        const owned_event = try dupeWorkerEvent(alloc, .{
-            .context_compaction = turn,
-        });
-        var owns_event = true;
-        defer if (owns_event) freeWorkerEvent(alloc, owned_event);
-
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        const result = try self.awaitHistoryPublicationLocked(alloc, .{
+            .context_compaction = .{
+                .turn_id = self.active_turn_id,
+                .summary = summary,
+                .active_prefix = active_prefix,
+                .max_history_turns = max_history_turns,
+            },
+        });
+        std.debug.assert(result == null);
+    }
+
+    pub fn prepareFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, preparation: FreshPromptPreparation) !FreshPromptHistory {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var request = preparation;
+        request.turn_id = self.active_turn_id;
+        return (try self.awaitHistoryPublicationLocked(alloc, .{ .prepare_fresh_prompt = request })) orelse error.InvalidHistoryPublication;
+    }
+
+    fn awaitHistoryPublicationLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !?FreshPromptHistory {
+        if (self.worker_stop_requested or self.isCancelRequested()) return error.Aborted;
+        std.debug.assert(self.history_publication_response == .idle);
+        const owned_event = try dupeWorkerEvent(alloc, event);
+        var owns_event = true;
+        defer if (owns_event) freeWorkerEvent(alloc, owned_event);
         try self.worker_events.ensureUnusedCapacity(alloc, 1);
-        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+        self.history_publication_response = .{ .waiting = self.active_turn_id };
+        defer {
+            if (self.history_publication_response == .committed) {
+                if (self.history_publication_response.committed) |*snapshot| snapshot.deinit(alloc);
+            }
+            self.history_publication_response = .idle;
+        }
         self.worker_events.appendAssumeCapacity(owned_event);
         owns_event = false;
-        self.applyRecoveryStateEvent(owned_event);
         self.worker_cond.broadcast(io_mod.getIo());
+
+        while (self.history_publication_response == .waiting and
+            !self.worker_stop_requested and !self.isCancelRequested())
+        {
+            try self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex);
+        }
+        switch (self.history_publication_response) {
+            .committed => |result| {
+                self.history_publication_response = .idle;
+                return result;
+            },
+            .failed => |err| return err,
+            .waiting, .idle => return error.Aborted,
+        }
+    }
+
+    pub fn failPendingHistoryPublication(self: *WorkerRuntime, err: anyerror) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.history_publication_response != .waiting) return;
+        self.history_publication_response = .{ .failed = err };
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    pub fn resolveContextCompaction(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        event: ContextCompaction,
+        ctx: *anyopaque,
+        handler: ContextCompactionHandler,
+    ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.history_publication_response != .waiting or
+            self.history_publication_response.waiting != event.turn_id)
+        {
+            debug_trace.logf("worker", "compaction delivery dropped reason=stale turn_id={d}", .{event.turn_id});
+            return;
+        }
+        defer self.worker_cond.broadcast(io_mod.getIo());
+        if (self.worker_stop_requested or self.isCancelRequested()) {
+            self.history_publication_response = .{ .failed = error.Aborted };
+            return;
+        }
+        self.publishContextCompactionLocked(alloc, event, ctx, handler) catch |err| {
+            self.history_publication_response = .{ .failed = err };
+            return;
+        };
+        self.history_publication_response = .{ .committed = null };
+    }
+
+    pub fn resolveFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.history_publication_response != .waiting or self.history_publication_response.waiting != event.turn_id) {
+            debug_trace.logf("worker", "fresh prompt preparation dropped reason=stale turn_id={d}", .{event.turn_id});
+            return;
+        }
+        defer self.worker_cond.broadcast(io_mod.getIo());
+        if (self.worker_stop_requested or self.isCancelRequested()) {
+            self.history_publication_response = .{ .failed = error.Aborted };
+            return;
+        }
+        const snapshot = self.publishFreshPromptLocked(alloc, event, ctx, handler) catch |err| {
+            self.history_publication_response = .{ .failed = err };
+            return;
+        };
+        self.history_publication_response = .{ .committed = snapshot };
+    }
+
+    pub fn publishFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) !FreshPromptHistory {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.publishFreshPromptLocked(alloc, event, ctx, handler);
+    }
+
+    fn publishFreshPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) !FreshPromptHistory {
+        const Publication = struct {
+            ctx: *anyopaque,
+            handler: FreshPromptHandler,
+            event: FreshPromptPreparation,
+            result: ?FreshPromptHistory = null,
+
+            fn commit(raw: *anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                self_.result = try self_.handler(self_.ctx, self_.event);
+            }
+        };
+        var publication: Publication = .{ .ctx = ctx, .handler = handler, .event = event };
+        try self.propagateHistoryTurnLocked(alloc, event.prior_turn, 0, .{ .ctx = &publication, .commit_fn = Publication.commit });
+        return publication.result.?;
+    }
+
+    pub fn publishContextCompaction(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        event: ContextCompaction,
+        ctx: *anyopaque,
+        handler: ContextCompactionHandler,
+    ) !void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        try self.publishContextCompactionLocked(alloc, event, ctx, handler);
+    }
+
+    fn publishContextCompactionLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        event: ContextCompaction,
+        ctx: *anyopaque,
+        handler: ContextCompactionHandler,
+    ) !void {
+        var publication: ContextCompactionPublication = .{ .ctx = ctx, .handler = handler, .event = event };
+        try self.propagateHistoryTurnLocked(
+            alloc,
+            .{ .compacted_summary = event.summary },
+            event.max_history_turns,
+            .{ .ctx = &publication, .commit_fn = ContextCompactionPublication.commit },
+        );
+        if (event.active_prefix != null) {
+            if (self.active_prompt_snapshot_ownership) |ownership| {
+                _ = ownership.preserve();
+            }
+        }
     }
 
     fn propagateHistoryTurnLocked(
@@ -1557,8 +1773,12 @@ pub const WorkerRuntime = struct {
         alloc: std.mem.Allocator,
         turn: types.HistoryTurn,
         max_history_turns: usize,
+        publication: ?HistoryPublication,
     ) !void {
-        if (self.queued_prompts.items.len == 0) return;
+        if (self.queued_prompts.items.len == 0) {
+            if (publication) |value| try value.commit();
+            return;
+        }
         const active_ownership = if (self.active_prompt_snapshot_ownership) |ownership|
             try ownership.ensureSharedOwnership(alloc)
         else
@@ -1636,6 +1856,10 @@ pub const WorkerRuntime = struct {
             };
         }
 
+        if (publication) |value| try value.commit();
+        if (next_history.len <= self.queued_history.len) {
+            debug_trace.logf("worker", "queued history replaced by context checkpoint turns={d}", .{self.queued_history.len});
+        }
         types.freeHistoryTurnSlice(alloc, self.queued_history);
         self.queued_history = next_history;
         next_history_owned = false;
@@ -2296,15 +2520,20 @@ fn appendHistoryTurnProjection(
     max_history_turns: usize,
 ) ![]types.HistoryTurn {
     _ = max_history_turns;
-    const next = try alloc.alloc(types.HistoryTurn, current.len + 1);
+    const retained = if (turn == .compacted_summary and
+        std.mem.startsWith(u8, turn.compacted_summary.summary, types.context_handoff_open))
+        &.{}
+    else
+        current;
+    const next = try alloc.alloc(types.HistoryTurn, retained.len + 1);
     errdefer alloc.free(next);
     var copied: usize = 0;
     errdefer for (next[0..copied]) |owned| types.freeHistoryTurn(alloc, owned);
-    for (current, 0..) |entry, index| {
+    for (retained, 0..) |entry, index| {
         next[index] = try types.dupeHistoryTurn(alloc, entry);
         copied += 1;
     }
-    next[current.len] = try types.dupeHistoryTurn(alloc, turn);
+    next[retained.len] = try types.dupeHistoryTurn(alloc, turn);
     return next;
 }
 
@@ -2700,6 +2929,72 @@ test "accepted history prevents propagated queue cleanup from deleting snapshots
     try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
 }
 
+test "compaction preserves active snapshots only after persistence succeeds" {
+    const Persist = struct {
+        fail: bool,
+
+        fn commit(raw: *anyopaque, _: ContextCompaction) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.TestPersistenceFailure;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |queued| {
+        for ([_]bool{ false, true }) |fail| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            {
+                var file = try tmp.dir.createFile(std.testing.io, "snapshot.bin", .{});
+                defer file.close(std.testing.io);
+                try file.writeStreamingAll(std.testing.io, "snapshot");
+            }
+            const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "snapshot.bin");
+            defer alloc.free(path);
+            var images = [_]types.ImageAttachment{.{
+                .id = 1,
+                .path = @constCast("/tmp/source.png"),
+                .media_type = @constCast("image/png"),
+                .snapshot_path = path,
+                .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            }};
+            var runtime: WorkerRuntime = .{};
+            defer runtime.deinit(alloc);
+            if (queued) try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
+            var ownership = ActivePromptSnapshotOwnership.init(&images);
+            runtime.beginActivePromptSnapshots(&ownership);
+            var active = true;
+            defer if (active) runtime.endActivePromptSnapshots(&ownership);
+            var persist: Persist = .{ .fail = fail };
+            const event: ContextCompaction = .{
+                .summary = .{
+                    .summary = @constCast("<context_handoff>image checkpoint</context_handoff>"),
+                    .removed_turn_count = 1,
+                    .compaction_count = 1,
+                },
+                .active_prefix = .{
+                    .user = .{ .text = @constCast("inspect image"), .images = &images },
+                    .assistant = @constCast(""),
+                },
+            };
+            if (fail) {
+                try std.testing.expectError(error.TestPersistenceFailure, runtime.publishContextCompaction(alloc, event, &persist, Persist.commit));
+            } else {
+                try runtime.publishContextCompaction(alloc, event, &persist, Persist.commit);
+                try runtime.publishContextCompaction(alloc, event, &persist, Persist.commit);
+            }
+            runtime.endActivePromptSnapshots(&ownership);
+            active = false;
+            runtime.clearQueuedPrompts(alloc, &.{});
+            if (fail) {
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, path, .{}));
+            } else {
+                try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+                try std.testing.expect(ownership.shared_ownership == null);
+            }
+        }
+    }
+}
+
 test "failed queued prompt dequeue retains borrowed snapshot ownership" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2846,9 +3141,13 @@ fn checkContextCompactionCommitAllocation(
 ) !bool {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
-    const prompt = try makePrompt(alloc, "queued", "model");
+    var prompt = try makePrompt(alloc, "queued", "model");
     var owns_prompt = true;
     errdefer if (owns_prompt) freeQueuedPrompt(alloc, prompt);
+    prompt.history = try session_runtime.snapshotOwnedContextHistory(alloc, &.{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior user") },
+        .assistant = @constCast("prior answer"),
+    } }}, 0, 0);
     try runtime.enqueuePrompt(alloc, prompt);
     owns_prompt = false;
 
@@ -2861,12 +3160,13 @@ fn checkContextCompactionCommitAllocation(
         alloc,
         .{ .fail_index = fail_index },
     );
-    runtime.commitContextCompaction(failing.allocator(), turn, 8) catch |err| {
+    runtime.publishContextCompaction(failing.allocator(), .{ .summary = turn.compacted_summary, .max_history_turns = 8 }, &runtime, discardCompactionForTest) catch |err| {
         if (!failing.has_induced_failure) return err;
         try std.testing.expectEqual(
-            @as(usize, 0),
+            @as(usize, 1),
             runtime.queued_history.len,
         );
+        try std.testing.expectEqualStrings("prior answer", runtime.queued_history[0].assistant.assistant);
         try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
         return false;
     };
@@ -2875,9 +3175,190 @@ fn checkContextCompactionCommitAllocation(
         @as(usize, 1),
         runtime.queued_history.len,
     );
-    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
-    try std.testing.expect(runtime.worker_events.items[0] == .context_compaction);
+    try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+    try std.testing.expectEqualStrings(turn.compacted_summary.summary, runtime.queued_history[0].compacted_summary.summary);
     return true;
+}
+
+fn discardCompactionForTest(_: *anyopaque, _: ContextCompaction) !void {}
+
+test "context compaction callback waits for UI persistence" {
+    const Probe = struct {
+        returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This(), runtime: *WorkerRuntime) void {
+            runtime.commitContextCompaction(std.testing.allocator, .{
+                .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            }, null, 8) catch |err| {
+                self.failure = err;
+            };
+            self.returned.store(true, .release);
+        }
+    };
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    var probe: Probe = .{};
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ &probe, &runtime });
+    defer {
+        runtime.requestShutdown();
+        thread.join();
+    }
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    while (true) {
+        var state = try runtime.snapshotState(std.testing.allocator);
+        defer state.deinit(std.testing.allocator);
+        if (state.pending_event_count > 0) break;
+        if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    io_mod.sleep(10 * std.time.ns_per_ms);
+    try std.testing.expect(!probe.returned.load(.acquire));
+}
+
+test "context compaction acknowledgment commits or fails before worker continuation" {
+    const Probe = struct {
+        const Outcome = enum { commit, fail, cancel_after_commit };
+        runtime: *WorkerRuntime,
+        outcome: Outcome,
+        returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        continued: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+        persisted: bool = false,
+
+        fn run(self: *@This()) void {
+            self.runtime.commitContextCompaction(std.testing.allocator, .{
+                .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            }, .{
+                .user = .{ .text = @constCast("active request") },
+                .assistant = @constCast(""),
+            }, 8) catch |err| {
+                self.failure = err;
+                self.returned.store(true, .release);
+                return;
+            };
+            self.continued.store(true, .release);
+            self.returned.store(true, .release);
+        }
+
+        fn commit(raw: *anyopaque, event: ContextCompaction) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("active request", event.active_prefix.?.user.text);
+            try std.testing.expectEqualStrings("old answer", self.runtime.queued_history[0].assistant.assistant);
+            if (self.outcome == .fail) return error.TestPersistenceFailure;
+            self.persisted = true;
+            if (self.outcome == .cancel_after_commit) {
+                self.runtime.worker_cancel_requested.store(true, .seq_cst);
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]Probe.Outcome{ .commit, .fail, .cancel_after_commit }) |outcome| {
+        var runtime: WorkerRuntime = .{};
+        defer runtime.deinit(alloc);
+        var prompt = try makePrompt(alloc, "queued", "model");
+        prompt.history = try session_runtime.snapshotOwnedContextHistory(alloc, &.{.{ .assistant = .{
+            .user = .{ .text = @constCast("old request") },
+            .assistant = @constCast("old answer"),
+        } }}, 0, 0);
+        try runtime.enqueuePrompt(alloc, prompt);
+        var probe: Probe = .{ .runtime = &runtime, .outcome = outcome };
+        const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+        var joined = false;
+        defer if (!joined) {
+            runtime.requestShutdown();
+            thread.join();
+        };
+        const deadline = io_mod.milliTimestamp() + 5_000;
+        while (true) {
+            var state = try runtime.snapshotState(alloc);
+            defer state.deinit(alloc);
+            if (state.pending_event_count > 0) break;
+            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        var events = runtime.takeEvents();
+        defer events.deinit(alloc);
+        defer for (events.items) |event| freeWorkerEvent(alloc, event);
+        try std.testing.expectEqual(@as(usize, 1), events.items.len);
+        try std.testing.expect(!probe.returned.load(.acquire));
+        try std.testing.expect(!probe.continued.load(.acquire));
+        runtime.resolveContextCompaction(alloc, events.items[0].context_compaction, &probe, Probe.commit);
+        thread.join();
+        joined = true;
+        if (outcome == .fail) {
+            try std.testing.expectEqual(error.TestPersistenceFailure, probe.failure.?);
+            try std.testing.expect(!probe.persisted);
+            try std.testing.expect(!probe.continued.load(.acquire));
+            try std.testing.expectEqualStrings("old answer", runtime.queued_history[0].assistant.assistant);
+        } else {
+            try std.testing.expect(probe.failure == null);
+            try std.testing.expect(probe.persisted);
+            try std.testing.expect(probe.continued.load(.acquire));
+            try std.testing.expect(runtime.queued_history[0] == .compacted_summary);
+        }
+    }
+}
+
+test "context compaction waiter exits on cancellation and rejects stale delivery" {
+    const Probe = struct {
+        returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+        commits: usize = 0,
+
+        fn run(self: *@This(), runtime: *WorkerRuntime) void {
+            runtime.commitContextCompaction(std.testing.allocator, .{
+                .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            }, null, 8) catch |err| {
+                self.failure = err;
+            };
+            self.returned.store(true, .release);
+        }
+
+        fn commit(raw: *anyopaque, _: ContextCompaction) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.commits += 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |shutdown| {
+        var runtime: WorkerRuntime = .{};
+        defer runtime.deinit(alloc);
+        var probe: Probe = .{};
+        const thread = try std.Thread.spawn(.{}, Probe.run, .{ &probe, &runtime });
+        var joined = false;
+        defer if (!joined) {
+            runtime.requestShutdown();
+            thread.join();
+        };
+        const deadline = io_mod.milliTimestamp() + 5_000;
+        while (true) {
+            var state = try runtime.snapshotState(alloc);
+            defer state.deinit(alloc);
+            if (state.pending_event_count > 0) break;
+            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        var events = runtime.takeEvents();
+        defer events.deinit(alloc);
+        defer for (events.items) |event| freeWorkerEvent(alloc, event);
+        if (shutdown) runtime.requestShutdown() else runtime.requestInteractiveCancel();
+        while (!probe.returned.load(.acquire)) {
+            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionCancellation;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        thread.join();
+        joined = true;
+        try std.testing.expectEqual(error.Aborted, probe.failure.?);
+        runtime.resolveContextCompaction(alloc, events.items[0].context_compaction, &probe, Probe.commit);
+        try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    }
 }
 
 test "context compaction commit is allocation-failure atomic" {
@@ -2889,6 +3370,40 @@ test "context compaction commit is allocation-failure atomic" {
         )) return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "queued prompts begin with the latest checkpoint and its suffix" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var first = try makePrompt(alloc, "first queued", "model");
+    first.history = try session_runtime.snapshotOwnedContextHistory(alloc, &.{.{
+        .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") },
+    }}, 0, 0);
+    try runtime.enqueuePrompt(alloc, first);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second queued", "model"));
+
+    const checkpoint: types.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("<context_handoff>current summary</context_handoff>"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    try runtime.publishContextCompaction(alloc, .{ .summary = checkpoint.compacted_summary }, &runtime, discardCompactionForTest);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_history.len);
+    try runtime.propagateHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("later request") },
+        .assistant = @constCast("later answer"),
+    } }, 0);
+
+    for (0..2) |_| {
+        const job = (try runtime.tryTakeNextPrompt(alloc)).?;
+        defer freeQueuedPrompt(alloc, job);
+        try std.testing.expectEqual(@as(usize, 2), job.history.len);
+        try std.testing.expectEqualStrings(checkpoint.compacted_summary.summary, job.history[0].compacted_summary.summary);
+        try std.testing.expectEqualStrings("later answer", job.history[1].assistant.assistant);
+    }
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
 }
 
 test "finish ownership handoff deletes snapshots after its last unaccepted release" {
@@ -3155,8 +3670,28 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .full = full,
             } };
         },
-        .context_compaction => |turn| .{
-            .context_compaction = try types.dupeHistoryTurn(alloc, turn),
+        .prepare_fresh_prompt => |value| blk: {
+            const user = try types.dupeUserTurn(alloc, value.user);
+            errdefer types.freeUserTurn(alloc, user);
+            break :blk .{ .prepare_fresh_prompt = .{
+                .turn_id = value.turn_id,
+                .user = user,
+                .prior_turn = try types.dupeHistoryTurn(alloc, value.prior_turn),
+            } };
+        },
+        .context_compaction => |value| blk: {
+            const summary = try types.dupeHistoryTurn(alloc, .{ .compacted_summary = value.summary });
+            errdefer types.freeHistoryTurn(alloc, summary);
+            const prefix = if (value.active_prefix) |prefix|
+                (try types.dupeHistoryTurn(alloc, .{ .assistant = prefix })).assistant
+            else
+                null;
+            break :blk .{ .context_compaction = .{
+                .turn_id = value.turn_id,
+                .summary = summary.compacted_summary,
+                .active_prefix = prefix,
+                .max_history_turns = value.max_history_turns,
+            } };
         },
         .finish_prompt => |finished| .{ .finish_prompt = try types.dupeFinishedPrompt(alloc, finished) },
         .session_grant => |grant| blk: {
@@ -3205,7 +3740,14 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         },
         .tool_lifecycle => |lifecycle| freeToolLifecycleEvent(alloc, lifecycle),
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
-        .context_compaction => |turn| types.freeHistoryTurn(alloc, turn),
+        .prepare_fresh_prompt => |value| {
+            types.freeUserTurn(alloc, value.user);
+            types.freeHistoryTurn(alloc, value.prior_turn);
+        },
+        .context_compaction => |value| {
+            types.freeHistoryTurn(alloc, .{ .compacted_summary = value.summary });
+            if (value.active_prefix) |prefix| types.freeHistoryTurn(alloc, .{ .assistant = prefix });
+        },
         .finish_prompt => |finished| types.freeFinishedPrompt(alloc, finished),
         .session_grant => |grant| {
             alloc.free(grant.tool_name);

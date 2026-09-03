@@ -76,6 +76,16 @@ pub const RecoveryCheckpoint = struct {
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
 
+    /// Borrows the checkpoint's exact user and uncommitted response suffix.
+    pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
+        return .{ .interrupted = .{
+            .user = self.user,
+            .assistant = if (self.assistant_source.len > 0) self.assistant_source else null,
+            .execution = self.execution,
+            .terminal_reason = .failed,
+        } };
+    }
+
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
         alloc.free(self.assistant_source);

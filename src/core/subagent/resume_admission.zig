@@ -84,38 +84,6 @@ pub fn listActionableCatalog(
     return .{ .summaries = summaries };
 }
 
-pub fn actionablePageFromCatalog(
-    alloc: Allocator,
-    catalog: *const ActionableSessionCatalog,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !ActionableSessionPage {
-    if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
-    var page = try session_summary_codec.resumablePageFromSummaries(
-        alloc,
-        catalog.summaries.items,
-        null,
-        null,
-        continuation,
-        limit,
-    );
-    errdefer page.deinit(alloc);
-    const next = if (page.has_more and page.summaries.items.len > 0) blk: {
-        const last = page.summaries.items[page.summaries.items.len - 1];
-        break :blk ActionableContinuation{
-            .updated_at_ms = last.updated_at_ms,
-            .id = try alloc.dupe(u8, last.id),
-        };
-    } else null;
-    const result = ActionableSessionPage{
-        .summaries = page.summaries,
-        .has_more = page.has_more,
-        .continuation = next,
-    };
-    page.summaries = .empty;
-    return result;
-}
-
 pub fn listVisiblePage(
     store: session_store.Store,
     alloc: Allocator,

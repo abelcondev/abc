@@ -19,6 +19,7 @@ const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_layout = @import("session_layout.zig");
 const session_log = @import("session_log.zig");
+const session_replay = @import("session_replay.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
@@ -549,8 +550,8 @@ pub const Store = struct {
         return self.startWritableSessionWithOptions(alloc, state, .{});
     }
 
-    /// Starts a new writable session, attaching the latest-pointer lifecycle and
-    /// the writable managed-child capability. Caller owns the returned session.
+    /// Starts a new conversation and attaches its writable managed-child
+    /// capability. Caller owns the returned session.
     pub fn startWritableSessionWithOptions(
         self: Store,
         alloc: Allocator,
@@ -3123,7 +3124,7 @@ pub const Store = struct {
         };
     }
 
-    /// Creates a new schema-v3 session from the exact validated manifest
+    /// Creates a new conversation session from the exact validated manifest
     /// boundary of a source whose commit watermark is corrupt. The source is
     /// locked for the read and is never modified.
     pub fn recoverSessionCopy(
@@ -3177,10 +3178,21 @@ pub const Store = struct {
             return error.SessionRecoveryUnsupportedSchema;
         }
 
-        var imported = loadSchemaV3ReadOnly(
+        var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.SessionRecoveryBoundaryInvalid,
+        };
+        defer manifest.deinit(alloc);
+        if (!std.mem.eql(u8, manifest.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
+        var events = openSessionFile(&source.dir, "events.jsonl", .read_only) catch
+            return error.SessionRecoveryBoundaryInvalid;
+        defer events.close(io_mod.getIo());
+        var imported = session_replay.replayCommittedPrefix(
             alloc,
-            &source.dir,
-            session_id,
+            events,
+            manifest.log_generation,
+            manifest.last_event_seq,
+            manifest.event_log_bytes,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSessionSchema => return error.SessionRecoveryUnsupportedSchema,
@@ -3188,6 +3200,9 @@ pub const Store = struct {
         };
         var imported_owned = true;
         defer if (imported_owned) imported.deinit(alloc);
+        if (!session_projection.stateMatchesManifest(imported.state, manifest)) {
+            return error.SessionRecoveryBoundaryInvalid;
+        }
         var recovered = imported.takeState();
         imported_owned = false;
         defer recovered.deinit(alloc);

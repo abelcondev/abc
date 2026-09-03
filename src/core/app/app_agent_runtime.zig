@@ -937,13 +937,30 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn processQueuedPrompt(
             app: *App,
-            job: worker_runtime.QueuedPrompt,
+            queued_job: worker_runtime.QueuedPrompt,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !void {
+            var job = queued_job;
+            var fresh_history: ?worker_runtime.FreshPromptHistory = null;
+            defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);
             var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
             app.worker.beginActivePromptSnapshots(&snapshot_ownership);
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
+            if (job.recovery_checkpoint == null) {
+                if (try app_session_runtime.Runtime(App).snapshotFreshPromptBoundary(app, std.heap.c_allocator)) |value| {
+                    var checkpoint = value;
+                    defer checkpoint.deinit(std.heap.c_allocator);
+                    fresh_history = try app_callbacks.Bindings(App).prepareFreshPrompt(app, .{
+                        .user = .{ .text = job.prompt, .images = job.images },
+                        .prior_turn = checkpoint.interruptedTurn(),
+                    });
+                    job.history = fresh_history.?.history;
+                    job.authorized_image_catalog = fresh_history.?.authorized_image_catalog;
+                    job.root_user_intent_context = fresh_history.?.root_user_intent_context;
+                    job.unversioned_history_count = fresh_history.?.unversioned_history_count;
+                }
+            }
             app.worker.active_context_snapshot = &job.context_snapshot;
             defer app.worker.active_context_snapshot = null;
             app.worker.active_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
@@ -1088,6 +1105,35 @@ pub fn Runtime(comptime App: type) type {
             );
             const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
+            const permission_mode = app_permission_runtime.Runtime(App).livePermissionSnapshot(app).mode;
+            var tool_projection = try app.snapshotModelToolProjection(arena, permission_mode);
+            defer tool_projection.deinit(arena);
+            var skill_catalog = app.skills.acquireCatalog();
+            defer skill_catalog.deinit();
+            var bounded_skills = try skill_catalog.buildRoutedSystemPromptSection(
+                arena,
+                "",
+                if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
+            );
+            defer bounded_skills.deinit(arena);
+            const config = buildQueuedPromptConfig(app, .{
+                .prompt = @constCast(""),
+                .images = &.{},
+                .model = job.model,
+                .provider = job.provider,
+                .api_key = job.api_key,
+                .permission_mode = permission_mode,
+                .history = &.{},
+                .grants = &.{},
+                .agent_settings = app.worker.effectiveAgentTurnSettings(),
+            }, bounded_skills.text, "", gateway_retry_count, "", &tool_projection, null);
+            const continuation = try agent_runtime.prepareManualCompactionContinuation(
+                arena,
+                &deps,
+                config,
+                job.model,
+                capabilities,
+            );
             const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
             var compaction_count: usize = 0;
             for (job.history) |turn| switch (turn) {
@@ -1105,7 +1151,7 @@ pub fn Runtime(comptime App: type) type {
                 .working_capabilities = capabilities,
                 .request_tokens = source_tokens,
                 .source_tokens = source_tokens,
-                .protected_tokens = 0,
+                .continuation = continuation,
                 .source_messages = messages.items,
                 .uncertain_source_message_count = uncertain_message_count,
                 .result_storage = result_storage,
@@ -2576,6 +2622,154 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     };
 }
 
+test "queued fresh prompt waits for paused turn closure before provider execution" {
+    const session_codec = @import("../session/session_codec.zig");
+    const session_store = @import("../session/session_store.zig");
+    const Probe = struct {
+        app: *FakeApp,
+        returned: std.atomic.Value(bool) = .init(false),
+        requests: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+        cancel_after_prepare: bool = false,
+
+        fn run(self: *@This(), job: worker_runtime.QueuedPrompt) void {
+            Runtime(FakeApp).processQueuedPrompt(self.app, job, 1, test_gateway_chat_url) catch |err| {
+                self.failure = err;
+            };
+            self.returned.store(true, .release);
+        }
+
+        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            _ = self.requests.fetchAdd(1, .seq_cst);
+            try std.testing.expect(!self.app.session_persistence.writable.?.conversation_writer.turn_open);
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            return .{ .completed = .{ .completion = .{ .content = "new answer", .finish_reason = .stop } } };
+        }
+
+        fn prepare(raw: *anyopaque, request: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = try app_session_runtime.Runtime(FakeApp).prepareFreshPrompt(self.app, request);
+            if (self.cancel_after_prepare) self.app.worker.worker_cancel_requested.store(true, .seq_cst);
+            return result;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const queue_alloc = std.heap.c_allocator;
+    const Outcome = enum { success, preflight_oom, cancel_after_prepare };
+    for ([_]Outcome{ .success, .preflight_oom, .cancel_after_prepare }) |outcome| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var app = try FakeApp.init(alloc);
+        defer app.deinit();
+        app.workspace_root = root;
+        app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
+        defer app.session_persistence.deinit(alloc);
+        app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
+            .id = @constCast("queued-pause"),
+            .origin_workspace_root = @constCast(root),
+            .workspace_root = @constCast(root),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = .literal("en"),
+            .history = &.{},
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        });
+        try app_session_runtime.Runtime(FakeApp).commitContextCompaction(&app, .{
+            .summary = @constCast("<context_handoff>original request</context_handoff>"),
+            .removed_turn_count = 0,
+            .compaction_count = 1,
+        }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") });
+        const checkpoint: session_codec.RecoveryCheckpoint = .{
+            .turn_id = 41,
+            .user = .{ .text = @constCast("same prompt") },
+            .assistant_source = @constCast("old partial answer"),
+            .cause = .response_interrupted,
+            .action = .paused,
+            .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 1,
+            .consumed_provider_attempts = 1,
+        };
+        try app_session_runtime.Runtime(FakeApp).setRecoveryCheckpoint(&app, checkpoint);
+        app.worker.worker_processing = true;
+        app.worker.active_turn_id = 41;
+        var queued = try makeQueuedPrompt(queue_alloc);
+        queue_alloc.free(queued.prompt);
+        queued.prompt = try queue_alloc.dupe(u8, "same prompt");
+        types.freeHistoryTurnSlice(queue_alloc, queued.history);
+        queued.history = try app.session.snapshotHistory(queue_alloc);
+        try app.worker.admitInteractivePrompt(queue_alloc, queued);
+        try app.worker.enqueuePrompt(queue_alloc, try makeQueuedPrompt(queue_alloc));
+        app.worker.finishProcessing();
+        const job = (try app.worker.tryTakeNextPrompt(queue_alloc)).?;
+        defer worker_runtime.freeQueuedPrompt(queue_alloc, job);
+        try std.testing.expect(job.delivery.isContinuation());
+        try std.testing.expect(job.recovery_checkpoint == null);
+        var probe: Probe = .{ .app = &app, .cancel_after_prepare = outcome == .cancel_after_prepare };
+        var provider = testAgentStreamProvider(Probe.stream);
+        provider.context = &probe;
+        app.agent_stream_provider = provider;
+        if (outcome == .preflight_oom) app.snapshot_tools_error = error.OutOfMemory;
+        const thread = try std.Thread.spawn(.{}, Probe.run, .{ &probe, job });
+        var joined = false;
+        defer if (!joined) {
+            app.worker.requestShutdown();
+            thread.join();
+        };
+        const deadline = io_mod.milliTimestamp() + 5_000;
+        var observed = false;
+        while (!observed) {
+            var events = app.worker.takeEvents();
+            defer events.deinit(queue_alloc);
+            defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
+            for (events.items) |event| {
+                if (event != .prepare_fresh_prompt) continue;
+                try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
+                try std.testing.expect(!probe.returned.load(.acquire));
+                app.worker.resolveFreshPrompt(queue_alloc, event.prepare_fresh_prompt, &probe, Probe.prepare);
+                observed = true;
+            }
+            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedFreshPromptPreparation;
+            if (!observed) io_mod.sleep(std.time.ns_per_ms);
+        }
+        thread.join();
+        joined = true;
+        if (outcome == .preflight_oom) {
+            try std.testing.expectEqual(error.OutOfMemory, probe.failure.?);
+            try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
+            try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+            continue;
+        }
+        if (probe.failure) |err| return err;
+        if (outcome == .cancel_after_prepare) {
+            try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.requests.load(.seq_cst));
+        try std.testing.expectEqualStrings("old partial answer", app.worker.queued_history[1].interrupted.assistant.?);
+        var events = app.worker.takeEvents();
+        defer events.deinit(queue_alloc);
+        defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
+        for (events.items) |event| {
+            if (event == .finish_prompt) try app_session_runtime.Runtime(FakeApp).appendFinishedPrompt(&app, event.finish_prompt);
+        }
+        var page = try app.session_persistence.store.?.loadHistoryPage(alloc, "queued-pause", null, 10);
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), page.turns.len);
+        try std.testing.expectEqualStrings("same prompt", page.turns[0].interrupted.user.text);
+        try std.testing.expectEqualStrings("old partial answer", page.turns[0].interrupted.assistant.?);
+        try std.testing.expectEqualStrings("same prompt", page.turns[1].assistant.user.text);
+        try std.testing.expectEqualStrings("new answer", page.turns[1].assistant.assistant);
+    }
+}
+
 test "manual compaction worker call commits a checkpoint without a continuation" {
     const Gateway = struct {
         request_count: usize = 0,
@@ -2629,21 +2823,67 @@ test "manual compaction worker call commits a checkpoint without a continuation"
         .assistant = @constCast("second response"),
     } });
 
-    try Runtime(FakeApp).processContextCompaction(&app, job, 1);
+    const Worker = struct {
+        returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This(), target: *FakeApp, task: worker_runtime.ContextCompactionTask) void {
+            Runtime(FakeApp).processContextCompaction(target, task, 1) catch |err| {
+                self.failure = err;
+            };
+            self.returned.store(true, .release);
+        }
+
+        fn commit(raw: *anyopaque, event: worker_runtime.ContextCompaction) !void {
+            const target: *FakeApp = @ptrCast(@alignCast(raw));
+            try app_session_runtime.Runtime(FakeApp).commitContextCompaction(target, event.summary, event.active_prefix);
+        }
+    };
+    var worker: Worker = .{};
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &worker, &app, job });
+    var joined = false;
+    defer if (!joined) {
+        app.worker.requestShutdown();
+        thread.join();
+    };
+    var events: std.ArrayList(worker_runtime.WorkerEvent) = .empty;
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    while (events.items.len < 2) {
+        var batch = app.worker.takeEvents();
+        defer batch.deinit(std.heap.c_allocator);
+        try events.appendSlice(std.heap.c_allocator, batch.items);
+        if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
+        if (events.items.len < 2) io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(events.items[1] == .context_compaction);
+    try std.testing.expect(!worker.returned.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+    app.worker.resolveContextCompaction(std.heap.c_allocator, events.items[1].context_compaction, &app, Worker.commit);
+    thread.join();
+    joined = true;
+    if (worker.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    var tail_events = app.worker.takeEvents();
+    defer tail_events.deinit(std.heap.c_allocator);
+    try events.appendSlice(std.heap.c_allocator, tail_events.items);
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
     try std.testing.expect(gateway.saw_no_tools);
     try std.testing.expectEqualStrings("openai/gpt-5.6-luna", gateway.observed_model.?);
-    var events = app.worker.takeEvents();
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     try std.testing.expectEqual(@as(usize, 3), events.items.len);
     try std.testing.expect(events.items[0] == .semantic_notice);
     try std.testing.expectEqualStrings("Compacting context…", events.items[0].semantic_notice.body);
     try std.testing.expect(events.items[1] == .context_compaction);
-    try std.testing.expect(events.items[1].context_compaction == .compacted_summary);
+    try std.testing.expect(events.items[1].context_compaction.active_prefix == null);
     try std.testing.expect(events.items[2] == .semantic_notice);
     try std.testing.expectEqualStrings("Context compacted.", events.items[2].semantic_notice.body);
+
+    app.snapshot_custom_guidance = "fixed tool guidance " ** 20_000;
+    try std.testing.expectError(error.ContextCapacityExceeded, Runtime(FakeApp).processContextCompaction(&app, job, 1));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
 }
 
 test "app agent runtime processes a cancelled queued prompt" {

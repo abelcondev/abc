@@ -733,6 +733,12 @@ pub fn handlePrompt(
             },
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
+    } else if (session.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), false, null);
+        }
     }
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
@@ -1347,6 +1353,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
@@ -1999,6 +2006,62 @@ fn persistAcpHistoryTurn(
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+}
+
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try session.session_rt.prepareHistoryEntry(ctx.alloc, .{ .compacted_summary = summary });
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
+    if (session.writable) |*writable| {
+        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, io_mod.milliTimestamp());
+        if (active_prefix != null) {
+            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+        }
+    }
+    if (comptime host_target.is_wasm) {
+        if (session.wasm_state) |*base| {
+            var next = try base.dupe(ctx.alloc);
+            var next_owned = true;
+            defer if (next_owned) next.deinit(ctx.alloc);
+            const history = try session_runtime.snapshotOwnedContextHistory(ctx.alloc, &.{prepared}, 0, 0);
+            types.freeHistoryTurnSlice(ctx.alloc, next.history);
+            next.history = history;
+            const permission_state = try session.session_rt.snapshotPermissionState(ctx.alloc);
+            next.permission_state.deinit(ctx.alloc);
+            next.permission_state = permission_state;
+            next.context_history_start = 0;
+            next.conversation_language = session.session_rt.languageSnapshot();
+            next.updated_at_ms = io_mod.milliTimestamp();
+            const model = try ctx.alloc.dupe(u8, session.model);
+            ctx.alloc.free(next.preferences.model);
+            next.preferences.model = model;
+            next.preferences.provider = session.provider;
+            next.preferences.effort = session.effort;
+            next.preferences.fast_mode = session.fast_mode;
+            const usage = try session.session_rt.usage.snapshot(ctx.alloc);
+            if (next.usage) |*old| old.deinit(ctx.alloc);
+            next.usage = usage;
+            const revision = try @import("../core/session/js_host_session_store.zig").commit(ctx.alloc, next, session.wasm_revision);
+            if (session.wasm_revision) |old| ctx.alloc.free(old);
+            base.deinit(ctx.alloc);
+            session.wasm_state = next;
+            session.wasm_revision = revision;
+            next_owned = false;
+            if (active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+        }
+    }
+    session.session_rt.commitPreparedHistoryEntry(ctx.alloc, prepared);
+    prepared_owned = false;
 }
 
 fn setRecoveryCheckpoint(

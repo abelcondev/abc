@@ -1,4 +1,6 @@
 const std = @import("std");
+const worker_runtime = @import("../agent/worker_runtime.zig");
+const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const builtin = @import("builtin");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -507,6 +509,7 @@ pub const SessionPicker = struct {
 
 const SessionPickerCatalogCache = struct {
     ready: bool = false,
+    loaded_at_ns: i128 = 0,
     active_id: ?[]u8 = null,
     catalog: subagent_resume_admission.ActionableSessionCatalog = .{},
 
@@ -524,6 +527,12 @@ const SessionPickerCatalogCache = struct {
         return self.ready and optionalStringEql(self.active_id, active_id);
     }
 
+    fn isFresh(self: *const SessionPickerCatalogCache) bool {
+        const now_ns = io_mod.nanoTimestamp();
+        return self.ready and now_ns >= self.loaded_at_ns and
+            now_ns - self.loaded_at_ns <= 5 * std.time.ns_per_s;
+    }
+
     fn install(
         self: *SessionPickerCatalogCache,
         source: *subagent_resume_admission.ActionableSessionCatalog,
@@ -535,6 +544,7 @@ const SessionPickerCatalogCache = struct {
         self.deinit();
         self.* = .{
             .ready = true,
+            .loaded_at_ns = io_mod.nanoTimestamp(),
             .active_id = owned_active_id,
             .catalog = source.*,
         };
@@ -560,7 +570,7 @@ fn sessionPickerCacheForScope(
 fn replaceSessionPickerPage(
     picker: *SessionPicker,
     alloc: Allocator,
-    source: *const subagent_resume_admission.ActionableSessionPage,
+    source: *const session_store.ResumableSessionPage,
 ) !void {
     var replacement: std.ArrayList(session_store.SessionSummary) = .empty;
     errdefer {
@@ -588,13 +598,36 @@ fn applySessionPickerCatalogPage(
     limit: usize,
     append: bool,
 ) !void {
-    var page = try subagent_resume_admission.actionablePageFromCatalog(
+    var selected_index: ?usize = null;
+    var page_limit = limit;
+    if (!append) {
+        page_limit = @max(page_limit, picker.summaries.items.len);
+        if (picker.selectedId()) |selected_id| {
+            for (cache.catalog.summaries.items, 0..) |summary, index| {
+                if (!std.mem.eql(u8, summary.id, selected_id)) continue;
+                selected_index = index;
+                page_limit = @max(page_limit, index + 1);
+                break;
+            }
+        }
+    }
+    var page = try session_summary_codec.resumablePageFromSummaries(
         alloc,
-        &cache.catalog,
+        cache.catalog.summaries.items,
+        null,
+        null,
         continuation,
-        limit,
+        page_limit,
     );
     defer page.deinit(alloc);
+    var next: ?subagent_resume_admission.ActionableContinuation = if (page.has_more and page.summaries.items.len > 0) blk: {
+        const last = page.summaries.items[page.summaries.items.len - 1];
+        break :blk .{
+            .updated_at_ms = last.updated_at_ms,
+            .id = try alloc.dupe(u8, last.id),
+        };
+    } else null;
+    defer if (next) |*value| value.deinit(alloc);
     const previous_filtered_count = picker.filteredItemCount();
     const selected_load_more = append and
         picker.selected == previous_filtered_count;
@@ -604,12 +637,21 @@ fn applySessionPickerCatalogPage(
         try replaceSessionPickerPage(picker, alloc, &page);
     }
     if (picker.continuation) |*prior| prior.deinit(alloc);
-    picker.continuation = page.continuation;
-    page.continuation = null;
+    picker.continuation = next;
+    next = null;
     picker.has_more = page.has_more;
     picker.loading_more = false;
     picker.load_state = .ready;
-    if (selected_load_more) {
+    if (!append) {
+        if (selected_index) |index| {
+            picker.selected = session_catalog.filteredCount(
+                picker.summaries.items[0..index],
+                picker.query(),
+            );
+        }
+        picker.selected = @min(picker.selected, picker.filteredItemCount() -| 1);
+        picker.window_start = @min(picker.window_start, picker.selected);
+    } else if (selected_load_more) {
         picker.selected = selectionAfterLoadedPage(
             previous_filtered_count,
             picker.filteredItemCount(),
@@ -956,6 +998,7 @@ const PendingCancelledCommand = struct {
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
+    // UI compaction publication takes worker_mutex before this mutex.
     write_mutex: std.Io.Mutex = .init,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
@@ -1770,6 +1813,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 session_store.default_resume_page_limit;
             const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
+            var cache_visible = false;
             if (cache.matches(active_id)) {
                 try applySessionPickerCatalogPage(
                     picker,
@@ -1779,8 +1823,11 @@ pub fn Runtime(comptime App: type) type {
                     limit,
                     false,
                 );
-                picker.generation = app.session_persistence.session_picker_load.allocateGeneration();
-                return;
+                cache_visible = true;
+                if (cache.isFresh()) {
+                    picker.generation = app.session_persistence.session_picker_load.allocateGeneration();
+                    return;
+                }
             }
 
             const loader = &app.session_persistence.session_picker_load;
@@ -1794,13 +1841,13 @@ pub fn Runtime(comptime App: type) type {
                 active_id,
                 limit,
             ) catch |err| {
-                picker.load_state = .failed;
+                if (!cache_visible) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
                 return;
             };
             picker.generation = request.generation;
             loader.schedule(store, request) catch |err| {
-                picker.load_state = .failed;
+                if (!cache_visible) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
                 return;
             };
@@ -1819,7 +1866,7 @@ pub fn Runtime(comptime App: type) type {
             const loader = &app.session_persistence.session_picker_load;
             for ([_]SessionPickerScope{ .current_workspace, .all_workspaces }) |scope| {
                 const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
-                if (cache.matches(active_id)) continue;
+                if (cache.matches(active_id) and cache.isFresh()) continue;
                 if (loader.matchingInitialGeneration(scope, active_id, limit) != null) continue;
                 const request = SessionPickerLoad.PageRequest.init(
                     loader.allocateGeneration(),
@@ -1888,7 +1935,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
             } else if (task.failure) |err| {
-                picker.load_state = .failed;
+                if (picker.load_state != .ready) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
             } else {
                 const cache = sessionPickerCacheForScope(
@@ -2173,6 +2220,36 @@ pub fn Runtime(comptime App: type) type {
 
             app.session.setConversationLanguageFromUserMessage(checkpoint.user.text);
             return app.queueRecoveryCheckpoint(&checkpoint);
+        }
+
+        pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else return null;
+            if (!loaded.conversation_writer.turn_open) return null;
+            const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
+            return try value.dupe(alloc);
+        }
+
+        pub fn prepareFreshPrompt(app: *App, request: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+            const alloc = std.heap.c_allocator;
+            var source: std.ArrayList(types.HistoryTurn) = .empty;
+            defer source.deinit(alloc);
+            try source.appendSlice(alloc, app.session.agent.history.items);
+            try source.append(alloc, request.prior_turn);
+            const history = try session_runtime.snapshotOwnedContextHistory(alloc, source.items, 0, 0);
+            errdefer types.freeHistoryTurnSlice(alloc, history);
+            const images = try session_runtime.collect_image_catalog(alloc, history, request.user.images);
+            errdefer types.freeImageAttachmentSlice(alloc, images);
+            const intent = try auto_classifier_context.buildCanonicalRootUserContext(alloc, request.user.text, history);
+            errdefer alloc.free(intent);
+            try appendHistoryTurn(app, request.prior_turn);
+            return .{
+                .history = history,
+                .authorized_image_catalog = images,
+                .root_user_intent_context = intent,
+                .unversioned_history_count = app.session.unversionedHistoryEnd(),
+            };
         }
 
         pub fn appendHistoryTurnForVisualEpoch(
@@ -2635,6 +2712,7 @@ pub fn Runtime(comptime App: type) type {
             if (!try loaded.renameConversation(app.alloc, title)) {
                 return error.UnsupportedSessionFormat;
             }
+            invalidateSessionPickerCaches(app);
         }
 
         pub fn activeSessionDisplayPath(
@@ -4262,6 +4340,45 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn commitContextCompaction(
+            app: *App,
+            summary: types.CompactedSummaryHistoryTurn,
+            active_prefix: ?types.AssistantHistoryTurn,
+        ) !void {
+            const prepared = try app.session.prepareHistoryEntry(app.alloc, .{ .compacted_summary = summary });
+            var prepared_owned = true;
+            defer if (prepared_owned) types.freeHistoryTurn(app.alloc, prepared);
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (app.session_persistence.writable) |*loaded| {
+                    _ = try loaded.commitContextCompaction(
+                        app.alloc,
+                        summary,
+                        active_prefix,
+                        io_mod.milliTimestamp(),
+                    );
+                } else if (app.session_persistence.js_host_session) |*owner| {
+                    var next = try snapshotCurrentState(app, owner.state, io_mod.milliTimestamp());
+                    var next_owned = true;
+                    defer if (next_owned) next.deinit(app.alloc);
+                    const history = try session_runtime.snapshotOwnedContextHistory(app.alloc, &.{prepared}, 0, 0);
+                    types.freeHistoryTurnSlice(app.alloc, next.history);
+                    next.history = history;
+                    next.context_history_start = 0;
+                    const revision = try app.session_persistence.js_host_store.commit(app.alloc, next, owner.revision);
+                    if (owner.revision) |old| app.alloc.free(old);
+                    owner.state.deinit(app.alloc);
+                    owner.state = next;
+                    owner.revision = revision;
+                    next_owned = false;
+                    if (owner.state.usage) |usage| app.session.usage.markClean(usage);
+                }
+            }
+            app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+            prepared_owned = false;
+        }
+
         pub fn commitPermissionState(
             app: *App,
             permission_state: session_permission_state.State,
@@ -5213,6 +5330,37 @@ test "js-host resume restores transcript context preferences usage and revision"
         "revision-1",
         app.session_persistence.js_host_session.?.revision.?,
     );
+}
+
+test "js-host compaction store failure preserves live history and revision" {
+    const alloc = std.testing.allocator;
+    var fake: FakeJsHostSessionStore = .{
+        .state = try makeJsHostTestState(alloc, "saved-session", "old request", "old reply"),
+        .commit_error = error.SessionRevisionConflict,
+    };
+    defer fake.deinit(alloc);
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    app.session_persistence.js_host_store = fake.store();
+    app.requested_resume = .last;
+    try Runtime(TestApp).resumeRequestedJsHostSession(&app);
+    const summary: types.CompactedSummaryHistoryTurn = .{
+        .summary = @constCast("<context_handoff>new summary</context_handoff>"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    };
+    try std.testing.expectError(error.SessionRevisionConflict, Runtime(TestApp).commitContextCompaction(&app, summary, null));
+    try std.testing.expectEqualStrings("old reply", app.session.agent.history.items[0].assistant.assistant);
+    try std.testing.expectEqualStrings("revision-1", app.session_persistence.js_host_session.?.revision.?);
+    try std.testing.expect(fake.committed_state == null);
+    fake.commit_error = null;
+    try Runtime(TestApp).commitContextCompaction(&app, summary, null);
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    try std.testing.expect(app.session.agent.history.items[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("revision-next", app.session_persistence.js_host_session.?.revision.?);
+    try std.testing.expectEqualStrings("revision-1", fake.expected_revision.?);
+    try std.testing.expectEqualStrings(summary.summary, fake.committed_state.?.history[0].compacted_summary.summary);
 }
 
 test "js-host resume store failures and missing records fall back to fresh sessions" {
@@ -7919,6 +8067,62 @@ test "appendHistoryTurn commits conversation without copying runtime counters" {
     try std.testing.expectEqual(@as(u64, 0), loaded.total_output_tokens);
 }
 
+test "fresh TUI prompt preparation preserves equal user text as distinct turns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).commitContextCompaction(&app, .{
+        .summary = @constCast("<context_handoff>unfinished request</context_handoff>"),
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+    }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") });
+    const checkpoint: session_codec.RecoveryCheckpoint = .{
+        .turn_id = 41,
+        .user = .{ .text = @constCast("same prompt") },
+        .assistant_source = @constCast("partial old response"),
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 2,
+    };
+    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
+    var prepared = try Runtime(TestApp).prepareFreshPrompt(&app, .{
+        .user = .{ .text = @constCast("same prompt") },
+        .prior_turn = checkpoint.interruptedTurn(),
+    });
+    defer prepared.deinit(std.heap.c_allocator);
+    try std.testing.expectEqual(@as(usize, 2), prepared.history.len);
+    try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+    try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+        .user = .{ .text = @constCast("same prompt") },
+        .assistant = @constCast("new answer"),
+    } });
+    var page = try app.session_persistence.store.?.loadHistoryPage(alloc, app.session_persistence.writable.?.active_id, null, 10);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), page.turns.len);
+    try std.testing.expect(page.turns[0] == .interrupted);
+    try std.testing.expectEqualStrings("partial old response", page.turns[0].interrupted.assistant.?);
+    try std.testing.expectEqualStrings("same prompt", page.turns[1].assistant.user.text);
+    try std.testing.expectEqualStrings("new answer", page.turns[1].assistant.assistant);
+}
+
 test "context checkpoint persists before releasing summarized model memory" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7943,11 +8147,20 @@ test "context checkpoint persists before releasing summarized model memory" {
     defer session_runtime.freeHistoryTurn(alloc, second);
     try Runtime(TestApp).appendHistoryTurn(&app, first);
     try Runtime(TestApp).appendHistoryTurn(&app, second);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .compacted_summary = .{
+    const summary: types.CompactedSummaryHistoryTurn = .{
         .summary = @constCast("<context_handoff>both turns</context_handoff>"),
         .removed_turn_count = 2,
         .compaction_count = 1,
-    } });
+    };
+    const writer = &app.session_persistence.writable.?.conversation_writer;
+    const saved_seq = writer.last_seq;
+    const saved_bytes = writer.committed_bytes;
+    writer.last_seq = std.math.maxInt(u64);
+    try std.testing.expectError(error.ConversationSequenceOverflow, Runtime(TestApp).commitContextCompaction(&app, summary, null));
+    writer.last_seq = saved_seq;
+    try std.testing.expectEqual(saved_bytes, writer.committed_bytes);
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    try Runtime(TestApp).commitContextCompaction(&app, summary, null);
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(
@@ -8319,6 +8532,22 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
     );
 
     Runtime(TestApp).cancelSessionPicker(&app);
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        "external-session",
+        &history,
+        0,
+    );
+    {
+        var renamed = try app.session_persistence.store.?.resumeForWrite(
+            alloc,
+            "cached-session",
+        );
+        defer renamed.deinit(alloc);
+        try std.testing.expect(try renamed.renameConversation(alloc, "renamed externally"));
+    }
+    app.session_persistence.session_picker_current_cache.loaded_at_ns = 0;
     try Runtime(TestApp).openSessionPicker(&app);
 
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
@@ -8326,6 +8555,74 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
         "cached-session",
         app.session_persistence.session_picker.selectedId().?,
     );
+    try waitForSessionPickerPrewarm(&app);
+    const picker = &app.session_persistence.session_picker;
+    try std.testing.expectEqual(@as(usize, 2), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("cached-session", picker.selectedId().?);
+    const renamed = session_catalog.summaryAt(picker.summaries.items, "renamed externally", 0);
+    try std.testing.expect(renamed != null);
+    try std.testing.expectEqualStrings("cached-session", renamed.?.id);
+
+    Runtime(TestApp).cancelSessionPicker(&app);
+    {
+        var removed = try app.session_persistence.store.?.resumeForWrite(
+            alloc,
+            "external-session",
+        );
+        _ = app.session_persistence.store.?.deleteCommittedSession(alloc, &removed);
+    }
+    app.session_persistence.session_picker_current_cache.loaded_at_ns = 0;
+    try Runtime(TestApp).openSessionPicker(&app);
+    try waitForSessionPickerPrewarm(&app);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("cached-session", picker.selectedId().?);
+}
+
+test "session picker refresh preserves selection and loaded pagination" {
+    const alloc = std.testing.allocator;
+    var cache: SessionPickerCatalogCache = .{};
+    defer cache.catalog.deinit(alloc);
+    var picker: SessionPicker = .{ .active = true };
+    defer picker.deinit(alloc);
+
+    for ([_][]const u8{ "one", "two", "three" }, 0..) |id, index| {
+        var summary = try session_summary_codec.cloneSessionSummary(alloc, .{
+            .id = @constCast(id),
+            .created_at_ms = 1,
+            .updated_at_ms = @intCast(3 - index),
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        });
+        errdefer summary.deinit(alloc);
+        try cache.catalog.summaries.append(alloc, summary);
+    }
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, null, 1, false);
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, picker.continuation.?.view(), 1, true);
+    picker.selected = 1;
+    try std.testing.expectEqualStrings("two", picker.selectedId().?);
+
+    var added = try session_summary_codec.cloneSessionSummary(alloc, .{
+        .id = @constCast("new"),
+        .created_at_ms = 4,
+        .updated_at_ms = 4,
+        .conversation_language = .literal("en"),
+        .history_len = 1,
+    });
+    cache.catalog.summaries.insert(alloc, 0, added) catch |err| {
+        added.deinit(alloc);
+        return err;
+    };
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, null, 1, false);
+    try std.testing.expectEqual(@as(usize, 3), picker.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), picker.selected);
+    try std.testing.expectEqualStrings("two", picker.selectedId().?);
+    try std.testing.expectEqualStrings("two", picker.continuation.?.id);
+
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, picker.continuation.?.view(), 1, true);
+    try std.testing.expectEqual(@as(usize, 4), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("three", picker.summaries.items[3].id);
+    try std.testing.expect(!picker.has_more);
+    try std.testing.expectEqualStrings("two", picker.selectedId().?);
 }
 
 test "session picker prewarms current and all workspace pages before opening" {

@@ -129,53 +129,56 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
-  test("writable resume truncates a complete-record unfinished turn", async () => {
-    const fixture = createFixture("fx-session-unfinished-turn-");
-    const gateway = startFakeGateway([
-      fakeGatewayFinalText("FIRST_TURN_SAVED"),
-      fakeGatewayFinalText("UNFINISHED_TURN_RECOVERED"),
-    ]);
-    try {
-      const sessionId = await createSavedSession(fixture, gateway);
-      const eventsPath = join(
-        fixture.home,
-        ".fx",
-        "sessions",
-        sessionId,
-        "events.jsonl",
-      );
-      const committed = readFileSync(eventsPath, "utf8");
-      const lines = committed.trimEnd().split("\n");
-      const last = JSON.parse(lines[lines.length - 1]!);
-      appendFileSync(eventsPath, JSON.stringify({
-        schema_version: 1,
-        seq: last.seq + 1,
-        timestamp_ms: Date.now(),
-        event: {
-          user: {
-            text: "DANGLING_USER_MUST_NOT_REPLAY",
-            images: [],
-            work_id: null,
+  for (const partialNextRecord of [false, true]) {
+    test(`writable resume truncates an unfinished turn with partial next record=${partialNextRecord}`, async () => {
+      const fixture = createFixture("fx-session-unfinished-turn-");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("FIRST_TURN_SAVED"),
+        fakeGatewayFinalText("UNFINISHED_TURN_RECOVERED"),
+      ]);
+      try {
+        const sessionId = await createSavedSession(fixture, gateway);
+        const eventsPath = join(
+          fixture.home,
+          ".fx",
+          "sessions",
+          sessionId,
+          "events.jsonl",
+        );
+        const committed = readFileSync(eventsPath, "utf8");
+        const lines = committed.trimEnd().split("\n");
+        const last = JSON.parse(lines[lines.length - 1]!);
+        appendFileSync(eventsPath, JSON.stringify({
+          schema_version: 1,
+          seq: last.seq + 1,
+          timestamp_ms: Date.now(),
+          event: {
+            user: {
+              text: "DANGLING_USER_MUST_NOT_REPLAY",
+              images: [],
+              work_id: null,
+            },
           },
-        },
-      }) + "\n");
+        }) + "\n");
+        if (partialNextRecord) appendFileSync(eventsPath, '{"schema_version":1,"event":');
 
-      const resumed = await continueSession(fixture, gateway, sessionId);
-      expect(resumed.code).toBe(0);
-      expect(resumed.stderr).toBe("");
-      expect(JSON.parse(resumed.stdout).output).toBe("UNFINISHED_TURN_RECOVERED");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1]!.body).not.toContain(
-        "DANGLING_USER_MUST_NOT_REPLAY",
-      );
-      expect(readFileSync(eventsPath, "utf8")).not.toContain(
-        "DANGLING_USER_MUST_NOT_REPLAY",
-      );
-    } finally {
-      gateway.stop();
-      rmSync(fixture.root, { recursive: true, force: true });
-    }
-  }, TIMEOUT);
+        const resumed = await continueSession(fixture, gateway, sessionId);
+        expect(resumed.code).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(JSON.parse(resumed.stdout).output).toBe("UNFINISHED_TURN_RECOVERED");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).not.toContain(
+          "DANGLING_USER_MUST_NOT_REPLAY",
+        );
+        expect(readFileSync(eventsPath, "utf8")).not.toContain(
+          "DANGLING_USER_MUST_NOT_REPLAY",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
 
   test("committed-history corruption fails closed without rewriting JSONL", async () => {
     const fixture = createFixture("fx-session-middle-corruption-");

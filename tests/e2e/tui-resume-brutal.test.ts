@@ -232,7 +232,11 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
-      env: gatewayEnv(paths.home, gateway),
+      env: {
+        ...gatewayEnv(paths.home, gateway),
+        FX_TRACE_LOG: paths.trace,
+        FX_TRACE_SCOPES: "prompt,session,context_compaction,worker",
+      },
       stderrPath: paths.stderr,
       width: 104,
       height: 30,
@@ -243,13 +247,21 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText(`${REAL_TITLE}: build the prepared long chat and tool history.`);
-    await session.waitForText(FINAL_MARKER, TIMEOUT * 20);
+    await session.waitForPane((pane) =>
+      stripAnsi(pane).includes(FINAL_MARKER) && hasEmptyComposer(pane),
+    TIMEOUT * 20);
+    const savedSessionsRoot = join(paths.home, ".fx", "sessions");
+    await session.waitForPane(() => readdirSync(savedSessionsRoot).some((id) => {
+      const path = join(savedSessionsRoot, id, "events.jsonl");
+      return existsSync(path) && readFileSync(path, "utf8").includes('"turn_completed"');
+    }), TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
   } finally {
     if (session) await session.kill();
     gateway.stop();
   }
+  expect(readFileSync(paths.stderr, "utf8")).toBe("");
 
   const sessionsRoot = join(paths.home, ".fx", "sessions");
   const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })

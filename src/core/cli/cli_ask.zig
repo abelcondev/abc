@@ -1560,6 +1560,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    } else if (ctx.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
+            defer ctx.prompt_snapshot_committed = prompt_snapshot_committed;
+            try propagateHistoryTurn(&ctx, checkpoint.interruptedTurn());
+        }
     }
 
     var routed_credential: ?credentials.Credential = null;
@@ -1994,6 +2002,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCallAuthorized,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
@@ -2875,6 +2884,23 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
+}
+
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, .{ .compacted_summary = summary });
+    errdefer types.freeHistoryTurn(ctx.alloc, prepared);
+    if (ctx.writable) |*writable| {
+        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, io_mod.milliTimestamp());
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    }
+    ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
 }
 
 fn setRecoveryCheckpoint(
@@ -8522,6 +8548,89 @@ test "json run with missing API key prints diagnostic then final object" {
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
+}
+
+test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+    const Process = struct {
+        fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+            if (job.recovery_checkpoint) |checkpoint| {
+                try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
+                try std.testing.expectEqualStrings("original request", job.prompt);
+            }
+            try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+                .user = .{ .text = job.prompt },
+                .assistant = @constCast("new answer"),
+            } });
+            try testPushAssistantText(deps, "new answer");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { prompt: [:0]const u8, continue_recovery: bool = false }{
+        .{ .prompt = "different request" },
+        .{ .prompt = "original request" },
+        .{ .prompt = "original request", .continue_recovery = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+        const session_id = "retained-open-session";
+        var store = try session_store.Store.initFromHome(alloc, home, "/tmp/fx-test");
+        defer store.deinit(alloc);
+        var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
+        defer state.deinit(alloc);
+        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        {
+            var writable = try store.startWritableSession(alloc, state);
+            defer writable.deinit(alloc);
+            _ = try writable.commitContextCompaction(alloc, .{
+                .summary = @constCast("<context_handoff>Earlier work completed.</context_handoff>"),
+                .removed_turn_count = 0,
+                .compaction_count = 1,
+            }, .{ .user = old_user, .assistant = @constCast("") }, 10);
+            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+                .turn_id = 7,
+                .user = old_user,
+                .assistant_source = @constCast("old partial answer"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 3,
+                .consumed_provider_attempts = 1,
+            } } }, 20);
+        }
+
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = Process.run;
+        const args: []const [:0]const u8 = if (case.continue_recovery)
+            &.{ "--json", "--resume-id", session_id, "--continue-recovery" }
+        else
+            &.{ "--json", "--resume-id", session_id, case.prompt };
+        try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, args, testConfig(), deps));
+
+        var restored = try store.loadReadOnly(alloc, session_id);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (case.continue_recovery) 2 else 3), restored.history.len);
+        if (!case.continue_recovery) {
+            try std.testing.expect(restored.history[1] == .interrupted);
+            try std.testing.expectEqualStrings("original request", restored.history[1].interrupted.user.text);
+            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
+        }
+        const last = restored.history[restored.history.len - 1].assistant;
+        try std.testing.expectEqualStrings(case.prompt, last.user.text);
+        try std.testing.expectEqualStrings("new answer", last.assistant);
+        try std.testing.expect(restored.recovery_checkpoint == null);
+    }
 }
 
 test "recovery continuation checks local checkpoint before credentials" {

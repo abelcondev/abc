@@ -3172,6 +3172,7 @@ noinline fn recoveryCheckpointAssistantSource(
 
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
     arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
@@ -3199,7 +3200,7 @@ fn persistRecoveryCheckpoint(
             .images = job.images,
         },
         .assistant_source = @constCast(assistant_source),
-        .execution = execution,
+        .execution = try finalization.compacted_execution.project(arena, execution),
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
@@ -4061,21 +4062,7 @@ fn processQueuedPromptInner(
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
 
-    if (config.system_prompt.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.system_prompt });
-    }
-    if (config.custom_tool_guidance.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
-    }
-    if (config.skills_prompt_section.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.skills_prompt_section });
-    }
-    if (config.model_prompt_overlay) |overlay| {
-        try stable_prefix.append(arena, .{ .role = .system, .content = overlay });
-    }
-    if (deps.append_static_context) |append_static_context| {
-        try append_static_context(deps.ctx, arena, &stable_prefix);
-    }
+    try appendStablePromptContext(arena, deps, config, &stable_prefix);
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
@@ -4535,9 +4522,17 @@ fn buildCanonicalCompactionWindow(
     within_turn_suffix: []const ChatMessage,
     uncertain_history_count: usize,
     uncertain_message_count: *usize,
+    handoff: ?[]const u8,
+    compacted_suffix_len: usize,
 ) !std.ArrayList(ChatMessage) {
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
+    if (handoff) |summary| {
+        uncertain_message_count.* = 0;
+        try messages.append(alloc, .{ .role = .user, .content = summary, .cache_policy = .no_cache });
+        try messages.appendSlice(alloc, within_turn_suffix[compacted_suffix_len..]);
+        return messages;
+    }
     uncertain_message_count.* = try session_runtime.appendCompactionHistoryChatMessages(
         alloc,
         &messages,
@@ -4573,6 +4568,8 @@ test "repeated compaction source keeps canonical history and the complete active
         &suffix,
         0,
         &uncertain_message_count,
+        null,
+        0,
     );
     defer messages.deinit(std.testing.allocator);
 
@@ -4603,7 +4600,7 @@ test "current checkpoint excludes uncertain raw prefix from repeated compaction"
         .{ .role = .tool, .content = "new result" },
     };
     var uncertain_message_count: usize = 0;
-    var messages = try buildCanonicalCompactionWindow(arena, &history, &suffix, 1, &uncertain_message_count);
+    var messages = try buildCanonicalCompactionWindow(arena, &history, &suffix, 1, &uncertain_message_count, null, 0);
     defer messages.deinit(arena);
     try std.testing.expectEqual(@as(usize, 5), messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), uncertain_message_count);
@@ -4629,11 +4626,100 @@ fn latestCompactionCount(history: []const HistoryTurn) usize {
 fn commitContextCompaction(
     deps: *const AgentRuntimeDeps,
     summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
 ) !void {
     if (deps.commit_context_compaction) |effect| {
-        return effect.commit(deps.ctx, summary);
+        return effect.commit(deps.ctx, summary, active_prefix);
     }
+    if (active_prefix != null) return error.ContextCompactionUnavailable;
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
+}
+
+fn appendStablePromptContext(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    messages: *std.ArrayList(ChatMessage),
+) !void {
+    for ([_][]const u8{
+        config.system_prompt,
+        config.custom_tool_guidance,
+        config.skills_prompt_section,
+    }) |content| {
+        if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
+    }
+    if (config.model_prompt_overlay) |overlay| {
+        try messages.append(alloc, .{ .role = .system, .content = overlay });
+    }
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, messages);
+}
+
+const CompactionContinuation = struct {
+    request: agent_stream_provider.RequestData,
+    handoff_message_index: usize,
+
+    fn measure(
+        self: CompactionContinuation,
+        alloc: Allocator,
+        provider: agent_stream_provider.Provider,
+        handoff: []const u8,
+    ) !runtime_prompt_context.RequestCost {
+        const messages = try alloc.dupe(ChatMessage, self.request.messages);
+        defer alloc.free(messages);
+        std.debug.assert(messages[self.handoff_message_index].role == .user);
+        messages[self.handoff_message_index].content = handoff;
+        var candidate = self.request;
+        candidate.messages = messages;
+        const body = (try provider.buildRequest(alloc, candidate)) orelse
+            return error.ContextCompactionUnavailable;
+        defer alloc.free(body);
+        return runtime_prompt_context.measureProviderRequest(body);
+    }
+};
+
+/// Builds arena-owned fixed request inputs for manual compaction without
+/// starting a model turn. The empty user message is the checkpoint slot.
+pub fn prepareManualCompactionContinuation(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    model: []const u8,
+    capabilities: model_capabilities.Capabilities,
+) !CompactionContinuation {
+    var stable_prefix: std.ArrayList(ChatMessage) = .empty;
+    try appendStablePromptContext(arena, deps, config, &stable_prefix);
+    var overlay: std.ArrayList(ChatMessage) = .empty;
+    try deps.append_runtime_context(deps.ctx, arena, &overlay);
+    const projection = try build_gateway_messages_with_response_language_control(
+        arena,
+        stable_prefix.items,
+        overlay.items,
+        &.{},
+        .{ .role = .user, .content = "", .cache_policy = .no_cache },
+        &.{},
+        config.origin,
+        config.enforce_response_language,
+        false,
+        null,
+        &.{},
+        0,
+    );
+    return .{
+        .request = .{
+            .model = model,
+            .messages = projection.messages.items,
+            .tools = .{
+                .registry = deps.tool_registry,
+                .advertised_names = config.advertised_tool_names,
+                .advertised_functions = config.advertised_functions,
+            },
+            .tool_choice = config.first_call_tool_choice,
+            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode),
+            .max_output_tokens = request_max_output_tokens(capabilities),
+            .budget = .{ .cancel_flag = config.cancel_flag },
+        },
+        .handoff_message_index = projection.current_user_index,
+    };
 }
 
 pub const ContextCompactionTransactionRequest = struct {
@@ -4642,7 +4728,8 @@ pub const ContextCompactionTransactionRequest = struct {
     working_capabilities: model_capabilities.Capabilities,
     request_tokens: usize,
     source_tokens: usize,
-    protected_tokens: usize,
+    continuation: CompactionContinuation,
+    active_prefix: ?types.AssistantHistoryTurn = null,
     source_messages: []ChatMessage,
     uncertain_source_message_count: usize = 0,
     result_storage: runtime_context_compaction.ResultStorage,
@@ -4674,14 +4761,16 @@ pub fn compactContextTransaction(
     request: ContextCompactionTransactionRequest,
 ) !?ContextCompactionTransactionResult {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const plan = runtime_prompt_context.planCompaction(.{
+    var plan_input = runtime_prompt_context.CompactionPlanInput{
         .trigger = request.trigger,
         .capabilities = request.working_capabilities,
         .request_tokens = request.request_tokens,
         .source_tokens = request.source_tokens,
-        .protected_tokens = request.protected_tokens,
-    });
-    if (plan.decision == .no_op) return null;
+    };
+    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) return null;
+    const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
+    plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
+    const plan = runtime_prompt_context.planCompaction(plan_input);
     const accepted_tokens = plan.accepted_handoff_tokens orelse
         return error.ContextCapacityExceeded;
     const generation_tokens = plan.generation_tokens orelse
@@ -4747,17 +4836,22 @@ pub fn compactContextTransaction(
     );
     errdefer compacted.deinit(alloc);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
+    if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
+        return error.ContextCapacityExceeded;
+    }
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     try commitContextCompaction(deps, .{
         .summary = compacted.handoff,
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
-    });
+    }, request.active_prefix);
     if (deps.push_interactive_notice) |push_notice| {
-        try push_notice(deps.ctx, .{
+        push_notice(deps.ctx, .{
             .topic = "context",
             .tone = .neutral,
             .body = "Context compacted.",
-        });
+        }) catch |err| debug_trace.logf("context_compaction", "completed notice unavailable err={s}", .{@errorName(err)});
     }
     return .{
         .compacted = compacted,
@@ -5127,6 +5221,7 @@ fn processQueuedPromptLoop(
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5164,6 +5259,7 @@ fn processQueuedPromptLoop(
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5398,9 +5494,6 @@ fn processQueuedPromptLoop(
                         request_cost.estimated_input_tokens
                     else
                         0,
-                    .protected_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                        &.{current_user_effective},
-                    ),
                 });
                 debug_trace.eventf(
                     "context_compaction",
@@ -5449,6 +5542,8 @@ fn processQueuedPromptLoop(
                             within_turn_suffix.items,
                             uncertain_history_count,
                             &uncertain_message_count,
+                            active_compaction_handoff,
+                            compacted_suffix_len,
                         );
                         defer compaction_messages.deinit(arena);
                         const result_storage: runtime_context_compaction.ResultStorage =
@@ -5459,22 +5554,58 @@ fn processQueuedPromptLoop(
                             else
                                 .unavailable;
                         const compaction_source_message_count = compaction_messages.items.len;
-                        const prompt_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                            &.{current_user_effective},
+                        const continuation_projection = try build_gateway_messages_with_response_language_control(
+                            overlay_arena,
+                            stable_prefix.items,
+                            ephemeral_overlay.items,
+                            &.{},
+                            current_user_effective,
+                            &.{},
+                            config.origin,
+                            config.enforce_response_language,
+                            response_language_correction_attempted,
+                            "",
+                            &.{},
+                            0,
                         );
+                        const continuation_source = try appendReadFailureRecoveryContext(
+                            overlay_arena,
+                            continuation_projection.messages.items,
+                            recovery_strategy,
+                            try recoveryCheckpointAssistantSource(arena, stop_state, stream_ctx.accepted_source()),
+                        );
+                        var continuation_request = request_data;
+                        continuation_request.messages = if (vision_policy.route == .fallback)
+                            try runtime_vision_contracts.project_text_only_messages(
+                                overlay_arena,
+                                continuation_source,
+                                continuation_projection.current_user_index,
+                                job.authorized_image_catalog,
+                            )
+                        else
+                            continuation_source;
                         const next_compaction_history_tail: []const ChatMessage = &.{};
                         const next_compacted_suffix_len = within_turn_suffix.items.len;
                         const raw_history_turns = session_runtime.rawHistoryTurnCount(
                             job.history,
                         );
                         const next_compaction_count = compaction_count + 1;
+                        const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
                         const transaction_result = compactContextTransaction(arena, deps, .{
                             .trigger = compaction_trigger,
                             .provider = job.provider,
                             .working_capabilities = request_capabilities,
                             .request_tokens = request_cost.estimated_input_tokens,
                             .source_tokens = request_cost.estimated_input_tokens,
-                            .protected_tokens = prompt_tokens,
+                            .continuation = .{
+                                .request = continuation_request,
+                                .handoff_message_index = continuation_projection.current_user_index - 1,
+                            },
+                            .active_prefix = if (within_turn_suffix.items.len > compacted_suffix_len) .{
+                                .user = .{ .text = job.prompt, .images = job.images },
+                                .assistant = @constCast(""),
+                                .execution = prefix_execution,
+                            } else null,
                             .source_messages = compaction_messages.items[0..compaction_source_message_count],
                             .uncertain_source_message_count = @min(
                                 uncertain_message_count,
@@ -5517,6 +5648,10 @@ fn processQueuedPromptLoop(
                         active_compaction_handoff = transaction.compacted.handoff;
                         active_compaction_history_tail = next_compaction_history_tail;
                         compacted_suffix_len = next_compacted_suffix_len;
+                        finalization.compacted_execution = .{
+                            .tool_steps = finalization.compacted_execution.tool_steps + prefix_execution.tool_steps.len,
+                            .steering = finalization.compacted_execution.steering + prefix_execution.steering.len,
+                        };
                         compaction_count = next_compaction_count;
                         if (context_overflow_recovery == .pending) {
                             context_overflow_recovery = .used;
@@ -5544,6 +5679,7 @@ fn processQueuedPromptLoop(
             if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5640,6 +5776,7 @@ fn processQueuedPromptLoop(
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -5737,6 +5874,7 @@ fn processQueuedPromptLoop(
                 }
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5779,6 +5917,7 @@ fn processQueuedPromptLoop(
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6046,6 +6185,7 @@ fn processQueuedPromptLoop(
                 );
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -6139,6 +6279,7 @@ fn processQueuedPromptLoop(
             {
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -6235,6 +6376,7 @@ fn processQueuedPromptLoop(
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6275,6 +6417,7 @@ fn processQueuedPromptLoop(
                     if (route_changed) {
                         try persistRecoveryCheckpoint(
                             deps,
+                            finalization,
                             arena,
                             job,
                             within_turn_suffix.items,
@@ -6569,6 +6712,7 @@ fn processQueuedPromptLoop(
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6608,6 +6752,7 @@ fn processQueuedPromptLoop(
                     if (route_changed) {
                         try persistRecoveryCheckpoint(
                             deps,
+                            finalization,
                             arena,
                             job,
                             within_turn_suffix.items,
@@ -7136,7 +7281,7 @@ fn processQueuedPromptLoop(
             var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
-                .execution = finish_execution,
+                .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -10060,7 +10205,7 @@ fn finishFailedTurnWithNotice(
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
-        .execution = execution_memory,
+        .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

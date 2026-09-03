@@ -668,6 +668,7 @@ fn handleRestoreSession(
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, session_id);
     defer alloc.free(session_dir);
 
+    writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
@@ -2007,6 +2008,15 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
+        _ = try new_writable.appendEvent(arena, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("remember this") },
+                .assistant = @constCast("retained answer"),
+            } },
+        } }, io_mod.milliTimestamp());
         const session_id = try alloc.dupe(u8, new_active.session_id);
         defer alloc.free(session_id);
         try server.releaseActiveSession(&state);
@@ -2028,6 +2038,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
 
         const loaded_active = &state.active_session.?;
         const loaded_writable = &loaded_active.writable.?;
+        try std.testing.expectEqual(@as(usize, 1), loaded_active.session_rt.historyLen());
+        try std.testing.expectEqual(@as(usize, 0), loaded_writable.state.history.len);
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
             loaded_active.mode,

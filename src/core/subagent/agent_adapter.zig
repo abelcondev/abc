@@ -193,9 +193,12 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err)) catch return error.OutOfMemory;
+        return error.ProviderFailed;
+    };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
-    const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
-        return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
@@ -376,6 +379,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = .{
             .set = setRecoveryCheckpoint,
         },
@@ -700,6 +704,15 @@ fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
         context.output_tokens,
         io_mod.milliTimestamp(),
     );
+}
+
+fn commitContextCompaction(
+    raw: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.commitContextCompaction(summary, active_prefix, io_mod.milliTimestamp());
 }
 
 fn setRecoveryCheckpoint(
