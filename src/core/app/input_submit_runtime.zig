@@ -15,6 +15,7 @@ pub const PendingPhase = enum {
     awaiting_frame,
     awaiting_adoption,
     adopted,
+    awaiting_auth,
     queued,
 };
 
@@ -36,6 +37,7 @@ pub const PendingPromptDraft = struct {
 pub const PendingSubmission = struct {
     draft: PendingPromptDraft,
     phase: PendingPhase = .awaiting_frame,
+    credential_admitted: bool = false,
     skill_refresh_generation: ?u64 = null,
 
     fn init(draft: PendingPromptDraft) PendingSubmission {
@@ -136,6 +138,11 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn cancelPromptRetryAfterAuth(app: *App) void {
             app.submission.retry_after_auth = false;
+            const pending = app.submission.pending orelse return;
+            if (pending.phase != .awaiting_auth) return;
+            clearPendingSubmission(app, "auth_retry_cancelled");
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
         }
 
         fn takePromptRetryAfterAuth(app: *App) bool {
@@ -144,8 +151,25 @@ pub fn SubmitRuntime(comptime App: type) type {
             return pending;
         }
 
+        fn resumePendingPromptAfterAuth(app: *App, trigger: []const u8) bool {
+            const pending = if (app.submission.pending) |*value| value else return false;
+            if (pending.phase != .awaiting_auth) return false;
+            pending.phase = .adopted;
+            app.submission.retry_after_auth = false;
+            app.shell.render_requests.request(.footer);
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_auth_resumed",
+                .{ .turn_id = pending.draft.turn_id },
+                "trigger={s}",
+                .{trigger},
+            );
+            return true;
+        }
+
         pub fn resumePromptAfterAuth(app: *App, max_prompt_history: usize) !void {
             if (!takePromptRetryAfterAuth(app)) return;
+            if (resumePendingPromptAfterAuth(app, "auth_completion")) return;
             try submit(app, max_prompt_history);
         }
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
@@ -226,6 +250,52 @@ pub fn SubmitRuntime(comptime App: type) type {
                 pending = &app.submission.pending.?;
             }
             if (pending.phase != .adopted) return;
+
+            if (!pending.credential_admitted) {
+                if (comptime @hasDecl(App, "collectPendingPromptCredential")) {
+                    const readiness = App.collectPendingPromptCredential(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    switch (readiness) {
+                        .pending => return,
+                        .current => {},
+                        .rejected => {
+                            pending = &app.submission.pending.?;
+                            pending.phase = .awaiting_auth;
+                            requestPromptRetryAfterAuth(app);
+                            debug_trace.eventf(
+                                "input",
+                                "pending_prompt_awaiting_auth",
+                                .{ .turn_id = pending.draft.turn_id },
+                                "",
+                                .{},
+                            );
+                            return;
+                        },
+                    }
+                } else if (comptime @hasDecl(App, "ensurePromptCredential")) {
+                    const admitted = preflightPrompt(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    pending = &app.submission.pending.?;
+                    if (!admitted) {
+                        pending.phase = .awaiting_auth;
+                        requestPromptRetryAfterAuth(app);
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_awaiting_auth",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                        return;
+                    }
+                }
+                app.submission.pending.?.credential_admitted = true;
+                pending = &app.submission.pending.?;
+            }
 
             if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
                 const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
@@ -473,14 +543,49 @@ pub fn SubmitRuntime(comptime App: type) type {
         pub fn submit(app: *App, max_prompt_history: usize) !void {
             if (comptime @hasField(App, "submission")) {
                 if (app.submission.pending) |pending| {
-                    debug_trace.eventf(
-                        "input",
-                        "prompt_submit_deferred_for_pending",
-                        .{ .turn_id = pending.draft.turn_id },
-                        "phase={s}",
-                        .{@tagName(pending.phase)},
-                    );
-                    return;
+                    const route_local_command = pending.phase == .awaiting_auth and
+                        pendingAuthRoutesLocalCommand(app);
+                    if (!route_local_command and
+                        pending.phase == .awaiting_auth and
+                        app.input_runtime.edit_state.input.items.len == 0)
+                    {
+                        if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
+                            switch (try App.retryPendingPromptCredential(app)) {
+                                .pending => {
+                                    app.submission.retry_after_auth = false;
+                                    app.submission.pending.?.phase = .adopted;
+                                    app.shell.render_requests.request(.footer);
+                                },
+                                .current => {
+                                    const resumed = resumePendingPromptAfterAuth(app, "submit");
+                                    std.debug.assert(resumed);
+                                },
+                                .rejected => {},
+                            }
+                        } else if (try preflightPrompt(app)) {
+                            const resumed = resumePendingPromptAfterAuth(app, "submit");
+                            std.debug.assert(resumed);
+                        }
+                        return;
+                    }
+                    if (route_local_command) {
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_auth_command_routed",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                    } else {
+                        debug_trace.eventf(
+                            "input",
+                            "prompt_submit_deferred_for_pending",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "phase={s}",
+                            .{@tagName(pending.phase)},
+                        );
+                        return;
+                    }
                 }
             }
             const expanded_len = paste_blocks.expandedLen(
@@ -548,7 +653,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    if (!try preflightPrompt(app)) return;
                     const admission = try enqueuePromptForSubmit(app, "", &.{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
@@ -598,8 +702,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const has_inline_images = extracted.images.len > 0;
             const effective_text = if (has_inline_images) extracted.text else expanded.text;
-
-            if (!try preflightPrompt(app)) return;
 
             var staged_images = if (app.pending_images.items.len > 0 or extracted.images.len > 0)
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
@@ -711,6 +813,17 @@ pub fn SubmitRuntime(comptime App: type) type {
                 return App.ensurePromptCredential(app);
             }
             return true;
+        }
+
+        fn pendingAuthRoutesLocalCommand(app: *App) bool {
+            const input = std.mem.trimStart(
+                u8,
+                app.input_runtime.edit_state.input.items,
+                " \t\r\n",
+            );
+            const submission = resolvedSlashSubmission(app, input);
+            const command = knownSlashCommand(app, submission) orelse return false;
+            return !requiresPromptCredential(command, submission);
         }
 
         fn knownSlashCommand(app: *const App, text: []const u8) ?*const command_specs.SlashSpec {
@@ -895,6 +1008,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 .installed => return .pending,
                 .unavailable => {},
             }
+            if (!try preflightPrompt(app)) return .rejected;
             const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
@@ -2018,6 +2132,8 @@ test "pending draft construction frees every partial allocation" {
 }
 
 const PendingLifecycleFake = struct {
+    const CredentialReadiness = enum { pending, current, rejected };
+
     alloc: std.mem.Allocator,
     submission: State = .{},
     worker: struct {
@@ -2062,6 +2178,7 @@ const PendingLifecycleFake = struct {
     finalization_count: usize = 0,
     finalization_error: bool = false,
     notice_count: usize = 0,
+    credential_checks: usize = 0,
     skill_refresh: enum { pending, current, failed } = .current,
     skill_refresh_checks: usize = 0,
 
@@ -2087,6 +2204,13 @@ const PendingLifecycleFake = struct {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
         self.worker.queued_turn_id = draft.turn_id;
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *PendingLifecycleFake,
+    ) !CredentialReadiness {
+        self.credential_checks += 1;
+        return .current;
     }
 
     pub fn collectPendingSkillRefresh(
@@ -2201,13 +2325,18 @@ test "pending submission waits for its skill catalog generation before queueing"
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
     try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
     try std.testing.expectEqual(@as(?u64, 1), app.submission.pending.?.skill_refresh_generation);
+
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
 
     app.skill_refresh = .current;
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
     try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 }
 

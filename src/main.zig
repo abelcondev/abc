@@ -955,6 +955,24 @@ const App = struct {
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
+    pub fn startPromptCredentialPrewarm(self: *App) void {
+        if (comptime !host_target.is_wasm) {
+            AuthAppRuntime.startPromptCredentialPrewarm(self);
+        }
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *App,
+    ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        return AuthAppRuntime.collectPendingPromptCredential(self);
+    }
+
+    pub fn retryPendingPromptCredential(
+        self: *App,
+    ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        return AuthAppRuntime.retryPendingPromptCredential(self);
+    }
+
     pub fn runProviderCommand(self: *App) !void {
         try AuthAppRuntime.runProviderCommand(self);
     }
