@@ -1481,6 +1481,7 @@ pub const LoadedWritableSession = struct {
         capture: session_resume_view.Capture,
         text: []const u8,
     ) !void {
+        if (self.conversation_writer != null) return;
         try session_resume_view.write(
             alloc,
             &self.log.dir,
@@ -2508,6 +2509,24 @@ pub const Root = struct {
             else => return err,
         };
         defer session_dir.close();
+        if (try hasConversationMetadata(alloc, &session_dir)) {
+            const metadata_bytes = try readManagedFileAlloc(
+                alloc,
+                &session_dir,
+                manifest_file,
+                session_codec.max_session_metadata_bytes,
+            );
+            defer alloc.free(metadata_bytes);
+            var metadata = try session_codec.decodeSessionMetadata(
+                alloc,
+                metadata_bytes,
+            );
+            defer metadata.deinit();
+            if (!std.mem.eql(u8, metadata.value.id, session_id)) {
+                return error.InvalidSessionMetadata;
+            }
+            return metadata.value.subagent_child;
+        }
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         defer log_file.close(io_mod.getIo());
         return session_replay.readSubagentChildIdentity(alloc, log_file);
@@ -2520,6 +2539,9 @@ pub const Root = struct {
     ) !ResumeViewAdmission {
         var writable = try self.openWritableSessionDir(alloc, session_id, 0);
         errdefer writable.deinit(alloc);
+        if (try hasConversationMetadata(alloc, &writable.dir)) {
+            return .{ .writable = writable, .view = .missing };
+        }
         const position = try loadCurrentPositionReference(alloc, &writable.dir, session_id);
         return .{
             .writable = writable,

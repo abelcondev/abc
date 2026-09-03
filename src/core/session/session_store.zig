@@ -918,6 +918,45 @@ pub const Store = struct {
             );
             return .retained;
         }
+        if (loaded.usesConversationStorage()) {
+            const sessions = &(self.canonical_root.sessions orelse {
+                debug_trace.logf(
+                    "session",
+                    "event={s} disposition=indeterminate stage=sessions_root",
+                    .{event_name},
+                );
+                return .indeterminate;
+            });
+            if (cascade_children and !self.deleteOwnedSubagentChildren(
+                alloc,
+                loaded.active_id,
+                event_name,
+            )) {
+                return .indeterminate;
+            }
+            sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event={s} disposition=indeterminate stage=delete err={s}",
+                    .{ event_name, @errorName(err) },
+                );
+                return .indeterminate;
+            };
+            io_mod.syncVerifiedDir(sessions.dir) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event={s} disposition=indeterminate stage=sync err={s}",
+                    .{ event_name, @errorName(err) },
+                );
+                return .indeterminate;
+            };
+            debug_trace.logf(
+                "session",
+                "event={s} disposition=discarded",
+                .{event_name},
+            );
+            return .discarded;
+        }
         const lifecycle = if (loaded.commit_lifecycle) |*value| value else {
             debug_trace.logf(
                 "session",
@@ -1156,20 +1195,11 @@ pub const Store = struct {
         return switch (target) {
             .id => |id| try root.admitResumeView(alloc, id),
             .last => blk: {
-                if (self.deferredCacheInvalidatesReads()) {
-                    var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
-                    defer latest.deinit(alloc);
-                    break :blk try root.admitResumeView(
-                        alloc,
-                        latest.id,
-                    );
-                }
-                var latest = (try readLatestPointer(self, alloc, self.workspace_root)) orelse
-                    return null;
+                var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
                 defer latest.deinit(alloc);
                 break :blk try root.admitResumeView(
                     alloc,
-                    latest.session_id,
+                    latest.id,
                 );
             },
         };
@@ -1290,114 +1320,6 @@ pub const Store = struct {
         workspace_root: []const u8,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        if (self.deferredCacheInvalidatesReads()) {
-            return self.resumeLatestDiscoveryAfterBarrier(
-                alloc,
-                workspace_root,
-                options,
-            );
-        }
-        const cached = readLatestPointer(self, alloc, workspace_root) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        if (cached) |pointer_value| {
-            var pointer = pointer_value;
-            defer pointer.deinit(alloc);
-            var loaded = self.resumeExactForWrite(
-                alloc,
-                pointer.session_id,
-                workspace_root,
-                false,
-                options,
-            ) catch |cached_error| {
-                if (!try latestPointerStillMatches(self, alloc, workspace_root, pointer)) {
-                    return self.resumeLatestByDiscovery(alloc, workspace_root, options);
-                }
-                return switch (cached_error) {
-                    error.SessionNotFound,
-                    error.SessionTargetChanged,
-                    error.InvalidSessionFormat,
-                    error.SessionPathUnsafe,
-                    => self.resumeLatestByDiscovery(alloc, workspace_root, options),
-                    else => cached_error,
-                };
-            };
-            if (std.mem.eql(u8, loaded.state.id, pointer.session_id) and
-                std.mem.eql(u8, loaded.state.workspace_root, workspace_root) and
-                loaded.state.updated_at_ms == pointer.updated_at_ms)
-            {
-                const still_matches = latestPointerStillMatches(
-                    self,
-                    alloc,
-                    workspace_root,
-                    pointer,
-                ) catch |err| {
-                    loaded.deinit(alloc);
-                    return err;
-                };
-                if (still_matches) return loaded;
-            }
-            loaded.deinit(alloc);
-        }
-        const pending_id = readPendingLatestSessionId(
-            self,
-            alloc,
-            workspace_root,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        if (pending_id) |observed_id| {
-            defer alloc.free(observed_id);
-            const barrier_contended = try self.crossLatestBarrier(options.log.test_controls);
-            const current_pending = readPendingLatestSessionId(
-                self,
-                alloc,
-                workspace_root,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => null,
-            };
-            if (current_pending) |session_id| {
-                defer alloc.free(session_id);
-                try options.log.test_controls.boundary(.latest_barrier_completed);
-                var recovered = self.resumeExactForWrite(
-                    alloc,
-                    session_id,
-                    workspace_root,
-                    false,
-                    options,
-                ) catch |err| {
-                    return switch (err) {
-                        error.SessionNotFound,
-                        error.SessionTargetChanged,
-                        error.FileNotFound,
-                        => if (barrier_contended)
-                            self.resumeLatestDiscoveryAfterBarrier(
-                                alloc,
-                                workspace_root,
-                                options,
-                            )
-                        else
-                            self.resumeLatestByDiscovery(alloc, workspace_root, options),
-                        else => err,
-                    };
-                };
-                recovered.deinit(alloc);
-                return self.resumeLatestByDiscovery(alloc, workspace_root, options);
-            }
-            return self.resumeLatestDiscoveryAttempt(
-                alloc,
-                workspace_root,
-                options,
-            ) catch |err| switch (err) {
-                error.SessionNotFound,
-                error.FileNotFound,
-                => self.resumeLatestByDiscovery(alloc, workspace_root, options),
-                else => err,
-            };
-        }
         return self.resumeLatestByDiscovery(alloc, workspace_root, options);
     }
 
@@ -1408,7 +1330,6 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !LoadedWritableSession {
         for (0..2) |attempt| {
-            _ = try self.crossLatestBarrier(options.log.test_controls);
             const loaded = self.resumeLatestDiscoveryAttempt(
                 alloc,
                 workspace_root,
@@ -6479,6 +6400,45 @@ test "store start does not publish session caches" {
         try std.testing.expectEqualStrings("cache-free-store", entry.name);
     }
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "resume last selects conversation metadata without cache files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var older = try testDurableState(alloc, "cache-free-older", ctx.workspace);
+    defer older.deinit(alloc);
+    older.updated_at_ms = 10;
+    var newer = try testDurableState(alloc, "cache-free-newer", ctx.workspace);
+    defer newer.deinit(alloc);
+    newer.updated_at_ms = 20;
+    {
+        var writable = try ctx.store.startWritableSession(alloc, older);
+        writable.deinit(alloc);
+    }
+    {
+        var writable = try ctx.store.startWritableSession(alloc, newer);
+        writable.deinit(alloc);
+    }
+
+    var resumed = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .last,
+        ctx.workspace,
+        .{},
+    );
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("cache-free-newer", resumed.active_id);
+    try std.testing.expectError(
+        error.FileNotFound,
+        ctx.store.canonical_root.sessions.?.dir.statFile(
+            std.testing.io,
+            "latest",
+            .{},
+        ),
+    );
 }
 
 test "workspace latest pointer is materialized on session creation" {
