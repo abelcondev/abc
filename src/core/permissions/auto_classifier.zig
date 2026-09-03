@@ -271,7 +271,7 @@ pub const ReviewTurnContext = struct {
     /// Host-owned current-turn I/O gate. False short-circuits only if
     /// deterministic admission reaches remote model review.
     review_attempt_available: bool = true,
-    credential: types.CredentialLease = .{},
+    credential: types.CredentialLease = .{ .direct = .{} },
     /// Canonical root-user context for contextual security review. Assistant,
     /// tool, repository, attachment, and permission-feedback text never become
     /// authority.

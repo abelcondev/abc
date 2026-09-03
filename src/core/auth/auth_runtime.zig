@@ -10,6 +10,7 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -45,7 +46,7 @@ const UnavailableSourcePolicy = enum {
 };
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
-const max_api_key_mask_glyphs: usize = 32;
+const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
 const max_manual_code_mask_glyphs: usize = 32;
 const max_team_query_bytes: usize = 256;
 
@@ -492,8 +493,15 @@ const ApiKeySaveRuntime = struct {
     }
 };
 
+pub const InventoryRefreshDestination = enum {
+    auth_picker,
+    provider_picker_login,
+    provider_picker_command,
+};
+
 pub const InventoryRefreshAction = struct {
     provider: model_provider.ProviderId,
+    destination: InventoryRefreshDestination = .auth_picker,
 };
 
 pub const InventoryRefreshStart = enum {
@@ -630,6 +638,7 @@ pub const PickerView = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
+    api_key_inline: bool = false,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -1005,7 +1014,7 @@ pub const View = struct {
 };
 
 pub const GatewayCredential = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
 };
@@ -1016,6 +1025,7 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
@@ -1036,6 +1046,9 @@ pub const Runtime = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
+    /// The key field is rendered as a `/provider` column instead of the staged
+    /// panel, so the composer keeps showing which path the user walked.
+    api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
@@ -1045,10 +1058,20 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) Self {
+        return initWithMode(validator, transport, secret_store, .local);
+    }
+
+    pub fn initWithMode(
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) Self {
         return .{
             .api_key_validator = validator,
             .oauth_transport = transport,
             .secret_store = secret_store,
+            .auth_mode = auth_mode,
         };
     }
 
@@ -1060,8 +1083,18 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) void {
+        initIntoWithMode(storage, validator, transport, secret_store, .local);
+    }
+
+    pub fn initIntoWithMode(
+        storage: *Self,
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) void {
         comptime {
-            if (std.meta.fields(Self).len != 26) {
+            if (std.meta.fields(Self).len != 28) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1069,6 +1102,7 @@ pub const Runtime = struct {
         storage.api_key_validator = validator;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
+        storage.auth_mode = auth_mode;
         storage.selected_credential = null;
         storage.credential_refresh_failure_source = null;
         storage.source_inventory = .empty;
@@ -1089,6 +1123,7 @@ pub const Runtime = struct {
         storage.sign_in_code_visible = false;
         storage.sign_in_code_input = .empty;
         storage.api_key_input = .empty;
+        storage.api_key_inline = false;
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
@@ -1113,6 +1148,11 @@ pub const Runtime = struct {
     }
 
     fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+        if (self.auth_mode == .host_managed) return .{
+            .api_key = null,
+            .gateway_team = null,
+            .source = .host_managed,
+        };
         const credential = self.selected_credential orelse return null;
         if (credential.needsRefreshAt(now_ms)) return null;
         if (credential.source == .fx_login) {
@@ -1131,6 +1171,14 @@ pub const Runtime = struct {
         return credential.api_key;
     }
 
+    pub fn isHostManaged(self: *const Self) bool {
+        return self.auth_mode == .host_managed;
+    }
+
+    pub fn authMode(self: *const Self) credentials.AuthMode {
+        return self.auth_mode;
+    }
+
     pub fn oauthTransport(self: *const Self) oauth_transport.Provider {
         return self.oauth_transport;
     }
@@ -1140,6 +1188,7 @@ pub const Runtime = struct {
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
+        if (self.auth_mode == .host_managed) return .host_managed;
         if (self.credential_refresh_failure_source) |source| {
             return credentials.catalogAccessAfterRefreshFailure(source);
         }
@@ -1152,11 +1201,13 @@ pub const Runtime = struct {
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
+        if (self.auth_mode == .host_managed) return .host_managed;
         const credential = self.selected_credential orelse return null;
         return credential.source;
     }
 
     pub fn accountId(self: *const Self) ?[]const u8 {
+        if (self.auth_mode == .host_managed) return null;
         const credential = self.selected_credential orelse return null;
         return credential.accountId();
     }
@@ -1180,6 +1231,12 @@ pub const Runtime = struct {
     }
 
     fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+        if (self.auth_mode == .host_managed) return .{
+            .active_source = .host_managed,
+            .gateway_connected = true,
+            .chatgpt_connected = true,
+            .grok_connected = true,
+        };
         const gateway_connected = self.source_inventory.contains(.vercel_oidc_token) or
             self.source_inventory.contains(.ai_gateway_api_key) or
             self.source_inventory.contains(.fx_login) or
@@ -1233,6 +1290,10 @@ pub const Runtime = struct {
     }
 
     pub fn refreshSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) {
+            self.source_inventory = .empty;
+            return;
+        }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
     }
 
@@ -1292,6 +1353,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshChatGptSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .chatgpt_subscription)) {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
@@ -1300,6 +1362,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
             self.source_inventory.insert(.grok_subscription);
         } else if (self.credentialSource() != .grok_subscription) {
@@ -1371,7 +1434,8 @@ pub const Runtime = struct {
             .sign_in_source = self.sign_in_source,
             .sign_in_code_visible = self.sign_in_code_visible,
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
-            .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .api_key_mask_count = self.apiKeyMaskCount(),
+            .api_key_inline = self.api_key_inline,
         };
     }
 
@@ -1394,6 +1458,21 @@ pub const Runtime = struct {
             return true;
         }
         return false;
+    }
+
+    /// Frees a team list adopted for the inline `/provider` picker. The staged
+    /// picker owns its list through its stages, so an active staged picker is
+    /// left alone.
+    pub fn releaseLoadedTeamSelection(self: *Self, alloc: Allocator) void {
+        if (self.picker_active) return;
+        self.clearTeamSelection(alloc);
+    }
+
+    /// Takes ownership of a loaded team list without opening the staged picker
+    /// band, so the inline `/provider` picker can render the teams as a column.
+    pub fn adoptTeamSelection(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
+        self.clearTeamSelection(alloc);
+        self.team_selection = selection.take();
     }
 
     pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
@@ -1487,6 +1566,30 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+    }
+
+    /// Opens the key field for the inline `/provider` picker. The stage is the
+    /// same one the staged panel uses, so entry, saving, and cancelling all
+    /// keep working; only the rendering differs.
+    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, false);
+        self.api_key_inline = true;
+    }
+
+    pub fn apiKeyInlineActive(self: *const Self) bool {
+        return self.apiKeyEntryActive() and self.api_key_inline;
+    }
+
+    pub fn apiKeyMaskCount(self: *const Self) usize {
+        return @min(self.api_key_input.items.len, max_api_key_mask_glyphs);
+    }
+
+    /// Leaves the key field without saving, zeroing whatever was typed.
+    pub fn cancelInlineApiKeyEntry(self: *Self, alloc: Allocator) void {
+        if (!self.apiKeyInlineActive()) return;
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.picker_active = false;
+        self.picker_stage = .root;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
@@ -1864,8 +1967,10 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
-        if (!self.picker_active or self.picker_stage != .change_team) return null;
+    /// The loaded team list regardless of which picker is presenting it: the
+    /// staged picker only shows it during its team stage, while the inline
+    /// `/provider` picker renders it as a column without opening a stage.
+    pub fn loadedTeamSelection(self: *Self) ?*login_flow.TeamSelection {
         return if (self.team_selection) |*selection| selection else null;
     }
 
@@ -1952,6 +2057,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         provider: model_provider.ProviderId,
     ) !?bool {
+        if (self.auth_mode == .host_managed) return false;
         return switch (provider) {
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
@@ -2113,6 +2219,7 @@ pub const Runtime = struct {
     }
 
     fn exitApiKeyStage(self: *Self, alloc: Allocator, reason: ApiKeyExitReason) void {
+        self.api_key_inline = false;
         const byte_count = self.api_key_input.items.len;
         if (self.api_key_input.capacity > 0) {
             const allocated = self.api_key_input.allocatedSlice();
@@ -2154,6 +2261,33 @@ test "auth in-place initialization preserves empty runtime state" {
     try std.testing.expect(runtime.api_key_input.items.len == 0);
 }
 
+test "host-managed runtime exposes authority without local credential state" {
+    var runtime = Runtime.initWithMode(
+        api_key_validator.unavailable_provider,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .host_managed,
+    );
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(runtime.isHostManaged());
+    try std.testing.expect(runtime.apiKey() == null);
+    try std.testing.expect(runtime.accountId() == null);
+    try std.testing.expect(runtime.gatewayTeam() == null);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.credentialSource().?);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
+    try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
+    const status = runtime.statusSnapshot();
+    try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
+    try std.testing.expect(status.gateway_connected);
+    try std.testing.expect(status.chatgpt_connected);
+    try std.testing.expect(status.grok_connected);
+    try std.testing.expect(!status.refreshable());
+    try runtime.refreshSourceInventory(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), runtime.source_inventory.count());
+}
+
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
@@ -2193,7 +2327,17 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source);
+    // Interactive selection paths run on keypresses; a source whose refresh
+    // the issuer rejects must read as "unavailable" (the callers all explain
+    // that), not ride a `try` chain out of the event loop. `resolve()` keeps
+    // its own error handling for startup status reporting.
+    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source) catch |err| switch (err) {
+        error.OutOfMemory => err,
+        else => {
+            debug_trace.logf("auth", "credential load failed source={t} err={s}", .{ source, @errorName(err) });
+            return null;
+        },
+    };
 }
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
@@ -2546,7 +2690,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     _ = runtime.adoptCredential(alloc, &credential);
 
     const gateway_credential = runtime.gatewayCredential().?;
-    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key);
+    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key.?);
     try std.testing.expectEqualStrings("team_123", gateway_credential.gateway_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
@@ -2590,7 +2734,7 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
 }
 
 test "auth runtime view preserves missing and loaded states" {
@@ -3111,7 +3255,7 @@ test "auth picker navigation skips disabled hub actions" {
     ));
 }
 
-test "setup picker projects the active Vercel team" {
+test "provider picker projects the active Vercel team" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
