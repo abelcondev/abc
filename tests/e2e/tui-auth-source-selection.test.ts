@@ -1874,6 +1874,21 @@ async function waitForModelRequestCount(
   }
 }
 
+async function waitForOAuthRequestCount(
+  fakeOAuth: ReturnType<typeof startFakeOAuth>,
+  count: number,
+): Promise<void> {
+  const started = Date.now();
+  while (fakeOAuth.requests.length < count) {
+    if (Date.now() - started >= TIMEOUT) {
+      throw new Error(
+        `Timed out waiting for ${count} OAuth requests; saw ${fakeOAuth.requests.length}`,
+      );
+    }
+    await Bun.sleep(25);
+  }
+}
+
 async function waitForTrace(
   tracePath: string,
   needle: string,
@@ -4722,7 +4737,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "expired saved login discovers models without refreshing prompt credentials",
+  "expired saved login prewarms credentials while model discovery stays anonymous",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-models-"));
     stderrPath = join(home, "stderr.log");
@@ -4741,7 +4756,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
@@ -4754,7 +4773,10 @@ tmuxTest(
       TIMEOUT,
     );
 
-    expect(oauth.requests).toEqual([]);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4865,7 +4887,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "an invalid refreshed lifetime retires the login and keeps model discovery anonymous",
+  "an immediately expired prewarm retires the login and keeps model discovery anonymous",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-refresh-models-"));
     stderrPath = join(home, "stderr.log");
@@ -4980,7 +5002,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(creditsGateway.requests).toEqual([]);
 
@@ -5032,7 +5058,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
     expect(creditsGateway.requests).toEqual([]);
@@ -5051,6 +5081,8 @@ tmuxTest(
     expect(gateway.modelRequests).toHaveLength(1);
     expect(creditsGateway.requests).toHaveLength(0);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
     ]);
