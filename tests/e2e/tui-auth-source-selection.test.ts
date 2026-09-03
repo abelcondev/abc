@@ -3325,6 +3325,37 @@ test("Grok logout removes local credentials when remote revocation fails", async
   }
 });
 
+test("Grok logout removes malformed and unsafe local credentials", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-logout-unreadable-"));
+  const grok = startFakeGrokOAuth();
+  try {
+    const authPath = join(home, ".fx", "grok-auth.json");
+    for (const failure of ["malformed", "unsafe"]) {
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      if (failure === "malformed") writeFileSync(authPath, "{invalid-json");
+      else chmodSync(authPath, 0o644);
+
+      const result = await runFx(["logout", "grok"], {
+        env: {
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_E2E_GROK_REVOKE_URL: grok.env.FX_E2E_GROK_REVOKE_URL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain("Signed out of Grok.");
+      expect(result.stderr).toContain("remote revocation could not be confirmed");
+      expect(existsSync(authPath)).toBe(false);
+      expect(grok.requests).toHaveLength(0);
+      expect(result.stderr).not.toContain(grok.initialAccessToken);
+    }
+  } finally {
+    grok.stop();
+  }
+});
+
 test("Grok 401 replay refuses a different account before the second provider send", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-grok-account-mismatch-"));
   gateway = startFakeGateway([]);

@@ -989,10 +989,10 @@ pub const StatusSnapshot = struct {
 
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
+        if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
         if (self.failure) |failure| {
             if (preparationError(failure)) |err| return preparationFailureNotice(err);
         }
-        if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
         if (self.required_source == .fx_login) {
             return if (self.fx_login_status == .unavailable)
                 "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
@@ -3028,7 +3028,10 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
     const absent = StatusSnapshot{ .stored_key_status = .not_found };
     try std.testing.expectEqualStrings(credentials.missing_credential_message, absent.missingHelp(.cli).?);
 
-    const unreadable = StatusSnapshot{ .stored_key_status = .unavailable };
+    const unreadable = StatusSnapshot{
+        .stored_key_status = .unavailable,
+        .failure = .{ .source = .stored_key, .reason = .invalid_storage },
+    };
     try std.testing.expectEqualStrings(credentials.unreadable_store_message, unreadable.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.unreadable_store_message, unreadable.missingHelp(.interactive).?);
 

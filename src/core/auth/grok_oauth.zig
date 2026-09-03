@@ -491,7 +491,12 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
     };
     defer mutation.deinit();
     var revocation_failed = false;
-    if (try mutation.load(alloc)) |loaded| {
+    const loaded_session = mutation.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
+        revocation_failed = true;
+        break :blk null;
+    };
+    if (loaded_session) |loaded| {
         var session = loaded;
         defer session.deinit(alloc);
         revokeToken(alloc, transport, session.refresh_token) catch {
