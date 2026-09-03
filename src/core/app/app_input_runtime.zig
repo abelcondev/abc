@@ -1486,7 +1486,8 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
-                    if (app.input_runtime.edit_state.selectionRange() == null and
+                    if (!queueReviewOwnsComposer(app) and
+                        app.input_runtime.edit_state.selectionRange() == null and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
                     {
@@ -1518,12 +1519,13 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    const queue_review_owns_composer = queueReviewOwnsComposer(app);
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
-                    if (try submitModelMenuSelection(app)) return;
+                    if (!queue_review_owns_composer and try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (try submitSlashPickerSelection(app)) return;
+                    if (!queue_review_owns_composer and try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
                     }
@@ -1534,11 +1536,13 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                    if (!queue_review_owns_composer and
+                        picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state))
+                    {
                         try openModelBrowseCatalog(app);
                         return;
                     }
-                    if (provider_picker_rt.hasQuery(app)) {
+                    if (!queue_review_owns_composer and provider_picker_rt.hasQuery(app)) {
                         if (app.stream.active) {
                             try app.writeDomainNotice(.{
                                 .topic = "provider",
@@ -1550,10 +1554,10 @@ pub fn Runtime(comptime App: type) type {
                         }
                         if (try provider_picker_rt.submit(app)) return;
                     }
-                    if (completion_rt.hasModelQuery(app)) {
+                    if (!queue_review_owns_composer and completion_rt.hasModelQuery(app)) {
                         if (try completion_rt.submitModelPicker(app)) return;
                     }
-                    if (try submitExplicitModelSelection(
+                    if (!queue_review_owns_composer and try submitExplicitModelSelection(
                         app,
                         resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
                     )) return;
@@ -2219,6 +2223,13 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        fn queueReviewOwnsComposer(app: *const App) bool {
+            if (comptime @hasField(App, "queued_prompt_review")) {
+                return app.queued_prompt_review.visible;
+            }
+            return false;
+        }
+
         fn closeSkillsMenu(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
@@ -2653,6 +2664,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
+            if (queueReviewOwnsComposer(app)) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
             const prefix = command_specs.slashCompletionPrefix(
@@ -2712,6 +2724,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             parsed: ExplicitModelSelectionParse,
         ) !bool {
+            if (queueReviewOwnsComposer(app)) return false;
             switch (parsed) {
                 .none => return false,
                 .invalid => {
@@ -3397,9 +3410,15 @@ const RoutingWorker = struct {
     queued_count: usize = 0,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
+    queue_review_reason: ?worker_runtime.QueueReviewReason = null,
+    replaced_queue_prompt: [128]u8 = undefined,
+    replaced_queue_prompt_len: usize = 0,
 
-    pub fn queuePreview(_: *RoutingWorker, _: []u8) @import("../agent/worker_runtime.zig").QueuePreview {
-        return .{};
+    pub fn queuePreview(self: *RoutingWorker) @import("../agent/worker_runtime.zig").QueuePreview {
+        return .{
+            .count = self.queued_count,
+            .paused = self.queue_review_reason != null,
+        };
     }
 
     pub fn queuedPromptCount(self: *const RoutingWorker) usize {
@@ -3416,6 +3435,17 @@ const RoutingWorker = struct {
 
     pub fn requestCancel(self: *RoutingWorker) void {
         self.cancel_requested = true;
+    }
+
+    pub fn requestInteractiveCancel(self: *RoutingWorker) bool {
+        self.cancel_requested = true;
+        return self.beginQueueReview(.post_cancel);
+    }
+
+    pub fn beginQueueReview(self: *RoutingWorker, reason: worker_runtime.QueueReviewReason) bool {
+        if (self.queued_count == 0 and self.queue_review_reason == null) return false;
+        self.queue_review_reason = reason;
+        return true;
     }
 
     pub fn interactiveAdmissionSnapshot(self: *RoutingWorker) worker_runtime.InteractiveAdmissionSnapshot {
@@ -3494,6 +3524,59 @@ const RoutingWorker = struct {
     pub fn syncQueuedPromptFastMode(_: *RoutingWorker, _: bool) void {}
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
+
+    pub fn snapshotQueuedPromptDrafts(
+        _: *RoutingWorker,
+        _: std.mem.Allocator,
+    ) ![]worker_runtime.QueuedPromptDraft {
+        return &.{};
+    }
+
+    pub fn clearQueuedPrompts(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: []const types.ImageAttachment,
+    ) void {
+        self.queued_count = 0;
+    }
+
+    pub fn deleteQueuedPromptDraft(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: u64,
+        _: []const types.ImageAttachment,
+    ) bool {
+        if (self.queued_count == 0) return false;
+        self.queued_count -= 1;
+        return true;
+    }
+
+    pub fn queueReviewReason(self: *const RoutingWorker) ?worker_runtime.QueueReviewReason {
+        return self.queue_review_reason;
+    }
+
+    pub fn replaceQueuedPromptDrafts(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        drafts: []const worker_runtime.QueuedPromptDraft,
+    ) !bool {
+        if (drafts.len == 0) return true;
+        self.replaced_queue_prompt_len = @min(
+            drafts[0].prompt.len,
+            self.replaced_queue_prompt.len,
+        );
+        @memcpy(
+            self.replaced_queue_prompt[0..self.replaced_queue_prompt_len],
+            drafts[0].prompt[0..self.replaced_queue_prompt_len],
+        );
+        return true;
+    }
+
+    pub fn resumeQueueReview(self: *RoutingWorker) bool {
+        if (self.queue_review_reason == null) return false;
+        self.queue_review_reason = null;
+        return true;
+    }
 };
 
 const RoutingPacer = struct {
@@ -3603,6 +3686,7 @@ const RoutingFakeApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     input_runtime: core_input_runtime.Runtime = .{},
+    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: test_ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
     terminal: shell_runtime.TerminalState = .{},
@@ -3709,6 +3793,7 @@ const RoutingFakeApp = struct {
         self.auth.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
         self.question_prompt.deinit(self.alloc);
+        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
@@ -4040,6 +4125,31 @@ const RoutingFakeApp = struct {
         self.pending_images.clearRetainingCapacity();
     }
 };
+
+fn openRoutingQueueReview(app: *RoutingFakeApp, input: []const u8) !void {
+    const entries = try app.alloc.alloc(input_queue_runtime.ReviewEntry, 1);
+    var entries_owned = true;
+    errdefer if (entries_owned) app.alloc.free(entries);
+    const prompt = try app.alloc.dupe(u8, input);
+    var prompt_owned = true;
+    errdefer if (prompt_owned) app.alloc.free(prompt);
+    entries[0] = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = prompt,
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    app.queued_prompt_review = .{
+        .entries = entries,
+        .selected_index = 0,
+        .reason = .manual,
+        .visible = true,
+    };
+    entries_owned = false;
+    prompt_owned = false;
+    app.worker.queue_review_reason = .manual;
+    try app.input_runtime.textReplacementState().replace(app.alloc, input);
+}
 
 fn routingOpenUrl(
     _: ?*anyopaque,
@@ -6476,6 +6586,46 @@ test "app_input_runtime Enter on selected model slash completion opens browse on
     try std.testing.expect(app.model_cache.menu.active);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "queue review keeps model-shaped Space in the queued draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingQueueReview(&app, "/model openai/gpt-5");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
+
+    try std.testing.expectEqualStrings("/model openai/gpt-5 ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.queued_prompt_review.visible);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expect(!app.model_cache.menu.active);
+}
+
+test "queue review Enter submits model-shaped text as the queued draft" {
+    const cases = [_][]const u8{
+        "/model",
+        "/mode",
+        "/model openai/gpt-5 auto normal",
+    };
+    for (cases) |input| {
+        const alloc = std.testing.allocator;
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        try openRoutingQueueReview(&app, input);
+
+        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+        try std.testing.expectEqualStrings(
+            input,
+            app.worker.replaced_queue_prompt[0..app.worker.replaced_queue_prompt_len],
+        );
+        try std.testing.expect(!app.queued_prompt_review.active());
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expect(!app.model_cache.menu.active);
+        try std.testing.expect(app.last_command == null);
+        try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    }
 }
 
 test "app_input_runtime bare model Tab opens on current scrolled selection before staging effort" {
