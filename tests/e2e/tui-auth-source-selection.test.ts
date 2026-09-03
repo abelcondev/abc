@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -796,7 +796,7 @@ async function runGrokLoginWithBrowser(
   }
   const proc = nodeSpawn(FX_BIN, ["login", "grok"], {
     cwd: REPO_ROOT,
-    env: childEnv,
+    env: providerVersionTestEnv(childEnv),
     stdio: [authorizationCode ? "pipe" : "ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -877,7 +877,7 @@ async function runCodexLoginWithBrowser(
   }
   const proc = nodeSpawn(FX_BIN, ["login", "codex"], {
     cwd: REPO_ROOT,
-    env: childEnv,
+    env: providerVersionTestEnv(childEnv),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -5183,7 +5183,7 @@ for (const scenario of [
   );
 }
 
-tmuxTest("Codex catalog includes models gated by the current client version", async () => {
+tmuxTest("Codex discovers upstream versions and refreshes models in an open session without a CLI", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-codex-catalog-version-"));
   stderrPath = join(home, "stderr.log");
   gateway = startFakeGateway([]);
@@ -5193,15 +5193,21 @@ tmuxTest("Codex catalog includes models gated by the current client version", as
     models: { codex: "gpt-5.6-luna" },
   }) + "\n", { mode: 0o600 });
   const versions: Array<string | null> = [];
+  const releaseHeaders: Headers[] = [];
+  let latest = "0.999.1";
   const catalog = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
+      if (new URL(request.url).pathname === "/version") {
+        releaseHeaders.push(request.headers);
+        return Response.json({ version: latest });
+      }
       const version = new URL(request.url).searchParams.get("client_version");
       versions.push(version);
-      const [major = 0, minor = 0] = (version ?? "").split(".").map(Number);
       const ids = ["gpt-5.6-luna"];
-      if (major > 0 || minor >= 153) ids.push("gpt-6-astra");
+      if (version === latest) ids.push("gpt-6-astra");
+      if (version === "1.0.0") ids.push("future-release");
       return Response.json({ models: ids.map((slug) => ({
         slug,
         visibility: "list",
@@ -5215,11 +5221,14 @@ tmuxTest("Codex catalog includes models gated by the current client version", as
   try {
     const env = {
       HOME: home,
+      PATH: "/usr/bin:/bin",
       FX_MODEL: undefined,
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       FX_SOUND: "0",
       FX_E2E_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${catalog.port}/models`,
+      FX_E2E_CODEX_VERSION_URL: `http://127.0.0.1:${catalog.port}/version`,
+      FX_E2E_CODEX_CLIENT_VERSION: undefined,
     };
     const listed = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     expect(listed.code, listed.stderr).toBe(0);
@@ -5231,10 +5240,102 @@ tmuxTest("Codex catalog includes models gated by the current client version", as
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/model");
     await session.waitForText("gpt-6-astra", TIMEOUT);
+    expect(releaseHeaders).toHaveLength(1);
+    await session.sendKeys("Escape");
+    latest = "1.0.0";
+    await Bun.sleep(61_000);
+    await session.sendText("/model");
+    await session.waitForText("future-release", TIMEOUT);
+    expect(releaseHeaders).toHaveLength(2);
+    expect(versions.at(-1)).toBe("1.0.0");
+    for (const headers of releaseHeaders) {
+      for (const name of ["authorization", "cookie", "chatgpt-account-id"]) {
+        expect(headers.get(name)).toBeNull();
+      }
+    }
     expect(versions.length).toBeGreaterThanOrEqual(2);
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   } finally {
     catalog.stop(true);
   }
-}, 60_000);
+}, 120_000);
+
+test("Grok refreshes upstream versions for catalogs and responses and survives lookup failures", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-version-discovery-"));
+  const grok = startFakeGrokOAuth();
+  let latest = "1.999.1";
+  let failure: "none" | "unavailable" | "malformed" | "slow" = "none";
+  const releaseHeaders: Headers[] = [];
+  const releases = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      releaseHeaders.push(request.headers);
+      if (failure === "slow") await Bun.sleep(5000);
+      if (failure === "unavailable") return new Response("unavailable", { status: 503 });
+      return new Response(failure === "malformed" ? "1.2.3\r\nInjected: bad" : latest);
+    },
+  });
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      provider: "grok", models: { grok: "grok-4.20" },
+    }) + "\n", { mode: 0o600 });
+    const env = {
+      HOME: home,
+      PATH: "/usr/bin:/bin",
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_SOUND: "0",
+      ...grok.env,
+      FX_E2E_GROK_VERSION_URL: `http://127.0.0.1:${releases.port}/stable`,
+      FX_E2E_GROK_CLIENT_VERSION: undefined,
+    };
+    const cachePath = join(home, ".fx", "provider-versions", "grok.json");
+    const expireCache = () => {
+      const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+      cached.checked_at_ms = 0;
+      writeFileSync(cachePath, JSON.stringify(cached));
+    };
+    const first = await runFx(["models", "--json"], { env });
+    expect(first.code, first.stderr).toBe(0);
+    expect(releaseHeaders).toHaveLength(1);
+    expect(grok.requests.find((request) => request.path === "/v1/models")?.clientVersion).toBe(latest);
+    expect(grok.requests.find((request) => request.path === "/v1/language-models")?.clientVersion).toBeNull();
+
+    latest = "2.0.0";
+    expireCache();
+    const asked = await runFx(["ask", "--json", "--auto", "--no-save", "Reply briefly."], { env });
+    expect(asked.code, asked.stderr).toBe(0);
+    expect(asked.stdout).toContain("GROK_DIRECT_RESPONSE");
+    expect(grok.requests.find((request) => request.path === "/v1/responses")?.clientVersion).toBe(latest);
+    expect(releaseHeaders).toHaveLength(2);
+
+    for (const mode of ["unavailable", "malformed"] as const) {
+      failure = mode;
+      expireCache();
+      const result = await runFx(["models", "--json"], { env });
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(cachePath, "utf8")).version).toBe("2.0.0");
+    }
+    rmSync(cachePath);
+    const malformed = await runFx(["models", "--json"], { env });
+    expect(malformed.code).toBe(1);
+    expect(existsSync(cachePath)).toBe(false);
+    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    failure = "slow";
+    const started = Date.now();
+    const timedOut = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+    expect(timedOut.code).toBe(1);
+    expect(Date.now() - started).toBeLessThan(6500);
+    for (const headers of releaseHeaders) {
+      for (const name of ["authorization", "cookie", "x-userid", "x-xai-token-auth"]) {
+        expect(headers.get(name)).toBeNull();
+      }
+    }
+  } finally {
+    grok.stop();
+    releases.stop(true);
+  }
+}, 30_000);
