@@ -4,12 +4,14 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -853,6 +855,7 @@ async function completeDisplayedSubscriptionLogin(
   activeSession: TmuxSession,
   label: string,
   authorizationUrlPrefix: string,
+  expectedStatus = 200,
 ) {
   await activeSession.waitForText(label, TIMEOUT);
   const escapes = await activeSession.capturePaneEscapes();
@@ -864,7 +867,7 @@ async function completeDisplayedSubscriptionLogin(
   }
   const authorizationUrl = escapes.slice(urlStart, urlEnd);
   const response = await fetch(authorizationUrl, { redirect: "follow" });
-  expect(response.status).toBe(200);
+  expect(response.status).toBe(expectedStatus);
 }
 
 async function runCodexLoginWithBrowser(
@@ -1204,6 +1207,332 @@ function startFakeGrokResourceRecovery() {
     stop() { server.stop(true); },
   };
 }
+
+tmuxTest(
+  "malformed sessions and read-only locks never become missing authentication",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-storage-error-kinds-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth("unused-token");
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      for (const damage of ["malformed", "lock"]) {
+        writeSeededFxLogin(home, damage === "lock" ? 0 : Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+        writeSeededChatGptLogin(home);
+        writeSeededGrokLogin(home, grok.initialAccessToken);
+        if (damage === "malformed") {
+          for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
+            writeFileSync(join(home, ".fx", name), "not-json", { mode: 0o600 });
+          }
+        } else {
+          for (const name of ["auth.lock", "chatgpt-auth.lock", "grok-auth.lock"]) {
+            writeFileSync(join(home, ".fx", name), "");
+            chmodSync(join(home, ".fx", name), 0o400);
+          }
+        }
+        session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+          ...chatgptOauth.env,
+          ...grok.env,
+        });
+        await session.waitForComposer(TIMEOUT);
+        for (const [provider, label] of [["vercel", "Vercel AI Gateway"], ["codex", "Codex subscription"], ["grok", "Grok subscription"]]) {
+          await session.sendKeys("Escape");
+          await session.sendKeys("C-u");
+          await openProviderPicker(session);
+          await session.sendText(provider);
+          if (provider === "vercel") {
+            await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+            await session.sendKeys("Enter");
+          }
+          await session.waitForText(`${label}: Saved credential storage is unavailable`, 10_000);
+          expect(await session.captureFullScrollback()).not.toContain("Waiting for authorization");
+        }
+        expect(oauth.requests).toHaveLength(0);
+        expect(chatgptOauth.requests).toHaveLength(0);
+        expect(grok.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.kill();
+        session = null;
+      }
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "unavailable configured credentials remain recoverable in TUI ask and ACP",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-startup-failure-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("GATEWAY_RECOVERED_gateway"),
+      fakeGatewayFinalText("GATEWAY_RECOVERED_codex"),
+      fakeGatewayFinalText("GATEWAY_RECOVERED_grok"),
+    ]);
+    oauth = startFakeOAuth("unused-token");
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+    writeSeededChatGptLogin(home);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
+      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+    }
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SOUND: "0",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_MODEL: undefined,
+      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      ...chatgptOauth.env,
+      ...grok.env,
+    };
+    try {
+      for (const provider of ["gateway", "codex", "grok"]) {
+        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+          provider,
+          credential_source: "fx_login",
+          models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" },
+        }));
+        const status = await runFx(["status", "--json"], { env });
+        expect(status.code).toBe(0);
+        expect(JSON.parse(status.stdout).auth_help).toContain("Saved credential storage is unavailable");
+        const doctor = await runFx(["doctor", "--json"], { env });
+        expect(doctor.timedOut).toBe(false);
+        expect(doctor.stdout).toContain("Saved credential storage is unavailable");
+        const ask = await runFx(["ask", "--json", "--no-save", "do not use another account"], { env });
+        expect(ask.code).toBe(1);
+        expect(JSON.parse(ask.stdout).error).toBe("CredentialStorageUnavailable");
+        const acp = await runFx(["acp"], {
+          env,
+          stdin: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } }) + "\n",
+        });
+        expect(acp.code).toBe(0);
+        const response = acp.stdout.trim().split("\n").map((line) => JSON.parse(line)).find((message) => message.id === 1);
+        expect(response.error.code).toBe(-32600);
+        expect(response.error.message).toContain("Saved credential storage is unavailable");
+        session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
+        await session.waitForComposer(TIMEOUT);
+        await selectEnvKeyCredential(session);
+        await session.sendText("Use the working Gateway account.");
+        await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.kill();
+        session = null;
+      }
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "browser authorization reports a failed save without activating the provider",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-callback-save-failure-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_AFTER_FAILED_SIGNIN")]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      for (const [provider, label] of [["codex", "Codex"], ["grok", "Grok"]]) {
+        await openProviderPicker(session);
+        await session.sendText(provider);
+        await session.waitForText(`Authorize with ${label}`, TIMEOUT);
+        if (provider === "codex") writeSeededChatGptLogin(home);
+        else writeSeededGrokLogin(home, grok.initialAccessToken);
+        const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
+        const original = join(home, ".fx", name);
+        linkSync(original, join(home, `${name}.alias`));
+        await completeDisplayedSubscriptionLogin(
+          session,
+          `Authorize with ${label}`,
+          provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
+          400,
+        );
+        await session.waitForText(`${label} subscription: Credential could not be saved`, TIMEOUT);
+        expect(await session.captureFullScrollback()).not.toContain(`Switched to ${label}`);
+        expect(statSync(original).nlink).toBe(2);
+        expect(readFileSync(original, "utf8")).toBe(readFileSync(join(home, `${name}.alias`), "utf8"));
+        await session.waitForComposer(TIMEOUT);
+      }
+      await session.sendText("Use the original Gateway credential.");
+      await session.waitForText("GATEWAY_AFTER_FAILED_SIGNIN", TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "all provider sign-in entries reject unavailable storage before OAuth",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-storage-admission-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth("unused-token");
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+    writeSeededChatGptLogin(home);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
+      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+    }
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SOUND: "0",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_OAUTH_CLIENT_ID: "test-client",
+      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      ...chatgptOauth.env,
+      ...grok.env,
+    };
+    try {
+      for (const provider of ["vercel", "codex", "grok"]) {
+        const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
+        expect(result.timedOut).toBe(false);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stdout).not.toContain("http");
+      }
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      await openProviderPicker(session);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Saved credential storage is unavailable", TIMEOUT);
+      expect(await session.captureFullScrollback()).not.toContain("Sign in with Vercel");
+      for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
+        unlinkSync(join(home, `${name}.alias`));
+        chmodSync(join(home, ".fx", name), 0o400);
+      }
+      for (const provider of ["vercel", "codex", "grok"]) {
+        const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
+        expect(result.timedOut).toBe(false);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("Saved credential storage is unavailable");
+        expect(result.stdout).not.toContain("http");
+      }
+      expect(oauth.requests).toHaveLength(0);
+      expect(chatgptOauth.requests).toHaveLength(0);
+      expect(grok.requests).toHaveLength(0);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  30_000,
+);
+
+tmuxTest(
+  "unavailable saved subscriptions keep login and provider selection usable",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-unavailable-subscriptions-"));
+    stderrPath = join(home, "stderr.log");
+    writeSeededChatGptLogin(home);
+    writeSeededGrokLogin(home, "grok-initial-access-token");
+    for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
+      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+    }
+    gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_WITH_UNAVAILABLE_SUBSCRIPTIONS")]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      10_000,
+    );
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Codex subscription is unavailable");
+    expect(scrollback).toContain("Grok subscription is unavailable");
+    expect(scrollback).not.toContain("picker was not opened with stale data");
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
+    await selectEnvKeyCredential(session);
+    await session.sendText("Keep using the working Gateway credential.");
+    await session.waitForText("GATEWAY_WITH_UNAVAILABLE_SUBSCRIPTIONS", TIMEOUT);
+    for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
+      expect(statSync(join(home, ".fx", name)).nlink).toBe(2);
+    }
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "unavailable saved subscription reports storage failure and recovers after repair",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-auth-unavailable-signin-"));
+    stderrPath = join(home, "stderr.log");
+    writeSeededChatGptLogin(home);
+    writeSeededGrokLogin(home, "grok-initial-access-token");
+    for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
+      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+    }
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      for (const [provider, label] of [["codex", "Codex"], ["grok", "Grok"]]) {
+        await openProviderPicker(session);
+        await session.sendText(provider);
+        await session.waitForText(`${label} subscription: Saved credential storage is unavailable`, 10_000);
+        const blocked = await session.captureFullScrollback();
+        expect(blocked).not.toContain(`Authorize with ${label}`);
+        expect(blocked).not.toContain(`Switched to ${label}`);
+        await session.waitForComposer(TIMEOUT);
+
+        const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
+        const original = join(home, ".fx", name);
+        expect(statSync(original).nlink).toBe(2);
+        expect(readFileSync(original, "utf8")).toBe(readFileSync(join(home, `${name}.alias`), "utf8"));
+        unlinkSync(join(home, `${name}.alias`));
+        await openProviderPicker(session);
+        await session.sendText(provider);
+        await session.waitForText(`Switched to ${label} subscription`, TIMEOUT);
+        await session.sendText(`Use the saved ${label} credential.`);
+        await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+      }
+      for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
+        expect(statSync(join(home, ".fx", name)).nlink).toBe(1);
+      }
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
 
 tmuxTest(
   "inline sign-in renders the device flow and Ctrl+C cancels without a session",
