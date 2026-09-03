@@ -61,6 +61,7 @@ pub const ConversationEvent = union(enum) {
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
     steering: ConversationText,
+    turn_completed: void,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
 };
@@ -137,7 +138,7 @@ pub fn validateConversationTransition(
                 }
             }
         },
-        .user, .assistant, .steering, .interrupted => {},
+        .user, .assistant, .steering, .turn_completed, .interrupted => {},
     }
 }
 
@@ -175,6 +176,7 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             if (interrupted.partial_text) |text| try validateOptionalConversationText(text);
         },
         .context_checkpoint => |checkpoint| try validateConversationText(checkpoint.summary),
+        .turn_completed => {},
     }
 }
 
@@ -251,6 +253,121 @@ pub fn decodeConversationFrame(
     validateConversationEventShape(parsed.value.event) catch
         return error.InvalidConversationFrame;
     return parsed;
+}
+
+/// Appends borrowed conversational events for one canonical history turn.
+/// The caller owns only the destination list storage; event payloads remain
+/// valid for the lifetime of `turn`.
+pub fn appendHistoryTurnConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    turn: types.HistoryTurn,
+) !void {
+    const initial_len = events.items.len;
+    errdefer events.shrinkRetainingCapacity(initial_len);
+    switch (turn) {
+        .assistant => |entry| {
+            try events.append(alloc, .{ .user = .{ .text = entry.user.text } });
+            try appendExecutionConversationEvents(alloc, events, entry.execution);
+            if (entry.assistant.len > 0) {
+                try events.append(alloc, .{ .assistant = .{ .text = entry.assistant } });
+            }
+            try events.append(alloc, .{ .turn_completed = {} });
+        },
+        .interrupted => |entry| {
+            try events.append(alloc, .{ .user = .{ .text = entry.user.text } });
+            try appendExecutionConversationEvents(alloc, events, entry.execution);
+            if (entry.tool_call) |call| {
+                try events.append(alloc, .{ .tool_call = .{
+                    .call_id = call.id,
+                    .tool_name = call.name,
+                    .arguments_json = call.arguments_json,
+                } });
+            }
+            try events.append(alloc, .{ .interrupted = .{
+                .reason = entry.terminal_reason,
+                .partial_text = entry.assistant,
+            } });
+        },
+        .compacted_summary => return error.ConversationCheckpointRequiresSequence,
+    }
+}
+
+fn appendExecutionConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    execution: types.ExecutionMemory,
+) !void {
+    var steering_index: usize = 0;
+    while (steering_index < execution.steering.len and
+        execution.steering[steering_index].after_tool_step_count == 0)
+    {
+        try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
+        steering_index += 1;
+    }
+    for (execution.tool_steps, 0..) |step, step_index| {
+        if (step.assistant) |assistant| {
+            if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+        }
+        for (step.tool_calls) |call| {
+            try events.append(alloc, .{ .tool_call = .{
+                .call_id = call.id,
+                .tool_name = call.name,
+                .arguments_json = call.arguments_json,
+            } });
+        }
+        for (step.tool_results) |result| {
+            const artifact_ref = resultArtifactRef(result) orelse
+                return error.ConversationArtifactRequired;
+            try events.append(alloc, .{ .tool_result = .{
+                .call_id = result.tool_call_id,
+                .tool_name = result.tool_name,
+                .status = result.status,
+                .artifact_ref = artifact_ref,
+                .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
+                    return error.InvalidConversationEvent,
+                .completeness = .complete,
+                .preview = result.preview,
+            } });
+            for (result.permission_feedback) |feedback| {
+                if (feedback.len > 0) {
+                    try events.append(alloc, .{ .steering = .{ .text = feedback } });
+                }
+            }
+        }
+        const completed_steps = step_index + 1;
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == completed_steps)
+        {
+            try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
+            steering_index += 1;
+        }
+    }
+    if (steering_index != execution.steering.len) {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn appendSteeringConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    steering: types.PersistedSteering,
+) !void {
+    if (steering.assistant_prefix) |assistant| {
+        if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+    }
+    if (steering.text.len > 0) {
+        try events.append(alloc, .{ .steering = .{ .text = steering.text } });
+    }
+}
+
+fn resultArtifactRef(result: types.PersistedToolResult) ?[]const u8 {
+    if (result.output_handle) |handle| return handle;
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
 }
 
 pub const Kind = enum {
@@ -3239,4 +3356,43 @@ test "conversation frame round trips an external tool result reference" {
     try std.testing.expectEqualStrings("sha256:abcdef", result.artifact_ref);
     try std.testing.expectEqual(ArtifactCompleteness.partial, result.completeness);
     try std.testing.expectEqualStrings("bounded preview", result.preview.?);
+}
+
+test "history turn projects to flat conversation events with artifact references" {
+    var calls = [_]types.ToolCall{.{
+        .id = "call-shell",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"printf done\"}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_handle = @constCast("result-shell.txt"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("I will run it."),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const turn = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("Run the command.") },
+        .assistant = @constCast("It completed."),
+        .execution = .{ .tool_steps = &steps },
+    } };
+    var events: std.ArrayList(ConversationEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+
+    try appendHistoryTurnConversationEvents(std.testing.allocator, &events, turn);
+
+    try std.testing.expectEqual(@as(usize, 6), events.items.len);
+    try std.testing.expectEqualStrings("Run the command.", events.items[0].user.text);
+    try std.testing.expectEqualStrings("I will run it.", events.items[1].assistant.text);
+    try std.testing.expectEqualStrings("call-shell", events.items[2].tool_call.call_id);
+    try std.testing.expectEqualStrings("result-shell.txt", events.items[3].tool_result.artifact_ref);
+    try std.testing.expectEqualStrings("It completed.", events.items[4].assistant.text);
+    try std.testing.expect(events.items[5] == .turn_completed);
 }

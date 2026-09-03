@@ -203,6 +203,88 @@ pub const DurableSessionState = struct {
     }
 };
 
+pub const session_metadata_schema_version: u8 = 4;
+pub const max_session_metadata_bytes: usize = 64 * 1024;
+const max_session_title_bytes: usize = 240;
+
+pub const SessionMetadata = struct {
+    schema_version: u8 = session_metadata_schema_version,
+    id: []const u8,
+    origin_workspace_root: []const u8,
+    workspace_root: []const u8,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    conversation_language: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    title: ?[]const u8 = null,
+    subagent_child: bool = false,
+};
+
+pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
+
+pub fn encodeSessionMetadata(
+    alloc: Allocator,
+    metadata: SessionMetadata,
+) ![]u8 {
+    try validateSessionMetadata(metadata);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeSessionMetadata(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedSessionMetadata {
+    if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+        .max_value_len = max_session_metadata_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionMetadata,
+    };
+    errdefer parsed.deinit();
+    validateSessionMetadata(parsed.value) catch return error.InvalidSessionMetadata;
+    return parsed;
+}
+
+fn validateSessionMetadata(metadata: SessionMetadata) !void {
+    if (metadata.schema_version != session_metadata_schema_version) {
+        return error.UnsupportedSessionSchema;
+    }
+    try validateSessionId(metadata.id);
+    try validateWorkspaceRoot(metadata.origin_workspace_root);
+    try validateWorkspaceRoot(metadata.workspace_root);
+    if (metadata.created_at_ms < 0 or metadata.updated_at_ms < metadata.created_at_ms) {
+        return error.InvalidSessionMetadata;
+    }
+    try validateConversationLanguageBytes(metadata.conversation_language);
+    if (model_provider.parse(metadata.provider) == null) return error.InvalidSessionMetadata;
+    try validateModel(metadata.model);
+    if (types.ReasoningEffort.parse(metadata.effort) == null) {
+        return error.InvalidSessionMetadata;
+    }
+    if (metadata.title) |title| {
+        if (title.len == 0 or
+            title.len > max_session_title_bytes or
+            !std.unicode.utf8ValidateSlice(title))
+        {
+            return error.InvalidSessionMetadata;
+        }
+    }
+}
+
 pub const EncodeSummary = struct {
     encoded_bytes: u64,
     sha256: [Sha256.digest_length]u8,
@@ -4016,4 +4098,34 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
         .max_value_bytes = buffer.len,
     }) catch return;
     state.deinit(std.testing.allocator);
+}
+
+test "session metadata round trips without conversation or control state" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSessionMetadata(alloc, .{
+        .id = "session-1",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 20,
+        .conversation_language = "en",
+        .provider = "gateway",
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+        .title = "Compaction work",
+        .subagent_child = false,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "history") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+
+    var decoded = try decodeSessionMetadata(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("session-1", decoded.value.id);
+    try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
+    try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
+    try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
 }

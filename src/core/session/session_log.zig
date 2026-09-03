@@ -154,6 +154,31 @@ pub const ConversationWriter = struct {
         return self.pending_tool_calls.items.len;
     }
 
+    pub fn appendHistoryTurn(
+        self: *ConversationWriter,
+        alloc: Allocator,
+        timestamp_ms: i64,
+        turn: types.HistoryTurn,
+    ) !void {
+        if (turn == .compacted_summary) {
+            if (self.last_seq == 0) return error.InvalidCheckpointCoverage;
+            _ = try self.append(alloc, timestamp_ms, .{
+                .context_checkpoint = .{
+                    .covers_through_seq = self.last_seq,
+                    .summary = turn.compacted_summary.summary,
+                },
+            });
+            return;
+        }
+
+        var events: std.ArrayList(session_event.ConversationEvent) = .empty;
+        defer events.deinit(alloc);
+        try session_event.appendHistoryTurnConversationEvents(alloc, &events, turn);
+        for (events.items) |event| {
+            _ = try self.append(alloc, timestamp_ms, event);
+        }
+    }
+
     pub fn readAllForTest(self: *const ConversationWriter, alloc: Allocator) ![]u8 {
         const size = std.math.cast(usize, self.committed_bytes) orelse
             return error.ConversationTooLarge;
@@ -198,7 +223,7 @@ pub const ConversationWriter = struct {
             .context_checkpoint => |checkpoint| {
                 self.latest_checkpoint_coverage = checkpoint.covers_through_seq;
             },
-            .user, .assistant, .steering, .interrupted => {},
+            .user, .assistant, .steering, .turn_completed, .interrupted => {},
         }
         self.last_seq = seq;
     }
@@ -7987,4 +8012,47 @@ test "conversation writer repairs only a partial final record and continues" {
         11,
         .{ .assistant = .{ .text = "continued" } },
     ));
+}
+
+test "conversation writer flattens a canonical history turn" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{
+        .read = true,
+        .truncate = true,
+    });
+    var writer = try ConversationWriter.init(alloc, file);
+    defer writer.deinit();
+
+    var calls = [_]types.ToolCall{.{
+        .id = "call-shell",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"printf done\"}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_handle = @constCast("result-shell.txt"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Running it."),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+        .user = .{ .text = @constCast("Run the command.") },
+        .assistant = @constCast("It completed."),
+        .execution = .{ .tool_steps = &steps },
+    } });
+
+    const bytes = try writer.readAllForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, bytes, "\n"));
+    try std.testing.expectEqual(@as(u64, 6), writer.last_seq);
+    try std.testing.expectEqual(@as(usize, 0), writer.pendingToolCallCount());
 }
