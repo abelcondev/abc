@@ -529,26 +529,39 @@ fn classifyConversationCandidate(
         return error.InvalidSessionFormat;
     }
 
-    var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
-    defer event_file.close(io_mod.getIo());
-    const event_stat = try event_file.stat(io_mod.getIo());
-    const length = try event_file.length(io_mod.getIo());
-    var offset: u64 = 0;
+    const event_stat = try session_dir.dir.statFile(
+        io_mod.getIo(),
+        "events.jsonl",
+        .{ .follow_symlinks = false },
+    );
+    if (event_stat.kind != .file or event_stat.nlink != 1) {
+        return error.SessionPathUnsafe;
+    }
     var history_len: usize = 0;
-    while (offset < length) {
-        const line = try session_replay.readLineAt(alloc, event_file, offset, length) orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        switch (decoded.value.event) {
-            .turn_completed, .interrupted => history_len = std.math.add(
-                usize,
-                history_len,
-                1,
-            ) catch return error.InvalidSessionFormat,
-            else => {},
+    if (event_stat.size > 0) {
+        var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
+        defer event_file.close(io_mod.getIo());
+        var offset: u64 = 0;
+        while (offset < event_stat.size) {
+            const line = try session_replay.readLineAt(
+                alloc,
+                event_file,
+                offset,
+                event_stat.size,
+            ) orelse break;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            switch (decoded.value.event) {
+                .turn_completed, .interrupted => history_len = std.math.add(
+                    usize,
+                    history_len,
+                    1,
+                ) catch return error.InvalidSessionFormat,
+                else => {},
+            }
+            offset = line.next_offset;
         }
-        offset = line.next_offset;
     }
 
     const id = try alloc.dupe(u8, metadata.value.id);
@@ -565,13 +578,16 @@ fn classifyConversationCandidate(
             .origin_workspace_root = origin,
             .title = title,
             .created_at_ms = metadata.value.created_at_ms,
-            .updated_at_ms = @max(
-                metadata.value.updated_at_ms,
-                std.math.cast(
-                    i64,
-                    @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
-                ) orelse std.math.maxInt(i64),
-            ),
+            .updated_at_ms = if (history_len == 0)
+                metadata.value.updated_at_ms
+            else
+                @max(
+                    metadata.value.updated_at_ms,
+                    std.math.cast(
+                        i64,
+                        @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
+                    ) orelse std.math.maxInt(i64),
+                ),
             .conversation_language = session.ConversationLanguage.fromSlice(
                 metadata.value.conversation_language,
             ) catch return error.InvalidSessionFormat,

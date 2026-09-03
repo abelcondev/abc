@@ -112,18 +112,6 @@ pub const SessionListPage = struct {
     }
 };
 
-/// Aggregate cache summary: how many sessions exist and which is latest.
-pub const StateSummary = struct {
-    count: usize,
-    latest_id: ?[]u8 = null,
-
-    /// Frees the owned latest id, if any, and poisons the value.
-    pub fn deinit(self: *StateSummary, alloc: Allocator) void {
-        if (self.latest_id) |id| alloc.free(id);
-        self.* = undefined;
-    }
-};
-
 /// A resumable writable session handle, re-exported from `session_log` so the
 /// store's public surface is self-contained.
 pub const LoadedWritableSession = session_log.LoadedWritableSession;

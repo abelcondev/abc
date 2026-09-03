@@ -536,6 +536,11 @@ fn loadConversationStateIfPresent(
     defer event_file.close(io_mod.getIo());
     const history = try replayConversationHistory(alloc, event_file);
     errdefer session.freeHistoryTurnSlice(alloc, history);
+    const last_work_id = if (latestConversationWorkId(history)) |work_id|
+        try alloc.dupe(u8, work_id)
+    else
+        null;
+    errdefer if (last_work_id) |work_id| alloc.free(work_id);
     var usage = try session_usage_sidecar.load(
         alloc,
         dir,
@@ -579,10 +584,19 @@ fn loadConversationStateIfPresent(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
         .permission_state = permission_state,
+        .last_subagent_work_id = last_work_id,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
         .subagent_child = metadata.value.subagent_child,
     };
+}
+
+fn latestConversationWorkId(history: []const session.HistoryTurn) ?[]const u8 {
+    var latest: ?[]const u8 = null;
+    for (history) |turn| {
+        if (session.historyTurnWorkId(turn)) |work_id| latest = work_id;
+    }
+    return latest;
 }
 
 pub fn hasConversationMetadata(
@@ -596,6 +610,7 @@ pub fn hasConversationMetadata(
         session_codec.max_session_metadata_bytes,
     ) catch |err| switch (err) {
         error.FileNotFound => return false,
+        error.InvalidSessionFormat => return false,
         else => return err,
     };
     defer alloc.free(bytes);
@@ -1222,6 +1237,17 @@ fn removeCompactedSummaries(
     for (state.history) |turn| if (turn != .compacted_summary) {
         raw_count += 1;
     };
+    if (raw_count == 0 and state.history.len > 0) {
+        const retained = try alloc.alloc(session.HistoryTurn, 1);
+        retained[0] = state.history[state.history.len - 1];
+        for (state.history[0 .. state.history.len - 1]) |turn| {
+            session.freeHistoryTurn(alloc, turn);
+        }
+        alloc.free(state.history);
+        state.history = retained;
+        state.context_history_start = 0;
+        return;
+    }
     if (raw_count == state.history.len) {
         state.context_history_start = 0;
         return;
@@ -1281,7 +1307,7 @@ fn externalizeConversationResults(
             &entry.execution,
             capability,
         ),
-        .compacted_summary => unreachable,
+        .compacted_summary => {},
     };
 }
 

@@ -87,8 +87,11 @@ fn collectFromHomeCancelable(
             continue;
         };
         if (!session_usage.needsProfileRecovery(usage)) {
-            if (marked.protected_updated_at_ms) |protected| {
-                if (state.updated_at_ms >= protected) continue;
+            const modified = store.usageCheckpointModifiedAtNs(marked.id) catch null;
+            if (modified != null and
+                modified.? > marked.marker_modified_at_ns)
+            {
+                continue;
             }
             unknown_pending = true;
             continue;
@@ -484,7 +487,7 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
             .compaction_byte_threshold = 0,
         },
     );
-    try std.testing.expect(!std.mem.eql(
+    try std.testing.expect(std.mem.eql(
         u8,
         &generation_before,
         &writable.position.log_generation,

@@ -141,45 +141,6 @@ pub fn listActionablePage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !ActionableSessionPage {
-    return (try listActionablePageInternal(
-        store,
-        alloc,
-        scope,
-        active_id,
-        continuation,
-        limit,
-        false,
-    )).?;
-}
-
-pub fn tryListActionableIndexPage(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !?ActionableSessionPage {
-    return listActionablePageInternal(
-        store,
-        alloc,
-        scope,
-        active_id,
-        continuation,
-        limit,
-        true,
-    );
-}
-
-fn listActionablePageInternal(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-    index_only: bool,
-) !?ActionableSessionPage {
     if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
 
     var result: ActionableSessionPage = .{};
@@ -198,18 +159,7 @@ fn listActionablePageInternal(
             max_page_limit - scanned,
         );
         const next = if (position) |value| value.view() else null;
-        const maybe_page = if (index_only) switch (scope) {
-            .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.tryListResumableIndexPage(
-                alloc,
-                active_id,
-                next,
-            ),
-        } else switch (scope) {
+        var page = switch (scope) {
             .current_workspace => try scoped.listResumableWorkspacePage(
                 alloc,
                 active_id,
@@ -220,10 +170,6 @@ fn listActionablePageInternal(
                 active_id,
                 next,
             ),
-        };
-        var page = maybe_page orelse {
-            result.deinit(alloc);
-            return null;
         };
         defer page.deinit(alloc);
         result.has_more = page.has_more;
