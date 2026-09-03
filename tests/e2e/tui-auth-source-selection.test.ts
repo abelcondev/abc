@@ -5182,3 +5182,59 @@ for (const scenario of [
     60_000,
   );
 }
+
+tmuxTest("Codex catalog includes models gated by the current client version", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-catalog-version-"));
+  stderrPath = join(home, "stderr.log");
+  gateway = startFakeGateway([]);
+  writeSeededChatGptLogin(home);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex",
+    models: { codex: "gpt-5.6-luna" },
+  }) + "\n", { mode: 0o600 });
+  const versions: Array<string | null> = [];
+  const catalog = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const version = new URL(request.url).searchParams.get("client_version");
+      versions.push(version);
+      const [major = 0, minor = 0] = (version ?? "").split(".").map(Number);
+      const ids = ["gpt-5.6-luna"];
+      if (major > 0 || minor >= 153) ids.push("gpt-6-astra");
+      return Response.json({ models: ids.map((slug) => ({
+        slug,
+        visibility: "list",
+        supported_in_api: true,
+        supported_reasoning_levels: [{ effort: "high" }, { effort: "ultra" }],
+        input_modalities: ["text", "image"],
+        context_window: 272000,
+      })) });
+    },
+  });
+  try {
+    const env = {
+      HOME: home,
+      FX_MODEL: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_SOUND: "0",
+      FX_E2E_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${catalog.port}/models`,
+    };
+    const listed = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(listed.code, listed.stderr).toBe(0);
+    const ids = JSON.parse(listed.stdout).models.map((model: { id: string }) => model.id);
+    expect(ids).toContain("gpt-6-astra");
+    expect(listed.stderr).toBe("");
+
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/model");
+    await session.waitForText("gpt-6-astra", TIMEOUT);
+    expect(versions.length).toBeGreaterThanOrEqual(2);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    catalog.stop(true);
+  }
+}, 60_000);

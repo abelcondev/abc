@@ -15,7 +15,7 @@ const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
 
-pub const protocol_client_version = "0.148.0";
+pub const protocol_client_version = "0.153.0";
 pub const reviewer_model = "gpt-5.6-luna";
 
 pub const model_catalog_provider = model_catalog.Provider{
@@ -352,8 +352,8 @@ test "Codex catalog parser keeps visible API models and live capabilities" {
 test "Codex catalog URL uses the live-validated protocol compatibility version" {
     const url = try modelsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") != null);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.0.4") == null);
+    try std.testing.expect(std.mem.find(u8, url, "client_version=0.153.0") != null);
+    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") == null);
 }
 
 test "host-managed Codex catalog auth carries no local headers" {
