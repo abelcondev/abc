@@ -36,6 +36,86 @@ pub const ActionableSessionPage = struct {
     }
 };
 
+pub const ActionableSessionCatalog = struct {
+    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+
+    pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
+        for (self.summaries.items) |*summary| summary.deinit(alloc);
+        self.summaries.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn listActionableCatalog(
+    store: session_store.Store,
+    alloc: Allocator,
+    scope: session_store.SessionListScope,
+    active_id: ?[]const u8,
+) !ActionableSessionCatalog {
+    var summaries = switch (scope) {
+        .current_workspace => try store.listForWorkspace(alloc),
+        .all_workspaces => try store.list(alloc),
+    };
+    errdefer session_summary_codec.freeSummaries(alloc, &summaries);
+    const keep = try alloc.alloc(bool, summaries.items.len);
+    defer alloc.free(keep);
+    for (summaries.items, keep) |summary, *retain| {
+        retain.* = summary.history_len != 0 or summary.has_managed_children;
+        if (retain.*) {
+            if (active_id) |id| {
+                retain.* = !std.mem.eql(u8, summary.id, id);
+            }
+        }
+        if (retain.*) retain.* = try isVisibleSession(store, alloc, summary.id);
+    }
+
+    var write_index: usize = 0;
+    for (summaries.items, keep, 0..) |*summary, retain, read_index| {
+        if (!retain) {
+            summary.deinit(alloc);
+            continue;
+        }
+        if (write_index != read_index) {
+            summaries.items[write_index] = summary.*;
+        }
+        write_index += 1;
+    }
+    summaries.items.len = write_index;
+    return .{ .summaries = summaries };
+}
+
+pub fn actionablePageFromCatalog(
+    alloc: Allocator,
+    catalog: *const ActionableSessionCatalog,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !ActionableSessionPage {
+    if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
+    var page = try session_summary_codec.resumablePageFromSummaries(
+        alloc,
+        catalog.summaries.items,
+        null,
+        null,
+        continuation,
+        limit,
+    );
+    errdefer page.deinit(alloc);
+    const next = if (page.has_more and page.summaries.items.len > 0) blk: {
+        const last = page.summaries.items[page.summaries.items.len - 1];
+        break :blk ActionableContinuation{
+            .updated_at_ms = last.updated_at_ms,
+            .id = try alloc.dupe(u8, last.id),
+        };
+    } else null;
+    const result = ActionableSessionPage{
+        .summaries = page.summaries,
+        .has_more = page.has_more,
+        .continuation = next,
+    };
+    page.summaries = .empty;
+    return result;
+}
+
 pub fn listVisiblePage(
     store: session_store.Store,
     alloc: Allocator,
@@ -226,42 +306,6 @@ pub fn resumeForExternalPrompt(
     );
     errdefer loaded.deinit(alloc);
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
-    try ensureLoadedExternalPromptAllowed(&loaded);
-    return loaded;
-}
-
-pub fn admitResumeViewForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    target: session_store.ResumeTarget,
-) !?session_store.ResumeViewAdmission {
-    switch (target) {
-        .id => |session_id| try ensureExternalMarkerAllowed(store, alloc, session_id),
-        .last => {},
-    }
-    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
-    errdefer admission.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
-    return admission;
-}
-
-pub fn resumeAdmittedForExternalPrompt(
-    store: session_store.Store,
-    alloc: Allocator,
-    admission: *session_store.ResumeViewAdmission,
-    session_id: []const u8,
-    workspace_root: []const u8,
-    options: session_store.ResumeOptions,
-) !session_store.LoadedWritableSession {
-    try ensureExternalMarkerAllowed(store, alloc, session_id);
-    var loaded = try store.resumeAdmittedForWrite(
-        alloc,
-        admission,
-        session_id,
-        workspace_root,
-        options,
-    );
-    errdefer loaded.deinit(alloc);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }

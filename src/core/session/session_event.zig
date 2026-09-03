@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
@@ -753,32 +754,6 @@ pub const SequenceValidator = struct {
     }
 };
 
-pub const IdentifierSource = struct {
-    context: *anyopaque,
-    next_fn: *const fn (context: *anyopaque) Identifier,
-
-    pub fn next(self: IdentifierSource) Identifier {
-        return self.next_fn(self.context);
-    }
-};
-
-pub const ReplacementWriteOptions = struct {
-    log_generation: Identifier,
-    first_seq: u64,
-    replacement_id: Identifier,
-    event_ids: IdentifierSource,
-    timestamp_ms: i64,
-    reason: ReplacementReason,
-};
-
-pub const ReplacementWriteSummary = struct {
-    encoded_bytes: u64,
-    sha256: Digest,
-    chunk_count: u64,
-    last_seq: u64,
-    last_event_id: Identifier,
-};
-
 pub const ReductionStart = struct {
     generation: ?Identifier = null,
     next_seq: u64 = 1,
@@ -803,7 +778,10 @@ pub const Reduction = struct {
     }
 };
 
-pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
+/// Test-fixture encoder for the read-only v3 importer. Current runtime code
+/// must never emit the legacy envelope.
+pub fn encodeLegacyFixtureFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
+    if (!builtin.is_test) @compileError("legacy session encoding is test-only");
     try validateEnvelope(envelope);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -874,84 +852,6 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
     errdefer envelope.deinit(alloc);
     try validateEnvelope(envelope);
     return envelope;
-}
-
-pub fn writeStateReplacement(
-    alloc: Allocator,
-    writer: *std.Io.Writer,
-    state: session_codec.DurableSessionState,
-    options: ReplacementWriteOptions,
-) !ReplacementWriteSummary {
-    var discard_buffer: [4096]u8 = undefined;
-    var discard = std.Io.Writer.Discarding.init(&discard_buffer);
-    const state_summary = try session_codec.encodeState(state, &discard.writer);
-    if (state_summary.encoded_bytes == 0) return error.InvalidReplacement;
-    const chunk_count = std.math.divCeil(
-        u64,
-        state_summary.encoded_bytes,
-        raw_state_chunk_bytes,
-    ) catch return error.InvalidReplacement;
-
-    const start = Envelope{
-        .log_generation = options.log_generation,
-        .seq = options.first_seq,
-        .event_id = options.event_ids.next(),
-        .timestamp_ms = options.timestamp_ms,
-        .event = .{ .state_replacement_started = .{
-            .replacement_id = options.replacement_id,
-            .reason = options.reason,
-            .encoded_bytes = state_summary.encoded_bytes,
-            .sha256 = state_summary.sha256,
-            .chunk_count = chunk_count,
-        } },
-    };
-    const start_line = try encodeFrame(alloc, start);
-    defer alloc.free(start_line);
-    try writer.writeAll(start_line);
-
-    var chunk_writer: ReplacementChunkWriter = undefined;
-    try chunk_writer.init(alloc, writer, options, state_summary, chunk_count);
-    defer chunk_writer.deinit();
-    const second_summary = session_codec.encodeState(state, &chunk_writer.interface) catch |err| {
-        return chunk_writer.failure orelse err;
-    };
-    chunk_writer.interface.flush() catch |err| return chunk_writer.failure orelse err;
-    try chunk_writer.finish();
-    if (second_summary.encoded_bytes != state_summary.encoded_bytes or
-        !std.mem.eql(u8, &second_summary.sha256, &state_summary.sha256) or
-        chunk_writer.chunk_index != chunk_count)
-    {
-        return error.InvalidReplacement;
-    }
-
-    const transaction_frame_count = std.math.add(u64, chunk_count, 1) catch
-        return error.InvalidReplacement;
-    const commit_seq = std.math.add(u64, options.first_seq, transaction_frame_count) catch
-        return error.InvalidReplacement;
-    const commit_id = options.event_ids.next();
-    const commit = Envelope{
-        .log_generation = options.log_generation,
-        .seq = commit_seq,
-        .event_id = commit_id,
-        .timestamp_ms = options.timestamp_ms,
-        .event = .{ .state_replacement_committed = .{
-            .replacement_id = options.replacement_id,
-            .encoded_bytes = state_summary.encoded_bytes,
-            .sha256 = state_summary.sha256,
-            .chunk_count = chunk_count,
-        } },
-    };
-    const commit_line = try encodeFrame(alloc, commit);
-    defer alloc.free(commit_line);
-    try writer.writeAll(commit_line);
-
-    return .{
-        .encoded_bytes = state_summary.encoded_bytes,
-        .sha256 = state_summary.sha256,
-        .chunk_count = chunk_count,
-        .last_seq = commit_seq,
-        .last_event_id = commit_id,
-    };
 }
 
 pub fn reduceJsonl(
@@ -1089,116 +989,6 @@ pub fn reduceJsonlFrom(
         .bytes_consumed = byte_offset,
     };
 }
-
-const ReplacementChunkWriter = struct {
-    alloc: Allocator,
-    destination: *std.Io.Writer,
-    options: ReplacementWriteOptions,
-    state_summary: session_codec.EncodeSummary,
-    expected_chunk_count: u64,
-    raw: []u8,
-    raw_len: usize = 0,
-    chunk_index: u64 = 0,
-    interface_buffer: [4096]u8 = undefined,
-    interface: std.Io.Writer = undefined,
-    failure: ?anyerror = null,
-
-    fn init(
-        self: *ReplacementChunkWriter,
-        alloc: Allocator,
-        destination: *std.Io.Writer,
-        options: ReplacementWriteOptions,
-        state_summary: session_codec.EncodeSummary,
-        expected_chunk_count: u64,
-    ) !void {
-        self.* = .{
-            .alloc = alloc,
-            .destination = destination,
-            .options = options,
-            .state_summary = state_summary,
-            .expected_chunk_count = expected_chunk_count,
-            .raw = try alloc.alloc(u8, raw_state_chunk_bytes),
-        };
-        self.interface = .{
-            .vtable = &.{ .drain = drain },
-            .buffer = &self.interface_buffer,
-            .end = 0,
-        };
-    }
-
-    fn deinit(self: *ReplacementChunkWriter) void {
-        self.alloc.free(self.raw);
-        self.* = undefined;
-    }
-
-    fn drain(
-        writer: *std.Io.Writer,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!usize {
-        const self: *ReplacementChunkWriter = @alignCast(@fieldParentPtr("interface", writer));
-        var consumed: usize = 0;
-        if (writer.end > 0) {
-            self.consume(writer.buffer[0..writer.end]) catch |err| {
-                self.failure = err;
-                return error.WriteFailed;
-            };
-            writer.end = 0;
-        }
-        for (data, 0..) |part, index| {
-            const repeat = if (index == data.len - 1) splat else 1;
-            for (0..repeat) |_| {
-                self.consume(part) catch |err| {
-                    self.failure = err;
-                    return error.WriteFailed;
-                };
-                consumed += part.len;
-            }
-        }
-        return consumed;
-    }
-
-    fn consume(self: *ReplacementChunkWriter, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len > 0) {
-            const count = @min(remaining.len, self.raw.len - self.raw_len);
-            @memcpy(self.raw[self.raw_len..][0..count], remaining[0..count]);
-            self.raw_len += count;
-            remaining = remaining[count..];
-            if (self.raw_len == self.raw.len) try self.emitChunk();
-        }
-    }
-
-    fn finish(self: *ReplacementChunkWriter) !void {
-        if (self.raw_len > 0) try self.emitChunk();
-    }
-
-    fn emitChunk(self: *ReplacementChunkWriter) !void {
-        if (self.chunk_index >= self.expected_chunk_count or self.raw_len == 0) {
-            return error.InvalidReplacement;
-        }
-        const chunk = self.raw[0..self.raw_len];
-        const envelope = Envelope{
-            .log_generation = self.options.log_generation,
-            .seq = std.math.add(u64, self.options.first_seq, self.chunk_index + 1) catch
-                return error.InvalidReplacement,
-            .event_id = self.options.event_ids.next(),
-            .timestamp_ms = self.options.timestamp_ms,
-            .event = .{ .state_replacement_chunk = .{
-                .replacement_id = self.options.replacement_id,
-                .chunk_index = self.chunk_index,
-                .raw_bytes = chunk.len,
-                .chunk_sha256 = sha256(chunk),
-                .bytes = chunk,
-            } },
-        };
-        const line = try encodeFrame(self.alloc, envelope);
-        defer self.alloc.free(line);
-        try self.destination.writeAll(line);
-        self.chunk_index += 1;
-        self.raw_len = 0;
-    }
-};
 
 const ReplacementOutcome = struct {
     state: ?session_codec.DurableSessionState,
@@ -2231,9 +2021,9 @@ test "event frame codec is deterministic and validates contiguous sequence and g
         } },
     };
 
-    const first = try encodeFrame(alloc, frame);
+    const first = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(first);
-    const second = try encodeFrame(alloc, frame);
+    const second = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(first[first.len - 1] == '\n');
@@ -2297,7 +2087,7 @@ test "history_turn_committed event decode repairs duplicate-key tool arguments" 
         } },
     };
 
-    const encoded = try encodeFrame(std.testing.allocator, frame);
+    const encoded = try encodeLegacyFixtureFrame(std.testing.allocator, frame);
     defer std.testing.allocator.free(encoded);
     var decoded = try decodeFrame(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
@@ -2319,7 +2109,7 @@ test "event frame cap is inclusive of the required newline" {
         .timestamp_ms = 1,
         .event = .{ .preferences_changed = .{ .fast_mode = true } },
     };
-    const encoded = try encodeFrame(alloc, frame);
+    const encoded = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(encoded);
 
     const exact = try alloc.alloc(u8, event_frame_max_bytes);
@@ -2336,176 +2126,6 @@ test "event frame cap is inclusive of the required newline" {
     oversized[oversized.len - 2] = ' ';
     oversized[oversized.len - 1] = '\n';
     try std.testing.expectError(error.EventFrameTooLarge, decodeFrame(alloc, oversized));
-}
-
-test "replacement writer uses four MiB chunks and reducer commits only complete replacement" {
-    const alloc = std.testing.allocator;
-    const large_text = try alloc.alloc(u8, raw_state_chunk_bytes + 1);
-    defer alloc.free(large_text);
-    @memset(large_text, 'x');
-
-    const initial = session_codec.DurableSessionState{
-        .id = @constCast("session-1"),
-        .origin_workspace_root = @constCast("/tmp/origin"),
-        .workspace_root = @constCast("/tmp/current"),
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = @constCast("model-a"),
-            .effort = types.ReasoningEffort.literal("low"),
-            .fast_mode = false,
-        },
-        .history = @constCast(&.{}),
-        .total_input_tokens = 1,
-        .total_output_tokens = 2,
-    };
-    var large_history = [_]session.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("large") },
-        .assistant = large_text,
-    } }};
-    const replacement = session_codec.DurableSessionState{
-        .id = initial.id,
-        .origin_workspace_root = initial.origin_workspace_root,
-        .workspace_root = initial.workspace_root,
-        .created_at_ms = initial.created_at_ms,
-        .updated_at_ms = 15,
-        .conversation_language = session.ConversationLanguage.literal("fr"),
-        .preferences = .{
-            .model = @constCast("model-b"),
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = true,
-        },
-        .history = large_history[0..],
-        .total_input_tokens = 9,
-        .total_output_tokens = 8,
-    };
-
-    var complete: std.Io.Writer.Allocating = .init(alloc);
-    defer complete.deinit();
-    var event_id_source = TestIdentifierSource.init(0x33);
-    const replacement_summary = try writeStateReplacement(alloc, &complete.writer, replacement, .{
-        .log_generation = identifier(0x11),
-        .first_seq = 5,
-        .replacement_id = identifier(0x22),
-        .event_ids = event_id_source.source(),
-        .timestamp_ms = 15,
-        .reason = .recovery,
-    });
-    try std.testing.expect(replacement_summary.chunk_count >= 2);
-    try std.testing.expectEqualSlices(
-        u8,
-        &identifier(0x33 + @as(u8, @intCast(replacement_summary.chunk_count + 1))),
-        &replacement_summary.last_event_id,
-    );
-
-    var source = std.Io.Reader.fixed(complete.written());
-    var reduced = try reduceJsonlFrom(
-        alloc,
-        &source,
-        try initial.dupe(alloc),
-        .{ .generation = identifier(0x11), .next_seq = 5 },
-    );
-    defer reduced.deinit(alloc);
-    try std.testing.expect(reduced.truncate_from == null);
-    try std.testing.expectEqualStrings("model-b", reduced.state.preferences.model);
-    try std.testing.expectEqual(@as(i64, 15), reduced.state.updated_at_ms);
-    try std.testing.expectEqual(@as(usize, 1), reduced.state.history.len);
-    try std.testing.expectEqual(large_text.len, reduced.state.history[0].assistant.assistant.len);
-
-    const commit_start = std.mem.lastIndexOf(u8, complete.written(), "{\"schema_version\":1") orelse return error.TestExpectedEqual;
-    var incomplete_source = std.Io.Reader.fixed(complete.written()[0..commit_start]);
-    var incomplete = try reduceJsonlFrom(
-        alloc,
-        &incomplete_source,
-        try initial.dupe(alloc),
-        .{ .generation = identifier(0x11), .next_seq = 5 },
-    );
-    defer incomplete.deinit(alloc);
-    try std.testing.expectEqual(@as(?u64, 0), incomplete.truncate_from);
-    try std.testing.expectEqualStrings("model-a", incomplete.state.preferences.model);
-    try std.testing.expectEqual(@as(i64, 20), incomplete.state.updated_at_ms);
-
-    const FailingAfterReader = struct {
-        bytes: []const u8,
-        fail_at: usize,
-        offset: usize = 0,
-        buffer: [1]u8 = undefined,
-        interface: std.Io.Reader = undefined,
-
-        fn init(self: *@This(), bytes: []const u8, fail_at: usize) void {
-            self.* = .{ .bytes = bytes, .fail_at = fail_at };
-            self.interface = .{
-                .vtable = &.{
-                    .stream = stream,
-                    .readVec = readVec,
-                },
-                .buffer = &self.buffer,
-                .seek = 0,
-                .end = 0,
-            };
-        }
-
-        fn readVec(reader: *std.Io.Reader, destinations: [][]u8) std.Io.Reader.Error!usize {
-            const self: *@This() = @alignCast(@fieldParentPtr("interface", reader));
-            if (self.offset >= self.fail_at) return error.ReadFailed;
-            if (self.offset >= self.bytes.len) return error.EndOfStream;
-            for (destinations) |destination| {
-                if (destination.len == 0) continue;
-                const count = @min(
-                    destination.len,
-                    @min(
-                        self.fail_at - self.offset,
-                        self.bytes.len - self.offset,
-                    ),
-                );
-                if (count == 0) return error.ReadFailed;
-                @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);
-                self.offset += count;
-                return count;
-            }
-            const destination = reader.buffer[reader.end..];
-            if (destination.len == 0) return 0;
-            const count = @min(
-                destination.len,
-                @min(
-                    self.fail_at - self.offset,
-                    self.bytes.len - self.offset,
-                ),
-            );
-            if (count == 0) return error.ReadFailed;
-            @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);
-            self.offset += count;
-            reader.end += count;
-            return 0;
-        }
-
-        fn stream(
-            reader: *std.Io.Reader,
-            writer: *std.Io.Writer,
-            limit: std.Io.Limit,
-        ) std.Io.Reader.StreamError!usize {
-            const destination = limit.slice(try writer.writableSliceGreedy(1));
-            var destinations = [1][]u8{destination};
-            const count = try readVec(reader, &destinations);
-            writer.advance(count);
-            return count;
-        }
-    };
-    const first_frame_end =
-        (std.mem.findScalar(u8, complete.written(), '\n') orelse
-            return error.TestExpectedEqual) + 1;
-    var failing_source: FailingAfterReader = undefined;
-    failing_source.init(complete.written(), first_frame_end + 16);
-    try std.testing.expectError(
-        error.ReadFailed,
-        reduceJsonlFrom(
-            alloc,
-            &failing_source.interface,
-            try initial.dupe(alloc),
-            .{ .generation = identifier(0x11), .next_seq = 5 },
-        ),
-    );
 }
 
 test "semantic reducer uses event timestamps and enforces immutable identity" {
@@ -2552,7 +2172,7 @@ test "semantic reducer uses event timestamps and enforces immutable identity" {
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
     for (frames) |frame| {
-        const line = try encodeFrame(alloc, frame);
+        const line = try encodeLegacyFixtureFrame(alloc, frame);
         defer alloc.free(line);
         try jsonl.writer.writeAll(line);
     }
@@ -2567,12 +2187,12 @@ test "semantic reducer uses event timestamps and enforces immutable identity" {
 
     var bad = frames[2];
     bad.event.workspace_rebound.previous_workspace_root = @constCast("/tmp/not-current");
-    const bad_line = try encodeFrame(alloc, bad);
+    const bad_line = try encodeLegacyFixtureFrame(alloc, bad);
     defer alloc.free(bad_line);
     var bad_log: std.Io.Writer.Allocating = .init(alloc);
     defer bad_log.deinit();
     for (frames[0..2]) |frame| {
-        const line = try encodeFrame(alloc, frame);
+        const line = try encodeLegacyFixtureFrame(alloc, frame);
         defer alloc.free(line);
         try bad_log.writer.writeAll(line);
     }
@@ -2607,7 +2227,7 @@ test "semantic reducer resumes a contiguous suffix from owned state" {
         .timestamp_ms = 30,
         .event = .{ .preferences_changed = .{ .fast_mode = true } },
     };
-    const line = try encodeFrame(alloc, envelope);
+    const line = try encodeLegacyFixtureFrame(alloc, envelope);
     defer alloc.free(line);
 
     var source = std.Io.Reader.fixed(line);
@@ -2682,7 +2302,7 @@ test "single event application updates caller-owned state without replaying its 
             } },
         } },
     };
-    const line = try encodeFrame(alloc, history);
+    const line = try encodeLegacyFixtureFrame(alloc, history);
     defer alloc.free(line);
     const boundary = try applyEventFrame(
         alloc,
@@ -2769,7 +2389,7 @@ test "single event application preserves caller-owned state on allocation failur
             } },
         } },
     };
-    const line = try encodeFrame(alloc, event);
+    const line = try encodeLegacyFixtureFrame(alloc, event);
     defer alloc.free(line);
 
     const AllocationCheck = struct {
@@ -2854,7 +2474,7 @@ test "single event application validates boundaries for every semantic event kin
     };
 
     for (events, 0..) |event, index| {
-        const line = try encodeFrame(alloc, event);
+        const line = try encodeLegacyFixtureFrame(alloc, event);
         defer alloc.free(line);
         if (index == 0) {
             try std.testing.expectError(
@@ -2987,7 +2607,7 @@ test "history_turn_committed leaves absent session usage unchanged" {
         } },
     };
 
-    const committed_line = try encodeFrame(alloc, committed);
+    const committed_line = try encodeLegacyFixtureFrame(alloc, committed);
     defer alloc.free(committed_line);
 
     var decoded = try decodeFrame(alloc, committed_line);
@@ -3011,7 +2631,7 @@ test "history_turn_committed leaves absent session usage unchanged" {
 
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
-    const started_line = try encodeFrame(alloc, started);
+    const started_line = try encodeLegacyFixtureFrame(alloc, started);
     defer alloc.free(started_line);
     try jsonl.writer.writeAll(started_line);
     try jsonl.writer.writeAll(committed_line);
@@ -3150,7 +2770,7 @@ test "history event provenance rejects conflicts and malformed IDs" {
     var persisted_conflict = base;
     persisted_conflict.event.history_turn_committed.work_id = @constCast("work-a");
     persisted_conflict.event.history_turn_committed.turn.assistant.user.work_id = @constCast("work-a");
-    const encoded = try encodeFrame(std.testing.allocator, persisted_conflict);
+    const encoded = try encodeLegacyFixtureFrame(std.testing.allocator, persisted_conflict);
     defer std.testing.allocator.free(encoded);
     const final_id = std.mem.lastIndexOf(u8, encoded, "work-a") orelse
         return error.TestExpectedEqual;
@@ -3275,7 +2895,7 @@ test "usage checkpoint event decodes a cumulative snapshot" {
             },
         } },
     };
-    const started_line = try encodeFrame(alloc, started);
+    const started_line = try encodeLegacyFixtureFrame(alloc, started);
     defer alloc.free(started_line);
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
@@ -3473,28 +3093,6 @@ fn identifier(seed: u8) Identifier {
     return value;
 }
 
-const TestIdentifierSource = struct {
-    next_seed: u8,
-
-    fn init(seed: u8) TestIdentifierSource {
-        return .{ .next_seed = seed };
-    }
-
-    fn source(self: *TestIdentifierSource) IdentifierSource {
-        return .{
-            .context = self,
-            .next_fn = next,
-        };
-    }
-
-    fn next(context: *anyopaque) Identifier {
-        const self: *TestIdentifierSource = @ptrCast(@alignCast(context));
-        const value = identifier(self.next_seed);
-        self.next_seed +%= 1;
-        return value;
-    }
-};
-
 test "conversation transition validates sequence tool identity and checkpoint safety" {
     try validateConversationTransition(.{}, .{
         .seq = 1,
@@ -3583,6 +3181,27 @@ test "conversation frame round trips an external tool result reference" {
     try std.testing.expectEqualStrings("sha256:abcdef", result.artifact_ref);
     try std.testing.expectEqual(ArtifactCompleteness.partial, result.completeness);
     try std.testing.expectEqualStrings("bounded preview", result.preview.?);
+}
+
+test "conversation frame decoder stays bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzConversationFrame, .{
+        .corpus = &.{
+            "",
+            "{}\n",
+            "{\"schema_version\":1}\n",
+            "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
+        },
+    });
+}
+
+fn fuzzConversationFrame(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var decoded = decodeConversationFrame(
+        std.testing.allocator,
+        buffer[0..len],
+    ) catch return;
+    decoded.deinit();
 }
 
 test "history turn projects to flat conversation events with artifact references" {

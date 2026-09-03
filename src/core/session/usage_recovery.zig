@@ -484,12 +484,6 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
         alloc,
         .{ .usage_checkpointed = .{ .usage = unresolved } },
         unresolved_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{
-            .checkpoint_interval = 0,
-            .compaction_frame_threshold = 0,
-            .compaction_byte_threshold = 0,
-        },
     );
     try std.testing.expect(std.mem.eql(
         u8,
@@ -511,8 +505,6 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
         alloc,
         .{ .usage_checkpointed = .{ .usage = settled } },
         settled_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
 
     var after_settled_checkpoint = try collectFromHome(alloc, home);

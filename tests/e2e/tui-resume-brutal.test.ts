@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   hasEmptyComposer,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -209,12 +210,23 @@ function historyBatch(batch: number, config: Config): Response {
 }
 
 async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSummary> {
-  const responses: Response[] = [];
-  for (let batch = 0; batch < config.chatBatches; batch += 1) {
-    responses.push(historyBatch(batch, config));
-  }
-  responses.push(fakeGatewayFinalText(FINAL_MARKER));
-  const gateway = startFakeGateway(responses);
+  let nextBatch = 0;
+  let finalSent = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("Summarize the conversation goals")) {
+      return fakeGatewayFinalText(
+        "The session is building a large, heterogeneous transcript and reading bounded ranges from resume-tool-payload.txt. Continue the same task without repeating completed reads.",
+      );
+    }
+    if (nextBatch < config.chatBatches) {
+      return historyBatch(nextBatch++, config);
+    }
+    if (!finalSent) {
+      finalSent = true;
+      return fakeGatewayFinalText(FINAL_MARKER);
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({

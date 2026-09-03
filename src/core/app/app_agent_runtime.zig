@@ -1074,10 +1074,7 @@ pub fn Runtime(comptime App: type) type {
             var messages: std.ArrayList(ChatMessage) = .empty;
             defer messages.deinit(arena);
             const uncertain_history_count = @min(
-                @max(
-                    job.unversioned_history_count,
-                    job.context_history_start,
-                ),
+                job.unversioned_history_count,
                 job.history.len,
             );
             const uncertain_message_count = try session_runtime.appendCompactionHistoryChatMessages(

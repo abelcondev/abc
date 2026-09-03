@@ -1219,11 +1219,8 @@ const App = struct {
         try SessionAppRuntime.resetSession(self);
     }
 
-    pub fn prepareLiveSessionResume(
-        self: *App,
-        log_options: session_log.Options,
-    ) !void {
-        try SessionAppRuntime.prepareLiveSessionResume(self, log_options);
+    pub fn prepareLiveSessionResume(self: *App) !void {
+        try SessionAppRuntime.prepareLiveSessionResume(self);
     }
 
     pub fn finishLiveSessionResume(self: *App) !void {
@@ -1277,10 +1274,6 @@ const App = struct {
 
     pub fn commitStartupResumeReplayAnchor(self: *App) !void {
         try self.flushRequestedFrame();
-    }
-
-    pub fn persistResumeViewAfterFrame(self: *App) void {
-        SessionAppRuntime.persistResumeViewAfterFrame(self);
     }
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
@@ -1449,7 +1442,6 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
@@ -1494,7 +1486,6 @@ const App = struct {
             .credential_source = credential.source,
             .account_id = account_id,
             .history = history,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
         HerdrAppRuntime.reportWorking(self);

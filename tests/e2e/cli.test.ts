@@ -4224,6 +4224,83 @@ describe("cli: ask success", () => {
   );
 
   test(
+    "saved ask converts a legacy session once and continues after restart",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-legacy-convert-"));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("LEGACY_CONVERTED_OK"),
+        fakeGatewayFinalText("LEGACY_RESTART_OK"),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        const sessionId = "legacy-ask-convert";
+        writeLegacySession(home, workspaceRoot, sessionId);
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-legacy-convert-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--resume-id", sessionId, "Convert and continue."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(first.code).toBe(0);
+        expect(first.stderr).toBe("");
+        expect(JSON.parse(first.stdout)).toMatchObject({
+          session_id: sessionId,
+          final_output: "LEGACY_CONVERTED_OK",
+        });
+
+        const sessionDir = join(home, ".fx", "sessions", sessionId);
+        const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
+        expect(metadata.schema_version).toBe(4);
+        expect(Object.hasOwn(metadata, "history")).toBe(false);
+        expect(existsSync(join(sessionDir, "authority.json"))).toBe(false);
+        expect(existsSync(join(sessionDir, "checkpoint.json"))).toBe(false);
+        expect(existsSync(join(sessionDir, "events.v3.backup"))).toBe(false);
+
+        const second = await runFx(
+          ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after restart."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(second.code).toBe(0);
+        expect(second.stderr).toBe("");
+        expect(JSON.parse(second.stdout)).toMatchObject({
+          session_id: sessionId,
+          final_output: "LEGACY_RESTART_OK",
+        });
+        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => Object.keys(JSON.parse(line).event)[0]);
+        expect(events).toEqual([
+          "user",
+          "assistant",
+          "turn_completed",
+          "user",
+          "assistant",
+          "turn_completed",
+        ]);
+        expect(gateway.requests).toHaveLength(2);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+
+  test(
     "saved asks remain discoverable and resumable without session caches",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-cache-free-"));

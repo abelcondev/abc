@@ -719,10 +719,8 @@ const AskContext = struct {
         self.session.usage.configurePublicationSink(null);
         self.session.usage.configureCheckpointSink(null);
         if (self.writable) |*writable| {
-            if (writable.needsFinalStateReplacement(
-                self.session.usage.isDirty(),
-            )) {
-                commitAskStateReplacement(self, writable, false) catch |err| {
+            if (self.session.usage.isDirty()) {
+                flushAskSessionUsage(self, writable) catch |err| {
                     debug_trace.logf(
                         "session",
                         "failed to flush ask session usage err={s}",
@@ -876,9 +874,9 @@ const AskContext = struct {
                 self.alloc,
                 writable.state.conversation_language,
                 writable.state.history,
-                writable.state.context_history_start,
                 writable.state.permission_state,
             );
+            writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
                     self.alloc,
@@ -1785,7 +1783,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .context_history_start = ctx.session.contextHistoryStart(),
         .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
@@ -1934,8 +1931,6 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
             ctx.alloc,
             .{ .recovery_checkpoint_cleared = .{} },
             io_mod.milliTimestamp(),
-            .retry_expected_tail,
-            .{},
         ) catch |err| {
             debug_trace.logf(
                 "ask",
@@ -2107,25 +2102,10 @@ fn persistUsageCheckpoint(
         writable,
         snapshot,
     );
-    if (writable.degradedTail() != null) {
-        var current = try currentAskState(
-            ctx,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
@@ -2882,19 +2862,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         ctx.retain_external_root_user_turn,
     );
 
-    if (writable.degradedTail() != null) {
-        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
-        prepared_owned = false;
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAskState(ctx, writable, now_ms);
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
-
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
@@ -2904,8 +2871,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        .{},
     );
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
@@ -2921,73 +2886,26 @@ fn setRecoveryCheckpoint(
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAskState(ctx, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
+    );
 }
 
-fn currentAskState(
+fn flushAskSessionUsage(
     ctx: *AskContext,
     writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(ctx.alloc);
-    errdefer state.deinit(ctx.alloc);
-    const history = try ctx.session.snapshotHistory(ctx.alloc);
-    types.freeHistoryTurnSlice(ctx.alloc, state.history);
-    state.history = history;
-    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
-    state.permission_state.deinit(ctx.alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = ctx.session.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try ctx.session.usage.snapshot(ctx.alloc);
-    if (state.usage) |*old| old.deinit(ctx.alloc);
-    state.usage = usage;
-    return state;
-}
-
-fn commitAskStateReplacement(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
 ) !void {
     const now_ms = io_mod.milliTimestamp();
-    var state = try currentAskState(ctx, writable, now_ms);
-    defer state.deinit(ctx.alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(ctx.alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
+    var usage = try ctx.session.usage.snapshot(ctx.alloc);
+    defer usage.deinit(ctx.alloc);
+    _ = try writable.appendEvent(
         ctx.alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
+        .{ .usage_checkpointed = .{ .usage = usage } },
+        now_ms,
     );
-    if (state.usage) |usage| {
-        ctx.session.usage.markClean(usage);
-    }
+    ctx.session.usage.markClean(usage);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -7229,93 +7147,6 @@ test "saved ask allocation failures keep managed borrows owned" {
                 .{ fail_index, @errorName(err) },
             );
             return err;
-        };
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(
-            failing.allocated_bytes,
-            failing.freed_bytes,
-        );
-    }
-}
-
-fn exerciseCurrentAskStateAllocation(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    alloc: Allocator,
-) !void {
-    const previous_alloc = ctx.alloc;
-    ctx.alloc = alloc;
-    defer ctx.alloc = previous_alloc;
-
-    var state = try currentAskState(ctx, writable, io_mod.milliTimestamp());
-    defer state.deinit(alloc);
-}
-
-test "current ask state releases partial snapshots on allocation failure" {
-    const setup_alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home = try io_mod.dirRealpathAlloc(setup_alloc, tmp.dir, "home");
-    defer setup_alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        setup_alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer setup_alloc.free(workspace);
-    const test_home = try TestAskHome.install(setup_alloc, home);
-    defer test_home.deinit();
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(setup_alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(setup_alloc);
-    var ctx = AskContext.init(
-        setup_alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    defer ctx.deinit();
-    try ctx.initializeSessionStores();
-    try ctx.session.appendAssistantHistoryTurn(
-        setup_alloc,
-        "question",
-        "answer",
-    );
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        setup_alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    const writable = &ctx.writable.?;
-
-    var counting = std.testing.FailingAllocator.init(setup_alloc, .{});
-    try exerciseCurrentAskStateAllocation(&ctx, writable, counting.allocator());
-
-    for (0..counting.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            setup_alloc,
-            .{ .fail_index = fail_index },
-        );
-        exerciseCurrentAskStateAllocation(
-            &ctx,
-            writable,
-            failing.allocator(),
-        ) catch |err| {
-            if (err != error.OutOfMemory) return err;
         };
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(

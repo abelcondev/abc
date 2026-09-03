@@ -33,17 +33,12 @@ const store_types = @import("session_store_types.zig");
 const summary_codec = @import("session_summary_codec.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
-const authorityTransitionsEqual = authority_module.authorityTransitionsEqual;
 const classifyAuthority = authority_module.classifyAuthority;
 const classifyAuthorityAllowingLargeLegacy = authority_module.classifyAuthorityAllowingLargeLegacy;
 const deleteSessionEntry = authority_module.deleteSessionEntry;
-const loadAuthorityTransitionOptional = authority_module.loadAuthorityTransitionOptional;
-const mapReplayError = authority_module.mapReplayError;
 const openSessionFile = authority_module.openSessionFile;
 const readExactLegacyFile = authority_module.readExactLegacyFile;
 const requireAuthorityFenceAbsent = authority_module.requireAuthorityFenceAbsent;
-const requireAuthorityTransitionSession = authority_module.requireAuthorityTransitionSession;
-const restoreLegacyAuthority = authority_module.restoreLegacyAuthority;
 const DiscoveryCandidateMetadata = discovery.DiscoveryCandidateMetadata;
 const DiscoveryMode = discovery.DiscoveryMode;
 const ReadOnlyCandidate = discovery.ReadOnlyCandidate;
@@ -71,11 +66,9 @@ const max_usage_recovery_sessions: usize = 512;
 const LegacyStoredSession = migration.LegacyStoredSession;
 const MigrationPreferenceSource = migration.MigrationPreferenceSource;
 const legacyToDurableState = migration.legacyToDurableState;
-const loadedMigrationTarget = migration.loadedMigrationTarget;
+const loadSchemaV3ReadOnly = migration.loadSchemaV3ReadOnly;
 const migrateLegacyLocked = migration.migrateLegacyLocked;
-const migratedSourceBytes = migration.migratedSourceBytes;
-const migratedSourceSchemaVersion = migration.migratedSourceSchemaVersion;
-const validateMigrationTarget = migration.validateMigrationTarget;
+const migrateSchemaV3Locked = migration.migrateSchemaV3Locked;
 const normalizeWorkspaceRoot = paths.normalizeWorkspaceRoot;
 pub const sessionDirPath = paths.sessionDirPath;
 const sessionJsonPath = paths.sessionJsonPath;
@@ -128,7 +121,6 @@ pub fn imageSnapshotStorageDir(
 pub const ReadOnlyDetail = store_types.ReadOnlyDetail;
 pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
-pub const ResumeViewAdmission = session_log.ResumeViewAdmission;
 pub const SessionMigrationResult = store_types.SessionMigrationResult;
 pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
@@ -583,12 +575,7 @@ pub const Store = struct {
         state: session_codec.DurableSessionState,
         options: session_log.Options,
     ) !LoadedWritableSession {
-        var loaded = try staging_root.startWritableSessionWithLifecycle(
-            alloc,
-            state,
-            options,
-            null,
-        );
+        var loaded = try staging_root.startConversationSession(alloc, state, options);
         errdefer loaded.deinit(alloc);
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
@@ -704,9 +691,7 @@ pub const Store = struct {
         loaded: *LoadedWritableSession,
     ) PristineDiscardDisposition {
         defer loaded.deinit(alloc);
-        if (staging_root.mode != .writable or
-            loaded.commit_lifecycle != null)
-        {
+        if (staging_root.mode != .writable) {
             debug_trace.logf(
                 "session",
                 "event=recovery_staging_discard disposition=retained reason=guard_failed",
@@ -843,53 +828,6 @@ pub const Store = struct {
             );
             return .retained;
         }
-        if (loaded.usesConversationStorage()) {
-            const sessions = &(self.canonical_root.sessions orelse {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=sessions_root",
-                    .{event_name},
-                );
-                return .indeterminate;
-            });
-            if (cascade_children and !self.deleteOwnedSubagentChildren(
-                alloc,
-                loaded.active_id,
-                event_name,
-            )) {
-                return .indeterminate;
-            }
-            sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=delete err={s}",
-                    .{ event_name, @errorName(err) },
-                );
-                return .indeterminate;
-            };
-            io_mod.syncVerifiedDir(sessions.dir) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=sync err={s}",
-                    .{ event_name, @errorName(err) },
-                );
-                return .indeterminate;
-            };
-            debug_trace.logf(
-                "session",
-                "event={s} disposition=discarded",
-                .{event_name},
-            );
-            return .discarded;
-        }
-        const lifecycle = if (loaded.commit_lifecycle) |*value| value else {
-            debug_trace.logf(
-                "session",
-                "event={s} disposition=retained reason=cache_lifecycle_unavailable",
-                .{event_name},
-            );
-            return .retained;
-        };
         const sessions = &(self.canonical_root.sessions orelse {
             debug_trace.logf(
                 "session",
@@ -905,21 +843,6 @@ pub const Store = struct {
         )) {
             return .indeterminate;
         }
-        const log_options: session_log.Options = .{};
-        lifecycle.prepare(
-            alloc,
-            loaded.active_id,
-            loaded.state.workspace_root,
-            loaded.state.workspace_root,
-            log_options.commit_lock_deadline_ms,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event={s} disposition=indeterminate stage=cache_pending err={s}",
-                .{ event_name, @errorName(err) },
-            );
-            return .indeterminate;
-        };
         sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
             debug_trace.logf(
                 "session",
@@ -1100,25 +1023,6 @@ pub const Store = struct {
         );
     }
 
-    pub fn admitResumeView(
-        self: Store,
-        alloc: Allocator,
-        target: ResumeTarget,
-    ) !?ResumeViewAdmission {
-        var root = self.canonical_root;
-        return switch (target) {
-            .id => |id| try root.admitResumeView(alloc, id),
-            .last => blk: {
-                var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
-                defer latest.deinit(alloc);
-                break :blk try root.admitResumeView(
-                    alloc,
-                    latest.id,
-                );
-            },
-        };
-    }
-
     /// Resumes a target (a specific id, or the latest) for writing under
     /// `workspace_root`, migrating legacy storage and recovering interrupted
     /// authority transitions as needed. Caller owns the returned session.
@@ -1143,34 +1047,11 @@ pub const Store = struct {
         return self.finishResumedForWrite(alloc, loaded, options);
     }
 
-    pub fn resumeAdmittedForWrite(
-        self: Store,
-        alloc: Allocator,
-        admission: *ResumeViewAdmission,
-        expected_session_id: []const u8,
-        workspace_root: []const u8,
-        options: ResumeOptions,
-    ) !LoadedWritableSession {
-        try validateWorkspaceRoot(workspace_root);
-        if (!std.mem.eql(u8, admission.sessionId(), expected_session_id)) {
-            return error.SessionTargetChanged;
-        }
-        const loaded = try admission.resumeForWrite(alloc, options.log);
-        const rebound = try self.finishWorkspaceResume(
-            alloc,
-            loaded,
-            workspace_root,
-            true,
-            options,
-        );
-        return self.finishResumedForWrite(alloc, rebound, options);
-    }
-
     fn finishResumedForWrite(
         self: Store,
         alloc: Allocator,
         loaded_value: LoadedWritableSession,
-        options: ResumeOptions,
+        _: ResumeOptions,
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
@@ -1178,60 +1059,15 @@ pub const Store = struct {
             loaded.state.permission_state.version !=
             session_permission_state.schema_version;
         if (needs_permission_migration) {
-            const migrated_permission_state = try session_permission_state.migrateV1ToV2(
+            var migrated_permission_state = try session_permission_state.migrateV1ToV2(
                 alloc,
                 loaded.state.permission_state,
             );
-            loaded.state.permission_state.deinit(alloc);
-            loaded.state.permission_state = migrated_permission_state;
-        }
-        var migration_state = try loaded.state.dupe(alloc);
-        defer migration_state.deinit(alloc);
-        const session_dir = try sessionDirPath(
-            alloc,
-            self.sessions_dir,
-            loaded.active_id,
-        );
-        defer alloc.free(session_dir);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
-        defer alloc.free(snapshot_dir);
-        const needs_image_migration = try session.repair_legacy_images_transactionally(
-            alloc,
-            migration_state.history,
-            snapshot_dir,
-        );
-        const needs_migration_commit = needs_permission_migration or
-            needs_image_migration;
-        if (needs_migration_commit) {
-            var migration_committed = false;
-            errdefer if (!migration_committed) {
-                deleteSnapshotFilesAddedByMigration(
-                    migration_state.history,
-                    loaded.state.history,
-                );
-            };
-            _ = try loaded.commitStateReplacement(
+            defer migrated_permission_state.deinit(alloc);
+            try loaded.replacePermissionState(
                 alloc,
-                migration_state,
-                .migration,
-                .rollback_before_adapter_continue,
-                options.log,
-            );
-            migration_committed = true;
-            std.mem.swap(
-                session_codec.DurableSessionState,
-                &loaded.state,
-                &migration_state,
-            );
-        }
-        const converted_storage = !loaded.usesConversationStorage();
-        try loaded.convertToConversationStorage(alloc);
-        if (converted_storage) {
-            try resolveSessionSnapshotLocators(
-                alloc,
-                loaded.state.history,
-                self.sessions_dir,
-                loaded.active_id,
+                migrated_permission_state,
+                io_mod.milliTimestamp(),
             );
         }
         try self.attachWritableChildCapability(alloc, &loaded);
@@ -1790,10 +1626,15 @@ pub const Store = struct {
         const authority = try classifyAuthority(alloc, &session_dir, session_id);
         return switch (authority) {
             .schema_v3 => {
-                var root = self.canonical_root;
-                var state = root.loadReadOnly(alloc, session_id, options.log) catch |err| {
-                    return mapReplayError(err);
-                };
+                var source = try loadSchemaV3ReadOnly(
+                    alloc,
+                    &session_dir,
+                    session_id,
+                );
+                var source_owned = true;
+                defer if (source_owned) source.deinit(alloc);
+                var state = source.takeState();
+                source_owned = false;
                 errdefer state.deinit(alloc);
                 try resolveSessionSnapshotLocators(
                     alloc,
@@ -2570,13 +2411,9 @@ pub const Store = struct {
             self.workspace_root,
         );
         defer writable_store.deinit(alloc);
-        var loaded = try writable_store.canonical_root.resumeForWrite(
-            alloc,
-            session_id,
-            .{ .resolve_authority_intent = false },
-        );
+        var loaded = try writable_store.resumeForWrite(alloc, session_id);
         defer loaded.deinit(alloc);
-        return loaded.cleanupOrphans(alloc, .delete);
+        return .{};
     }
 
     fn openSessionDir(
@@ -2673,6 +2510,22 @@ pub const Store = struct {
     ) !LoadedWritableSession {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
+        if (try session_log.legacyImportRecoveryNeeded(&session_dir)) {
+            session_dir.close();
+            {
+                var writable = try self.openWritableSessionDir(
+                    alloc,
+                    session_id,
+                    options.log.session_lock_deadline_ms,
+                );
+                defer writable.deinit(alloc);
+                try session_log.recoverInterruptedLegacyImport(
+                    alloc,
+                    &writable,
+                );
+            }
+            session_dir = try self.openSessionDir(session_id);
+        }
         defer session_dir.close();
         if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
             var root = self.canonical_root;
@@ -2682,7 +2535,6 @@ pub const Store = struct {
                 loaded,
                 workspace_root,
                 allow_rebind,
-                options,
             );
         }
         const authority = classifyAuthority(
@@ -2703,20 +2555,16 @@ pub const Store = struct {
                     recovered,
                     workspace_root,
                     allow_rebind,
-                    options,
                 );
             },
             else => return err,
         };
-        var loaded = switch (authority) {
-            .schema_v3 => blk: {
-                var root = self.canonical_root;
-                break :blk root.resumeForWrite(
-                    alloc,
-                    session_id,
-                    options.log,
-                ) catch |err| return mapReplayError(err);
-            },
+        const loaded = switch (authority) {
+            .schema_v3 => try self.migrateSchemaV3ForWrite(
+                alloc,
+                session_id,
+                options,
+            ),
             .legacy => try self.migrateLegacyForWrite(
                 alloc,
                 session_id,
@@ -2725,13 +2573,11 @@ pub const Store = struct {
                 options,
             ),
         };
-        errdefer loaded.deinit(alloc);
         return self.finishWorkspaceResume(
             alloc,
             loaded,
             workspace_root,
             allow_rebind,
-            options,
         );
     }
 
@@ -2741,7 +2587,6 @@ pub const Store = struct {
         loaded_value: LoadedWritableSession,
         workspace_root: []const u8,
         allow_rebind: bool,
-        options: ResumeOptions,
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
@@ -2759,7 +2604,7 @@ pub const Store = struct {
             return session_log.failLoadedWritableSession(error.SessionTargetChanged);
         }
 
-        const rebound = session_event.Event{ .workspace_rebound = .{
+        const rebound = session_log.SessionUpdate{ .workspace_rebound = .{
             .previous_workspace_root = loaded.state.workspace_root,
             .workspace_root = @constCast(workspace_root),
         } };
@@ -2767,12 +2612,7 @@ pub const Store = struct {
             alloc,
             rebound,
             io_mod.milliTimestamp(),
-            .rollback_before_adapter_continue,
-            options.log,
-        ) catch |err| switch (err) {
-            error.SessionPersistenceDegraded => return session_log.failLoadedWritableSession(error.SessionWorkspaceRebindFailed),
-            else => return err,
-        };
+        ) catch |err| return err;
         return loaded;
     }
 
@@ -2863,7 +2703,7 @@ pub const Store = struct {
         alloc: Allocator,
         session_id: []const u8,
         workspace_root: []const u8,
-        options: ResumeOptions,
+        _: ResumeOptions,
     ) !WritableCandidate {
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
@@ -2928,20 +2768,17 @@ pub const Store = struct {
                     else => {},
                 }
 
-                var root = self.canonical_root;
-                var state = root.loadReadOnly(
+                var source = loadSchemaV3ReadOnly(
                     alloc,
+                    &session_dir,
                     session_id,
-                    options.log,
                 ) catch |err| {
-                    const mapped = mapReplayError(err);
-                    if (mapped != error.SessionCommitBoundaryUnavailable) return mapped;
-                    const candidate = projected orelse return mapped;
+                    const candidate = projected orelse return err;
                     if (std.mem.eql(
                         u8,
                         candidate.summary.workspace_root.?,
                         workspace_root,
-                    )) return mapped;
+                    )) return err;
                     return dupeWritableCandidate(
                         alloc,
                         candidate.summary.id,
@@ -2951,12 +2788,12 @@ pub const Store = struct {
                         .stale,
                     );
                 };
-                defer state.deinit(alloc);
+                defer source.deinit(alloc);
                 return dupeWritableCandidate(
                     alloc,
-                    state.id,
-                    state.workspace_root,
-                    state.updated_at_ms,
+                    source.state.id,
+                    source.state.workspace_root,
+                    source.state.updated_at_ms,
                     .schema_v3,
                     .stale,
                 );
@@ -2982,6 +2819,21 @@ pub const Store = struct {
             options,
         );
         return loaded;
+    }
+
+    fn migrateSchemaV3ForWrite(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: ResumeOptions,
+    ) !LoadedWritableSession {
+        var writable = try self.openWritableSessionDir(
+            alloc,
+            session_id,
+            options.log.session_lock_deadline_ms,
+        );
+        errdefer writable.deinit(alloc);
+        return migrateSchemaV3Locked(self.ctx(), alloc, &writable);
     }
 
     // Keep cold fallible constructors behind noinline out-parameter boundaries
@@ -3057,7 +2909,6 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var lifecycle: ?session_log.CommitLifecycle = null;
         return migrateLegacyLocked(
             self.ctx(),
             alloc,
@@ -3065,7 +2916,6 @@ pub const Store = struct {
             workspace_root,
             preference_source,
             options,
-            &lifecycle,
         );
     }
 
@@ -3077,126 +2927,58 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var loaded: LoadedWritableSession = undefined;
-        try self.resolveAuthorityTransitionForWriteInto(
-            &loaded,
-            alloc,
-            session_id,
-            workspace_root,
-            preference_source,
-            options,
-        );
-        return loaded;
-    }
-
-    noinline fn resolveAuthorityTransitionForWriteInto(
-        self: Store,
-        out: *LoadedWritableSession,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        preference_source: MigrationPreferenceSource,
-        options: ResumeOptions,
-    ) !void {
-        var read_dir = try self.openSessionDir(session_id);
-        var transition = (try loadAuthorityTransitionOptional(
-            alloc,
-            &read_dir,
-        )) orelse {
-            read_dir.close();
-            return error.SessionAuthorityBoundaryUnavailable;
-        };
-        read_dir.close();
-        defer transition.deinit(alloc);
-        try requireAuthorityTransitionSession(transition, session_id);
-
-        if (transition.kind == .session_create) {
-            var root = self.canonical_root;
-            const loaded = try root.resumeForWrite(
-                alloc,
-                session_id,
-                options.log,
-            );
-            out.* = loaded;
-            return;
-        }
-
         var writable = try self.openWritableSessionDir(
             alloc,
             session_id,
             options.log.session_lock_deadline_ms,
         );
-        var commit_lock = io_mod.acquireTimedAdvisoryLock(
-            &writable.dir,
-            "commit.lock",
-            options.log.commit_lock_deadline_ms,
-        ) catch |err| {
-            writable.deinit(alloc);
-            return switch (err) {
-                error.LockBusy, error.LockUnsupported => error.SessionCommitBoundaryUnavailable,
-                else => err,
-            };
-        };
-        var commit_lock_held = true;
-        defer if (commit_lock_held) commit_lock.release();
         errdefer writable.deinit(alloc);
 
-        var current = (try loadAuthorityTransitionOptional(
+        var stable = openSessionFile(
+            &writable.dir,
+            "session.legacy.json",
+            .read_only,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionAuthorityBoundaryUnavailable,
+            else => return err,
+        };
+        defer stable.close(io_mod.getIo());
+        const stat = try stable.stat(io_mod.getIo());
+        const allowed_size = if (options.allow_large_legacy)
+            stat.size
+        else
+            automatic_legacy_max_bytes;
+        if (stat.size > allowed_size) return error.LegacySessionTooLarge;
+        const bytes = readExactLegacyFile(
+            alloc,
+            &stable,
+            stat.size,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.LegacySessionMigrationResourceExhausted,
+            else => return error.LegacySessionMigrationFailed,
+        };
+        defer alloc.free(bytes);
+        _ = try session_json.parseLegacySchemaVersion(alloc, bytes);
+
+        try io_mod.durableReplaceVerified(
             alloc,
             &writable.dir,
-        )) orelse return error.SessionAuthorityBoundaryUnavailable;
-        defer current.deinit(alloc);
-        try requireAuthorityTransitionSession(current, session_id);
-        if (!authorityTransitionsEqual(current, transition)) {
-            return error.InvalidSessionFormat;
-        }
+            "session.json",
+            bytes,
+        );
+        try deleteSessionEntry(&writable.dir, "authority.pending.json");
+        try deleteSessionEntry(&writable.dir, "authority.json");
+        try deleteSessionEntry(&writable.dir, "checkpoint.json");
+        try io_mod.syncVerifiedDir(writable.dir.dir);
 
-        const target_state: ?session_codec.DurableSessionState =
-            validateMigrationTarget(
-                alloc,
-                &writable.dir,
-                session_id,
-                current.authority_id,
-                current.proposed,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.LegacySessionMigrationResourceExhausted,
-                else => null,
-            };
-        if (target_state) |validated_state| {
-            var state = validated_state;
-            errdefer state.deinit(alloc);
-            io_mod.syncVerifiedDir(writable.dir.dir) catch
-                return error.LegacySessionMigrationIndeterminate;
-            deleteSessionEntry(
-                &writable.dir,
-                "authority.pending.json",
-            ) catch return error.SessionAuthorityIntentCleanupPending;
-            commit_lock.release();
-            commit_lock_held = false;
-            const loaded = try loadedMigrationTarget(
-                alloc,
-                &writable,
-                state,
-                current,
-            );
-            state = undefined;
-            out.* = loaded;
-            return;
-        }
-
-        try restoreLegacyAuthority(alloc, &writable, current);
-        commit_lock.release();
-        commit_lock_held = false;
-        const loaded = try self.migrateLegacyWithoutCache(
+        return self.migrateLegacyWithoutCache(
             alloc,
             &writable,
             workspace_root,
             preference_source,
             options,
         );
-        out.* = loaded;
     }
-
     fn openWritableSessionDir(
         self: Store,
         alloc: Allocator,
@@ -3245,6 +3027,8 @@ pub const Store = struct {
     /// Migrates a legacy session to schema-v3 in place without returning a live
     /// session, reporting the source schema/bytes. Idempotent on already-current
     /// sessions. Caller owns the returned result.
+    /// Converts any supported older session to the current conversation format.
+    /// Current sessions are reported without rewriting them.
     pub fn migrateLegacyStorageOnly(
         self: Store,
         alloc: Allocator,
@@ -3253,86 +3037,84 @@ pub const Store = struct {
     ) !SessionMigrationResult {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
-        const authority = (if (options.allow_large)
-            classifyAuthorityAllowingLargeLegacy(alloc, &session_dir, session_id)
-        else
-            classifyAuthority(alloc, &session_dir, session_id)) catch |err| switch (err) {
-            error.SessionAuthorityBoundaryUnavailable => {
-                var transition = (try loadAuthorityTransitionOptional(
-                    alloc,
-                    &session_dir,
-                )) orelse {
-                    session_dir.close();
-                    return error.SessionAuthorityBoundaryUnavailable;
-                };
-                defer transition.deinit(alloc);
-                try requireAuthorityTransitionSession(transition, session_id);
-                session_dir.close();
-                var resolved = try self.resolveAuthorityTransitionForWrite(
+        if (try session_log.legacyImportRecoveryNeeded(&session_dir)) {
+            session_dir.close();
+            {
+                var writable = try self.openWritableSessionDir(
                     alloc,
                     session_id,
-                    self.workspace_root,
-                    .preserved_workspace,
-                    .{
-                        .allow_large_legacy = options.allow_large,
-                        .seed_preferences = options.seed_preferences,
-                        .log = options.log,
-                    },
+                    options.log.session_lock_deadline_ms,
                 );
-                defer resolved.deinit(alloc);
-                if (transition.kind == .session_create) {
-                    return .{
-                        .session_id = try alloc.dupe(u8, session_id),
-                        .source_schema_version = 3,
-                        .source_bytes = 0,
-                        .status = .already_current,
-                    };
-                }
-                const source_schema_version = resolved.migration_source_schema_version orelse try migratedSourceSchemaVersion(
+                defer writable.deinit(alloc);
+                try session_log.recoverInterruptedLegacyImport(
                     alloc,
-                    &resolved.log.dir,
-                    options.allow_large,
+                    &writable,
                 );
-                const source_bytes = resolved.migration_source_bytes orelse try migratedSourceBytes(&resolved.log.dir);
-                return .{
-                    .session_id = try alloc.dupe(u8, session_id),
-                    .source_schema_version = source_schema_version,
-                    .source_bytes = source_bytes,
-                    .status = .migrated,
-                };
-            },
-            else => {
-                session_dir.close();
-                return err;
-            },
-        };
-        session_dir.close();
-        if (authority == .schema_v3) {
+            }
+            session_dir = try self.openSessionDir(session_id);
+        }
+        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
+            session_dir.close();
             return .{
                 .session_id = try alloc.dupe(u8, session_id),
-                .source_schema_version = 3,
+                .source_schema_version = session_codec.session_metadata_schema_version,
                 .source_bytes = 0,
                 .status = .already_current,
             };
         }
-        var migrated = try self.migrateLegacyForWrite(
-            alloc,
-            session_id,
-            self.workspace_root,
-            .preserved_workspace,
-            .{
-                .allow_large_legacy = options.allow_large,
-                .seed_preferences = options.seed_preferences,
-                .log = options.log,
-            },
-        );
+        const authority = (if (options.allow_large)
+            classifyAuthorityAllowingLargeLegacy(alloc, &session_dir, session_id)
+        else
+            classifyAuthority(alloc, &session_dir, session_id)) catch |err| {
+            session_dir.close();
+            if (err != error.SessionAuthorityBoundaryUnavailable) return err;
+            var recovered = try self.resolveAuthorityTransitionForWrite(
+                alloc,
+                session_id,
+                self.workspace_root,
+                .preserved_workspace,
+                .{
+                    .allow_large_legacy = options.allow_large,
+                    .seed_preferences = options.seed_preferences,
+                    .log = options.log,
+                },
+            );
+            defer recovered.deinit(alloc);
+            return migrationResultFromLoaded(alloc, session_id, recovered);
+        };
+        session_dir.close();
+
+        var migrated = switch (authority) {
+            .schema_v3 => try self.migrateSchemaV3ForWrite(
+                alloc,
+                session_id,
+                .{ .log = options.log },
+            ),
+            .legacy => try self.migrateLegacyForWrite(
+                alloc,
+                session_id,
+                self.workspace_root,
+                .preserved_workspace,
+                .{
+                    .allow_large_legacy = options.allow_large,
+                    .seed_preferences = options.seed_preferences,
+                    .log = options.log,
+                },
+            ),
+        };
         defer migrated.deinit(alloc);
-        const source_schema_version = migrated.migration_source_schema_version orelse try migratedSourceSchemaVersion(
-            alloc,
-            &migrated.log.dir,
-            options.allow_large,
-        );
-        const source_bytes = migrated.migration_source_bytes orelse try migratedSourceBytes(&migrated.log.dir);
+        return migrationResultFromLoaded(alloc, session_id, migrated);
+    }
+
+    fn migrationResultFromLoaded(
+        alloc: Allocator,
+        session_id: []const u8,
+        loaded: LoadedWritableSession,
+    ) !SessionMigrationResult {
+        const source_schema_version = loaded.migration_source_schema_version orelse
+            return error.LegacySessionMigrationFailed;
+        const source_bytes = loaded.migration_source_bytes orelse
+            return error.LegacySessionMigrationFailed;
         return .{
             .session_id = try alloc.dupe(u8, session_id),
             .source_schema_version = source_schema_version,
@@ -3395,21 +3177,19 @@ pub const Store = struct {
             return error.SessionRecoveryUnsupportedSchema;
         }
 
-        var recovered = session_log.recoverManifestBoundary(
+        var imported = loadSchemaV3ReadOnly(
             alloc,
-            &source,
-            options,
+            &source.dir,
+            session_id,
         ) catch |err| switch (err) {
-            error.OutOfMemory,
-            error.SessionRecoveryNotNeeded,
-            error.SessionAuthorityBoundaryUnavailable,
-            error.SessionCommitBoundaryUnavailable,
-            error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported,
-            => return err,
+            error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSessionSchema => return error.SessionRecoveryUnsupportedSchema,
             else => return error.SessionRecoveryBoundaryInvalid,
         };
+        var imported_owned = true;
+        defer if (imported_owned) imported.deinit(alloc);
+        var recovered = imported.takeState();
+        imported_owned = false;
         defer recovered.deinit(alloc);
         try resolveSessionSnapshotLocators(
             alloc,
@@ -3439,7 +3219,7 @@ pub const Store = struct {
         alloc.free(recovered.id);
         recovered.id = replacement_id;
 
-        var initial = try recoveryInitialState(alloc, recovered);
+        var initial = try recovered.dupe(alloc);
         defer initial.deinit(alloc);
         var staging_lock = try self.acquireRecoveryStagingLock(
             options.session_lock_deadline_ms,
@@ -3516,40 +3296,6 @@ pub const Store = struct {
             target.child_capability orelse
                 return error.SessionChildStoreFailed,
         );
-        _ = target.commitStateReplacement(
-            alloc,
-            recovered,
-            .recovery,
-            .rollback_before_adapter_continue,
-            options,
-        ) catch |commit_err| {
-            target.namespace_confirmation_required = true;
-            target.validateResumeBoundary(alloc, options) catch |resolve_err| {
-                debug_trace.logf(
-                    "session",
-                    "event=session_recovery_target_indeterminate target={s} commit_err={s} resolve_err={s}",
-                    .{
-                        recovered_id,
-                        @errorName(commit_err),
-                        @errorName(resolve_err),
-                    },
-                );
-                const disposition = discardRecoveryStagedSession(
-                    &staging_root,
-                    alloc,
-                    &target,
-                );
-                target_owned = false;
-                if (disposition != .discarded) {
-                    debug_trace.logf(
-                        "session",
-                        "event=session_recovery_staged_target_cleanup disposition={s}",
-                        .{@tagName(disposition)},
-                    );
-                }
-                return error.SessionRecoveryIndeterminate;
-            };
-        };
         if (!try session_log.durableStatesEqual(target.state, recovered)) {
             const disposition = discardRecoveryStagedSession(
                 &staging_root,
@@ -3566,27 +3312,6 @@ pub const Store = struct {
             }
             return error.SessionRecoveryIndeterminate;
         }
-        target.validateResumeBoundary(alloc, options) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event=session_recovery_target_indeterminate target={s} validation_err={s}",
-                .{ recovered_id, @errorName(err) },
-            );
-            const disposition = discardRecoveryStagedSession(
-                &staging_root,
-                alloc,
-                &target,
-            );
-            target_owned = false;
-            if (disposition != .discarded) {
-                debug_trace.logf(
-                    "session",
-                    "event=session_recovery_staged_target_cleanup disposition={s}",
-                    .{@tagName(disposition)},
-                );
-            }
-            return error.SessionRecoveryIndeterminate;
-        };
         const promotion = self.promoteRecoveryStagedSession(
             &staging_root,
             recovered_id,
@@ -3663,30 +3388,6 @@ const RecoveryPromotionStatus = enum {
     promoted,
     indeterminate,
 };
-
-fn recoveryInitialState(
-    alloc: Allocator,
-    recovered: session_codec.DurableSessionState,
-) !session_codec.DurableSessionState {
-    const id = try alloc.dupe(u8, recovered.id);
-    errdefer alloc.free(id);
-    const origin = try alloc.dupe(u8, recovered.origin_workspace_root);
-    errdefer alloc.free(origin);
-    const workspace = try alloc.dupe(u8, recovered.workspace_root);
-    errdefer alloc.free(workspace);
-    return .{
-        .id = id,
-        .origin_workspace_root = origin,
-        .workspace_root = workspace,
-        .created_at_ms = recovered.created_at_ms,
-        .updated_at_ms = recovered.updated_at_ms,
-        .conversation_language = recovered.conversation_language,
-        .preferences = try recovered.preferences.dupe(alloc),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-}
 
 fn copyRecoveredImageSnapshots(
     alloc: Allocator,
@@ -4354,8 +4055,6 @@ pub fn isPristineStartedSession(loaded: *const LoadedWritableSession) bool {
         loaded.state.total_input_tokens == 0 and
         loaded.state.total_output_tokens == 0 and
         loaded.state.recovery_checkpoint == null and
-        !loaded.namespace_confirmation_required and
-        loaded.degraded_tail == null and
         loaded.migration_source_schema_version == null and
         loaded.migration_source_bytes == null;
 }
@@ -4701,8 +4400,6 @@ fn writeWritableHistoryResponseFixture(
             .turn = turn,
         } },
         updated_at_ms,
-        .retry_expected_tail,
-        .{},
     );
     writable.deinit(alloc);
 }
@@ -4770,8 +4467,6 @@ fn writeStaleWritableHistoryFixture(
             .turn = turn,
         } },
         updated_at_ms,
-        .retry_expected_tail,
-        .{},
     );
     try io_mod.durableReplaceVerified(
         alloc,
@@ -4815,25 +4510,14 @@ fn writeWritableIncompleteAuthorityFixture(
         break :blk owned;
     };
     defer session.freeHistoryTurnSlice(alloc, history);
-    const desired = session_codec.DurableSessionState{
-        .id = writable.state.id,
-        .origin_workspace_root = writable.state.origin_workspace_root,
-        .workspace_root = writable.state.workspace_root,
-        .created_at_ms = writable.state.created_at_ms,
-        .updated_at_ms = updated_at_ms,
-        .conversation_language = writable.state.conversation_language,
-        .preferences = writable.state.preferences,
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    _ = try writable.commitStateReplacement(
-        alloc,
-        desired,
-        .recovery,
-        .retry_expected_tail,
-        .{},
-    );
+    for (history) |turn| {
+        _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = writable.state.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = turn,
+        } }, updated_at_ms);
+    }
     writable.deinit(alloc);
 }
 
@@ -4972,25 +4656,14 @@ fn writeWritableManagedHistoryFixture(
         output_handle,
         replay_handle,
     );
-    const desired = session_codec.DurableSessionState{
-        .id = writable.state.id,
-        .origin_workspace_root = writable.state.origin_workspace_root,
-        .workspace_root = writable.state.workspace_root,
-        .created_at_ms = writable.state.created_at_ms,
-        .updated_at_ms = 20,
-        .conversation_language = writable.state.conversation_language,
-        .preferences = writable.state.preferences,
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    _ = try writable.commitStateReplacement(
-        alloc,
-        desired,
-        .recovery,
-        .retry_expected_tail,
-        .{},
-    );
+    for (history) |turn| {
+        _ = try writable.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = writable.state.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = turn,
+        } }, 20);
+    }
 }
 
 fn makeManagedRecoveryResult(
@@ -5071,7 +4744,7 @@ fn replaceHistoryPageFixture(
             .total_input_tokens = 0,
             .total_output_tokens = 0,
             .turn = turn,
-        } }, updated_at_ms + @as(i64, @intCast(index)), .retry_expected_tail, .{});
+        } }, updated_at_ms + @as(i64, @intCast(index)));
     }
 }
 
@@ -5115,7 +4788,7 @@ fn replaceHistoryPageTurnsFixture(
             else
                 null,
             .turn = turn,
-        } }, updated_at_ms + @as(i64, @intCast(index)), .retry_expected_tail, .{});
+        } }, updated_at_ms + @as(i64, @intCast(index)));
     }
 }
 
@@ -5264,67 +4937,6 @@ fn corruptPendingReplacementTimestampForTest(
     try file.sync(io_mod.getIo());
 }
 
-const MigrationBoundaryFailure = struct {
-    target: session_log.Boundary,
-    remaining_matches: usize = 0,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        const self: *MigrationBoundaryFailure = @ptrCast(@alignCast(context.?));
-        if (boundary != self.target) return;
-        if (self.remaining_matches > 0) {
-            self.remaining_matches -= 1;
-            return;
-        }
-        return error.InjectedBoundaryFailure;
-    }
-
-    fn options(self: *MigrationBoundaryFailure) ResumeOptions {
-        return .{
-            .log = .{
-                .test_controls = .{
-                    .context = self,
-                    .boundary_fn = callback,
-                },
-            },
-        };
-    }
-};
-
-const ArmedBoundaryFailure = struct {
-    target: session_log.Boundary,
-    armed: bool = false,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        const self: *ArmedBoundaryFailure = @ptrCast(@alignCast(context.?));
-        if (self.armed and boundary == self.target) return error.InjectedBoundaryFailure;
-    }
-
-    fn logOptions(self: *ArmedBoundaryFailure) session_log.Options {
-        return .{
-            .test_controls = .{
-                .context = self,
-                .boundary_fn = callback,
-            },
-        };
-    }
-};
-
-const RecoveryResolutionFailure = struct {
-    fn callback(_: ?*anyopaque, boundary: session_log.Boundary) !void {
-        if (boundary == .after_target_namespace_sync or
-            boundary == .before_recovery_proposed_validation)
-        {
-            return error.InjectedBoundaryFailure;
-        }
-    }
-
-    fn options() session_log.Options {
-        return .{
-            .test_controls = .{ .boundary_fn = callback },
-        };
-    }
-};
-
 const LatestBarrierFailure = struct {
     injected_error: anyerror,
     completed_count: usize = 0,
@@ -5338,7 +4950,6 @@ const LatestBarrierFailure = struct {
                 self.completed_count += 1;
                 return self.injected_error;
             },
-            else => {},
         }
     }
 
@@ -5367,32 +4978,6 @@ fn waitForTestFlagInCallback(flag: *const std.atomic.Value(bool)) bool {
     return true;
 }
 
-const DiscardPauseControl = struct {
-    armed: std.atomic.Value(bool) = .init(false),
-    pending: std.atomic.Value(bool) = .init(false),
-    release: std.atomic.Value(bool) = .init(false),
-    timed_out: std.atomic.Value(bool) = .init(false),
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        const self: *DiscardPauseControl = @ptrCast(@alignCast(context.?));
-        if (boundary != .after_latest_cache_pending or !self.armed.load(.seq_cst)) return;
-        self.pending.store(true, .seq_cst);
-        if (!waitForTestFlagInCallback(&self.release)) {
-            self.timed_out.store(true, .seq_cst);
-            return error.TestTimedOut;
-        }
-    }
-
-    fn logOptions(self: *DiscardPauseControl) session_log.Options {
-        return .{
-            .test_controls = .{
-                .context = self,
-                .boundary_fn = callback,
-            },
-        };
-    }
-};
-
 const ResumeInterleavingControl = struct {
     pause_on_session: bool = false,
     barrier_contended: std.atomic.Value(bool) = .init(false),
@@ -5406,13 +4991,13 @@ const ResumeInterleavingControl = struct {
         switch (point) {
             .latest_barrier_contended => self.barrier_contended.store(true, .seq_cst),
             .latest_barrier_completed => _ = self.barrier_completed_count.fetchAdd(1, .seq_cst),
-            else => {},
         }
     }
 
     fn lock(context: ?*anyopaque, kind: session_log.LockKind) void {
         const self: *ResumeInterleavingControl = @ptrCast(@alignCast(context.?));
-        if (kind != .session or !self.pause_on_session) return;
+        _ = kind;
+        if (!self.pause_on_session) return;
         if (self.session_opened.swap(true, .seq_cst)) return;
         if (!waitForTestFlagInCallback(&self.release_session)) {
             self.timed_out.store(true, .seq_cst);
@@ -5489,47 +5074,6 @@ const ResumeWorker = struct {
             else => {},
         }
         self.result = .pending;
-    }
-};
-
-const MigrationStableCopyCorruption = struct {
-    legacy_copy_path: []const u8,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        if (boundary != .after_authority_namespace_sync) return;
-        const self: *MigrationStableCopyCorruption = @ptrCast(@alignCast(context.?));
-        try writeRawFile(self.legacy_copy_path, "{broken");
-    }
-
-    fn options(self: *MigrationStableCopyCorruption) session_log.Options {
-        return .{
-            .test_controls = .{
-                .context = self,
-                .boundary_fn = callback,
-            },
-        };
-    }
-};
-
-const MigrationInterruptedStableCopyCorruption = struct {
-    legacy_copy_path: []const u8,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        if (boundary != .after_authority_namespace_sync) return;
-        const self: *MigrationInterruptedStableCopyCorruption = @ptrCast(@alignCast(context.?));
-        try writeRawFile(self.legacy_copy_path, "{broken");
-        return error.InjectedBoundaryFailure;
-    }
-
-    fn options(self: *MigrationInterruptedStableCopyCorruption) ResumeOptions {
-        return .{
-            .log = .{
-                .test_controls = .{
-                    .context = self,
-                    .boundary_fn = callback,
-                },
-            },
-        };
     }
 };
 
@@ -5648,7 +5192,7 @@ test "conversation history pages remain complete after model compaction" {
                 .total_input_tokens = @intCast(index + 1),
                 .total_output_tokens = @intCast(index + 1),
                 .turn = turn,
-            } }, @intCast(20 + index), .retry_expected_tail, .{});
+            } }, @intCast(20 + index));
         }
     }
 
@@ -5696,7 +5240,6 @@ test "writable legacy resume converts once to conversation storage" {
             "legacy-conversation-convert",
         );
         defer resumed.deinit(alloc);
-        try std.testing.expect(resumed.usesConversationStorage());
     }
     var detail = try ctx.store.loadReadOnlyDetail(
         alloc,
@@ -5732,6 +5275,10 @@ test "writable legacy resume converts once to conversation storage" {
     try std.testing.expectError(
         error.FileNotFound,
         session_dir.dir.statFile(std.testing.io, "checkpoint.json", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        session_dir.dir.statFile(std.testing.io, "session.legacy.json", .{}),
     );
 }
 
@@ -5812,7 +5359,7 @@ test "legacy conversion externalizes available inline tool results" {
     try std.testing.expect(std.mem.find(u8, stored, "legacy available bytes") != null);
 }
 
-test "discarding a pristine started session ignores stale projection state" {
+test "discarding a pristine started conversation removes its directory" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5822,7 +5369,6 @@ test "discarding a pristine started session ignores stale projection state" {
     var state = try testDurableState(alloc, "discard-pristine", ctx.workspace);
     defer state.deinit(alloc);
     var writable = try ctx.store.startWritableSession(alloc, state);
-    writable.projection_status = .stale;
 
     try std.testing.expectEqual(
         PristineDiscardDisposition.discarded,
@@ -5866,8 +5412,6 @@ test "discarding a pristine started session permits usage checkpoints" {
         alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         20,
-        .retry_expected_tail,
-        .{},
     );
 
     try std.testing.expectEqual(
@@ -5907,8 +5451,6 @@ test "pristine discard retains active recovery and permits cleared recovery" {
         alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         20,
-        .retry_expected_tail,
-        .{},
     );
     try std.testing.expectEqual(
         PristineDiscardDisposition.retained,
@@ -5922,15 +5464,11 @@ test "pristine discard retains active recovery and permits cleared recovery" {
         alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         30,
-        .retry_expected_tail,
-        .{},
     );
     _ = try cleared.appendEvent(
         alloc,
         .{ .recovery_checkpoint_cleared = .{} },
         40,
-        .retry_expected_tail,
-        .{},
     );
     try std.testing.expectEqual(
         PristineDiscardDisposition.discarded,
@@ -5964,8 +5502,6 @@ test "pristine discard refuses resumed and committed writers" {
         alloc,
         .{ .preferences_changed = .{ .fast_mode = true } },
         20,
-        .retry_expected_tail,
-        .{},
     );
     try std.testing.expectEqual(
         PristineDiscardDisposition.retained,
@@ -5991,8 +5527,6 @@ test "committed session deletion consumes its exact writer" {
         alloc,
         .{ .preferences_changed = .{ .fast_mode = true } },
         20,
-        .retry_expected_tail,
-        .{},
     );
 
     try std.testing.expectEqual(
@@ -6019,8 +5553,6 @@ test "committed parent deletion removes exactly its marked direct child" {
         alloc,
         .{ .preferences_changed = .{ .fast_mode = true } },
         20,
-        .retry_expected_tail,
-        .{},
     );
 
     var child_state = try testDurableState(alloc, "delete-child", ctx.workspace);
@@ -6378,8 +5910,6 @@ test "a writable session publishes latest after its Store is deinitialized" {
         alloc,
         .{ .preferences_changed = .{ .fast_mode = true } },
         20,
-        .retry_expected_tail,
-        .{},
     );
     writer.deinit(alloc);
 
@@ -6469,7 +5999,7 @@ test "bounded doctor inspection exhausts under limit" {
     try std.testing.expectEqual(@as(usize, 2), result.inspected_count);
     try std.testing.expectEqual(@as(usize, 2), result.diagnostics.items.len);
     for (result.diagnostics.items) |diagnostic| {
-        try std.testing.expectEqual(DoctorIssueKind.missing_authority, diagnostic.kind);
+        try std.testing.expectEqual(DoctorIssueKind.canonical_state_invalid, diagnostic.kind);
     }
 }
 
@@ -7051,7 +6581,6 @@ test "invalid/corrupt record skipping" {
     try std.testing.expect(std.mem.find(u8, trace, "projection_state=current") != null);
     try std.testing.expect(std.mem.find(u8, trace, "cause=invalid_manifest") != null);
     try std.testing.expect(std.mem.find(u8, trace, "outcome=excluded") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "outcome=retained") != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,
@@ -7502,7 +7031,7 @@ test "malformed settings do not block legacy detail or migration" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", resumed.state.preferences.model);
 }
 
-test "explicit schema v3 resume rebinds workspace" {
+test "explicit conversation resume rebinds workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7527,7 +7056,6 @@ test "explicit schema v3 resume rebinds workspace" {
     defer target.deinit(alloc);
     var resumed = try target.resumeForWrite(alloc, state.id);
     try std.testing.expectEqualStrings(workspace_b, resumed.state.workspace_root);
-    try std.testing.expect(!resumed.needsFinalStateReplacement(false));
     resumed.deinit(alloc);
 
     var reopened = try target.loadReadOnly(alloc, state.id);
@@ -7547,7 +7075,6 @@ test "writable resume migrates legacy storage" {
     defer resumed.deinit(alloc);
     try std.testing.expectEqualStrings("legacy-migrate", resumed.state.id);
     try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
-    try std.testing.expect(resumed.usesConversationStorage());
     var detail = try ctx.store.loadReadOnlyDetail(alloc, "legacy-migrate", .{});
     defer detail.deinit(alloc);
     try std.testing.expectEqual(StorageFormat.conversation, detail.storage_format);
@@ -7591,7 +7118,7 @@ test "writable legacy resume preserves incomplete authority through migration an
     );
 }
 
-test "legacy resume honors immediate session and commit lock deadlines" {
+test "legacy resume honors the single writer lock deadline" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7615,35 +7142,11 @@ test "legacy resume honors immediate session and commit lock deadlines" {
             ctx.workspace,
             .{ .log = .{
                 .session_lock_deadline_ms = 0,
-                .commit_lock_deadline_ms = 0,
             } },
         ),
     );
     try std.testing.expect(io_mod.milliTimestamp() - session_started_at_ms < 1000);
     session_lock.release();
-
-    {
-        var commit_lock = try io_mod.acquireTimedAdvisoryLock(
-            &session_dir,
-            "commit.lock",
-            2000,
-        );
-        defer commit_lock.release();
-        const commit_started_at_ms = io_mod.milliTimestamp();
-        try std.testing.expectError(
-            error.SessionCommitBoundaryUnavailable,
-            ctx.store.resumeTargetForWrite(
-                alloc,
-                .{ .id = "legacy-lock-deadlines" },
-                ctx.workspace,
-                .{ .log = .{
-                    .session_lock_deadline_ms = 0,
-                    .commit_lock_deadline_ms = 0,
-                } },
-            ),
-        );
-        try std.testing.expect(io_mod.milliTimestamp() - commit_started_at_ms < 1000);
-    }
 }
 
 test "storage-only migration preserves legacy v2 source metadata" {
@@ -7727,7 +7230,7 @@ test "normal legacy classification parses top level schema beyond manifest prefi
     try std.testing.expectEqual(SessionMigrationStatus.migrated, result.status);
 }
 
-test "migration result uses captured source metadata after committed success" {
+test "migration result reports captured source metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7741,16 +7244,10 @@ test "migration result uses captured source metadata after committed success" {
         20,
     );
 
-    const session_dir = try sessionDirPath(alloc, ctx.store.sessions_dir, "legacy-large-result");
-    defer alloc.free(session_dir);
-    const legacy_copy_path = try std.fs.path.join(alloc, &.{ session_dir, "session.legacy.json" });
-    defer alloc.free(legacy_copy_path);
-    var corruption = MigrationStableCopyCorruption{ .legacy_copy_path = legacy_copy_path };
-
     var result = try ctx.store.migrateLegacyStorageOnly(
         alloc,
         "legacy-large-result",
-        .{ .log = corruption.options() },
+        .{},
     );
     defer result.deinit(alloc);
     try std.testing.expectEqual(SessionMigrationStatus.migrated, result.status);
@@ -7775,220 +7272,6 @@ test "session list ignores stale json cache without matching sessions" {
     var summaries = try ctx.store.list(alloc);
     defer freeSummaries(alloc, &summaries);
     try std.testing.expectEqual(@as(usize, 0), summaries.items.len);
-}
-
-test "interrupted migration restores exact legacy authority" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeLegacyFixture(alloc, ctx.store, "legacy-restore", ctx.workspace, 20);
-    var failure = MigrationBoundaryFailure{
-        .target = .after_authority_marker_rename,
-    };
-
-    try std.testing.expectError(
-        error.LegacySessionMigrationIndeterminate,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-restore" },
-            ctx.workspace,
-            failure.options(),
-        ),
-    );
-
-    var resumed = try ctx.store.resumeForWrite(alloc, "legacy-restore");
-    defer resumed.deinit(alloc);
-    try std.testing.expectEqualStrings("legacy-restore", resumed.state.id);
-    try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
-}
-
-test "interrupted migration recovery honors immediate lock deadlines" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeLegacyFixture(alloc, ctx.store, "legacy-recovery-locks", ctx.workspace, 20);
-    var failure = MigrationBoundaryFailure{
-        .target = .after_authority_marker_rename,
-    };
-    try std.testing.expectError(
-        error.LegacySessionMigrationIndeterminate,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-recovery-locks" },
-            ctx.workspace,
-            failure.options(),
-        ),
-    );
-
-    var session_dir = try ctx.store.openSessionDir("legacy-recovery-locks");
-    defer session_dir.close();
-    var session_lock = try io_mod.acquireTimedAdvisoryLock(
-        &session_dir,
-        "session.lock",
-        2000,
-    );
-    const session_started_at_ms = io_mod.milliTimestamp();
-    try std.testing.expectError(
-        error.SessionBusy,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-recovery-locks" },
-            ctx.workspace,
-            .{ .log = .{
-                .session_lock_deadline_ms = 0,
-                .commit_lock_deadline_ms = 0,
-            } },
-        ),
-    );
-    try std.testing.expect(io_mod.milliTimestamp() - session_started_at_ms < 1000);
-    session_lock.release();
-
-    {
-        var commit_lock = try io_mod.acquireTimedAdvisoryLock(
-            &session_dir,
-            "commit.lock",
-            2000,
-        );
-        defer commit_lock.release();
-        const commit_started_at_ms = io_mod.milliTimestamp();
-        try std.testing.expectError(
-            error.SessionCommitBoundaryUnavailable,
-            ctx.store.resumeTargetForWrite(
-                alloc,
-                .{ .id = "legacy-recovery-locks" },
-                ctx.workspace,
-                .{ .log = .{
-                    .session_lock_deadline_ms = 0,
-                    .commit_lock_deadline_ms = 0,
-                } },
-            ),
-        );
-        try std.testing.expect(io_mod.milliTimestamp() - commit_started_at_ms < 1000);
-    }
-}
-
-test "interrupted migration confirms exact proposed authority" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeLegacyFixture(alloc, ctx.store, "legacy-confirm", ctx.workspace, 20);
-    var failure = MigrationBoundaryFailure{
-        .target = .after_authority_namespace_sync,
-    };
-
-    try std.testing.expectError(
-        error.LegacySessionMigrationIndeterminate,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-confirm" },
-            ctx.workspace,
-            failure.options(),
-        ),
-    );
-
-    var resumed = try ctx.store.resumeForWrite(alloc, "legacy-confirm");
-    defer resumed.deinit(alloc);
-    try std.testing.expectEqualStrings("legacy-confirm", resumed.state.id);
-    try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
-}
-
-test "storage-only migration resolves an interrupted switch" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeLegacyFixture(
-        alloc,
-        ctx.store,
-        "legacy-storage-recovery",
-        ctx.workspace,
-        20,
-    );
-    var failure = MigrationBoundaryFailure{
-        .target = .after_authority_marker_rename,
-    };
-    try std.testing.expectError(
-        error.LegacySessionMigrationIndeterminate,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-storage-recovery" },
-            ctx.workspace,
-            failure.options(),
-        ),
-    );
-
-    var result = try ctx.store.migrateLegacyStorageOnly(
-        alloc,
-        "legacy-storage-recovery",
-        .{},
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(SessionMigrationStatus.migrated, result.status);
-    try std.testing.expectEqual(@as(u8, 1), result.source_schema_version);
-    try std.testing.expect(result.source_bytes > 0);
-}
-
-test "storage only migration recovery reports transition source metadata without rereading legacy copy" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-    try writeLegacyFixture(
-        alloc,
-        ctx.store,
-        "legacy-storage-metadata-recovery",
-        ctx.workspace,
-        20,
-    );
-    const original = try readFixtureFile(
-        alloc,
-        ctx.store,
-        "legacy-storage-metadata-recovery",
-        "session.json",
-        max_session_bytes,
-    );
-    defer alloc.free(original);
-    const session_dir = try sessionDirPath(
-        alloc,
-        ctx.store.sessions_dir,
-        "legacy-storage-metadata-recovery",
-    );
-    defer alloc.free(session_dir);
-    const legacy_copy_path = try std.fs.path.join(alloc, &.{
-        session_dir,
-        "session.legacy.json",
-    });
-    defer alloc.free(legacy_copy_path);
-    var corruption = MigrationInterruptedStableCopyCorruption{
-        .legacy_copy_path = legacy_copy_path,
-    };
-    try std.testing.expectError(
-        error.LegacySessionMigrationIndeterminate,
-        ctx.store.resumeTargetForWrite(
-            alloc,
-            .{ .id = "legacy-storage-metadata-recovery" },
-            ctx.workspace,
-            corruption.options(),
-        ),
-    );
-
-    var result = try ctx.store.migrateLegacyStorageOnly(
-        alloc,
-        "legacy-storage-metadata-recovery",
-        .{},
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(SessionMigrationStatus.migrated, result.status);
-    try std.testing.expectEqual(@as(u8, 1), result.source_schema_version);
-    try std.testing.expectEqual(@as(u64, original.len), result.source_bytes);
 }
 
 test "history page validates request input before replay" {
@@ -8067,7 +7350,7 @@ test "conversation history cursor remains stable across append" {
             .total_input_tokens = 0,
             .total_output_tokens = 0,
             .turn = turn,
-        } }, 30, .retry_expected_tail, .{});
+        } }, 30);
     }
     var older = try ctx.store.loadHistoryPage(
         alloc,
@@ -8142,8 +7425,6 @@ test "history pages expose per-turn provenance through replacement checkpoint an
         alloc,
         .{ .preferences_changed = .{ .fast_mode = true } },
         30,
-        .retry_expected_tail,
-        .{},
     );
     writable.deinit(alloc);
     writable_owned = false;
@@ -8179,8 +7460,6 @@ test "history pages expose per-turn provenance through replacement checkpoint an
                 .turn = direct_turn,
             } },
             40,
-            .retry_expected_tail,
-            .{},
         );
     }
     var direct_reloaded = try ctx.store.loadReadOnly(

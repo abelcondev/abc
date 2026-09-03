@@ -97,10 +97,6 @@ pub const QueuedPrompt = struct {
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
-    /// Active model-context boundary within the complete owned canonical
-    /// history snapshot. Compaction reads raw turns before this boundary;
-    /// ordinary provider projection does not.
-    context_history_start: usize = 0,
     /// Absolute end of the leading canonical-history range loaded without
     /// corrected result provenance. The conservative default protects callers
     /// that do not own a SessionRuntime snapshot.
@@ -134,7 +130,6 @@ pub const ContextCompactionTask = struct {
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
     history: []types.HistoryTurn,
-    context_history_start: usize = 0,
     unversioned_history_count: usize = std.math.maxInt(usize),
 };
 
@@ -317,15 +312,12 @@ pub const SteeringPresentationSnapshot = struct {
 };
 
 const PreparedHistoryPropagation = struct {
-    history: []types.HistoryTurn,
-    context_history_start: usize,
     root_user_intent_context: []u8,
     authorized_image_catalog: []types.ImageAttachment,
     snapshot_file_ownerships: ?[]types.SnapshotFileOwnership,
     added_snapshot_ownership: ?types.SnapshotFileOwnership,
 
     fn deinit(self: PreparedHistoryPropagation, alloc: std.mem.Allocator) void {
-        types.freeHistoryTurnSlice(alloc, self.history);
         alloc.free(self.root_user_intent_context);
         types.freeImageAttachmentSlice(alloc, self.authorized_image_catalog);
         if (self.added_snapshot_ownership) |ownership| ownership.release();
@@ -454,6 +446,9 @@ pub const WorkerRuntime = struct {
     /// One admission-ordered queue for ordinary prompts and steering. Steering
     /// remains in place until its target turn consumes or demotes it.
     queued_prompts: std.ArrayList(QueuedPrompt) = .empty,
+    /// One immutable conversation snapshot shared by every queued prompt.
+    /// It is transferred or copied only when a prompt actually begins.
+    queued_history: []types.HistoryTurn = &.{},
     queued_context_compaction: ?ContextCompactionTask = null,
     active_context_compaction: bool = false,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
@@ -514,6 +509,7 @@ pub const WorkerRuntime = struct {
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
+        types.freeHistoryTurnSlice(alloc, self.queued_history);
         if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
         self.clearActiveToolCallsLocked();
@@ -860,8 +856,18 @@ pub const WorkerRuntime = struct {
             prompt.skill_display_spans.len == 0;
     }
 
-    fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued: QueuedPrompt) !void {
-        try self.queued_prompts.append(alloc, queued);
+    fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued_value: QueuedPrompt) !void {
+        var queued = queued_value;
+        try self.queued_prompts.ensureUnusedCapacity(alloc, 1);
+        const supplied_history = queued.history;
+        queued.history = &.{};
+        if (self.queued_prompts.items.len == 0) {
+            std.debug.assert(self.queued_history.len == 0);
+            self.queued_history = supplied_history;
+        } else {
+            types.freeHistoryTurnSlice(alloc, supplied_history);
+        }
+        self.queued_prompts.appendAssumeCapacity(queued);
         debug_trace.logf(
             "worker",
             "queued prompt bytes={d} queue_depth={d} fast_mode={s} effort={s}",
@@ -960,6 +966,10 @@ pub const WorkerRuntime = struct {
             const prompt = self.queued_prompts.orderedRemove(index);
             freeQueuedPrompt(alloc, prompt);
         }
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
         debug_trace.eventf("worker", "prompt_steering_consumed", .{ .turn_id = turn_id }, "count={d}", .{messages.len});
         self.worker_cond.broadcast(io_mod.getIo());
         return messages;
@@ -998,6 +1008,10 @@ pub const WorkerRuntime = struct {
             if (queued.turn_id != turn_id) continue;
             removed = self.queued_prompts.orderedRemove(index);
             break;
+        }
+        if (removed != null and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
         }
         const remaining = self.queuedWorkCountLocked();
         self.worker_mutex.unlock(io_mod.getIo());
@@ -1100,6 +1114,19 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
+        const transfer_history = self.queued_prompts.items.len == 1;
+        const job_history = if (transfer_history)
+            self.queued_history
+        else
+            try session_runtime.snapshotOwnedContextHistory(
+                alloc,
+                self.queued_history,
+                0,
+                0,
+            );
+        errdefer if (!transfer_history) {
+            types.freeHistoryTurnSlice(alloc, job_history);
+        };
         if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
@@ -1125,6 +1152,8 @@ pub const WorkerRuntime = struct {
         }
 
         var job = self.queued_prompts.orderedRemove(0);
+        if (transfer_history) self.queued_history = &.{};
+        job.history = job_history;
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_recovery_pause_requested.store(false, .seq_cst);
@@ -1417,6 +1446,8 @@ pub const WorkerRuntime = struct {
             discardQueuedPrompt(alloc, prompt, retained_images);
         }
         self.queued_prompts.clearRetainingCapacity();
+        types.freeHistoryTurnSlice(alloc, self.queued_history);
+        self.queued_history = &.{};
         if (self.queued_context_compaction) |task| {
             freeContextCompactionTask(alloc, task);
             self.queued_context_compaction = null;
@@ -1532,6 +1563,14 @@ pub const WorkerRuntime = struct {
             try ownership.ensureSharedOwnership(alloc)
         else
             null;
+        const next_history = try appendHistoryTurnProjection(
+            alloc,
+            self.queued_history,
+            turn,
+            max_history_turns,
+        );
+        var next_history_owned = true;
+        defer if (next_history_owned) types.freeHistoryTurnSlice(alloc, next_history);
         const prepared = try alloc.alloc(
             PreparedHistoryPropagation,
             self.queued_prompts.items.len,
@@ -1560,14 +1599,6 @@ pub const WorkerRuntime = struct {
                 turn,
             );
             errdefer alloc.free(next_root_user_intent_context);
-            const next_history = try appendHistoryTurnProjection(
-                alloc,
-                prompt.history,
-                turn,
-                max_history_turns,
-            );
-            errdefer types.freeHistoryTurnSlice(alloc, next_history);
-
             const next_snapshot_file_ownerships = if (active_ownership) |ownership| blk: {
                 const ownership_count = std.math.add(
                     usize,
@@ -1595,11 +1626,6 @@ pub const WorkerRuntime = struct {
             }
 
             prepared[prepared_count] = .{
-                .history = next_history,
-                .context_history_start = if (turn == .compacted_summary)
-                    next_history.len - 1
-                else
-                    prompt.context_history_start,
                 .root_user_intent_context = next_root_user_intent_context,
                 .authorized_image_catalog = next_image_catalog,
                 .snapshot_file_ownerships = next_snapshot_file_ownerships,
@@ -1610,10 +1636,10 @@ pub const WorkerRuntime = struct {
             };
         }
 
+        types.freeHistoryTurnSlice(alloc, self.queued_history);
+        self.queued_history = next_history;
+        next_history_owned = false;
         for (self.queued_prompts.items, prepared) |*prompt, next| {
-            types.freeHistoryTurnSlice(alloc, prompt.history);
-            prompt.history = next.history;
-            prompt.context_history_start = next.context_history_start;
             if (turn == .compacted_summary) prompt.unversioned_history_count = 0;
             if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
             prompt.root_user_intent_context = next.root_user_intent_context;
@@ -2783,14 +2809,16 @@ fn checkHistoryPropagationAllocation(
             try std.testing.expectEqual(@as(usize, 0), prompt.authorized_image_catalog.len);
             try std.testing.expectEqual(@as(usize, 0), prompt.snapshot_file_ownerships.len);
         }
+        try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
         return false;
     };
 
     for (runtime.queued_prompts.items) |prompt| {
-        try std.testing.expectEqual(@as(usize, 1), prompt.history.len);
+        try std.testing.expectEqual(@as(usize, 0), prompt.history.len);
         try std.testing.expectEqual(@as(usize, 1), prompt.authorized_image_catalog.len);
         try std.testing.expectEqual(@as(usize, 1), prompt.snapshot_file_ownerships.len);
     }
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_history.len);
     return true;
 }
 
@@ -2837,7 +2865,7 @@ fn checkContextCompactionCommitAllocation(
         if (!failing.has_induced_failure) return err;
         try std.testing.expectEqual(
             @as(usize, 0),
-            runtime.queued_prompts.items[0].history.len,
+            runtime.queued_history.len,
         );
         try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
         return false;
@@ -2845,7 +2873,7 @@ fn checkContextCompactionCommitAllocation(
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        runtime.queued_prompts.items[0].history.len,
+        runtime.queued_history.len,
     );
     try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
     try std.testing.expect(runtime.worker_events.items[0] == .context_compaction);
@@ -4006,7 +4034,14 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
         .compaction_count = 0,
     } };
     defer types.freeHistoryTurn(alloc, old_turn);
-    runtime.queued_prompts.items[0].history = try session_runtime.appendHistoryTurnToOwnedContext(alloc, runtime.queued_prompts.items[0].history, old_turn, 2);
+    const seeded_history = try appendHistoryTurnProjection(
+        alloc,
+        runtime.queued_history,
+        old_turn,
+        2,
+    );
+    types.freeHistoryTurnSlice(alloc, runtime.queued_history);
+    runtime.queued_history = seeded_history;
     const turn: types.HistoryTurn = .{ .compacted_summary = .{
         .summary = try alloc.dupe(u8, "summary"),
         .removed_turn_count = 0,
@@ -4014,10 +4049,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     } };
     defer types.freeHistoryTurn(alloc, turn);
     try runtime.propagateHistoryTurn(alloc, turn, 1);
-    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].history.len);
-    try std.testing.expect(runtime.queued_prompts.items[0].history[1] == .compacted_summary);
-    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[1].compacted_summary.summary);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].context_history_start);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_history.len);
+    try std.testing.expect(runtime.queued_history[1] == .compacted_summary);
+    try std.testing.expectEqualStrings("summary", runtime.queued_history[1].compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
@@ -4266,10 +4300,10 @@ test "held turn propagation refreshes queued prompt trusted reviewer context" {
 
     try runtime.propagateHistoryTurn(alloc, turn, 8);
 
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].history.len);
-    try std.testing.expect(runtime.queued_prompts.items[0].history[0] == .assistant);
-    try std.testing.expectEqualStrings("Revoke permission: do not modify any more files.", runtime.queued_prompts.items[0].history[0].assistant.user.text);
-    try std.testing.expectEqualStrings("completed prior answer", runtime.queued_prompts.items[0].history[0].assistant.assistant);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_history.len);
+    try std.testing.expect(runtime.queued_history[0] == .assistant);
+    try std.testing.expectEqualStrings("Revoke permission: do not modify any more files.", runtime.queued_history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("completed prior answer", runtime.queued_history[0].assistant.assistant);
     try std.testing.expectEqualStrings("queued current prompt", runtime.queued_prompts.items[0].prompt);
     try std.testing.expectEqual(original_prompt_len, runtime.queued_prompts.items[0].prompt.len);
     try std.testing.expect(original_prompt_ptr == runtime.queued_prompts.items[0].prompt.ptr);

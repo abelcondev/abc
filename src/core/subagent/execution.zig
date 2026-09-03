@@ -119,9 +119,9 @@ pub const TurnContext = struct {
             alloc,
             loaded.state.conversation_language,
             loaded.state.history,
-            loaded.state.context_history_start,
             loaded.state.permission_state,
         );
+        loaded.releaseHydrationHistory(alloc);
         return .{
             .alloc = alloc,
             .runtime = runtime,
@@ -417,8 +417,6 @@ pub const TurnContext = struct {
                 .turn = prepared,
             } },
             timestamp_ms,
-            .retry_expected_tail,
-            .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionCommitFailed,
@@ -437,8 +435,6 @@ pub const TurnContext = struct {
             self.alloc,
             .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
             timestamp_ms,
-            .retry_expected_tail,
-            .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionCommitFailed,

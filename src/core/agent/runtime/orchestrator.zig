@@ -2875,6 +2875,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
         },
         .subagent,
         false,
+        false,
         "handoff",
         &.{.{ .role = .assistant, .content = "retained tail" }},
         1,
@@ -4143,10 +4144,7 @@ fn processQueuedPromptInner(
             return;
         }
     }
-    if (job.context_history_start > job.history.len) {
-        return error.InvalidContextHistoryStart;
-    }
-    const active_history = job.history[job.context_history_start..];
+    const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
     const partial_interrupted_closures = runtime_interruption.countPartialTextInterruptedClosures(active_history);
@@ -4163,14 +4161,14 @@ fn processQueuedPromptInner(
             arena,
             &history_messages,
             job.history,
-            job.context_history_start,
+            0,
         );
     } else {
         try session_runtime.appendActiveContextHistoryChatMessages(
             arena,
             &history_messages,
             job.history,
-            job.context_history_start,
+            0,
         );
     }
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
@@ -5440,7 +5438,7 @@ fn processQueuedPromptLoop(
                         const uncertain_history_count = @min(
                             @max(
                                 job.unversioned_history_count,
-                                job.context_history_start,
+                                0,
                             ),
                             job.history.len,
                         );

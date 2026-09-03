@@ -805,7 +805,6 @@ pub fn handlePrompt(
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
-        .context_history_start = session.session_rt.contextHistoryStart(),
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
@@ -1424,26 +1423,10 @@ fn persistUsageCheckpoint(
         writable,
         snapshot,
     );
-    if (writable.degradedTail() != null) {
-        var current = try currentAcpState(
-            ctx.alloc,
-            active,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
@@ -1966,7 +1949,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             turn,
             ctx.retain_external_root_user_turn,
             ctx.current_prompt_input,
-            .{},
         );
     }
 }
@@ -1977,7 +1959,6 @@ fn persistAcpHistoryTurn(
     turn: HistoryTurn,
     prompt_is_root_authority: bool,
     current_prompt_input: ?*ParsedPromptInput,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2005,23 +1986,6 @@ fn persistAcpHistoryTurn(
         prepared,
         prompt_is_root_authority,
     );
-    if (writable.degradedTail() != null) {
-        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
-        prepared_owned = false;
-        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAcpState(alloc, session, writable, now_ms);
-        defer current.deinit(alloc);
-        if (current.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-        current.recovery_checkpoint = null;
-        try writable.retryDegradedWithStateReplacement(
-            alloc,
-            current,
-            .{},
-        );
-        if (current.usage) |usage| session.session_rt.usage.markClean(usage);
-        return;
-    }
     _ = try writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
@@ -2031,8 +1995,6 @@ fn persistAcpHistoryTurn(
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        options,
     );
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
@@ -2049,50 +2011,11 @@ fn setRecoveryCheckpoint(
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAcpState(ctx.alloc, session, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
-}
-
-fn currentAcpState(
-    alloc: Allocator,
-    session: *server.ActiveSessionState,
-    writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(alloc);
-    errdefer state.deinit(alloc);
-    const history = try session.session_rt.snapshotHistory(alloc);
-    types.freeHistoryTurnSlice(alloc, state.history);
-    state.history = history;
-    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
-    state.permission_state.deinit(alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = session.session_rt.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try session.session_rt.usage.snapshot(alloc);
-    if (state.usage) |*old| old.deinit(alloc);
-    state.usage = usage;
-    return state;
+    );
 }
 
 /// Stores grants on the active ACP session without persisting them.

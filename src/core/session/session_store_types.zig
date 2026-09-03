@@ -270,10 +270,7 @@ pub const DoctorInspectionResult = struct {
 
 /// Thresholds that decide when committed-log growth is reported as overdue or
 /// failed compaction. Defaults match the historical behavior.
-pub const DoctorInspectionOptions = struct {
-    compaction_frame_threshold: u64 = 4096,
-    compaction_byte_threshold: u64 = 128 * 1024 * 1024,
-};
+pub const DoctorInspectionOptions = struct {};
 
 /// Copyable store state shared with discovery and migration without introducing
 /// a dependency on the `Store` facade. `canonical_root` retains value semantics.

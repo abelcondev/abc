@@ -6,7 +6,6 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
-const session_test_controls = @import("session_test_controls.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
@@ -152,7 +151,7 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     const permission_state = try session.session_rt.snapshotPermissionState(alloc);
     next.permission_state.deinit(alloc);
     next.permission_state = permission_state;
-    next.context_history_start = session.session_rt.context_history_start;
+    next.context_history_start = 0;
     next.conversation_language = session.session_rt.languageSnapshot();
     next.updated_at_ms = io_mod.milliTimestamp();
     alloc.free(next.preferences.model);
@@ -234,7 +233,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var writable = store.startWritableSessionWithOptions(
         alloc,
         initial,
-        session_test_controls.logOptions(),
+        .{},
     ) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
     var writable_owned = true;
@@ -266,6 +265,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             writable.state.created_at_ms,
         );
     }
+    writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
@@ -381,7 +381,6 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         alloc,
         loaded.state.conversation_language,
         loaded.state.history,
-        loaded.state.context_history_start,
         loaded.state.permission_state,
     );
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
@@ -610,7 +609,7 @@ fn handleRestoreSession(
         state.workspace_root,
         .{
             .seed_preferences = seed_preferences,
-            .log = session_test_controls.logOptions(),
+            .log = .{},
         },
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
@@ -653,7 +652,6 @@ fn handleRestoreSession(
         alloc,
         writable.state.conversation_language,
         writable.state.history,
-        writable.state.context_history_start,
         writable.state.permission_state,
     );
     if (writable.state.usage) |usage| {
@@ -693,7 +691,7 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_mcp_owned = false;
     if (kind.replaysHistory()) {
-        for (state.active_session.?.writable.?.state.history) |turn| {
+        for (state.active_session.?.session_rt.agent.history.items) |turn| {
             try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
         }
     }
@@ -996,14 +994,6 @@ fn handleLoadFailure(
         "session operation=load outcome=failed error={s}",
         .{@errorName(err)},
     );
-    if (err == error.SessionCommitIndeterminate) {
-        try state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Failed to commit session workspace rebind",
-        });
-        state.terminate_connection = true;
-        return;
-    }
     if (err == error.SessionWorkspaceRebindFailed) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
