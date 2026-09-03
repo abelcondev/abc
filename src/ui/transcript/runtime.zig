@@ -8106,9 +8106,7 @@ pub const TranscriptRuntime = struct {
                 }
             },
             .invalid => if (self.pendingResumeFlow().len > 0 and
-                !destructive_invalidation and
-                self.committed_frame_layout.terminal_cols == self.layout.cols and
-                self.committed_frame_layout.terminal_rows == self.layout.rows)
+                !destructive_invalidation)
             {
                 return .{
                     .flow_len = 0,
@@ -11798,16 +11796,12 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expect(facts.recovery_rebase);
 }
 
-test "oversized resume publication retains bounded recovery progress" {
+test "oversized resume publication starts without a prior committed frame" {
     const alloc = std.testing.allocator;
     const layout = invalidationTestLayout();
     var runtime = TranscriptRuntime{
         .layout = layout,
         .owned_top_row = 1,
-        .committed_frame_layout = .{
-            .terminal_rows = layout.rows,
-            .terminal_cols = layout.cols,
-        },
     };
     defer runtime.deinit(alloc);
 

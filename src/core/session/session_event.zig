@@ -51,12 +51,18 @@ pub const ConversationToolResult = struct {
     tool_name: []const u8,
     status: types.PersistedToolStatus,
     artifact_ref: []const u8,
+    output_bytes: ?u64 = null,
     stored_bytes: u64,
     completeness: ArtifactCompleteness,
     preview: ?[]const u8 = null,
+    provider_native: bool = false,
+    created_at_ms: i64 = 0,
     permission_feedback: []const []const u8 = &.{},
+    committed_file_presentation: ?types.CommittedFilePresentation = null,
     command_replay_ref: ?[]const u8 = null,
     command_replay_bytes: ?u64 = null,
+    command_process_presentation: ?types.CommandProcessPresentation = null,
+    terminal_action_presentation: ?types.TerminalActionPresentation = null,
 };
 
 pub const ConversationInterruption = struct {
@@ -65,6 +71,13 @@ pub const ConversationInterruption = struct {
     command_replay_ref: ?[]const u8 = null,
     command_replay_bytes: ?u64 = null,
     command_artifact_ref: ?[]const u8 = null,
+    files: []const types.FileEvidence = &.{},
+    turn_summary: ?types.TurnSummary = null,
+};
+
+pub const ConversationTurnCompleted = struct {
+    files: []const types.FileEvidence = &.{},
+    turn_summary: ?types.TurnSummary = null,
 };
 
 pub const ConversationCheckpoint = struct {
@@ -78,7 +91,7 @@ pub const ConversationEvent = union(enum) {
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
     steering: ConversationText,
-    turn_completed: void,
+    turn_completed: ConversationTurnCompleted,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
 };
@@ -219,8 +232,24 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
                     return error.InvalidConversationEvent;
                 }
             }
+            if (result.created_at_ms < 0) return error.InvalidConversationEvent;
             for (result.permission_feedback) |feedback| {
                 try validateOptionalConversationText(feedback);
+            }
+            if (result.committed_file_presentation) |presentation| {
+                try validateConversationPath(presentation.path);
+                for (presentation.lines) |line| {
+                    try validateOptionalConversationText(line.text);
+                }
+                if (presentation.previous_content) |content| {
+                    try validateOptionalConversationText(content);
+                }
+                if (presentation.after_content) |content| {
+                    try validateOptionalConversationText(content);
+                }
+                if (presentation.lifecycle_id) |lifecycle_id| {
+                    try validateConversationIdentity(lifecycle_id.call_id);
+                }
             }
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
@@ -244,9 +273,28 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
             if (interrupted.command_artifact_ref) |handle| {
                 try validateConversationIdentity(handle);
             }
+            try validateConversationFiles(interrupted.files);
         },
         .context_checkpoint => |checkpoint| try validateConversationText(checkpoint.summary),
-        .turn_completed => {},
+        .turn_completed => |completed| try validateConversationFiles(completed.files),
+    }
+}
+
+fn validateConversationFiles(files: []const types.FileEvidence) ConversationTransitionError!void {
+    for (files) |file| {
+        try validateConversationPath(file.path);
+        if (file.new_path) |path| try validateConversationPath(path);
+        try validateConversationIdentity(file.tool_call_id);
+        try validateConversationIdentity(file.tool_name);
+    }
+}
+
+fn validateConversationPath(path: []const u8) ConversationTransitionError!void {
+    if (path.len == 0 or
+        path.len > std.Io.Dir.max_path_bytes or
+        !std.unicode.utf8ValidateSlice(path))
+    {
+        return error.InvalidConversationEvent;
     }
 }
 
@@ -346,7 +394,10 @@ pub fn appendHistoryTurnConversationEvents(
             if (entry.assistant.len > 0) {
                 try events.append(alloc, .{ .assistant = .{ .text = entry.assistant } });
             }
-            try events.append(alloc, .{ .turn_completed = {} });
+            try events.append(alloc, .{ .turn_completed = .{
+                .files = entry.execution.files,
+                .turn_summary = entry.execution.turn_summary,
+            } });
         },
         .interrupted => |entry| {
             try events.append(alloc, .{ .user = .{
@@ -376,6 +427,8 @@ pub fn appendHistoryTurnConversationEvents(
                     presentation.command_artifact_handle
                 else
                     null,
+                .files = entry.execution.files,
+                .turn_summary = entry.execution.turn_summary,
             } });
         },
         .compacted_summary => return error.ConversationCheckpointRequiresSequence,
@@ -440,6 +493,8 @@ fn appendExecutionConversationEvents(
                 .tool_name = result.tool_name,
                 .status = result.status,
                 .artifact_ref = artifact_ref,
+                .output_bytes = std.math.cast(u64, result.output_bytes) orelse
+                    return error.InvalidConversationEvent,
                 .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
                     return error.InvalidConversationEvent,
                 .completeness = if (result.truncated) .partial else .complete,
@@ -447,9 +502,14 @@ fn appendExecutionConversationEvents(
                     result.output
                 else
                     null,
+                .provider_native = result.provider_native,
+                .created_at_ms = result.created_at_ms,
                 .permission_feedback = result.permission_feedback,
+                .committed_file_presentation = result.committed_file_presentation,
                 .command_replay_ref = resultCommandReplayRef(result),
                 .command_replay_bytes = resultCommandReplayBytes(result),
+                .command_process_presentation = result.command_process_presentation,
+                .terminal_action_presentation = result.terminal_action_presentation,
             } });
         }
         const completed_steps = step_index + 1;
@@ -3458,7 +3518,7 @@ test "conversation transition validates sequence tool identity and checkpoint sa
     try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(state, .{
         .seq = 3,
         .timestamp_ms = 10,
-        .event = .{ .turn_completed = {} },
+        .event = .{ .turn_completed = .{} },
     }));
     try validateConversationTransition(state, .{
         .seq = 3,

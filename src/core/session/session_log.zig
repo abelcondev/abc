@@ -709,8 +709,8 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            .turn_completed => {
-                const completed = try turn.finishAssistant();
+            .turn_completed => |value| {
+                const completed = try turn.finishAssistant(value);
                 errdefer session.freeHistoryTurn(alloc, completed);
                 try history.append(alloc, completed);
             },
@@ -787,7 +787,7 @@ pub fn loadConversationHistoryRange(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .turn_completed => try builder.finishAssistant(),
+            .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => blk: {
                 if (!builder.isIdle()) return error.InvalidConversationFrame;
@@ -854,7 +854,7 @@ pub fn loadConversationArchive(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .turn_completed => try builder.finishAssistant(),
+            .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
                 if (!builder.isIdle()) return error.InvalidConversationFrame;
@@ -1074,7 +1074,10 @@ const ConversationTurnBuilder = struct {
         self.pending_assistant = null;
     }
 
-    fn finishAssistant(self: *ConversationTurnBuilder) !session.HistoryTurn {
+    fn finishAssistant(
+        self: *ConversationTurnBuilder,
+        completed: session_event.ConversationTurnCompleted,
+    ) !session.HistoryTurn {
         if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
             return error.InvalidConversationFrame;
         }
@@ -1082,7 +1085,10 @@ const ConversationTurnBuilder = struct {
             text
         else
             try self.alloc.dupe(u8, "");
-        const execution = try self.takeExecution();
+        const execution = try self.takeExecution(
+            completed.files,
+            completed.turn_summary,
+        );
         const user = self.user.?;
         self.user = null;
         self.pending_assistant = null;
@@ -1140,7 +1146,10 @@ const ConversationTurnBuilder = struct {
             }
         else
             null;
-        const execution = try self.takeExecution();
+        const execution = try self.takeExecution(
+            value.files,
+            value.turn_summary,
+        );
         const user = self.user.?;
         self.user = null;
         return .{ .interrupted = .{
@@ -1153,7 +1162,11 @@ const ConversationTurnBuilder = struct {
         } };
     }
 
-    fn takeExecution(self: *ConversationTurnBuilder) !types.ExecutionMemory {
+    fn takeExecution(
+        self: *ConversationTurnBuilder,
+        files_source: []const types.FileEvidence,
+        turn_summary: ?types.TurnSummary,
+    ) !types.ExecutionMemory {
         const steps = try self.steps.toOwnedSlice(self.alloc);
         errdefer {
             for (steps) |step| {
@@ -1164,7 +1177,14 @@ const ConversationTurnBuilder = struct {
             if (steps.len > 0) self.alloc.free(steps);
         }
         const steering = try self.steering.toOwnedSlice(self.alloc);
-        return .{ .tool_steps = steps, .steering = steering };
+        errdefer types.freePersistedSteering(self.alloc, steering);
+        const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
+        return .{
+            .tool_steps = steps,
+            .files = files,
+            .steering = steering,
+            .turn_summary = turn_summary,
+        };
     }
 };
 
@@ -1211,8 +1231,19 @@ fn dupeConversationToolResult(
     errdefer if (command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     };
+    const committed_file_presentation = if (value.committed_file_presentation) |presentation|
+        try types.dupeCommittedFilePresentation(alloc, presentation)
+    else
+        null;
+    errdefer if (committed_file_presentation) |presentation| {
+        types.freeCommittedFilePresentation(alloc, presentation);
+    };
     const stored_bytes = std.math.cast(usize, value.stored_bytes) orelse
         return error.ConversationSizeOverflow;
+    const output_bytes = std.math.cast(
+        usize,
+        value.output_bytes orelse value.stored_bytes,
+    ) orelse return error.ConversationSizeOverflow;
     return .{
         .tool_call_id = call_id,
         .tool_name = tool_name,
@@ -1220,11 +1251,16 @@ fn dupeConversationToolResult(
         .output = output,
         .output_handle = handle,
         .preview = preview,
-        .output_bytes = stored_bytes,
+        .output_bytes = output_bytes,
         .stored_output_bytes = stored_bytes,
         .truncated = value.completeness != .complete,
+        .provider_native = value.provider_native,
+        .created_at_ms = value.created_at_ms,
         .permission_feedback = permission_feedback,
+        .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
+        .command_process_presentation = value.command_process_presentation,
+        .terminal_action_presentation = value.terminal_action_presentation,
     };
 }
 
@@ -1239,6 +1275,9 @@ fn freeConversationToolResult(
     if (result.preview) |preview| alloc.free(preview);
     for (result.permission_feedback) |feedback| alloc.free(feedback);
     if (result.permission_feedback.len > 0) alloc.free(result.permission_feedback);
+    if (result.committed_file_presentation) |presentation| {
+        types.freeCommittedFilePresentation(alloc, presentation);
+    }
     if (result.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
@@ -10240,24 +10279,51 @@ test "cache-free resume rebuilds tool calls and external result references" {
         .provenance = .provider_executed,
     }};
     var feedback = [_][]u8{@constCast("inspect the result")};
+    const presentation_lines = [_]types.CommittedFilePresentationLine{.{
+        .kind = .addition,
+        .new_line = 1,
+        .text = "done",
+    }};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-shell"),
         .tool_name = @constCast("shell"),
         .status = .success,
         .output = @constCast("done"),
         .output_handle = @constCast("result-shell.txt"),
-        .output_bytes = 4,
+        .output_bytes = 9,
         .stored_output_bytes = 4,
+        .truncated = true,
+        .provider_native = true,
+        .created_at_ms = 19,
         .permission_feedback = &feedback,
+        .committed_file_presentation = .{
+            .path = "done.txt",
+            .kind = .added,
+            .lines = &presentation_lines,
+            .additions = 1,
+            .deletions = 0,
+            .truncated = false,
+            .after_content = "done\n",
+            .lifecycle_id = .{ .turn_id = 7, .call_id = "call-shell" },
+        },
         .command_output_replay = .{ .available = .{
             .handle = @constCast("fx-command-replay-test.bin"),
             .framed_bytes = 42,
         } },
+        .command_process_presentation = .{ .exit_code = 7 },
+        .terminal_action_presentation = .{ .returned = .{ .exited = 7 } },
     }};
     var steps = [_]types.ToolExecutionStep{.{
         .assistant = @constCast("Running it."),
         .tool_calls = &calls,
         .tool_results = &results,
+    }};
+    var files = [_]types.FileEvidence{.{
+        .path = @constCast("done.txt"),
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .action = .write,
+        .model_view_covers_full_file = true,
     }};
     {
         var loaded = try temp.root.startConversationSession(alloc, initial, .{});
@@ -10269,7 +10335,15 @@ test "cache-free resume rebuilds tool calls and external result references" {
             .turn = .{ .assistant = .{
                 .user = .{ .text = @constCast("Run it.") },
                 .assistant = @constCast("Done."),
-                .execution = .{ .tool_steps = &steps },
+                .execution = .{
+                    .tool_steps = &steps,
+                    .files = &files,
+                    .turn_summary = .{
+                        .started_at_ms = 10,
+                        .completed_at_ms = 20,
+                        .turn_duration_ms = 10,
+                    },
+                },
             } },
         } }, 20, .retry_expected_tail, .{});
     }
@@ -10296,6 +10370,28 @@ test "cache-free resume rebuilds tool calls and external result references" {
         "inspect the result",
         execution.tool_steps[0].tool_results[0].permission_feedback[0],
     );
+    const result = execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(@as(usize, 9), result.output_bytes);
+    try std.testing.expectEqual(@as(usize, 4), result.stored_output_bytes);
+    try std.testing.expect(result.truncated);
+    try std.testing.expect(result.provider_native);
+    try std.testing.expectEqual(@as(i64, 19), result.created_at_ms);
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation{ .exit_code = 7 },
+        result.command_process_presentation.?,
+    );
+    try std.testing.expectEqual(
+        types.TerminalActionPresentation{ .returned = .{ .exited = 7 } },
+        result.terminal_action_presentation.?,
+    );
+    const presentation = result.committed_file_presentation.?;
+    try std.testing.expectEqualStrings("done.txt", presentation.path);
+    try std.testing.expectEqualStrings("done\n", presentation.after_content.?);
+    try std.testing.expectEqual(@as(u64, 7), presentation.lifecycle_id.?.turn_id);
+    try std.testing.expectEqual(@as(usize, 1), execution.files.len);
+    try std.testing.expectEqualStrings("done.txt", execution.files[0].path);
+    try std.testing.expect(execution.files[0].model_view_covers_full_file);
+    try std.testing.expectEqual(@as(u64, 10), execution.turn_summary.?.turn_duration_ms);
     const replay = execution.tool_steps[0].tool_results[0].command_output_replay orelse
         return error.TestExpectedCommandReplay;
     switch (replay) {
