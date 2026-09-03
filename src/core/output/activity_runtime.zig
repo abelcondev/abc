@@ -9,9 +9,15 @@ pub const ToolLifecyclePhase = enum {
 
 pub const CancellationPresentation = enum {
     none,
+    pending,
     tool_status,
-    turn_notice,
     replaced,
+};
+
+const TurnCancellationState = struct {
+    turn_id: u64,
+    interrupted: bool = false,
+    notice_presented: bool = false,
 };
 
 pub const ToolPresentationRecord = struct {
@@ -145,6 +151,7 @@ pub const ToolActivityState = struct {
     records: RecordMap = .empty,
     batch_finalized_turn_watermark: ?u64 = null,
     finalized_turn_watermark: u64 = 0,
+    turn_cancellation: ?TurnCancellationState = null,
     next_focus_seq: u64 = 0,
 
     pub fn deinit(self: *ToolActivityState, alloc: std.mem.Allocator) void {
@@ -192,10 +199,17 @@ pub const ToolActivityState = struct {
         self: *const ToolActivityState,
         id: types.ToolLifecycleId,
     ) bool {
+        const cancellation = self.turn_cancellation orelse return false;
+        if (cancellation.turn_id != id.turn_id or
+            !cancellation.interrupted or
+            cancellation.notice_presented)
+        {
+            return false;
+        }
         const settling = self.record(id) orelse return false;
         switch (settling.cancellation_presentation) {
-            .none, .turn_notice => return false,
-            .tool_status, .replaced => {},
+            .none => return false,
+            .pending, .tool_status, .replaced => {},
         }
         var iterator = self.records.valueIterator();
         while (iterator.next()) |record_ptr| {
@@ -205,11 +219,55 @@ pub const ToolActivityState = struct {
                 continue;
             }
             switch (record_ptr.cancellation_presentation) {
-                .tool_status, .turn_notice => return false,
+                .pending, .tool_status => return false,
                 .none, .replaced => {},
             }
         }
         return true;
+    }
+
+    pub fn needsTurnCancellationNoticeAfterTurnFinished(
+        self: *const ToolActivityState,
+        turn_id: u64,
+    ) bool {
+        const cancellation = self.turn_cancellation orelse return false;
+        if (cancellation.turn_id != turn_id or cancellation.notice_presented) {
+            return false;
+        }
+        var iterator = self.records.valueIterator();
+        while (iterator.next()) |record_ptr| {
+            if (record_ptr.id.turn_id != turn_id) continue;
+            switch (record_ptr.cancellation_presentation) {
+                .pending, .tool_status => return false,
+                .none, .replaced => {},
+            }
+        }
+        return true;
+    }
+
+    pub fn markTurnCancellationPresented(
+        self: *ToolActivityState,
+        turn_id: u64,
+    ) void {
+        self.turn_cancellation = .{ .turn_id = turn_id };
+    }
+
+    pub fn markTurnInterrupted(
+        self: *ToolActivityState,
+        turn_id: u64,
+    ) void {
+        if (self.turn_cancellation) |*cancellation| {
+            if (cancellation.turn_id == turn_id) cancellation.interrupted = true;
+        }
+    }
+
+    pub fn markTurnCancellationNoticePresented(
+        self: *ToolActivityState,
+        turn_id: u64,
+    ) void {
+        if (self.turn_cancellation) |*cancellation| {
+            if (cancellation.turn_id == turn_id) cancellation.notice_presented = true;
+        }
     }
 
     pub fn focusedRecord(
@@ -263,6 +321,10 @@ pub const ToolActivityState = struct {
             .entry_id = entry_id,
             .tool_name = tool_name,
             .activity_kind = activity_kind,
+            .cancellation_presentation = if (self.turn_cancellation) |cancellation|
+                if (cancellation.turn_id == id.turn_id) .pending else .none
+            else
+                .none,
             .phase = phase,
             .focus_seq = focus_seq,
         }, .{});

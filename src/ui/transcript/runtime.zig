@@ -4647,7 +4647,9 @@ pub const TranscriptRuntime = struct {
             alloc,
             updates,
             missing_detail_count,
+            null,
         );
+        self.lifecycle_state.markTurnCancellationPresented(focused.id.turn_id);
         for (active, detail_starts.items) |entry, *detail_start| {
             entry.record.cancellation_presentation = .tool_status;
             self.commitToolDetailStart(
@@ -5083,6 +5085,7 @@ pub const TranscriptRuntime = struct {
             result_memory,
             command_artifact_handle,
             null,
+            @as(u32, @intFromBool(append_turn_cancellation)),
         );
         defer detail_update.deinit(alloc);
         if (!try transcript_store.replacePinnedToolStatusForTerminalAtomic(
@@ -5095,14 +5098,15 @@ pub const TranscriptRuntime = struct {
             turn_cancellation_line,
         )) return error.MissingLifecycleTranscriptEntry;
         record.phase = .terminal;
-        record.cancellation_presentation = if (append_turn_cancellation)
-            .turn_notice
-        else if (outcome.kind == .cancelled)
+        record.cancellation_presentation = if (outcome.kind == .cancelled)
             .tool_status
         else if (record.cancellation_presentation != .none)
             .replaced
         else
             .none;
+        if (append_turn_cancellation) {
+            self.lifecycle_state.markTurnCancellationNoticePresented(id.turn_id);
+        }
         if (detail_start) |*pending| {
             self.commitLifecycleToolDetailStart(
                 alloc,
@@ -5179,12 +5183,28 @@ pub const TranscriptRuntime = struct {
                 .bytes = line,
             };
         }
+        const fallback_outcome: ?types.ToolOutcomeKind = switch (finished.outcome) {
+            .completed => .completed,
+            .interrupted => .cancelled,
+            .failed => .failed,
+            .paused => null,
+        };
+        const append_turn_cancellation = finished.outcome == .interrupted and
+            self.lifecycle_state.needsTurnCancellationNoticeAfterTurnFinished(
+                finished.turn_id,
+            );
+        const turn_cancellation_line = if (append_turn_cancellation)
+            try lifecycleTerminalLine(alloc, .cancelled, "Cancelled")
+        else
+            null;
+        defer if (turn_cancellation_line) |value| alloc.free(value);
         const replace_result = if (preserve_normal_buffer_anchor)
             transcript_store.replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
                 self,
                 alloc,
                 updates,
                 missing_detail_count,
+                turn_cancellation_line,
             )
         else
             transcript_store.replacePinnedToolStatusesAtomic(
@@ -5192,16 +5212,11 @@ pub const TranscriptRuntime = struct {
                 alloc,
                 updates,
                 missing_detail_count,
+                turn_cancellation_line,
             );
         replace_result catch |err| {
             traceLifecycleFailure("turn_finished", finished.turn_id, err);
             return err;
-        };
-        const fallback_outcome: ?types.ToolOutcomeKind = switch (finished.outcome) {
-            .completed => .completed,
-            .interrupted => .cancelled,
-            .failed => .failed,
-            .paused => null,
         };
         for (fallbacks, detail_starts.items) |fallback, *detail_start| {
             self.commitToolDetailStart(alloc, fallback.record.entry_id, detail_start);
@@ -5215,6 +5230,12 @@ pub const TranscriptRuntime = struct {
                 finished.outcome,
                 fallback.was_provisional,
             );
+        }
+        if (finished.outcome == .interrupted) {
+            self.lifecycle_state.markTurnInterrupted(finished.turn_id);
+            if (append_turn_cancellation) {
+                self.lifecycle_state.markTurnCancellationNoticePresented(finished.turn_id);
+            }
         }
         if (finished.outcome == .paused) {
             const entry_ids = try self.lifecycle_state.pausedTurnEntryIds(
@@ -5710,6 +5731,7 @@ pub const TranscriptRuntime = struct {
             result_memory,
             command_artifact_handle,
             command_output_entry_id_override,
+            0,
         );
         defer pending.deinit(alloc);
         if (self.toolDetailPtr(entry_id) == null) {
@@ -5727,6 +5749,7 @@ pub const TranscriptRuntime = struct {
         result_memory: ?types.ToolResultMemory,
         command_artifact_handle: ?[]const u8,
         command_output_entry_id_override: ?u32,
+        command_process_entry_offset: u32,
     ) !PendingToolDetailTerminal {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
@@ -5756,6 +5779,7 @@ pub const TranscriptRuntime = struct {
             pending.command_process_entry = try self.prepareCommandProcessPresentationEntry(
                 alloc,
                 lifecycle_id,
+                command_process_entry_offset,
             );
             pending.command_output_entry_id = pending.command_process_entry.?.entry_id;
         }
@@ -5838,8 +5862,11 @@ pub const TranscriptRuntime = struct {
         self: *TranscriptRuntime,
         alloc: Allocator,
         lifecycle_id: ?types.ToolLifecycleId,
+        entry_id_offset: u32,
     ) !PendingCommandProcessEntry {
-        var pending: PendingCommandProcessEntry = .{ .entry_id = self.next_entry_id };
+        var pending: PendingCommandProcessEntry = .{
+            .entry_id = self.next_entry_id +% entry_id_offset,
+        };
         errdefer pending.deinit(alloc);
         pending.bytes = try alloc.alloc(u8, 0);
 
