@@ -1265,10 +1265,17 @@ pub fn Runtime(comptime App: type) type {
                     measurement.frameLayoutMeasurement()
                 else
                     footerMeasurementFromRows(footer_frame.paint.footer);
-                const frame_activity = if (footer_measurement) |*measurement|
+                var frame_activity = if (footer_measurement) |*measurement|
                     frameActivityStateFromMeasurement(presentation_shell, measurement)
                 else
                     activityStateFromPlacement(footer_frame.paint.activity);
+                if (pending_card != null and frame_activity == .thinking) {
+                    // The pending tail already includes the transcript cursor's blank row.
+                    frame_activity.thinking.gap_above_activity = render_engine.transcript_blocks.blockGapRowsBetween(
+                        .user_turn,
+                        .assistant_turn,
+                    ) -| 1;
+                }
                 const target_activity_projection: activity_runtime.ActivityProjection = if (footer_measurement) |*measurement|
                     measurement.activity_projection
                 else

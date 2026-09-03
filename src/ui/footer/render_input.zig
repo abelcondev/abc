@@ -601,6 +601,9 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
+    if (!ctx.stream.active and ctx.pending_prompt_activity) {
+        return .{ .turn_thinking = .{ .label = "• Thinking" } };
+    }
     switch (ctx.activity) {
         .tool_slot => {},
         .turn_thinking => |thinking| {
@@ -618,9 +621,6 @@ fn turnActivityProjection(
 ) ActivityProjection {
     _ = shell;
     if (!ctx.stream.active) {
-        if (ctx.pending_prompt_activity) {
-            return .{ .turn_thinking = .{ .label = "• Thinking" } };
-        }
         if (!ctx.writing_response and !ctx.completed_assistant_presentation_tail) return .none;
         return .{ .turn_thinking = .{
             .label = activity_status.buildCompletedTurnLabel(buf, ctx.stream),
@@ -850,6 +850,16 @@ test "pending prompt projects thinking before the worker stream starts" {
 
     var label_buf: [128]u8 = undefined;
     switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    var retry_ctx = ctx;
+    retry_ctx.activity = .{ .turn_thinking = .{
+        .label = "Previous request failed",
+        .tone = .danger,
+    } };
+    switch (frameOwnedActivityProjection(&label_buf, &shell, retry_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

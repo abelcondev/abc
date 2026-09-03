@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { readTapeFrames } from "./render-lab/tape";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -4427,6 +4428,8 @@ tmuxTest(
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-repair-"));
     stderrPath = join(home, "stderr.log");
     const tracePath = join(home, "trace.log");
+    const tapePath = join(home, "pending-activity.fxtape");
+    const replayPath = join(home, "pending-activity-replay");
     writeFileSync(stderrPath, "");
     gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
@@ -4439,6 +4442,8 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
       AI_GATEWAY_API_KEY: undefined,
       FX_TRACE_SCOPES: "auth,input",
+      FX_RECORD: tapePath,
+      FX_RECORD_INPUT: "1",
     });
     await session.waitForComposer(TIMEOUT);
     await waitForTrace(tracePath, "prompt credential prewarm start outcome=started", 1_000);
@@ -4462,6 +4467,33 @@ tmuxTest(
       TIMEOUT,
     );
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    const frames = readTapeFrames(tapePath);
+    const promptInput = frames.findIndex((frame) => frame.kind === 2 && frame.payload.includes(prompt));
+    expect(promptInput).toBeGreaterThanOrEqual(0);
+    const enter = frames.findIndex((frame, index) =>
+      index > promptInput && frame.kind === 2 && frame.payload.equals(Buffer.from("\r"))
+    );
+    expect(enter).toBeGreaterThan(promptInput);
+    const firstOutput = frames.slice(enter + 1).find((frame) => frame.kind === 1);
+    expect(firstOutput).toBeDefined();
+    expect(firstOutput!.payload.includes(prompt)).toBe(true);
+    expect(firstOutput!.payload.includes("Thinking")).toBe(true);
+
+    const replay = await runFx(["replay", tapePath, "--frames-dir", replayPath]);
+    expect(replay.code).toBe(0);
+    const grids = readdirSync(join(replayPath, "frames"))
+      .filter((name) => name.endsWith(".grid.txt"))
+      .sort()
+      .map((name) => readFileSync(join(replayPath, "frames", name), "utf8"));
+    const thinkingGrids = grids.filter((grid) => grid.includes("Thinking"));
+    expect(thinkingGrids.length).toBeGreaterThan(0);
+    for (const grid of thinkingGrids) {
+      const rows = grid.split("\n");
+      const promptRow = rows.findIndex((row) => row.includes(prompt));
+      expect(promptRow).toBeGreaterThanOrEqual(0);
+      expect(rows.findIndex((row) => row.includes("Thinking"))).toBe(promptRow + 2);
+    }
 
     await session.sendKeys("Enter");
     await session.waitForText("Waiting for authorization", TIMEOUT);
