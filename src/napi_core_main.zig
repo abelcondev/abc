@@ -36,8 +36,9 @@ const runtime_handle_type_tag = c.napi_type_tag{
 
 const ReadyNotifier = struct {
     function: c.napi_threadsafe_function,
+    pending: std.atomic.Value(bool) = .init(false),
 
-    fn init(env: c.napi_env, callback: c.napi_value) !ReadyNotifier {
+    fn init(env: c.napi_env, callback: c.napi_value) !*ReadyNotifier {
         var callback_type: c.napi_valuetype = undefined;
         if (c.napi_typeof(env, callback, &callback_type) != c.napi_ok or callback_type != c.napi_function) {
             return error.InvalidReadyCallback;
@@ -46,26 +47,47 @@ const ReadyNotifier = struct {
         if (c.napi_create_string_utf8(env, "libfx core ready", c.NAPI_AUTO_LENGTH, &resource_name) != c.napi_ok) {
             return error.ReadyCallbackFailed;
         }
-        var function: c.napi_threadsafe_function = undefined;
+        const self = std.heap.c_allocator.create(ReadyNotifier) catch return error.ReadyCallbackFailed;
+        errdefer std.heap.c_allocator.destroy(self);
+        self.* = .{ .function = undefined };
+        // pending bounds this to one queued wake plus the callback currently running.
         if (c.napi_create_threadsafe_function(
             env,
             callback,
             null,
             resource_name,
+            0,
             1,
-            1,
-            null,
-            null,
-            null,
-            null,
-            &function,
+            self,
+            finalize,
+            self,
+            deliver,
+            &self.function,
         ) != c.napi_ok) return error.ReadyCallbackFailed;
-        return .{ .function = function };
+        return self;
     }
 
-    fn notify(self: *const ReadyNotifier) void {
-        // A full one-slot queue already carries a wake; the data stays in its owner.
-        _ = c.napi_call_threadsafe_function(self.function, null, c.napi_tsfn_nonblocking);
+    fn notify(self: *ReadyNotifier) void {
+        if (self.pending.swap(true, .acq_rel)) return;
+        if (c.napi_call_threadsafe_function(self.function, null, c.napi_tsfn_nonblocking) != c.napi_ok) {
+            self.pending.store(false, .release);
+        }
+    }
+
+    fn deliver(env: c.napi_env, callback: c.napi_value, context: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const self: *ReadyNotifier = @ptrCast(@alignCast(context.?));
+        // Disarm before draining: a producer can queue one more wake while this callback runs.
+        self.pending.store(false, .release);
+        if (env == null or callback == null) return;
+        var receiver: c.napi_value = undefined;
+        if (c.napi_get_undefined(env, &receiver) != c.napi_ok) return;
+        _ = c.napi_call_function(env, receiver, callback, 0, null, null);
+    }
+
+    fn finalize(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        // Queued callbacks can outlive Runtime; the thread-safe function owns this allocation.
+        const self: *ReadyNotifier = @ptrCast(@alignCast(data.?));
+        std.heap.c_allocator.destroy(self);
     }
 
     fn abort(self: *ReadyNotifier) void {
@@ -427,7 +449,7 @@ const Runtime = struct {
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
-    ready: ReadyNotifier,
+    ready: *ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(0),
@@ -658,7 +680,7 @@ const CreateError = error{
     ThreadFailed,
 };
 
-fn createRuntime(env: c.napi_env, options: c.napi_value, ready: ReadyNotifier) CreateError!*Runtime {
+fn createRuntime(env: c.napi_env, options: c.napi_value, ready: *ReadyNotifier) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
@@ -711,8 +733,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value, ready: ReadyNotifier) C
         .ready = ready,
         .thread = undefined,
     };
-    runtime.fetch.ready = &runtime.ready;
-    runtime.output.ready = &runtime.ready;
+    runtime.fetch.ready = runtime.ready;
+    runtime.output.ready = runtime.ready;
     runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
@@ -749,7 +771,7 @@ fn createCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_v
     var argv: [2]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
 
-    var ready = ReadyNotifier.init(env, argv[1]) catch |err| return switch (err) {
+    const ready = ReadyNotifier.init(env, argv[1]) catch |err| return switch (err) {
         error.InvalidReadyCallback => throwType(env, "LIBFX_INVALID_ARGUMENT", "ready callback must be a function"),
         error.ReadyCallbackFailed => throw(env, "LIBFX_NAPI", "could not create ready callback"),
     };

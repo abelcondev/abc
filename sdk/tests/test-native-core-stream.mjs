@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 
 const events = [];
-const unicodeText = "😀界".repeat(200_000);
+const unicodeText = "\u{1f600}界".repeat(200_000);
 let requestCount = 0;
 let firstResponse;
 let firstConnectionClosedResolve;
@@ -25,6 +25,11 @@ const server = createServer((request, response) => {
     assert.ok(payload);
     assert.ok(payload.tools == null || payload.tools.length === 0, "N-API core must not advertise native tools");
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (requestCount >= 4) {
+      response.end('data: {"type":"text-delta","delta":"x"}\n\n'.repeat(1000) +
+        'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n');
+      return;
+    }
     if (requestCount === 1) {
       firstResponse = response;
       response.on("close", () => {
@@ -134,6 +139,22 @@ try {
   for await (const update of unicodeTurn) if (update.type === "text_delta") unicodeOutput += update.delta;
   assert.equal((await unicodeTurn.result).stopReason, "end_turn");
   assert.ok(unicodeOutput === unicodeText, "native drain boundaries must preserve every UTF-8 character");
+  for (let batch = 0; batch < 20; batch++) {
+    const burst = agent.prompt(`stream burst ${batch}`);
+    let deltas = 0;
+    await Promise.race([
+      (async () => {
+        for await (const event of burst) if (event.type === "text_delta") {
+          assert.equal(event.delta, "x");
+          deltas++;
+        }
+        assert.equal((await burst.result).stopReason, "end_turn");
+      })(),
+      timeout("stream burst readiness"),
+    ]);
+    assert.equal(deltas, 1000);
+  }
+  assert.equal(requestCount, 23);
   assert.equal(await agent.close(), undefined);
   agent = null;
   console.log("native core stream passed: split terminal tail, matching abort, prompt reuse, and graceful close");
