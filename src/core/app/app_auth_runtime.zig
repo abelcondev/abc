@@ -85,6 +85,12 @@ const TeamCatalogValidation = union(enum) {
     }
 };
 
+pub const PendingPromptCredentialReadiness = enum {
+    pending,
+    current,
+    rejected,
+};
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
@@ -689,6 +695,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = "Using automatic credential precedence again.",
             }, true);
+            try resumePromptAfterAuth(app);
         }
 
         fn forgetCredentialSource(app: *App) void {
@@ -733,6 +740,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
+            try resumePromptAfterAuth(app);
             return true;
         }
 
@@ -1381,6 +1389,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn refreshFxLoginCredentialIfNeeded(app: *App) !void {
             const change = try app.auth.refreshSelectedCredentialIfNeeded(app.alloc);
+            applyCredentialRefreshChange(app, change);
+        }
+
+        fn applyCredentialRefreshChange(
+            app: *App,
+            change: auth_transition.CredentialChange,
+        ) void {
             if (change == .none) return;
             reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
@@ -1402,6 +1417,68 @@ pub fn Runtime(comptime App: type) type {
             }
             if (!try ensurePromptCredential(app)) return false;
             return preparePromptCredential(app);
+        }
+
+        pub fn startPromptCredentialPrewarm(app: *App) void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
+            const outcome = app.auth.beginPromptCredentialRefresh();
+            debug_trace.logf(
+                "auth",
+                "prompt credential prewarm start outcome={s}",
+                .{@tagName(outcome)},
+            );
+        }
+
+        pub fn collectPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (!try ensurePromptCredential(app)) return .rejected;
+            const source = app.auth.credentialSource() orelse return .rejected;
+            if (!credentials.sourceRefreshable(source)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
+
+            var refresh = app.auth.pollPromptCredentialRefresh();
+            defer refresh.deinit();
+            switch (refresh) {
+                .idle => {
+                    return switch (app.auth.beginPromptCredentialRefresh()) {
+                        .started, .pending => .pending,
+                        .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                        .failed => .rejected,
+                    };
+                },
+                .pending => return .pending,
+                .failed => |failure| {
+                    _ = try recoverCredentialFailure(app, failure.source, failure.err);
+                    return .rejected;
+                },
+                .ready => |*refreshed| {
+                    var owned = try refreshed.clone(app.alloc);
+                    defer owned.deinit(app.alloc);
+                    const change = app.auth.adoptPreparedCredential(app.alloc, &owned);
+                    applyCredentialRefreshChange(app, change);
+                    return if (app.auth.gatewayCredential() != null) .current else .pending;
+                },
+            }
+        }
+
+        pub fn retryPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (!failure.retryable()) {
+                        return if (try preparePromptCredential(app)) .current else .rejected;
+                    }
+                }
+            }
+            app.auth.cancelPromptCredentialRefresh();
+            return switch (app.auth.beginPromptCredentialRefresh()) {
+                .started, .pending => .pending,
+                .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                .failed => .rejected,
+            };
         }
 
         fn preparePromptCredential(app: *App) !bool {
@@ -1529,6 +1606,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyCredentialChange(app: *App, changed: bool) void {
             if (!changed) return;
+            if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) {
+                app.auth.cancelPromptCredentialRefresh();
+            }
             reconcileGatewayCredential(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {

@@ -200,7 +200,7 @@ fn buildPendingCardProjection(
     const pending = app.submission.pending orelse return null;
     switch (pending.phase) {
         .awaiting_frame, .awaiting_adoption => {},
-        .adopted, .queued => return null,
+        .adopted, .awaiting_auth, .queued => return null,
     }
 
     const spans = pending.draft.skill_display_spans;
@@ -902,6 +902,11 @@ pub fn Runtime(comptime App: type) type {
                 render_request.animation_interval_ms,
                 result.animation_visible,
             );
+            if (comptime @hasDecl(App, "startPromptCredentialPrewarm")) {
+                if (snapshot.reasons.contains(.first_frame)) {
+                    App.startPromptCredentialPrewarm(app);
+                }
+            }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
                     App.notePendingFrameCommitted(app);

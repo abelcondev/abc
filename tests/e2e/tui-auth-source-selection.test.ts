@@ -1874,9 +1874,13 @@ async function waitForModelRequestCount(
   }
 }
 
-async function waitForTrace(tracePath: string, needle: string): Promise<void> {
+async function waitForTrace(
+  tracePath: string,
+  needle: string,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
   const started = Date.now();
-  while (Date.now() - started < TIMEOUT) {
+  while (Date.now() - started < timeoutMs) {
     if (existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(needle)) return;
     await Bun.sleep(25);
   }
@@ -4387,9 +4391,6 @@ tmuxTest(
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
     await selectEnvKeyCredential(session);
-    await session.waitForComposer(TIMEOUT);
-    await session.sendLiteral(`${promptHead}${promptTail}`);
-    await session.sendKeys("Enter");
     await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
 
     expect(gateway.requests).toHaveLength(1);
@@ -4410,6 +4411,7 @@ tmuxTest(
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-repair-"));
     stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
     writeFileSync(stderrPath, "");
     gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
@@ -4419,12 +4421,23 @@ tmuxTest(
     });
     writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
 
-    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
       AI_GATEWAY_API_KEY: undefined,
+      FX_TRACE_SCOPES: "auth,input",
     });
     await session.waitForComposer(TIMEOUT);
+    await waitForTrace(tracePath, "prompt credential prewarm start outcome=started", 1_000);
     const prompt = "PRESERVE_DURING_LOGIN_REPAIR";
     await session.sendText(prompt);
+    await waitForTrace(tracePath, "event=pending_prompt_frame_committed", 1_000);
+    const responsiveDraft = "TERMINAL_RESPONSIVE_DURING_CREDENTIAL_REFRESH";
+    await session.sendLiteral(responsiveDraft);
+    await session.waitForPane(
+      (pane) => pane.includes(responsiveDraft),
+      1_000,
+    );
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
     await session.waitForText("fx login sign-in expired.", TIMEOUT);
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
 
