@@ -9322,6 +9322,16 @@ fn processQueuedPromptLoop(
             }
 
             if (execution.committed_file_handoff != null) {
+                var prepared = try runtime_execution_memory.prepareToolModelOutput(
+                    arena,
+                    config,
+                    tool_call,
+                    execution.model_output,
+                );
+                runtime_execution_memory.applyToolResultMemory(
+                    &prepared.memory,
+                    execution.tool_result_memory,
+                );
                 try runtime_tool_batch.processCommittedFileResult(
                     deps,
                     call_allocator,
@@ -9332,6 +9342,8 @@ fn processQueuedPromptLoop(
                     tool_call,
                     execution_call,
                     execution,
+                    prepared.model_output,
+                    prepared.memory,
                     committed_file_tool_name.?,
                     status_started,
                     file_display_path,

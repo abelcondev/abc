@@ -207,6 +207,23 @@ pub const ConversationWriter = struct {
         var events: std.ArrayList(session_event.ConversationEvent) = .empty;
         defer events.deinit(alloc);
         try session_event.appendHistoryTurnConversationEvents(alloc, &events, turn);
+        var projected_images: ?[]types.ImageAttachment = null;
+        defer if (projected_images) |images| {
+            types.freeImageAttachmentSlice(alloc, images);
+        };
+        for (events.items) |*event| switch (event.*) {
+            .user => |*user| {
+                if (user.images.len == 0) continue;
+                const images = try types.dupeImageAttachmentSlice(alloc, user.images);
+                projectConversationImageLocators(alloc, images) catch |err| {
+                    types.freeImageAttachmentSlice(alloc, images);
+                    return err;
+                };
+                user.images = images;
+                projected_images = images;
+            },
+            else => {},
+        };
         try self.appendBatch(alloc, timestamp_ms, events.items);
     }
 
@@ -1276,18 +1293,25 @@ fn projectConversationSnapshotLocators(
             .interrupted => |*entry| entry.user.images,
             .compacted_summary => continue,
         };
-        for (images) |*image| {
-            const snapshot_path = image.snapshot_path orelse continue;
-            if (!std.fs.path.isAbsolute(snapshot_path)) continue;
-            var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const projected = try session.projectSnapshotLocator(
-                &buffer,
-                snapshot_path,
-            );
-            const owned = try alloc.dupe(u8, projected);
-            alloc.free(snapshot_path);
-            image.snapshot_path = owned;
-        }
+        try projectConversationImageLocators(alloc, images);
+    }
+}
+
+fn projectConversationImageLocators(
+    alloc: Allocator,
+    images: []types.ImageAttachment,
+) !void {
+    for (images) |*image| {
+        const snapshot_path = image.snapshot_path orelse continue;
+        if (!std.fs.path.isAbsolute(snapshot_path)) continue;
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const projected = try session.projectSnapshotLocator(
+            &buffer,
+            snapshot_path,
+        );
+        const owned = try alloc.dupe(u8, projected);
+        alloc.free(snapshot_path);
+        image.snapshot_path = owned;
     }
 }
 
@@ -1301,32 +1325,61 @@ fn externalizeConversationResults(
             alloc,
             &entry.execution,
             capability,
+            true,
         ),
         .interrupted => |*entry| try externalizeExecutionResults(
             alloc,
             &entry.execution,
             capability,
+            true,
         ),
         .compacted_summary => {},
     };
 }
 
+fn externalizeConversationTurnResults(
+    alloc: Allocator,
+    turn: *session.HistoryTurn,
+    capability: ?*session_child_store.SessionChildCapability,
+) !void {
+    const execution = switch (turn.*) {
+        .assistant => |*entry| &entry.execution,
+        .interrupted => |*entry| &entry.execution,
+        .compacted_summary => return,
+    };
+    var has_results = false;
+    for (execution.tool_steps) |step| {
+        if (step.tool_results.len != 0) {
+            has_results = true;
+            break;
+        }
+    }
+    if (!has_results) return;
+    try externalizeExecutionResults(
+        alloc,
+        execution,
+        capability,
+        false,
+    );
+}
+
 fn externalizeExecutionResults(
     alloc: Allocator,
     execution: *types.ExecutionMemory,
-    capability: *session_child_store.SessionChildCapability,
+    capability: ?*session_child_store.SessionChildCapability,
+    legacy_completeness_unknown: bool,
 ) !void {
     for (execution.tool_steps) |*step| {
         for (step.tool_results) |*result| {
             if (result.output_handle == null) {
                 result.output_handle = try result_store.storeLargeResultManaged(
                     alloc,
-                    capability,
+                    capability orelse return error.SessionChildCapabilityUnavailable,
                     result.tool_call_id,
                     result.tool_name,
                     result.output,
                 );
-                result.truncated = true;
+                if (legacy_completeness_unknown) result.truncated = true;
                 result.stored_output_bytes = result.output.len;
             }
             if (result.preview == null) {
@@ -1959,6 +2012,19 @@ pub const LoadedWritableSession = struct {
         return self.conversation_writer != null;
     }
 
+    pub fn prepareHistoryTurnForCommit(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        turn: *session.HistoryTurn,
+    ) !void {
+        if (self.conversation_writer == null) return;
+        try externalizeConversationTurnResults(
+            alloc,
+            turn,
+            self.child_capability,
+        );
+    }
+
     pub fn renameConversation(
         self: *LoadedWritableSession,
         alloc: Allocator,
@@ -2270,12 +2336,28 @@ pub const LoadedWritableSession = struct {
         if (isCurrentConversationCheckpoint(payload.turn)) {
             try retainLatestCheckpointHistory(alloc, &next_state);
         }
+        var first_display: ?session_display_metadata.DisplayMetadata = if (self.state.history.len == 0)
+            session_display_metadata.deriveFromHistory(alloc, next_state.history) catch null
+        else
+            null;
+        defer if (first_display) |*display| display.deinit(alloc);
 
         try self.conversation_writer.?.appendHistoryTurn(
             alloc,
             timestamp_ms,
             payload.turn,
         );
+        if (first_display) |display| {
+            if (display.present) {
+                _ = self.renameConversation(alloc, display.title) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "derived session title not persisted session={s} err={s}",
+                        .{ self.active_id, @errorName(err) },
+                    );
+                };
+            }
+        }
         if (self.state.recovery_checkpoint != null and
             next_state.recovery_checkpoint == null)
         {
@@ -9748,8 +9830,18 @@ test "conversation writer flattens a canonical history turn" {
         .tool_calls = &calls,
         .tool_results = &results,
     }};
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/session/images/image-1-aaaaaaaaaaaaaaaa.bin"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/session/images/image-1-aaaaaaaaaaaaaaaa.bin"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    }};
     try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
-        .user = .{ .text = @constCast("Run the command.") },
+        .user = .{
+            .text = @constCast("Run the command."),
+            .images = &images,
+        },
         .assistant = @constCast("It completed."),
         .execution = .{ .tool_steps = &steps },
     } });
@@ -9759,6 +9851,16 @@ test "conversation writer flattens a canonical history turn" {
     try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, bytes, "\n"));
     try std.testing.expectEqual(@as(u64, 6), writer.last_seq);
     try std.testing.expectEqual(@as(usize, 0), writer.pendingToolCallCount());
+    try std.testing.expect(std.mem.find(
+        u8,
+        bytes,
+        "\"snapshot_path\":\"images/image-1-aaaaaaaaaaaaaaaa.bin\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        bytes,
+        "\"snapshot_path\":\"/tmp/session/images",
+    ) == null);
 }
 
 test "conversation storage creates only metadata and event log" {

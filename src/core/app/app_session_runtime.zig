@@ -2625,7 +2625,7 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
         ) !HistoryAppendOutcome {
-            const prepared = (if (comptime @hasDecl(@TypeOf(app.session), "prepareHistoryEntry"))
+            var prepared = (if (comptime @hasDecl(@TypeOf(app.session), "prepareHistoryEntry"))
                 app.session.prepareHistoryEntry(app.alloc, turn)
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
@@ -2665,6 +2665,7 @@ pub fn Runtime(comptime App: type) type {
                 return .committed;
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
             try subagent_resume_admission.retainExternalRootUserTurn(
                 app.session_persistence.store,
                 app.alloc,
@@ -2692,7 +2693,7 @@ pub fn Runtime(comptime App: type) type {
                     .conversation_language = app.session.languageSnapshot(),
                     .total_input_tokens = app.total_input_tokens,
                     .total_output_tokens = app.total_output_tokens,
-                    .turn = turn,
+                    .turn = prepared,
                 } },
                 io_mod.milliTimestamp(),
                 .retry_expected_tail,
@@ -8656,7 +8657,7 @@ test "context checkpoint persists before releasing summarized model memory" {
     try std.testing.expectEqualStrings("second", page.turns[1].assistant.user.text);
 }
 
-test "rejected conversation append leaves live history unchanged" {
+test "handle-free conversation result is externalized before live commit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8690,23 +8691,35 @@ test "rejected conversation append leaves live history unchanged" {
         .tool_results = &results,
     }};
 
-    try std.testing.expectError(
-        error.ConversationArtifactRequired,
-        Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-            .user = .{ .text = @constCast("run it") },
-            .assistant = @constCast("done"),
-            .execution = .{ .tool_steps = &steps },
-        } }),
-    );
-    try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
+        .user = .{ .text = @constCast("run it") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 1),
         app.session_persistence.writable.?.state.history.len,
     );
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        app.session_persistence.writable.?.conversation_writer.?.committed_bytes,
+    const live_result = app.session.agent.history.items[0].assistant.execution
+        .tool_steps[0].tool_results[0];
+    const stored_result = app.session_persistence.writable.?.state.history[0]
+        .assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expect(live_result.output_handle != null);
+    try std.testing.expectEqualStrings(
+        live_result.output_handle.?,
+        stored_result.output_handle.?,
     );
+    const capability = try app.session_persistence.writable.?.childCapability();
+    const stored = try result_store.readByRangeManaged(
+        alloc,
+        capability,
+        live_result.output_handle.?,
+        0,
+        64,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "done") != null);
 }
 
 test "completed conversation turn clears its recovery file" {

@@ -5079,7 +5079,7 @@ describe("acp: model-independent", () => {
           env: { HOME: root.home },
           timeoutMs: TIMEOUT,
         });
-        expect(detail.code).toBe(0);
+        expect(detail.code, detail.stdout + detail.stderr).toBe(0);
         expect(JSON.parse(detail.stdout).history_len).toBe(1);
         await client.close();
 

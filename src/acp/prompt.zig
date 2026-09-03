@@ -1981,21 +1981,34 @@ fn persistAcpHistoryTurn(
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    try session.session_rt.appendHistoryEntry(alloc, turn);
-    if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+    var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
     if (comptime host_target.is_wasm) {
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
-    const writable = if (session.writable) |*value| value else return;
+    const writable = if (session.writable) |*value| value else {
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(alloc, &prepared);
     try subagent_resume_admission.retainExternalRootUserTurn(
         session.store,
         alloc,
         writable,
-        turn,
+        prepared,
         prompt_is_root_authority,
     );
     if (writable.degradedTail() != null) {
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         const now_ms = io_mod.milliTimestamp();
         var current = try currentAcpState(alloc, session, writable, now_ms);
         defer current.deinit(alloc);
@@ -2009,24 +2022,21 @@ fn persistAcpHistoryTurn(
         if (current.usage) |usage| session.session_rt.usage.markClean(usage);
         return;
     }
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
             .conversation_language = session.session_rt.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
         .retry_expected_tail,
         options,
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAcpStateReplacement(alloc, session, writable, true);
-            return;
-        },
-        else => return err,
-    };
+    );
+    session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+    prepared_owned = false;
+    if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
 }
 
 fn setRecoveryCheckpoint(
@@ -2083,31 +2093,6 @@ fn currentAcpState(
     if (state.usage) |*old| old.deinit(alloc);
     state.usage = usage;
     return state;
-}
-
-fn commitAcpStateReplacement(
-    alloc: Allocator,
-    session: *server.ActiveSessionState,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
-) !void {
-    const now_ms = io_mod.milliTimestamp();
-    var state = try currentAcpState(alloc, session, writable, now_ms);
-    defer state.deinit(alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
-        alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
-    );
-    if (state.usage) |usage| {
-        session.session_rt.usage.markClean(usage);
-    }
 }
 
 /// Stores grants on the active ACP session without persisting them.

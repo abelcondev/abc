@@ -397,8 +397,16 @@ pub const TurnContext = struct {
                 error.InvalidWorkId, error.ConflictingWorkId => error.InvalidWorkId,
             };
         };
-        self.runtime.appendHistoryEntry(self.alloc, committed_turn) catch
+        var prepared = self.runtime.prepareHistoryEntry(self.alloc, committed_turn) catch
             return error.OutOfMemory;
+        var prepared_owned = true;
+        defer if (prepared_owned) session.freeHistoryTurn(self.alloc, prepared);
+        self.loaded.prepareHistoryTurnForCommit(self.alloc, &prepared) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SessionCommitFailed,
+            };
+        };
         _ = self.loaded.appendEvent(
             self.alloc,
             .{ .history_turn_committed = .{
@@ -406,7 +414,7 @@ pub const TurnContext = struct {
                 .total_input_tokens = total_input_tokens,
                 .total_output_tokens = total_output_tokens,
                 .work_id = @constCast(work_id),
-                .turn = committed_turn,
+                .turn = prepared,
             } },
             timestamp_ms,
             .retry_expected_tail,
@@ -415,6 +423,8 @@ pub const TurnContext = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionCommitFailed,
         };
+        self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
+        prepared_owned = false;
         self.committed = true;
     }
 

@@ -2863,19 +2863,28 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    try ctx.session.appendHistoryEntry(ctx.alloc, turn);
+    var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (ctx.writable) |*value| value else return;
+    const writable = if (ctx.writable) |*value| value else {
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
     try subagent_resume_admission.retainExternalRootUserTurn(
         ctx.store,
         ctx.alloc,
         writable,
-        turn,
+        prepared,
         ctx.retain_external_root_user_turn,
     );
 
     if (writable.degradedTail() != null) {
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
         const now_ms = io_mod.milliTimestamp();
         var current = try currentAskState(ctx, writable, now_ms);
         defer current.deinit(ctx.alloc);
@@ -2886,25 +2895,20 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         );
     }
 
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
         .retry_expected_tail,
         .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAskStateReplacement(ctx, writable, true);
-            ctx.prompt_snapshot_committed = true;
-            return;
-        },
-        else => return err,
-    };
+    );
+    ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+    prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
 }
 
