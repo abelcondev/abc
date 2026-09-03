@@ -4251,6 +4251,112 @@ tmuxTest(
 );
 
 tmuxTest(
+  "cancelled fx login repair allows a later explicit login",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-cancelled-repair-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 5_000,
+      teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    const prompt = "DO_NOT_REPLAY_AFTER_CANCELLED_REPAIR";
+    await session.sendText(prompt);
+    await session.waitForText("fx login sign-in expired.", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) => pane.includes(prompt) && !pane.includes("Waiting for authorization"),
+      TIMEOUT,
+    );
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    await session.waitForText("Team Harness", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
+
+    await session.sendText("use the repaired fx login");
+    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.headers.get("authorization")).toBe(
+      `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
+    );
+    expect(gateway.requests[0]!.body).not.toContain(prompt);
+    expect(savedCredentialSource(home)).toBe("fx_login");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "explicit login replaces a saved session rejected during team loading",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-rejected-session-login-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 1_000,
+      teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    await session.waitForText("Team Harness", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    expect(savedCredentialSource(home)).toBe("fx_login");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "prompt refresh replaces an expired public catalog with the selected team catalog",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-refresh-team-models-"));
