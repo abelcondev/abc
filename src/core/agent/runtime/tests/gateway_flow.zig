@@ -3054,6 +3054,94 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     );
 }
 
+test "processQueuedPrompt compacts and retries one context overflow" {
+    const alloc = std.testing.allocator;
+    const model = "provider/context-overflow-recovery";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .bad_request,
+            .err_body =
+            \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+            ,
+        },
+        .{ .content = "Retain the completed prior turn and continue from it." },
+        .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
+        .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "\"tools\":[]");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+    try std.testing.expectEqualStrings(
+        "CONTEXT_OVERFLOW_RECOVERED",
+        hooks.finish_assistant_text.?,
+    );
+    try std.testing.expect(hooks.http_status == null);
+}
+
+test "processQueuedPrompt stops after one context overflow recovery" {
+    const alloc = std.testing.allocator;
+    const model = "provider/repeated-context-overflow";
+    const overflow_body =
+        \\{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}
+    ;
+    const completions = [_]FakeCompletion{
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "Compact the prior turn once." },
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &.{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior user") },
+        .assistant = @constCast("prior assistant"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.index);
+    try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
 test "cancelled automatic compaction is retried by the next prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

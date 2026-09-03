@@ -210,6 +210,14 @@ pub fn usableInputTokens(
     return context_tokens;
 }
 
+pub fn usableInputTokensForGeneration(
+    capabilities: model_capabilities.Capabilities,
+    generation_tokens: usize,
+) ?usize {
+    const context_window = capabilities.context_window orelse return null;
+    return @as(usize, @intCast(context_window)) -| generation_tokens;
+}
+
 pub fn buildGatewayMessages(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
@@ -408,6 +416,21 @@ test "provider request measurement learns the prior exact token density" {
 
     try std.testing.expect(calibrated.estimated_input_tokens > 695_142);
     try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
+}
+
+test "compactor input budget reserves the requested generation" {
+    try std.testing.expectEqual(
+        @as(?usize, 296_816),
+        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 203_184),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 500_000),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        usableInputTokensForGeneration(.{}, 1),
+    );
 }
 
 test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {

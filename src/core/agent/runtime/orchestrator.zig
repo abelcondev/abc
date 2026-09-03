@@ -2855,8 +2855,45 @@ fn build_gateway_messages_with_response_language_control(
     return .{
         .messages = messages,
         .current_user_index = stable_prefix.len + effective_overlay.len +
-            if (compaction_handoff == null) durable_history.len else 0,
+            if (compaction_handoff == null)
+                durable_history.len
+            else
+                1 + compaction_history_tail.len,
     };
+}
+
+test "compacted request keeps the pending user prompt after the handoff" {
+    var projected = try build_gateway_messages_with_response_language_control(
+        std.testing.allocator,
+        &.{.{ .role = .system, .content = "stable" }},
+        &.{.{ .role = .system, .content = "overlay" }},
+        &.{.{ .role = .user, .content = "removed history" }},
+        .{ .role = .user, .content = "pending prompt" },
+        &.{
+            .{ .role = .assistant, .content = "compacted suffix" },
+            .{ .role = .tool, .content = "new suffix" },
+        },
+        .subagent,
+        false,
+        "handoff",
+        &.{.{ .role = .assistant, .content = "retained tail" }},
+        1,
+    );
+    defer projected.messages.deinit(std.testing.allocator);
+
+    const expected = [_][]const u8{
+        "stable",
+        "overlay",
+        "handoff",
+        "retained tail",
+        "pending prompt",
+        "new suffix",
+    };
+    try std.testing.expectEqual(expected.len, projected.messages.items.len);
+    for (expected, projected.messages.items) |content, message| {
+        try std.testing.expectEqualStrings(content, message.content.?);
+    }
+    try std.testing.expectEqual(@as(usize, 4), projected.current_user_index);
 }
 
 fn response_language_context_conflicts(
@@ -3250,6 +3287,86 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
         .gateway_timeout => .gateway_timeout,
         .provider_error => .bad_gateway,
     };
+}
+
+fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
+    if (failure.kind == .request_too_large) return true;
+    if (failure.kind != .invalid_request) return false;
+    const detail = failure.detail orelse return false;
+    inline for (.{
+        "context_length_exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "maximum context length",
+        "maximum prompt length",
+        "input is too long",
+        "too many input tokens",
+    }) |needle| {
+        if (text_utils.containsIgnoreCase(detail, needle)) return true;
+    }
+    return false;
+}
+
+const ContextOverflowRecoveryState = enum {
+    ready,
+    pending,
+    used,
+};
+
+fn shouldRecoverContextOverflow(
+    failure: agent_stream_provider.Failure,
+    has_compactable_context: bool,
+    replay_safe: bool,
+    recovery_available: bool,
+    cancelled: bool,
+) bool {
+    return !cancelled and
+        recovery_available and
+        has_compactable_context and
+        replay_safe and
+        isContextOverflowFailure(failure);
+}
+
+test "context overflow recovery is typed safe and bounded" {
+    const context_failure = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: input exceeds the context window"),
+    };
+    const unrelated_failure = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("invalid tool schema"),
+    };
+    const grok_prompt_overflow = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("This model's maximum prompt length is 1000000 but the request contains 1003383 tokens."),
+    };
+    const request_too_large = agent_stream_provider.Failure{
+        .kind = .request_too_large,
+    };
+    const cases = [_]struct {
+        failure: agent_stream_provider.Failure,
+        has_compactable_context: bool = true,
+        replay_safe: bool = true,
+        recovery_available: bool = true,
+        cancelled: bool = false,
+        expected: bool,
+    }{
+        .{ .failure = context_failure, .expected = true },
+        .{ .failure = grok_prompt_overflow, .expected = true },
+        .{ .failure = request_too_large, .expected = true },
+        .{ .failure = unrelated_failure, .expected = false },
+        .{ .failure = context_failure, .has_compactable_context = false, .expected = false },
+        .{ .failure = context_failure, .replay_safe = false, .expected = false },
+        .{ .failure = context_failure, .recovery_available = false, .expected = false },
+        .{ .failure = context_failure, .cancelled = true, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRecoverContextOverflow(
+        case.failure,
+        case.has_compactable_context,
+        case.replay_safe,
+        case.recovery_available,
+        case.cancelled,
+    ));
 }
 
 fn isPostVisionAssistantPrefillRejection(
@@ -4396,24 +4513,21 @@ fn buildGatewayMessagesForCompactionWindow(
         current_user_message,
         within_turn_suffix,
     );
-    var compacted_suffix: std.ArrayList(ChatMessage) = .empty;
-    try compacted_suffix.append(alloc, .{
+    var compacted_history: std.ArrayList(ChatMessage) = .empty;
+    defer compacted_history.deinit(alloc);
+    try compacted_history.append(alloc, .{
         .role = .user,
         .content = handoff.?,
         .cache_policy = .no_cache,
     });
-    try compacted_suffix.appendSlice(alloc, retained_history_tail);
-    try compacted_suffix.appendSlice(
-        alloc,
-        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
-    );
+    try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildGatewayMessages(
         alloc,
         stable_prefix,
         ephemeral_overlay,
-        &.{},
+        compacted_history.items,
         current_user_message,
-        compacted_suffix.items,
+        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
 }
 
@@ -4619,8 +4733,9 @@ pub fn compactContextTransaction(
             .cancel_flag = request.cancel_flag,
             .accepted_tokens = accepted_tokens,
             .generation_tokens = compactor_generation_tokens,
-            .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
+            .compactor_input_tokens = runtime_prompt_context.usableInputTokensForGeneration(
                 compactor_capabilities,
+                compactor_generation_tokens,
             ),
             .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
                 compactor_capabilities,
@@ -4973,6 +5088,7 @@ fn processQueuedPromptLoop(
         var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
+        var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -5274,8 +5390,10 @@ fn processQueuedPromptLoop(
                 request_cost_for_attempt = request_cost;
                 const has_new_compactable_context = active_compaction_handoff == null or
                     compacted_suffix_len < within_turn_suffix.items.len;
+                const compaction_trigger: runtime_prompt_context.CompactionTrigger =
+                    if (context_overflow_recovery == .pending) .manual else .automatic;
                 const projection_plan = runtime_prompt_context.planCompaction(.{
-                    .trigger = .automatic,
+                    .trigger = compaction_trigger,
                     .capabilities = request_capabilities,
                     .request_tokens = request_cost.estimated_input_tokens,
                     .source_tokens = if (has_new_compactable_context)
@@ -5303,7 +5421,9 @@ fn processQueuedPromptLoop(
                     },
                 );
                 switch (projection_plan.decision) {
-                    .no_op => if (!has_new_compactable_context) {
+                    .no_op => if (context_overflow_recovery == .pending) {
+                        return error.ContextCapacityExceeded;
+                    } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
                                 return error.ContextCapacityExceeded;
@@ -5351,7 +5471,7 @@ fn processQueuedPromptLoop(
                         );
                         const next_compaction_count = compaction_count + 1;
                         const transaction_result = compactContextTransaction(arena, deps, .{
-                            .trigger = .automatic,
+                            .trigger = compaction_trigger,
                             .provider = job.provider,
                             .working_capabilities = request_capabilities,
                             .request_tokens = request_cost.estimated_input_tokens,
@@ -5400,6 +5520,9 @@ fn processQueuedPromptLoop(
                         active_compaction_history_tail = next_compaction_history_tail;
                         compacted_suffix_len = next_compacted_suffix_len;
                         compaction_count = next_compaction_count;
+                        if (context_overflow_recovery == .pending) {
+                            context_overflow_recovery = .used;
+                        }
                         debug_trace.eventf(
                             "context_compaction",
                             "installed",
@@ -5412,6 +5535,9 @@ fn processQueuedPromptLoop(
                         continue;
                     },
                 }
+            }
+            if (context_overflow_recovery == .pending) {
+                return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
@@ -5956,6 +6082,38 @@ fn processQueuedPromptLoop(
             }
             const response_completion = streamCompletion(stream_result);
             const response_failure = streamFailure(stream_result);
+            const has_compactable_context = if (active_compaction_handoff == null)
+                history_messages.items.len > 0 or within_turn_suffix.items.len > 0
+            else
+                compacted_suffix_len < within_turn_suffix.items.len;
+            if (response_failure) |failure| {
+                if (shouldRecoverContextOverflow(
+                    failure,
+                    has_compactable_context,
+                    streamReplaySafe(&stream_ctx),
+                    context_overflow_recovery == .ready,
+                    config.cancel_flag.load(.seq_cst),
+                )) {
+                    debug_trace.eventf(
+                        "context_compaction",
+                        "provider_overflow_recovery",
+                        step_ctx,
+                        "model={s} request_bytes={d} estimated_tokens={d}",
+                        .{
+                            gateway_model,
+                            if (request_cost_for_attempt) |cost| cost.serialized_bytes else 0,
+                            if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0,
+                        },
+                    );
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    context_overflow_recovery = .pending;
+                    reset_stream_for_next_attempt = true;
+                    skip_next_preflight_refresh = true;
+                    continue;
+                }
+            }
             const settled_disposition = if (streamSucceeded(stream_result))
                 types.classifyProviderCompletion(response_completion)
             else
