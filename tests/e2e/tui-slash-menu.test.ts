@@ -3036,18 +3036,29 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     async () => {
       const fixture = createModelsMenuFixture();
       const currentModel = "anthropic/claude-opus-4.8";
+      const fastOnlyModel = "provider/fast-only-model";
       const held = heldFakeGatewayFinalText();
       gateway = startFakeGateway([held.response], {
-        models: [{
-          id: currentModel,
-          type: "language",
-          released: 100,
-          tags: ["reasoning", "tool-use"],
-          reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
-          fast_options: [{ type: "toggle" }],
-          context_window: 1_000_000,
-          max_tokens: 32_000,
-        }],
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: fastOnlyModel,
+            type: "language",
+            released: 90,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+        ],
       });
 
       try {
@@ -3091,6 +3102,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         );
         await session.sendKeys("Enter");
         await session.waitForText(`Next turn will use ${currentModel}`, 5_000);
+
+        await session.sendLiteralText(`/model ${fastOnlyModel}`);
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${fastOnlyModel}`, 5_000);
 
         expect(gateway.requests).toHaveLength(1);
         held.release("IN_FLIGHT_MODEL_PICKER_COMPLETE");

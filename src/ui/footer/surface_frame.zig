@@ -402,7 +402,8 @@ fn buildFooterSurfaceProjection(
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
     const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_models_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
-    const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and ctx.model_query_active;
+    const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
+        !ctx.queued_editor_active and ctx.model_query_active;
     const show_provider_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and
         !ctx.queued_editor_active and ctx.provider_query_active and !show_model_query;
     const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query and !show_provider_query;
@@ -1879,6 +1880,25 @@ test "surface footer exposes model picker while a response streams" {
     try std.testing.expect(visible.show_picker);
     try std.testing.expectEqual(PickerKind.model_stage, visible.picker_kind);
     try std.testing.expect(visible.picker_rows > 0);
+}
+
+test "surface footer keeps model picker out of queued review" {
+    const alloc = std.testing.allocator;
+    var approval = ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+    var ctx = surfaceTestContext(&input);
+    ctx.stream.active = true;
+    ctx.queued_editor_active = true;
+    ctx.model_query_active = true;
+    ctx.model_completions = &.{"provider/model"};
+
+    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+    defer measurement.deinit(alloc);
+    try std.testing.expect(!measurement.show_picker);
 }
 
 test "surface footer measurement reserves only the compact auth picker rows" {

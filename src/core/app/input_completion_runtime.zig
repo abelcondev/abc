@@ -34,6 +34,7 @@ const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.z
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
+const render_request = @import("../../ui/render_request.zig");
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 
@@ -138,6 +139,9 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (comptime @hasField(App, "approval_prompt")) {
                 if (app.approval_prompt.isActive()) return null;
+            }
+            if (queueReviewOwnsComposer(app)) {
+                return if (hasFileQuery(app)) .file else null;
             }
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) {
@@ -380,6 +384,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 return true;
             }
             if (hasModelQuery(app)) {
+                if (queueReviewOwnsComposer(app)) return false;
                 navigateModelPicker(app, delta);
                 return true;
             }
@@ -890,6 +895,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn navigateModelPicker(app: *App, delta: i32) void {
+            if (queueReviewOwnsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => navigateModelCompletion(app, query.query, delta),
@@ -973,6 +979,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn autocompleteModelPickerSelection(app: *App) !void {
+            if (queueReviewOwnsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => {
@@ -1009,6 +1016,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn advanceModelPickerOnSpace(app: *App) !bool {
+            if (queueReviewOwnsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
 
@@ -1047,6 +1055,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn submitModelPicker(app: *App) !bool {
+            if (queueReviewOwnsComposer(app)) return false;
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
                     if (app.isModelCacheLoading()) {
@@ -1107,6 +1116,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn openCurrentModelPicker(app: *App) !void {
+            if (queueReviewOwnsComposer(app)) return;
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
             app.input_runtime.picker.model_completion_anchor_current = true;
             app.shell.render_requests.request(.footer);
@@ -1125,7 +1135,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
 
             const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
-            try setModelComposerText(app, "/model {s} ", .{model});
+            if (supports_effort) {
+                try setModelComposerText(app, "/model {s} ", .{model});
+            } else {
+                try setModelComposerText(app, "/model {s} auto ", .{model});
+            }
             // Preselect the product effort default and enable Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
@@ -1142,6 +1156,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn stepBackModelPicker(app: *App) !bool {
+            if (queueReviewOwnsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (query.stage == .model) return false;
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
@@ -1198,11 +1213,13 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn shouldPreserveModelPickerInsert(app: *App) bool {
+            if (queueReviewOwnsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
 
         pub fn shouldPreserveModelPickerBackspace(app: *App) bool {
+            if (queueReviewOwnsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and query.query.len > 0 and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
@@ -1404,6 +1421,7 @@ const InlineCompletionTestApp = struct {
         layout: struct {
             cols: u16 = 80,
         } = .{},
+        render_requests: render_request.RenderRequestState = .{},
     } = .{},
 
     pub fn slashRegistry(_: *const InlineCompletionTestApp) command_specs.SlashRegistry {
@@ -1416,6 +1434,32 @@ const InlineCompletionTestApp = struct {
         self.pending_images.deinit(self.alloc);
     }
 };
+
+test "queue review prevents the model picker from opening over its draft" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.queued_prompt_review.visible = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try rt.openCurrentModelPicker(&app);
+
+    try std.testing.expectEqualStrings("/model", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "queue review excludes an existing model query from picker ownership" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.queued_prompt_review.visible = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/model");
+
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerSuppressed(.model));
+}
 
 const SkillsNavigationTestWorker = struct {
     fn queuePreview(_: *SkillsNavigationTestWorker) @import("../agent/worker_runtime.zig").QueuePreview {
