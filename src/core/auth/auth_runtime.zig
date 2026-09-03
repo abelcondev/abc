@@ -2270,6 +2270,7 @@ pub const Runtime = struct {
     }
 
     pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
+        if (comptime host_target.is_wasm) return .not_needed;
         if (self.auth_mode == .host_managed) return .not_needed;
         if (self.prompt_credential_refresh_task != null) return .pending;
         const credential = self.selected_credential orelse return .not_needed;

@@ -1432,6 +1432,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
             if (!try ensurePromptCredential(app)) return .rejected;
             const source = app.auth.credentialSource() orelse return .rejected;
             if (!credentials.sourceRefreshable(source)) {
@@ -1466,6 +1469,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn retryPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (!failure.retryable()) {
