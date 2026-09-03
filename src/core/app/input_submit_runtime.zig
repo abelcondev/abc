@@ -8,7 +8,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -21,18 +20,31 @@ pub const PendingPhase = enum {
 
 const PendingPhaseError = error{InvalidPendingPhase};
 
+pub const PendingPromptDraft = struct {
+    turn_id: u64,
+    prompt: []u8,
+    images: []types.ImageAttachment,
+    skill_display_spans: []worker_runtime.SkillDisplaySpan,
+
+    fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
+        alloc.free(self.prompt);
+        types.freeImageAttachmentSlice(alloc, self.images);
+        worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
+    }
+};
+
 pub const PendingSubmission = struct {
-    draft: worker_runtime.QueuedPromptDraft,
+    draft: PendingPromptDraft,
     phase: PendingPhase = .awaiting_frame,
     skill_refresh_generation: ?u64 = null,
 
-    fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
+    fn init(draft: PendingPromptDraft) PendingSubmission {
         std.debug.assert(draft.turn_id != 0);
         return .{ .draft = draft };
     }
 
     pub fn deinit(self: *PendingSubmission, alloc: std.mem.Allocator) void {
-        worker_runtime.freeQueuedPromptDraft(alloc, self.draft);
+        self.draft.deinit(alloc);
         self.* = undefined;
     }
 
@@ -68,13 +80,13 @@ pub const State = struct {
     retry_after_auth: bool = false,
 };
 
-fn buildQueuedPromptDraft(
+fn buildPendingPromptDraft(
     alloc: std.mem.Allocator,
     turn_id: u64,
     prompt_source: []const u8,
     image_source: []const types.ImageAttachment,
     skill_tokens: []const registered_entities.SkillTokenSpan,
-) !worker_runtime.QueuedPromptDraft {
+) !PendingPromptDraft {
     if (turn_id == 0) return error.InvalidTurnId;
 
     const prompt = try alloc.dupe(u8, prompt_source);
@@ -118,8 +130,6 @@ fn buildQueuedPromptDraft(
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
-
         pub fn requestPromptRetryAfterAuth(app: *App) void {
             app.submission.retry_after_auth = true;
         }
@@ -156,19 +166,26 @@ pub fn SubmitRuntime(comptime App: type) type {
             preserve,
         };
 
-        const AcceptedDraftProjection = struct {
+        const ComposerHistoryProjection = struct {
             input: []const u8,
             pasted_blocks: std.ArrayList(paste_blocks.PastedBlock) = .empty,
             image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty,
             skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
 
-            fn deinit(self: *AcceptedDraftProjection, alloc: std.mem.Allocator) void {
+            fn deinit(self: *ComposerHistoryProjection, alloc: std.mem.Allocator) void {
                 self.pasted_blocks.deinit(alloc);
                 self.image_tokens.deinit(alloc);
                 self.skill_tokens.deinit(alloc);
                 self.* = undefined;
             }
         };
+
+        fn composerHistoryEnabled(app: *const App) bool {
+            if (comptime @hasField(App, "prompt_history")) {
+                return app.prompt_history.enabled;
+            }
+            return true;
+        }
 
         pub fn noteCommittedFrame(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
@@ -267,10 +284,10 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (comptime !@hasField(App, "submission")) return false;
             const pending = app.submission.pending orelse return false;
             if (pending.phase == .queued) {
-                if (comptime !@hasDecl(@TypeOf(app.worker), "deleteQueuedPromptDraft")) {
+                if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
                     return false;
                 }
-                if (!app.worker.deleteQueuedPromptDraft(
+                if (!app.worker.removeQueuedPrompt(
                     std.heap.c_allocator,
                     pending.draft.turn_id,
                     pending.draft.images,
@@ -489,43 +506,41 @@ pub fn SubmitRuntime(comptime App: type) type {
             const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
 
-            if (!queue_rt.ownsComposer(app)) {
-                if (directCommand(expanded.text)) |command| {
-                    if (comptime @hasDecl(App, "submitDirectTerminal")) {
-                        try App.submitDirectTerminal(app, command);
-                        return;
-                    }
+            if (directCommand(expanded.text)) |command| {
+                if (comptime @hasDecl(App, "submitDirectTerminal")) {
+                    try App.submitDirectTerminal(app, command);
+                    return;
                 }
+            }
 
-                const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
-                const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
-                if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                    if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
-                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+            const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
+            const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
+            if (knownSlashCommand(app, resolved_slash_submission)) |command| {
+                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
+                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+                return;
+            }
+            if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
+                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+                return;
+            }
+            if (pendingImagesPrefixEnd(
+                app.input_runtime.edit_state.input.items,
+                expanded.text,
+                app.input_runtime.entities.pasted_blocks.items,
+                app.input_runtime.entities.image_tokens.items,
+                app.pending_images.items,
+            )) |command_start| {
+                const command_text = expanded.text[command_start..];
+                if (knownSlashCommand(app, command_text)) |command| {
+                    if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
+                    try submitSlashCommand(
+                        app,
+                        command_text,
+                        expanded.text[0..command_start],
+                        max_prompt_history,
+                    );
                     return;
-                }
-                if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
-                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
-                    return;
-                }
-                if (pendingImagesPrefixEnd(
-                    app.input_runtime.edit_state.input.items,
-                    expanded.text,
-                    app.input_runtime.entities.pasted_blocks.items,
-                    app.input_runtime.entities.image_tokens.items,
-                    app.pending_images.items,
-                )) |command_start| {
-                    const command_text = expanded.text[command_start..];
-                    if (knownSlashCommand(app, command_text)) |command| {
-                        if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
-                        try submitSlashCommand(
-                            app,
-                            command_text,
-                            expanded.text[0..command_start],
-                            max_prompt_history,
-                        );
-                        return;
-                    }
                 }
             }
 
@@ -534,7 +549,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
-                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null);
+                    const admission = try enqueuePromptForSubmit(app, "", &.{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -542,11 +557,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                     return;
-                }
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (try queue_rt.submitPausedQueueUnchanged(app)) {
-                        return;
-                    }
                 }
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
@@ -637,15 +647,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
-            var accepted_draft = try prepareAcceptedDraftProjection(
-                app,
-                expanded.text,
-                visual_text.text,
-                display_skill_tokens,
-                image_occurrences.items,
-                has_inline_images,
-            );
-            defer accepted_draft.deinit(app.alloc);
+            var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
+                try prepareComposerHistoryProjection(
+                    app,
+                    expanded.text,
+                    visual_text.text,
+                    display_skill_tokens,
+                    image_occurrences.items,
+                    has_inline_images,
+                )
+            else
+                null;
+            defer if (history_projection) |*projection| projection.deinit(app.alloc);
             const has_images_for_submit = if (staged_images) |*images|
                 images.items.len > 0
             else
@@ -656,7 +669,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
                     images,
                 )
             else
@@ -664,17 +676,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
-                recordAcceptedPromptComposerHistory(
-                    app,
-                    max_prompt_history,
-                    &accepted_draft,
-                );
+                if (history_projection) |*projection| {
+                    recordAcceptedPromptComposerHistory(
+                        app,
+                        max_prompt_history,
+                        projection,
+                    );
+                }
             }
             if (admission == .enqueued and !has_images_for_submit and visual_text.text.len > 0) {
                 recordAcceptedInput(app, visual_text.text);
@@ -877,58 +890,16 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: ?*const AcceptedDraftProjection,
         ) !PromptAdmission {
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
-            const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
-                app.queued_prompt_review.active()
-            else
-                false;
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                switch (try queue_rt.promptAdmission(
-                    app,
-                    if (accepted_draft) |draft| draft.input else prompt,
-                    if (accepted_draft) |draft| draft.pasted_blocks.items else &.{},
-                    if (accepted_draft) |draft| draft.image_tokens.items else &.{},
-                    if (accepted_draft) |draft| draft.skill_tokens.items else skill_tokens,
-                )) {
-                    .replaced => {
-                        return .enqueued;
-                    },
-                    .enqueue => {},
-                }
-            }
-
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
-                if (accepted_draft) |draft| {
-                    break :blk try App.enqueuePromptWithReviewDraft(
-                        app,
-                        prompt,
-                        skill_tokens,
-                        draft.input,
-                        draft.pasted_blocks.items,
-                        draft.image_tokens.items,
-                        draft.skill_tokens.items,
-                    );
-                }
-                break :blk try App.enqueuePromptWithSkillBindings(
-                    app,
-                    prompt,
-                    skill_tokens,
-                );
-            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
+            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
             if (!accepted) return .rejected;
-            if (resume_review) {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.resumeAfterNewPrompt(app);
-                }
-            }
             return .enqueued;
         }
 
@@ -961,7 +932,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
 
-            const draft = try buildQueuedPromptDraft(
+            const draft = try buildPendingPromptDraft(
                 app.alloc,
                 debug_trace.nextTurnId(),
                 prompt,
@@ -985,7 +956,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
         ) !PromptAdmission {
             const original_images = app.pending_images;
@@ -1000,7 +970,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
-                accepted_draft,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;
@@ -1199,16 +1168,16 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn recordAcceptedPromptComposerHistory(
             app: *App,
             max_prompt_history: usize,
-            accepted: *const AcceptedDraftProjection,
+            projection: *const ComposerHistoryProjection,
         ) void {
             recordComposerHistory(
                 app,
                 max_prompt_history,
-                accepted.input,
-                accepted.pasted_blocks.items,
+                projection.input,
+                projection.pasted_blocks.items,
                 app.pending_images.items,
-                accepted.image_tokens.items,
-                accepted.skill_tokens.items,
+                projection.image_tokens.items,
+                projection.skill_tokens.items,
             );
         }
 
@@ -1258,14 +1227,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             };
         }
 
-        fn prepareAcceptedDraftProjection(
+        fn prepareComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             image_occurrences: []const ImageOccurrence,
             has_extracted_images: bool,
-        ) !AcceptedDraftProjection {
+        ) !ComposerHistoryProjection {
             var submitted_image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty;
             defer submitted_image_tokens.deinit(app.alloc);
             try submitted_image_tokens.ensureTotalCapacity(
@@ -1286,7 +1255,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (app.input_runtime.entities.pasted_blocks.items.len > 0 and
                 !has_extracted_images)
             {
-                if (try prepareCompactAcceptedDraftProjection(
+                if (try prepareCompactComposerHistoryProjection(
                     app,
                     expanded_text,
                     visual_text,
@@ -1309,7 +1278,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 );
             }
 
-            var fallback = AcceptedDraftProjection{ .input = visual_text };
+            var fallback = ComposerHistoryProjection{ .input = visual_text };
             errdefer fallback.deinit(app.alloc);
             try fallback.image_tokens.appendSlice(
                 app.alloc,
@@ -1322,19 +1291,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             return fallback;
         }
 
-        fn prepareCompactAcceptedDraftProjection(
+        fn prepareCompactComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             submitted_image_tokens: []const entity_spans.ImageTokenSpan,
-        ) !?AcceptedDraftProjection {
+        ) !?ComposerHistoryProjection {
             const raw_input = app.input_runtime.edit_state.input.items;
             if (!std.mem.eql(u8, expanded_text, visual_text)) return null;
             const raw_start: usize = 0;
             const raw_end = raw_input.len;
 
-            var compact = AcceptedDraftProjection{
+            var compact = ComposerHistoryProjection{
                 .input = raw_input[raw_start..raw_end],
             };
             var transferred = false;
@@ -1979,7 +1948,7 @@ test "direct terminal route requires the literal first character" {
 
 test "pending submission phase methods keep hold ownership explicit" {
     const alloc = std.testing.allocator;
-    var pending = PendingSubmission.init(try buildQueuedPromptDraft(
+    var pending = PendingSubmission.init(try buildPendingPromptDraft(
         alloc,
         41,
         "use $review",
@@ -2017,7 +1986,7 @@ test "pending submission phase methods keep hold ownership explicit" {
 }
 
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
-    const draft = try buildQueuedPromptDraft(
+    const draft = try buildPendingPromptDraft(
         alloc,
         77,
         "hello $review",
@@ -2033,7 +2002,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
             .path = "/tmp/review/SKILL.md",
         }},
     );
-    defer worker_runtime.freeQueuedPromptDraft(alloc, draft);
+    defer draft.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 77), draft.turn_id);
     try std.testing.expectEqualStrings("hello $review", draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), draft.images.len);
@@ -2065,7 +2034,7 @@ const PendingLifecycleFake = struct {
             self.release_count += 1;
         }
 
-        pub fn deleteQueuedPromptDraft(
+        pub fn removeQueuedPrompt(
             self: *@This(),
             _: std.mem.Allocator,
             turn_id: u64,
@@ -2102,7 +2071,7 @@ const PendingLifecycleFake = struct {
 
     pub fn adoptPendingUserPrompt(
         self: *PendingLifecycleFake,
-        _: *const worker_runtime.QueuedPromptDraft,
+        _: *const PendingPromptDraft,
     ) !void {
         if (self.adoption_failures_remaining > 0) {
             self.adoption_failures_remaining -= 1;
@@ -2113,7 +2082,7 @@ const PendingLifecycleFake = struct {
 
     pub fn finalizePendingSubmission(
         self: *PendingLifecycleFake,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const PendingPromptDraft,
     ) !void {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
@@ -2147,7 +2116,7 @@ const PendingLifecycleFake = struct {
 fn pendingLifecycleFake(alloc: std.mem.Allocator, turn_id: u64) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible prompt",
@@ -2164,7 +2133,7 @@ fn pendingLifecycleFakeWithSnapshot(
 ) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible image prompt",
