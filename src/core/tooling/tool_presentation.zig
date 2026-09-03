@@ -162,6 +162,21 @@ pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []cons
 }
 
 /// The caller owns `detail` and must free it with `alloc`.
+pub fn runCommandCompletedActionLabel(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+) !?[]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or !isCapturedCommandCall(registry, call, parsed.value.object)) return null;
+    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
+    return if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched|
+        matched.tool.completed_action_label
+    else
+        "Ran";
+}
+
 pub fn formatRunCommandActivity(
     alloc: Allocator,
     registry: tool_dispatch.Registry,

@@ -56,6 +56,7 @@ pub const ToolDetailRecord = struct {
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
     command_display: ?[]u8 = null,
+    command_action_label: ?[]u8 = null,
     result: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
@@ -77,6 +78,7 @@ pub const ToolDetailRecord = struct {
         alloc.free(self.tool_name);
         if (self.arguments_json) |value| alloc.free(value);
         if (self.command_display) |value| alloc.free(value);
+        if (self.command_action_label) |value| alloc.free(value);
         if (self.result) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);

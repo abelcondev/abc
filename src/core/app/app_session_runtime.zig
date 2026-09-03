@@ -2000,6 +2000,7 @@ pub fn Runtime(comptime App: type) type {
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
+                    .workspace_root = state.workspace_root,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
@@ -3414,6 +3415,7 @@ pub fn Runtime(comptime App: type) type {
             return struct {
                 app: *App,
                 projection: *Projection,
+                workspace_root: []const u8,
 
                 const Self = @This();
 
@@ -3422,7 +3424,14 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn attachCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
-                    var parsed = std.json.parseFromSlice(std.json.Value, self.projection.alloc, call.arguments_json, .{}) catch return;
+                    var parsed = std.json.parseFromSlice(std.json.Value, self.projection.alloc, call.arguments_json, .{}) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "historical command metadata parse failed entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        return;
+                    };
                     defer parsed.deinit();
                     if (parsed.value != .object) return;
                     const command_value = parsed.value.object.get("command") orelse return;
@@ -3430,11 +3439,38 @@ pub fn Runtime(comptime App: type) type {
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
-                        self.app.workspace_root,
+                        self.workspace_root,
                         tooling_presentation.max_run_command_reflow_bytes,
-                    ) catch null) orelse return;
+                    ) catch |err| blk: {
+                        debug_trace.logf(
+                            "session",
+                            "historical command display unavailable entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        break :blk null;
+                    }) orelse return;
                     defer self.projection.alloc.free(display);
-                    self.projection.setHistoricalToolCommandDisplay(entry_id, display) catch {};
+                    const label = tooling_presentation.runCommandCompletedActionLabel(
+                        self.projection.alloc,
+                        self.app.toolRegistry(),
+                        call,
+                    ) catch |err| blk: {
+                        debug_trace.logf(
+                            "session",
+                            "historical command action label unavailable entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        break :blk null;
+                    };
+                    if (label) |value| self.projection.setHistoricalToolCommandMetadata(
+                        entry_id,
+                        display,
+                        value,
+                    ) catch |err| debug_trace.logf(
+                        "session",
+                        "historical command metadata unavailable entry_id={d} err={s}",
+                        .{ entry_id, @errorName(err) },
+                    );
                 }
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
@@ -3775,6 +3811,7 @@ pub fn Runtime(comptime App: type) type {
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
+                .workspace_root = app.workspace_root,
             };
             return replayHistoryToSinkIncremental(
                 app,

@@ -515,22 +515,6 @@ fn formatGroupBlock(
     return out.toOwnedSlice();
 }
 
-fn actionForTruncatedCommandPhrase(
-    phrase: []const u8,
-    command: []const u8,
-) ?[]const u8 {
-    const marker = "...";
-    if (!std.mem.endsWith(u8, phrase, marker)) return null;
-    const truncated = phrase[0 .. phrase.len - marker.len];
-    for (truncated, 0..) |byte, index| {
-        if (byte != ' ' or index == 0 or index + 1 == truncated.len) continue;
-        if (std.mem.startsWith(u8, command, truncated[index + 1 ..])) {
-            return truncated[0..index];
-        }
-    }
-    return null;
-}
-
 fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
@@ -538,8 +522,9 @@ fn reprojectTruncatedCommandPhrase(
 ) !?[]const u8 {
     const record = detail orelse return null;
     if (!record.isCapturedCommand() or record.outcome != .completed) return null;
+    if (!std.mem.endsWith(u8, phrase, "...")) return null;
     const command = record.command_display orelse return null;
-    const action = actionForTruncatedCommandPhrase(phrase, command) orelse return null;
+    const action = record.command_action_label orelse return null;
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
@@ -1307,6 +1292,7 @@ test "minimal completed command rows reproject stored arguments at the current w
             .activity_kind = .command,
             .arguments_json = arguments_json,
             .command_display = @constCast(command),
+            .command_action_label = @constCast("Ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -1359,6 +1345,7 @@ test "minimal completed command rows reproject stored arguments at the current w
             .activity_kind = .command,
             .arguments_json = relative_arguments_json,
             .command_display = @constCast(relative_command),
+            .command_action_label = @constCast("Ran"),
             .outcome = .completed,
             .command_process_presentation = .{ .exit_code = 0 },
         },
@@ -1377,7 +1364,18 @@ test "minimal completed command rows reproject stored arguments at the current w
             .class = .tool_status,
         } },
     };
-    var compatibility = try build(alloc, &compatibility_entries, &details, 240);
+    const compatibility_details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = true,
+        .activity_kind = .command,
+        .arguments_json = arguments_json,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Installed skill"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+    var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command\n└ Installed skill " ++ command,

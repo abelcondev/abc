@@ -500,24 +500,64 @@ pub fn Bindings(comptime App: type) type {
                 try app.shell.applyToolLifecycle(alloc, event);
             if (comptime @hasField(App, "workspace_root")) switch (event) {
                 .authoritative_started => |started| if (started.arguments_json) |arguments_json| {
-                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch null;
-                    if (parsed) |*value| {
-                        defer value.deinit();
-                        if (value.value == .object) {
-                            if (value.value.object.get("command")) |command_value| {
-                                if (command_value == .string) {
-                                    const display = tool_presentation.formatRunCommandDetailBounded(
-                                        alloc,
-                                        command_value.string,
-                                        app.workspace_root,
-                                        tool_presentation.max_run_command_reflow_bytes,
-                                    ) catch null;
-                                    defer if (display) |bytes| alloc.free(bytes);
-                                    if (display) |bytes| app.shell.setToolCommandDisplay(
+                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| {
+                        debug_trace.logf(
+                            "ui_activity",
+                            "command metadata parse failed turn_id={d} err={s}",
+                            .{ started.id.turn_id, @errorName(err) },
+                        );
+                        return .{
+                            .previous_focused_entry_id = previous_focused_entry_id,
+                            .snapshot = worker_tool_lifecycle_snapshot(raw_ctx),
+                            .applied_activity_kind = applied_activity_kind,
+                            .terminal_record = null,
+                        };
+                    };
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        if (parsed.value.object.get("command")) |command_value| {
+                            if (command_value == .string) {
+                                const display = tool_presentation.formatRunCommandDetailBounded(
+                                    alloc,
+                                    command_value.string,
+                                    app.workspace_root,
+                                    tool_presentation.max_run_command_reflow_bytes,
+                                ) catch |err| blk: {
+                                    debug_trace.logf(
+                                        "ui_activity",
+                                        "command display unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
+                                    break :blk null;
+                                };
+                                defer if (display) |bytes| alloc.free(bytes);
+                                const action_label = tool_presentation.runCommandCompletedActionLabel(
+                                    alloc,
+                                    app.toolRegistry(),
+                                    .{
+                                        .id = started.id.call_id,
+                                        .name = started.tool_name,
+                                        .arguments_json = arguments_json,
+                                    },
+                                ) catch |err| blk: {
+                                    debug_trace.logf(
+                                        "ui_activity",
+                                        "command action label unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
+                                    break :blk null;
+                                };
+                                if (display != null and action_label != null) {
+                                    app.shell.setToolCommandMetadata(
                                         alloc,
                                         started.id,
-                                        bytes,
-                                    ) catch {};
+                                        display.?,
+                                        action_label.?,
+                                    ) catch |err| debug_trace.logf(
+                                        "ui_activity",
+                                        "command metadata unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
                                 }
                             }
                         }

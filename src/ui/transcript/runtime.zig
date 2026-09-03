@@ -5213,26 +5213,37 @@ pub const TranscriptRuntime = struct {
         return &self.tool_details.items[search.index];
     }
 
-    pub fn setToolCommandDisplay(
+    pub fn setToolCommandMetadata(
         self: *TranscriptRuntime,
         alloc: Allocator,
         id: types.ToolLifecycleId,
         display: []const u8,
+        action_label: []const u8,
     ) !void {
         const record = self.lifecycle_state.record(id) orelse return;
-        try self.setToolCommandDisplayForEntry(alloc, record.entry_id, display);
+        try self.setToolCommandMetadataForEntry(
+            alloc,
+            record.entry_id,
+            display,
+            action_label,
+        );
     }
 
-    pub fn setToolCommandDisplayForEntry(
+    pub fn setToolCommandMetadataForEntry(
         self: *TranscriptRuntime,
         alloc: Allocator,
         entry_id: u32,
         display: []const u8,
+        action_label: []const u8,
     ) !void {
         const detail = self.toolDetailPtr(entry_id) orelse return;
-        const owned = try alloc.dupe(u8, display);
+        const owned_display = try alloc.dupe(u8, display);
+        errdefer alloc.free(owned_display);
+        const owned_label = try alloc.dupe(u8, action_label);
         if (detail.command_display) |previous| alloc.free(previous);
-        detail.command_display = owned;
+        if (detail.command_action_label) |previous| alloc.free(previous);
+        detail.command_display = owned_display;
+        detail.command_action_label = owned_label;
         self.markTranscriptContentDirtyFrom(entry_id);
     }
 
