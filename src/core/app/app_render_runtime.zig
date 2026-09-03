@@ -11,6 +11,7 @@ const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -533,6 +534,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         var file_completions_buf: [input_completion_runtime.file_picker_completion_cap]file_index.SearchResult = undefined;
         var file_match_spans_buf: [input_completion_runtime.file_picker_completion_cap * file_index.max_path_len]file_index.MatchSpan = undefined;
         var file_path_storage_buf: [input_completion_runtime.file_picker_path_storage_cap]u8 = undefined;
@@ -583,7 +585,47 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const file_query = if (model_query == null) app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) else null;
+            const provider_query = if (model_query == null)
+                app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
+            var provider_stage: picker_state.ProviderPickerStage = .provider;
+            var provider_picker_items: []const []const u8 = &.{};
+            var provider_picker_annotations: []const []const u8 = &.{};
+            var provider_picker_index: usize = 0;
+            var provider_picker_window_start: usize = 0;
+            var provider_picker_anchor: usize = 0;
+            if (provider_query) |picker_query| {
+                provider_stage = picker_query.stage;
+                provider_picker_anchor = picker_query.token_start;
+                const count = provider_picker_runtime.Runtime(App).columnOptions(app, picker_query, &provider_picker_column);
+                provider_picker_items = provider_picker_column.labels[0..count];
+                provider_picker_annotations = provider_picker_column.annotations[0..count];
+                switch (picker_query.stage) {
+                    .provider => {
+                        provider_picker_index = app.input_runtime.picker.provider_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.provider_column_window_start;
+                    },
+                    .method => {
+                        provider_picker_index = app.input_runtime.picker.method_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.method_column_window_start;
+                    },
+                    .team => {
+                        provider_picker_index = app.input_runtime.picker.team_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.team_column_window_start;
+                    },
+                    .key_source => {
+                        provider_picker_index = app.input_runtime.picker.key_source_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.key_source_column_window_start;
+                    },
+                    .api_key => {},
+                }
+            }
+
+            const file_query = if (model_query == null and provider_query == null)
+                app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
             var file_items: []const file_index.SearchResult = &.{};
             var file_anchor: usize = 0;
             var file_selection_index: usize = 0;
@@ -682,6 +724,13 @@ pub fn Runtime(comptime App: type) type {
                 .model_completion_index = picker_index,
                 .model_completion_window_start = picker_window_start,
                 .model_completion_anchor = picker_anchor,
+                .provider_query_active = provider_query != null,
+                .provider_picker_stage = provider_stage,
+                .provider_picker_completions = provider_picker_items,
+                .provider_picker_annotations = provider_picker_annotations,
+                .provider_picker_completion_index = provider_picker_index,
+                .provider_picker_completion_window_start = provider_picker_window_start,
+                .provider_picker_completion_anchor = provider_picker_anchor,
                 .file_query_active = file_query != null,
                 .file_completions = file_items,
                 .file_completion_index = file_selection_index,

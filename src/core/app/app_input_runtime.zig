@@ -65,6 +65,7 @@ const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
@@ -213,6 +214,7 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const history_rt = input_history_runtime.HistoryRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+        const provider_picker_rt = provider_picker_runtime.Runtime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
         const approval_rt = input_approval_runtime.ApprovalRuntime(App);
@@ -296,7 +298,7 @@ pub fn Runtime(comptime App: type) type {
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null and
                                 !app.stream.active and
-                                try completion_rt.stepBackModelPicker(app))
+                                (try provider_picker_rt.stepBack(app) or try completion_rt.stepBackModelPicker(app)))
                             {
                                 app.shell.render_requests.request(.footer);
                                 return;
@@ -305,6 +307,20 @@ pub fn Runtime(comptime App: type) type {
                         },
                         .character_right => {
                             app.input_runtime.vertical_navigation.reset();
+                            // In the provider picker the arrows walk columns:
+                            // Left reopens the previous one, Right acts as
+                            // Enter on the highlighted row. Only from the end
+                            // of the text, so Right keeps moving the cursor
+                            // while editing.
+                            if (!intent.extend_selection and
+                                app.input_runtime.edit_state.selectionRange() == null and
+                                !app.stream.active and
+                                app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len and
+                                try provider_picker_rt.submit(app))
+                            {
+                                app.shell.render_requests.request(.footer);
+                                return;
+                            }
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null)
                             {
@@ -1431,6 +1447,8 @@ pub fn Runtime(comptime App: type) type {
                             try input_limit_feedback.report(App, app, .composer, 1);
                         }
                         app.shell.render_requests.request(.footer);
+                    } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
+                        if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
                         // Mid-turn: list is hidden — do not autocomplete a hidden index.
                         if (!app.stream.active) {
@@ -1474,6 +1492,13 @@ pub fn Runtime(comptime App: type) type {
                         if (try completion_rt.advanceModelPickerOnSpace(app)) {
                             app.shell.render_requests.request(.footer);
                         }
+                    } else if (app.input_runtime.edit_state.selectionRange() == null and
+                        !app.stream.active and
+                        !commandSkillsMenuActive(app) and
+                        provider_picker_rt.hasQuery(app) and
+                        try provider_picker_rt.advanceOnSpace(app))
+                    {
+                        app.shell.render_requests.request(.footer);
                     } else {
                         switch (try insertComposerSliceBounded(app, " ", max_input_len, false)) {
                             .inserted => {
@@ -1511,6 +1536,18 @@ pub fn Runtime(comptime App: type) type {
                     if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try openModelBrowseCatalog(app);
                         return;
+                    }
+                    if (provider_picker_rt.hasQuery(app)) {
+                        if (app.stream.active) {
+                            try app.writeDomainNotice(.{
+                                .topic = "provider",
+                                .tone = .neutral,
+                                .body = "Provider switching is unavailable until active and queued work finishes.",
+                            }, true);
+                            app.shell.render_requests.request(.footer);
+                            return;
+                        }
+                        if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
                         if (app.stream.active) {

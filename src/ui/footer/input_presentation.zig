@@ -29,7 +29,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, models, file, slash, skills, help, settings, sessions, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -336,6 +336,30 @@ pub fn measureRawInputGeometryPrepared(
     show_file_query: bool,
     prepared_slash_completion_count: ?usize,
 ) RawInputGeometry {
+    return measureRawInputGeometryPreparedWithProvider(
+        ctx,
+        terminal_cols,
+        content_bottom,
+        input_visible,
+        modal_active,
+        show_model_query,
+        false,
+        show_file_query,
+        prepared_slash_completion_count,
+    );
+}
+
+pub fn measureRawInputGeometryPreparedWithProvider(
+    ctx: RenderContext,
+    terminal_cols: u16,
+    content_bottom: u16,
+    input_visible: bool,
+    modal_active: bool,
+    show_model_query: bool,
+    show_provider_query: bool,
+    show_file_query: bool,
+    prepared_slash_completion_count: ?usize,
+) RawInputGeometry {
     const display_input: []const u8 = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items;
     const display_cursor: usize = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor;
     const display_images: []const types.ImageAttachment = if (ctx.queued_editor_active) &.{} else ctx.pending_images;
@@ -347,6 +371,8 @@ pub fn measureRawInputGeometryPrepared(
         null
     else if (show_model_query)
         ctx.model_completion_anchor
+    else if (show_provider_query)
+        ctx.provider_picker_completion_anchor
     else if (show_file_query)
         ctx.file_completion_anchor
     else
@@ -363,14 +389,14 @@ pub fn measureRawInputGeometryPrepared(
     }, raw_anchor);
     const capped = cappedInputRows(summary.total_rows, content_bottom, input_visible);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, capped.row_limit);
-    const slash_query_active = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
+    const slash_query_active = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_provider_query or show_file_query);
     const slash_completion_count = if (slash_query_active)
         prepared_slash_completion_count orelse
-            slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
+            slashCompletionPickerCount(ctx, modal_active, show_model_query, show_provider_query or show_file_query)
     else
         0;
     const show_slash_query = slash_query_active and slash_completion_count > 0;
-    const picker_start_col = if (show_model_query or show_file_query or show_slash_query)
+    const picker_start_col = if (show_model_query or show_provider_query or show_file_query or show_slash_query)
         visual_layout.projectedAnchorColumn(summary, terminal_cols)
     else
         @as(u16, 1);
@@ -388,6 +414,18 @@ pub fn measureRawInputGeometryPrepared(
 
 fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const u8 {
     if (!view.active or view.include_skip) return null;
+
+    if (view.stage == .api_key and view.api_key_inline) {
+        const key_variants = [_][]const u8{
+            "Enter saves     Esc cancels     " ++ credentials.stored_key_backend_label,
+            "Enter saves  Esc cancels",
+            "Enter  Esc",
+        };
+        for (key_variants) |candidate| {
+            if (display_width.visibleWidth(candidate) <= width) return candidate;
+        }
+        return key_variants[key_variants.len - 1];
+    }
 
     const root_variants = [_][]const u8{
         "↑↓ Navigate     Enter Open     Esc Close",
