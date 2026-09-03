@@ -13,6 +13,7 @@ pub const ToolPresentationRecord = struct {
     tool_name: ?[]const u8,
     activity_kind: types.ToolActivityKind,
     captured_command: bool = false,
+    cancellation_presented: bool = false,
     phase: ToolLifecyclePhase,
     focus_seq: u64,
 };

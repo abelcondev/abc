@@ -3287,7 +3287,11 @@ pub fn Runtime(comptime App: type) type {
                         "Cancelled",
                     );
                     defer self.app.alloc.free(line);
-                    try self.appendRaw(line);
+                    try self.app.writeTranscriptClassified(
+                        line,
+                        true,
+                        .turn_cancellation,
+                    );
                 }
 
                 fn appendToolStatus(
@@ -3534,7 +3538,10 @@ pub fn Runtime(comptime App: type) type {
                         "Cancelled",
                     );
                     defer self.projection.alloc.free(line);
-                    try self.appendRaw(line);
+                    _ = try self.projection.appendRawClassified(
+                        line,
+                        .turn_cancellation,
+                    );
                 }
 
                 fn appendToolStatus(
@@ -5269,6 +5276,7 @@ const TestApp = struct {
     notices: std.ArrayList([]u8) = .empty,
     cards: std.ArrayList(PromptCard) = .empty,
     transcript: std.ArrayList(u8) = .empty,
+    raw_transcript_classes: std.ArrayList(transcript_runtime.RawEntryClass) = .empty,
     completed_tool_statuses: std.ArrayList([]u8) = .empty,
     completed_tool_outcomes: std.ArrayList(types.ToolOutcomeKind) = .empty,
     next_transcript_entry_id: u32 = 1,
@@ -5370,6 +5378,7 @@ const TestApp = struct {
         for (self.cards.items) |*card| card.deinit(self.alloc);
         self.cards.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.raw_transcript_classes.deinit(self.alloc);
         for (self.completed_tool_statuses.items) |status| self.alloc.free(status);
         self.completed_tool_statuses.deinit(self.alloc);
         self.completed_tool_outcomes.deinit(self.alloc);
@@ -5446,14 +5455,20 @@ const TestApp = struct {
     }
 
     fn writeTranscript(self: *TestApp, text: []const u8, record: bool) !void {
-        _ = record;
-        try self.transcript.appendSlice(self.alloc, text);
-        try self.replay_events.append(self.alloc, .raw_transcript);
-        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
+        try self.writeTranscriptClassified(text, record, .unknown_raw);
     }
 
-    fn writeTranscriptClassified(self: *TestApp, text: []const u8, record: bool, _: anytype) !void {
-        try self.writeTranscript(text, record);
+    fn writeTranscriptClassified(
+        self: *TestApp,
+        text: []const u8,
+        record: bool,
+        class: transcript_runtime.RawEntryClass,
+    ) !void {
+        _ = record;
+        try self.transcript.appendSlice(self.alloc, text);
+        try self.raw_transcript_classes.append(self.alloc, class);
+        try self.replay_events.append(self.alloc, .raw_transcript);
+        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
     }
 
     fn writeCompletedToolStatus(
@@ -8267,6 +8282,10 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.turn_cancellation,
+        app.raw_transcript_classes.getLast(),
+    );
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
 

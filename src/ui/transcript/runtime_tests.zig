@@ -14834,6 +14834,43 @@ test "active tool cancellation is presented immediately without closing lifecycl
     try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
 }
 
+test "active tool cancellation survives late successful settlement" {
+    const alloc = std.testing.allocator;
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+
+    const id = lifecycleId(1, "late-success");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+
+    try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Read the file" },
+        .result = "late result",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .interrupted,
+    } });
+
+    var rendered = try runtime.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Read the file") == null);
+    try std.testing.expectEqual(
+        types.ToolOutcomeKind.cancelled,
+        runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.outcome.?,
+    );
+}
+
 fn expectRawEntryBytes(
     runtime: *const TranscriptRuntime,
     entry_id: u32,

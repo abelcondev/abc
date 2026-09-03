@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { findFooterBlocks } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -6386,6 +6387,37 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Escape");
       await waitForCondition(() => hold.cancelled, "Escape to cancel the held response");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const resumedGateway = startFakeGateway([]);
+      gateways.push(resumedGateway);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} resume last`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("What can fx do differently?", TIMEOUT);
+      const resumedGrid = await active.capturePaneGrid();
+      const footer = findFooterBlocks(resumedGrid).at(-1);
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
+      expect(footer).toBeDefined();
+      expect(cancelledRow).toBeGreaterThanOrEqual(0);
+      expect(cancelledRow).toBeLessThan(footer!.topDivider);
+      const gapRows = resumedGrid.slice(cancelledRow + 1, footer!.topDivider);
+      expect(gapRows.length).toBeGreaterThanOrEqual(1);
+      expect(gapRows.map((row) => row.trim())).toEqual(
+        Array.from({ length: gapRows.length }, () => ""),
+      );
+      expect(resumedGateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");

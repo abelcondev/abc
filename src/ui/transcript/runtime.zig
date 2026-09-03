@@ -4649,6 +4649,7 @@ pub const TranscriptRuntime = struct {
             missing_detail_count,
         );
         for (active, detail_starts.items) |entry, *detail_start| {
+            entry.record.cancellation_presented = true;
             self.commitToolDetailStart(
                 alloc,
                 entry.record.entry_id,
@@ -5053,7 +5054,15 @@ pub const TranscriptRuntime = struct {
             );
             return error.UnknownToolLifecycleIdentity;
         };
-        const line = try lifecycleTerminalLine(alloc, outcome.kind, outcome.summary);
+        const presentation_outcome = if (record.cancellation_presented and outcome.kind != .cancelled)
+            types.ToolOutcome{ .kind = .cancelled, .summary = "Cancelled" }
+        else
+            outcome;
+        const line = try lifecycleTerminalLine(
+            alloc,
+            presentation_outcome.kind,
+            presentation_outcome.summary,
+        );
         defer alloc.free(line);
         var detail_start: ?PendingToolDetailStart = if (self.toolDetailPtr(record.entry_id) == null)
             try self.prepareToolDetailStart(
@@ -5098,7 +5107,7 @@ pub const TranscriptRuntime = struct {
             alloc,
             record.entry_id,
             record.activity_kind,
-            outcome.kind,
+            if (record.cancellation_presented) .cancelled else outcome.kind,
             &detail_update,
         );
         return null;
