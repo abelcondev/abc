@@ -3455,7 +3455,13 @@ describe("gateway stream lifecycle", () => {
       }
       return fakeGatewaySse([
         { type: "tool-call", toolCallId: `invalid_${batch}`, toolName: "shell", input: {
-          request: { command: "printf unexpected > must-not-run.txt", profile: "clean" },
+          request: {
+            command: "printf unexpected > must-not-run.txt",
+            tty: true,
+            shell: batch === 1
+              ? { kind: "executable", path: "/bin/bash" }
+              : { path: "/bin/bash", kind: "executable" },
+          },
           yield_time_ms: "1000",
         } },
         { type: "tool-call", toolCallId: `neighbor_${batch}`, toolName: "read_file", input: { path: "neighbor.txt" } },
