@@ -16,6 +16,7 @@ import { findFooterBlocks, readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   fakeShellRun,
   startFakeGateway,
   TmuxSession,
@@ -460,6 +461,88 @@ while :; do sleep 1; done
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "late successful tool settlement stays truthful after Escape",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-late-tool-success-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const corpus = join(workspace, "corpus");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const pattern = "LATE_SUCCESS_NEEDLE";
+      const callId = "late_success_grep";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(corpus, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      for (let index = 0; index < 30_000; index += 1) {
+        writeFileSync(
+          join(corpus, `candidate-${String(index).padStart(5, "0")}.txt`),
+          "ordinary corpus text\n",
+        );
+      }
+
+      gateway = startFakeGateway([
+        fakeGatewayToolCall(callId, "grep_files", {
+          path: "corpus",
+          pattern,
+          head_limit: 5,
+        }),
+      ]);
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-late-tool-success-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Search the prepared corpus.");
+      await session.waitForText(`Searching ${pattern}`, TIMEOUT);
+      expect(readTrace(tracePath)).not.toContain(
+        `event=after_tool_execution call_id=${callId}`,
+      );
+
+      const cancelStartedAt = Date.now();
+      await session.sendKeys("Escape");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+      await waitForTrace(tracePath, `event=after_tool_execution`, TIMEOUT);
+      await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
+
+      const trace = readTrace(tracePath);
+      const completedTool = trace.split("\n").find((line) =>
+        line.includes("event=after_tool_execution") &&
+        line.includes(`call_id=${callId}`) &&
+        line.includes("name=grep_files") &&
+        line.includes("result_kind=model_output")
+      );
+      expect(completedTool).toBeDefined();
+      await session.waitForText(`Searched ${pattern}`, TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain(`Searched ${pattern}`);
+      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
+      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("Cancelling");
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isPaneAlive()).toBe(true);
     },
     TIMEOUT * 2,

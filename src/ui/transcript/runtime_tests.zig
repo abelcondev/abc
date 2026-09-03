@@ -14834,41 +14834,57 @@ test "active tool cancellation is presented immediately without closing lifecycl
     try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
 }
 
-test "active tool cancellation survives late successful settlement" {
+test "late successful settlement preserves its result and one turn cancellation" {
     const alloc = std.testing.allocator;
-    var runtime = lifecycleTestRuntime(null);
-    defer runtime.deinit(alloc);
+    for ([_]bool{ false, true }) |finish_before_terminal| {
+        var runtime = lifecycleTestRuntime(null);
+        defer runtime.deinit(alloc);
 
-    const id = lifecycleId(1, "late-success");
-    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
-        .id = id,
-        .reconciles_provisional_call_id = null,
-        .tool_name = "read_file",
-        .activity_kind = .read,
-    } });
+        const id = lifecycleId(1, "late-success");
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        } });
 
-    try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
-    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
-        .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Read the file" },
-        .result = "late result",
-    } });
-    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
-        .turn_id = id.turn_id,
-        .outcome = .interrupted,
-    } });
+        try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+        if (finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
+        _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = "Read the file" },
+            .result = "late result",
+        } });
+        if (!finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
 
-    var rendered = try runtime.prepareTranscriptSource(alloc, null);
-    defer rendered.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
-    );
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Read the file") == null);
-    try std.testing.expectEqual(
-        types.ToolOutcomeKind.cancelled,
-        runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.outcome.?,
-    );
+        var rendered = try runtime.prepareTranscriptSource(alloc, null);
+        defer rendered.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "Read the file"),
+        );
+        try std.testing.expectEqual(
+            RawEntryClass.turn_cancellation,
+            runtime.entries.getLast().raw_bytes.class,
+        );
+        const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
+        try std.testing.expectEqualStrings("late result", detail.result.?);
+        try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+    }
 }
 
 fn expectRawEntryBytes(

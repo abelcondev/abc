@@ -7,13 +7,20 @@ pub const ToolLifecyclePhase = enum {
     terminal,
 };
 
+pub const CancellationPresentation = enum {
+    none,
+    tool_status,
+    turn_notice,
+    replaced,
+};
+
 pub const ToolPresentationRecord = struct {
     id: types.ToolLifecycleId,
     entry_id: u32,
     tool_name: ?[]const u8,
     activity_kind: types.ToolActivityKind,
     captured_command: bool = false,
-    cancellation_presented: bool = false,
+    cancellation_presentation: CancellationPresentation = .none,
     phase: ToolLifecyclePhase,
     focus_seq: u64,
 };
@@ -179,6 +186,30 @@ pub const ToolActivityState = struct {
             if (record_ptr.phase != .terminal) count += 1;
         }
         return count;
+    }
+
+    pub fn needsTurnCancellationNoticeAfterTerminal(
+        self: *const ToolActivityState,
+        id: types.ToolLifecycleId,
+    ) bool {
+        const settling = self.record(id) orelse return false;
+        switch (settling.cancellation_presentation) {
+            .none, .turn_notice => return false,
+            .tool_status, .replaced => {},
+        }
+        var iterator = self.records.valueIterator();
+        while (iterator.next()) |record_ptr| {
+            if (record_ptr.id.turn_id != id.turn_id or
+                std.mem.eql(u8, record_ptr.id.call_id, id.call_id))
+            {
+                continue;
+            }
+            switch (record_ptr.cancellation_presentation) {
+                .tool_status, .turn_notice => return false,
+                .none, .replaced => {},
+            }
+        }
+        return true;
     }
 
     pub fn focusedRecord(

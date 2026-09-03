@@ -4649,7 +4649,7 @@ pub const TranscriptRuntime = struct {
             missing_detail_count,
         );
         for (active, detail_starts.items) |entry, *detail_start| {
-            entry.record.cancellation_presented = true;
+            entry.record.cancellation_presentation = .tool_status;
             self.commitToolDetailStart(
                 alloc,
                 entry.record.entry_id,
@@ -5054,16 +5054,15 @@ pub const TranscriptRuntime = struct {
             );
             return error.UnknownToolLifecycleIdentity;
         };
-        const presentation_outcome = if (record.cancellation_presented and outcome.kind != .cancelled)
-            types.ToolOutcome{ .kind = .cancelled, .summary = "Cancelled" }
-        else
-            outcome;
-        const line = try lifecycleTerminalLine(
-            alloc,
-            presentation_outcome.kind,
-            presentation_outcome.summary,
-        );
+        const line = try lifecycleTerminalLine(alloc, outcome.kind, outcome.summary);
         defer alloc.free(line);
+        const append_turn_cancellation = outcome.kind != .cancelled and
+            self.lifecycle_state.needsTurnCancellationNoticeAfterTerminal(id);
+        const turn_cancellation_line = if (append_turn_cancellation)
+            try lifecycleTerminalLine(alloc, .cancelled, "Cancelled")
+        else
+            null;
+        defer if (turn_cancellation_line) |value| alloc.free(value);
         var detail_start: ?PendingToolDetailStart = if (self.toolDetailPtr(record.entry_id) == null)
             try self.prepareToolDetailStart(
                 alloc,
@@ -5093,8 +5092,17 @@ pub const TranscriptRuntime = struct {
             line,
             @intFromBool(detail_start != null),
             @intFromBool(detail_update.command_process_entry != null),
+            turn_cancellation_line,
         )) return error.MissingLifecycleTranscriptEntry;
         record.phase = .terminal;
+        record.cancellation_presentation = if (append_turn_cancellation)
+            .turn_notice
+        else if (outcome.kind == .cancelled)
+            .tool_status
+        else if (record.cancellation_presentation != .none)
+            .replaced
+        else
+            .none;
         if (detail_start) |*pending| {
             self.commitLifecycleToolDetailStart(
                 alloc,
@@ -5107,7 +5115,7 @@ pub const TranscriptRuntime = struct {
             alloc,
             record.entry_id,
             record.activity_kind,
-            if (record.cancellation_presented) .cancelled else outcome.kind,
+            outcome.kind,
             &detail_update,
         );
         return null;
@@ -5199,6 +5207,10 @@ pub const TranscriptRuntime = struct {
             self.commitToolDetailStart(alloc, fallback.record.entry_id, detail_start);
             const detail = self.toolDetailPtr(fallback.record.entry_id).?;
             detail.outcome = fallback_outcome;
+            fallback.record.cancellation_presentation = if (fallback_outcome == .cancelled)
+                .tool_status
+            else
+                .none;
             detail.fallback_disposition = lifecycleFallbackDisposition(
                 finished.outcome,
                 fallback.was_provisional,

@@ -1449,6 +1449,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
     new_bytes: []const u8,
     additional_tool_detail_capacity: usize,
     additional_command_output_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !bool {
     return replacePinnedToolStatusAtomicInternal(
         self,
@@ -1460,6 +1461,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
         .{
             .tool_details = additional_tool_detail_capacity,
             .command_output_entries = additional_command_output_capacity,
+            .turn_cancellation_line = turn_cancellation_line,
         },
     );
 }
@@ -1467,9 +1469,12 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
 const LifecycleStatusReservations = struct {
     tool_details: usize = 0,
     command_output_entries: usize = 0,
+    turn_cancellation_line: ?[]const u8 = null,
 
     fn empty(self: LifecycleStatusReservations) bool {
-        return self.tool_details == 0 and self.command_output_entries == 0;
+        return self.tool_details == 0 and
+            self.command_output_entries == 0 and
+            self.turn_cancellation_line == null;
     }
 };
 
@@ -1504,7 +1509,11 @@ fn replacePinnedToolStatusAtomicInternal(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
-    try shadow.entries.ensureUnusedCapacity(alloc, reservations.command_output_entries);
+    try shadow.entries.ensureUnusedCapacity(
+        alloc,
+        reservations.command_output_entries +
+            @intFromBool(reservations.turn_cancellation_line != null),
+    );
     try shadow.command_output_blocks.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries,
@@ -1519,10 +1528,23 @@ fn replacePinnedToolStatusAtomicInternal(
         const entry = shadow.entries.orderedRemove(shadow_index);
         shadow.entries.appendAssumeCapacity(entry);
     }
+    var retention_anchor = entry_id;
+    if (reservations.turn_cancellation_line) |cancellation_line| {
+        const owned = try alloc.dupe(u8, cancellation_line);
+        var handed_off = false;
+        errdefer if (!handed_off) alloc.free(owned);
+        retention_anchor = try appendRawBytesEntryClassified(
+            &shadow,
+            alloc,
+            owned,
+            .turn_cancellation,
+        );
+        handed_off = true;
+    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        entry_id,
+        retention_anchor,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
