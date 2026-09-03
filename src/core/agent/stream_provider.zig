@@ -174,26 +174,33 @@ pub const RequestData = struct {
     response_format: ?StructuredResponseFormat = null,
 
     pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
-        for (self.instructions) |instruction| {
-            if (instruction.role != .system or
-                instruction.content == null or
-                instruction.images.len != 0 or
-                instruction.tool_call_id != null or
-                instruction.tool_name != null or
-                instruction.tool_calls.len != 0 or
-                instruction.provider_state_json != null or
-                instruction.tool_result_status != null or
-                instruction.tool_result_memory != null or
-                instruction.permission_feedback)
-            {
-                return error.InvalidProviderPrompt;
-            }
-        }
-        for (self.messages) |message| {
-            if (message.role == .system) return error.InvalidProviderPrompt;
-        }
+        try validate_prompt_lanes(self.instructions, self.messages);
     }
 };
+
+pub fn validate_prompt_lanes(
+    instructions: []const types.ChatMessage,
+    messages: []const types.ChatMessage,
+) error{InvalidProviderPrompt}!void {
+    for (instructions) |instruction| {
+        if (instruction.role != .system or
+            instruction.content == null or
+            instruction.images.len != 0 or
+            instruction.tool_call_id != null or
+            instruction.tool_name != null or
+            instruction.tool_calls.len != 0 or
+            instruction.provider_state_json != null or
+            instruction.tool_result_status != null or
+            instruction.tool_result_memory != null or
+            instruction.permission_feedback)
+        {
+            return error.InvalidProviderPrompt;
+        }
+    }
+    for (messages) |message| {
+        if (message.role == .system) return error.InvalidProviderPrompt;
+    }
+}
 
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.

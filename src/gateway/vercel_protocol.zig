@@ -1,4 +1,5 @@
 const std = @import("std");
+const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -217,24 +218,8 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
     const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
-    for (instructions) |instruction| {
-        if (instruction.role != .system or
-            instruction.content == null or
-            instruction.images.len != 0 or
-            instruction.tool_call_id != null or
-            instruction.tool_name != null or
-            instruction.tool_calls.len != 0 or
-            instruction.provider_state_json != null or
-            instruction.tool_result_status != null or
-            instruction.tool_result_memory != null or
-            instruction.permission_feedback)
-        {
-            return error.InvalidGatewayHistory;
-        }
-    }
-    for (messages) |message| {
-        if (message.role == .system) return error.InvalidGatewayHistory;
-    }
+    stream_provider.validate_prompt_lanes(instructions, messages) catch
+        return error.InvalidGatewayHistory;
     const expanded = try expandPendingToolReviewMessages(
         alloc,
         messages,
@@ -1286,6 +1271,50 @@ test "pending tool review closes the exact assistant step with synthetic pending
         error.InvalidGatewayHistory,
         buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
     );
+}
+
+test "pending review and model requests enforce the same prompt lanes" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Read this." },
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
+        } },
+    };
+    const invalid = [_]ChatMessage{
+        .{ .role = .user, .content = "not instructions" },
+        .{ .role = .system },
+        .{ .role = .system, .content = "rules", .provider_state_json = "{}" },
+        .{ .role = .system, .content = "rules", .permission_feedback = true },
+    };
+    for (invalid) |instruction| {
+        const request = stream_provider.RequestData{
+            .model = "review-model",
+            .instructions = &.{instruction},
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        try std.testing.expectError(error.InvalidProviderPrompt, request.validatePrompt());
+        try std.testing.expectError(
+            error.InvalidGatewayHistory,
+            buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+                std.testing.allocator,
+                "[]",
+                &.{instruction},
+                &messages,
+                "read",
+                .{},
+                2048,
+                deadline,
+                &cancel,
+            ),
+        );
+    }
 }
 
 test "pending tool review rejects missing or duplicate target ids" {
