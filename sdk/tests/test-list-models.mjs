@@ -29,21 +29,37 @@ for (const [surface, listModels] of [["node", listNodeModels], ["browser", listB
   assert.equal(calls, 1, `${surface} listModels must perform one explicit request`);
 
   await assert.rejects(listModels({}), (error) => error instanceof TypeError && error.message.includes("apiKey"));
+  let httpErrorCancelled = 0;
   await assert.rejects(
-    listModels({ apiKey: "catalog-key", fetch: async () => new Response("unavailable", { status: 503 }) }),
+    listModels({
+      apiKey: "catalog-key",
+      fetch: async () => new Response(new ReadableStream({
+        pull() {},
+        cancel() {
+          httpErrorCancelled += 1;
+          throw new Error("injected HTTP cleanup failure");
+        },
+      }), { status: 503 }),
+    }),
     (error) => error instanceof Error && error.message.includes("503") && !error.message.includes("catalog-key"),
   );
+  assert.equal(httpErrorCancelled, 1, `${surface} must cancel an HTTP error body without masking the status error`);
   await assert.rejects(
     listModels({ apiKey: "catalog-key", fetch: async () => Response.json({ object: "list" }) }),
     (error) => error instanceof TypeError && error.message.includes("model catalog"),
   );
+  let declaredOversizeCancelled = 0;
   await assert.rejects(
     listModels({
       apiKey: "catalog-key",
-      fetch: async () => Response.json({ object: "list", data: [] }, { headers: { "content-length": String(4 * 1024 * 1024 + 1) } }),
+      fetch: async () => new Response(new ReadableStream({
+        pull() {},
+        cancel() { declaredOversizeCancelled += 1; },
+      }), { headers: { "content-length": String(4 * 1024 * 1024 + 1) } }),
     }),
     (error) => error instanceof RangeError && error.message.includes("4194304"),
   );
+  assert.equal(declaredOversizeCancelled, 1, `${surface} must cancel a body rejected by declared size`);
   await assert.rejects(
     listModels({
       apiKey: "catalog-key",

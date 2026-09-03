@@ -60,9 +60,16 @@ function agentEnvironment(options) {
   };
 }
 
+async function cancelResponseBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
 async function readBoundedResponseText(response, limit) {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > limit) {
+    await cancelResponseBody(response);
     throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
   }
   if (!response.body) {
@@ -107,7 +114,10 @@ export async function listModels(options = {}) {
     method: "GET",
     headers: { authorization: `Bearer ${apiKey}` },
   });
-  if (!response.ok) throw new Error(`model catalog request failed with HTTP ${response.status}`);
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    throw new Error(`model catalog request failed with HTTP ${response.status}`);
+  }
 
   let catalog;
   try {
@@ -1190,6 +1200,7 @@ export async function createFxAgent(options = {}) {
           elapsedMs,
           error: errorName,
         });
+        if (init.signal?.aborted) throw error;
       }
     }
     throw new Error("transport retry exhausted");

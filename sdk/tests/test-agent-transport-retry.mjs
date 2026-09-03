@@ -109,3 +109,40 @@ try {
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent cancellation stopped transport retry`);
+
+const retryBoundaryEvents = [];
+const retryBoundaryController = new AbortController();
+let retryBoundaryFetchCalls = 0;
+const retryBoundaryAgent = await createFxAgent({
+  backend,
+  nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
+  ...(backend === "wasm"
+    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
+    : {}),
+  fetch() {
+    retryBoundaryFetchCalls += 1;
+    throw new TypeError("injected retry-boundary transport failure");
+  },
+  apiKey: "transport-retry-boundary-key",
+  model: "transport-retry/model",
+  onEvent(event) {
+    retryBoundaryEvents.push(event);
+    if (event.type === "transport.retry") retryBoundaryController.abort();
+  },
+});
+
+try {
+  const turn = retryBoundaryAgent.prompt("cancel from the retry event", {
+    signal: retryBoundaryController.signal,
+  });
+  await turn.result.catch(() => {});
+  assert.equal(retryBoundaryFetchCalls, 1, "cancellation from transport.retry must prevent the second fetch");
+  assert.deepEqual(
+    retryBoundaryEvents.filter((event) => event.type === "transport.start").map((event) => event.attempt),
+    [1],
+  );
+} finally {
+  await retryBoundaryAgent.close();
+}
+
+console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent retry-event cancellation stopped transport retry`);
