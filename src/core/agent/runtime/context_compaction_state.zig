@@ -1,7 +1,9 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const result_store = @import("../../session/result_store.zig");
 
 const Allocator = std.mem.Allocator;
+const max_tool_argument_preview_bytes = result_store.preview_bytes;
 
 pub fn projectSemanticMessages(
     alloc: Allocator,
@@ -55,7 +57,7 @@ pub fn renderSemanticMessages(
                 for (message.tool_calls) |call| {
                     try out.writer.print("### Tool call {s}\n", .{call.name});
                     try out.writer.print("Call ID: {s}\n", .{call.id});
-                    try writeQuotedLines(&out.writer, call.arguments_json);
+                    try writeToolArguments(&out.writer, call.arguments_json);
                 }
             },
             .tool => {
@@ -76,6 +78,22 @@ pub fn renderSemanticMessages(
         }
     }
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn writeToolArguments(writer: *std.Io.Writer, arguments_json: []const u8) !void {
+    if (arguments_json.len <= max_tool_argument_preview_bytes) {
+        return writeQuotedLines(writer, arguments_json);
+    }
+    var end = max_tool_argument_preview_bytes;
+    while (end > 0 and !std.unicode.utf8ValidateSlice(arguments_json[0..end])) end -= 1;
+    try writeQuotedLines(writer, arguments_json[0..end]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(arguments_json, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try writer.print(
+        "> <tool_arguments_omitted bytes=\"{d}\" sha256=\"{s}\" />\n",
+        .{ arguments_json.len - end, &hex },
+    );
 }
 
 pub fn renderHandoff(
@@ -141,6 +159,31 @@ test "semantic projection includes completed tool outcomes" {
     try std.testing.expect(std.mem.find(u8, rendered, "Tool call shell") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Tool shell (success)") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "> done") != null);
+}
+
+test "semantic projection bounds oversized tool arguments with stable identity" {
+    const alloc = std.testing.allocator;
+    const arguments = try alloc.alloc(u8, max_tool_argument_preview_bytes + 64);
+    defer alloc.free(arguments);
+    @memset(arguments, 'x');
+    const calls = [_]types.ToolCall{.{
+        .id = "large-call",
+        .name = "write_file",
+        .arguments_json = arguments,
+    }};
+    const messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = &calls,
+    }};
+    const rendered = try renderSemanticMessages(alloc, &messages);
+    defer alloc.free(rendered);
+    try std.testing.expect(rendered.len < arguments.len + 512);
+    try std.testing.expect(std.mem.find(u8, rendered, "tool_arguments_omitted") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "bytes=\"64\"") != null);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(arguments, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expect(std.mem.find(u8, rendered, &hex) != null);
 }
 
 test "compaction handoff does not duplicate the lifetime operation ledger" {

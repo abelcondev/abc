@@ -259,9 +259,16 @@ fn planSummaryRanges(
         var end = start;
         var used: usize = 0;
         while (end < messages.len) {
-            const next = runtime_prompt_context.estimateCompactionSourceTokens(
-                messages[end .. end + 1],
-            );
+            const next = blk: {
+                const rendered = try compaction_state.renderSemanticMessages(
+                    alloc,
+                    messages[end .. end + 1],
+                );
+                defer alloc.free(rendered);
+                break :blk runtime_prompt_context.estimateCompactionSourceTokens(
+                    &.{.{ .role = .user, .content = rendered }},
+                );
+            };
             if (next > limit) return error.CompactionSourceTooLarge;
             if (end > start and used +| next > limit) break;
             used +|= next;

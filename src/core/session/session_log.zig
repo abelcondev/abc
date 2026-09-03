@@ -2139,6 +2139,26 @@ pub const LoadedWritableSession = struct {
         return true;
     }
 
+    pub fn conversationTitle(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+    ) !?[]u8 {
+        if (self.conversation_writer == null) return null;
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &self.log.dir,
+            manifest_file,
+            session_codec.max_session_metadata_bytes,
+        );
+        defer alloc.free(bytes);
+        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
+        defer metadata.deinit();
+        return if (metadata.value.title) |title|
+            try alloc.dupe(u8, title)
+        else
+            null;
+    }
+
     pub fn convertToConversationStorage(
         self: *LoadedWritableSession,
         alloc: Allocator,
@@ -2388,26 +2408,12 @@ pub const LoadedWritableSession = struct {
         const next_seq = std.math.add(u64, self.position.through_seq, 1) catch
             return error.ConversationSequenceOverflow;
         const event_id = randomIdentifier();
-        const frame = try session_event.encodeFrame(alloc, .{
-            .log_generation = self.position.log_generation,
-            .seq = next_seq,
-            .event_id = event_id,
-            .timestamp_ms = timestamp_ms,
-            .event = event,
-        });
-        defer alloc.free(frame);
-        var next_state = try self.state.dupe(alloc);
-        errdefer next_state.deinit(alloc);
-        _ = try session_event.applyEventFrame(
+        var next_state = try self.reduceCompatibilityEvent(
             alloc,
-            &next_state,
-            frame,
-            .{
-                .generation = self.position.log_generation,
-                .next_seq = next_seq,
-            },
-            event_id,
+            event,
+            timestamp_ms,
         );
+        errdefer next_state.deinit(alloc);
         if (isCurrentConversationCheckpoint(payload.turn)) {
             try retainLatestCheckpointHistory(alloc, &next_state);
         }
@@ -2526,28 +2532,13 @@ pub const LoadedWritableSession = struct {
         event: session_event.Event,
         timestamp_ms: i64,
     ) !session_codec.DurableSessionState {
-        const next_seq = std.math.add(u64, self.position.through_seq, 1) catch
-            return error.ConversationSequenceOverflow;
-        const event_id = randomIdentifier();
-        const frame = try session_event.encodeFrame(alloc, .{
-            .log_generation = self.position.log_generation,
-            .seq = next_seq,
-            .event_id = event_id,
-            .timestamp_ms = timestamp_ms,
-            .event = event,
-        });
-        defer alloc.free(frame);
         var next_state = try self.state.dupe(alloc);
         errdefer next_state.deinit(alloc);
-        _ = try session_event.applyEventFrame(
+        try session_event.applyEventToState(
             alloc,
             &next_state,
-            frame,
-            .{
-                .generation = self.position.log_generation,
-                .next_seq = next_seq,
-            },
-            event_id,
+            event,
+            timestamp_ms,
         );
         return next_state;
     }
@@ -10136,6 +10127,11 @@ test "cache-free metadata changes rewrite metadata without conversation records"
             .model = @constCast("updated/model"),
             .fast_mode = true,
         } }, 20, .retry_expected_tail, .{});
+        try std.testing.expect(try loaded.renameConversation(alloc, "renamed session"));
+        const title = (try loaded.conversationTitle(alloc)) orelse
+            return error.TestExpectedConversationTitle;
+        defer alloc.free(title);
+        try std.testing.expectEqualStrings("renamed session", title);
         try std.testing.expectEqual(
             committed_bytes,
             loaded.conversation_writer.?.committed_bytes,

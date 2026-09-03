@@ -4,19 +4,20 @@ const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const event_frame_max_bytes: usize = 8 * 1024 * 1024;
+pub const event_frame_max_bytes: usize = context_limits.emergency_ceiling_bytes;
 pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
 pub const conversation_schema_version: u8 = 1;
-pub const max_conversation_text_bytes: usize = 8 * 1024 * 1024;
+pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = 256;
-pub const max_conversation_arguments_bytes: usize = 1024 * 1024;
+pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_preview_bytes: usize = 4 * 1024;
 
 pub const ArtifactCompleteness = enum {
@@ -1588,6 +1589,26 @@ fn applyDelta(
             return error.InvalidReplacement;
         },
     }
+}
+
+pub fn applyEventToState(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+    event: Event,
+    timestamp_ms: i64,
+) !void {
+    const zero_id = [_]u8{0} ** 16;
+    const envelope = Envelope{
+        .log_generation = zero_id,
+        .seq = 1,
+        .event_id = zero_id,
+        .timestamp_ms = timestamp_ms,
+        .event = event,
+    };
+    try validateEnvelope(envelope);
+    var current: ?session_codec.DurableSessionState = state.*;
+    try applyDelta(alloc, &current, envelope);
+    state.* = current.?;
 }
 
 fn validateEnvelope(envelope: Envelope) !void {

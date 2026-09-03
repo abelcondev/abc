@@ -2756,13 +2756,10 @@ describe("gateway stream lifecycle", () => {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { kind: string });
-      expect(appendedEvents.map((event) => event.kind)).toContain(
-        "history_turn_committed",
-      );
-      expect(appendedEvents.map((event) => event.kind)).not.toContain(
-        "state_replacement_started",
-      );
+        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
+      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
+      expect(appendedKinds).toContain("turn_completed");
+      expect(appendedKinds).not.toContain("state_replacement_started");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4822,11 +4819,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
         expect(compactionRequest).toContain("Read the explicit skill before compaction.");
-        expect(compactionRequest).not.toContain(bodySentinel);
-        expect(compactionRequest).not.toContain("<skill_content");
-        expect(compactionRequest).not.toContain("tool_result_handle");
+        expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain("<skill_content");
+        expect(compactionRequest).toContain("Result handle:");
         expect(postCompactionRequest).toContain("context_handoff");
-        expect(postCompactionRequest).toContain("result_handle=");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {

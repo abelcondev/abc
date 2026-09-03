@@ -3583,6 +3583,9 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             session: *session_store.LoadedWritableSession,
         ) !session_display_metadata.DisplayMetadata {
+            if (try session.conversationTitle(app.alloc)) |title| {
+                return .{ .present = true, .title = title };
+            }
             // The sidecar title is frozen at first derivation; prefer it so the
             // notice matches the picker row the user selected. The notice is
             // cosmetic, so read failures fall back instead of failing the resume.

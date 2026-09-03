@@ -5,6 +5,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -225,7 +226,7 @@ pub const SessionMetadata = struct {
 
 pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
 pub const max_permission_state_bytes: usize = 1024 * 1024;
-pub const max_recovery_checkpoint_bytes: usize = 8 * 1024 * 1024;
+pub const max_recovery_checkpoint_bytes: usize = context_limits.emergency_ceiling_bytes;
 
 pub fn encodeSessionMetadata(
     alloc: Allocator,
@@ -3988,6 +3989,29 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "recovery checkpoint accepts the exact composer byte limit" {
+    const alloc = std.testing.allocator;
+    const prompt = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(prompt);
+    @memset(prompt, 'x');
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = prompt },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+    const encoded = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > prompt.len);
+    try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
 }
 
 test "session permission state round trips while legacy state stays empty" {
