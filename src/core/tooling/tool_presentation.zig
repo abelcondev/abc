@@ -161,7 +161,7 @@ pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []cons
     return false;
 }
 
-/// The caller owns `detail` and must free it with `alloc`.
+/// Returns a borrowed static label when the call is a captured command.
 pub fn runCommandCompletedActionLabel(
     alloc: Allocator,
     registry: tool_dispatch.Registry,

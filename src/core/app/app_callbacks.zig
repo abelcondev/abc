@@ -517,10 +517,14 @@ pub fn Bindings(comptime App: type) type {
                     if (parsed.value == .object) {
                         if (parsed.value.object.get("command")) |command_value| {
                             if (command_value == .string) {
+                                const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                                    if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+                                else
+                                    app.workspace_root;
                                 const display = tool_presentation.formatRunCommandDetailBounded(
                                     alloc,
                                     command_value.string,
-                                    app.workspace_root,
+                                    workspace_root,
                                     tool_presentation.max_run_command_reflow_bytes,
                                 ) catch |err| blk: {
                                     debug_trace.logf(
@@ -531,6 +535,11 @@ pub fn Bindings(comptime App: type) type {
                                     break :blk null;
                                 };
                                 defer if (display) |bytes| alloc.free(bytes);
+                                if (display == null) debug_trace.logf(
+                                    "ui_activity",
+                                    "command display withheld turn_id={d}",
+                                    .{started.id.turn_id},
+                                );
                                 const action_label = tool_presentation.runCommandCompletedActionLabel(
                                     alloc,
                                     app.toolRegistry(),
@@ -547,6 +556,11 @@ pub fn Bindings(comptime App: type) type {
                                     );
                                     break :blk null;
                                 };
+                                if (action_label == null) debug_trace.logf(
+                                    "ui_activity",
+                                    "command action label withheld turn_id={d}",
+                                    .{started.id.turn_id},
+                                );
                                 if (display != null and action_label != null) {
                                     app.shell.setToolCommandMetadata(
                                         alloc,

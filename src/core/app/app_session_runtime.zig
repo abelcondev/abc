@@ -1997,10 +1997,18 @@ pub fn Runtime(comptime App: type) type {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
                 defer projection.deinit();
+                const projection_workspace_root = if (std.mem.eql(
+                    u8,
+                    state.origin_workspace_root,
+                    state.workspace_root,
+                ))
+                    state.workspace_root
+                else
+                    "";
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
-                    .workspace_root = state.workspace_root,
+                    .workspace_root = projection_workspace_root,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
@@ -3448,7 +3456,14 @@ pub fn Runtime(comptime App: type) type {
                             .{ entry_id, @errorName(err) },
                         );
                         break :blk null;
-                    }) orelse return;
+                    }) orelse {
+                        debug_trace.logf(
+                            "session",
+                            "historical command display withheld entry_id={d}",
+                            .{entry_id},
+                        );
+                        return;
+                    };
                     defer self.projection.alloc.free(display);
                     const label = tooling_presentation.runCommandCompletedActionLabel(
                         self.projection.alloc,
@@ -3462,6 +3477,11 @@ pub fn Runtime(comptime App: type) type {
                         );
                         break :blk null;
                     };
+                    if (label == null) debug_trace.logf(
+                        "session",
+                        "historical command action label withheld entry_id={d}",
+                        .{entry_id},
+                    );
                     if (label) |value| self.projection.setHistoricalToolCommandMetadata(
                         entry_id,
                         display,
