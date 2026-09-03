@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { readTapeFrames } from "./render-lab/tape";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -1633,6 +1634,48 @@ tmuxTest(
 );
 
 tmuxTest(
+  "provider switch before the first prompt discards the previous credential prewarm",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-prewarm-provider-switch-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(null);
+    chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ credential_source: "fx_login" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      ...chatgptOauth.env,
+      FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await waitForTrace(tracePath, "prompt credential prewarm start outcome=started");
+    await openProviderPicker(session);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to Codex subscription", TIMEOUT);
+
+    await session.sendText("Use the selected subscription for the first prompt.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", 10_000);
+    const responses = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses",
+    );
+    expect(responses).toHaveLength(1);
+    expect(responses[0]!.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "provider switch reauthenticates current Codex and replaces an unavailable model",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-success-"));
@@ -2203,9 +2246,28 @@ async function waitForModelRequestCount(
   }
 }
 
-async function waitForTrace(tracePath: string, needle: string): Promise<void> {
+async function waitForOAuthRequestCount(
+  fakeOAuth: ReturnType<typeof startFakeOAuth>,
+  count: number,
+): Promise<void> {
   const started = Date.now();
-  while (Date.now() - started < TIMEOUT) {
+  while (fakeOAuth.requests.length < count) {
+    if (Date.now() - started >= TIMEOUT) {
+      throw new Error(
+        `Timed out waiting for ${count} OAuth requests; saw ${fakeOAuth.requests.length}`,
+      );
+    }
+    await Bun.sleep(25);
+  }
+}
+
+async function waitForTrace(
+  tracePath: string,
+  needle: string,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
     if (existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(needle)) return;
     await Bun.sleep(25);
   }
@@ -4747,9 +4809,6 @@ tmuxTest(
     await session.sendKeys("C-u");
     await session.sendKeys("C-k");
     await selectEnvKeyCredential(session);
-    await session.waitForComposer(TIMEOUT);
-    await session.sendLiteral(`${promptHead}${promptTail}`);
-    await session.sendKeys("Enter");
     await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
 
     expect(gateway.requests).toHaveLength(1);
@@ -4770,6 +4829,9 @@ tmuxTest(
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-repair-"));
     stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    const tapePath = join(home, "pending-activity.fxtape");
+    const replayPath = join(home, "pending-activity-replay");
     writeFileSync(stderrPath, "");
     gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
@@ -4779,14 +4841,61 @@ tmuxTest(
     });
     writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
 
-    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
       AI_GATEWAY_API_KEY: undefined,
+      FX_TRACE_SCOPES: "auth,input",
+      FX_RECORD: tapePath,
+      FX_RECORD_INPUT: "1",
     });
     await session.waitForComposer(TIMEOUT);
+    await waitForTrace(tracePath, "prompt credential prewarm start outcome=started", 1_000);
     const prompt = "PRESERVE_DURING_LOGIN_REPAIR";
     await session.sendText(prompt);
-    await session.waitForText("fx login sign-in expired.", TIMEOUT);
+    await waitForTrace(tracePath, "event=pending_prompt_frame_committed", 1_000);
+    await session.waitForPane(
+      (pane) => pane.includes(prompt) && pane.includes("Thinking"),
+      1_000,
+    );
+    const responsiveDraft = "TERMINAL_RESPONSIVE_DURING_CREDENTIAL_REFRESH";
+    await session.sendLiteral(responsiveDraft);
+    await session.waitForPane(
+      (pane) => pane.includes(responsiveDraft),
+      1_000,
+    );
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+    await session.waitForPane(
+      (pane) => pane.includes("fx login sign-in expired.") && !pane.includes("Thinking"),
+      TIMEOUT,
+    );
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    const frames = readTapeFrames(tapePath);
+    const promptInput = frames.findIndex((frame) => frame.kind === 2 && frame.payload.includes(prompt));
+    expect(promptInput).toBeGreaterThanOrEqual(0);
+    const enter = frames.findIndex((frame, index) =>
+      index > promptInput && frame.kind === 2 && frame.payload.equals(Buffer.from("\r"))
+    );
+    expect(enter).toBeGreaterThan(promptInput);
+    const firstOutput = frames.slice(enter + 1).find((frame) => frame.kind === 1);
+    expect(firstOutput).toBeDefined();
+    expect(firstOutput!.payload.includes(prompt)).toBe(true);
+    expect(firstOutput!.payload.includes("Thinking")).toBe(true);
+
+    const replay = await runFx(["replay", tapePath, "--frames-dir", replayPath]);
+    expect(replay.code).toBe(0);
+    const grids = readdirSync(join(replayPath, "frames"))
+      .filter((name) => name.endsWith(".grid.txt"))
+      .sort()
+      .map((name) => readFileSync(join(replayPath, "frames", name), "utf8"));
+    const thinkingGrids = grids.filter((grid) => grid.includes("Thinking"));
+    expect(thinkingGrids.length).toBeGreaterThan(0);
+    for (const grid of thinkingGrids) {
+      const rows = grid.split("\n");
+      const promptRow = rows.findIndex((row) => row.includes(prompt));
+      expect(promptRow).toBeGreaterThanOrEqual(0);
+      expect(rows.findIndex((row) => row.includes("Thinking"))).toBe(promptRow + 2);
+    }
 
     await session.sendKeys("Enter");
     await session.waitForText("Waiting for authorization", TIMEOUT);
@@ -5069,7 +5178,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "expired saved login discovers models without refreshing prompt credentials",
+  "expired saved login prewarms credentials while model discovery stays anonymous",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-models-"));
     stderrPath = join(home, "stderr.log");
@@ -5088,7 +5197,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
@@ -5101,7 +5214,10 @@ tmuxTest(
       TIMEOUT,
     );
 
-    expect(oauth.requests).toEqual([]);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5212,7 +5328,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "an invalid refreshed lifetime retires the login and keeps model discovery anonymous",
+  "an immediately expired prewarm retires the login and keeps model discovery anonymous",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-refresh-models-"));
     stderrPath = join(home, "stderr.log");
@@ -5327,7 +5443,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(creditsGateway.requests).toEqual([]);
 
@@ -5379,7 +5499,11 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
-    expect(oauth.requests).toEqual([]);
+    await waitForOAuthRequestCount(oauth, 2);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
     expect(creditsGateway.requests).toEqual([]);
