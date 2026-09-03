@@ -224,6 +224,8 @@ pub const SessionMetadata = struct {
 };
 
 pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
+pub const max_permission_state_bytes: usize = 1024 * 1024;
+pub const max_recovery_checkpoint_bytes: usize = 8 * 1024 * 1024;
 
 pub fn encodeSessionMetadata(
     alloc: Allocator,
@@ -257,6 +259,73 @@ pub fn decodeSessionMetadata(
     errdefer parsed.deinit();
     validateSessionMetadata(parsed.value) catch return error.InvalidSessionMetadata;
     return parsed;
+}
+
+pub fn encodePermissionState(
+    alloc: Allocator,
+    state: session_permission_state.State,
+) ![]u8 {
+    try session_permission_state.validate(state);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writePermissionState(&out.writer, state);
+    if (out.written().len == 0 or out.written().len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodePermissionState(
+    alloc: Allocator,
+    bytes: []const u8,
+) !session_permission_state.State {
+    if (bytes.len == 0 or bytes.len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_permission_state_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+    defer parsed.deinit();
+    return parsePermissionState(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+}
+
+pub fn encodeRecoveryCheckpoint(
+    alloc: Allocator,
+    checkpoint: RecoveryCheckpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeRecoveryCheckpoint(&out.writer, checkpoint);
+    if (out.written().len == 0 or out.written().len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeRecoveryCheckpoint(
+    alloc: Allocator,
+    bytes: []const u8,
+) !RecoveryCheckpoint {
+    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_recovery_checkpoint_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+    defer parsed.deinit();
+    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
 }
 
 fn validateSessionMetadata(metadata: SessionMetadata) !void {

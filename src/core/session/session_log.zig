@@ -16,6 +16,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_resume_view = @import("session_resume_view.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -31,6 +32,8 @@ const authority_file = "authority.json";
 const authority_intent_file = "authority.pending.json";
 const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
+const permission_state_file = "permissions.json";
+const recovery_checkpoint_file = "recovery.json";
 const checkpoint_file = "checkpoint.json";
 const session_lock_file = "session.lock";
 const commit_lock_file = "commit.lock";
@@ -251,6 +254,110 @@ fn createConversationStorage(
     return ConversationWriter.init(alloc, file);
 }
 
+fn writeConversationMetadata(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    state: session_codec.DurableSessionState,
+) !void {
+    const bytes = try session_codec.encodeSessionMetadata(alloc, .{
+        .id = state.id,
+        .origin_workspace_root = state.origin_workspace_root,
+        .workspace_root = state.workspace_root,
+        .created_at_ms = state.created_at_ms,
+        .updated_at_ms = state.updated_at_ms,
+        .conversation_language = state.conversation_language.view(),
+        .provider = @tagName(state.preferences.provider),
+        .model = state.preferences.model,
+        .effort = state.preferences.effort.label(),
+        .fast_mode = state.preferences.fast_mode,
+        .subagent_child = state.subagent_child,
+    });
+    defer alloc.free(bytes);
+    try io_mod.durableReplaceVerified(alloc, dir, manifest_file, bytes);
+}
+
+fn writeConversationControlState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    state: session_codec.DurableSessionState,
+) !void {
+    const permission_bytes = try session_codec.encodePermissionState(
+        alloc,
+        state.permission_state,
+    );
+    defer alloc.free(permission_bytes);
+    try io_mod.durableReplaceVerified(
+        alloc,
+        dir,
+        permission_state_file,
+        permission_bytes,
+    );
+    if (state.usage) |usage| {
+        try session_usage_sidecar.write(alloc, dir, state.id, usage);
+    }
+    try writeConversationRecoveryState(alloc, dir, state.recovery_checkpoint);
+}
+
+fn writeConversationRecoveryState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    recovery_checkpoint: ?session_codec.RecoveryCheckpoint,
+) !void {
+    if (recovery_checkpoint) |checkpoint| {
+        const recovery_bytes = try session_codec.encodeRecoveryCheckpoint(
+            alloc,
+            checkpoint,
+        );
+        defer alloc.free(recovery_bytes);
+        try io_mod.durableReplaceVerified(
+            alloc,
+            dir,
+            recovery_checkpoint_file,
+            recovery_bytes,
+        );
+    } else {
+        dir.dir.deleteFile(io_mod.getIo(), recovery_checkpoint_file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try io_mod.syncVerifiedDir(dir.dir);
+    }
+}
+
+fn loadConversationPermissionState(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !session_permission_state.State {
+    const bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        permission_state_file,
+        session_codec.max_permission_state_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer alloc.free(bytes);
+    return session_codec.decodePermissionState(alloc, bytes);
+}
+
+fn loadConversationRecoveryCheckpoint(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !?session_codec.RecoveryCheckpoint {
+    const bytes = readManagedFileAlloc(
+        alloc,
+        dir,
+        recovery_checkpoint_file,
+        session_codec.max_recovery_checkpoint_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(bytes);
+    return try session_codec.decodeRecoveryCheckpoint(alloc, bytes);
+}
+
 fn loadConversationStateIfPresent(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
@@ -287,6 +394,16 @@ fn loadConversationStateIfPresent(
     defer event_file.close(io_mod.getIo());
     const history = try replayConversationHistory(alloc, event_file);
     errdefer session.freeHistoryTurnSlice(alloc, history);
+    var usage = try session_usage_sidecar.load(
+        alloc,
+        dir,
+        expected_session_id,
+    );
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+    var permission_state = try loadConversationPermissionState(alloc, dir);
+    errdefer permission_state.deinit(alloc);
+    var recovery_checkpoint = try loadConversationRecoveryCheckpoint(alloc, dir);
+    errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     const id = try alloc.dupe(u8, metadata.value.id);
     errdefer alloc.free(id);
     const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
@@ -319,6 +436,9 @@ fn loadConversationStateIfPresent(
         .context_history_start = latestConversationCheckpointIndex(history),
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .permission_state = permission_state,
+        .usage = usage,
+        .recovery_checkpoint = recovery_checkpoint,
         .subagent_child = metadata.value.subagent_child,
     };
 }
@@ -1296,7 +1416,22 @@ pub const LoadedWritableSession = struct {
                 event,
                 timestamp_ms,
             ),
-            else => {},
+            .preferences_changed, .workspace_rebound => return self.appendConversationMetadataEvent(
+                alloc,
+                event,
+                timestamp_ms,
+            ),
+            .usage_checkpointed => return self.appendConversationUsageEvent(
+                alloc,
+                event,
+                timestamp_ms,
+            ),
+            .recovery_checkpoint_set, .recovery_checkpoint_cleared => return self.appendConversationRecoveryEvent(
+                alloc,
+                event,
+                timestamp_ms,
+            ),
+            else => return error.UnsupportedConversationEvent,
         };
         const preserves_pristine_start = switch (event) {
             .usage_checkpointed,
@@ -1419,6 +1554,106 @@ pub const LoadedWritableSession = struct {
         return self.position;
     }
 
+    fn appendConversationMetadataEvent(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        event: session_event.Event,
+        timestamp_ms: i64,
+    ) !CommitPosition {
+        var next_state = try self.reduceCompatibilityEvent(
+            alloc,
+            event,
+            timestamp_ms,
+        );
+        errdefer next_state.deinit(alloc);
+        try writeConversationMetadata(alloc, &self.log.dir, next_state);
+        self.state.deinit(alloc);
+        self.state = next_state;
+        self.freshly_started = false;
+        self.state_replacement_pending = false;
+        return self.position;
+    }
+
+    fn appendConversationUsageEvent(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        event: session_event.Event,
+        timestamp_ms: i64,
+    ) !CommitPosition {
+        var next_state = try self.reduceCompatibilityEvent(
+            alloc,
+            event,
+            timestamp_ms,
+        );
+        errdefer next_state.deinit(alloc);
+        const snapshot = next_state.usage orelse return error.InvalidConversationEvent;
+        try session_usage_sidecar.write(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+            snapshot,
+        );
+        self.state.deinit(alloc);
+        self.state = next_state;
+        self.state_replacement_pending = false;
+        return self.position;
+    }
+
+    fn appendConversationRecoveryEvent(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        event: session_event.Event,
+        timestamp_ms: i64,
+    ) !CommitPosition {
+        var next_state = try self.reduceCompatibilityEvent(
+            alloc,
+            event,
+            timestamp_ms,
+        );
+        errdefer next_state.deinit(alloc);
+        try writeConversationRecoveryState(
+            alloc,
+            &self.log.dir,
+            next_state.recovery_checkpoint,
+        );
+        self.state.deinit(alloc);
+        self.state = next_state;
+        self.state_replacement_pending = false;
+        return self.position;
+    }
+
+    fn reduceCompatibilityEvent(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        event: session_event.Event,
+        timestamp_ms: i64,
+    ) !session_codec.DurableSessionState {
+        const next_seq = std.math.add(u64, self.position.through_seq, 1) catch
+            return error.ConversationSequenceOverflow;
+        const event_id = randomIdentifier();
+        const frame = try session_event.encodeFrame(alloc, .{
+            .log_generation = self.position.log_generation,
+            .seq = next_seq,
+            .event_id = event_id,
+            .timestamp_ms = timestamp_ms,
+            .event = event,
+        });
+        defer alloc.free(frame);
+        var next_state = try self.state.dupe(alloc);
+        errdefer next_state.deinit(alloc);
+        _ = try session_event.applyEventFrame(
+            alloc,
+            &next_state,
+            frame,
+            .{
+                .generation = self.position.log_generation,
+                .next_seq = next_seq,
+            },
+            event_id,
+        );
+        return next_state;
+    }
+
     pub fn commitStateReplacement(
         self: *LoadedWritableSession,
         alloc: Allocator,
@@ -1427,6 +1662,19 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
+        if (self.conversation_writer != null) {
+            if (state.history.len != self.state.history.len) {
+                return error.ConversationHistoryMustUseEvents;
+            }
+            try writeConversationMetadata(alloc, &self.log.dir, state);
+            try writeConversationControlState(alloc, &self.log.dir, state);
+            const next_state = try state.dupe(alloc);
+            self.state.deinit(alloc);
+            self.state = next_state;
+            self.freshly_started = false;
+            self.state_replacement_pending = false;
+            return self.position;
+        }
         var replacement = state;
         replacement.subagent_child = self.state.subagent_child;
         const usage_sidecar_bytes = if (replacement.usage) |usage|
@@ -3010,6 +3258,7 @@ fn createNativeSession(
         state.usage = synthesized_usage;
         synthesized_usage = null;
     }
+    try writeConversationControlState(alloc, &writable.dir, state);
     const active_id = try alloc.dupe(u8, writable.session_id);
     errdefer alloc.free(active_id);
     const generation = randomIdentifier();
@@ -8714,17 +8963,23 @@ test "root starts a cache-free conversation session" {
     var saw_events = false;
     var saw_metadata = false;
     var saw_writer_lock = false;
+    var saw_permissions = false;
+    var saw_usage = false;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |entry| {
         count += 1;
         if (std.mem.eql(u8, entry.name, "events.jsonl")) saw_events = true;
         if (std.mem.eql(u8, entry.name, "session.json")) saw_metadata = true;
         if (std.mem.eql(u8, entry.name, "session.lock")) saw_writer_lock = true;
+        if (std.mem.eql(u8, entry.name, "permissions.json")) saw_permissions = true;
+        if (std.mem.eql(u8, entry.name, "usage-v2.json")) saw_usage = true;
     }
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 5), count);
     try std.testing.expect(saw_events);
     try std.testing.expect(saw_metadata);
     try std.testing.expect(saw_writer_lock);
+    try std.testing.expect(saw_permissions);
+    try std.testing.expect(saw_usage);
 }
 
 test "cache-free session appends history through the conversation writer" {
@@ -8758,7 +9013,7 @@ test "cache-free session appends history through the conversation writer" {
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 5), count);
 }
 
 test "cache-free conversation session resumes from metadata and JSONL" {
@@ -8832,6 +9087,150 @@ test "cache-free writable resume continues the conversation sequence" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
     try std.testing.expectEqualStrings("second answer", loaded.history[1].assistant.assistant);
+}
+
+test "cache-free metadata changes rewrite metadata without conversation records" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-metadata", 10);
+    defer initial.deinit(alloc);
+    var committed_bytes: u64 = 0;
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        committed_bytes = loaded.conversation_writer.?.committed_bytes;
+        _ = try loaded.appendEvent(alloc, .{ .preferences_changed = .{
+            .model = @constCast("updated/model"),
+            .fast_mode = true,
+        } }, 20, .retry_expected_tail, .{});
+        try std.testing.expectEqual(
+            committed_bytes,
+            loaded.conversation_writer.?.committed_bytes,
+        );
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("updated/model", resumed.preferences.model);
+    try std.testing.expect(resumed.preferences.fast_mode);
+}
+
+test "cache-free usage checkpoints stay outside conversation history" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-usage", 10);
+    defer initial.deinit(alloc);
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    try usage.recordCommittedLines(9, 4);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var committed_bytes: u64 = 0;
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        committed_bytes = loaded.conversation_writer.?.committed_bytes;
+        _ = try loaded.appendEvent(alloc, .{
+            .usage_checkpointed = .{ .usage = snapshot },
+        }, 20, .retry_expected_tail, .{});
+        try std.testing.expectEqual(
+            committed_bytes,
+            loaded.conversation_writer.?.committed_bytes,
+        );
+        try std.testing.expect(loaded.freshly_started);
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 9), resumed.usage.?.lines_added);
+    try std.testing.expectEqual(@as(u64, 4), resumed.usage.?.lines_removed);
+    try std.testing.expectEqual(@as(usize, 0), resumed.history.len);
+}
+
+test "cache-free recovery checkpoint resumes and clears independently" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery", 10);
+    defer initial.deinit(alloc);
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20, .retry_expected_tail, .{});
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_cleared = .{},
+        }, 30, .retry_expected_tail, .{});
+    }
+
+    var cleared = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer cleared.deinit(alloc);
+    try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), cleared.recovery_checkpoint);
+}
+
+test "cache-free permission state resumes from its domain file" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-permission", 10);
+    defer initial.deinit(alloc);
+    const key = try session_permission_state.RuleKey.init(
+        .command,
+        "command\x00/workspace\x00zig build",
+    );
+    var applied = try session_permission_state.apply(alloc, .{}, .{ .set = .{
+        .key = key,
+        .display_identity = "zig build",
+        .decision = .deny,
+        .expected_generation = null,
+    } });
+    var permissions = applied.takeApplied() orelse return error.TestUnexpectedResult;
+    defer permissions.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var replacement = try loaded.state.dupe(alloc);
+        defer replacement.deinit(alloc);
+        replacement.permission_state.deinit(alloc);
+        replacement.permission_state = try session_permission_state.dupe(
+            alloc,
+            permissions,
+        );
+        _ = try loaded.commitStateReplacement(
+            alloc,
+            replacement,
+            .compaction,
+            .retry_expected_tail,
+            .{},
+        );
+    }
+
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(resumed.permission_state, key),
+    );
 }
 
 test "cache-free resume rebuilds tool calls and external result references" {
