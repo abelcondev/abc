@@ -1,7 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -135,20 +134,13 @@ const RenderReconciliation = union(enum) {
     frame_result: FrameAttemptResult,
 };
 
-const QueuedCardProjection = struct {
-    cards: []render_input.QueuedPromptCard = &.{},
-    steering_messages: [][]u8 = &.{},
-    steering_waits_for_tool: bool = false,
-    ordinary_count: usize = 0,
-    paused: bool = false,
-    row_count: u16 = 0,
-    editor_active: bool = false,
+const SteeringProjection = struct {
+    messages: [][]u8 = &.{},
+    waits_for_tool: bool = false,
 
-    fn deinit(self: *QueuedCardProjection, alloc: std.mem.Allocator) void {
-        for (self.cards) |card| alloc.free(card.bytes);
-        if (self.cards.len > 0) alloc.free(self.cards);
-        for (self.steering_messages) |message| alloc.free(message);
-        if (self.steering_messages.len > 0) alloc.free(self.steering_messages);
+    fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
+        for (self.messages) |message| alloc.free(message);
+        if (self.messages.len > 0) alloc.free(self.messages);
         self.* = .{};
     }
 };
@@ -318,107 +310,17 @@ fn previewWithPendingCard(
     return next;
 }
 
-// Steering text stays visible while ordinary queued prompts remain collapsed
-// until review opens. Every slice in the result is owned for one render frame.
-fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
-    var projection: QueuedCardProjection = .{};
+// Every steering slice in the result is owned for one render frame.
+fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
+    var projection: SteeringProjection = .{};
     errdefer projection.deinit(app.alloc);
-    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotQueuePresentation")) {
-        var snapshot = try app.worker.snapshotQueuePresentation(app.alloc);
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
+        var snapshot = try app.worker.snapshotSteeringPresentation(app.alloc);
         defer snapshot.deinit(app.alloc);
-        projection.ordinary_count = snapshot.ordinary_count;
-        projection.paused = snapshot.paused;
-        projection.steering_waits_for_tool = snapshot.steering_waits_for_tool;
-        projection.steering_messages = snapshot.steering_messages;
-        snapshot.steering_messages = &.{};
-    } else {
-        const queue_preview = app.worker.queuePreview();
-        const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-            queue_preview.steering_count
-        else
-            0;
-        projection.ordinary_count = queue_preview.count -| steering_count;
-        projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
-            queue_preview.paused
-        else
-            false;
+        projection.waits_for_tool = snapshot.waits_for_tool;
+        projection.messages = snapshot.messages;
+        snapshot.messages = &.{};
     }
-    if (comptime !@hasField(App, "queued_prompt_review")) return projection;
-    const review_entries = app.queued_prompt_review.entries;
-    if (!app.queued_prompt_review.visible or
-        !app.queued_prompt_review.active() or
-        review_entries.len == 0) return projection;
-    const draft_count = review_entries.len;
-
-    const measurement = try input_queue_runtime.measureVisibleReviewRows(
-        app.alloc,
-        &app.queued_prompt_review,
-        .{
-            .input = app.input_runtime.edit_state.input.items,
-            .cursor = app.input_runtime.edit_state.cursor,
-            .terminal_cols = app.shell.layout.cols,
-            .images = app.pending_images.items,
-            .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
-            .image_tokens = app.input_runtime.entities.image_tokens.items,
-            .skill_tokens = app.input_runtime.entities.skill_tokens.items,
-        },
-    );
-
-    const cards = try app.alloc.alloc(render_input.QueuedPromptCard, draft_count);
-    var built: usize = 0;
-    errdefer {
-        for (cards[0..built]) |card| app.alloc.free(card.bytes);
-        app.alloc.free(cards);
-    }
-
-    while (built < draft_count) : (built += 1) {
-        const draft = review_entries[built].draft;
-        const editing = app.queued_prompt_review.selected_index != null and
-            app.queued_prompt_review.selected_index.? == built;
-        if (editing) {
-            cards[built] = .{
-                .bytes = try app.alloc.dupe(u8, ""),
-                .editing = true,
-            };
-            continue;
-        }
-
-        const review_input = draft.reviewInput();
-        const review_skill_spans = draft.reviewSkillDisplaySpans();
-        var skill_tokens: []registered_entities.SkillTokenSpan = if (review_skill_spans.len > 0)
-            try app.alloc.alloc(registered_entities.SkillTokenSpan, review_skill_spans.len)
-        else
-            &.{};
-        defer if (skill_tokens.len > 0) app.alloc.free(skill_tokens);
-        for (review_skill_spans, 0..) |span, i| {
-            skill_tokens[i] = .{
-                .raw_start = span.raw_start,
-                .raw_end = span.raw_end,
-                .name = span.name,
-                .path = span.path,
-                .display_source = span.display_source,
-                .owns_trailing_separator = span.owns_trailing_separator,
-            };
-        }
-
-        const bytes = try input_presentation.composeQueuedPromptCard(
-            app.alloc,
-            .{
-                .input = review_input,
-                .cursor = 0,
-                .terminal_cols = app.shell.layout.cols,
-                .images = draft.images,
-                .pasted_blocks = review_entries[built].pasted_blocks.items,
-                .image_tokens = review_entries[built].image_tokens.items,
-                .skill_tokens = skill_tokens,
-            },
-        );
-        cards[built] = .{ .bytes = bytes };
-    }
-
-    projection.cards = cards;
-    projection.row_count = measurement.card_rows;
-    projection.editor_active = measurement.editor_active;
     return projection;
 }
 
@@ -542,7 +444,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             upgrade_status_buf: *[64]u8,
             shimmer_pos: i16,
-            queued_cards: *const QueuedCardProjection,
+            steering: *const SteeringProjection,
         ) render_input.RenderContext {
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
             const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
@@ -711,24 +613,8 @@ pub fn Runtime(comptime App: type) type {
                     app.permission_engine.mode
                 else
                     .ask,
-                .queued_count = if (queued_cards.cards.len > 0)
-                    queued_cards.cards.len
-                else
-                    queued_cards.ordinary_count + queued_cards.steering_messages.len,
-                .steering_messages = queued_cards.steering_messages,
-                .steering_waits_for_tool = queued_cards.steering_waits_for_tool,
-                .queued_paused = queued_cards.paused,
-                .queued_cancel_all_available = if (comptime @hasField(App, "queued_prompt_review"))
-                    app.queued_prompt_review.active() and
-                        app.queued_prompt_review.reason.? == .post_cancel and
-                        !app.queued_prompt_review.visible and
-                        app.input_runtime.edit_state.input.items.len == 0 and
-                        app.pending_images.items.len == 0
-                else
-                    false,
-                .queued_prompt_cards = queued_cards.cards,
-                .queued_prompt_card_rows = queued_cards.row_count,
-                .queued_editor_active = queued_cards.editor_active,
+                .steering_messages = steering.messages,
+                .steering_waits_for_tool = steering.waits_for_tool,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
@@ -1217,8 +1103,8 @@ pub fn Runtime(comptime App: type) type {
             const presentation_shell: *transcript_runtime.TranscriptRuntime = &app.shell;
             const render_requests = activeRenderRequests(app);
             var upgrade_status_buf: [64]u8 = undefined;
-            var queued_cards = try buildQueuedCardProjection(App, app);
-            defer queued_cards.deinit(app.alloc);
+            var steering = try buildSteeringProjection(App, app);
+            defer steering.deinit(app.alloc);
             const shimmer_pos = if (snapshot.animation_candidate) |candidate|
                 candidate.phase
             else
@@ -1227,10 +1113,10 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 &upgrade_status_buf,
                 shimmer_pos,
-                &queued_cards,
+                &steering,
             );
             var footer_ctx = main_footer_ctx;
-            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx, app.shell.layout.cols))) {
+            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
                 .frame_result => |result| return result,
@@ -3213,14 +3099,8 @@ test "core.app_render_runtime animation retry stays ahead of a newer fact" {
 
 const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
-    queued_count: usize = 0,
-    paused: bool = false,
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
-
-    pub fn queuePreview(self: *@This()) worker_runtime.QueuePreview {
-        return .{ .count = self.queued_count, .paused = self.paused };
-    }
 
     pub fn isCancelRequested(self: *const @This()) bool {
         return self.cancel_requested;
@@ -3313,7 +3193,6 @@ const CoordinatorTestApp = struct {
     shell: transcript_runtime.TranscriptRuntime,
     metrics: types.Metrics = .{},
     input_runtime: core_input_runtime.Runtime = .{},
-    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
@@ -3347,7 +3226,6 @@ const CoordinatorTestApp = struct {
 
     fn deinit(self: *CoordinatorTestApp) void {
         self.shell.deinit(self.alloc);
-        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -3410,19 +3288,6 @@ const CoordinatorTestApp = struct {
     }
 };
 
-fn makeCoordinatorReviewEntry(
-    alloc: std.mem.Allocator,
-    turn_id: u64,
-    text: []const u8,
-) !input_queue_runtime.ReviewEntry {
-    return .{ .draft = .{
-        .turn_id = turn_id,
-        .prompt = try alloc.dupe(u8, text),
-        .images = &.{},
-        .skill_display_spans = &.{},
-    } };
-}
-
 fn initCoordinatorProjectionTestApp(
     alloc: std.mem.Allocator,
     file: std.Io.File,
@@ -3471,12 +3336,12 @@ test "core.app_render_runtime keeps final token progress during paced response t
     defer app.deinit();
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqual(progress, ctx.stream.token_progress);
@@ -3512,12 +3377,12 @@ test "core.app_render_runtime hides loading after active tool cancellation" {
     } });
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expect(!ctx.stream.active);
@@ -3544,12 +3409,12 @@ test "core.app_render_runtime keeps loading while cancellation continues the tur
     app.worker.cancel_continues_turn = true;
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expect(ctx.stream.active);
@@ -3568,23 +3433,20 @@ test "core.app_render_runtime keeps configured controls visible while model capa
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     var hint_buf: [128]u8 = undefined;
     const line = ui_render.buildHintLine(
-        ctx.stream.active,
         false,
         ctx.has_api_key,
         ctx.model,
         ctx.permission_mode,
-        ctx.queued_count,
-        null,
         ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
@@ -3626,12 +3488,12 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
             try app.selected_model.appendSlice(std.testing.allocator, case.model);
 
             var upgrade_status_buf: [64]u8 = undefined;
-            const queued_cards: QueuedCardProjection = .{};
+            const steering: SteeringProjection = .{};
             const ctx = Runtime(CoordinatorTestApp).footerContext(
                 &app,
                 &upgrade_status_buf,
                 0,
-                &queued_cards,
+                &steering,
             );
 
             try std.testing.expectEqual(case.expected_indicator, ctx.fast_indicator_active);
@@ -3650,12 +3512,12 @@ test "core.app_render_runtime keeps a bound fast preference stable after catalog
     try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expect(ctx.fast_indicator_active);
@@ -3679,12 +3541,12 @@ test "core.app_render_runtime projects only the visible inline completion suffix
     try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqualStrings("aged-menu", ctx.inline_completion_suffix);
@@ -3703,12 +3565,12 @@ test "core.app_render_runtime projects an inline slash completion suffix after t
     try app.input_runtime.textReplacementState().replace(alloc, "explain /he");
 
     var upgrade_status_buf: [64]u8 = undefined;
-    const queued_cards: QueuedCardProjection = .{};
+    const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
         &upgrade_status_buf,
         0,
-        &queued_cards,
+        &steering,
     );
 
     try std.testing.expectEqualStrings("/help", ctx.slash_registry.commands[0].command);
@@ -3736,12 +3598,9 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
     var buf: [128]u8 = undefined;
     const line = ui_render.buildHintLine(
         false,
-        false,
         true,
         "anthropic/claude-opus-4.8",
         .ask,
-        0,
-        null,
         false,
         .auto,
         true,
@@ -4358,80 +4217,6 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     defer alloc.free(terminal_bytes);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
-}
-
-test "core.app_render_runtime width-changed queued editor keeps mention navigation and render aligned" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "skills-queue-width.log", .{ .read = true });
-    defer file.close(io_mod.getIo());
-
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
-        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
-        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
-        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
-        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
-        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
-        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
-    };
-    var app = CoordinatorTestApp{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = file,
-            .layout = .{
-                .rows = 24,
-                .cols = 40,
-                .content_bottom = 20,
-                .divider_top_row = 21,
-                .input_row = 22,
-                .divider_bottom_row = 23,
-                .hint_row = 24,
-            },
-            .owned_top_row = 1,
-            .viewport_top_row = 1,
-        },
-    };
-    defer app.deinit();
-    try app.selected_model.appendSlice(alloc, "test-model");
-    app.skills.items = @constCast(&skills);
-    app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = 1 }, "");
-    try app.input_runtime.textReplacementState().replace(alloc, "$" ++ "x" ** 59);
-
-    const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
-    entries[0] = try makeCoordinatorReviewEntry(alloc, 1, "stored");
-    entries[1] = try makeCoordinatorReviewEntry(alloc, 2, "selected");
-    app.queued_prompt_review = .{
-        .entries = entries,
-        .selected_index = 1,
-        .reason = .manual,
-        .visible = true,
-    };
-    app.worker.queued_count = 2;
-
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "queue width transcript\n", true);
-    app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-    app.shell.layout.cols = 12;
-    const completion = input_completion_runtime.CompletionRuntime(CoordinatorTestApp);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try completion.routeModifiedHistory(&app, .down, 1);
-    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
-
-    app.shell.render_requests.request(.resize);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-    try std.testing.expectEqual(@as(u16, 12), app.shell.shadow_vt.?.cols);
-    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "four"));
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 }
 
 test "core.app_render_runtime active setup hub stays on the inline transcript surface" {
