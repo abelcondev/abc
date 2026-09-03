@@ -1080,16 +1080,11 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 job.history.len,
             );
-            try session_runtime.appendCompactionHistoryChatMessages(
+            const uncertain_message_count = try session_runtime.appendCompactionHistoryChatMessages(
                 arena,
                 &messages,
-                job.history[0..uncertain_history_count],
-            );
-            const uncertain_message_count = messages.items.len;
-            try session_runtime.appendCompactionHistoryChatMessages(
-                arena,
-                &messages,
-                job.history[uncertain_history_count..],
+                job.history,
+                uncertain_history_count,
             );
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,

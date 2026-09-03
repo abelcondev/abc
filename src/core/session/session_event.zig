@@ -13,6 +13,246 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
+pub const conversation_schema_version: u8 = 1;
+pub const max_conversation_text_bytes: usize = 8 * 1024 * 1024;
+pub const max_conversation_identity_bytes: usize = 256;
+pub const max_conversation_arguments_bytes: usize = 1024 * 1024;
+pub const max_conversation_preview_bytes: usize = 4 * 1024;
+
+pub const ArtifactCompleteness = enum {
+    complete,
+    partial,
+    unknown,
+};
+
+pub const ConversationText = struct {
+    text: []const u8,
+};
+
+pub const ConversationToolCall = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+};
+
+pub const ConversationToolResult = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    status: types.PersistedToolStatus,
+    artifact_ref: []const u8,
+    stored_bytes: u64,
+    completeness: ArtifactCompleteness,
+    preview: ?[]const u8 = null,
+};
+
+pub const ConversationInterruption = struct {
+    reason: session.InterruptedTerminalReason,
+    partial_text: ?[]const u8 = null,
+};
+
+pub const ConversationCheckpoint = struct {
+    covers_through_seq: u64,
+    summary: []const u8,
+};
+
+pub const ConversationEvent = union(enum) {
+    user: ConversationText,
+    assistant: ConversationText,
+    tool_call: ConversationToolCall,
+    tool_result: ConversationToolResult,
+    steering: ConversationText,
+    interrupted: ConversationInterruption,
+    context_checkpoint: ConversationCheckpoint,
+};
+
+pub const ConversationEnvelope = struct {
+    schema_version: u8 = conversation_schema_version,
+    seq: u64,
+    timestamp_ms: i64,
+    event: ConversationEvent,
+};
+
+pub const DecodedConversationFrame = std.json.Parsed(ConversationEnvelope);
+
+pub const PendingToolCall = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    seq: u64,
+};
+
+pub const ConversationStateView = struct {
+    last_seq: u64 = 0,
+    latest_checkpoint_coverage: u64 = 0,
+    pending_tool_calls: []const PendingToolCall = &.{},
+};
+
+pub const ConversationTransitionError = error{
+    UnsupportedConversationSchema,
+    OutOfOrderConversationEvent,
+    InvalidConversationEvent,
+    DuplicateToolCall,
+    OrphanToolResult,
+    ToolIdentityMismatch,
+    InvalidCheckpointCoverage,
+    UnresolvedToolCall,
+};
+
+pub fn validateConversationTransition(
+    state: ConversationStateView,
+    envelope: ConversationEnvelope,
+) ConversationTransitionError!void {
+    if (envelope.schema_version != conversation_schema_version) {
+        return error.UnsupportedConversationSchema;
+    }
+    const expected_seq = std.math.add(u64, state.last_seq, 1) catch
+        return error.OutOfOrderConversationEvent;
+    if (envelope.seq != expected_seq) return error.OutOfOrderConversationEvent;
+    if (envelope.timestamp_ms < 0) return error.InvalidConversationEvent;
+    try validateConversationEventShape(envelope.event);
+
+    switch (envelope.event) {
+        .tool_call => |call| {
+            for (state.pending_tool_calls) |pending| {
+                if (std.mem.eql(u8, pending.call_id, call.call_id)) {
+                    return error.DuplicateToolCall;
+                }
+            }
+        },
+        .tool_result => |result| {
+            const pending = findPendingToolCall(state.pending_tool_calls, result.call_id) orelse
+                return error.OrphanToolResult;
+            if (!std.mem.eql(u8, pending.tool_name, result.tool_name)) {
+                return error.ToolIdentityMismatch;
+            }
+        },
+        .context_checkpoint => |checkpoint| {
+            if (checkpoint.covers_through_seq <= state.latest_checkpoint_coverage or
+                checkpoint.covers_through_seq > state.last_seq)
+            {
+                return error.InvalidCheckpointCoverage;
+            }
+            for (state.pending_tool_calls) |pending| {
+                if (pending.seq <= checkpoint.covers_through_seq) {
+                    return error.UnresolvedToolCall;
+                }
+            }
+        },
+        .user, .assistant, .steering, .interrupted => {},
+    }
+}
+
+fn validateConversationEventShape(event: ConversationEvent) ConversationTransitionError!void {
+    switch (event) {
+        .user, .assistant, .steering => |value| try validateConversationText(value.text),
+        .tool_call => |call| {
+            try validateConversationIdentity(call.call_id);
+            try validateConversationIdentity(call.tool_name);
+            if (call.arguments_json.len == 0 or
+                call.arguments_json.len > max_conversation_arguments_bytes or
+                !std.unicode.utf8ValidateSlice(call.arguments_json))
+            {
+                return error.InvalidConversationEvent;
+            }
+        },
+        .tool_result => |result| {
+            try validateConversationIdentity(result.call_id);
+            try validateConversationIdentity(result.tool_name);
+            if (result.artifact_ref.len == 0 or
+                result.artifact_ref.len > max_conversation_identity_bytes or
+                !std.unicode.utf8ValidateSlice(result.artifact_ref))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (result.preview) |preview| {
+                if (preview.len > max_conversation_preview_bytes or
+                    !std.unicode.utf8ValidateSlice(preview))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+        },
+        .interrupted => |interrupted| {
+            if (interrupted.partial_text) |text| try validateOptionalConversationText(text);
+        },
+        .context_checkpoint => |checkpoint| try validateConversationText(checkpoint.summary),
+    }
+}
+
+fn validateConversationText(text: []const u8) ConversationTransitionError!void {
+    if (text.len == 0) return error.InvalidConversationEvent;
+    return validateOptionalConversationText(text);
+}
+
+fn validateOptionalConversationText(text: []const u8) ConversationTransitionError!void {
+    if (text.len > max_conversation_text_bytes or !std.unicode.utf8ValidateSlice(text)) {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn validateConversationIdentity(value: []const u8) ConversationTransitionError!void {
+    if (value.len == 0 or
+        value.len > max_conversation_identity_bytes or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn findPendingToolCall(
+    pending_calls: []const PendingToolCall,
+    call_id: []const u8,
+) ?PendingToolCall {
+    for (pending_calls) |pending| {
+        if (std.mem.eql(u8, pending.call_id, call_id)) return pending;
+    }
+    return null;
+}
+
+pub fn encodeConversationFrame(
+    alloc: Allocator,
+    envelope: ConversationEnvelope,
+) ![]u8 {
+    if (envelope.schema_version != conversation_schema_version or
+        envelope.seq == 0 or
+        envelope.timestamp_ms < 0)
+    {
+        return error.InvalidConversationEvent;
+    }
+    try validateConversationEventShape(envelope.event);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(envelope, .{}, &out.writer);
+    try out.writer.writeByte('\n');
+    if (out.written().len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeConversationFrame(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedConversationFrame {
+    if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
+        return error.InvalidConversationFrame;
+    }
+    var parsed = std.json.parseFromSlice(ConversationEnvelope, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .max_value_len = event_frame_max_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidConversationFrame,
+    };
+    errdefer parsed.deinit();
+    if (parsed.value.schema_version != conversation_schema_version or
+        parsed.value.seq == 0 or
+        parsed.value.timestamp_ms < 0)
+    {
+        return error.InvalidConversationFrame;
+    }
+    validateConversationEventShape(parsed.value.event) catch
+        return error.InvalidConversationFrame;
+    return parsed;
+}
+
 pub const Kind = enum {
     session_started,
     preferences_changed,
@@ -2923,3 +3163,80 @@ const TestIdentifierSource = struct {
         return value;
     }
 };
+
+test "conversation transition validates sequence tool identity and checkpoint safety" {
+    const pending = [_]PendingToolCall{.{ .call_id = "call-shell", .tool_name = "shell", .seq = 2 }};
+    const state = ConversationStateView{ .last_seq = 2, .pending_tool_calls = &pending };
+    try validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .tool_result = .{
+            .call_id = "call-shell",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:abc",
+            .stored_bytes = 4,
+            .completeness = .complete,
+            .preview = "done",
+        } },
+    });
+    try std.testing.expectError(error.OrphanToolResult, validateConversationTransition(.{ .last_seq = 2 }, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .tool_result = .{
+            .call_id = "missing",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:missing",
+            .stored_bytes = 0,
+            .completeness = .unknown,
+        } },
+    }));
+    try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "checkpoint" } },
+    }));
+    try validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 1, .summary = "checkpoint" } },
+    });
+    try std.testing.expectError(error.OutOfOrderConversationEvent, validateConversationTransition(state, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .assistant = .{ .text = "skipped sequence" } },
+    }));
+}
+
+test "conversation frame round trips an external tool result reference" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeConversationFrame(alloc, .{
+        .seq = 7,
+        .timestamp_ms = 42,
+        .event = .{ .tool_result = .{
+            .call_id = "call-shell",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:abcdef",
+            .stored_bytes = 4096,
+            .completeness = .partial,
+            .preview = "bounded preview",
+        } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.endsWith(u8, encoded, "\n"));
+    try std.testing.expect(std.mem.find(u8, encoded, "full result bytes") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "DurableSessionState") == null);
+
+    var decoded = try decodeConversationFrame(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 7), decoded.value.seq);
+    try std.testing.expectEqual(@as(i64, 42), decoded.value.timestamp_ms);
+    const result = decoded.value.event.tool_result;
+    try std.testing.expectEqualStrings("call-shell", result.call_id);
+    try std.testing.expectEqualStrings("shell", result.tool_name);
+    try std.testing.expectEqualStrings("sha256:abcdef", result.artifact_ref);
+    try std.testing.expectEqual(ArtifactCompleteness.partial, result.completeness);
+    try std.testing.expectEqualStrings("bounded preview", result.preview.?);
+}

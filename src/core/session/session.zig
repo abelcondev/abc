@@ -2380,24 +2380,35 @@ pub fn appendHistoryChatMessages(
     _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
 }
 
-/// Projects complete raw canonical turns for semantic compaction. Prior
-/// checkpoints are derived model context and never become semantic source for
-/// a later checkpoint.
+/// Projects the latest current checkpoint and its suffix for semantic
+/// compaction. Without a current checkpoint, projects raw canonical turns and
+/// returns the message boundary whose result provenance remains uncertain.
 pub fn appendCompactionHistoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
-) !void {
+    uncertain_history_count: usize,
+) !usize {
+    var checkpoint_index: ?usize = null;
     for (history, 0..) |turn, index| {
-        if (turn == .compacted_summary) continue;
-        _ = try appendHistoryChatMessagesImpl(
-            alloc,
-            messages,
-            history[index .. index + 1],
-            false,
-            .closed,
-        );
+        if (isCurrentCompactionCheckpoint(turn)) checkpoint_index = index;
     }
+    if (checkpoint_index) |start| {
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history[start..], true, .closed);
+        return 0;
+    }
+
+    const boundary = @min(uncertain_history_count, history.len);
+    for (history[0..boundary], 0..) |turn, index| {
+        if (turn == .compacted_summary) continue;
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history[index .. index + 1], false, .closed);
+    }
+    const uncertain_message_count = messages.items.len;
+    for (history[boundary..], boundary..) |turn, index| {
+        if (turn == .compacted_summary) continue;
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history[index .. index + 1], false, .closed);
+    }
+    return uncertain_message_count;
 }
 
 fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
@@ -2580,10 +2591,11 @@ pub fn retainedHistoryTailForMessageCount(
 
     var projected: std.ArrayList(core_types.ChatMessage) = .empty;
     defer projected.deinit(alloc);
-    try appendCompactionHistoryChatMessages(
+    _ = try appendCompactionHistoryChatMessages(
         alloc,
         &projected,
         history[retained_start..],
+        0,
     );
     return .{
         .turn_count = turn_count,
@@ -2723,16 +2735,39 @@ test "compaction history keeps permission feedback non-authoritative" {
     } }};
     var messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer messages.deinit(std.testing.allocator);
-    try appendCompactionHistoryChatMessages(
+    _ = try appendCompactionHistoryChatMessages(
         std.testing.allocator,
         &messages,
         &history,
+        0,
     );
     var feedback_count: usize = 0;
     for (messages.items) |entry| {
         if (entry.permission_feedback) feedback_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), feedback_count);
+}
+
+test "compaction history starts at the latest checkpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("old user must stay out") }, .assistant = @constCast("old assistant must stay out") } },
+        .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>prior checkpoint</context_handoff>"), .removed_turn_count = 1, .compaction_count = 1 } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("new user") }, .assistant = @constCast("new assistant") } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    _ = try appendCompactionHistoryChatMessages(arena, &messages, &history, 0);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "prior checkpoint") != null);
+    try std.testing.expectEqualStrings("new user", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("new assistant", messages.items[2].content.?);
+    for (messages.items) |entry| {
+        const content = entry.content orelse continue;
+        try std.testing.expect(std.mem.find(u8, content, "must stay out") == null);
+    }
 }
 
 pub const HistoryBudgetOptions = struct {

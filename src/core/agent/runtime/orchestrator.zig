@@ -4426,17 +4426,11 @@ fn buildCanonicalCompactionWindow(
 ) !std.ArrayList(ChatMessage) {
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
-    const boundary = @min(uncertain_history_count, history.len);
-    try session_runtime.appendCompactionHistoryChatMessages(
+    uncertain_message_count.* = try session_runtime.appendCompactionHistoryChatMessages(
         alloc,
         &messages,
-        history[0..boundary],
-    );
-    uncertain_message_count.* = messages.items.len;
-    try session_runtime.appendCompactionHistoryChatMessages(
-        alloc,
-        &messages,
-        history[boundary..],
+        history,
+        uncertain_history_count,
     );
     try messages.appendSlice(alloc, within_turn_suffix);
     return messages;
@@ -4479,6 +4473,34 @@ test "repeated compaction source keeps canonical history and the complete active
     for (messages.items) |message| {
         try std.testing.expect(message.content == null or
             std.mem.find(u8, message.content.?, "prior handoff") == null);
+    }
+}
+
+test "current checkpoint excludes uncertain raw prefix from repeated compaction" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("old uncertain user") }, .assistant = @constCast("old uncertain assistant") } },
+        .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>prior checkpoint</context_handoff>"), .removed_turn_count = 1, .compaction_count = 1 } },
+    };
+    const suffix = [_]ChatMessage{
+        .{ .role = .assistant, .content = "old assistant" },
+        .{ .role = .tool, .content = "old result" },
+        .{ .role = .assistant, .content = "new assistant" },
+        .{ .role = .tool, .content = "new result" },
+    };
+    var uncertain_message_count: usize = 0;
+    var messages = try buildCanonicalCompactionWindow(arena, &history, &suffix, 1, &uncertain_message_count);
+    defer messages.deinit(arena);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), uncertain_message_count);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "prior checkpoint") != null);
+    try std.testing.expectEqualStrings("old assistant", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("new result", messages.items[4].content.?);
+    for (messages.items) |message| {
+        const content = message.content orelse continue;
+        try std.testing.expect(std.mem.find(u8, content, "old uncertain") == null);
     }
 }
 

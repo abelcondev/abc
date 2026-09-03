@@ -111,6 +111,7 @@ test {
     _ = tool_admission;
     _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
+    _ = @import("../session/result_store.zig");
     _ = file_mutation_execution;
     _ = tool_presentation;
 }
