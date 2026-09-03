@@ -80,6 +80,22 @@ pub fn composeQueuedSummaryRow(
     return row;
 }
 
+fn appendSteeringMessageRow(
+    alloc: Allocator,
+    composed: *ComposedInputRows,
+    content: []const u8,
+    width: u16,
+) !void {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, "┋", width);
+    if (width > 1) try row_text.appendClipped(alloc, &row, " ", width - 1);
+    if (width > 2) try row_text.appendClipped(alloc, &row, content, width - 2);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    try composed.rows.append(alloc, row);
+}
+
 pub fn composeSteeringMessageRows(
     alloc: Allocator,
     message: []const u8,
@@ -100,34 +116,37 @@ pub fn composeSteeringMessageRows(
 
     const content_width: usize = width -| 2;
     const visible_width = display_width.visibleWidth(safe_message.bytes);
-    const natural_rows: usize = if (content_width == 0 or visible_width == 0)
-        1
-    else
-        1 + (visible_width - 1) / content_width;
-    const row_count = @min(@as(usize, max_rows), natural_rows);
-
-    var projected: std.ArrayList(u8) = .empty;
-    defer projected.deinit(alloc);
-    try row_text.appendSingleLineMiddleEllipsized(
-        alloc,
-        &projected,
-        safe_message.bytes,
-        content_width * row_count,
-    );
-
-    var remaining = projected.items;
-    for (0..row_count) |_| {
-        const content = display_width.prefixByWidth(remaining, content_width);
-        var row: std.ArrayList(u8) = .empty;
-        errdefer row.deinit(alloc);
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row_text.appendClipped(alloc, &row, "┋", width);
-        if (width > 1) try row_text.appendClipped(alloc, &row, " ", width - 1);
-        if (width > 2) try row_text.appendClipped(alloc, &row, content, width - 2);
-        try row.appendSlice(alloc, ui_render.reset_style);
-        try composed.rows.append(alloc, row);
-        remaining = remaining[content.len..];
+    if (content_width == 0 or max_rows == 1 or visible_width <= content_width) {
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(alloc);
+        try row_text.appendSingleLineMiddleEllipsized(
+            alloc,
+            &content,
+            safe_message.bytes,
+            content_width,
+        );
+        try appendSteeringMessageRow(alloc, &composed, content.items, width);
+        return composed;
     }
+
+    const first = text_utils.prefixTerminalSafeByWidth(safe_message.bytes, content_width);
+    try appendSteeringMessageRow(alloc, &composed, first, width);
+
+    const remaining = safe_message.bytes[first.len..];
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(alloc);
+    if (display_width.visibleWidth(remaining) <= content_width) {
+        try second.appendSlice(alloc, remaining);
+    } else {
+        try second.appendSlice(alloc, "…");
+        if (content_width > 1) {
+            try second.appendSlice(
+                alloc,
+                text_utils.suffixTerminalSafeByWidth(remaining, content_width - 1),
+            );
+        }
+    }
+    try appendSteeringMessageRow(alloc, &composed, second.items, width);
     return composed;
 }
 
@@ -206,6 +225,15 @@ test "narrow steering row preserves distinguishing message ends without the esca
         try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") == null);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
     }
+}
+
+test "two steering rows preserve a wide glyph tail when cells do not pack evenly" {
+    var rows = try composeSteeringMessageRows(std.testing.allocator, "界海語", 5, 2);
+    defer rows.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ …語") != null);
 }
 
 test "steering rows visibly escape terminal control bytes" {
