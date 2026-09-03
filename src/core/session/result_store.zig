@@ -448,7 +448,7 @@ fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8,
     return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
 }
 
-fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
+pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(text, max_bytes));
 }
 

@@ -697,7 +697,7 @@ pub const Store = struct {
         options: session_log.Options,
     ) !LoadedWritableSession {
         var root = self.canonical_root;
-        var loaded = try root.startWritableSession(
+        var loaded = try root.startConversationSession(
             alloc,
             state,
             options,
@@ -1366,6 +1366,7 @@ pub const Store = struct {
                 &migration_state,
             );
         }
+        try loaded.convertToConversationStorage(alloc);
         try self.attachWritableChildCapability(alloc, &loaded);
         return loaded;
     }
@@ -3426,7 +3427,7 @@ pub const Store = struct {
             },
             else => return err,
         };
-        const loaded = switch (authority) {
+        var loaded = switch (authority) {
             .schema_v3 => blk: {
                 var root = self.canonical_root;
                 break :blk root.resumeForWrite(
@@ -3443,6 +3444,7 @@ pub const Store = struct {
                 options,
             ),
         };
+        errdefer loaded.deinit(alloc);
         return self.finishWorkspaceResume(
             alloc,
             loaded,
@@ -6625,6 +6627,142 @@ test "conversation history pages remain complete after model compaction" {
     try std.testing.expectEqual(@as(usize, 1), older.turns.len);
     try std.testing.expectEqualStrings("old question", older.turns[0].assistant.user.text);
     try std.testing.expect(older.next_cursor == null);
+}
+
+test "writable legacy resume converts once to conversation storage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeLegacyFixture(
+        alloc,
+        ctx.store,
+        "legacy-conversation-convert",
+        ctx.workspace,
+        20,
+    );
+
+    {
+        var resumed = try ctx.store.resumeForWrite(
+            alloc,
+            "legacy-conversation-convert",
+        );
+        defer resumed.deinit(alloc);
+        try std.testing.expect(resumed.usesConversationStorage());
+    }
+    var detail = try ctx.store.loadReadOnlyDetail(
+        alloc,
+        "legacy-conversation-convert",
+        .{},
+    );
+    defer detail.deinit(alloc);
+    try std.testing.expectEqual(StorageFormat.conversation, detail.storage_format);
+    var session_dir = try ctx.store.openSessionDir("legacy-conversation-convert");
+    defer session_dir.close();
+    var metadata_file = try session_dir.dir.openFile(
+        std.testing.io,
+        "session.json",
+        .{},
+    );
+    defer metadata_file.close(std.testing.io);
+    const metadata_bytes = try io_mod.readFileToEnd(
+        alloc,
+        &metadata_file,
+        session_codec.max_session_metadata_bytes,
+    );
+    defer alloc.free(metadata_bytes);
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    try std.testing.expectEqual(
+        session_codec.session_metadata_schema_version,
+        metadata.value.schema_version,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        session_dir.dir.statFile(std.testing.io, "authority.json", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        session_dir.dir.statFile(std.testing.io, "checkpoint.json", .{}),
+    );
+}
+
+test "legacy conversion externalizes available inline tool results" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var calls = [_]core_types.ToolCall{.{
+        .id = "legacy-call",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"legacy.txt\"}",
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("legacy-call"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("legacy available bytes"),
+        .output_bytes = 64,
+        .stored_output_bytes = 22,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("read legacy") },
+        .assistant = @constCast("read complete"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    const rendered = try session_json.renderSessionJson(
+        alloc,
+        "legacy-result-convert",
+        10,
+        20,
+        .literal("en"),
+        ctx.workspace,
+        &history,
+        .{},
+    );
+    defer alloc.free(rendered);
+    const path = try writeSessionFixture(
+        alloc,
+        ctx.store,
+        "legacy-result-convert",
+        rendered,
+    );
+    alloc.free(path);
+
+    {
+        var resumed = try ctx.store.resumeForWrite(alloc, "legacy-result-convert");
+        resumed.deinit(alloc);
+    }
+    var detail = try ctx.store.loadReadOnlyDetail(
+        alloc,
+        "legacy-result-convert",
+        .{},
+    );
+    defer detail.deinit(alloc);
+    const result = detail.state.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expect(result.output_handle != null);
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqualStrings("legacy available bytes", result.preview.?);
+    var capability = try ctx.store.openChildCapabilityReadOnly(
+        alloc,
+        "legacy-result-convert",
+    );
+    defer capability.deinit();
+    const stored = try result_store.readByRangeManaged(
+        alloc,
+        &capability,
+        result.output_handle.?,
+        0,
+        64,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "legacy available bytes") != null);
 }
 
 test "workspace latest pointer is materialized on session creation" {

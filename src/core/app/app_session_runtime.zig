@@ -2707,7 +2707,10 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
         ) !HistoryAppendOutcome {
-            const prepared = app.session.prepareHistoryEntry(app.alloc, turn) catch |err| {
+            const prepared = (if (comptime @hasDecl(@TypeOf(app.session), "prepareHistoryEntry"))
+                app.session.prepareHistoryEntry(app.alloc, turn)
+            else
+                types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
                 return switch (mode) {
                     .strict => err,
                     .visual_epoch => .uncommitted,
@@ -2716,8 +2719,12 @@ pub fn Runtime(comptime App: type) type {
             var prepared_owned = true;
             defer if (prepared_owned) types.freeHistoryTurn(app.alloc, prepared);
             if (comptime !@hasField(App, "session_persistence")) {
-                app.session.commitPreparedHistoryEntry(app.alloc, prepared);
-                prepared_owned = false;
+                if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
+                    app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                    prepared_owned = false;
+                } else {
+                    try app.session.appendHistoryEntry(app.alloc, prepared);
+                }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app) catch {};
                 commitJsHostSnapshot(app, "history_turn");
@@ -2728,8 +2735,12 @@ pub fn Runtime(comptime App: type) type {
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else {
-                app.session.commitPreparedHistoryEntry(app.alloc, prepared);
-                prepared_owned = false;
+                if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
+                    app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                    prepared_owned = false;
+                } else {
+                    try app.session.appendHistoryEntry(app.alloc, prepared);
+                }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app) catch {};
                 commitJsHostSnapshot(app, "history_turn");
@@ -2780,8 +2791,12 @@ pub fn Runtime(comptime App: type) type {
                     },
                 };
             };
-            app.session.commitPreparedHistoryEntry(app.alloc, prepared);
-            prepared_owned = false;
+            if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
+                app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                prepared_owned = false;
+            } else {
+                try app.session.appendHistoryEntry(app.alloc, prepared);
+            }
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app) catch {};
             commitJsHostSnapshot(app, "history_turn");
@@ -9099,6 +9114,50 @@ test "rejected conversation append leaves live history unchanged" {
     );
 }
 
+test "completed conversation turn clears its recovery file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    });
+    try std.testing.expect(
+        app.session_persistence.writable.?.state.recovery_checkpoint != null,
+    );
+    const turn = try session_runtime.makeAssistantTurn(alloc, "prompt", "done");
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+    try std.testing.expectError(
+        error.FileNotFound,
+        app.session_persistence.writable.?.log.dir.dir.statFile(
+            std.testing.io,
+            "recovery.json",
+            .{},
+        ),
+    );
+}
+
 const SnapshotOwnershipProbe = struct {
     transfers: usize = 0,
 
@@ -10201,6 +10260,13 @@ test "renameActiveSession persists the title only in session metadata" {
     try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
     const loaded = &app.session_persistence.writable.?;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        loaded.state.updated_at_ms + 1,
+        .retry_expected_tail,
+        .{},
+    );
     var metadata_file = try loaded.log.dir.dir.openFile(
         std.testing.io,
         "session.json",

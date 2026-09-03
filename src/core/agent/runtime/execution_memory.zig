@@ -1004,7 +1004,7 @@ test "no-save preparation preserves capped success without a result handle" {
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "abc123") == null);
 }
 
-test "saved preparation keeps redaction shrink complete and inline" {
+test "saved preparation externalizes complete redacted output without cap loss" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1031,7 +1031,11 @@ test "saved preparation keeps redaction shrink complete and inline" {
         raw,
     );
 
-    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(prepared.memory.output_handle != null);
+    try std.testing.expectEqualStrings(
+        "AI_GATEWAY_API_KEY=[redacted] end",
+        prepared.memory.preview.?,
+    );
     try std.testing.expect(!prepared.memory.truncated);
     try std.testing.expectEqualStrings(
         "AI_GATEWAY_API_KEY=[redacted] end",

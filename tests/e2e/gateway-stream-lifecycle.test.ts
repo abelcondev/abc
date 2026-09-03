@@ -4500,6 +4500,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
         expect(sessionFiles).not.toContain("checkpoint.json");
         expect(sessionFiles).not.toContain("display.json");
+        expect(sessionFiles).not.toContain("recovery.json");
         expect(readdirSync(sessionsRoot)).not.toContain("index.json");
         expect(readdirSync(sessionsRoot)).not.toContain("latest.lock");
         const canonical = JSON.parse(beforeResume.stdout) as {

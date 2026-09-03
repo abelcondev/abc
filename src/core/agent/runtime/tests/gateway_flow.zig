@@ -2798,7 +2798,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "Continue from the compacted history with the recent request intact." },
+        .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2815,8 +2815,8 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 0, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":");
     try expectBodyContains(&gateway, 1, "context_handoff");
     try expectBodyNotContains(&gateway, 1, old_marker);

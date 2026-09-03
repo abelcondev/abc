@@ -14,6 +14,7 @@ const session_projection = @import("session_projection.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_resume_view = @import("session_resume_view.zig");
+const result_store = @import("result_store.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -34,6 +35,8 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
+const conversation_migration_temp_file = "events.v4.tmp";
+const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
 const session_lock_file = "session.lock";
 const commit_lock_file = "commit.lock";
@@ -363,7 +366,43 @@ fn writeConversationMetadata(
     dir: *io_mod.VerifiedDir,
     state: session_codec.DurableSessionState,
 ) !void {
-    const bytes = try session_codec.encodeSessionMetadata(alloc, .{
+    const existing = readManagedFileAlloc(
+        alloc,
+        dir,
+        manifest_file,
+        session_codec.max_session_metadata_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (existing) |bytes| alloc.free(bytes);
+    var decoded = if (existing) |bytes|
+        try session_codec.decodeSessionMetadata(alloc, bytes)
+    else
+        null;
+    defer if (decoded) |*metadata| metadata.deinit();
+    const bytes = try encodeConversationMetadataWithTitle(
+        alloc,
+        state,
+        if (decoded) |metadata| metadata.value.title else null,
+    );
+    defer alloc.free(bytes);
+    try io_mod.durableReplaceVerified(alloc, dir, manifest_file, bytes);
+}
+
+fn encodeConversationMetadata(
+    alloc: Allocator,
+    state: session_codec.DurableSessionState,
+) ![]u8 {
+    return encodeConversationMetadataWithTitle(alloc, state, null);
+}
+
+fn encodeConversationMetadataWithTitle(
+    alloc: Allocator,
+    state: session_codec.DurableSessionState,
+    title: ?[]const u8,
+) ![]u8 {
+    return session_codec.encodeSessionMetadata(alloc, .{
         .id = state.id,
         .origin_workspace_root = state.origin_workspace_root,
         .workspace_root = state.workspace_root,
@@ -374,10 +413,9 @@ fn writeConversationMetadata(
         .model = state.preferences.model,
         .effort = state.preferences.effort.label(),
         .fast_mode = state.preferences.fast_mode,
+        .title = title,
         .subagent_child = state.subagent_child,
     });
-    defer alloc.free(bytes);
-    try io_mod.durableReplaceVerified(alloc, dir, manifest_file, bytes);
 }
 
 fn writeConversationControlState(
@@ -634,7 +672,7 @@ fn replayConversationHistory(
         var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
         defer decoded.deinit();
         switch (decoded.value.event) {
-            .user => |value| try turn.begin(value.text),
+            .user => |value| try turn.begin(value),
             .assistant => |value| try turn.appendAssistant(value.text),
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
@@ -698,7 +736,7 @@ pub fn loadConversationHistoryRange(
         defer decoded.deinit();
         const completed: ?session.HistoryTurn = switch (decoded.value.event) {
             .user => |value| blk: {
-                try builder.begin(value.text);
+                try builder.begin(value);
                 break :blk null;
             },
             .assistant => |value| blk: {
@@ -765,7 +803,7 @@ pub fn loadConversationArchive(
         defer decoded.deinit();
         const completed: ?session.HistoryTurn = switch (decoded.value.event) {
             .user => |value| blk: {
-                try builder.begin(value.text);
+                try builder.begin(value);
                 break :blk null;
             },
             .assistant => |value| blk: {
@@ -863,7 +901,7 @@ fn findConversationReplayWindow(
 
 const ConversationTurnBuilder = struct {
     alloc: Allocator,
-    user: ?[]u8 = null,
+    user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
     calls: std.ArrayList(types.ToolCall) = .empty,
     results: std.ArrayList(types.PersistedToolResult) = .empty,
@@ -875,10 +913,12 @@ const ConversationTurnBuilder = struct {
     }
 
     fn deinit(self: *ConversationTurnBuilder) void {
-        if (self.user) |text| self.alloc.free(text);
+        if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
-        types.freeToolCallSlice(self.alloc, self.calls.items);
-        types.freePersistedToolResults(self.alloc, self.results.items);
+        for (self.calls.items) |call| types.freeToolCall(self.alloc, call);
+        self.calls.deinit(self.alloc);
+        for (self.results.items) |result| freeConversationToolResult(self.alloc, result);
+        self.results.deinit(self.alloc);
         for (self.steps.items) |step| {
             if (step.assistant) |text| self.alloc.free(text);
             types.freeToolCallSlice(self.alloc, step.tool_calls);
@@ -902,9 +942,16 @@ const ConversationTurnBuilder = struct {
             self.steering.items.len == 0;
     }
 
-    fn begin(self: *ConversationTurnBuilder, text: []const u8) !void {
+    fn begin(
+        self: *ConversationTurnBuilder,
+        value: session_event.ConversationUser,
+    ) !void {
         if (!self.isIdle()) return error.InvalidConversationFrame;
-        self.user = try self.alloc.dupe(u8, text);
+        self.user = try types.dupeUserTurn(self.alloc, .{
+            .text = @constCast(value.text),
+            .images = @constCast(value.images),
+            .work_id = if (value.work_id) |work_id| @constCast(work_id) else null,
+        });
     }
 
     fn appendAssistant(self: *ConversationTurnBuilder, text: []const u8) !void {
@@ -928,6 +975,11 @@ const ConversationTurnBuilder = struct {
             .id = value.call_id,
             .name = value.tool_name,
             .arguments_json = value.arguments_json,
+            .argument_integrity = value.argument_integrity,
+            .provisional_id = value.provisional_id,
+            .provider_result = value.provider_result,
+            .final_identity = value.final_identity,
+            .provenance = value.provenance,
         });
         errdefer types.freeToolCall(self.alloc, call);
         try self.calls.append(self.alloc, call);
@@ -1003,7 +1055,7 @@ const ConversationTurnBuilder = struct {
         self.user = null;
         self.pending_assistant = null;
         return .{ .assistant = .{
-            .user = .{ .text = user },
+            .user = user,
             .assistant = assistant,
             .execution = execution,
         } };
@@ -1030,14 +1082,41 @@ const ConversationTurnBuilder = struct {
         else
             null;
         errdefer if (assistant) |text| self.alloc.free(text);
+        const replay = if (value.command_replay_ref) |handle| blk: {
+            const owned_handle = try self.alloc.dupe(u8, handle);
+            break :blk types.CommandOutputReplay{ .available = .{
+                .handle = owned_handle,
+                .framed_bytes = std.math.cast(
+                    usize,
+                    value.command_replay_bytes.?,
+                ) orelse {
+                    self.alloc.free(owned_handle);
+                    return error.ConversationSizeOverflow;
+                },
+            } };
+        } else null;
+        errdefer if (replay) |owned| types.freeCommandOutputReplay(self.alloc, owned);
+        const command_artifact = if (value.command_artifact_ref) |handle|
+            try self.alloc.dupe(u8, handle)
+        else
+            null;
+        errdefer if (command_artifact) |handle| self.alloc.free(handle);
+        const cancelled_command = if (replay != null or command_artifact != null)
+            types.CancelledCommandPresentation{
+                .output_replay = replay,
+                .command_artifact_handle = command_artifact,
+            }
+        else
+            null;
         const execution = try self.takeExecution();
         const user = self.user.?;
         self.user = null;
         return .{ .interrupted = .{
-            .user = .{ .text = user },
+            .user = user,
             .assistant = assistant,
             .tool_call = tool_call,
             .execution = execution,
+            .cancelled_command = cancelled_command,
             .terminal_reason = value.reason,
         } };
     }
@@ -1133,6 +1212,137 @@ fn retainLatestCheckpointHistory(
     alloc.free(state.history);
     state.history = retained;
     state.context_history_start = 0;
+}
+
+fn removeCompactedSummaries(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+) !void {
+    var raw_count: usize = 0;
+    for (state.history) |turn| if (turn != .compacted_summary) {
+        raw_count += 1;
+    };
+    if (raw_count == state.history.len) {
+        state.context_history_start = 0;
+        return;
+    }
+    const raw = try alloc.alloc(session.HistoryTurn, raw_count);
+    var index: usize = 0;
+    for (state.history) |turn| switch (turn) {
+        .compacted_summary => session.freeHistoryTurn(alloc, turn),
+        else => {
+            raw[index] = turn;
+            index += 1;
+        },
+    };
+    alloc.free(state.history);
+    state.history = raw;
+    state.context_history_start = 0;
+}
+
+fn projectConversationSnapshotLocators(
+    alloc: Allocator,
+    history: []session.HistoryTurn,
+) !void {
+    for (history) |*turn| {
+        const images = switch (turn.*) {
+            .assistant => |*entry| entry.user.images,
+            .interrupted => |*entry| entry.user.images,
+            .compacted_summary => continue,
+        };
+        for (images) |*image| {
+            const snapshot_path = image.snapshot_path orelse continue;
+            if (!std.fs.path.isAbsolute(snapshot_path)) continue;
+            var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const projected = try session.projectSnapshotLocator(
+                &buffer,
+                snapshot_path,
+            );
+            const owned = try alloc.dupe(u8, projected);
+            alloc.free(snapshot_path);
+            image.snapshot_path = owned;
+        }
+    }
+}
+
+fn externalizeConversationResults(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+    capability: *session_child_store.SessionChildCapability,
+) !void {
+    for (state.history) |*turn| switch (turn.*) {
+        .assistant => |*entry| try externalizeExecutionResults(
+            alloc,
+            &entry.execution,
+            capability,
+        ),
+        .interrupted => |*entry| try externalizeExecutionResults(
+            alloc,
+            &entry.execution,
+            capability,
+        ),
+        .compacted_summary => unreachable,
+    };
+}
+
+fn externalizeExecutionResults(
+    alloc: Allocator,
+    execution: *types.ExecutionMemory,
+    capability: *session_child_store.SessionChildCapability,
+) !void {
+    for (execution.tool_steps) |*step| {
+        for (step.tool_results) |*result| {
+            if (result.output_handle == null) {
+                result.output_handle = try result_store.storeLargeResultManaged(
+                    alloc,
+                    capability,
+                    result.tool_call_id,
+                    result.tool_name,
+                    result.output,
+                );
+                result.truncated = true;
+                result.stored_output_bytes = result.output.len;
+            }
+            if (result.preview == null) {
+                result.preview = try result_store.previewText(
+                    alloc,
+                    result.output,
+                    result_store.preview_bytes,
+                );
+            }
+        }
+    }
+}
+
+fn deleteConversationMigrationFile(
+    dir: *io_mod.VerifiedDir,
+    name: []const u8,
+) !void {
+    dir.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+}
+
+fn deleteLegacyConversationFiles(
+    alloc: Allocator,
+    loaded: *LoadedWritableSession,
+) !void {
+    const watermark = try watermarkName(alloc, loaded.position.log_generation);
+    defer alloc.free(watermark);
+    const names = [_][]const u8{
+        conversation_migration_backup_file,
+        authority_file,
+        authority_intent_file,
+        publication_intent_file,
+        checkpoint_file,
+        commit_lock_file,
+        session_display_metadata.sidecar_file,
+        "resume-view.bin",
+        watermark,
+    };
+    for (names) |name| try deleteConversationMigrationFile(&loaded.log.dir, name);
+    try io_mod.syncVerifiedDir(loaded.log.dir.dir);
 }
 
 pub const Boundary = enum {
@@ -1762,6 +1972,134 @@ pub const LoadedWritableSession = struct {
         return true;
     }
 
+    pub fn convertToConversationStorage(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+    ) !void {
+        if (self.conversation_writer != null) return;
+        var converted = try self.state.dupe(alloc);
+        errdefer converted.deinit(alloc);
+        try removeCompactedSummaries(alloc, &converted);
+        try projectConversationSnapshotLocators(alloc, converted.history);
+
+        const display_path = try io_mod.dirRealpathAlloc(
+            alloc,
+            self.log.dir.dir,
+            ".",
+        );
+        defer alloc.free(display_path);
+        var capability = try session_child_store.SessionChildCapability.init(
+            alloc,
+            self.log.dir.dir,
+            display_path,
+            .writable,
+        );
+        defer capability.deinit();
+        try externalizeConversationResults(alloc, &converted, &capability);
+
+        try deleteConversationMigrationFile(&self.log.dir, conversation_migration_temp_file);
+        var temp_file = try createManagedFile(
+            &self.log.dir,
+            conversation_migration_temp_file,
+        );
+        var writer = ConversationWriter.init(alloc, temp_file) catch |err| {
+            temp_file.close(io_mod.getIo());
+            return err;
+        };
+        var writer_owned = true;
+        defer if (writer_owned) writer.deinit();
+        for (converted.history) |turn| {
+            try writer.appendHistoryTurn(alloc, converted.updated_at_ms, turn);
+        }
+        writer.deinit();
+        writer_owned = false;
+
+        try writeConversationControlState(alloc, &self.log.dir, converted);
+        const metadata_bytes = try encodeConversationMetadata(alloc, converted);
+        defer alloc.free(metadata_bytes);
+        if (try entryExists(&self.log.dir, conversation_migration_backup_file)) {
+            return error.SessionMigrationIncomplete;
+        }
+        var old_log_renamed = false;
+        var metadata_published = false;
+        errdefer if (!metadata_published and old_log_renamed) {
+            deleteConversationMigrationFile(&self.log.dir, events_file) catch {};
+            self.log.dir.dir.rename(
+                conversation_migration_backup_file,
+                self.log.dir.dir,
+                events_file,
+                io_mod.getIo(),
+            ) catch {};
+            io_mod.syncVerifiedDir(self.log.dir.dir) catch {};
+        };
+        try self.log.dir.dir.rename(
+            events_file,
+            self.log.dir.dir,
+            conversation_migration_backup_file,
+            io_mod.getIo(),
+        );
+        old_log_renamed = true;
+        try self.log.dir.dir.rename(
+            conversation_migration_temp_file,
+            self.log.dir.dir,
+            events_file,
+            io_mod.getIo(),
+        );
+        try io_mod.syncVerifiedDir(self.log.dir.dir);
+        try io_mod.durableReplaceVerified(
+            alloc,
+            &self.log.dir,
+            manifest_file,
+            metadata_bytes,
+        );
+        metadata_published = true;
+
+        var event_file = try openManagedFile(
+            &self.log.dir,
+            events_file,
+            .read_write,
+        );
+        var conversation_writer = ConversationWriter.init(alloc, event_file) catch |err| {
+            event_file.close(io_mod.getIo());
+            return err;
+        };
+        errdefer conversation_writer.deinit();
+        deleteLegacyConversationFiles(alloc, self) catch |err| debug_trace.logf(
+            "session",
+            "event=legacy_session_cleanup_failed session={s} err={s}",
+            .{ self.active_id, @errorName(err) },
+        );
+
+        if (self.commit_lifecycle) |*lifecycle| lifecycle.deinit(alloc);
+        self.commit_lifecycle = null;
+        self.state.deinit(alloc);
+        self.state = converted;
+        converted = undefined;
+        self.conversation_writer = conversation_writer;
+        const generation = randomIdentifier();
+        self.position = .{
+            .log_generation = generation,
+            .through_seq = conversation_writer.last_seq,
+            .through_event_id = randomIdentifier(),
+            .through_event_log_bytes = conversation_writer.committed_bytes,
+        };
+        self.authority_id = randomIdentifier();
+        self.generation_base_seq = self.position.through_seq;
+        self.generation_base_bytes = self.position.through_event_log_bytes;
+        self.checkpoint_seq = null;
+        self.checkpoint_sha256 = null;
+        self.projection_status = .current;
+        self.namespace_confirmation_required = false;
+        self.state_replacement_pending = false;
+        if (self.degraded_tail) |*tail| tail.deinit(alloc);
+        self.degraded_tail = null;
+        self.compaction_warning_active = false;
+        self.migration_source_schema_version = null;
+        self.migration_source_bytes = null;
+        self.usage_sidecar_reseal_pending = false;
+        self.resume_view_stale = false;
+    }
+
     pub fn installCommitLifecycle(
         self: *LoadedWritableSession,
         lifecycle: CommitLifecycle,
@@ -1912,6 +2250,11 @@ pub const LoadedWritableSession = struct {
             timestamp_ms,
             payload.turn,
         );
+        if (self.state.recovery_checkpoint != null and
+            next_state.recovery_checkpoint == null)
+        {
+            try writeConversationRecoveryState(alloc, &self.log.dir, null);
+        }
         self.state.deinit(alloc);
         self.state = next_state;
         self.position = .{
@@ -2493,12 +2836,44 @@ pub const Root = struct {
         );
     }
 
+    pub fn startConversationSession(
+        self: *Root,
+        alloc: Allocator,
+        initial_state: session_codec.DurableSessionState,
+        options: Options,
+    ) !LoadedWritableSession {
+        return self.startWritableSessionMode(
+            alloc,
+            initial_state,
+            options,
+            null,
+            true,
+        );
+    }
+
     pub fn startWritableSessionWithLifecycle(
         self: *Root,
         alloc: Allocator,
         initial_state: session_codec.DurableSessionState,
         options: Options,
         lifecycle: ?CommitLifecycle,
+    ) !LoadedWritableSession {
+        return self.startWritableSessionMode(
+            alloc,
+            initial_state,
+            options,
+            lifecycle,
+            false,
+        );
+    }
+
+    fn startWritableSessionMode(
+        self: *Root,
+        alloc: Allocator,
+        initial_state: session_codec.DurableSessionState,
+        options: Options,
+        lifecycle: ?CommitLifecycle,
+        conversation_storage: bool,
     ) !LoadedWritableSession {
         var lifecycle_value = lifecycle;
         errdefer if (lifecycle_value) |*value| value.deinit(alloc);
@@ -2583,12 +2958,20 @@ pub const Root = struct {
                 return err;
             };
         }
-        var created = try createNativeSession(
-            alloc,
-            &writable,
-            initial_state,
-            options,
-        );
+        var created = if (conversation_storage)
+            try createNativeSession(
+                alloc,
+                &writable,
+                initial_state,
+                options,
+            )
+        else
+            try createLegacyNativeSession(
+                alloc,
+                &writable,
+                initial_state,
+                options,
+            );
         writable_owned = false;
         var created_owned = true;
         errdefer if (created_owned) created.deinit(alloc);
@@ -9322,6 +9705,8 @@ test "conversation writer flattens a canonical history turn" {
         .id = "call-shell",
         .name = "shell",
         .arguments_json = "{\"command\":\"printf done\"}",
+        .provider_result = "{\"native\":true}",
+        .provenance = .provider_executed,
     }};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-shell"),
@@ -9393,7 +9778,7 @@ test "root starts a cache-free conversation session" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "cache-free-session", 10);
     defer initial.deinit(alloc);
-    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
     defer loaded.deinit(alloc);
 
     var count: usize = 0;
@@ -9425,7 +9810,7 @@ test "cache-free session appends history through the conversation writer" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "conversation-append", 10);
     defer initial.deinit(alloc);
-    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
     defer loaded.deinit(alloc);
     const turn = types.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("question") },
@@ -9460,7 +9845,7 @@ test "cache-free conversation session resumes from metadata and JSONL" {
     var initial = try testState(alloc, "conversation-resume", 10);
     defer initial.deinit(alloc);
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         _ = try loaded.appendEvent(
             alloc,
@@ -9493,7 +9878,7 @@ test "cache-free writable resume continues the conversation sequence" {
     var initial = try testState(alloc, "conversation-write-resume", 10);
     defer initial.deinit(alloc);
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
             .conversation_language = .literal("en"),
@@ -9534,7 +9919,7 @@ test "cache-free metadata changes rewrite metadata without conversation records"
     defer initial.deinit(alloc);
     var committed_bytes: u64 = 0;
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         committed_bytes = loaded.conversation_writer.?.committed_bytes;
         _ = try loaded.appendEvent(alloc, .{ .preferences_changed = .{
@@ -9566,7 +9951,7 @@ test "cache-free usage checkpoints stay outside conversation history" {
     defer snapshot.deinit(alloc);
     var committed_bytes: u64 = 0;
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         committed_bytes = loaded.conversation_writer.?.committed_bytes;
         _ = try loaded.appendEvent(alloc, .{
@@ -9605,7 +9990,7 @@ test "cache-free recovery checkpoint resumes and clears independently" {
         .consumed_provider_attempts = 1,
     };
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         _ = try loaded.appendEvent(alloc, .{
             .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
@@ -9644,7 +10029,7 @@ test "cache-free permission state resumes from its domain file" {
     var permissions = applied.takeApplied() orelse return error.TestUnexpectedResult;
     defer permissions.deinit(alloc);
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         var replacement = try loaded.state.dupe(alloc);
         defer replacement.deinit(alloc);
@@ -9680,6 +10065,8 @@ test "cache-free resume rebuilds tool calls and external result references" {
         .id = "call-shell",
         .name = "shell",
         .arguments_json = "{\"command\":\"printf done\"}",
+        .provider_result = "{\"native\":true}",
+        .provenance = .provider_executed,
     }};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-shell"),
@@ -9696,7 +10083,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
         .tool_results = &results,
     }};
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
             .conversation_language = .literal("en"),
@@ -9716,6 +10103,14 @@ test "cache-free resume rebuilds tool calls and external result references" {
     const execution = resumed.history[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("call-shell", execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(
+        types.ToolExecutionProvenance.provider_executed,
+        execution.tool_steps[0].tool_calls[0].provenance,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"native\":true}",
+        execution.tool_steps[0].tool_calls[0].provider_result.?,
+    );
     try std.testing.expectEqualStrings(
         "result-shell.txt",
         execution.tool_steps[0].tool_results[0].output_handle.?,
@@ -9729,7 +10124,7 @@ test "cache-free resume loads only the latest checkpoint and suffix" {
     var initial = try testState(alloc, "conversation-checkpoint", 10);
     defer initial.deinit(alloc);
     {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
         defer loaded.deinit(alloc);
         _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
             .conversation_language = .literal("en"),

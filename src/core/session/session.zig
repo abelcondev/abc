@@ -1656,12 +1656,14 @@ pub const SessionRuntime = struct {
         context_history_start: usize,
     ) !void {
         if (context_history_start > history.len) return error.InvalidContextHistoryStart;
+        const current_checkpoint = context_history_start < history.len and
+            isCurrentCompactionCheckpoint(history[context_history_start]);
         try self.restore(alloc, language, history);
-        self.context_history_start = context_history_start;
-        if (context_history_start < self.agent.history.items.len and
-            isCurrentCompactionCheckpoint(self.agent.history.items[context_history_start]))
-        {
+        if (current_checkpoint) {
+            self.context_history_start = 0;
             self.unversioned_history_len = 0;
+        } else {
+            self.context_history_start = context_history_start;
         }
     }
 

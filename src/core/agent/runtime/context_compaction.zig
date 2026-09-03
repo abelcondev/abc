@@ -80,7 +80,12 @@ pub fn promoteMessageResults(
         const call_id = message.tool_call_id orelse return error.IncompleteCompactionResult;
         const tool_name = message.tool_name orelse return error.IncompleteCompactionResult;
         const handle = switch (storage) {
-            .unavailable => return error.CompactionResultStorageUnavailable,
+            .unavailable => {
+                if (memory.truncated or uncertain) {
+                    return error.CompactionResultStorageUnavailable;
+                }
+                continue;
+            },
             .legacy_dir => |dir| try result_store.storeLargeResult(
                 alloc,
                 dir,
@@ -803,4 +808,24 @@ test "compaction result retention snapshots uncertain history without changing c
     try std.testing.expectEqual(original_content.ptr, replay_backed[0].content.?.ptr);
     try std.testing.expect(replay_backed[0].tool_result_memory.?.output_handle == null);
     try std.testing.expect(replay_backed[0].tool_result_memory.?.truncated);
+
+    var complete_without_store = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "complete no-save result",
+        .tool_call_id = "call-no-save",
+        .tool_name = "shell",
+        .tool_result_memory = .{
+            .output_bytes = 23,
+            .stored_output_bytes = 23,
+            .truncated = false,
+        },
+    }};
+    try promoteMessageResults(alloc, &complete_without_store, .unavailable, 0);
+    try std.testing.expectEqualStrings(
+        "complete no-save result",
+        complete_without_store[0].content.?,
+    );
+    try std.testing.expect(
+        complete_without_store[0].tool_result_memory.?.output_handle == null,
+    );
 }

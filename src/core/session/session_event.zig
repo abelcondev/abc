@@ -29,10 +29,21 @@ pub const ConversationText = struct {
     text: []const u8,
 };
 
+pub const ConversationUser = struct {
+    text: []const u8,
+    images: []const types.ImageAttachment = &.{},
+    work_id: ?[]const u8 = null,
+};
+
 pub const ConversationToolCall = struct {
     call_id: []const u8,
     tool_name: []const u8,
     arguments_json: []const u8,
+    argument_integrity: types.ToolArgumentIntegrity = .valid,
+    provisional_id: ?[]const u8 = null,
+    provider_result: ?[]const u8 = null,
+    final_identity: types.FinalToolIdentity = .valid,
+    provenance: types.ToolExecutionProvenance = .fx_local,
 };
 
 pub const ConversationToolResult = struct {
@@ -48,6 +59,9 @@ pub const ConversationToolResult = struct {
 pub const ConversationInterruption = struct {
     reason: session.InterruptedTerminalReason,
     partial_text: ?[]const u8 = null,
+    command_replay_ref: ?[]const u8 = null,
+    command_replay_bytes: ?u64 = null,
+    command_artifact_ref: ?[]const u8 = null,
 };
 
 pub const ConversationCheckpoint = struct {
@@ -56,7 +70,7 @@ pub const ConversationCheckpoint = struct {
 };
 
 pub const ConversationEvent = union(enum) {
-    user: ConversationText,
+    user: ConversationUser,
     assistant: ConversationText,
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
@@ -151,7 +165,23 @@ pub fn validateConversationTransition(
 
 fn validateConversationEventShape(event: ConversationEvent) ConversationTransitionError!void {
     switch (event) {
-        .user, .assistant, .steering => |value| try validateConversationText(value.text),
+        .user => |value| {
+            try validateConversationText(value.text);
+            if (value.images.len > 128) return error.InvalidConversationEvent;
+            for (value.images) |image| {
+                if (image.path.len == 0 or
+                    image.path.len > std.Io.Dir.max_path_bytes or
+                    image.media_type.len == 0 or
+                    image.media_type.len > max_conversation_identity_bytes or
+                    !std.unicode.utf8ValidateSlice(image.path) or
+                    !std.unicode.utf8ValidateSlice(image.media_type))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+            if (value.work_id) |work_id| try validateConversationIdentity(work_id);
+        },
+        .assistant, .steering => |value| try validateConversationText(value.text),
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -160,6 +190,14 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
                 !std.unicode.utf8ValidateSlice(call.arguments_json))
             {
                 return error.InvalidConversationEvent;
+            }
+            if (call.provisional_id) |value| try validateConversationIdentity(value);
+            if (call.provider_result) |value| {
+                if (value.len > max_conversation_arguments_bytes or
+                    !std.unicode.utf8ValidateSlice(value))
+                {
+                    return error.InvalidConversationEvent;
+                }
             }
         },
         .tool_result => |result| {
@@ -181,6 +219,17 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
         },
         .interrupted => |interrupted| {
             if (interrupted.partial_text) |text| try validateOptionalConversationText(text);
+            if ((interrupted.command_replay_ref == null) !=
+                (interrupted.command_replay_bytes == null))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (interrupted.command_replay_ref) |handle| {
+                try validateConversationIdentity(handle);
+            }
+            if (interrupted.command_artifact_ref) |handle| {
+                try validateConversationIdentity(handle);
+            }
         },
         .context_checkpoint => |checkpoint| try validateConversationText(checkpoint.summary),
         .turn_completed => {},
@@ -274,7 +323,11 @@ pub fn appendHistoryTurnConversationEvents(
     errdefer events.shrinkRetainingCapacity(initial_len);
     switch (turn) {
         .assistant => |entry| {
-            try events.append(alloc, .{ .user = .{ .text = entry.user.text } });
+            try events.append(alloc, .{ .user = .{
+                .text = entry.user.text,
+                .images = entry.user.images,
+                .work_id = entry.user.work_id,
+            } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.assistant.len > 0) {
                 try events.append(alloc, .{ .assistant = .{ .text = entry.assistant } });
@@ -282,22 +335,59 @@ pub fn appendHistoryTurnConversationEvents(
             try events.append(alloc, .{ .turn_completed = {} });
         },
         .interrupted => |entry| {
-            try events.append(alloc, .{ .user = .{ .text = entry.user.text } });
+            try events.append(alloc, .{ .user = .{
+                .text = entry.user.text,
+                .images = entry.user.images,
+                .work_id = entry.user.work_id,
+            } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
                 try events.append(alloc, .{ .tool_call = .{
                     .call_id = call.id,
                     .tool_name = call.name,
                     .arguments_json = call.arguments_json,
+                    .argument_integrity = call.argument_integrity,
+                    .provisional_id = call.provisional_id,
+                    .provider_result = call.provider_result,
+                    .final_identity = call.final_identity,
+                    .provenance = call.provenance,
                 } });
             }
             try events.append(alloc, .{ .interrupted = .{
                 .reason = entry.terminal_reason,
                 .partial_text = entry.assistant,
+                .command_replay_ref = interruptedCommandReplayRef(entry),
+                .command_replay_bytes = interruptedCommandReplayBytes(entry),
+                .command_artifact_ref = if (entry.cancelled_command) |presentation|
+                    presentation.command_artifact_handle
+                else
+                    null,
             } });
         },
         .compacted_summary => return error.ConversationCheckpointRequiresSequence,
     }
+}
+
+fn interruptedCommandReplayRef(
+    entry: types.InterruptedHistoryTurn,
+) ?[]const u8 {
+    const replay = (entry.cancelled_command orelse return null).output_replay orelse
+        return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn interruptedCommandReplayBytes(
+    entry: types.InterruptedHistoryTurn,
+) ?u64 {
+    const replay = (entry.cancelled_command orelse return null).output_replay orelse
+        return null;
+    return switch (replay) {
+        .available => |descriptor| @intCast(descriptor.framed_bytes),
+        .unavailable => null,
+    };
 }
 
 fn appendExecutionConversationEvents(
@@ -321,6 +411,11 @@ fn appendExecutionConversationEvents(
                 .call_id = call.id,
                 .tool_name = call.name,
                 .arguments_json = call.arguments_json,
+                .argument_integrity = call.argument_integrity,
+                .provisional_id = call.provisional_id,
+                .provider_result = call.provider_result,
+                .final_identity = call.final_identity,
+                .provenance = call.provenance,
             } });
         }
         for (step.tool_results) |result| {
@@ -333,8 +428,11 @@ fn appendExecutionConversationEvents(
                 .artifact_ref = artifact_ref,
                 .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
                     return error.InvalidConversationEvent,
-                .completeness = .complete,
-                .preview = result.preview,
+                .completeness = if (result.truncated) .partial else .complete,
+                .preview = result.preview orelse if (result.output.len <= max_conversation_preview_bytes)
+                    result.output
+                else
+                    null,
             } });
             for (result.permission_feedback) |feedback| {
                 if (feedback.len > 0) {
