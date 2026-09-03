@@ -8,7 +8,6 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
-const oauth = @import("../auth/oauth.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -1145,16 +1144,11 @@ pub fn Runtime(comptime App: type) type {
                 // A session file that exists but can no longer be refreshed is
                 // not a listing failure: there is nothing to list until the
                 // user signs in again.
-                switch (err) {
-                    error.NoSession,
-                    error.NoRefreshToken,
-                    error.SessionChanged,
-                    oauth.OAuthError.InvalidClient,
-                    oauth.OAuthError.ExpiredToken,
-                    oauth.OAuthError.AccessDenied,
-                    oauth.OAuthError.InvalidGrant,
-                    => return .needs_sign_in,
-                    else => {},
+                if (err == error.NoSession or
+                    err == error.SessionChanged or
+                    !auth_runtime.classifyCredentialFailure(.fx_login, err).retryable())
+                {
+                    return .needs_sign_in;
                 }
                 try app.writeDomainNotice(.{
                     .topic = "auth",

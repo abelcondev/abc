@@ -750,24 +750,66 @@ pub fn refreshFxSession(
     defer metadata.deinit(alloc);
     try oauth_session.validateE2EEndpoint(issuer_url, metadata.token_endpoint);
 
-    var refreshed = try oauth.refreshToken(
+    var refreshed = oauth.refreshToken(
         alloc,
         transport,
         metadata,
         session.client_id,
         session.refresh_token,
-    );
+    ) catch |err| {
+        if (err == error.InvalidOAuthResponse) {
+            debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
+            try retire_fx_session(alloc, mutation);
+            return error.NoRefreshToken;
+        }
+        if (refresh_rejection_requires_sign_in(err)) {
+            debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
+            try retire_fx_session(alloc, mutation);
+        }
+        return err;
+    };
     defer refreshed.deinit(alloc);
+
+    const rotated_refresh_token = refreshed.refresh_token orelse {
+        debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
+        try retire_fx_session(alloc, mutation);
+        return error.NoRefreshToken;
+    };
+    const expires_at_ms = oauth.expiry_timestamp_ms(
+        io_mod.milliTimestamp(),
+        refreshed.expires_in,
+    ) catch |err| {
+        debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
+        try retire_fx_session(alloc, mutation);
+        return error.NoRefreshToken;
+    };
+
+    const replacement = oauth_session.Session{
+        .issuer = session.issuer,
+        .client_id = session.client_id,
+        .access_token = refreshed.access_token,
+        .refresh_token = rotated_refresh_token,
+        .expires_at_ms = expires_at_ms,
+        .scope = refreshed.scope,
+        .token_type = refreshed.token_type,
+        .team_slug = session.team_slug,
+        .team_id = session.team_id,
+    };
+    mutation.save(alloc, replacement) catch |err| {
+        debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
+        retire_fx_session(alloc, mutation) catch |cleanup_err| {
+            debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
+        };
+        return error.OAuthSessionCleanupUncertain;
+    };
 
     secret.zeroAndFree(alloc, session.access_token);
     session.access_token = refreshed.access_token;
     refreshed.access_token = &.{};
 
-    if (refreshed.refresh_token) |value| {
-        secret.zeroAndFree(alloc, session.refresh_token);
-        session.refresh_token = value;
-        refreshed.refresh_token = null;
-    }
+    secret.zeroAndFree(alloc, session.refresh_token);
+    session.refresh_token = rotated_refresh_token;
+    refreshed.refresh_token = null;
 
     alloc.free(session.scope);
     session.scope = refreshed.scope;
@@ -777,8 +819,26 @@ pub fn refreshFxSession(
     session.token_type = refreshed.token_type;
     refreshed.token_type = &.{};
 
-    session.expires_at_ms = try oauth.expiry_timestamp_ms(io_mod.milliTimestamp(), refreshed.expires_in);
-    try mutation.save(alloc, session.*);
+    session.expires_at_ms = expires_at_ms;
+}
+
+fn refresh_rejection_requires_sign_in(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidGrant,
+        error.AccessDenied,
+        error.ExpiredToken,
+        error.InvalidClient,
+        => true,
+        else => false,
+    };
+}
+
+fn retire_fx_session(
+    alloc: std.mem.Allocator,
+    mutation: *oauth_session.Mutation,
+) !void {
+    const result = mutation.delete(alloc) catch return error.OAuthSessionCleanupUncertain;
+    if (result.local_cleanup_failed) return error.OAuthSessionCleanupUncertain;
 }
 
 fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?i64) Credential {
@@ -1401,6 +1461,141 @@ const ExpiredFxLoginFixture = struct {
         self.tmp.cleanup();
     }
 };
+
+const FxLoginRefreshProbe = struct {
+    token_disposition: oauth_transport.Disposition,
+    token_body: []const u8,
+    auth_path_to_make_read_only: ?[]const u8 = null,
+    calls: usize = 0,
+
+    fn provider(self: *FxLoginRefreshProbe) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(
+        raw: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        request: oauth_transport.Request,
+    ) !oauth_transport.Response {
+        const self: *FxLoginRefreshProbe = @ptrCast(@alignCast(raw.?));
+        const response_body = switch (self.calls) {
+            0 => blk: {
+                if (request.method != .get) return error.UnexpectedOAuthRequest;
+                break :blk "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}";
+            },
+            1 => blk: {
+                if (request.method != .post_form) return error.UnexpectedOAuthRequest;
+                if (self.auth_path_to_make_read_only) |auth_path| {
+                    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), auth_path, .{ .mode = .read_write });
+                    defer file.close(io_mod.getIo());
+                    try file.setPermissions(
+                        io_mod.getIo(),
+                        std.Io.File.Permissions.fromMode(0o400),
+                    );
+                }
+                break :blk self.token_body;
+            },
+            else => return error.UnexpectedOAuthRequest,
+        };
+        const disposition: oauth_transport.Disposition = if (self.calls == 0)
+            .accepted
+        else
+            self.token_disposition;
+        self.calls += 1;
+        return .{
+            .disposition = disposition,
+            .body = try alloc.dupe(u8, response_body),
+        };
+    }
+};
+
+test "an invalid fx login refresh retires the rejected session" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .rejected,
+        .token_body = "{\"error\":\"invalid_grant\"}",
+    };
+
+    try std.testing.expectError(
+        error.InvalidGrant,
+        refreshFxLoginCredential(alloc, refresh.provider()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+
+    var persisted = try oauth_session.load(alloc);
+    defer if (persisted) |*session| session.deinit(alloc);
+    try std.testing.expect(persisted == null);
+}
+
+test "an fx login refresh without a rotated refresh token retires the session" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{\"access_token\":\"new-access\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+    };
+
+    if (refreshFxLoginCredential(alloc, refresh.provider())) |maybe_credential| {
+        if (maybe_credential) |credential_value| {
+            var credential = credential_value;
+            credential.deinit(alloc);
+        }
+        return error.TestExpectedMissingRefreshToken;
+    } else |err| {
+        try std.testing.expectEqual(error.NoRefreshToken, err);
+    }
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+
+    var persisted = try oauth_session.load(alloc);
+    defer if (persisted) |*session| session.deinit(alloc);
+    try std.testing.expect(persisted == null);
+}
+
+test "a malformed successful fx login refresh retires the session" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{}",
+    };
+
+    try std.testing.expectError(
+        error.NoRefreshToken,
+        refreshFxLoginCredential(alloc, refresh.provider()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+
+    var persisted = try oauth_session.load(alloc);
+    defer if (persisted) |*session| session.deinit(alloc);
+    try std.testing.expect(persisted == null);
+}
+
+test "an fx login refresh retires the consumed token when durable replacement fails" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    const auth_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    defer alloc.free(auth_path);
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+        .auth_path_to_make_read_only = auth_path,
+    };
+
+    try std.testing.expectError(
+        error.OAuthSessionCleanupUncertain,
+        refreshFxLoginCredential(alloc, refresh.provider()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+
+    var persisted = try oauth_session.load(alloc);
+    defer if (persisted) |*session| session.deinit(alloc);
+    try std.testing.expect(persisted == null);
+}
 
 test "a disabled store still reports why the fx login was silent" {
     const alloc = std.testing.allocator;
