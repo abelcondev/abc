@@ -3881,6 +3881,14 @@ describe("cli: ask success", () => {
       const sizes = [1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024];
       const gateway = startFakeGateway(
         sizes.map((_, index) => fakeGatewayFinalText(`large stdin ${index}`)),
+        { models: [{
+          id: FAKE_GATEWAY_MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          // Keep the stdin transport cases below the separate compaction threshold.
+          context_window: 2_000_000,
+          max_tokens: 16_384,
+        }] },
       );
       try {
         mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
@@ -3907,7 +3915,7 @@ describe("cli: ask success", () => {
             },
           );
 
-          expect(result.code).toBe(0);
+          expect(result.code, JSON.stringify({ size, stdout: result.stdout, stderr: result.stderr })).toBe(0);
           expect(JSON.parse(result.stdout).output.trim()).toBe(`large stdin ${index}`);
           const request = JSON.parse(gateway.requests[index]!.body) as {
             prompt: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
