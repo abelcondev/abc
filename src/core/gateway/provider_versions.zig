@@ -160,7 +160,7 @@ test "provider versions accept bounded stable releases and reject header or URL 
 
 test "provider version cache round trips and rejects damaged data" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "versions");
     defer dir.close();
