@@ -296,12 +296,16 @@ pub fn Runtime(comptime App: type) type {
                         .character_left => {
                             app.input_runtime.vertical_navigation.reset();
                             if (!intent.extend_selection and
-                                app.input_runtime.edit_state.selectionRange() == null and
-                                !app.stream.active and
-                                (try provider_picker_rt.stepBack(app) or try completion_rt.stepBackModelPicker(app)))
+                                app.input_runtime.edit_state.selectionRange() == null)
                             {
-                                app.shell.render_requests.request(.footer);
-                                return;
+                                if (!app.stream.active and try provider_picker_rt.stepBack(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
+                                if (try completion_rt.stepBackModelPicker(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
                             }
                             _ = app.input_runtime.moveInputCursor(intent);
                         },
@@ -1440,7 +1444,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
-                    } else if (!app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                    } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
@@ -1450,10 +1454,7 @@ pub fn Runtime(comptime App: type) type {
                     } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
                         if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
-                        // Mid-turn: list is hidden — do not autocomplete a hidden index.
-                        if (!app.stream.active) {
-                            try completion_rt.autocompleteModelPickerSelection(app);
-                        }
+                        try completion_rt.autocompleteModelPickerSelection(app);
                     } else if (completion_rt.visibleInlineCompletion(app) != null) {
                         if ((try completion_rt.autocompleteInlineCompletion(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1550,19 +1551,6 @@ pub fn Runtime(comptime App: type) type {
                         if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
-                        if (app.stream.active) {
-                            if (try submitExplicitModelSelection(
-                                app,
-                                resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
-                            )) return;
-                            try app.writeDomainNotice(.{
-                                .topic = "model",
-                                .tone = .neutral,
-                                .body = "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
                         if (try completion_rt.submitModelPicker(app)) return;
                     }
                     if (try submitExplicitModelSelection(
@@ -6397,21 +6385,24 @@ test "active stream Enter commits a complete model choice for the next turn" {
     );
 }
 
-test "active stream Enter explains an incomplete hidden model choice" {
+test "active stream Enter selects the visible model choice" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
+    const model = "provider/plain-model";
+    app.model_completion_values = &.{model};
 
-    try app.input_runtime.textReplacementState().replace(alloc, "/model openai/gpt");
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/plain");
     app.stream.active = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-    try std.testing.expectEqualStrings("/model openai/gpt", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
+        "Next turn will use " ++ model,
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
@@ -6590,46 +6581,28 @@ test "app_input_runtime bare model Tab keeps current selection beyond completion
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime stream model-shaped keys stay model-owned" {
+test "app_input_runtime stream model picker opens navigates and selects" {
     const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "model-helper",
-        .description = "model helper",
-        .path = "/tmp/model-helper/SKILL.md",
-        .source = .global_fx,
-    }};
-    const completions = [_][]const u8{"xai/grok-build-1"};
-    const cases = [_]struct {
-        input: []const u8,
-        byte: u8,
-        expect_input: []const u8,
-        expect_catalog: bool = false,
-    }{
-        .{ .input = "/model ", .byte = '\r', .expect_input = "/model " },
-        .{ .input = "/model", .byte = '\r', .expect_input = "", .expect_catalog = true },
-        .{ .input = "/model", .byte = '\t', .expect_input = "/model" },
-        .{ .input = "/model ", .byte = '\t', .expect_input = "/model " },
+    const models = [_][]const u8{
+        "provider/first-model",
+        "provider/second-model",
     };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &models;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    for (cases) |case| {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.skills.items = @constCast(&skills);
-        app.model_completion_values = &completions;
-        app.selected_model.clearRetainingCapacity();
-        try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.7");
-        app.stream.active = true;
-        try app.input_runtime.textReplacementState().replace(alloc, case.input);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, case.byte, 4096, 100);
-
-        try std.testing.expectEqualStrings(case.expect_input, app.input_runtime.edit_state.input.items);
-        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
-        try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", app.selected_model.items);
-        try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-        try std.testing.expectEqual(case.expect_catalog, app.model_cache.menu.active);
-    }
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(models[1], app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -7007,7 +6980,27 @@ test "app_input_runtime stale Tab selection requests a footer repaint" {
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime terminated file tokens submit while streaming queries stay local" {
+test "app_input_runtime stream file picker navigates and selects without submitting" {
+    const alloc = std.testing.allocator;
+    const completions = [_]file_index.Candidate{
+        .{ .path = "first.txt", .kind = .file },
+        .{ .path = "second.txt", .kind = .file },
+    };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.file_completion_values = &completions;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "@file");
+
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqualStrings("@second.txt ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime terminated and unmatched file tokens submit as prompt text" {
     const alloc = std.testing.allocator;
 
     {
@@ -7024,7 +7017,7 @@ test "app_input_runtime terminated file tokens submit while streaming queries st
         defer app.deinit();
         app.stream.active = true;
         try app.input_runtime.textReplacementState().replace(alloc, "@queued");
-        try std.testing.expect(!Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
+        try std.testing.expect(Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);

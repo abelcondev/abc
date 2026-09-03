@@ -90,8 +90,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn slashCompletionQueryActive(app: *App) bool {
             if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
-            // Model query always owns this slot. Mid-turn bare `/model` does too
-            // (list stays hidden); idle bare `/model` still surfaces slash rows.
+            // Model query always owns this slot. Mid-turn bare `/model` does too;
+            // idle bare `/model` still surfaces slash rows.
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
             }
@@ -141,9 +141,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) {
-                    if (queueReviewOwnsComposer(app)) {
-                        return if (hasFileQuery(app)) .file else null;
-                    }
+                    if (hasModelQuery(app)) return .model;
+                    if (hasFileQuery(app)) return .file;
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
                     if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
@@ -376,13 +375,12 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 if (try routeSessionPickerMove(app, delta)) return true;
             }
-            const stream_suppresses_file_picker = app.stream.active and !queueReviewOwnsComposer(app);
-            if (!stream_suppresses_file_picker and hasFileQuery(app)) {
+            if (hasFileQuery(app)) {
                 navigateFilePicker(app, delta);
                 return true;
             }
             if (hasModelQuery(app)) {
-                if (!app.stream.active) navigateModelPicker(app, delta);
+                navigateModelPicker(app, delta);
                 return true;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
@@ -1761,7 +1759,7 @@ fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
     );
 }
 
-test "streaming suppresses file selection until queued review owns the composer" {
+test "streaming file selection does not require queued review" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(FilePickerTestApp);
     var app = FilePickerTestApp{
@@ -1773,18 +1771,11 @@ test "streaming suppresses file selection until queued review owns the composer"
     app.stream.active = true;
 
     try std.testing.expectEqual(
-        @as(?edit_contract.InsertResult, null),
-        try rt.submitFilePickerOnEnter(&app, 4096),
-    );
-    try std.testing.expectEqualStrings("review @src/mai", app.input_runtime.edit_state.input.items);
-
-    app.queued_prompt_review.visible = true;
-    try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         (try rt.submitFilePickerOnEnter(&app, 4096)).?,
     );
     try std.testing.expectEqualStrings("review @src/main.zig ", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.queued_prompt_review.selected_dirty);
+    try std.testing.expect(!app.queued_prompt_review.selected_dirty);
 }
 
 test "file picker rejects paths that would reopen quote grammar" {
