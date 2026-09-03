@@ -54,6 +54,9 @@ pub const ConversationToolResult = struct {
     stored_bytes: u64,
     completeness: ArtifactCompleteness,
     preview: ?[]const u8 = null,
+    permission_feedback: []const []const u8 = &.{},
+    command_replay_ref: ?[]const u8 = null,
+    command_replay_bytes: ?u64 = null,
 };
 
 pub const ConversationInterruption = struct {
@@ -215,6 +218,17 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
                 {
                     return error.InvalidConversationEvent;
                 }
+            }
+            for (result.permission_feedback) |feedback| {
+                try validateOptionalConversationText(feedback);
+            }
+            if ((result.command_replay_ref == null) !=
+                (result.command_replay_bytes == null))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (result.command_replay_ref) |handle| {
+                try validateConversationIdentity(handle);
             }
         },
         .interrupted => |interrupted| {
@@ -433,12 +447,10 @@ fn appendExecutionConversationEvents(
                     result.output
                 else
                     null,
+                .permission_feedback = result.permission_feedback,
+                .command_replay_ref = resultCommandReplayRef(result),
+                .command_replay_bytes = resultCommandReplayBytes(result),
             } });
-            for (result.permission_feedback) |feedback| {
-                if (feedback.len > 0) {
-                    try events.append(alloc, .{ .steering = .{ .text = feedback } });
-                }
-            }
         }
         const completed_steps = step_index + 1;
         while (steering_index < execution.steering.len and
@@ -471,6 +483,22 @@ fn resultArtifactRef(result: types.PersistedToolResult) ?[]const u8 {
     const replay = result.command_output_replay orelse return null;
     return switch (replay) {
         .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn resultCommandReplayRef(result: types.PersistedToolResult) ?[]const u8 {
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn resultCommandReplayBytes(result: types.PersistedToolResult) ?u64 {
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| @intCast(descriptor.framed_bytes),
         .unavailable => null,
     };
 }

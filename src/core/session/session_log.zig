@@ -1182,6 +1182,35 @@ fn dupeConversationToolResult(
     errdefer alloc.free(handle);
     const preview = if (value.preview) |text| try alloc.dupe(u8, text) else null;
     errdefer if (preview) |text| alloc.free(text);
+    var permission_feedback: [][]u8 = if (value.permission_feedback.len > 0)
+        try alloc.alloc([]u8, value.permission_feedback.len)
+    else
+        &.{};
+    errdefer if (permission_feedback.len > 0) alloc.free(permission_feedback);
+    var feedback_count: usize = 0;
+    errdefer for (permission_feedback[0..feedback_count]) |feedback| {
+        alloc.free(feedback);
+    };
+    for (value.permission_feedback, 0..) |feedback, index| {
+        permission_feedback[index] = try alloc.dupe(u8, feedback);
+        feedback_count += 1;
+    }
+    const command_output_replay: ?types.CommandOutputReplay = if (value.command_replay_ref) |replay_ref| blk: {
+        const replay_handle = try alloc.dupe(u8, replay_ref);
+        break :blk .{ .available = .{
+            .handle = replay_handle,
+            .framed_bytes = std.math.cast(
+                usize,
+                value.command_replay_bytes.?,
+            ) orelse {
+                alloc.free(replay_handle);
+                return error.ConversationSizeOverflow;
+            },
+        } };
+    } else null;
+    errdefer if (command_output_replay) |replay| {
+        types.freeCommandOutputReplay(alloc, replay);
+    };
     const stored_bytes = std.math.cast(usize, value.stored_bytes) orelse
         return error.ConversationSizeOverflow;
     return .{
@@ -1194,6 +1223,8 @@ fn dupeConversationToolResult(
         .output_bytes = stored_bytes,
         .stored_output_bytes = stored_bytes,
         .truncated = value.completeness != .complete,
+        .permission_feedback = permission_feedback,
+        .command_output_replay = command_output_replay,
     };
 }
 
@@ -1206,6 +1237,11 @@ fn freeConversationToolResult(
     alloc.free(result.output);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
+    for (result.permission_feedback) |feedback| alloc.free(feedback);
+    if (result.permission_feedback.len > 0) alloc.free(result.permission_feedback);
+    if (result.command_output_replay) |replay| {
+        types.freeCommandOutputReplay(alloc, replay);
+    }
 }
 
 fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize {
@@ -2402,21 +2438,22 @@ pub const LoadedWritableSession = struct {
         event: session_event.Event,
         timestamp_ms: i64,
     ) !CommitPosition {
-        var next_state = try self.reduceCompatibilityEvent(
-            alloc,
-            event,
-            timestamp_ms,
-        );
-        errdefer next_state.deinit(alloc);
-        const snapshot = next_state.usage orelse return error.InvalidConversationEvent;
+        const snapshot = switch (event) {
+            .usage_checkpointed => |payload| payload.usage,
+            else => return error.InvalidConversationEvent,
+        };
+        var next_usage = try session_usage.dupeSnapshotOwned(alloc, snapshot);
+        errdefer next_usage.deinit(alloc);
         try session_usage_sidecar.write(
             alloc,
             &self.log.dir,
             self.active_id,
             snapshot,
         );
-        self.state.deinit(alloc);
-        self.state = next_state;
+        if (self.state.usage) |*prior| prior.deinit(alloc);
+        self.state.usage = next_usage;
+        next_usage = undefined;
+        self.state.updated_at_ms = timestamp_ms;
         self.state_replacement_pending = false;
         return self.position;
     }
@@ -9816,6 +9853,7 @@ test "conversation writer flattens a canonical history turn" {
         .provider_result = "{\"native\":true}",
         .provenance = .provider_executed,
     }};
+    var feedback = [_][]u8{@constCast("inspect the result")};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-shell"),
         .tool_name = @constCast("shell"),
@@ -9824,6 +9862,11 @@ test "conversation writer flattens a canonical history turn" {
         .output_handle = @constCast("result-shell.txt"),
         .output_bytes = 4,
         .stored_output_bytes = 4,
+        .permission_feedback = &feedback,
+        .command_output_replay = .{ .available = .{
+            .handle = @constCast("fx-command-replay-test.bin"),
+            .framed_bytes = 42,
+        } },
     }};
     var steps = [_]types.ToolExecutionStep{.{
         .assistant = @constCast("Running it."),
@@ -10196,6 +10239,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
         .provider_result = "{\"native\":true}",
         .provenance = .provider_executed,
     }};
+    var feedback = [_][]u8{@constCast("inspect the result")};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-shell"),
         .tool_name = @constCast("shell"),
@@ -10204,6 +10248,11 @@ test "cache-free resume rebuilds tool calls and external result references" {
         .output_handle = @constCast("result-shell.txt"),
         .output_bytes = 4,
         .stored_output_bytes = 4,
+        .permission_feedback = &feedback,
+        .command_output_replay = .{ .available = .{
+            .handle = @constCast("fx-command-replay-test.bin"),
+            .framed_bytes = 42,
+        } },
     }};
     var steps = [_]types.ToolExecutionStep{.{
         .assistant = @constCast("Running it."),
@@ -10243,6 +10292,22 @@ test "cache-free resume rebuilds tool calls and external result references" {
         "result-shell.txt",
         execution.tool_steps[0].tool_results[0].output_handle.?,
     );
+    try std.testing.expectEqualStrings(
+        "inspect the result",
+        execution.tool_steps[0].tool_results[0].permission_feedback[0],
+    );
+    const replay = execution.tool_steps[0].tool_results[0].command_output_replay orelse
+        return error.TestExpectedCommandReplay;
+    switch (replay) {
+        .available => |descriptor| {
+            try std.testing.expectEqualStrings(
+                "fx-command-replay-test.bin",
+                descriptor.handle,
+            );
+            try std.testing.expectEqual(@as(usize, 42), descriptor.framed_bytes);
+        },
+        .unavailable => return error.TestExpectedCommandReplay,
+    }
 }
 
 test "cache-free resume loads only the latest checkpoint and suffix" {

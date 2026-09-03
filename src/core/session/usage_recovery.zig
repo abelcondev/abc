@@ -86,10 +86,10 @@ fn collectFromHomeCancelable(
             unknown_pending = true;
             continue;
         };
+        const checkpoint_modified = store.usageCheckpointModifiedAtNs(marked.id) catch null;
         if (!session_usage.needsProfileRecovery(usage)) {
-            const modified = store.usageCheckpointModifiedAtNs(marked.id) catch null;
-            if (modified != null and
-                modified.? > marked.marker_modified_at_ns)
+            if (checkpoint_modified != null and
+                checkpoint_modified.? > marked.marker_modified_at_ns)
             {
                 continue;
             }
@@ -97,7 +97,11 @@ fn collectFromHomeCancelable(
             continue;
         }
         if (marked.protected_updated_at_ms) |protected| {
-            if (state.updated_at_ms < protected) {
+            const checkpoint_is_newer = if (checkpoint_modified) |modified|
+                modified > marked.marker_modified_at_ns
+            else
+                state.updated_at_ms >= protected;
+            if (!checkpoint_is_newer) {
                 unknown_pending = true;
             }
         }
