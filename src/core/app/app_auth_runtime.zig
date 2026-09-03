@@ -1130,6 +1130,13 @@ pub fn Runtime(comptime App: type) type {
         };
 
         pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (failure.source == .fx_login and !failure.retryable()) {
+                        return .needs_sign_in;
+                    }
+                }
+            }
             if (!app.auth.pickerView().fx_login_session_available) return .needs_sign_in;
             try app.flushBeforeBlockingExternalWork();
 
@@ -1145,6 +1152,7 @@ pub fn Runtime(comptime App: type) type {
                     oauth.OAuthError.InvalidClient,
                     oauth.OAuthError.ExpiredToken,
                     oauth.OAuthError.AccessDenied,
+                    oauth.OAuthError.InvalidGrant,
                     => return .needs_sign_in,
                     else => {},
                 }
