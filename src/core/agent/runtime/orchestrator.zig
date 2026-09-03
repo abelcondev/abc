@@ -8663,8 +8663,27 @@ fn processQueuedPromptLoop(
                 turn_review_cache.cached(execution_call)
             else
                 null;
+            const review_attempt_available = action_permission_mode != .auto or
+                turn_review_cache.reviewAttemptAvailable(execution_call);
+            const exhausted_review = if (!review_attempt_available)
+                command_admission.PermissionOutcome{
+                    .decision = .deny,
+                    .denial_reason = .review_unavailable,
+                    .auto_review_failure = .turn_review_budget_exhausted,
+                }
+            else
+                null;
+            if (!review_attempt_available) {
+                debug_trace.eventf(
+                    "permission",
+                    "auto_review_budget_exhausted",
+                    step_ctx,
+                    "call_id={s} tool_name={s} execution_started=false",
+                    .{ tool_call.id, tool_call.name },
+                );
+            }
             const effective_preserved_denial = preserved_denial orelse
-                preserved_review_hold;
+                preserved_review_hold orelse exhausted_review;
             if (effective_preserved_denial != null) {
                 debug_trace.eventf(
                     "permission",

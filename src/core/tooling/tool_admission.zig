@@ -4058,11 +4058,11 @@ test "missing contextual review authority maps to unavailable without reviewer t
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.review_calls += 1;
-            return permission_auto_classifier.Reviewer.withTransport(.{
+            return permission_auto_classifier.Reviewer.withTransportModel(.{
                 .context = raw_ctx,
                 .send_fn = send,
                 .build_fn = build,
-            }, null, 1000).review(alloc, request);
+            }, null, 1000, "test/reviewer").review(alloc, request);
         }
     };
 

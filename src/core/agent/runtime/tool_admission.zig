@@ -31,6 +31,7 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const PermissionActionId = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const max_turn_review_holds: usize = 64;
+const max_turn_unavailable_attempts: usize = 64;
 const max_consecutive_malformed_argument_batches: usize = 3;
 
 const CachedReviewHold = struct {
@@ -46,6 +47,9 @@ const CachedReviewHold = struct {
 
 pub const TurnReviewCache = struct {
     holds: std.ArrayList(CachedReviewHold) = .empty,
+    /// Exact actions that already spent one unavailable reviewer attempt this
+    /// turn. This is an I/O budget, not a cached security decision.
+    unavailable_attempts: std.ArrayList(PermissionActionId) = .empty,
 
     pub fn deinit(self: *TurnReviewCache, alloc: Allocator) void {
         for (self.holds.items) |entry| switch (entry.detail) {
@@ -53,6 +57,7 @@ pub const TurnReviewCache = struct {
             .evidence_incomplete => {},
         };
         self.holds.deinit(alloc);
+        self.unavailable_attempts.deinit(alloc);
         self.* = .{};
     }
 
@@ -65,7 +70,17 @@ pub const TurnReviewCache = struct {
         const denial_reason = outcome.denial_reason orelse return;
         switch (denial_reason) {
             .review_caution, .review_evidence_incomplete => {},
-            .user_denied, .auto_denied, .review_unavailable, .policy_denied, .permission_required => return,
+            .review_unavailable => {
+                if (outcome.auto_review_failure == null) return;
+                const exact_id = permissionActionId(call);
+                for (self.unavailable_attempts.items) |entry| {
+                    if (std.mem.eql(u8, &entry, &exact_id)) return;
+                }
+                if (self.unavailable_attempts.items.len == max_turn_unavailable_attempts) return;
+                try self.unavailable_attempts.append(alloc, exact_id);
+                return;
+            },
+            .user_denied, .auto_denied, .policy_denied, .permission_required => return,
         }
         const exact_id = permissionActionId(call);
         for (self.holds.items) |entry| {
@@ -93,6 +108,14 @@ pub const TurnReviewCache = struct {
             }),
             .user_denied, .auto_denied, .review_unavailable, .policy_denied, .permission_required => unreachable,
         }
+    }
+
+    pub fn reviewAttemptAvailable(self: *const TurnReviewCache, call: ToolCall) bool {
+        const exact_id = permissionActionId(call);
+        for (self.unavailable_attempts.items) |entry| {
+            if (std.mem.eql(u8, &entry, &exact_id)) return false;
+        }
+        return true;
     }
 
     pub fn cached(
@@ -467,8 +490,22 @@ test "turn review cache reuses only exact deterministic holds" {
     try cache.remember(alloc, wrapped, .{
         .decision = .deny,
         .denial_reason = .review_unavailable,
+        .auto_review_failure = .transport_timed_out,
     });
+    const repeated_unavailable = ToolCall{
+        .id = "same-unavailable",
+        .name = wrapped.name,
+        .arguments_json = wrapped.arguments_json,
+    };
+    try std.testing.expect(cache.cached(repeated_unavailable) == null);
+    try std.testing.expect(!cache.reviewAttemptAvailable(repeated_unavailable));
+    try std.testing.expect(cache.reviewAttemptAvailable(.{
+        .id = "changed-unavailable",
+        .name = wrapped.name,
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
+    }));
     try std.testing.expectEqual(@as(usize, 1), cache.holds.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.unavailable_attempts.items.len);
 
     const incomplete = ToolCall{
         .id = "incomplete",
