@@ -2089,6 +2089,26 @@ test "full transcript resized restore bounds invalidation to the current termina
     try std.testing.expect(empty.render_requests.pendingInvalidations().isEmpty());
 }
 
+test "full transcript opening waits for primary damage and remains cancellable" {
+    var runtime = TranscriptRuntime{ .layout = std.mem.zeroes(Layout) };
+    runtime.layout.rows = 24;
+    runtime.layout.cols = 80;
+    try std.testing.expect(runtime.requestFullTranscriptOpen());
+
+    runtime.repaintRestoredPrimaryTranscriptAfterResize();
+    try std.testing.expect(!runtime.requestFullTranscriptOpen());
+    try std.testing.expect(runtime.full_transcript_open_request != null);
+    var interrupted = (try runtime.render_requests.beginAttempt()).?;
+    interrupted.restore();
+    try std.testing.expect(runtime.cancelPendingFullTranscriptOpen());
+    try std.testing.expect(!runtime.requestFullTranscriptOpen());
+
+    var committed = (try runtime.render_requests.beginAttempt()).?;
+    committed.commit(0, 0, false);
+    try std.testing.expect(runtime.requestFullTranscriptOpen());
+    try std.testing.expect(runtime.full_transcript_open_request == null);
+}
+
 test "full transcript recovery starts at closest visible entry before a hidden anchor" {
     const provenance = [_]transcript_blocks.LineProvenance{
         .{ .entry = .{ .entry_id = 10, .entry_class = .unknown_raw } },
@@ -9826,7 +9846,8 @@ pub const TranscriptRuntime = struct {
 
     pub fn requestFullTranscriptOpen(self: *TranscriptRuntime) bool {
         self.full_transcript_restore_open_pending = false;
-        if (self.fullTranscriptPreparedForOpen()) {
+        // Pending primary damage must commit before another buffer can consume it.
+        if (self.fullTranscriptPreparedForOpen() and self.render_requests.pendingInvalidations().isEmpty()) {
             self.full_transcript_open_request = null;
             debug_trace.logf("full_transcript", "open_request state=ready", .{});
             return true;
@@ -9880,6 +9901,7 @@ pub const TranscriptRuntime = struct {
 
     pub fn takeReadyFullTranscriptOpen(self: *TranscriptRuntime) bool {
         const requested = self.full_transcript_open_request orelse return false;
+        if (!self.render_requests.pendingInvalidations().isEmpty()) return false;
         if (self.full_transcript_installed_page_retired) return false;
         const page = if (self.full_transcript_installed_page) |*value| value else return false;
         if (page.prepared_window == null or

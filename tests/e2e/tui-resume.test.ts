@@ -3169,7 +3169,11 @@ test.skipIf(!tmuxAvailable())(
 
           await active.sendKeys("C-o");
           await active.waitForText("Full detail · ctrl o close", TIMEOUT);
-          if (width === 120) await active.resizeWindow(88, 24, 500);
+          if (width === 120) {
+            await active.resizeWindow(88, 24, 500);
+            await active.sendKeys("Escape C-o");
+            await active.waitForText("Full detail · ctrl o close", TIMEOUT);
+          }
           await active.sendKeys("Escape");
           const restored = await active.waitForStableGrid(
             narrowGrid, normalizeVolatileStatusRows, 5_000,
