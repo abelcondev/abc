@@ -269,6 +269,16 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            const hold_turn_start = logout_provider == selected_provider and logout_provider != .gateway;
+            if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Sign out is unavailable until active and queued work finishes.",
+                });
+                return;
+            }
+            defer if (hold_turn_start) app.worker.releaseTurnStartHold();
             if (logout_provider == .grok) {
                 const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
                     try writeAuthNotice(app, .{
@@ -295,6 +305,7 @@ pub fn Runtime(comptime App: type) type {
                         .body = "The local Grok session was removed, but remote revocation could not be confirmed.",
                     });
                 }
+                try reconcileSubscriptionLogout(app, .grok);
                 return;
             }
             if (logout_provider == .codex) {
@@ -316,6 +327,7 @@ pub fn Runtime(comptime App: type) type {
                     .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
                     .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
                 });
+                try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
@@ -329,6 +341,28 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             try applyLogoutResult(app, result);
+        }
+
+        fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
+            const selected = provider_runtime.provider(app);
+            if (selected != removed) return;
+            const candidates = auth_transition.logoutFallbackProviders(.{
+                .requested = removed,
+                .selected = selected,
+                .active_source = app.auth.credentialSource(),
+                .available_sources = app.auth.pickerView().available_sources,
+            });
+            for (candidates) |candidate| {
+                const target = candidate orelse continue;
+                try switchProvider(app, target, false, .manual);
+                if (provider_runtime.provider(app) == target and
+                    model_provider.authorizesCredential(target, app.auth.credentialSource())) return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .warning,
+                .body = "No connected provider is available. Use /provider to sign in.",
+            }, true);
         }
 
         pub fn runProviderCommand(app: *App) !void {
@@ -1112,7 +1146,11 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(
+                        .body = if (failure.category == .cancellation) providerFailureMessage(
+                            intent,
+                            "Provider switching was cancelled. The current provider is unchanged.",
+                            "Subscription sign-in completed, but provider activation was cancelled. The current provider is unchanged.",
+                        ) else providerFailureMessage(
                             intent,
                             "The target provider catalog could not be validated. The current provider is unchanged.",
                             "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",

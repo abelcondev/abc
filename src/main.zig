@@ -472,10 +472,11 @@ const App = struct {
     ) !model_catalog.ProviderResult {
         const catalog = self.providerSet().select(provider).model_catalog orelse
             return error.ModelCatalogUnavailable;
+        var cancel_requested = std.atomic.Value(bool).init(false);
         return catalog.fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,
-            .cancel_flag = &self.worker.worker_cancel_requested,
+            .cancel_flag = &cancel_requested,
             .view = .picker,
         });
     }
@@ -4157,6 +4158,8 @@ test {
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
+    _ = @import("core/auth/auth_transition.zig");
+    _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/workspace_commands.zig");
