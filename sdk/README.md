@@ -59,6 +59,28 @@ returns an async iterable of normalized events:
 - `tool_start`
 - `tool_end`
 
+Consume the turn while it runs, then await `turn.result`. Output is lossless and
+backpressured: a slow reader pauses production instead of growing an unlimited
+event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+If you only need the result, explicitly discard events:
+
+```js
+const turn = agent.prompt("Update the index.");
+for await (const _ of turn) {}
+const result = await turn.result;
+```
+
+A turn has one event consumer. Breaking out of its iterator cancels the turn;
+`turn.cancel()` and `agent.close()` also release blocked output. Transport or
+message-decoding failures reject the result instead of returning success with
+missing text.
+
+Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
+backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
+that threshold when the queue is empty; an individual encoded ACP message is
+limited to 64 MiB on both backends. These are transport bounds, not a total
+answer-size limit or a bound on retained conversation history.
+
 Only one prompt may run at a time. `checkpoint()` is idle-only and returns
 opaque, bounded, versioned bytes. Restore them only when creating a fresh
 agent:
