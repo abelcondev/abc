@@ -2947,8 +2947,49 @@ fn build_provider_prompt_with_response_language_control(
     return .{
         .instructions = prompt.instructions,
         .messages = prompt.messages,
-        .current_user_index = if (compaction_handoff == null) durable_history.len else 0,
+        .current_user_index = if (compaction_handoff == null)
+            durable_history.len
+        else
+            1 + compaction_history_tail.len,
     };
+}
+
+test "compacted request keeps the pending user prompt after the handoff" {
+    var projected = try build_provider_prompt_with_response_language_control(
+        std.testing.allocator,
+        &.{.{ .role = .system, .content = "stable" }},
+        &.{.{ .role = .system, .content = "overlay" }},
+        &.{.{ .role = .user, .content = "removed history" }},
+        .{ .role = .user, .content = "pending prompt" },
+        &.{
+            .{ .role = .assistant, .content = "compacted suffix" },
+            .{ .role = .tool, .content = "new suffix" },
+        },
+        .subagent,
+        false,
+        false,
+        "handoff",
+        &.{.{ .role = .assistant, .content = "retained tail" }},
+        1,
+    );
+    defer projected.instructions.deinit(std.testing.allocator);
+    defer projected.messages.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), projected.instructions.items.len);
+    try std.testing.expectEqualStrings("stable", projected.instructions.items[0].content.?);
+    try std.testing.expectEqualStrings("overlay", projected.instructions.items[1].content.?);
+    const expected = [_][]const u8{
+        "handoff",
+        "retained tail",
+        "pending prompt",
+        "new suffix",
+    };
+    try std.testing.expectEqual(expected.len, projected.messages.items.len);
+    for (expected, projected.messages.items) |content, message| {
+        try std.testing.expectEqualStrings(content, message.content.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), projected.current_user_index);
+    try agent_stream_provider.validate_prompt_lanes(projected.instructions.items, projected.messages.items);
 }
 
 fn response_language_context_conflicts(
@@ -3226,6 +3267,7 @@ noinline fn recoveryCheckpointAssistantSource(
 
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
     arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
@@ -3253,7 +3295,7 @@ fn persistRecoveryCheckpoint(
             .images = job.images,
         },
         .assistant_source = @constCast(assistant_source),
-        .execution = execution,
+        .execution = try finalization.compacted_execution.project(arena, execution),
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
@@ -3342,6 +3384,86 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
         .gateway_timeout => .gateway_timeout,
         .provider_error => .bad_gateway,
     };
+}
+
+fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
+    if (failure.kind == .request_too_large) return true;
+    if (failure.kind != .invalid_request) return false;
+    const detail = failure.detail orelse return false;
+    inline for (.{
+        "context_length_exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "maximum context length",
+        "maximum prompt length",
+        "input is too long",
+        "too many input tokens",
+    }) |needle| {
+        if (text_utils.containsIgnoreCase(detail, needle)) return true;
+    }
+    return false;
+}
+
+const ContextOverflowRecoveryState = enum {
+    ready,
+    pending,
+    used,
+};
+
+fn shouldRecoverContextOverflow(
+    failure: agent_stream_provider.Failure,
+    has_compactable_context: bool,
+    replay_safe: bool,
+    recovery_available: bool,
+    cancelled: bool,
+) bool {
+    return !cancelled and
+        recovery_available and
+        has_compactable_context and
+        replay_safe and
+        isContextOverflowFailure(failure);
+}
+
+test "context overflow recovery is typed safe and bounded" {
+    const context_failure = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: input exceeds the context window"),
+    };
+    const unrelated_failure = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("invalid tool schema"),
+    };
+    const grok_prompt_overflow = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("This model's maximum prompt length is 1000000 but the request contains 1003383 tokens."),
+    };
+    const request_too_large = agent_stream_provider.Failure{
+        .kind = .request_too_large,
+    };
+    const cases = [_]struct {
+        failure: agent_stream_provider.Failure,
+        has_compactable_context: bool = true,
+        replay_safe: bool = true,
+        recovery_available: bool = true,
+        cancelled: bool = false,
+        expected: bool,
+    }{
+        .{ .failure = context_failure, .expected = true },
+        .{ .failure = grok_prompt_overflow, .expected = true },
+        .{ .failure = request_too_large, .expected = true },
+        .{ .failure = unrelated_failure, .expected = false },
+        .{ .failure = context_failure, .has_compactable_context = false, .expected = false },
+        .{ .failure = context_failure, .replay_safe = false, .expected = false },
+        .{ .failure = context_failure, .recovery_available = false, .expected = false },
+        .{ .failure = context_failure, .cancelled = true, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRecoverContextOverflow(
+        case.failure,
+        case.has_compactable_context,
+        case.replay_safe,
+        case.recovery_available,
+        case.cancelled,
+    ));
 }
 
 fn isPostVisionAssistantPrefillRejection(
@@ -3962,6 +4084,29 @@ const PreparedSkills = struct {
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
 };
 
+fn prepareSkillCatalog(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    context_window: ?u32,
+) !?skill_runtime.BoundedPromptSection {
+    if (config.skill_catalog.skills.len == 0 and config.skill_catalog.diagnostics.len == 0) return null;
+    var namespace_bytes: [8]u8 = undefined;
+    std.Io.random(io_mod.getIo(), &namespace_bytes);
+    var section = try skill_runtime.buildSkillPrompt(
+        alloc,
+        config.skill_catalog.skills,
+        config.skill_catalog.diagnostics,
+        config.context_limits,
+        context_window,
+        std.mem.readInt(u64, &namespace_bytes, .little),
+    );
+    errdefer section.deinit(alloc);
+    if (section.notice) |notice| try deps.pushContextNotice(notice);
+    if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+    return section;
+}
+
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -4108,24 +4253,11 @@ fn processQueuedPromptInner(
             return;
         }
     }
-    var skill_section: ?skill_runtime.BoundedPromptSection = null;
+    var skill_section = try prepareSkillCatalog(arena, deps, config, request_capabilities.context_window);
     defer if (skill_section) |*section| section.deinit(arena);
     var explicit_section: ?skill_invocation.ExplicitPromptSection = null;
     defer if (explicit_section) |*section| section.deinit(arena);
-    if (config.skill_catalog.skills.len > 0 or config.skill_catalog.diagnostics.len > 0) {
-        var namespace_bytes: [8]u8 = undefined;
-        std.Io.random(io_mod.getIo(), &namespace_bytes);
-        skill_section = try skill_runtime.buildSkillPrompt(
-            arena,
-            config.skill_catalog.skills,
-            config.skill_catalog.diagnostics,
-            config.context_limits,
-            request_capabilities.context_window,
-            std.mem.readInt(u64, &namespace_bytes, .little),
-        );
-        const section = &skill_section.?;
-        if (section.notice) |notice| try deps.pushContextNotice(notice);
-        if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+    if (skill_section != null) {
         explicit_section = load_explicit: while (true) {
             const prepared = skill_invocation.buildExplicitPromptSection(arena, config.skill_catalog, job.prompt, config.skill_bindings, config.context_limits, config.cancel_flag) catch |err| {
                 if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -4153,28 +4285,8 @@ fn processQueuedPromptInner(
         if (explicit_section.?.notice) |notice| try deps.pushContextNotice(notice);
         if (explicit_section.?.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
     }
-    if (config.system_prompt.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.system_prompt });
-    }
-    if (config.custom_tool_guidance.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
-    }
-    if (skill_section) |section| {
-        if (section.text.len > 0) try stable_prefix.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (config.host_instructions.len > 0) {
-        try stable_prefix.append(arena, .{ .role = .system, .content = config.host_instructions });
-    }
-    if (config.model_prompt_overlay) |overlay| {
-        try stable_prefix.append(arena, .{ .role = .system, .content = overlay });
-    }
-    if (deps.append_static_context) |append_static_context| {
-        try append_static_context(deps.ctx, arena, &stable_prefix);
-    }
-    if (job.context_history_start > job.history.len) {
-        return error.InvalidContextHistoryStart;
-    }
-    const active_history = job.history[job.context_history_start..];
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
     const partial_interrupted_closures = runtime_interruption.countPartialTextInterruptedClosures(active_history);
@@ -4191,14 +4303,14 @@ fn processQueuedPromptInner(
             arena,
             &history_messages,
             job.history,
-            job.context_history_start,
+            0,
         );
     } else {
         try session_runtime.appendActiveContextHistoryChatMessages(
             arena,
             &history_messages,
             job.history,
-            job.context_history_start,
+            0,
         );
     }
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
@@ -4542,90 +4654,22 @@ fn buildProviderPromptForCompactionWindow(
         current_user_message,
         within_turn_suffix,
     );
-    var compacted_suffix: std.ArrayList(ChatMessage) = .empty;
-    try compacted_suffix.append(alloc, .{
+    var compacted_history: std.ArrayList(ChatMessage) = .empty;
+    defer compacted_history.deinit(alloc);
+    try compacted_history.append(alloc, .{
         .role = .user,
         .content = handoff.?,
         .cache_policy = .no_cache,
     });
-    try compacted_suffix.appendSlice(alloc, retained_history_tail);
-    try compacted_suffix.appendSlice(
-        alloc,
-        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
-    );
+    try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildProviderPrompt(
         alloc,
         stable_prefix,
         ephemeral_overlay,
-        &.{},
+        compacted_history.items,
         current_user_message,
-        compacted_suffix.items,
+        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
-}
-
-fn buildCanonicalCompactionWindow(
-    alloc: Allocator,
-    history: []const HistoryTurn,
-    within_turn_suffix: []const ChatMessage,
-    uncertain_history_count: usize,
-    uncertain_message_count: *usize,
-) !std.ArrayList(ChatMessage) {
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    errdefer messages.deinit(alloc);
-    const boundary = @min(uncertain_history_count, history.len);
-    try session_runtime.appendCompactionHistoryChatMessages(
-        alloc,
-        &messages,
-        history[0..boundary],
-    );
-    uncertain_message_count.* = messages.items.len;
-    try session_runtime.appendCompactionHistoryChatMessages(
-        alloc,
-        &messages,
-        history[boundary..],
-    );
-    try messages.appendSlice(alloc, within_turn_suffix);
-    return messages;
-}
-
-test "repeated compaction source keeps canonical history and the complete active suffix" {
-    const history = [_]HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("canonical user") },
-            .assistant = @constCast("canonical assistant"),
-        } },
-        .{ .compacted_summary = .{
-            .summary = @constCast("prior handoff must not become source"),
-            .removed_turn_count = 1,
-            .compaction_count = 1,
-        } },
-    };
-    const suffix = [_]ChatMessage{
-        .{ .role = .assistant, .content = "old assistant" },
-        .{ .role = .tool, .content = "old result" },
-        .{ .role = .assistant, .content = "new assistant" },
-        .{ .role = .tool, .content = "new result" },
-    };
-    var uncertain_message_count: usize = 0;
-    var messages = try buildCanonicalCompactionWindow(
-        std.testing.allocator,
-        &history,
-        &suffix,
-        0,
-        &uncertain_message_count,
-    );
-    defer messages.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
-    try std.testing.expectEqual(@as(usize, 0), uncertain_message_count);
-    try std.testing.expectEqualStrings("canonical user", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("canonical assistant", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("old assistant", messages.items[2].content.?);
-    try std.testing.expectEqualStrings("new result", messages.items[5].content.?);
-    for (messages.items) |message| {
-        try std.testing.expect(message.content == null or
-            std.mem.find(u8, message.content.?, "prior handoff") == null);
-    }
 }
 
 fn latestCompactionCount(history: []const HistoryTurn) usize {
@@ -4638,37 +4682,231 @@ fn latestCompactionCount(history: []const HistoryTurn) usize {
     return count;
 }
 
-fn retainedHistoryTailLimit(
-    history: []const HistoryTurn,
-    has_active_suffix: bool,
-) usize {
-    if (has_active_suffix) return 0;
-    if (history.len > 0 and history[history.len - 1] == .interrupted) return 0;
-    return 2;
-}
-
-test "interrupted history is compactable on the next prompt" {
-    const completed = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("completed") },
-        .assistant = @constCast("done"),
-    } }};
-    const interrupted = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("interrupted") },
-    } }};
-
-    try std.testing.expectEqual(@as(usize, 2), retainedHistoryTailLimit(&completed, false));
-    try std.testing.expectEqual(@as(usize, 0), retainedHistoryTailLimit(&interrupted, false));
-    try std.testing.expectEqual(@as(usize, 0), retainedHistoryTailLimit(&completed, true));
-}
-
 fn commitContextCompaction(
     deps: *const AgentRuntimeDeps,
     summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
 ) !void {
     if (deps.commit_context_compaction) |effect| {
-        return effect.commit(deps.ctx, summary);
+        return effect.commit(deps.ctx, summary, active_prefix, retained_from);
     }
+    if (active_prefix != null or retained_from != null) return error.ContextCompactionUnavailable;
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
+}
+
+fn appendStablePromptContext(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    skill_catalog_text: ?[]const u8,
+    messages: *std.ArrayList(ChatMessage),
+) !void {
+    for ([_][]const u8{
+        config.system_prompt,
+        config.custom_tool_guidance,
+        skill_catalog_text orelse "",
+        config.host_instructions,
+    }) |content| {
+        if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
+    }
+    if (config.model_prompt_overlay) |overlay| {
+        try messages.append(alloc, .{ .role = .system, .content = overlay });
+    }
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, messages);
+}
+
+const CompactionContinuation = struct {
+    request: agent_stream_provider.RequestData,
+    handoff_message_index: usize,
+
+    fn measure(
+        self: CompactionContinuation,
+        alloc: Allocator,
+        provider: agent_stream_provider.Provider,
+        handoff: []const u8,
+    ) !runtime_prompt_context.RequestCost {
+        const messages = try alloc.dupe(ChatMessage, self.request.messages);
+        defer alloc.free(messages);
+        std.debug.assert(messages[self.handoff_message_index].role == .user);
+        messages[self.handoff_message_index].content = handoff;
+        var candidate = self.request;
+        candidate.messages = messages;
+        const body = (try provider.buildRequest(alloc, candidate)) orelse
+            return error.ContextCompactionUnavailable;
+        defer alloc.free(body);
+        return runtime_prompt_context.measureProviderRequest(body);
+    }
+};
+
+pub const RetainedCompactionWindow = struct {
+    source: []ChatMessage,
+    retained_history: []HistoryTurn,
+    retained_messages: []ChatMessage,
+    cut: types.ContextHistoryCut,
+    newest_exchange_tokens: usize,
+};
+
+pub fn prepareRetainedCompactionWindow(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    active: ?types.AssistantHistoryTurn,
+    capabilities: model_capabilities.Capabilities,
+    source_tokens: usize,
+) !RetainedCompactionWindow {
+    var combined: std.ArrayList(HistoryTurn) = .empty;
+    try combined.appendSlice(arena, history);
+    if (active) |turn| try combined.append(arena, .{ .assistant = turn });
+    const selection = runtime_prompt_context.selectRecentContext(
+        combined.items,
+        runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
+        runtime_prompt_context.usableInputTokens(capabilities),
+    );
+    var cut = selection.cut;
+    if (active) |turn| {
+        const active_index = session_runtime.rawHistoryTurnCount(history);
+        if (cut.turns > active_index) cut = .{
+            .turns = active_index,
+            .tool_steps = turn.execution.tool_steps.len,
+            .steering = turn.execution.steering.len,
+        };
+    }
+    const older = try session_runtime.contextHistoryRange(arena, combined.items, .{}, cut);
+    var source: std.ArrayList(ChatMessage) = .empty;
+    var index = history.len;
+    while (index > 0 and older.len > 0) {
+        index -= 1;
+        if (history[index] == .compacted_summary and std.mem.startsWith(u8, history[index].compacted_summary.summary, types.context_handoff_open)) {
+            try session_runtime.appendHistoryChatMessages(arena, &source, history[index .. index + 1]);
+            break;
+        }
+    }
+    try session_runtime.appendHistoryChatMessages(arena, &source, older);
+    const retained = try session_runtime.contextHistoryRange(arena, history, cut, null);
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendHistoryChatMessages(arena, &messages, retained);
+    return .{
+        .source = source.items,
+        .retained_history = retained,
+        .retained_messages = messages.items,
+        .cut = cut,
+        .newest_exchange_tokens = selection.newest_exchange_tokens,
+    };
+}
+
+test "retained context ends an unfinished turn at its completed exchange" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const calls = [_]types.ToolCall{.{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("large-write"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("written"),
+        .output_bytes = 7,
+        .stored_output_bytes = 7,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("write once") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    };
+    const capabilities = model_capabilities.Capabilities{ .context_window = 4_000 };
+    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000);
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, active.cut);
+    try std.testing.expectEqual(@as(usize, 3), active.source.len);
+    try std.testing.expectEqual(@as(usize, 0), active.retained_messages.len);
+    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000);
+    try std.testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
+    try std.testing.expectEqual(@as(usize, 0), saved.retained_messages.len);
+}
+
+/// Builds arena-owned fixed request inputs for manual compaction without
+/// starting a model turn. The empty user message is the checkpoint slot.
+pub fn prepareManualCompactionContinuation(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    model: []const u8,
+    capabilities: model_capabilities.Capabilities,
+) !CompactionContinuation {
+    var stable_prefix: std.ArrayList(ChatMessage) = .empty;
+    const skill_section = try prepareSkillCatalog(arena, deps, config, capabilities.context_window);
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    var overlay: std.ArrayList(ChatMessage) = .empty;
+    try deps.append_runtime_context(deps.ctx, arena, &overlay);
+    const projection = try build_provider_prompt_with_response_language_control(
+        arena,
+        stable_prefix.items,
+        overlay.items,
+        &.{},
+        .{ .role = .user, .content = "", .cache_policy = .no_cache },
+        &.{},
+        config.origin,
+        config.enforce_response_language,
+        false,
+        null,
+        &.{},
+        0,
+    );
+    return .{
+        .request = .{
+            .model = model,
+            .instructions = projection.instructions.items,
+            .messages = projection.messages.items,
+            .tools = .{
+                .registry = deps.tool_registry,
+                .advertised_names = config.advertised_tool_names,
+                .advertised_functions = config.advertised_functions,
+            },
+            .tool_choice = config.first_call_tool_choice,
+            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode),
+            .max_output_tokens = request_max_output_tokens(capabilities),
+            .budget = .{ .cancel_flag = config.cancel_flag },
+        },
+        .handoff_message_index = projection.current_user_index,
+    };
+}
+
+test "manual compaction fixed context measures prepared skills and host instructions" {
+    const alloc = std.testing.allocator;
+    const support = @import("tests/support.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var test_deps = support.FakeAgentRuntimeDeps.init(alloc);
+    defer test_deps.deinit();
+    var gateway = support.FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var deps = test_deps.deps();
+    deps.agent_stream_provider = gateway.provider();
+    var fixture = support.PromptFixture{};
+    var config = fixture.config();
+    config.host_instructions = "HOST_COMPACTION_INSTRUCTIONS";
+    config.skill_catalog = .{ .skills = &.{.{
+        .name = "compaction-workflow",
+        .description = "workflow description " ** 100,
+        .path = "/skills/compaction-workflow",
+        .source = .global_fx,
+    }} };
+    const small = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 8_000 });
+    const body = (try deps.agent_stream_provider.buildRequest(arena, small.request)).?;
+    try std.testing.expect(std.mem.find(u8, body, "available_skills") != null);
+    try std.testing.expect(std.mem.find(u8, body, "compaction-workflow") != null);
+    try std.testing.expect(std.mem.find(u8, body, "HOST_COMPACTION_INSTRUCTIONS") != null);
+    const measured = try small.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expectEqual(runtime_prompt_context.measureProviderRequest(body), measured);
+    const large = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 1_000_000 });
+    const large_cost = try large.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expect(large_cost.estimated_input_tokens > measured.estimated_input_tokens);
+    config.skill_catalog = .{ .skills = &.{} };
+    config.host_instructions = "";
+    const without = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 8_000 });
+    const without_cost = try without.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expect(measured.estimated_input_tokens > without_cost.estimated_input_tokens);
+    try std.testing.expectEqual(@as(usize, 0), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), test_deps.capability_queries.items.len);
 }
 
 pub const ContextCompactionTransactionRequest = struct {
@@ -4677,7 +4915,10 @@ pub const ContextCompactionTransactionRequest = struct {
     working_capabilities: model_capabilities.Capabilities,
     request_tokens: usize,
     source_tokens: usize,
-    protected_tokens: usize,
+    continuation: CompactionContinuation,
+    active_prefix: ?types.AssistantHistoryTurn = null,
+    retained_from: ?types.ContextHistoryCut = null,
+    newest_exchange_tokens: usize = 0,
     source_messages: []ChatMessage,
     uncertain_source_message_count: usize = 0,
     result_storage: runtime_context_compaction.ResultStorage,
@@ -4709,28 +4950,28 @@ pub fn compactContextTransaction(
     request: ContextCompactionTransactionRequest,
 ) !?ContextCompactionTransactionResult {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const plan = runtime_prompt_context.planCompaction(.{
+    var plan_input = runtime_prompt_context.CompactionPlanInput{
         .trigger = request.trigger,
         .capabilities = request.working_capabilities,
         .request_tokens = request.request_tokens,
         .source_tokens = request.source_tokens,
-        .protected_tokens = request.protected_tokens,
-    });
-    if (plan.decision == .no_op) return null;
+        .newest_exchange_tokens = request.newest_exchange_tokens,
+    };
+    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) return null;
+    const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
+    plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
+    const plan = runtime_prompt_context.planCompaction(plan_input);
     const accepted_tokens = plan.accepted_handoff_tokens orelse
         return error.ContextCapacityExceeded;
     const generation_tokens = plan.generation_tokens orelse
         return error.ContextCapacityExceeded;
-    const compaction_route = switch (deps.compaction_route) {
-        .ready => |route| if (route.provider == request.provider)
-            route
-        else
-            return error.ContextCompactionRouteMismatch,
-        .unavailable => return error.ContextCompactionUnavailable,
-    };
+    if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
+        return error.ContextCompactionUnavailable;
+    }
+    const compaction_model = request.continuation.request.model;
     const compactor_capabilities = deps.available_model_capabilities(
         deps.ctx,
-        compaction_route.model,
+        compaction_model,
     );
     const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
         @min(generation_tokens, @as(usize, @intCast(limit)))
@@ -4756,7 +4997,7 @@ pub fn compactContextTransaction(
         request.source_messages,
         .{
             .stream_provider = deps.agent_stream_provider,
-            .model = compaction_route.model,
+            .model = compaction_model,
             .api_key = request.api_key,
             .credential_source = request.credential_source,
             .account_id = request.account_id,
@@ -4766,8 +5007,9 @@ pub fn compactContextTransaction(
             .cancel_flag = request.cancel_flag,
             .accepted_tokens = accepted_tokens,
             .generation_tokens = compactor_generation_tokens,
-            .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
+            .compactor_input_tokens = runtime_prompt_context.usableInputTokensForGeneration(
                 compactor_capabilities,
+                @min(compactor_generation_tokens, accepted_tokens),
             ),
             .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
                 compactor_capabilities,
@@ -4781,17 +5023,22 @@ pub fn compactContextTransaction(
     );
     errdefer compacted.deinit(alloc);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
+    if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
+        return error.ContextCapacityExceeded;
+    }
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     try commitContextCompaction(deps, .{
         .summary = compacted.handoff,
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
-    });
+    }, request.active_prefix, request.retained_from);
     if (deps.push_interactive_notice) |push_notice| {
-        try push_notice(deps.ctx, .{
+        push_notice(deps.ctx, .{
             .topic = "context",
             .tone = .neutral,
             .body = "Context compacted.",
-        });
+        }) catch |err| debug_trace.logf("context_compaction", "completed notice unavailable err={s}", .{@errorName(err)});
     }
     return .{
         .compacted = compacted,
@@ -4844,6 +5091,7 @@ fn processQueuedPromptLoop(
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
+    var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
     var compaction_count = latestCompactionCount(job.history);
     var request_token_calibration: ?struct {
@@ -5121,6 +5369,7 @@ fn processQueuedPromptLoop(
         var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
+        var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -5161,6 +5410,7 @@ fn processQueuedPromptLoop(
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5198,6 +5448,7 @@ fn processQueuedPromptLoop(
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5230,6 +5481,7 @@ fn processQueuedPromptLoop(
                 pending_auto_retry_status = null;
                 return;
             }
+            const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
             } else {
@@ -5412,19 +5664,17 @@ fn processQueuedPromptLoop(
                 else
                     measured_request_cost;
                 request_cost_for_attempt = request_cost;
-                const has_new_compactable_context = active_compaction_handoff == null or
-                    compacted_suffix_len < within_turn_suffix.items.len;
+                const has_new_compactable_context = !just_rebuilt_request;
+                const compaction_trigger: runtime_prompt_context.CompactionTrigger =
+                    if (context_overflow_recovery == .pending) .manual else .automatic;
                 const projection_plan = runtime_prompt_context.planCompaction(.{
-                    .trigger = .automatic,
+                    .trigger = compaction_trigger,
                     .capabilities = request_capabilities,
                     .request_tokens = request_cost.estimated_input_tokens,
                     .source_tokens = if (has_new_compactable_context)
                         request_cost.estimated_input_tokens
                     else
                         0,
-                    .protected_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                        &.{current_user_effective},
-                    ),
                 });
                 debug_trace.eventf(
                     "context_compaction",
@@ -5443,36 +5693,44 @@ fn processQueuedPromptLoop(
                     },
                 );
                 switch (projection_plan.decision) {
-                    .no_op => if (!has_new_compactable_context) {
+                    .no_op => if (context_overflow_recovery == .pending) {
+                        return error.ContextCapacityExceeded;
+                    } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
                                 return error.ContextCapacityExceeded;
                             }
                         }
                     },
-                    .compact => {
-                        try promoteRequestLocalResultsForCompaction(
-                            arena,
-                            config,
-                            within_turn_suffix.items,
-                            @constCast(request_messages),
-                        );
+                    .compact => compact_attempt: {
                         const uncertain_history_count = @min(
                             @max(
                                 job.unversioned_history_count,
-                                job.context_history_start,
+                                0,
                             ),
                             job.history.len,
                         );
-                        var uncertain_message_count: usize = 0;
-                        var compaction_messages = try buildCanonicalCompactionWindow(
-                            arena,
-                            job.history,
-                            within_turn_suffix.items,
-                            uncertain_history_count,
-                            &uncertain_message_count,
-                        );
-                        defer compaction_messages.deinit(arena);
+                        const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
+                        const active_prefix: ?types.AssistantHistoryTurn = if (within_turn_suffix.items.len > compacted_suffix_len) .{
+                            .user = .{ .text = job.prompt, .images = job.images },
+                            .assistant = @constCast(""),
+                            .execution = prefix_execution,
+                        } else null;
+                        const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
+                            .user = .{ .text = job.prompt, .images = job.images },
+                            .assistant = @constCast(""),
+                            .execution = prefix_execution,
+                        }, request_capabilities, request_cost.estimated_input_tokens);
+                        if (window.source.len == 0) {
+                            if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
+                            break :compact_attempt;
+                        }
+                        const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
+                        const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (window.cut.turns == raw_history_turns) .{
+                            .tool_steps = window.cut.tool_steps,
+                            .steering = window.cut.steering,
+                        } else .{};
+                        const next_compacted_suffix_len = compacted_suffix_len + try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
                         const result_storage: runtime_context_compaction.ResultStorage =
                             if (config.session_child_capability) |capability|
                                 .{ .managed = capability }
@@ -5480,74 +5738,55 @@ fn processQueuedPromptLoop(
                                 .{ .legacy_dir = dir }
                             else
                                 .unavailable;
-                        const retained_tail_limit = retainedHistoryTailLimit(
-                            job.history,
-                            within_turn_suffix.items.len > 0,
+                        const compaction_source_message_count = window.source.len;
+                        var continuation_projection = try build_provider_prompt_with_response_language_control(
+                            overlay_arena,
+                            stable_prefix.items,
+                            ephemeral_overlay.items,
+                            &.{},
+                            current_user_effective,
+                            within_turn_suffix.items,
+                            config.origin,
+                            config.enforce_response_language,
+                            response_language_correction_attempted,
+                            "",
+                            window.retained_messages,
+                            next_compacted_suffix_len,
                         );
-                        const retained_history_tail = if (retained_tail_limit == 0)
-                            session_runtime.RetainedHistoryTail{ .turn_count = 0, .message_count = 0 }
+                        try appendRecoveryConversationContext(
+                            overlay_arena,
+                            &continuation_projection.messages,
+                            recovery_strategy,
+                        );
+                        var continuation_request = request_data;
+                        continuation_request.instructions = continuation_projection.instructions.items;
+                        continuation_request.messages = if (vision_policy.route == .fallback)
+                            try runtime_vision_contracts.project_text_only_messages(
+                                overlay_arena,
+                                continuation_projection.messages.items,
+                                continuation_projection.current_user_index,
+                                job.authorized_image_catalog,
+                            )
                         else
-                            try session_runtime.retainedHistoryTailForMessageCount(
-                                arena,
-                                job.history,
-                                retained_tail_limit,
-                            );
-                        const retained_message_count = retained_history_tail.message_count;
-                        const compaction_source_message_count =
-                            compaction_messages.items.len - retained_message_count;
-                        const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                            compaction_messages.items[compaction_messages.items.len - retained_message_count ..],
-                        );
-                        const prompt_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                            &.{current_user_effective},
-                        );
-                        const compactable_suffix_start = @min(
-                            compacted_suffix_len,
-                            within_turn_suffix.items.len,
-                        );
-                        const compactable_suffix_message_count =
-                            within_turn_suffix.items.len - compactable_suffix_start;
-                        const retained_active_messages = @min(
-                            retained_message_count,
-                            compactable_suffix_message_count,
-                        );
-                        const retained_history_messages =
-                            retained_message_count - retained_active_messages;
-                        const history_message_count = compaction_messages.items.len -
-                            compactable_suffix_message_count;
-                        if (retained_history_messages > history_message_count) {
-                            return error.InvalidContextHistoryStart;
-                        }
-                        const next_compaction_history_tail = try arena.dupe(
-                            ChatMessage,
-                            compaction_messages.items[history_message_count - retained_history_messages .. history_message_count],
-                        );
-                        const next_compacted_suffix_len = within_turn_suffix.items.len -
-                            retained_active_messages;
-                        const retained_history_turns = try session_runtime.retainedHistoryTurnCountForMessageTail(
-                            arena,
-                            job.history,
-                            retained_history_messages,
-                        );
-                        const raw_history_turns = session_runtime.rawHistoryTurnCount(
-                            job.history,
-                        );
-                        if (retained_history_turns > raw_history_turns) {
-                            return error.InvalidContextHistoryStart;
-                        }
+                            continuation_projection.messages.items;
+                        const next_compaction_history_tail = window.retained_messages;
                         const next_compaction_count = compaction_count + 1;
+                        const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
                         const transaction_result = compactContextTransaction(arena, deps, .{
-                            .trigger = .automatic,
+                            .trigger = compaction_trigger,
                             .provider = job.provider,
                             .working_capabilities = request_capabilities,
                             .request_tokens = request_cost.estimated_input_tokens,
                             .source_tokens = request_cost.estimated_input_tokens,
-                            .protected_tokens = prompt_tokens +| retained_tokens,
-                            .source_messages = compaction_messages.items[0..compaction_source_message_count],
-                            .uncertain_source_message_count = @min(
-                                uncertain_message_count,
-                                compaction_source_message_count,
-                            ),
+                            .continuation = .{
+                                .request = continuation_request,
+                                .handoff_message_index = continuation_projection.current_user_index - window.retained_messages.len - 1,
+                            },
+                            .active_prefix = active_prefix,
+                            .retained_from = window.cut,
+                            .newest_exchange_tokens = window.newest_exchange_tokens,
+                            .source_messages = window.source,
+                            .uncertain_source_message_count = if (uncertain_history_count > 0) compaction_source_message_count else 0,
                             .result_storage = result_storage,
                             .api_key = active_api_key,
                             .credential_source = job.credential_source,
@@ -5557,7 +5796,7 @@ fn processQueuedPromptLoop(
                             .retry_count = config.gateway_retry_count,
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
-                            .removed_turn_count = raw_history_turns - retained_history_turns,
+                            .removed_turn_count = window.cut.turns,
                             .compaction_count = next_compaction_count,
                         }) catch |err| {
                             if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
@@ -5584,8 +5823,22 @@ fn processQueuedPromptLoop(
                             return error.ContextCapacityExceeded;
                         active_compaction_handoff = transaction.compacted.handoff;
                         active_compaction_history_tail = next_compaction_history_tail;
+                        next_history[0] = .{ .compacted_summary = .{
+                            .summary = transaction.compacted.handoff,
+                            .removed_turn_count = window.cut.turns,
+                            .compaction_count = next_compaction_count,
+                        } };
+                        @memcpy(next_history[1..], window.retained_history);
+                        compaction_history = next_history;
                         compacted_suffix_len = next_compacted_suffix_len;
+                        finalization.compacted_execution = .{
+                            .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
+                            .steering = finalization.compacted_execution.steering + active_cut.steering,
+                        };
                         compaction_count = next_compaction_count;
+                        if (context_overflow_recovery == .pending) {
+                            context_overflow_recovery = .used;
+                        }
                         debug_trace.eventf(
                             "context_compaction",
                             "installed",
@@ -5599,6 +5852,9 @@ fn processQueuedPromptLoop(
                     },
                 }
             }
+            if (context_overflow_recovery == .pending) {
+                return error.ContextCapacityExceeded;
+            }
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
@@ -5606,6 +5862,7 @@ fn processQueuedPromptLoop(
             if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5703,6 +5960,7 @@ fn processQueuedPromptLoop(
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -5800,6 +6058,7 @@ fn processQueuedPromptLoop(
                 }
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -5842,6 +6101,7 @@ fn processQueuedPromptLoop(
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6109,6 +6369,7 @@ fn processQueuedPromptLoop(
                 );
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -6143,6 +6404,38 @@ fn processQueuedPromptLoop(
             }
             const response_completion = streamCompletion(stream_result);
             const response_failure = streamFailure(stream_result);
+            const has_compactable_context = if (active_compaction_handoff == null)
+                history_messages.items.len > 0 or within_turn_suffix.items.len > 0
+            else
+                compacted_suffix_len < within_turn_suffix.items.len;
+            if (response_failure) |failure| {
+                if (shouldRecoverContextOverflow(
+                    failure,
+                    has_compactable_context,
+                    streamReplaySafe(&stream_ctx),
+                    context_overflow_recovery == .ready,
+                    config.cancel_flag.load(.seq_cst),
+                )) {
+                    debug_trace.eventf(
+                        "context_compaction",
+                        "provider_overflow_recovery",
+                        step_ctx,
+                        "model={s} request_bytes={d} estimated_tokens={d}",
+                        .{
+                            gateway_model,
+                            if (request_cost_for_attempt) |cost| cost.serialized_bytes else 0,
+                            if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0,
+                        },
+                    );
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    context_overflow_recovery = .pending;
+                    reset_stream_for_next_attempt = true;
+                    skip_next_preflight_refresh = true;
+                    continue;
+                }
+            }
             const settled_disposition = if (streamSucceeded(stream_result))
                 types.classifyProviderCompletion(response_completion)
             else
@@ -6170,6 +6463,7 @@ fn processQueuedPromptLoop(
             {
                 try persistRecoveryCheckpoint(
                     deps,
+                    finalization,
                     arena,
                     job,
                     within_turn_suffix.items,
@@ -6266,6 +6560,7 @@ fn processQueuedPromptLoop(
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6306,6 +6601,7 @@ fn processQueuedPromptLoop(
                     if (route_changed) {
                         try persistRecoveryCheckpoint(
                             deps,
+                            finalization,
                             arena,
                             job,
                             within_turn_suffix.items,
@@ -6600,6 +6896,7 @@ fn processQueuedPromptLoop(
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
                         deps,
+                        finalization,
                         arena,
                         job,
                         within_turn_suffix.items,
@@ -6639,6 +6936,7 @@ fn processQueuedPromptLoop(
                     if (route_changed) {
                         try persistRecoveryCheckpoint(
                             deps,
+                            finalization,
                             arena,
                             job,
                             within_turn_suffix.items,
@@ -7167,7 +7465,7 @@ fn processQueuedPromptLoop(
             var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
-                .execution = finish_execution,
+                .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -7191,8 +7489,17 @@ fn processQueuedPromptLoop(
             if (needs_continuation) {
                 continuation_injected = true;
                 const continuation_prompt = "Summarize what you just did.";
-                debug_trace.logf("agent", "injecting continuation after {d} silent tool steps", .{silent_tool_steps});
-                try within_turn_suffix.append(arena, .{ .role = .assistant, .content = completion.content });
+                debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
+                    silent_tool_steps,
+                    if (completion.content) |content| content.len else 0,
+                    if (completion.provider_state_json != null) "true" else "false",
+                });
+                if (completion.provider_state_json) |state| {
+                    try within_turn_suffix.append(arena, .{
+                        .role = .assistant,
+                        .provider_state_json = state,
+                    });
+                }
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
                 continue;
             }
@@ -9594,6 +9901,16 @@ fn processQueuedPromptLoop(
             }
 
             if (execution.committed_file_handoff != null) {
+                var prepared = try runtime_execution_memory.prepareToolModelOutput(
+                    arena,
+                    config,
+                    tool_call,
+                    execution.model_output,
+                );
+                runtime_execution_memory.applyToolResultMemory(
+                    &prepared.memory,
+                    execution.tool_result_memory,
+                );
                 try runtime_tool_batch.processCommittedFileResult(
                     deps,
                     call_allocator,
@@ -9604,6 +9921,8 @@ fn processQueuedPromptLoop(
                     tool_call,
                     execution_call,
                     execution,
+                    prepared.model_output,
+                    prepared.memory,
                     committed_file_tool_name.?,
                     status_started,
                     file_display_path,
@@ -10071,59 +10390,6 @@ fn processQueuedPromptLoop(
     );
 }
 
-fn promoteRequestLocalResultsForCompaction(
-    alloc: Allocator,
-    config: Config,
-    canonical_messages: []ChatMessage,
-    request_messages: []ChatMessage,
-) !void {
-    for (canonical_messages) |*message| {
-        if (message.role != .tool) continue;
-        const content = message.content orelse continue;
-        var memory = message.tool_result_memory orelse
-            return error.ContextCapacityExceeded;
-        if (runtime_context_compaction.resultHandleForContinuation(memory) != null) continue;
-        if (memory.truncated) return error.ContextCapacityExceeded;
-        const call_id = message.tool_call_id orelse return error.ContextCapacityExceeded;
-        const tool_name = message.tool_name orelse return error.ContextCapacityExceeded;
-        const handle = if (config.session_child_capability) |capability|
-            try result_store.storeLargeResultManaged(
-                alloc,
-                capability,
-                call_id,
-                tool_name,
-                content,
-            )
-        else if (config.tool_result_dir) |dir|
-            try result_store.storeLargeResult(
-                alloc,
-                dir,
-                call_id,
-                tool_name,
-                content,
-            )
-        else
-            return error.ContextCapacityExceeded;
-        memory.output_handle = handle;
-        memory.stored_output_bytes = content.len;
-        message.tool_result_memory = memory;
-
-        for (request_messages) |*request_message| {
-            if (request_message.role != .tool) continue;
-            const request_call_id = request_message.tool_call_id orelse continue;
-            if (!std.mem.eql(u8, request_call_id, call_id)) continue;
-            const request_content = request_message.content orelse "";
-            request_message.content = try std.fmt.allocPrint(
-                alloc,
-                "{s}\n<tool_result_handle>{s}</tool_result_handle>",
-                .{ request_content, handle },
-            );
-            request_message.tool_result_memory = memory;
-            break;
-        }
-    }
-}
-
 fn finishFailedTurnWithNotice(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
@@ -10168,7 +10434,7 @@ fn finishFailedTurnWithNotice(
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
-        .execution = execution_memory,
+        .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

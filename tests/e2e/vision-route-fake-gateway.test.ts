@@ -502,7 +502,7 @@ async function expectChangedCanonicalVisionPathFailure(
 }
 
 function parseFxJson(result: Awaited<ReturnType<typeof runFx>>) {
-  expect(result.code).toBe(0);
+  expect(result.code, result.stdout + result.stderr).toBe(0);
   return JSON.parse(result.stdout.trim()) as {
     output: string;
     exit_code: number;

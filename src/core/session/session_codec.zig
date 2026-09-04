@@ -5,6 +5,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -74,6 +75,16 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+
+    /// Borrows the checkpoint's exact user and uncommitted response suffix.
+    pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
+        return .{ .interrupted = .{
+            .user = self.user,
+            .assistant = if (self.assistant_source.len > 0) self.assistant_source else null,
+            .execution = self.execution,
+            .terminal_reason = .failed,
+        } };
+    }
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
@@ -202,6 +213,157 @@ pub const DurableSessionState = struct {
         };
     }
 };
+
+pub const session_metadata_schema_version: u8 = 4;
+pub const max_session_metadata_bytes: usize = 64 * 1024;
+const max_session_title_bytes: usize = 240;
+
+pub const SessionMetadata = struct {
+    schema_version: u8 = session_metadata_schema_version,
+    id: []const u8,
+    origin_workspace_root: []const u8,
+    workspace_root: []const u8,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    conversation_language: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    title: ?[]const u8 = null,
+    subagent_child: bool = false,
+};
+
+pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
+pub const max_permission_state_bytes: usize = 1024 * 1024;
+pub const max_recovery_checkpoint_bytes: usize = context_limits.emergency_ceiling_bytes;
+
+pub fn encodeSessionMetadata(
+    alloc: Allocator,
+    metadata: SessionMetadata,
+) ![]u8 {
+    try validateSessionMetadata(metadata);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeSessionMetadata(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedSessionMetadata {
+    if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+        .max_value_len = max_session_metadata_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionMetadata,
+    };
+    errdefer parsed.deinit();
+    validateSessionMetadata(parsed.value) catch return error.InvalidSessionMetadata;
+    return parsed;
+}
+
+pub fn encodePermissionState(
+    alloc: Allocator,
+    state: session_permission_state.State,
+) ![]u8 {
+    try session_permission_state.validate(state);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writePermissionState(&out.writer, state);
+    if (out.written().len == 0 or out.written().len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodePermissionState(
+    alloc: Allocator,
+    bytes: []const u8,
+) !session_permission_state.State {
+    if (bytes.len == 0 or bytes.len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_permission_state_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+    defer parsed.deinit();
+    return parsePermissionState(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+}
+
+pub fn encodeRecoveryCheckpoint(
+    alloc: Allocator,
+    checkpoint: RecoveryCheckpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeRecoveryCheckpoint(&out.writer, checkpoint);
+    if (out.written().len == 0 or out.written().len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeRecoveryCheckpoint(
+    alloc: Allocator,
+    bytes: []const u8,
+) !RecoveryCheckpoint {
+    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_recovery_checkpoint_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+    defer parsed.deinit();
+    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+}
+
+fn validateSessionMetadata(metadata: SessionMetadata) !void {
+    if (metadata.schema_version != session_metadata_schema_version) {
+        return error.UnsupportedSessionSchema;
+    }
+    try validateSessionId(metadata.id);
+    try validateWorkspaceRoot(metadata.origin_workspace_root);
+    try validateWorkspaceRoot(metadata.workspace_root);
+    if (metadata.created_at_ms < 0 or metadata.updated_at_ms < metadata.created_at_ms) {
+        return error.InvalidSessionMetadata;
+    }
+    try validateConversationLanguageBytes(metadata.conversation_language);
+    if (model_provider.parse(metadata.provider) == null) return error.InvalidSessionMetadata;
+    try validateModel(metadata.model);
+    if (types.ReasoningEffort.parse(metadata.effort) == null) {
+        return error.InvalidSessionMetadata;
+    }
+    if (metadata.title) |title| {
+        if (title.len == 0 or
+            title.len > max_session_title_bytes or
+            !std.unicode.utf8ValidateSlice(title))
+        {
+            return error.InvalidSessionMetadata;
+        }
+    }
+}
 
 pub const EncodeSummary = struct {
     encoded_bytes: u64,
@@ -3917,6 +4079,29 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
 }
 
+test "recovery checkpoint accepts the exact composer byte limit" {
+    const alloc = std.testing.allocator;
+    const prompt = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(prompt);
+    @memset(prompt, 'x');
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = prompt },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+    const encoded = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > prompt.len);
+    try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
+}
+
 test "session permission state round trips while legacy state stays empty" {
     const alloc = std.testing.allocator;
     const key = try session_permission_state.RuleKey.init(
@@ -4094,4 +4279,34 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
         .max_value_bytes = buffer.len,
     }) catch return;
     state.deinit(std.testing.allocator);
+}
+
+test "session metadata round trips without conversation or control state" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSessionMetadata(alloc, .{
+        .id = "session-1",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 20,
+        .conversation_language = "en",
+        .provider = "gateway",
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+        .title = "Compaction work",
+        .subagent_child = false,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "history") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+
+    var decoded = try decodeSessionMetadata(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("session-1", decoded.value.id);
+    try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
+    try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
+    try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
 }
