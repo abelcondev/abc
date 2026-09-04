@@ -411,6 +411,7 @@ pub fn prepareCapturedToolModelOutput(
             raw_output,
             config.max_tool_result_bytes,
         );
+        errdefer arena.free(prepared.model_output);
         var memory: types.ToolResultMemory = .{
             .output_bytes = raw_output.len,
             .stored_output_bytes = prepared.model_output.len,
@@ -420,6 +421,7 @@ pub fn prepareCapturedToolModelOutput(
             (config.session_child_capability != null or config.tool_result_dir != null))
         {
             const complete_output = try text_utils.sanitizeModelText(arena, raw_output);
+            defer if (complete_output.ptr != raw_output.ptr) arena.free(complete_output);
             memory.output_handle = if (config.session_child_capability) |capability|
                 try result_store.storeLargeResultManaged(arena, capability, tool_call.id, tool_call.name, complete_output)
             else
@@ -1240,10 +1242,8 @@ test "retrieved output storage failure does not publish an unbacked result" {
     defer writable.deinit();
     var readonly = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .read_only);
     defer readonly.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
     var cancel = std.atomic.Value(bool).init(false);
-    try std.testing.expectError(error.SessionChildReadOnly, prepareToolModelOutput(arena_state.allocator(), .{
+    try std.testing.expectError(error.SessionChildReadOnly, prepareToolModelOutput(alloc, .{
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
