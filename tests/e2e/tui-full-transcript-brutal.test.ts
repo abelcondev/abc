@@ -1453,7 +1453,12 @@ test.skipIf(!tmuxAvailable())(
       await session.sendHexBytes(CTRL_O);
       await waitForMode(session, "full", DRAFT);
       const beforeOrdinaryClose = await terminalOutputBytes(paths.tapePath);
+      const ordinaryCloseStart = traceSize(paths.tracePath);
       await session.sendKeys("Escape");
+      await waitForCommittedFrameAfter(paths.tracePath, ordinaryCloseStart, [
+        "close_full_transcript restore=exact",
+        "transcript_transition_commit state=stable",
+      ]);
       await waitForMode(session, "main", DRAFT);
       expect(await terminalOutputBytes(paths.tapePath) - beforeOrdinaryClose).toBeLessThan(256 * 1024);
       await completeHistory();
