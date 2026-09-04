@@ -115,6 +115,9 @@ const agent = await createFxAgent({
 
 The JavaScript host is the authority for tool effects. The same descriptors,
 schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Cancelling a prompt aborts its tools' signals and stops waiting for their
+callbacks. Late results and rejections are ignored. Tools remain responsible
+for stopping their own work when their signal is aborted.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system
