@@ -764,7 +764,7 @@ fn project_subagent_request_messages(
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
             if (!std.mem.eql(u8, call.name, "subagent")) continue;
-            if (call.argument_integrity != .valid) {
+            if (call.argument_integrity == .malformed_json) {
                 try calls.append(alloc, .{
                     .id = call.id,
                     .action = "malformed",
@@ -894,6 +894,42 @@ fn project_subagent_request_messages(
         }
     }
     return projected;
+}
+
+test "non-object subagent rejection keeps its call and result during projection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var calls = [_]ToolCall{
+        .{ .id = "rejected", .name = "subagent", .arguments_json = "{}", .argument_integrity = .non_object_json },
+        .{ .id = "valid", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
+        .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
+    };
+    for (0..2) |_| {
+        const projected = try project_subagent_request_messages(alloc, .{ .tools = &.{tool} }, true, &messages);
+        try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
+        try std.testing.expectEqualStrings("rejected", projected[0].tool_calls[0].id);
+        try std.testing.expectEqualStrings("{}", projected[0].tool_calls[0].arguments_json);
+        try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+        try std.testing.expectEqualStrings("rejected", projected[1].tool_call_id.?);
+        try std.testing.expectEqualStrings("not executed", projected[1].content.?);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, projected[1].tool_result_status.?);
+        calls[0].argument_integrity = .valid;
+    }
 }
 
 test "subagent history makes every removed manager action inert" {
@@ -7312,7 +7348,7 @@ fn processQueuedPromptLoop(
             if (successful_vision_mode == .required and
                 !std.mem.eql(u8, tool_call.name, "vision"))
             {
-                const owned_call = try types.dupeToolCall(arena, tool_call);
+                const owned_call = try runtime_lifecycle.dupeBlockedToolCall(arena, tool_call);
                 errdefer types.freeToolCall(arena, owned_call);
                 prepared_tool_calls[tool_call_index] = .{ .blocked = .{
                     .call = owned_call,
@@ -7331,7 +7367,7 @@ fn processQueuedPromptLoop(
             if (std.mem.eql(u8, tool_call.name, "vision") and
                 successful_vision_mode == .unavailable)
             {
-                const owned_call = try types.dupeToolCall(arena, tool_call);
+                const owned_call = try runtime_lifecycle.dupeBlockedToolCall(arena, tool_call);
                 errdefer types.freeToolCall(arena, owned_call);
                 prepared_tool_calls[tool_call_index] = .{ .blocked = .{
                     .call = owned_call,
@@ -8104,7 +8140,7 @@ fn processQueuedPromptLoop(
                     admitted_precomputed_results,
                 ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
-                    if (parallel_call.argument_integrity == .malformed_json) continue;
+                    if (parallel_call.argument_integrity != .valid) continue;
                     try runtime_tool_admission.recordRejectedToolCall(
                         deps,
                         arena,
@@ -8173,8 +8209,8 @@ fn processQueuedPromptLoop(
                             "tool",
                             "argument_integrity_rejected",
                             step_ctx,
-                            "call_id={s} name={s} failure=malformed_json provenance=fx_local",
-                            .{ tool_call.id, tool_call.name },
+                            "call_id={s} name={s} failure={s} provenance=fx_local",
+                            .{ tool_call.id, tool_call.name, @tagName(tool_call.argument_integrity) },
                         );
                     } else if (blocked.kind == .route_unavailable) {
                         debug_trace.eventf(
@@ -8236,12 +8272,13 @@ fn processQueuedPromptLoop(
                         "tool",
                         "execution_result",
                         step_ctx,
-                        "call_id={s} name={s} result_kind={s} model_output_bytes={d}",
+                        "call_id={s} name={s} result_kind={s} model_output_bytes={d} argument_integrity={s}",
                         .{
                             tool_call.id,
                             tool_call.name,
                             @tagName(blocked.kind),
                             prepared.model_output.len,
+                            @tagName(tool_call.argument_integrity),
                         },
                     );
                     try runtime_tool_batch.appendToolResultContent(
@@ -8258,7 +8295,7 @@ fn processQueuedPromptLoop(
                 },
                 .provider_executed, .ready => {},
             }
-            if (tool_call.argument_integrity == .malformed_json) {
+            if (tool_call.argument_integrity != .valid) {
                 unreachable;
             }
             if (config.cancel_flag.load(.seq_cst)) {

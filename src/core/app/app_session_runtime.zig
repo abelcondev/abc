@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -2874,8 +2875,7 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// Replaces the cached footer title. App owns the copy. Keeps the
-        /// terminal title in step because both surfaces read this cache.
+        /// Replaces the cached footer title. App owns the copy.
         pub fn setCachedSessionTitle(app: *App, title: []const u8) !void {
             if (comptime !@hasField(App, "session_title")) return;
             app.session_title.clearRetainingCapacity();
@@ -2889,12 +2889,9 @@ pub fn Runtime(comptime App: type) type {
             syncTerminalTitle(app);
         }
 
-        /// Drops C0 and DEL bytes. The cached title feeds the statusline and
-        /// the OSC 2 terminal title, where a stray BEL or ESC would close the
-        /// escape sequence early and hand the remaining bytes to the terminal
-        /// as commands. Derived titles come from prompt text and from the
-        /// display sidecar, so neither source is trusted here; `/rename` input
-        /// is already rejected by `validateSessionTitle`.
+        /// Drops C0 and DEL bytes before the cached title reaches the statusline.
+        /// Derived titles come from untrusted prompt text and display sidecars;
+        /// `/rename` input is already rejected by `validateSessionTitle`.
         fn appendTitleWithoutControlBytes(app: *App, title: []const u8) !void {
             var start: usize = 0;
             for (title, 0..) |byte, index| {
@@ -2913,65 +2910,18 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        const terminal_title_primary_max_bytes: usize = 64;
-        const terminal_title_model_max_bytes: usize = 48;
-        const terminal_title_separator = " · ";
-        const terminal_title_label_max_bytes = terminal_title_primary_max_bytes +
-            terminal_title_separator.len + terminal_title_model_max_bytes;
-
-        fn workspaceTerminalTitle(app: *App) []const u8 {
-            if (comptime !@hasField(App, "workspace_root")) return "workspace";
-            const basename = std.fs.path.basename(app.workspace_root);
-            return if (basename.len == 0) "workspace" else basename;
-        }
-
-        fn writeBoundedTerminalTitleComponent(
-            writer: *std.Io.Writer,
-            value: []const u8,
-            max_bytes: usize,
-        ) !void {
-            if (value.len <= max_bytes) return writer.writeAll(value);
-            const marker = "...";
-            const prefix_budget = max_bytes - marker.len;
-            const prefix = if (std.unicode.utf8ValidateSlice(value))
-                text_utils.utf8PrefixByBytes(value, prefix_budget)
-            else
-                value[0..prefix_budget];
-            try writer.writeAll(prefix);
-            try writer.writeAll(marker);
-        }
-
-        /// Terminal tabs prefer the session name and otherwise use the
-        /// workspace basename. The active model remains visible as secondary
-        /// context, including after a model switch.
+        /// Terminal tabs identify the running build independently of the session.
         pub fn syncTerminalTitle(app: *App) void {
             if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
         }
 
         pub fn syncTerminalTitleWith(
-            app: *App,
+            _: *App,
             provider: host_capability.TerminalTitle,
         ) void {
             if (comptime !provider_runtime.supported(App)) return;
-            var label_buffer: [terminal_title_label_max_bytes]u8 = undefined;
-            var writer: std.Io.Writer = .fixed(&label_buffer);
-            const primary = cachedSessionTitle(app) orelse workspaceTerminalTitle(app);
-            writeBoundedTerminalTitleComponent(
-                &writer,
-                primary,
-                terminal_title_primary_max_bytes,
-            ) catch return;
-            const selected_model = provider_runtime.model(app);
-            if (selected_model.len > 0) {
-                writer.writeAll(terminal_title_separator) catch return;
-                writeBoundedTerminalTitleComponent(
-                    &writer,
-                    selected_model,
-                    terminal_title_model_max_bytes,
-                ) catch return;
-            }
-            provider.set(writer.buffered());
+            provider.set("v" ++ build_options.app_version);
         }
 
         pub fn cachedSessionTitle(app: *App) ?[]const u8 {
@@ -10105,8 +10055,7 @@ test "renameActiveSession persists the title to the sidecar and session index" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    // And carried to the terminal tab.
-    try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 
     // Durable in the sidecar.
     const loaded = &app.session_persistence.writable.?;
@@ -10242,7 +10191,7 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
 }
 
-test "terminal title combines session or workspace with the active model" {
+test "terminal title initializes to the build version and ignores session and model changes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10255,11 +10204,13 @@ test "terminal title combines session or workspace with the active model" {
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
-
-    // Before the first turn names the session, tabs show workspace and model.
+    try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("workspace · zai/glm-5.2", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+
+    try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
+    Runtime(TestApp).syncTerminalTitle(&app);
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -10268,26 +10219,19 @@ test "terminal title combines session or workspace with the active model" {
     } });
     try Runtime(TestApp).ensureCachedSessionTitle(&app);
     try std.testing.expectEqualStrings(
-        "wire the release notes generator · zai/glm-5.2",
-        app.terminalTitleLabelText(),
+        "wire the release notes generator",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
     );
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 
-    // A model switch preserves the session discriminator and updates the
-    // secondary model context.
     app.selected_model.clearRetainingCapacity();
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-5");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings(
-        "wire the release notes generator · anthropic/claude-opus-5",
-        app.terminalTitleLabelText(),
-    );
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 
-    // Starting over hands the primary discriminator back to the workspace.
     Runtime(TestApp).clearCachedSessionTitle(&app);
-    try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-opus-5",
-        app.terminalTitleLabelText(),
-    );
+    try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -10303,18 +10247,16 @@ test "cached session title drops control bytes before they reach the terminal" {
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    // Derived titles come from prompt text and from the display sidecar, so a
-    // BEL could otherwise close the OSC 2 sequence and hand the rest of the
-    // title to the terminal as commands.
+    try app.selected_model.appendSlice(alloc, "provider/\x07\x1b]2;owned\x7fmodel");
     try Runtime(TestApp).setCachedSessionTitle(&app, "safe\x07\x1b]2;owned\x7ftail");
     try std.testing.expectEqualStrings(
         "safe]2;ownedtail",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 }
 
-test "terminal title bounds session and model context" {
+test "terminal title ignores long session and model context" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10330,8 +10272,5 @@ test "terminal title bounds session and model context" {
     try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
     try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
 
-    const label = app.terminalTitleLabelText();
-    try std.testing.expect(label.len <= Runtime(TestApp).terminal_title_label_max_bytes);
-    try std.testing.expect(std.mem.find(u8, label, "...") != null);
-    try std.testing.expect(std.mem.find(u8, label, " · provider/") != null);
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
 }

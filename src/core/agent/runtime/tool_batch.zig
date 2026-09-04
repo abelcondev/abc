@@ -207,7 +207,7 @@ pub fn assembleParallelToolResults(
                     );
                 };
             }
-        } else if (original_call.argument_integrity == .malformed_json) {
+        } else if (original_call.argument_integrity != .valid) {
             try provisional_statuses.finishMalformedToolArguments(
                 hooks,
                 arena,
@@ -218,8 +218,8 @@ pub fn assembleParallelToolResults(
                 "tool",
                 "argument_integrity_rejected",
                 step_ctx,
-                "call_id={s} name={s} failure=malformed_json provenance=fx_local",
-                .{ original_call.id, original_call.name },
+                "call_id={s} name={s} failure={s} provenance=fx_local",
+                .{ original_call.id, original_call.name, @tagName(original_call.argument_integrity) },
             );
             try runtime_tool_admission.recordRejectedToolCall(
                 hooks,
