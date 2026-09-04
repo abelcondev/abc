@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
   composerContains,
@@ -84,10 +84,10 @@ function captureViewportEscapes(session: TmuxSession): string {
   });
 }
 
-function runningBinaryTitle(): string {
+function runningBinaryTitle(workspace: string): string {
   const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
   expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
-  return `fx v${version}`;
+  return `fx v${version} | ${basename(workspace)}`;
 }
 
 async function expectCleanTitleTranscript(session: TmuxSession, title: string): Promise<void> {
@@ -817,15 +817,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "terminal tab title stays at the running binary version across rename, resume, and new session",
+    "terminal tab title shows the version and current folder across rename, resume, and new session",
     async () => {
-      const title = runningBinaryTitle();
       const workDir = mkdtempSync(join(tmpdir(), "fx-title-rename-e2e-"));
       workDirs.push(workDir);
       const home = join(workDir, "home");
-      const workspace = join(workDir, "workspace");
+      const workspace = join(workDir, "fx");
+      const resumedWorkspace = join(workDir, "another project é");
+      let title = runningBinaryTitle(workspace);
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
+      mkdirSync(resumedWorkspace, { recursive: true });
       writeFileSync(
         join(home, ".fx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission: {} }),
@@ -861,7 +863,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForPaneTitle(session, title, 5_000);
       await expectCleanTitleTranscript(session, title);
 
-      // Naming the session must not add session or model context to the title.
+      // Session names must not replace the workspace in the title.
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
       await session.waitForStableComposer();
@@ -891,12 +893,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
 
-      // Restoring a named session must keep the same version-only title.
+      // A resumed session uses its current folder, not its original workspace.
+      title = runningBinaryTitle(resumedWorkspace);
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
         cmd: `${FX_BIN} resume ${sessionIds[0]}`,
-        cwd: workspace,
+        cwd: resumedWorkspace,
         env: {
           ...env,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -2832,7 +2835,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 32,
       });
       await session.waitForComposer(10_000);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle());
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
 
       const alternateCount = (sequence: string) =>
         countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
@@ -2947,7 +2950,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle());
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/quit");
@@ -3061,7 +3064,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Reasoning effort");
       expect(pane).not.toContain("default");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle());
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
@@ -3602,10 +3605,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(gateway.requests).toHaveLength(1);
       const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
       expect(firstPrompt).toContain(
-        "Every skill below is already loaded and must be used for this query.",
+        "Use every successfully loaded skill for this query.",
       );
       expect(firstPrompt).toContain(
-        "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.",
+        "Report blocked or ambiguous requests.",
       );
       expect(firstPrompt).toContain('<skill_content name="exact-picker"');
       expect(firstPrompt).toContain(fixture.workspaceDescription);

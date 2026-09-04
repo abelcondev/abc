@@ -17,7 +17,7 @@ pub const Digest = [Sha256.digest_length]u8;
 
 pub const conversation_schema_version: u8 = 1;
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
-pub const max_conversation_identity_bytes: usize = 256;
+pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_preview_bytes: usize = 4 * 1024;
 
@@ -312,10 +312,7 @@ fn validateOptionalConversationText(text: []const u8) ConversationTransitionErro
 }
 
 fn validateConversationIdentity(value: []const u8) ConversationTransitionError!void {
-    if (value.len == 0 or
-        value.len > max_conversation_identity_bytes or
-        !std.unicode.utf8ValidateSlice(value))
-    {
+    if (types.ConversationIdentity.invalidReason(value) != null) {
         return error.InvalidConversationEvent;
     }
 }

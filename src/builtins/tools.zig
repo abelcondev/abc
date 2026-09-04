@@ -163,9 +163,9 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
 }};
 
 const skill_description =
-    "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
+    "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
 const capability_search_description =
-    "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, and catalog bounds. Set server only when an exact configured MCP alias is already known. Load an exact skill with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. A no-match result permits a different query; do not guess identities.";
+    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -548,12 +548,11 @@ pub const skill = ToolSpec{
         .description = skill_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "name", .json_type = .string, .description = "The name of the skill from the available skills list." },
                 .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
                 .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Defaults to SKILL.md." },
-                .{ .name = "offset", .json_type = .integer, .description = "Optional UTF-8 byte offset. Use the returned next_offset to continue." },
             },
-            .required = &.{"name"},
+            .required = &.{"location"},
+            .additional_properties = false,
         },
     },
     .executor_kind = .skill,
@@ -566,6 +565,7 @@ pub const skill = ToolSpec{
     .presentation_fn = skill_impl.presentation,
     .permission_target_kind = .none,
     .decode = skill_impl.decode,
+    .prepare_skill_call_fn = skill_impl.prepare,
     .validate = skill_impl.validate,
     .call = skill_impl.call,
     .reads_only_fn = skill_impl.readsOnly,
@@ -938,7 +938,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "efe46c6118a4002649d450fbd5b56e6cec9057048af46d4f60c7ec95b96dd1de",
+        "1d6ad9ee3289b7568831f4e05c92befc52c4123b71f7bbe2141fe939a60faece",
         &actual_hex,
     );
 }
@@ -1366,13 +1366,14 @@ test "built-in skill owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resources in bounded chunks") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resource completely") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "selected skill directory") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "the task clearly matches one") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "installing a missing skill") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"location\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\",\"location\"]") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, skill.activity_kind);
@@ -1471,7 +1472,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
 
     try std.testing.expectEqualStrings("capability_search", capability_search.name);
     try std.testing.expect(std.mem.find(u8, capability_search.description, "configured MCP tools") != null);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "runtime owns") != null);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "no_match does not rule out another query") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4096") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\",\"minLength\":1") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\"") == null);

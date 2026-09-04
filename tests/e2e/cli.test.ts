@@ -3863,8 +3863,10 @@ describe("cli: ask success", () => {
           "Explicitly invoked skill content for this query:",
         );
         expect(gateway.requests[0]!.body).toContain(
-          '<skill_content name=\\"cli-explicit\\" resource=\\"SKILL.md\\"',
+          '<skill_content name=\\"cli-explicit\\"',
         );
+        expect(gateway.requests[0]!.body).toContain('resource=\\"SKILL.md\\"');
+        expect(gateway.requests[0]!.body).toContain('complete=\\"true\\"');
         expect(gateway.requests[0]!.body).toContain(skillBody);
       } finally {
         gateway.stop();
@@ -4030,7 +4032,7 @@ describe("cli: ask success", () => {
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
-        expect(request).not.toHaveProperty("providerOptions");
+        expect(request.providerOptions).toEqual({ gateway: { caching: "auto" } });
         expect(
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",

@@ -77,7 +77,6 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
-const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
@@ -274,8 +273,7 @@ fn runAskChild(
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skills_prompt_section = ctx.subagent_skills_prompt,
-        .explicit_skills_prompt_section = ctx.subagent_explicit_skills_prompt,
+        .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
@@ -556,8 +554,7 @@ const AskContext = struct {
     managed_executions: managed_execution.Runtime,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    subagent_skills_prompt: []u8 = &.{},
-    subagent_explicit_skills_prompt: []u8 = &.{},
+    loaded_skills: app_runtime_setup.LoadedSkills = .{},
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -762,8 +759,7 @@ const AskContext = struct {
             freeToolCallRecord(self.alloc, record);
         }
         self.tool_call_records.deinit(self.alloc);
-        if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
-        if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
+        self.loaded_skills.deinit(self.alloc);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -1664,12 +1660,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
-    var loaded_skills = try options.deps.load_skills(
+    ctx.loaded_skills = try options.deps.load_skills(
         alloc,
         startup.workspace_root,
         cfg.skill_root_policy,
     );
-    defer loaded_skills.deinit(alloc);
+    const loaded_skills = &ctx.loaded_skills;
     try ctx.checkCancellation();
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
@@ -1745,27 +1741,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
-    const skills_view = skill_runtime.Runtime{
-        .items = loaded_skills.skills,
-        .diagnostics = loaded_skills.diagnostics,
-    };
-    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
-    defer bounded_skills.deinit(alloc);
-    if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    const skills_section = bounded_skills.text;
-    var explicit_skills = try skill_invocation.buildExplicitPromptSection(
-        alloc,
-        .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
-        owned_prompt,
-        &.{},
-        ctx.context_limits,
-    );
-    defer explicit_skills.deinit(alloc);
-    if (explicit_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    ctx.subagent_skills_prompt = try alloc.dupe(u8, skills_section);
-    ctx.subagent_explicit_skills_prompt = try alloc.dupe(u8, explicit_skills.text);
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
@@ -1813,8 +1788,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
-        .skills_prompt_section = skills_section,
-        .explicit_skills_prompt_section = explicit_skills.text,
+        .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -1990,6 +1964,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2212,6 +2187,11 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -4238,6 +4218,10 @@ fn testProcessQueuedPromptPartialThenReadFailed(_: *agent_runtime.Agent, deps: *
 }
 
 fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.skills.len);
+    try std.testing.expectEqualStrings("visible", cfg.skill_catalog.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.context_limits.skill_catalog_bytes.effectiveBytes());
     const diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/bad-skill/SKILL.md",
         .source = .workspace_shared,
@@ -4247,6 +4231,7 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, de
     var notice: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
+    try deps.push_context_notice.?(deps.ctx, notice.written());
     try deps.push_context_notice.?(deps.ctx, notice.written());
     try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
@@ -8730,7 +8715,7 @@ test "missing API key returns before project context gathering" {
     try std.testing.expectEqual(@as(usize, 0), test_gather_project_context_calls);
 }
 
-test "fx ask emits one discovery warning when catalog truncation and a skill read report it" {
+test "fx ask forwards its catalog and deduplicates repeated discovery warnings" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8752,7 +8737,6 @@ test "fx ask emits one discovery warning when catalog truncation and a skill rea
         @as(usize, 1),
         std.mem.count(u8, stderr_capture.bytes.items, "skill discovery warning:"),
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "[context] skill catalog omitted 1 entries") != null);
 }
 
 test "fx ask carries resolved auto mode and initial registry context into the queued prompt" {

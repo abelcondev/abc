@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -743,6 +744,8 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -1109,11 +1112,6 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
-pub const ChatCachePolicy = enum {
-    default,
-    no_cache,
-};
-
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1127,7 +1125,6 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
-    cache_policy: ChatCachePolicy = .default,
 };
 
 pub const Usage = struct {
@@ -1531,9 +1528,25 @@ test "ProviderFinishReason accepts only the canonical provider domain" {
     try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
+pub const ConversationIdentity = struct {
+    pub const max_bytes: usize = 256;
+    pub const Failure = enum { empty, too_long, invalid_utf8 };
+
+    pub fn invalidReason(value: []const u8) ?Failure {
+        if (value.len == 0) return .empty;
+        if (value.len > max_bytes) return .too_long;
+        if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
+        return null;
+    }
+};
+
 pub const AuthoritativeToolAdmission = union(enum) {
     admitted,
     reject_malformed_identity: FinalToolIdentity,
+    reject_unstorable_identity: struct {
+        field: enum { id, name, provisional_id },
+        reason: ConversationIdentity.Failure,
+    },
     reject_malformed_provider_result: ProviderResultIdentityFailure,
     reject_malformed_provider_arguments,
     reject_duplicate_identity,
@@ -1569,6 +1582,20 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
+        if (ConversationIdentity.invalidReason(call.id)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .id, .reason = reason } };
+        }
+        if (ConversationIdentity.invalidReason(call.name)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .name, .reason = reason } };
+        }
+        if (call.provisional_id) |id| {
+            if (ConversationIdentity.invalidReason(id)) |reason| {
+                return .{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = reason } };
+            }
+        }
+    }
+
+    for (completion.tool_calls) |call| {
         if (call.provenance == .provider_executed and
             call.argument_integrity == .malformed_json)
         {
@@ -1592,6 +1619,62 @@ test "authoritative tool admission rejects blank current call ids" {
             AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
             authoritativeToolAdmission(.{ .tool_calls = &calls }),
         );
+    }
+}
+
+test "authoritative tool admission rejects unstorable names" {
+    const oversized = [_]u8{'n'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = "", .reason = .empty },
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+        for (cases) |case| {
+            const calls = [_]ToolCall{.{ .id = "call", .name = case.value, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqualDeep(
+                AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .name, .reason = case.reason } },
+                authoritativeToolAdmission(.{ .tool_calls = &calls }),
+            );
+        }
+    }
+}
+
+test "authoritative tool admission rejects unstorable correlation identities" {
+    const oversized = [_]u8{'i'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{.{ .id = case.value, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+        const provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = case.value }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &provisional }),
+        );
+    }
+    const empty_provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = "" }};
+    try std.testing.expectEqualDeep(
+        AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = .empty } },
+        authoritativeToolAdmission(.{ .tool_calls = &empty_provisional }),
+    );
+}
+
+test "authoritative tool admission preserves bounded canonical identity formats" {
+    const boundary = [_]u8{'i'} ** 256;
+    const unicode_boundary = "é" ** 128;
+    for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
+        for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+            const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqual(AuthoritativeToolAdmission.admitted, authoritativeToolAdmission(.{ .tool_calls = &calls }));
+            try std.testing.expectEqualStrings(identity, calls[0].id);
+            try std.testing.expectEqualStrings(identity, calls[0].name);
+        }
     }
 }
 
@@ -2599,6 +2682,15 @@ test "dupeToolCall preserves argument integrity" {
     defer freeToolCall(std.testing.allocator, copy);
 
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "dupeToolCall drops action scoped skill bindings" {
+    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
+    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 
 test "function input classification distinguishes syntax from object shape" {

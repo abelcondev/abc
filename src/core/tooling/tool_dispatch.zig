@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
@@ -168,6 +169,8 @@ pub const ToolResult = union(enum) {
     }
 };
 
+pub const ModelContentKind = enum { ordinary, complete_skill };
+
 pub const HostToolProviderFn = *const fn (
     *anyopaque,
     Allocator,
@@ -261,6 +264,8 @@ pub const DispatchContext = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
     permission_ctx: ?*const PermissionContext = null,
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
@@ -316,6 +321,7 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    model_content_kind_sink: ?*ModelContentKind = null,
     command_result_json_sink: ?*?[]const u8 = null,
     turn_control_sink: ?*?TurnControl = null,
     result_commit_sink: ?*?result_commit.Token = null,
@@ -506,6 +512,7 @@ pub const Tool = struct {
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
+    prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
 };
@@ -808,6 +815,7 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
 
 /// Owned tool-result message body produced by dispatch.
 pub const DispatchResult = struct {
+    model_content_kind: ModelContentKind = .ordinary,
     status: Status,
     body: []u8,
     images: []core_types.ToolImage = &.{},
@@ -859,12 +867,15 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_model_content_kind: ModelContentKind = .ordinary;
     var captured_command_result_json: ?[]const u8 = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.model_content_kind_sink == null) call_ctx.model_content_kind_sink = &captured_model_content_kind;
+    call_ctx.model_content_kind_sink.?.* = .ordinary;
     if (call_ctx.command_result_json_sink == null) call_ctx.command_result_json_sink = &captured_command_result_json;
 
     const admission = try admitToolCall(call_ctx, registry, call);
@@ -883,6 +894,10 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const output = result.intoAuthorized();
             return .{
                 .status = output.status,
+                .model_content_kind = if (output.status == .success)
+                    if (admitted.context.model_content_kind_sink) |kind| kind.* else .ordinary
+                else
+                    .ordinary,
                 .body = output.body,
                 .images = output.images,
                 .inner_usage = inner_usage,

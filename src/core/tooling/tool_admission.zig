@@ -3578,6 +3578,51 @@ fn testInputWithClassifier(
     };
 }
 
+test "resolved skill calls retain name policy and ordinary execution authority" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.skill} };
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("skill"),
+        .pattern = @constCast("restricted-name"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const skill: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
+        .name = "restricted-name",
+        .description = "",
+        .path = "/installed/different-directory-name",
+        .source = .global_fx,
+    } };
+    const calls = [_]ToolCall{
+        .{ .id = "alias", .name = "skill", .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory-name\"}", .resolved_skill = &skill },
+        .{ .id = "canonical", .name = "skill", .arguments_json = "{\"location\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .resolved_skill = &skill },
+        .{ .id = "legacy", .name = "skill", .arguments_json = "{\"name\":\"restricted-name\",\"location\":\"/installed/different-directory-name\",\"offset\":1}", .resolved_skill = &skill },
+    };
+    for (calls) |call| {
+        try std.testing.expectEqualStrings("restricted-name", try permissionTargetForCall(input, arena, call));
+        for ([_]PermissionMode{ .ask, .auto }) |mode| {
+            const outcome = try requestPermissionOutcome(input, arena, call, mode, &.{});
+            try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+            try std.testing.expect(outcome.execution_authority == null);
+        }
+    }
+    rules[0].action = .allow;
+    const allowed = try requestPermissionOutcome(input, arena, calls[0], .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, allowed.decision);
+    try std.testing.expect(allowed.execution_authority.? == .ordinary);
+    var legacy_unbound = calls[2];
+    legacy_unbound.resolved_skill = null;
+    const old_key = try permissionStateKeyForCall(input, arena, legacy_unbound);
+    const bound_key = try permissionStateKeyForCall(input, arena, calls[2]);
+    try std.testing.expect(old_key.eql(bound_key));
+}
+
 test "exact command approval remains valid across live authority revalidation" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);

@@ -3349,7 +3349,6 @@ const CoordinatorTestApp = struct {
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
         var fallback = model_capabilities.Capabilities{
-            .prompt_caching = true,
             .context_window = 1_000_000,
         };
         if (self.intrinsic_fast_model) |intrinsic_model| {

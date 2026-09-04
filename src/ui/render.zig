@@ -729,13 +729,13 @@ test "terminal title writes the label to the caller's output file" {
 
     // A host that redirects its output keeps the escape sequence off the
     // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("v" ++ main.version);
+    terminalTitleFor(&sink).set("v" ++ main.version ++ " | fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
     defer written_file.close(io_mod.getIo());
     const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
     defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;fx v" ++ main.version ++ "\x07", written);
+    try std.testing.expectEqualStrings("\x1b]2;fx v" ++ main.version ++ " | fx\x07", written);
 }
 
 test "terminal title sanitizes and bounds untrusted labels" {

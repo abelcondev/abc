@@ -437,6 +437,16 @@ pub fn Runtime(comptime App: type) type {
             try pushOwnedEvent(app, .{ .diff_block = payload });
         }
 
+        /// Activate an admitted continuation without presenting another user turn.
+        pub fn beginRecoveryPresentation(app: *App) void {
+            app.stream = .{
+                .active = true,
+                .turn_started_ms = io_mod.milliTimestamp(),
+            };
+            _ = app.shell.worker_status_state().clear();
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn syncState(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -2538,6 +2548,31 @@ test "core.app_worker_runtime syncState does not start activity for idle queued 
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime admitted recovery activates progress without resetting command display" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 10,
+        .action = .paused,
+    } });
+    try tickNoop(&app);
+    app.shell.command_output_display.touched = true;
+    app.worker.queued_count = 1;
+
+    Runtime(FakeApp).beginRecoveryPresentation(&app);
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expect(app.stream.turn_started_ms > 0);
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expect(app.shell.command_output_display.touched);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime syncState does not start activity for idle processing snapshot" {

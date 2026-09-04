@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -169,6 +170,7 @@ pub const Context = struct {
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
     context_limits: context_limits.Values = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
@@ -359,6 +361,7 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -895,6 +898,7 @@ fn executeRunCommandBackend(
 }
 
 const DispatchMetadata = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
@@ -904,6 +908,7 @@ const DispatchMetadata = struct {
     turn_control: ?tool_dispatch.TurnControl = null,
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.model_content_kind_sink = &self.model_content_kind;
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
@@ -925,6 +930,7 @@ fn toolExecutionResultFromDispatch(
     }
     return switch (result.status) {
         .success => .{
+            .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
             .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
@@ -1056,6 +1062,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
+        .skill_locations = ctx.skill_locations,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -1172,7 +1179,16 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
+    dispatch.resolved_skill = call.resolved_skill;
     return dispatch;
+}
+
+pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const tool = ctx.tool_registry.lookup(call.name) orelse return error.UnsupportedTool;
+    const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
+    var dispatch = typedDispatchContextForCall(ctx, arena, call);
+    dispatch.skill_locations = locations;
+    return prepare(dispatch, call.arguments_json);
 }
 
 const VisionProviderState = struct {
@@ -6544,14 +6560,22 @@ test "skill tool preserves resource and discovery notices separately" {
     defer arena_state.deinit();
     var ctx = rt.context();
     ctx.context_limits.skill_chunk_bytes = .{ .value = .{ .bytes = 96 }, .source = .command_line };
-    const result = try executeToolCall(ctx, arena_state.allocator(), .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
-    try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-    try expectContains(result.model_output, "use the workflow skill");
-    try expectNotContains(result.model_output, "assets/data.txt");
-    try std.testing.expect(result.system_notice == null);
-    try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
-    try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
-    try expectContains(result.context_notices[1], "skill discovery warning:");
+    const call: ToolCall = .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" };
+    const preparation = try prepareSkillCall(ctx, arena_state.allocator(), call, null);
+    defer @import("../skills/skill_invocation.zig").freeCallPreparation(arena_state.allocator(), preparation);
+    const selected = preparation.selected;
+    for ([_]bool{ false, true }) |bound| {
+        var effective_call = call;
+        if (bound) effective_call.resolved_skill = &selected;
+        const result = try executeToolCall(ctx, arena_state.allocator(), effective_call);
+        try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
+        try expectContains(result.model_output, "use the workflow skill");
+        try expectNotContains(result.model_output, "assets/data.txt");
+        try std.testing.expect(result.system_notice == null);
+        try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
+        try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
+        try expectContains(result.context_notices[1], "skill discovery warning:");
+    }
 }
 
 test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {

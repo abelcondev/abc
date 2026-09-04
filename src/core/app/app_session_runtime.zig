@@ -36,6 +36,10 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tooling_presentation = @import("../tooling/tool_presentation.zig");
+const tool_args = @import("../tooling/tool_args.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -2610,18 +2614,30 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs identify the running build independently of the session.
+        /// Terminal tabs identify the running build and workspace, not the session.
         pub fn syncTerminalTitle(app: *App) void {
             if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
         }
 
         pub fn syncTerminalTitleWith(
-            _: *App,
+            app: *App,
             provider: host_capability.TerminalTitle,
         ) void {
             if (comptime !provider_runtime.supported(App)) return;
-            provider.set("v" ++ build_options.app_version);
+            const basename = if (comptime @hasField(App, "workspace_root"))
+                std.fs.path.basename(app.workspace_root)
+            else
+                "";
+            const folder = if (basename.len == 0) "workspace" else basename;
+            const prefix = "v" ++ build_options.app_version ++ " | ";
+            var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
+                debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
+                provider.set("v" ++ build_options.app_version);
+                return;
+            };
+            provider.set(label);
         }
 
         pub fn cachedSessionTitle(app: *App) ?[]const u8 {
@@ -3659,21 +3675,34 @@ pub fn Runtime(comptime App: type) type {
                     decision.label,
                     &.{},
                 )
-            else if (result.status == .success)
-                try app.describeToolActionCompletedWithAdvertised(
+            else if (result.status == .success) success: {
+                var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
+                const registry = app.toolAdvertisementSet().registry;
+                const display_target = target: {
+                    const spec = registry.lookup(call.name) orelse break :target null;
+                    if (spec.prepare_skill_call_fn == null) break :target null;
+                    const args = tool_args.parseToolArgsObject(action_arena.allocator(), call.arguments_json) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => break :target null,
+                    };
+                    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+                    if (presentation.label_arg_kind != .name or
+                        tool_dispatch.presentationLabelValue(presentation, args) != null) break :target null;
+                    break :target skill_invocation.displayNameFromOutput(result.preview orelse result.output, &skill_name_buffer);
+                };
+                break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    null,
-                    &.{},
-                )
-            else
-                try app.describeToolActionDeniedWithAdvertised(
-                    action_arena.allocator(),
-                    call,
-                    null,
-                    "Failed",
+                    display_target,
                     &.{},
                 );
+            } else try app.describeToolActionDeniedWithAdvertised(
+                action_arena.allocator(),
+                call,
+                null,
+                "Failed",
+                &.{},
+            );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
                     try std.fmt.allocPrint(
@@ -9194,7 +9223,7 @@ test "renameActiveSession persists the title only in session metadata" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     const loaded = &app.session_persistence.writable.?;
     _ = try loaded.appendEvent(
@@ -9357,7 +9386,7 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
 }
 
-test "terminal title initializes to the build version and ignores session and model changes" {
+test "terminal title combines the build version and workspace but ignores session and model changes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9372,11 +9401,11 @@ test "terminal title initializes to the build version and ignores session and mo
 
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -9388,16 +9417,16 @@ test "terminal title initializes to the build version and ignores session and mo
         "wire the release notes generator",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     app.selected_model.clearRetainingCapacity();
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-5");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -9419,7 +9448,25 @@ test "cached session title drops control bytes before they reach the terminal" {
         "safe]2;ownedtail",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+}
+
+test "terminal title uses the workspace basename and handles unnamed roots" {
+    const cases = [_]struct { path: []const u8, folder: []const u8 }{
+        .{ .path = "/projects/fx", .folder = "fx" },
+        .{ .path = "/projects/fx/", .folder = "fx" },
+        .{ .path = "/projects/my project é", .folder = "my project é" },
+        .{ .path = "/", .folder = "workspace" },
+        .{ .path = "", .folder = "workspace" },
+    };
+    for (cases) |case| {
+        var app = try TestApp.init(std.testing.allocator, case.path);
+        defer app.deinit();
+        Runtime(TestApp).syncTerminalTitle(&app);
+        var expected_buffer: [128]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "v{s} | {s}", .{ build_options.app_version, case.folder });
+        try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
+    }
 }
 
 test "terminal title ignores long session and model context" {
@@ -9438,5 +9485,5 @@ test "terminal title ignores long session and model context" {
     try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
     try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version, app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }

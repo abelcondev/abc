@@ -535,6 +535,7 @@ function startFakeChatGptOAuth(
     unauthorizedResponses?: number;
     rejectRefresh?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
+    modelsResponse?: () => Promise<Response | void>;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
@@ -587,7 +588,8 @@ function startFakeChatGptOAuth(
         });
       }
       if (url.pathname === "/chatgpt/models") {
-        return Response.json({ models });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ models });
       }
       if (url.pathname === "/chatgpt/responses") {
         responseCount += 1;
@@ -633,6 +635,7 @@ function startFakeGrokOAuth(options: {
   beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
   userinfoSub?: string;
+  modelsResponse?: () => Promise<Response | void>;
 } = {}) {
   const initialAccessToken = "grok-initial-access-token";
   const refreshedAccessToken = "grok-refreshed-access-token";
@@ -733,7 +736,8 @@ function startFakeGrokOAuth(options: {
         return Response.json({ models });
       }
       if (url.pathname === "/v1/models") {
-        return Response.json({ data: subscriptionModels });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ data: subscriptionModels });
       }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
@@ -895,6 +899,9 @@ async function runCodexLoginWithBrowser(
 }
 
 function startFakeCodexToolLoop(options: {
+  responses?: Response[];
+  model?: string;
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -915,14 +922,15 @@ function startFakeCodexToolLoop(options: {
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: inputModalities, context_window: 272000 },
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
-        ] });
+        ].map((model, index) => index === 0 && options.model ? { ...model, slug: options.model } : model) });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -985,6 +993,9 @@ function startFakeCodexCapacityLoop() {
 }
 
 function startFakeGrokToolLoop(options: {
+  responses?: Response[];
+  model?: string;
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -1000,17 +1011,18 @@ function startFakeGrokToolLoop(options: {
     async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
-        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 1_000_000)] });
+        return Response.json({ data: [grokSubscriptionModel(options.model ?? "grok-4.20", 1_000_000)] });
       }
       if (path === "/modalities") {
-        return Response.json({ models: [grokModalityModel("grok-4.20", true)] });
+        return Response.json({ models: [grokModalityModel(options.model ?? "grok-4.20", true)] });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-grok-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -4338,6 +4350,151 @@ tmuxTest(
   60_000,
 );
 
+for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
+  test("direct Responses final records " + scenario, async () => {
+    const conflict = scenario !== "replace";
+    for (const provider of ["codex", "grok"] as const) {
+      const profile = mkdtempSync(join(tmpdir(), "fx-" + provider + "-final-record-"));
+      const testGateway = startFakeGateway([]);
+      const completed = { type: "response.completed", response: { status: "completed" } };
+      const item = (id: string, path: string) => ({
+        type: "function_call", id: "fc_" + id, call_id: id, name: "write_file",
+        arguments: JSON.stringify({ path, content: "saved" }),
+      });
+      const prior = item("prior", "prior.txt");
+      const pending = item("pending", "preview.txt");
+      const sibling = item("sibling", "sibling.txt");
+      const final = item("pending", "final.txt");
+      const responses: Response[] = [];
+      if (conflict) responses.push(fakeGatewaySse([
+        { type: "response.output_item.added", output_index: 0, item: { ...prior, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: prior.arguments },
+        { type: "response.output_item.done", output_index: 0, item: prior },
+        completed,
+      ]));
+      const events: object[] = [
+        { type: "response.output_item.added", output_index: 0, item: { ...pending, arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 0, item_id: pending.id, delta: pending.arguments },
+      ];
+      if (conflict) events.push(
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: pending.arguments },
+        { type: "response.output_item.added", output_index: 1, item: { ...sibling, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 1, arguments: sibling.arguments },
+      );
+      events.push(
+        { type: "response.output_item.done", output_index: scenario === "invalid-index" ? "0" : 0, item: final },
+        scenario === "invalid-index" ? completed : { type: "response.completed", response: { status: "completed", output: conflict ? [final, sibling] : [final] } },
+      );
+      responses.push(fakeGatewaySse(events), fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "FINAL_RECORD_OK" }, completed,
+      ]));
+      const model = "fixture-model";
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create the requested files containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(result.code, provider + ": " + result.stdout + "\n" + result.stderr).toBe(conflict ? 1 : 0);
+        expect(result.signal).toBeNull();
+        expect(direct.bodies).toHaveLength(2);
+        expect(existsSync(join(profile, "preview.txt"))).toBe(false);
+        expect(existsSync(join(profile, "sibling.txt"))).toBe(false);
+        expect(existsSync(join(profile, "prior.txt"))).toBe(conflict);
+        expect(existsSync(join(profile, "final.txt"))).toBe(!conflict);
+        expect(readFileSync(join(profile, conflict ? "prior.txt" : "final.txt"), "utf8")).toBe("saved");
+        const resultJson = JSON.parse(result.stdout);
+        if (conflict) expect(resultJson.error).toBe(scenario === "invalid-index" ? (provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent") : "ResponsesToolCallConflict");
+        else {
+          expect(resultJson.output).toBe("FINAL_RECORD_OK");
+          expect(result.stderr).toBe("Writing final.txt\n");
+        }
+        const detail = await runFx(["session", "--json", "--id", resultJson.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        const steps = history[0].execution.tool_steps;
+        expect(steps).toHaveLength(1);
+        expect(steps[0].tool_calls).toHaveLength(1);
+        expect(steps[0].tool_calls[0].id).toBe(conflict ? "prior" : "pending");
+        expect(steps[0].tool_calls[0].arguments_json).toBe(conflict ? prior.arguments : final.arguments);
+        if (conflict) {
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", resultJson.session_id, "Report the completed work without writing more files."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(resumed.stderr).toBe("");
+          expect(JSON.parse(resumed.stdout).output).toBe("FINAL_RECORD_OK");
+          expect(direct.bodies).toHaveLength(3);
+          const input = JSON.parse(direct.bodies[2]).input;
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call_output").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+        }
+        expect(testGateway.requests).toHaveLength(0);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+}
+
+test("direct provider tool identities obey the session boundary before execution", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    for (const bytes of [256, 257]) {
+      const profile = mkdtempSync(join(tmpdir(), `fx-${provider}-identity-`));
+      const testGateway = startFakeGateway([]);
+      const options = { toolCallId: "i".repeat(bytes), toolName: "write_file", toolArguments: { path: "result.txt", content: "saved" } };
+      const direct = provider === "codex" ? startFakeCodexToolLoop(options) : startFakeGrokToolLoop(options);
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        const catalog = await (await fetch(direct.modelsUrl)).json();
+        const model = provider === "codex" ? catalog.models[0].slug : catalog.data[0].id;
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [`${provider}_model`]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        const accepted = bytes === 256;
+        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(accepted ? 0 : 1);
+        expect(result.signal).toBeNull();
+        expect(existsSync(join(profile, "result.txt"))).toBe(accepted);
+        expect(direct.bodies).toHaveLength(accepted ? 2 : 1);
+        expect(testGateway.requests).toHaveLength(0);
+        const json = JSON.parse(result.stdout);
+        expect(json.tool_calls).toEqual(accepted ? [{ name: "write_file", status: "success" }] : []);
+        if (!accepted) expect(json.error).toBe("MalformedAuthoritativeToolIdentity");
+        const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(accepted ? 1 : 0);
+        if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }
+}, 60_000);
+
 test(
   "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",
   async () => {
@@ -6501,3 +6658,333 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
     releases.stop(true);
   }
 }, 30_000);
+
+for (const provider of ["codex", "grok"] as const) {
+  for (const outcome of ["success", "failure", "cancel"] as const) {
+    tmuxTest(`provider preparation keeps input responsive through ${provider} ${outcome}`, async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([fakeGatewayFinalText("PREPARATION_GATEWAY_RECOVERY")]);
+      let entered = 0;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const modelsResponse = async () => {
+        entered++;
+        if (entered !== 1) return;
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      };
+      chatgptOauth = startFakeChatGptOAuth({ modelsResponse });
+      const grok = startFakeGrokOAuth({ modelsResponse });
+      try {
+        writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+        writeSeededGrokLogin(home, grok.initialAccessToken);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, JSON.stringify({ provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } }));
+        session = await startFx(home, stderrPath, gateway, undefined, join(home, "trace.log"), {
+          ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,prompt,input,provider",
+        });
+        await session.waitForComposer(TIMEOUT);
+        await openProviderPicker(session);
+        await session.sendLiteral(provider);
+        await session.sendKeys("Enter");
+        await session.waitForPane(() => entered === 1, 5000);
+        await session.sendLiteral("retained café 日本語");
+        await session.waitForText("retained café 日本語", 1500);
+        await session.resizeWindow(88, 24);
+        expect(await session.capturePane()).toContain("retained café 日本語");
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+        const direct = provider === "codex" ? chatgptOauth : grok;
+        const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
+        const responses = () => direct.requests.filter((request) => request.path === responsePath);
+        if (outcome === "cancel") {
+          await session.sendKeys("C-c");
+          await session.waitForText("Provider preparation cancelled.", 1500);
+          expect(await session.capturePane()).toContain("retained café 日本語");
+          release();
+          await Bun.sleep(100);
+          expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+          expect(responses()).toHaveLength(0);
+          await session.sendKeys("C-u");
+          await openProviderPicker(session);
+          await session.sendLiteral(provider);
+          await session.sendKeys("Enter");
+          await session.waitForText(`Switched to ${provider === "codex" ? "Codex" : "Grok"} subscription`, TIMEOUT);
+        } else {
+          await session.sendKeys("Enter");
+          await session.waitForPane(() => readFileSync(join(home!, "trace.log"), "utf8").includes("pending_prompt_adopted"), 3000);
+          expect(gateway.requests).toHaveLength(0);
+          expect(responses()).toHaveLength(0);
+          release();
+          if (outcome === "success") {
+            await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+            expect(responses()).toHaveLength(1);
+            expect(responses()[0]!.body).toContain("retained café 日本語");
+            expect(gateway.requests).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
+          } else {
+            await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+            expect(gateway.requests).toHaveLength(0);
+            expect(responses()).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+            await session.sendKeys("Enter");
+            await session.waitForText("PREPARATION_GATEWAY_RECOVERY", TIMEOUT);
+            expect(gateway.requests).toHaveLength(1);
+            expect(JSON.stringify(gateway.requests[0]!.body)).toContain("retained café 日本語");
+          }
+        }
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).not.toContain(chatgptOauth.accessToken);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(3000);
+        session = null;
+      } finally {
+        release();
+        grok.stop();
+      }
+    }, TIMEOUT);
+  }
+}
+
+tmuxTest("provider preparation does not delay double Ctrl+C shutdown", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-exit-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => { entered = true; await held; } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.sendKeys("C-c");
+    await session.waitForSessionEnd(1500);
+    session = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    release();
+  }
+}, TIMEOUT);
+
+for (const outcome of ["cancel", "failure"] as const) {
+  tmuxTest(`provider preparation validates Vercel team before saving through ${outcome}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-team-preparation-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let entered = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateway = startFakeGateway([fakeGatewayFinalText("TEAM_PREPARATION_OK")], { models: async () => {
+      entered++;
+      if (entered === 1) {
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      }
+      return [FAKE_GATEWAY_MODEL, "openai/gpt-5.6-sol"].map((id) => ({ id, type: "language", tags: ["tool-use"] }));
+    } });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teams: [{ id: "team_next", slug: "next-team", name: "Next Team" }],
+    });
+    chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_previous");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const settingsPath = join(home, ".fx", "settings.json");
+    const authPath = join(home, ".fx", "auth.json");
+    writeFileSync(settingsPath, JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: "openai/gpt-5.6-sol" } }));
+    const beforeAuth = readFileSync(authPath, "utf8");
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0" });
+      await session.waitForComposer(TIMEOUT);
+      const chooseTeam = async () => {
+        await session!.sendKeys("C-u");
+        await openProviderPicker(session!);
+        await session!.sendLiteral("vercel");
+        await session!.sendKeys("Enter");
+        await session!.waitForText("oauth", TIMEOUT);
+        await session!.sendKeys("Enter");
+        await session!.waitForText("next-team", TIMEOUT);
+        await session!.sendKeys("Enter");
+      };
+      await chooseTeam();
+      await session.waitForPane(() => entered === 1, 5000);
+      await session.sendLiteral("team draft");
+      await session.waitForText("team draft", 1500);
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      if (outcome === "cancel") {
+        await session.sendKeys("C-c");
+        await session.waitForText("Provider preparation cancelled.", 1500);
+        release();
+      } else {
+        release();
+        await session.waitForText("could not be validated for AI Gateway", TIMEOUT);
+      }
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
+      await chooseTeam();
+      await session.waitForText("Changed Vercel team to Next Team", TIMEOUT);
+      expect(JSON.parse(readFileSync(authPath, "utf8")).team_id).toBe("team_next");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
+      await session.sendText("Use the validated team.");
+      await session.waitForText("TEAM_PREPARATION_OK", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.captureFullScrollbackEscapes();
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(3000);
+      session = null;
+    } finally { release(); }
+  }, TIMEOUT);
+}
+
+tmuxTest("provider preparation cancellation stops logout fallback", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-preparation-cancel-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.waitForText("Provider preparation cancelled.", 1500);
+    release();
+    await Bun.sleep(100);
+    expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(3000);
+    session = null;
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+tmuxTest("provider recovery continues after a held prompt and failed catalog", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-fallback-prompt-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendText("Use the remaining subscription after recovery.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("GROK_DIRECT_RESPONSE", 5000);
+    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+    expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+
+tmuxTest("provider preparation resumes a held prompt after explicit provider retry", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-explicit-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => {
+    entered++;
+    if (entered === 1) {
+      await held;
+      return new Response("unavailable", { status: 503 });
+    }
+  } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered === 1, 5000);
+    await session.sendText("Retain this prompt across the explicit provider retry.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", 5000);
+    const requests = chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.body).toContain("Retain this prompt across the explicit provider retry.");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); }
+}, TIMEOUT);
+
+tmuxTest("provider preparation completes existing-key recovery for a held prompt", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-key-recovery-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([fakeGatewayFinalText("KEY_RECOVERY_OK")]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  linkSync(join(home, ".fx", "chatgpt-auth.json"), join(home, "auth-alias"));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+  const trace = join(home, "trace.log");
+  session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("Use the Gateway after repair.");
+  await waitForTrace(trace, "pending_prompt_awaiting_auth", 5000);
+  await openProviderPicker(session);
+  await session.sendLiteral("vercel");
+  await session.sendKeys("Enter");
+  await session.waitForText("api-key", TIMEOUT);
+  await session.sendLiteral("api-key");
+  await session.sendKeys("Enter");
+  await session.waitForText("env", TIMEOUT);
+  await session.sendLiteral("env");
+  await session.sendKeys("Enter");
+  await session.waitForText("KEY_RECOVERY_OK", 5000);
+  expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("gateway");
+  expect(gateway.requests).toHaveLength(1);
+  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("Use the Gateway after repair.");
+  expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);

@@ -95,6 +95,7 @@ pub const PendingPromptCredentialReadiness = enum {
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
+            if (try rejectPendingPreparation(app)) return false;
             if (comptime provider_runtime.supported(App) and
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
@@ -231,6 +232,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
+            if (try rejectPendingPreparation(app)) return;
             if (hostManagesAuth(app)) {
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
                 return;
@@ -352,11 +354,9 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = app.auth.pickerView().available_sources,
             });
-            for (candidates) |candidate| {
-                const target = candidate orelse continue;
-                try switchProvider(app, target, false, .manual);
-                if (provider_runtime.provider(app) == target and
-                    model_provider.authorizesCredential(target, app.auth.credentialSource())) return;
+            if (candidates[0]) |target| {
+                try startProviderSwitch(app, target, false, .manual, candidates[1]);
+                return;
             }
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -534,6 +534,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn applyPickerChoice(app: *App, choice: auth_runtime.Choice) !void {
+            if (try rejectPendingPreparation(app)) return;
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -861,6 +862,7 @@ pub fn Runtime(comptime App: type) type {
         /// chain further work (the inline picker's provider switch) can stop
         /// when it did not. Failure is already explained to the user here.
         pub fn applySourceChoice(app: *App, source: credentials.Source) !bool {
+            if (try rejectPendingPreparation(app)) return false;
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Switched credential to {s}.",
@@ -1010,9 +1012,19 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
         ) !void {
+            try startProviderSwitch(app, target, allow_login, intent, null);
+        }
+
+        fn startProviderSwitch(
+            app: *App,
+            target: model_provider.ProviderId,
+            allow_login: bool,
+            intent: ProviderSwitchIntent,
+            fallback: ?model_provider.ProviderId,
+        ) !void {
             if (comptime !provider_runtime.supported(App) or
-                !@hasDecl(App, "fetchProviderCatalog") or
-                !@hasDecl(@TypeOf(app.model_cache), "adoptOwnedCatalog"))
+                !@hasDecl(App, "providerCatalog") or
+                !@hasDecl(@TypeOf(app.auth), "beginProviderPreparation") or host_target.is_wasm)
             {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1021,137 +1033,194 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            if (comptime host_target.is_wasm) {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .warning,
-                    .body = "Subscription provider switching is unavailable in this WASM session.",
-                }, true);
-                return;
-            }
-
-            const current = provider_runtime.provider(app);
-            const active_source = app.auth.credentialSource();
-            const target_credential_ready = if (active_source) |source|
-                model_provider.authorizesCredential(target, source)
-            else
-                false;
+            if (try rejectPendingPreparation(app)) return;
             switch (decideProviderSwitch(.{
-                .current = current,
+                .current = provider_runtime.provider(app),
                 .target = target,
-                .target_credential_ready = target_credential_ready,
+                .target_credential_ready = model_provider.authorizesCredential(target, app.auth.credentialSource()),
                 .intent = intent,
-                .stream_active = app.stream.active,
+                .stream_active = app.stream.active or pendingPromptBlocksPreparation(app),
                 .queued_prompts = app.worker.queuedPromptCount(),
             })) {
                 .prepare => {},
                 .no_change => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "Already using {s}.",
-                        .{provider_catalog.label(target)},
-                    );
+                    const body = try std.fmt.allocPrint(app.alloc, "Already using {s}.", .{provider_catalog.label(target)});
                     defer app.alloc.free(body);
-                    try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .neutral,
+                        .body = body,
+                    }, true);
                     return;
                 },
                 .busy => {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = providerFailureMessage(
-                            intent,
-                            provider_busy_message,
-                            "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
-                        ),
+                        .body = providerFailureMessage(intent, provider_busy_message, "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged."),
                     }, true);
                     return;
                 },
             }
-            try app.flushBeforeBlockingExternalWork();
-
             var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
                 debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the saved provider selection. The current provider is unchanged.",
-                        "Subscription sign-in completed, but the saved provider selection could not be loaded. The current provider is unchanged.",
-                    ),
+                    .body = "Could not load the saved provider selection. The current provider is unchanged.",
                 }, true);
                 return;
             };
             defer settings.deinit(app.alloc);
-
-            var credential: ?credentials.Credential = null;
-            defer if (credential) |*value| value.deinit(app.alloc);
-            if (!hostManagesAuth(app)) {
-                credential = (auth_runtime.prepareCredential(
-                    app.alloc,
-                    app.auth.oauthTransport(),
-                    app.auth.secretStore(),
-                    target,
-                    if (target == .gateway) settings.credential_source else null,
-                ) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
-                    const body = try auth_runtime.preparationFailureText(app.alloc, target, err);
-                    defer app.alloc.free(body);
-                    try app.writeDomainNotice(.{
-                        .topic = "provider",
-                        .tone = .@"error",
-                        .body = body,
-                    }, true);
-                    return;
-                }) orelse {
-                    if (target == .codex and allow_login) {
-                        try beginCodexSignInForProviderSwitch(app);
-                        return;
-                    }
-                    if (target == .grok and allow_login) {
-                        try beginGrokSignInForProviderSwitch(app);
-                        return;
-                    }
-                    try app.writeDomainNotice(.{
-                        .topic = "provider",
-                        .tone = .warning,
-                        .body = if (intent == .post_oauth)
-                            "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
-                        else if (target == .codex)
-                            "Run fx login codex, then try switching again."
-                        else if (target == .grok)
-                            "Run fx login grok, then try switching again."
-                        else
-                            credentials.missing_interactive_credential_message,
-                    }, true);
-                    return;
-                };
-            }
-
-            const access: credentials.CatalogAccess = if (hostManagesAuth(app))
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    credential.?.source,
-                    credential.?.token,
-                    credential.?.gatewayTeam(),
-                    credential.?.accountId(),
-                );
-            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
-                debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+            const catalog_provider = app.providerCatalog(target) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the target provider catalog. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
-                    ),
+                    .body = "The target provider catalog is unavailable. The current provider is unchanged.",
                 }, true);
                 return;
             };
+            try beginPreparation(app, .{
+                .intent = .{ .provider = .{ .target = target, .allow_login = allow_login, .origin = intent, .fallback = fallback } },
+                .catalog_provider = catalog_provider,
+                .models_path = app.model_cache.models_path,
+                .preferred_source = if (target == .gateway) settings.credential_source else null,
+                .primary_model = if (intent == .post_oauth and provider_runtime.provider(app) == target) provider_runtime.model(app) else null,
+                .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
+            });
+        }
+
+        fn pendingPromptBlocksPreparation(app: *const App) bool {
+            if (comptime !@hasField(App, "submission")) return false;
+            const pending = app.submission.pending orelse return false;
+            return pending.credential_admitted or pending.phase == .queued;
+        }
+
+        fn pendingPromptNeedsAdoption(app: *const App) bool {
+            if (comptime !@hasField(App, "submission")) return false;
+            const pending = app.submission.pending orelse return false;
+            return pending.phase == .awaiting_frame or pending.phase == .awaiting_adoption;
+        }
+
+        fn rejectPendingPreparation(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "providerPreparationPending")) return false;
+            if (!app.auth.providerPreparationPending()) return false;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .neutral,
+                .body = "Provider preparation is still in progress. Ctrl+C cancels.",
+            }, true);
+            return true;
+        }
+
+        fn beginPreparation(app: *App, input: auth_runtime.ProviderPreparationInput) !void {
+            app.auth.beginProviderPreparation(app.alloc, input) catch |err| {
+                debug_trace.logf("provider", "preparation start failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not start provider preparation. The current provider is unchanged.",
+                }, true);
+                return;
+            };
+            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .neutral,
+                .body = body,
+            }, true);
+        }
+
+        pub fn collectProviderPreparationFacts(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
+            if (pendingPromptNeedsAdoption(app)) return;
+            const task = app.auth.takeProviderPreparation() orelse return;
+            defer task.deinit();
+            if (task.cancel_requested.load(.seq_cst)) {
+                holdPromptAfterPreparationFailure(app);
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .neutral,
+                    .body = "Provider preparation cancelled. The current provider is unchanged.",
+                }, true);
+                return;
+            }
+            const applied = switch (task.input.intent) {
+                .provider => try finishProviderSwitch(app, task),
+                .team => try finishTeamPreparation(app, task),
+            };
+            if (applied) {
+                if (comptime @hasField(App, "submission")) {
+                    if (app.submission.pending) |pending| {
+                        if (pending.phase == .awaiting_auth) requestPromptRetryAfterAuth(app);
+                    }
+                }
+                try resumePromptAfterAuth(app);
+                return;
+            }
+            if (task.input.intent == .provider) {
+                if (task.input.intent.provider.fallback) |target| {
+                    try startProviderSwitch(app, target, false, .manual, null);
+                    if (app.auth.providerPreparationPending()) return;
+                }
+            }
+            holdPromptAfterPreparationFailure(app);
+        }
+
+        fn holdPromptAfterPreparationFailure(app: *App) void {
+            if (comptime !@hasField(App, "submission")) return;
+            if (app.submission.pending) |*pending| {
+                if (pending.phase == .adopted) {
+                    pending.phase = .awaiting_auth;
+                    app.submission.retry_after_auth = app.auth.signInEntryActive();
+                    debug_trace.logf("provider", "pending prompt retained after preparation failure", .{});
+                }
+            }
+        }
+
+        fn finishProviderSwitch(app: *App, task: *auth_runtime.ProviderPreparation) !bool {
+            const request = task.input.intent.provider;
+            const target = request.target;
+            const intent = request.origin;
+            if (task.failure) |err| {
+                debug_trace.logf("provider", "preparation failed target={t} err={s}", .{ target, @errorName(err) });
+                if (task.credential == null and !hostManagesAuth(app)) {
+                    const body = try auth_runtime.preparationFailureText(app.alloc, target, err);
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = body,
+                    }, true);
+                } else {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = providerFailureMessage(intent, "Could not load the target provider catalog. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged."),
+                    }, true);
+                }
+                return false;
+            }
+            if (task.credential == null and !hostManagesAuth(app)) {
+                if (request.allow_login) {
+                    switch (target) {
+                        .codex => try beginCodexSignInForProviderSwitch(app),
+                        .grok => try beginGrokSignInForProviderSwitch(app),
+                        .gateway => {},
+                    }
+                }
+                if (target == .gateway or !request.allow_login) {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                    }, true);
+                }
+                return false;
+            }
+            const fetched = task.catalog orelse return false;
+            task.catalog = null;
             var catalog = switch (fetched) {
                 .catalog => |catalog| catalog,
                 .failure => |failure| {
@@ -1159,45 +1228,26 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = if (failure.category == .cancellation) providerFailureMessage(
-                            intent,
-                            "Provider switching was cancelled. The current provider is unchanged.",
-                            "Subscription sign-in completed, but provider activation was cancelled. The current provider is unchanged.",
-                        ) else providerFailureMessage(
-                            intent,
-                            "The target provider catalog could not be validated. The current provider is unchanged.",
-                            "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
-                        ),
+                        .body = if (failure.category == .cancellation) "Provider switching was cancelled. The current provider is unchanged." else providerFailureMessage(intent, "The target provider catalog could not be validated. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
                     }, true);
-                    return;
+                    return false;
                 },
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
-            if (catalog.items.len == 0) {
+            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "The target provider returned no supported models. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
-                    ),
+                    .body = providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
                 }, true);
-                return;
-            }
-
-            const saved_model = settings.models.get(target);
-            const current_model = if (intent == .post_oauth and current == target)
-                provider_runtime.model(app)
-            else
-                null;
-            const preferred_model = if (intent == .post_oauth)
-                saved_model
-            else
-                io_mod.getenv("FX_MODEL") orelse saved_model;
-            const selected_model = selectCatalogModel(catalog.items, current_model, preferred_model) orelse unreachable;
+                return false;
+            };
+            var credential = task.credential;
+            task.credential = null;
+            defer if (credential) |*value| value.deinit(app.alloc);
+            const access: credentials.CatalogAccess = if (hostManagesAuth(app)) .host_managed else credentials.catalogAccessForCredentialAndAccount(credential.?.source, credential.?.token, credential.?.gatewayTeam(), credential.?.accountId());
             var owned_model = try app.alloc.dupe(u8, selected_model);
-            errdefer app.alloc.free(owned_model);
+            defer app.alloc.free(owned_model);
 
             if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
@@ -1209,7 +1259,7 @@ pub fn Runtime(comptime App: type) type {
                         "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                     ),
                 }, true);
-                return;
+                return false;
             }
 
             app.model_cache.adoptOwnedCatalog(access, &catalog);
@@ -1244,7 +1294,11 @@ pub fn Runtime(comptime App: type) type {
                         .body = "Provider switched for this run, but the selection could not be saved.",
                     }, true);
                 } else {
-                    try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .neutral,
+                        .body = body,
+                    }, true);
                 }
             } else {
                 var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
@@ -1268,6 +1322,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             app.shell.render_requests.request(.footer);
+            return true;
         }
 
         /// What the inline `/provider` picker should do after the user chooses to
@@ -1363,16 +1418,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn applyTeamChoice(app: *App, index: usize) !bool {
+            if (pendingPromptBlocksPreparation(app)) {
+                try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = provider_busy_message }, true);
+                return false;
+            }
+            if (try rejectPendingPreparation(app)) return false;
+            if (try reject_provider_picker_if_busy(app)) return false;
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
-            const team = selection.teams.items[index];
-            const body = try std.fmt.allocPrint(
-                app.alloc,
-                "Changed Vercel team to {s} ({s}).",
-                .{ team.name, team.slug },
-            );
-            defer app.alloc.free(body);
-
             var candidate = selection.validationCredential(app.alloc, index) catch |err| {
                 cancelPromptRetryAfterAuth(app);
                 if (err == error.OutOfMemory) return err;
@@ -1386,8 +1439,55 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             };
             defer candidate.deinit(app.alloc);
-            var validation = try validateTeamCredential(app, candidate);
+            if (comptime @hasDecl(@TypeOf(app.auth), "beginProviderPreparation") and @hasDecl(App, "providerCatalog") and !host_target.is_wasm) {
+                const catalog_provider = app.providerCatalog(.gateway) orelse return false;
+                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                    debug_trace.logf("auth", "team preparation settings failed err={s}", .{@errorName(err)});
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not load provider preferences. The current team is unchanged." }, true);
+                    return false;
+                };
+                defer settings.deinit(app.alloc);
+                try beginPreparation(app, .{
+                    .intent = .{ .team = .{ .index = index, .activate_gateway = provider_runtime.provider(app) != .gateway } },
+                    .preferred_model = io_mod.getenv("FX_MODEL") orelse settings.models.get(.gateway),
+                    .catalog_provider = catalog_provider,
+                    .models_path = app.model_cache.models_path,
+                    .candidate = candidate,
+                });
+                return false;
+            } else {
+                var validation = try validateTeamCredential(app, candidate);
+                defer validation.deinit(app.alloc);
+                return finishTeamChoice(app, index, validation, null);
+            }
+        }
+
+        fn finishTeamPreparation(app: *App, task: *auth_runtime.ProviderPreparation) !bool {
+            const request = task.input.intent.team;
+            if (try reject_provider_picker_if_busy(app)) return false;
+            if (task.failure) |err| debug_trace.logf("auth", "team preparation failed err={s}", .{@errorName(err)});
+            const selection = app.auth.loadedTeamSelection() orelse {
+                debug_trace.logf("auth", "team preparation discarded reason=selection_closed", .{});
+                return false;
+            };
+            const candidate = task.credential orelse return false;
+            if (request.index >= selection.teams.items.len or
+                !std.mem.eql(u8, selection.teams.items[request.index].id, candidate.team_id orelse ""))
+            {
+                debug_trace.logf("auth", "team preparation discarded reason=selection_changed", .{});
+                return false;
+            }
+            var validation: TeamCatalogValidation = if (task.catalog) |catalog| try validateTeamCatalog(app, catalog) else .rejected;
             defer validation.deinit(app.alloc);
+            return finishTeamChoice(app, request.index, validation, if (request.activate_gateway) task else null);
+        }
+
+        fn finishTeamChoice(app: *App, index: usize, validation: TeamCatalogValidation, activation: ?*auth_runtime.ProviderPreparation) !bool {
+            const selection = app.auth.loadedTeamSelection() orelse return false;
+            if (index >= selection.teams.items.len) return false;
+            const team = selection.teams.items[index];
+            const body = try std.fmt.allocPrint(app.alloc, "Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            defer app.alloc.free(body);
             if (validation == .rejected) {
                 cancelPromptRetryAfterAuth(app);
                 app.auth.closePicker(app.alloc);
@@ -1414,6 +1514,17 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             };
             defer selected_team.deinit(app.alloc);
+
+            if (comptime provider_runtime.supported(App) and @hasDecl(App, "providerCatalog") and @hasDecl(@TypeOf(app.auth), "beginProviderPreparation")) {
+                if (activation) |task| {
+                    task.input.intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } };
+                    if (!try finishProviderSwitch(app, task)) return false;
+                    rememberCredentialSource(app, .fx_login);
+                    app.auth.closePicker(app.alloc);
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                    return true;
+                }
+            }
 
             var model_persistence_failed = false;
             if (comptime provider_runtime.supported(App)) {
@@ -1476,24 +1587,38 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             candidate: credentials.Credential,
         ) std.mem.Allocator.Error!TeamCatalogValidation {
-            if (comptime !@hasDecl(App, "fetchProviderCatalog")) {
+            if (comptime !@hasDecl(App, "providerCatalog")) {
                 return .{ .accepted = null };
             }
             const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
             if (access.authorizationCredential() == null) return .rejected;
-            const fetched = app.fetchProviderCatalog(.gateway, access) catch |err| {
+            const provider = app.providerCatalog(.gateway) orelse return .rejected;
+            var cancelled = std.atomic.Value(bool).init(false);
+            const fetched = provider.fetch(app.alloc, .{
+                .access = access,
+                .endpoint = app.model_cache.models_path,
+                .cancel_flag = &cancelled,
+                .view = .picker,
+            }) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 debug_trace.logf("auth", "team catalog validation failed err={s}", .{@errorName(err)});
                 return .rejected;
             };
+            defer if (fetched == .catalog) {
+                var owned = fetched.catalog;
+                model_catalog.freeModelCatalog(app.alloc, &owned);
+            };
+            return validateTeamCatalog(app, fetched);
+        }
+
+        fn validateTeamCatalog(app: *App, fetched: model_catalog.ProviderResult) std.mem.Allocator.Error!TeamCatalogValidation {
             return switch (fetched) {
                 .failure => |failure| result: {
                     debug_trace.logf("auth", "team catalog rejected category={t}", .{failure.category});
                     break :result .rejected;
                 },
                 .catalog => |catalog_value| result: {
-                    var catalog = catalog_value;
-                    defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+                    const catalog = catalog_value;
                     if (catalog.items.len == 0) break :result .rejected;
                     if (comptime provider_runtime.supported(App)) {
                         const current_model = provider_runtime.model(app);
@@ -1579,6 +1704,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startPromptCredentialPrewarm(app: *App) void {
+            if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
+                if (app.auth.providerPreparationPending()) return;
+            }
             if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
             if (comptime provider_runtime.supported(App)) {
                 if (!model_provider.authorizesCredential(provider_runtime.provider(app), app.auth.credentialSource())) return;
@@ -1594,6 +1722,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
+                if (app.auth.providerPreparationPending()) return .pending;
+            }
             if (comptime host_target.is_wasm) {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
@@ -1631,6 +1762,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn retryPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
+                if (app.auth.providerPreparationPending()) return .pending;
+            }
             if (comptime host_target.is_wasm) {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
@@ -1873,6 +2007,33 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
+test "provider preparation waits for prompt adoption and protects admitted prompts" {
+    const submission = @import("input_submit_runtime.zig");
+    const FakeApp = struct { submission: submission.State = .{} };
+    var app: FakeApp = .{};
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
+    app.submission.pending = .{ .draft = .{ .turn_id = 1, .prompt = &.{}, .images = &.{}, .skill_display_spans = &.{} } };
+    for ([_]submission.PendingPhase{ .awaiting_frame, .awaiting_adoption }) |phase| {
+        app.submission.pending.?.phase = phase;
+        try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+        try std.testing.expect(Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
+    }
+    app.submission.pending.?.phase = .adopted;
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    app.submission.pending.?.credential_admitted = true;
+    try std.testing.expect(Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    app.submission.pending.?.credential_admitted = false;
+    for ([_]submission.PendingPhase{.queued}) |phase| {
+        app.submission.pending.?.phase = phase;
+        try std.testing.expect(Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+        try std.testing.expect(!Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
+    }
+    app.submission.pending.?.phase = .awaiting_auth;
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
+}
+
 test "provider switch state machine no-ops rejects busy work and prepares only idle changes" {
     try std.testing.expectEqual(
         ProviderSwitchDecision.no_change,
@@ -1967,6 +2128,7 @@ test "post OAuth catalog selection keeps valid current then saved then first" {
 }
 
 const TestModelCache = struct {
+    models_path: []const u8 = "/models",
     reset_count: usize = 0,
 
     fn reset(self: *TestModelCache) void {
@@ -2504,11 +2666,12 @@ const TestApp = struct {
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 
-    fn fetchProviderCatalog(
-        self: *TestApp,
-        _: model_provider.ProviderId,
-        _: credentials.CatalogAccess,
-    ) !model_catalog.ProviderResult {
+    fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetchTestCatalog };
+    }
+
+    fn fetchTestCatalog(raw: ?*anyopaque, _: std.mem.Allocator, _: model_catalog.FetchInput) std.mem.Allocator.Error!model_catalog.ProviderResult {
+        const self: *TestApp = @ptrCast(@alignCast(raw.?));
         if (!self.team_catalog_accepted) {
             return .{ .failure = .{ .category = .authentication } };
         }

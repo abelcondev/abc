@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -94,6 +95,7 @@ pub const ParallelRunResult = struct {
 };
 
 pub const ParallelHookExecContext = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     hooks: *const AgentRuntimeDeps,
     turn_id: u64,
     root_user_intent_context: []const u8,
@@ -277,6 +279,7 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
     return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
+        .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
         .call = call,
@@ -322,6 +325,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         };
     }
     var duplicated_execution: ToolExecutionResult = .{
+        .model_content_kind = execution.model_content_kind,
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
         .web_search_completion = execution.web_search_completion,
@@ -756,6 +760,7 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         "{\"path\":\"notes.txt\"}",
     );
     const execution: ToolExecutionResult = .{
+        .model_content_kind = .complete_skill,
         .model_output = "contents",
         .status_detail = "detail",
         .system_notice = "notice",
@@ -767,6 +772,8 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         .context_notices = &.{ "first context notice", "second context notice" },
         .command_result_json = "{}",
         .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }},
+            .tool_image_handle = "image-result-handle",
             .output_handle = "result-handle",
             .preview = "preview",
             .output_bytes = 8,
@@ -780,6 +787,12 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         execution,
     );
     defer freeParallelToolResult(alloc, duplicated);
+    try std.testing.expectEqual(execution.model_content_kind, duplicated.execution.model_content_kind);
+    const memory = duplicated.execution.tool_result_memory.?;
+    try std.testing.expectEqualStrings("image-result-handle", memory.tool_image_handle.?);
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_images.len);
+    try std.testing.expectEqualStrings("cG5n", memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("image/png", memory.tool_images[0].mime_type);
     try std.testing.expectEqualStrings("notice", duplicated.execution.system_notice.?);
     const interactive_notice = duplicated.execution.interactive_notice.?;
     try std.testing.expectEqualStrings("background", interactive_notice.topic);
