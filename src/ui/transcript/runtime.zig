@@ -4009,7 +4009,7 @@ const InstalledFullTranscriptPage = struct {
             std.heap.c_allocator.free(self.measured_item_rows);
         }
         self.projection.deinit(std.heap.c_allocator);
-        self.source.deinit();
+        self.source.deinit(std.heap.c_allocator);
         self.* = undefined;
     }
 };
@@ -9743,8 +9743,8 @@ pub const TranscriptRuntime = struct {
         } else if (!task.cancel_requested.load(.acquire) and
             full_transcript_page.sameSurface(desired, request))
         {
-            if (task.takeProjection()) |projection| {
-                const prepared_window = task.takePreparedWindow() orelse
+            if (task.projection) |projection| {
+                const prepared_window = task.prepared_window orelse
                     return error.MissingPreparedFullTranscriptSource;
                 const measured_item_rows = try std.heap.c_allocator.dupe(
                     transcript_presentation.ItemRow,
@@ -9758,8 +9758,8 @@ pub const TranscriptRuntime = struct {
                 if (self.full_transcript_installed_page) |*page| page.deinit();
                 self.full_transcript_installed_page = .{
                     .source = source,
-                    .projection = projection,
-                    .prepared_window = prepared_window,
+                    .projection = task.takeProjection().?,
+                    .prepared_window = task.takePreparedWindow().?,
                     .measured_total_rows = projection.measured_total_rows,
                     .measured_anchor_row = projection.measured_anchor_row,
                     .measured_item_rows = measured_item_rows,

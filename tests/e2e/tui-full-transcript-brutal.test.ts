@@ -19,6 +19,7 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   fakeGatewaySse,
   fakeShellRun,
   startFakeGateway,
@@ -1202,6 +1203,70 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     }
   }
 }
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O keeps saved tool output intact across window replacement",
+  async () => {
+    const paths = makeRoot("saved-result-lifetime");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    const lines = Array.from({ length: 300 }, (_, i) =>
+      `SAVED_ROW_${String(i + 1).padStart(4, "0")} original tool output`,
+    );
+    writeFileSync(join(paths.workspace, "saved.txt"), lines.join("\n") + "\n");
+    const savedGateway = startFakeGateway([
+      fakeGatewayToolCall("saved-read", "read_file", { path: "saved.txt", line_count: 300 }),
+      fakeGatewayFinalText("Saved read complete."),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: paths.workspace,
+        env: { ...gatewayEnv(paths.home, savedGateway), FX_RECORD: paths.tapePath },
+        stderrPath: paths.stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Read saved.txt completely.");
+      await active.waitForText("Saved read complete.", TIMEOUT);
+      for (const width of [100, 80]) {
+        await active.resizeWindow(width, 32);
+        await active.sendHexBytes(CTRL_O);
+        await active.waitForText(FULL_FOOTER, TIMEOUT);
+        let previous = await active.waitForText("SAVED_ROW_0300", TIMEOUT);
+        // Each accepted page must show earlier original rows, including cache misses.
+        for (let page = 0; page < 6; page++) {
+          const first = Number(previous.match(/SAVED_ROW_(\d+)/)?.[1]);
+          expect(first).toBeGreaterThan(1);
+          await active.sendHexBytes(PAGE_UP);
+          previous = await active.waitForPane((pane) => {
+            const current = Number(pane.match(/SAVED_ROW_(\d+)/)?.[1]);
+            return current > 0 && current < first;
+          }, TIMEOUT);
+          expect(previous).not.toContain("Full saved result unavailable.");
+          for (const marker of previous.matchAll(/SAVED_ROW_(\d+)/g)) {
+            expect(previous).toContain(lines[Number(marker[1]) - 1]!);
+          }
+        }
+        await active.sendHexBytes(CTRL_O);
+        await active.waitForComposer(TIMEOUT);
+      }
+      const scrollback = await active.captureFullScrollback();
+      expect(scrollback).toContain("Saved read complete.");
+      expect(scrollback).not.toContain("Full saved result unavailable.");
+      expect(savedGateway.requests).toHaveLength(2);
+      expect(active.isAlive()).toBe(true);
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      savedGateway.stop();
+      rmSync(paths.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
 
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O fills a viewport taller than the prepared overscan cache",

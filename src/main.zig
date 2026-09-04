@@ -1327,6 +1327,7 @@ const App = struct {
             checkpoint.turn_id,
             false,
         )) return false;
+        WorkerAppRuntime.beginRecoveryPresentation(self);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
