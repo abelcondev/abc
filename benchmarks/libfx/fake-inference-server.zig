@@ -42,7 +42,7 @@ fn serveConnection(stream: std.Io.net.Stream) void {
     var io_backend: std.Io.Threaded = .init_single_threaded;
     defer io_backend.deinit();
     serveConnectionFallible(io_backend.io(), stream) catch |err| {
-        std.debug.print("libfx benchmark server failed: {s}\n", .{@errorName(err)});
+        std.log.err("libfx benchmark server failed: {s}", .{@errorName(err)});
     };
 }
 

@@ -61,6 +61,8 @@ Each core has one nonblocking Unix socketpair for readiness. The adapter takes o
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
 
+The shared Agent checks its current turn's cancellation state before invoking host fetch. A request published after cancellation is aborted through the existing runtime boundary, so an earlier idle abort cannot leave the cancelled turn waiting for a response.
+
 The native kernel installs only the host-stream provider and static model metadata. It does not inherit CLI billing reconciliation, model discovery, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
 
 ## Native module ABI

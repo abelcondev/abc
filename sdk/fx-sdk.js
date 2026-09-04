@@ -1182,6 +1182,10 @@ export async function createFxAgent(options = {}) {
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
       emit("transport.start", { attempt, method, endpoint, model: options.model });
       try {
+        if (activeTurn?.cancelled) {
+          runtime.abortHostEffects();
+          throw new DOMException("Aborted", "AbortError");
+        }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
         const response = await hostFetch(input, init);
         const headers = response.headers;
@@ -1412,6 +1416,7 @@ export async function createFxAgent(options = {}) {
       push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
       toolControllers,
       transportAttempts: 0,
+      get cancelled() { return cancelled; },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
