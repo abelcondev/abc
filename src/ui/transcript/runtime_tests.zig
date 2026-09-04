@@ -16186,6 +16186,104 @@ test "pending replacement notice holds release until the finished replacement se
     try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
 }
 
+fn appendRecordedWriteForFinalityTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    lifecycle_id: ?types.ToolLifecycleId,
+) !u32 {
+    const entry_id = try runtime.appendRawTranscriptEntryClassified(alloc, "● Wrote receipt.txt\n", .tool_status);
+    try runtime.attachHistoricalToolDetailWithLifecycle(
+        alloc,
+        entry_id,
+        .{ .id = "saved-write", .name = "write_file", .arguments_json = "{\"path\":\"receipt.txt\"}" },
+        .write,
+        .{
+            .tool_call_id = @constCast("saved-write"),
+            .tool_name = @constCast("write_file"),
+            .status = .success,
+            .output = @constCast("saved result"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+        },
+        lifecycle_id,
+    );
+    return entry_id;
+}
+
+test "recorded tool finality does not depend on the current turn watermark" {
+    const alloc = std.testing.allocator;
+    for ([_]?u64{ null, 1, 2, 50_000 }) |turn_id| {
+        var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+        defer runtime.deinit(alloc);
+        const id = try appendRecordedWriteForFinalityTest(&runtime, alloc, if (turn_id) |turn|
+            .{ .turn_id = turn, .call_id = "saved-write" }
+        else
+            null);
+        var source = try runtime.prepareTranscriptSource(alloc, null);
+        defer source.deinit(alloc);
+        try std.testing.expectEqual(@as(?usize, null), runtime.transcript_release.finality_floor(source.finality, 0, null));
+        if (turn_id) |turn| {
+            const archived_id = runtime.toolDetailForEntry(id).?.lifecycle_id.?;
+            try std.testing.expectEqual(turn, archived_id.turn_id);
+            try std.testing.expectEqualStrings("saved-write", archived_id.call_id);
+        }
+    }
+}
+
+test "recorded tool finality stays independent of a live turn with the same number" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer runtime.deinit(alloc);
+    _ = try appendRecordedWriteForFinalityTest(&runtime, alloc, .{ .turn_id = 1, .call_id = "saved-write" });
+    _ = try runtime.appendRawTranscriptEntry(alloc, "Saved response\n");
+    const live_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-write" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = live_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "write_file",
+        .activity_kind = .write,
+    } });
+    for ([_]bool{ false, true }) |terminal| {
+        if (terminal) _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = live_id,
+            .outcome = .{ .kind = .completed, .summary = "Wrote live file" },
+        } });
+        var source = try runtime.prepareTranscriptSource(alloc, null);
+        defer source.deinit(alloc);
+        const floor = runtime.transcript_release.finality_floor(source.finality, 0, null) orelse return error.TestExpectedLiveFinalityFloor;
+        try std.testing.expect(floor > 0);
+        try std.testing.expect(std.mem.find(u8, source.bytes[0..floor], "Saved response") != null);
+    }
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 1, .outcome = .completed } });
+    try runtime.finishLifecycleBatch(alloc);
+    var finished = try runtime.prepareTranscriptSource(alloc, null);
+    defer finished.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, null), runtime.transcript_release.finality_floor(finished.finality, runtime.finalizedToolTurnWatermark(), null));
+}
+
+test "recorded tool finality survives an owned snapshot after source retirement" {
+    const alloc = std.testing.allocator;
+    var restored = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+    defer restored.deinit(alloc);
+    const entry_id = try restored.appendRawTranscriptEntryClassified(alloc, "● Wrote receipt.txt\n", .tool_status);
+    {
+        var original = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
+        defer original.deinit(alloc);
+        const id = try appendRecordedWriteForFinalityTest(&original, alloc, .{ .turn_id = 2, .call_id = "saved-write" });
+        var detail = try transcript_store.cloneToolDetailForSnapshot(alloc, original.toolDetailForEntry(id).?.*);
+        errdefer detail.deinit(alloc);
+        detail.entry_id = entry_id;
+        try restored.tool_details.append(alloc, detail);
+    }
+    var source = try restored.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, null), restored.transcript_release.finality_floor(source.finality, 0, null));
+    const detail = restored.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqual(@as(u64, 2), detail.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("saved-write", detail.lifecycle_id.?.call_id);
+    try std.testing.expectEqualStrings("saved result", detail.result.?);
+}
+
 test "finality candidates keep tool turn and replaceable tail offsets independent" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{

@@ -5509,6 +5509,7 @@ pub const TranscriptRuntime = struct {
         );
         if (self.toolDetailPtr(entry_id)) |detail| {
             detail.created_at_ms = result.created_at_ms;
+            detail.origin = .recorded;
         }
     }
 
