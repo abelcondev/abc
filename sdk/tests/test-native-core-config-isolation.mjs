@@ -57,6 +57,15 @@ try {
   agent = await createFxAgent({
     nativeAddon: addon,
     backend: "native",
+    fetch(input, init) {
+      if (init.method === "GET") {
+        assert.equal(input, "https://ai-gateway.vercel.sh/coding-agent/v1/models");
+        return Response.json({ object: "list", data: [{ id: "native/test-model", type: "language" }] });
+      }
+      assert.equal(init.method, "POST");
+      assert.equal(input, `http://127.0.0.1:${port}/chat`);
+      return fetch(input, init);
+    },
     home: runtimeHome,
     workspaceRoot: runtimeWorkspace,
     instructions: marker,

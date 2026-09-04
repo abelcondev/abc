@@ -75,7 +75,7 @@ const options = (wasm = wasmPath) => ({
   wasm,
   fetch(input, init) {
     signals.push({ method: init.method, signal: init.signal });
-    return fetch(input, init);
+    return fetch(init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input, init);
   },
   apiKey: "wasm-cache-key",
   gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
