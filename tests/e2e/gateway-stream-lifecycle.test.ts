@@ -923,6 +923,8 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
           expectPermissionModeContext(request.body, mode);
+          expect(JSON.parse(request.body).providerOptions.gateway.caching).toBe("auto");
+          expect(request.body).not.toContain("cacheControl");
           const captured = parseGatewayRequest(request.body);
           expect(findUnavailableCapabilityReferences(captured)).toEqual([]);
           expect(customProviderGuidanceState(captured).guidanceMessageIndices).toEqual([1]);

@@ -609,29 +609,6 @@ fn runScriptedVision(
     });
 }
 
-fn expectGatewayPromptEntryCacheControl(gateway: *const FakeGateway, index: usize, needle: []const u8, expected: bool) !void {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(index < gateway.request_bodies.items.len);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[index], .{});
-    defer parsed.deinit();
-
-    const prompt = parsed.value.object.get("prompt").?.array.items;
-    for (prompt) |entry| {
-        if (countPromptEntryText(entry, needle) == 0) continue;
-        try std.testing.expectEqual(expected, entry.object.get("providerOptions") != null);
-        return;
-    }
-    return error.TestExpectedPromptMessageMissing;
-}
-
-fn expectNoPromptCacheControlAfter(gateway: *const FakeGateway, index: usize, needle: []const u8) !void {
-    try std.testing.expect(index < gateway.request_bodies.items.len);
-    const body = gateway.request_bodies.items[index];
-    const start = std.mem.indexOf(u8, body, needle) orelse return error.TestExpectedBodyNeedleMissing;
-    try std.testing.expect(std.mem.find(u8, body[start..], "cacheControl") == null);
-}
-
 test "processQueuedPrompt gates text-only images through the real Vision runtime" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2768,7 +2745,7 @@ test "processQueuedPrompt omits Fast without catalog support" {
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     try expectBodyNotContains(&gateway, 0, "\"maxOutputTokens\"");
 }
 
@@ -3603,7 +3580,7 @@ test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqualStrings("provider/new-reasoning-model", hooks.capability_queries.items[0]);
     try expectBodyContains(&gateway, 0, "\"reasoning\":\"future-tier\"");
-    try expectBodyNotContains(&gateway, 0, "\"providerOptions\"");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
@@ -3640,7 +3617,7 @@ test "processQueuedPrompt traces why stale controls are omitted" {
 
     try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
@@ -3725,7 +3702,7 @@ test "processQueuedPrompt keeps exact model identity and emits Gateway Fast" {
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
 }
 
 test "processQueuedPrompt keeps directly selected fast model identity for portable lookup" {
@@ -3785,7 +3762,7 @@ test "processQueuedPrompt filters stale controls against each queued model" {
 
         try expectBodyContains(&gateway, 0, "\"reasoning\":\"xhigh\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 
     {
@@ -3804,7 +3781,7 @@ test "processQueuedPrompt filters stale controls against each queued model" {
 
         try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
 }
 
@@ -3828,7 +3805,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
 
     {
@@ -3847,7 +3824,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 }
 
@@ -3881,7 +3858,7 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
     worker.finishProcessing();
 
@@ -3915,7 +3892,7 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 }
 
@@ -4090,6 +4067,45 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
     try std.testing.expect(summary.turn_duration_ms >= summary.thinking_duration_ms);
 }
 
+test "processQueuedPrompt enables Gateway automatic caching across model families and tool steps" {
+    const alloc = std.testing.allocator;
+    const models = [_][]const u8{
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.6-luna",
+        "zai/glm-5.2",
+        "moonshotai/kimi-k3",
+        "google/gemini-3-flash",
+        "xai/grok-4.5",
+        "provider/new-model",
+    };
+    for (models) |model| {
+        const calls = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"a\"}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.runtime_context_text = "runtime context remains visible";
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        for (gateway.request_bodies.items) |body| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            const options = parsed.value.object.get("providerOptions").?.object;
+            try std.testing.expectEqualStrings("auto", options.get("gateway").?.object.get("caching").?.string);
+            try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+            try std.testing.expect(std.mem.find(u8, body, "runtime context remains visible") != null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    }
+}
+
 test "processQueuedPrompt places transient overlay before history and current prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "No" }};
@@ -4122,10 +4138,6 @@ test "processQueuedPrompt places transient overlay before history and current pr
     try std.testing.expect(static_idx < runtime_idx);
     try std.testing.expect(runtime_idx < history_idx);
     try std.testing.expect(history_idx < current_idx);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "system", true);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "static project context unique", true);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "runtime tail context unique", false);
-    try expectNoPromptCacheControlAfter(&gateway, 0, "runtime tail context unique");
     try expectGatewayPromptFinalUserText(&gateway, 0, "is it still running");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
@@ -5229,9 +5241,9 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 }
 
 test "processQueuedPrompt disables provider option fast after a replay safe HTTP failure" {
@@ -5257,9 +5269,9 @@ test "processQueuedPrompt disables provider option fast after a replay safe HTTP
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 }
 
 test "processQueuedPrompt retries directly selected intrinsic fast model without rewriting its ID" {
@@ -6655,9 +6667,9 @@ test "processQueuedPrompt disable Fast recovery retries the same exact model" {
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[1]);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", hooks.capability_queries.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);

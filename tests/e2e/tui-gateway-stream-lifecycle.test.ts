@@ -2238,7 +2238,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       for (const request of queuedGateway.requests.slice(1)) {
         const retryRequest = JSON.parse(request.body);
         expect(retryRequest).not.toHaveProperty("fast");
-        expect(retryRequest.providerOptions?.gateway).toBeUndefined();
+        expect(retryRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       }
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -2426,10 +2426,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       const secondRequest = JSON.parse(queuedGateway.requests[1]!.body);
       expect(secondRequest).not.toHaveProperty("fast");
-      expect(secondRequest.providerOptions?.gateway).toBeUndefined();
+      expect(secondRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       const finalRequest = JSON.parse(queuedGateway.requests[3]!.body);
       expect(finalRequest).not.toHaveProperty("fast");
-      expect(finalRequest.providerOptions?.gateway).toBeUndefined();
+      expect(finalRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       expect(scrollback).toContain(finalText);
       expect(scrollback).toMatch(TURN_SUMMARY_WITH_TOKENS);
       expect(scrollback).not.toContain("✓ recovered");
