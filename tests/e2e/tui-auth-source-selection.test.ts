@@ -899,6 +899,7 @@ async function runCodexLoginWithBrowser(
 }
 
 function startFakeCodexToolLoop(options: {
+  responses?: Response[];
   toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
@@ -923,6 +924,7 @@ function startFakeCodexToolLoop(options: {
         ] });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
@@ -990,6 +992,7 @@ function startFakeCodexCapacityLoop() {
 }
 
 function startFakeGrokToolLoop(options: {
+  responses?: Response[];
   toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
@@ -1012,6 +1015,7 @@ function startFakeGrokToolLoop(options: {
         return Response.json({ models: [grokModalityModel("grok-4.20", true)] });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
@@ -4343,6 +4347,103 @@ tmuxTest(
   },
   60_000,
 );
+
+for (const conflict of [false, true]) {
+  test("direct Responses final records " + (conflict ? "reject the current group and preserve earlier work" : "replace progressive arguments before execution"), async () => {
+    for (const provider of ["codex", "grok"] as const) {
+      const profile = mkdtempSync(join(tmpdir(), "fx-" + provider + "-final-record-"));
+      const testGateway = startFakeGateway([]);
+      const completed = { type: "response.completed", response: { status: "completed" } };
+      const item = (id: string, path: string) => ({
+        type: "function_call", id: "fc_" + id, call_id: id, name: "write_file",
+        arguments: JSON.stringify({ path, content: "saved" }),
+      });
+      const prior = item("prior", "prior.txt");
+      const pending = item("pending", "preview.txt");
+      const sibling = item("sibling", "sibling.txt");
+      const final = item("pending", "final.txt");
+      const responses: Response[] = [];
+      if (conflict) responses.push(fakeGatewaySse([
+        { type: "response.output_item.added", output_index: 0, item: { ...prior, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: prior.arguments },
+        { type: "response.output_item.done", output_index: 0, item: prior },
+        completed,
+      ]));
+      const events: object[] = [
+        { type: "response.output_item.added", output_index: 0, item: { ...pending, arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 0, item_id: pending.id, delta: pending.arguments },
+      ];
+      if (conflict) events.push(
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: pending.arguments },
+        { type: "response.output_item.added", output_index: 1, item: { ...sibling, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 1, arguments: sibling.arguments },
+      );
+      events.push(
+        { type: "response.output_item.done", output_index: 0, item: final },
+        { type: "response.completed", response: { status: "completed", output: conflict ? [final, sibling] : [final] } },
+      );
+      responses.push(fakeGatewaySse(events), fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "FINAL_RECORD_OK" }, completed,
+      ]));
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses }) : startFakeGrokToolLoop({ responses });
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        const model = provider === "codex" ? "gpt-5.6-sol" : "grok-4.20";
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create the requested files containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(result.code, provider + ": " + result.stdout + "\n" + result.stderr).toBe(conflict ? 1 : 0);
+        expect(result.signal).toBeNull();
+        expect(direct.bodies).toHaveLength(2);
+        expect(existsSync(join(profile, "preview.txt"))).toBe(false);
+        expect(existsSync(join(profile, "sibling.txt"))).toBe(false);
+        expect(existsSync(join(profile, "prior.txt"))).toBe(conflict);
+        expect(existsSync(join(profile, "final.txt"))).toBe(!conflict);
+        expect(readFileSync(join(profile, conflict ? "prior.txt" : "final.txt"), "utf8")).toBe("saved");
+        const resultJson = JSON.parse(result.stdout);
+        if (conflict) expect(resultJson.error).toBe("ResponsesToolCallConflict");
+        else {
+          expect(resultJson.output).toBe("FINAL_RECORD_OK");
+          expect(result.stderr).toBe("Writing final.txt\n");
+        }
+        const detail = await runFx(["session", "--json", "--id", resultJson.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        const steps = history[0].execution.tool_steps;
+        expect(steps).toHaveLength(1);
+        expect(steps[0].tool_calls).toHaveLength(1);
+        expect(steps[0].tool_calls[0].id).toBe(conflict ? "prior" : "pending");
+        expect(steps[0].tool_calls[0].arguments_json).toBe(conflict ? prior.arguments : final.arguments);
+        if (conflict) {
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", resultJson.session_id, "Report the completed work without writing more files."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(resumed.stderr).toBe("");
+          expect(JSON.parse(resumed.stdout).output).toBe("FINAL_RECORD_OK");
+          expect(direct.bodies).toHaveLength(3);
+          const input = JSON.parse(direct.bodies[2]).input;
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call_output").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+        }
+        expect(testGateway.requests).toHaveLength(0);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+}
 
 test("direct provider tool identities obey the session boundary before execution", async () => {
   for (const provider of ["codex", "grok"] as const) {
