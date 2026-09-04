@@ -105,6 +105,8 @@ fx automatically summarizes a long session into a fresh context window when the 
 
 Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries or operation ledgers.
 
+In saved sessions, oversized `read_tool_result` responses keep a complete terminal-safe backing copy even when the inline response is clipped. Compaction and later retrieval preserve that copy without masking the explicitly requested text again.
+
 Use `fx ask` for a single request:
 
 ```bash
