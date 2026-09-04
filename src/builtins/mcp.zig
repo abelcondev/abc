@@ -137,8 +137,8 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
         return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server> | approve-all | reset", false);
     }
 
-    if (std.mem.startsWith(u8, trimmed, "auth ")) {
-        var tokens = std.mem.tokenizeAny(u8, trimmed[5..], " \t");
+    if (std.mem.eql(u8, trimmed, "auth") or std.mem.startsWith(u8, trimmed, "auth ")) {
+        var tokens = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
         const name = tokens.next() orelse
             return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
         const confirmation = tokens.next();
@@ -251,20 +251,20 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 );
             return .{
                 .display = .{ .line = text },
-                .reload = !result.local_only,
+                .reload = false,
             };
         }
         if (result.revocation_failed) {
             return lineParts(
                 alloc,
                 &.{ "Logged out of MCP server '", name, "' locally; remote revocation failed." },
-                !result.local_only,
+                false,
             );
         }
         return lineParts(
             alloc,
             &.{ "Logged out of MCP server '", name, "'." },
-            !result.local_only,
+            false,
         );
     }
 
@@ -2027,7 +2027,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
 
     var logged_out = try handleCommand(alloc, "logout remote", command_request);
     defer logged_out.deinit(alloc);
-    try expectLine(logged_out, "Logged out of MCP server 'remote'.", true);
+    try expectLine(logged_out, "Logged out of MCP server 'remote'.", false);
     try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
 
     fixture.logout_repaired_entries = 2;
@@ -2036,7 +2036,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     try expectLine(
         repaired,
         "Logged out of MCP server 'remote'. Removed 2 unreadable MCP credential entries.",
-        true,
+        false,
     );
 }
 

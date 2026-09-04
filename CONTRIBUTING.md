@@ -303,8 +303,20 @@ or `fx ask` model request; optional failures publish a reduced, degraded
 capability set. Terminal `fx ask` completes admitted MCP discovery before its
 first model request. JSON and other headless asks start required servers first
 and defer optional servers until the turn performs an MCP operation or delegates
-MCP capability to a child. `/mcp list` renders a bounded, secret-free health
-snapshot.
+MCP capability to a child. Server-filtered searches, selected tools, and feature
+operations activate only their target; a broad search activates the broader
+catalog. Each server owns its startup and recovery progress. Connection deadlines
+cover discovery, fallback, and restarts together. Interactive authentication and
+logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
+snapshot. The interactive menu refreshes that view while it is open.
+
+Search and explicit selection share bounded schema publication. Definitions are
+checked against their runtime, connection, catalog, and credential generations
+before execution. Tool argument JSON must be bounded and object-shaped; semantic
+schema assertions belong to the server. Image results use the shared tool-result,
+provider, and versioned history paths. Saved native images use managed result
+artifacts that `read_tool_result` can load without repeating the original tool.
+
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 

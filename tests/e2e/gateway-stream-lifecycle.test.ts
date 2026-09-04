@@ -5380,7 +5380,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("bounded MCP search selects and executes without model-managed pagination", async () => {
+  test("bounded MCP search loads schemas and executes without a selection round trip", async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
     const distractorSkill = join(root.workspace, ".agents", "skills", "prompt-master");
@@ -5391,7 +5391,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
     const mcp = writeMcpFixture(root, { toolCount: 28 });
     const searchCallId = "mcp_search_targeted_1";
-    const selectCallId = "mcp_select_lazy_1";
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway(() => {
       if (requestIndex === 0) expect(existsSync(mcp.pidPath)).toBe(false);
@@ -5402,14 +5401,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             server: "fixture",
           });
         case 1:
-          return fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
-            name: DYNAMIC_MCP_TOOL_NAME,
-          });
-        case 2:
           return fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
             text: "lazy MCP proof",
           });
-        case 3:
+        case 2:
           return fakeGatewayFinalText("MCP lazy context complete.");
         default:
           return new Response("unexpected request", { status: 500 });
@@ -5432,7 +5427,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("MCP lazy context complete.");
-      expect(gateway.requestCount()).toBe(4);
+      expect(gateway.requestCount()).toBe(3);
       const initialPrompt = promptText(gateway.requests[0]!.body);
       const initialServer = initialPrompt.match(
         /<server name="fixture" state="available_on_demand"[^>]*\/>/,
@@ -5464,7 +5459,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(boundedNames).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(boundedNames.every((name: string) => name.startsWith("mcp_fixture_"))).toBe(true);
 
-      const selectedRequest = gatewayRequest(gateway.requests[2]!.body);
+      const selectedRequest = gatewayRequest(gateway.requests[1]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
@@ -5472,10 +5467,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );
-      expect(gateway.requests[2]!.body).toContain(
+      expect(gateway.requests[1]!.body).toContain(
         "SECRET_SERVER_INSTRUCTION_SENTINEL",
       );
-      expect(toolResultOutput(gateway.requests[3]!.body, "mcp_call_lazy_1")).toContain(
+      expect(toolResultOutput(gateway.requests[2]!.body, "mcp_call_lazy_1")).toContain(
         "unexpected MCP call",
       );
       expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
@@ -5486,7 +5481,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("empty MCP capability search is terminal and does not broaden or execute", async () => {
+  test("empty MCP capability search remains available without broadening or executing", async () => {
     const root = createFixtureRoot("mcp-terminal-no-match");
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, {
@@ -5517,9 +5512,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             gatewayRequest(gateway.requests[1]!.body).tools.some((tool) =>
               tool.name === "capability_search"
             ),
-          ).toBe(
-            false,
-          );
+          ).toBe(true);
           return fakeGatewayFinalText("No matching monitoring capability is configured.");
         }
         default:

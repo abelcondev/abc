@@ -211,6 +211,57 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test("an OAuth-configured server failure does not invent an authentication challenge", async () => {
+    let hits = 0;
+    const failing = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        hits += 1;
+        return new Response("server unavailable", { status: 500 });
+      },
+    });
+    const root = createRoot("oauth-server-failure", { url: `http://127.0.0.1:${failing.port}/mcp` });
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({
+      mcp: {
+        fixture: {
+          type: "http",
+          url: `http://127.0.0.1:${failing.port}/mcp`,
+          oauth: { client_id: "fixture-client" },
+          startup_timeout_ms: 1_000,
+        },
+      },
+    }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search_fixture", "capability_search", { query: "fixture", server: "fixture" }),
+      fakeGatewayFinalText("Server failure observed."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the fixture tools"], {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_SKIP_ONBOARDING: "1",
+          FX_SOUND: "0",
+          AI_GATEWAY_API_KEY: "local-fixture-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(hits).toBeGreaterThan(0);
+      expect(gateway.requests.length).toBe(2);
+      expect(gateway.requests[1]!.body).not.toContain("authentication_required");
+    } finally {
+      failing.stop(true);
+    }
+  }, 20_000);
+
   test("MongoDB-like session-required discovery falls back to legacy initialize", async () => {
     fixture = startModernMcpHttpFixture("legacy_session_required");
     const root = createRoot("mongodb-legacy-fallback", fixture);
@@ -452,6 +503,7 @@ describe("modern MCP Streamable HTTP", () => {
         server: "fixture",
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.stormResourceListChanges(25);
         await Bun.sleep(50);
         return fakeGatewayToolCall("storm_resource_list_refreshed", "mcp_features", {
@@ -486,6 +538,7 @@ describe("modern MCP Streamable HTTP", () => {
         server: "fixture",
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.failNextResourceRefresh();
         await Bun.sleep(25);
         return fakeGatewayToolCall("failed_resource_list_stale", "mcp_features", {
@@ -1125,6 +1178,7 @@ describe("modern MCP Streamable HTTP", () => {
         name: TOOL_NAME,
       }),
       async () => {
+        await fixture!.waitForSubscription();
         fixture!.invalidateTools();
         await Bun.sleep(100);
         return fakeGatewayToolCall("call_old", TOOL_NAME, { text: "old" });
@@ -1157,9 +1211,7 @@ describe("modern MCP Streamable HTTP", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.message.params?.name).toBe("fresh");
     expect(fixture.toolsListCalls).toBe(2);
-    expect(gateway.requests[2]?.body).toContain(
-      "Unsupported tool: mcp_fixture_echo",
-    );
+    expect(toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).toContain("before execution");
     expect(gateway.requests.some((entry) => entry.body.includes(freshTool)))
       .toBe(true);
     const trace = readFileSync(root.traceLogPath, "utf8");

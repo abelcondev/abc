@@ -8,6 +8,9 @@ const mrtr = @import("mrtr.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
 const tools_feature = @import("features/tools.zig");
 
+const tool_content = @import("../tooling/tool_content.zig");
+const image_data = @import("../images/image_data.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ExtractOptions = struct {
@@ -28,7 +31,7 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         options.response,
         options.protocol,
         options.output_schema_json,
-        options.max_tool_result_bytes,
+        @max(options.max_tool_result_bytes, image_data.max_result_frame_bytes),
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -58,7 +61,14 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 .{ .parse_numbers = false },
             ) catch return error.McpInvalidJson;
             defer parsed.deinit();
+            var images: []types.ToolImage = &.{};
+            errdefer types.freeToolImages(alloc, images);
+            if (parsed.value.object.getPtr("content")) |content| {
+                if (content.* == .array) images = try image_data.parseToolImages(alloc, content.array.items);
+                try tool_content.projectMediaForText(parsed.arena.allocator(), content);
+            }
             break :blk .{
+                .images = images,
                 .model_output = try serialize_capped(
                     alloc,
                     options.server_name,

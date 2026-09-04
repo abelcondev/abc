@@ -1760,8 +1760,12 @@ fn runRuntimeRecoveryCollision(
     };
     const first_thread = try std.Thread.spawn(.{}, RuntimeCall.run, .{&first_call});
     const second_thread = try std.Thread.spawn(.{}, RuntimeCall.run, .{&second_call});
-    try waitForReadyCount(io, alloc, recovery_ready, 1, 2_000);
-    sleep(io, 250 * std.time.ns_per_ms);
+    waitForReadyCount(io, alloc, recovery_ready, 2, 2_000) catch |err| {
+        try createSignalFile(io, recovery_release);
+        first_thread.join();
+        second_thread.join();
+        return err;
+    };
     const ready_before_release = try readyCount(io, alloc, recovery_ready);
     try createSignalFile(io, recovery_release);
     first_thread.join();
@@ -1771,7 +1775,7 @@ fn runRuntimeRecoveryCollision(
     if (first_call.err == null or second_call.err == null) {
         return error.MissingRecoveryTriggerError;
     }
-    if (ready_before_release != 1) return error.RecoveryWasNotSerialized;
+    if (ready_before_release != 2) return error.UnrelatedRecoveryWasBlocked;
     const ready_after_release = try readyCount(io, alloc, recovery_ready);
     if (ready_after_release != 2) return error.MissingSecondRecovery;
 

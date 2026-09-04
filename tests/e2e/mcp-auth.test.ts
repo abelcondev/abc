@@ -1254,6 +1254,7 @@ describe("MCP remote authentication lifecycle", () => {
         expect(authenticated).toContain(
           "Removed 1 unreadable MCP credential entry.",
         );
+        await tui.sendText("/mcp reload");
         await tui.waitForText("MCP configuration reloaded", 15_000);
         await tui.sendText("/mcp list");
         let pane = await tui.waitForText("MCP health (2 servers):", 10_000);
@@ -2091,7 +2092,7 @@ describe("MCP remote authentication lifecycle", () => {
       ).toHaveLength(1);
       expect(gateway.requests[1]?.body).toContain("authentication_required");
       expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth for this server in an interactive fx session.",
+        "Run /mcp auth fixture --open in an interactive fx session.",
       );
       expect(
         existsSync(join(root.home, ".fx", "mcp-credentials")),
@@ -2400,6 +2401,10 @@ describe("MCP remote authentication lifecycle", () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
       const root = createRoot(auth);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.healthy = { type: "http", url: upstream.url, headers: { "x-test-healthy": "1" }, startup_timeout_ms: 5_000 };
+      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startFakeGateway([
         fakeGatewayFinalText("TUI idle."),
       ], {
@@ -2419,6 +2424,11 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
 
+      const healthyDeadline = Date.now() + 10_000;
+      while (!upstream.requests.some((entry) => entry.headers["x-test-healthy"] === "1" && entry.message.method === "tools/list") && Date.now() < healthyDeadline) await Bun.sleep(25);
+      const healthyRequests = () => upstream!.requests.filter((entry) => entry.headers["x-test-healthy"] === "1").length;
+      const healthyBeforeAuth = healthyRequests();
+      expect(healthyBeforeAuth).toBeGreaterThan(0);
       await tui.sendText("/mcp auth fixture");
       await tui.waitForText(
         "Run /mcp auth fixture --open to confirm opening your browser.",
@@ -2444,7 +2454,8 @@ describe("MCP remote authentication lifecycle", () => {
         await Bun.sleep(25);
       }
       expect(auth.tokenExchanges).toBe(1);
-      await tui.waitForText("MCP configuration reloaded.", 15_000);
+      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      expect(healthyRequests()).toBe(healthyBeforeAuth);
       expect(auth.authorizationRequests).toBe(1);
       expect(auth.tokenExchanges).toBe(1);
       const credentialPath = join(
@@ -2458,7 +2469,7 @@ describe("MCP remote authentication lifecycle", () => {
       expect(stored.credentials[0].access_token).toBe(ACCESS_INITIAL);
 
       await tui.sendKeys("Escape");
-      await tui.waitForText("fixture", 5_000);
+      await tui.waitForText("Enter Inspect", 5_000);
       await tui.sendKeys("Escape");
       await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       expect(await tui.captureFullScrollback()).toBe(beforeMenu);
@@ -2519,7 +2530,7 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp");
-      const summary = await tui.waitForText("MCP 1", 5_000);
+      const summary = await tui.waitForText("MCP 2", 5_000);
       expect(summary).toContain("fixture");
       expect(summary).toContain("Ready");
       await tui.sendKeys("Escape");
@@ -2535,7 +2546,7 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.sendKeys("L");
       await tui.waitForText("Log out of this MCP server?", 5_000);
       await tui.sendKeys("Enter");
-      await tui.waitForText("MCP reloaded with 1 unavailable server.", 15_000);
+      await tui.waitForText("Logged out of MCP server 'fixture'.", 15_000);
       expect(existsSync(credentialPath)).toBe(false);
       expect(auth.revocations).toBe(2);
       await tui.sendKeys("Escape");

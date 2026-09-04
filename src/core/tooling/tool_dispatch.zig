@@ -116,6 +116,7 @@ pub const SelectedDynamicToolSinkFn = *const fn (
     ?*anyopaque,
     []const u8,
     []const u8,
+    ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void;
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
@@ -144,13 +145,26 @@ pub const ToolInput = struct {
 pub const ToolResult = union(enum) {
     success: []u8,
     failure: []u8,
+    rich: struct { text: []u8, images: []core_types.ToolImage, is_error: bool = false },
 
-    /// Frees the owned result text.
+    /// Frees the owned result text and media.
     pub fn deinit(self: ToolResult, alloc: Allocator) void {
         switch (self) {
             .success => |body| alloc.free(body),
             .failure => |body| alloc.free(body),
+            .rich => |content| {
+                alloc.free(content.text);
+                core_types.freeToolImages(alloc, content.images);
+            },
         }
+    }
+
+    pub fn intoAuthorized(self: ToolResult) AuthorizedDispatchResult {
+        return switch (self) {
+            .success => |body| .{ .status = .success, .body = body },
+            .failure => |body| .{ .status = .failure, .body = body },
+            .rich => |content| .{ .status = if (content.is_error) .failure else .success, .body = content.text, .images = content.images },
+        };
     }
 };
 
@@ -422,6 +436,7 @@ pub const ExecutorKind = enum {
     skill,
     install_skill,
     subagent,
+    capability_search,
     mcp_select_tool,
     mcp_features,
     ask_user_question,
@@ -795,6 +810,7 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
 pub const DispatchResult = struct {
     status: Status,
     body: []u8,
+    images: []core_types.ToolImage = &.{},
     status_detail: ?[]u8 = null,
     inner_usage: ?core_types.ToolUsage = null,
     web_search_completion: ?core_types.WebSearchCompletion = null,
@@ -811,6 +827,7 @@ pub const DispatchResult = struct {
     /// Frees the owned tool-result body and optional diagnostic detail.
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
         if (self.status_detail) |detail| alloc.free(detail);
         if (self.command_result_json) |json| alloc.free(@constCast(json));
         if (self.tool_result_memory) |memory| {
@@ -828,9 +845,11 @@ pub const DispatchResult = struct {
 pub const AuthorizedDispatchResult = struct {
     status: DispatchResult.Status,
     body: []u8,
+    images: []core_types.ToolImage = &.{},
 
     pub fn deinit(self: AuthorizedDispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
     }
 };
 
@@ -861,25 +880,16 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
             const command_result_json = if (admitted.context.command_result_json_sink) |slot| slot.* else captured_command_result_json;
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                    .command_result_json = command_result_json,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                    .command_result_json = command_result_json,
-                },
+            const output = result.intoAuthorized();
+            return .{
+                .status = output.status,
+                .body = output.body,
+                .images = output.images,
+                .inner_usage = inner_usage,
+                .web_search_completion = web_search_completion,
+                .web_fetch_completion = web_fetch_completion,
+                .tool_result_memory = tool_result_memory,
+                .command_result_json = command_result_json,
             };
         },
     }
@@ -928,16 +938,7 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
                 result.deinit(ctx.allocator);
                 return error.Cancelled;
             }
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                },
-            };
+            return result.intoAuthorized();
         },
     }
 }
@@ -981,9 +982,10 @@ pub fn reportSelectedDynamicTool(
     ctx: DispatchContext,
     name: []const u8,
     schema_json: []const u8,
+    binding: ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void {
     const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json);
+    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json, binding);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {

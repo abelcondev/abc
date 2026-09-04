@@ -1862,7 +1862,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 } else if (state.screen == .details) {
                     const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (server.authentication == .required) {
+                    if (mcp_menu_state.serverActionAvailable(.authenticate, server)) {
                         try authenticateMcpMenuServer(app);
                     }
                 } else if (state.screen == .confirm) {
@@ -1963,6 +1963,10 @@ pub fn Runtime(comptime App: type) type {
                     !(app.mcp.menu.screen == .browse and
                         app.mcp.menu.section == .servers and
                         (action == .trust_approve_all or action == .trust_reset))) return true;
+                if (app.mcp.menu.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (!mcp_menu_state.serverActionAvailable(action, server)) return true;
+                }
                 _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
             }
             return true;
@@ -2003,7 +2007,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "mcp")) {
                 if (app.mcp.menu.screen == .details) {
                     const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (server.workspace_admission == .pending) {
+                    if (mcp_menu_state.serverActionAvailable(.trust_approve, server)) {
                         const effect = applyMcpMenuEvent(
                             app,
                             .{ .request_action = .trust_approve },
@@ -2968,6 +2972,7 @@ pub fn Runtime(comptime App: type) type {
         fn cancelMcpMenu(app: *App) bool {
             if (!mcpMenuActive(app)) return false;
             if (comptime @hasField(App, "mcp")) {
+                debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
                 if (app.mcp.menu.filter_active) {
                     _ = applyMcpMenuEvent(app, .clear_filter);
                     return true;

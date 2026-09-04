@@ -706,6 +706,25 @@ pub const ToolArgumentIntegrity = enum {
     }
 };
 
+/// Identifies the server and catalog offered to one model step.
+pub const McpToolBinding = struct {
+    runtime_generation: u64,
+    server_index: usize,
+    connection_generation: u64,
+    catalog_generation: u64,
+    auth_generation: u64,
+    credential_authority: u64 = 0,
+    definition_digest: [32]u8 = .{0} ** 32,
+
+    /// Transport renewal may change epochs without changing the advertised action.
+    pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
+        return self.runtime_generation == other.runtime_generation and
+            self.server_index == other.server_index and
+            self.credential_authority == other.credential_authority and
+            std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
+    }
+};
+
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
@@ -813,6 +832,8 @@ pub const CommittedFilePresentation = struct {
 };
 
 pub const PersistedToolResult = struct {
+    tool_images: []ToolImage = &.{},
+    tool_image_handle: ?[]u8 = null,
     tool_call_id: []u8,
     tool_name: []u8,
     status: PersistedToolStatus,
@@ -974,6 +995,8 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    tool_images: []const ToolImage = &.{},
+    tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     output_bytes: usize = 0,
@@ -1020,6 +1043,39 @@ pub const ExecutionMemory = struct {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
+
+/// Image bytes returned by a tool; never a grant to read a user file.
+pub const ToolImage = struct {
+    data: []u8,
+    mime_type: []u8,
+};
+
+pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
+    for (images) |image| {
+        alloc.free(image.data);
+        alloc.free(image.mime_type);
+    }
+    alloc.free(images);
+}
+
+pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]ToolImage {
+    const copies = try alloc.alloc(ToolImage, images.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |image| {
+            alloc.free(image.data);
+            alloc.free(image.mime_type);
+        }
+        alloc.free(copies);
+    }
+    for (images, 0..) |image, index| {
+        const data = try alloc.dupe(u8, image.data);
+        errdefer alloc.free(data);
+        copies[index] = .{ .data = data, .mime_type = try alloc.dupe(u8, image.mime_type) };
+        initialized += 1;
+    }
+    return copies;
+}
 
 pub const ImageAttachment = struct {
     id: usize = 0,
@@ -2335,7 +2391,12 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = result.status,
@@ -2359,6 +2420,8 @@ fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     freePermissionFeedback(alloc, result.permission_feedback);

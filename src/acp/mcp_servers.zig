@@ -123,7 +123,7 @@ pub fn prepare(
             config.deinit(alloc);
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch => unreachable,
+                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch, error.McpRuntimeAlreadyStarted => unreachable,
             };
         };
     }

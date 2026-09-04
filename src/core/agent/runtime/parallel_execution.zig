@@ -306,8 +306,8 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
 
     if (execution.diff_entry != null or
         execution.finish_turn or
-        execution.selected_dynamic_tool_name != null or
-        execution.selected_dynamic_tool_schema_json != null or
+        execution.selected_dynamic_tools.len != 0 or
+        execution.retired_dynamic_tool_names.len != 0 or
         execution.tool_result_memory_prepared or
         execution.committed_file_handoff != null or
         execution.deferred_tool_completion != null)
@@ -375,7 +375,12 @@ fn duplicateToolResultMemory(
         null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
 
+    const image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (image_handle) |handle| alloc.free(handle);
+    const tool_images = try types.dupeToolImages(alloc, memory.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = image_handle,
         .output_handle = output_handle,
         .preview = preview,
         .output_bytes = memory.output_bytes,
@@ -408,6 +413,8 @@ fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) v
     freeContextNotices(alloc, result.context_notices);
     if (result.command_result_json) |value| alloc.free(value);
     if (result.tool_result_memory) |memory| {
+        types.freeToolImages(alloc, memory.tool_images);
+        if (memory.tool_image_handle) |handle| alloc.free(handle);
         if (memory.output_handle) |value| alloc.free(value);
         if (memory.preview) |value| alloc.free(value);
         if (memory.command_output_replay) |replay| {

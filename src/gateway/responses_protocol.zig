@@ -79,7 +79,29 @@ pub fn writeInput(
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
                 try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
                 try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                if (tool_images.len == 0) {
+                    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                } else {
+                    const failed = message.tool_result_status == .failure;
+                    const text = if (failed) try std.fmt.allocPrint(alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
+                    defer if (failed) alloc.free(text);
+                    try writer.writeByte('[');
+                    if (text.len > 0) {
+                        try writer.writeAll("{\"type\":\"input_text\",\"text\":");
+                        try std.json.Stringify.value(text, .{}, writer);
+                        try writer.writeByte('}');
+                    }
+                    for (tool_images, 0..) |image, index| {
+                        const url = try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                        defer alloc.free(url);
+                        if (index > 0 or text.len > 0) try writer.writeByte(',');
+                        try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
+                        try std.json.Stringify.value(url, .{}, writer);
+                        try writer.writeByte('}');
+                    }
+                    try writer.writeByte(']');
+                }
                 try writer.writeByte('}');
             },
         }

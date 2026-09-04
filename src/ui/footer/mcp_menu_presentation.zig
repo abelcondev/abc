@@ -25,7 +25,10 @@ pub fn menuRowCount(projection: McpMenuProjection, width: u16, max_rows: u16) u1
             @max(projection.itemCount(), @as(usize, 1)),
             body_budget,
         )),
-        .details => @min(@as(u16, 7), body_budget),
+        .details => @min(if (projection.selectedServer()) |server|
+            if (server.failure != null) @as(u16, 8) else 7
+        else
+            @as(u16, 1), body_budget),
         .preview => @min(previewVisualRowCount(projection.preview, width), body_budget),
         .add => @min(
             if (projection.state.add_transport == .local) @as(u16, 5) else @as(u16, 4),
@@ -35,7 +38,7 @@ pub fn menuRowCount(projection: McpMenuProjection, width: u16, max_rows: u16) u1
             @max(projection.arguments.len, @as(usize, 1)),
             body_budget,
         )),
-        .info => @min(@as(u16, 2), body_budget),
+        .info => @min(@as(u16, 7), body_budget),
         .confirm => 1,
     };
     return header_rows + body_rows;
@@ -87,10 +90,17 @@ pub noinline fn composeMcpMenuRow(
         ) catch "Filter";
         return composeTextRow(alloc, filter, width, ui_render.dim_style, 2);
     }
+    if (show_header and row_index == 1) {
+        if (projection.state.section == .resources or projection.state.section == .prompts) {
+            if (projection.selectedServer()) |server| return composeFactRow(alloc, "Server", server.configured_name, width);
+        } else if (projection.state.section == .tools) {
+            return composeTextRow(alloc, "All available servers", width, ui_render.dim_style, 2);
+        }
+    }
     if (row_index < body_start) return empty;
     const body_index = row_index - body_start;
     return switch (projection.state.screen) {
-        .browse => composeBrowseRow(alloc, projection, body_index, width, row_count - body_start),
+        .browse => composeBrowseRow(alloc, projection, body_index, width, row_count - body_start, show_header),
         .details => composeDetailsRow(alloc, projection, body_index, width),
         .preview => composePreviewRow(
             alloc,
@@ -194,12 +204,14 @@ fn composeBrowseRow(
     body_index: u16,
     width: u16,
     visible_rows: u16,
+    feedback_in_header: bool,
 ) !std.ArrayList(u8) {
-    if (projection.state.load_state == .loading) {
+    if (projection.state.load_state == .loading and projection.state.section != .servers) {
         if (body_index > 0) return .empty;
         return composeTextRow(alloc, "Loading MCP catalog…", width, ui_render.dim_style, 2);
     }
-    if (projection.state.load_state == .failed and projection.feedback != null) {
+    if (projection.state.load_state == .failed and projection.feedback != null and projection.state.section != .servers) {
+        if (feedback_in_header) return .empty;
         if (body_index > 0) return .empty;
         return composeTextRow(alloc, projection.feedback.?, width, ui_render.warning_style, 2);
     }
@@ -234,6 +246,7 @@ fn composeBrowseRow(
             alloc,
             projection.servers[display_index],
             display_index == projection.state.selected_index,
+            projection.state.load_state == .loading,
             width,
         ),
         .tools => if (projection.toolAt(display_index)) |tool|
@@ -273,6 +286,11 @@ fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u
     return switch (row_index) {
         0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
+        2 => composeTextRow(alloc, "Servers: A Add · R Reload · Enter Inspect", width, ui_render.dim_style, 2),
+        3 => composeTextRow(alloc, "Project trust: P Approve all · Z Reset", width, ui_render.dim_style, 2),
+        4 => composeTextRow(alloc, "Details: Enter Sign in · L Logout · D Remove", width, ui_render.dim_style, 2),
+        5 => composeTextRow(alloc, "Project details: A Approve · X Reject", width, ui_render.dim_style, 2),
+        6 => composeTextRow(alloc, "Catalogs: / Filter · Enter Open · I Insert preview", width, ui_render.dim_style, 2),
         else => .empty,
     };
 }
@@ -327,6 +345,7 @@ fn composeServerRow(
     alloc: Allocator,
     server: mcp_health.ServerSnapshot,
     selected: bool,
+    reloading: bool,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -339,7 +358,7 @@ fn composeServerRow(
     try appendTerminalSafeSingleLine(alloc, &row, server.configured_name, name_width);
     if (width > name_width + 4) {
         try row_text.appendSpacesToColumn(alloc, &row, name_width + 4);
-        const state = serverStateLabel(server);
+        const state = if (reloading) "Reloading" else serverStateLabel(server);
         const state_width: usize = if (width >= 80) 20 else @as(usize, width) -| name_width -| 4;
         try appendTerminalSafeSingleLine(alloc, &row, state, state_width);
     }
@@ -405,6 +424,7 @@ fn composeDetailsRow(
         4 => .{ .label = "Policy", .value = if (server.required) "required" else "optional" },
         5 => .{ .label = "Protocol", .value = server.protocol_version orelse "unavailable" },
         6 => .{ .label = "Capabilities", .value = capabilitySummary(&value_buf, server.counts) },
+        7 => .{ .label = "Error", .value = server.failure orelse return .empty },
         else => return .empty,
     };
     return composeFactRow(alloc, pair.label, pair.value, width);

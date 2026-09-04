@@ -461,6 +461,7 @@ const Runtime = struct {
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         acp_server.runWithTransport(
             self.alloc,

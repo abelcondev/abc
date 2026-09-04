@@ -812,6 +812,13 @@ export function startModernMcpHttpFixture(
     get currentToolName() {
       return currentToolName;
     },
+    async waitForSubscription() {
+      const deadline = Date.now() + 3_000;
+      while (!subscriptionController || subscriptionId === null) {
+        if (Date.now() >= deadline) throw new Error("subscription listener did not start");
+        await Bun.sleep(5);
+      }
+    },
     invalidateTools() {
       if (!subscriptionController || subscriptionId === null) {
         throw new Error("subscription listener is not active");

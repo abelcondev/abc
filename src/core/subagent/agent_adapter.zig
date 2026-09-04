@@ -366,6 +366,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
@@ -570,6 +571,11 @@ test "subagent inherits model capabilities" {
     try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
 }
 
+fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
+}
+
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
@@ -601,9 +607,11 @@ fn requestToolPermission(
     live: ?agent_runtime.LiveToolAuthority,
     revalidation: ?agent_runtime.LivePermissionRevalidation,
     dynamic_names: []const []const u8,
+    mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
+    var tool_ctx = admissionContext(context, dynamic_names, review);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     if (revalidation) |request| return switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
             tool_ctx.admissionInputWithLiveAuthority(live),

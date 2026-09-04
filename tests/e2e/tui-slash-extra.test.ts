@@ -465,14 +465,14 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         expect(menu).toContain("[Servers]");
         expect(menu).toContain("No MCP servers configured.");
         expect(menu).toContain("A Add");
-        expect(menu).toContain("C Config");
-        expect(menu).toContain("P All");
-        expect(menu).toContain("Z Reset");
+        expect(menu).toContain("C Help");
         expect(menu).not.toContain("MCP: no servers configured");
 
         await session.sendKeys("C");
         const info = await session.waitForText("~/.fx/mcp.json", 5_000);
         expect(info).toContain("<workspace>/.mcp.json");
+        expect(info).toContain("P Approve all");
+        expect(info).toContain("Z Reset");
         await session.sendKeys("Escape");
         await session.waitForText("No MCP servers configured.", 5_000);
 

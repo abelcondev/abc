@@ -264,7 +264,6 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .mcp_runtime = ctx.mcp,
             .subagent_available = true,
         },
     ) catch return error.OutOfMemory;
@@ -1056,6 +1055,7 @@ const AskContext = struct {
             tc.mcp_call_tool = mcpCallTool;
             tc.mcp_search_tools = mcpSearchTools;
             tc.mcp_tool_schema = mcpToolSchemaJson;
+            tc.mcp_snapshot_tool = mcpSnapshotTool;
             tc.mcp_call_feature = mcpCallFeature;
             if (self.mcp_elicitation_capabilities.any()) {
                 tc.mcp_input_responder = .{
@@ -1716,7 +1716,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (options.output_mode.isTerminal()) {
             mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
         } else {
-            mcp.connectRequiredForAsk(ctx.toolRegistry());
+            mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
         }
     }
     try ctx.checkCancellation();
@@ -1739,7 +1739,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
-        .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
@@ -1995,6 +1994,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2215,6 +2215,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
+fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (try ctx.cfg.mode_registry.toolPolicyDeniedJson(arena, ctx.deps.tool_set, ctx.mode_id, call.name)) |reason| {
@@ -2286,9 +2291,10 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
     );
 }
 
-fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    var tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     return finishCliPermissionOutcome(
         ctx,
         tool_ctx,
@@ -3345,31 +3351,28 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
 
 fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
     const runtime = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    try runtime.connectDeferredForAsk(ctx.toolRegistry());
+    try runtime.connectDeferredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
     return runtime;
 }
 
 fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch return false;
+    const mcp = ctx.mcp orelse return false;
+    mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, ctx.cancelFlag()) catch return false;
     return mcp.hasToolWithAccess(name, access);
 }
 
 fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
     const self: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activateAskMcp(self) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return .not_available;
-        return err;
-    };
+    const runtime = self.mcp orelse return .not_available;
+    try runtime.connectDeferredToolForAsk(self.toolRegistry(), name, access, self.cancelFlag());
     return runtime.validateToolArgumentsByNameWithAccess(arena, name, arguments_json, access);
 }
 
 fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return null;
-        return err;
-    };
+    const mcp = ctx.mcp orelse return null;
+    try mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, options.access, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callToolByNameWithOptions(
         arena,
         name,
@@ -3379,16 +3382,28 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
+    if (request.server) |server_name| {
+        try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag());
+    } else {
+        try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
+    }
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
 }
 
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = try activateAskMcp(ctx);
-    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access);
+    const runtime = ctx.mcp orelse return .unavailable;
+    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
+}
+
+fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const runtime = ctx.mcp orelse return null;
+    try runtime.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, cancel_flag orelse ctx.cancelFlag());
+    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access, cancel_flag);
 }
 
 fn mcpCallFeature(
@@ -3398,8 +3413,9 @@ fn mcpCallFeature(
     options: tool_mcp_runtime.FeatureCallOptions,
 ) anyerror!tool_mcp_runtime.FeatureResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (!options.access.allowsFeatureServer(mcp.generation, request.server_name)) return error.McpServerNotFound;
+    try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), request.server_name, options.access, .features, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callFeatureForModel(arena, request, options);
 }
 
@@ -4945,7 +4961,7 @@ test "Ask MCP adapters revalidate scoped authority before catalog access" {
     provider.calls = 0;
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access),
+        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access, null),
     );
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
@@ -5796,17 +5812,7 @@ test "fx ask automatic review observes worker cancellation" {
     var review_turn = TestReviewTurn.init("Create cancelled.txt.", call);
     try std.testing.expectError(
         error.Cancelled,
-        requestToolPermissionOutcomeWithRequest(
-            &ctx,
-            arena_state.allocator(),
-            call,
-            review_turn.context(),
-            .auto,
-            &.{},
-            null,
-            null,
-            &.{},
-        ),
+        requestToolPermissionOutcomeWithRequest(&ctx, arena_state.allocator(), call, review_turn.context(), .auto, &.{}, null, null, &.{}, null),
     );
 }
 
@@ -6303,17 +6309,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
-    const direct = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        direct_call,
-        direct_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const direct = try requestToolPermissionOutcomeWithRequest(&ctx, arena, direct_call, direct_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(
         command_admission.ShellAuthorizationSource.auto_classifier,
         direct.execution_authority.?.run_command.shell_allowed.source,
@@ -6326,17 +6322,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        accepted_call,
-        accepted_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{}, null);
     switch ((accepted.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
         .shell_allowed => |authority| try std.testing.expectEqual(
@@ -6353,17 +6339,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch check.txt\"}",
     };
     var check_review = TestReviewTurn.init("Check this command.", check_call);
-    const blocked = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        check_call,
-        check_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, check_call, check_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
@@ -6800,7 +6776,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         .arguments_json = arguments_json,
     };
     var review_turn = TestReviewTurn.init("Write hello to desktop-test.txt.", call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{});
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{}, null);
 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqualStrings("", fake.root_text);

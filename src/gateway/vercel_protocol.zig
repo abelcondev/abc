@@ -658,15 +658,36 @@ fn writeChatMessageJsonInner(
             else
                 false;
             const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
-            if (denied) {
-                try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
-            } else if (failed) {
-                try writer.writeAll(",\"output\":{\"type\":\"error-text\",\"value\":");
+            const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+            if (tool_images.len > 0 and !denied) {
+                try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
+                const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+                defer if (failed) scratch_alloc.free(text);
+                if (text.len > 0) {
+                    try writer.writeAll("{\"type\":\"text\",\"text\":");
+                    try std.json.Stringify.value(text, .{}, writer);
+                    try writer.writeByte('}');
+                }
+                for (tool_images, 0..) |image, index| {
+                    if (index > 0 or text.len > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"type\":\"image-data\",\"data\":");
+                    try std.json.Stringify.value(image.data, .{}, writer);
+                    try writer.writeAll(",\"mediaType\":");
+                    try std.json.Stringify.value(image.mime_type, .{}, writer);
+                    try writer.writeByte('}');
+                }
+                try writer.writeAll("]}}]");
             } else {
-                try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
+                if (denied) {
+                    try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
+                } else if (failed) {
+                    try writer.writeAll(",\"output\":{\"type\":\"error-text\",\"value\":");
+                } else {
+                    try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
+                }
+                try std.json.Stringify.value(content, .{}, writer);
+                try writer.writeAll("}}]");
             }
-            try std.json.Stringify.value(content, .{}, writer);
-            try writer.writeAll("}}]");
         },
     }
 

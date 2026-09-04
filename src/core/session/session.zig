@@ -3099,6 +3099,8 @@ pub fn appendExecutionMemoryChatMessages(
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
     return .{
+        .tool_images = result.tool_images,
+        .tool_image_handle = result.tool_image_handle,
         .output_handle = result.output_handle,
         .preview = result.preview,
         .output_bytes = result.output_bytes,

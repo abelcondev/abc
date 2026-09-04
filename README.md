@@ -145,6 +145,13 @@ Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive pr
 
 MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms` on a server when its cold start needs a different bound. For direct `docker run` stdio entries, fx uses a private container ID file to remove the owned container after shutdown or startup failure. A configuration that already supplies `--cidfile` keeps ownership of its own cleanup policy.
 
+MCP servers connect independently. In headless asks, a request for one server starts
+that server without starting unrelated optional servers. Capability search loads
+matching tool definitions automatically; explicit `mcp_select_tool` remains
+available. The server validates its tool arguments. Image results reach supported
+models as images and remain available in saved sessions; text-only models receive
+an explicit notice.
+
 ## Documentation
 
 Read the [fx documentation](https://fx.sh/docs).

@@ -165,7 +165,7 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
 const capability_search_description =
-    "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, catalog bounds, and terminal no-match handling. Set server only when an exact configured MCP alias is already known. Load one exact skill result with skill or select one exact MCP result with mcp_select_tool. Do not guess identities or repeat a no-match search.";
+    "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, and catalog bounds. Set server only when an exact configured MCP alias is already known. Load an exact skill with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. A no-match result permits a different query; do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -524,7 +524,7 @@ pub const capability_search = ToolSpec{
             .additional_properties = false,
         },
     },
-    .executor_kind = .skill,
+    .executor_kind = .capability_search,
     .activity_kind = .read,
     .requires_approval = false,
     .action_label = "Searching capabilities",
@@ -1479,7 +1479,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.capability_search, capability_search.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
     try std.testing.expect(!capability_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
@@ -1759,6 +1759,7 @@ test "built-in registry uses executable web_fetch implementation" {
     defer result.deinit(std.testing.allocator);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestUnexpectedResult,
         .failure => |body| body,
     };

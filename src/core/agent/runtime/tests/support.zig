@@ -1077,6 +1077,7 @@ pub const FakeAgentRuntimeDeps = struct {
         live_authority: ?runtime_tool_contracts.LiveToolAuthority,
         revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
         advertised_dynamic_tool_names: []const []const u8,
+        _: ?[]const u8,
     ) !command_admission.PermissionOutcome {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.permission_request_override) |override| {
