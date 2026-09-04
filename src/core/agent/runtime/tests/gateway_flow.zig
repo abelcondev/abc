@@ -4759,6 +4759,58 @@ test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
     );
 }
 
+fn expect_rejected_replacement_retains_preview(cancel_after_replacement: bool) !void {
+    const alloc = std.testing.allocator;
+    const accepted = "The accepted English preview.";
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{accepted}, .stream_error_after_chunks = error.ReadFailed },
+        .{
+            .chunks = &.{rejected},
+            .content = rejected,
+            .cancel_after_chunks = cancel_after_replacement,
+            .stream_error_after_chunks = if (cancel_after_replacement) null else error.ReadFailed,
+        },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("Explain the lockfile issue in English.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 1, accepted);
+    try expectBodyNotContains(&gateway, 1, rejected);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(accepted, hooks.assistant_sources.items[0]);
+    if (cancel_after_replacement) {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+        try std.testing.expectEqualStrings(accepted, hooks.history_turns.items[0].interrupted.assistant orelse "");
+    } else {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+        const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+        try std.testing.expectEqualStrings(accepted, checkpoint.assistant_source);
+        try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
+        try std.testing.expect(!checkpoint.outstanding_reservation);
+    }
+}
+
+test "processQueuedPrompt cancellation retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(true);
+}
+
+test "processQueuedPrompt exhaustion retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(false);
+}
+
 test "processQueuedPrompt cancellation during provider backoff finishes interrupted" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
