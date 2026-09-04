@@ -535,6 +535,7 @@ function startFakeChatGptOAuth(
     unauthorizedResponses?: number;
     rejectRefresh?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
+    modelsResponse?: () => Promise<Response | void>;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
@@ -587,7 +588,8 @@ function startFakeChatGptOAuth(
         });
       }
       if (url.pathname === "/chatgpt/models") {
-        return Response.json({ models });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ models });
       }
       if (url.pathname === "/chatgpt/responses") {
         responseCount += 1;
@@ -633,6 +635,7 @@ function startFakeGrokOAuth(options: {
   beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
   userinfoSub?: string;
+  modelsResponse?: () => Promise<Response | void>;
 } = {}) {
   const initialAccessToken = "grok-initial-access-token";
   const refreshedAccessToken = "grok-refreshed-access-token";
@@ -733,7 +736,8 @@ function startFakeGrokOAuth(options: {
         return Response.json({ models });
       }
       if (url.pathname === "/v1/models") {
-        return Response.json({ data: subscriptionModels });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ data: subscriptionModels });
       }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
@@ -6501,3 +6505,227 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
     releases.stop(true);
   }
 }, 30_000);
+
+for (const provider of ["codex", "grok"] as const) {
+  for (const outcome of ["success", "failure", "cancel"] as const) {
+    tmuxTest(`provider preparation keeps input responsive through ${provider} ${outcome}`, async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([fakeGatewayFinalText("PREPARATION_GATEWAY_RECOVERY")]);
+      let entered = 0;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const modelsResponse = async () => {
+        entered++;
+        if (entered !== 1) return;
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      };
+      chatgptOauth = startFakeChatGptOAuth({ modelsResponse });
+      const grok = startFakeGrokOAuth({ modelsResponse });
+      try {
+        writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+        writeSeededGrokLogin(home, grok.initialAccessToken);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, JSON.stringify({ provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } }));
+        session = await startFx(home, stderrPath, gateway, undefined, join(home, "trace.log"), {
+          ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,prompt,input,provider",
+        });
+        await session.waitForComposer(TIMEOUT);
+        await openProviderPicker(session);
+        await session.sendLiteral(provider);
+        await session.sendKeys("Enter");
+        await session.waitForPane(() => entered === 1, 5000);
+        await session.sendLiteral("retained café 日本語");
+        await session.waitForText("retained café 日本語", 1500);
+        await session.resizeWindow(88, 24);
+        expect(await session.capturePane()).toContain("retained café 日本語");
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+        const direct = provider === "codex" ? chatgptOauth : grok;
+        const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
+        const responses = () => direct.requests.filter((request) => request.path === responsePath);
+        if (outcome === "cancel") {
+          await session.sendKeys("C-c");
+          await session.waitForText("Provider preparation cancelled.", 1500);
+          expect(await session.capturePane()).toContain("retained café 日本語");
+          release();
+          await Bun.sleep(100);
+          expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+          expect(responses()).toHaveLength(0);
+          await session.sendKeys("C-u");
+          await openProviderPicker(session);
+          await session.sendLiteral(provider);
+          await session.sendKeys("Enter");
+          await session.waitForText(`Switched to ${provider === "codex" ? "Codex" : "Grok"} subscription`, TIMEOUT);
+        } else {
+          await session.sendKeys("Enter");
+          await session.waitForPane(() => readFileSync(join(home!, "trace.log"), "utf8").includes("pending_prompt_adopted"), 3000);
+          expect(gateway.requests).toHaveLength(0);
+          expect(responses()).toHaveLength(0);
+          release();
+          if (outcome === "success") {
+            await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+            expect(responses()).toHaveLength(1);
+            expect(responses()[0]!.body).toContain("retained café 日本語");
+            expect(gateway.requests).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
+          } else {
+            await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+            expect(gateway.requests).toHaveLength(0);
+            expect(responses()).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+            await session.sendKeys("Enter");
+            await session.waitForText("PREPARATION_GATEWAY_RECOVERY", TIMEOUT);
+            expect(gateway.requests).toHaveLength(1);
+            expect(JSON.stringify(gateway.requests[0]!.body)).toContain("retained café 日本語");
+          }
+        }
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).not.toContain(chatgptOauth.accessToken);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(3000);
+        session = null;
+      } finally {
+        release();
+        grok.stop();
+      }
+    }, TIMEOUT);
+  }
+}
+
+tmuxTest("provider preparation does not delay double Ctrl+C shutdown", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-exit-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => { entered = true; await held; } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.sendKeys("C-c");
+    await session.waitForSessionEnd(1500);
+    session = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    release();
+  }
+}, TIMEOUT);
+
+for (const outcome of ["cancel", "failure"] as const) {
+  tmuxTest(`provider preparation validates Vercel team before saving through ${outcome}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-team-preparation-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let entered = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateway = startFakeGateway([fakeGatewayFinalText("TEAM_PREPARATION_OK")], { models: async () => {
+      entered++;
+      if (entered === 1) {
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      }
+      return [FAKE_GATEWAY_MODEL, "openai/gpt-5.6-sol"].map((id) => ({ id, type: "language", tags: ["tool-use"] }));
+    } });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teams: [{ id: "team_next", slug: "next-team", name: "Next Team" }],
+    });
+    chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_previous");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const settingsPath = join(home, ".fx", "settings.json");
+    const authPath = join(home, ".fx", "auth.json");
+    writeFileSync(settingsPath, JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: "openai/gpt-5.6-sol" } }));
+    const beforeAuth = readFileSync(authPath, "utf8");
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0" });
+      await session.waitForComposer(TIMEOUT);
+      const chooseTeam = async () => {
+        await session!.sendKeys("C-u");
+        await openProviderPicker(session!);
+        await session!.sendLiteral("vercel");
+        await session!.sendKeys("Enter");
+        await session!.waitForText("oauth", TIMEOUT);
+        await session!.sendKeys("Enter");
+        await session!.waitForText("next-team", TIMEOUT);
+        await session!.sendKeys("Enter");
+      };
+      await chooseTeam();
+      await session.waitForPane(() => entered === 1, 5000);
+      await session.sendLiteral("team draft");
+      await session.waitForText("team draft", 1500);
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      if (outcome === "cancel") {
+        await session.sendKeys("C-c");
+        await session.waitForText("Provider preparation cancelled.", 1500);
+        release();
+      } else {
+        release();
+        await session.waitForText("could not be validated for AI Gateway", TIMEOUT);
+      }
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
+      await chooseTeam();
+      await session.waitForText("Changed Vercel team to Next Team", TIMEOUT);
+      expect(JSON.parse(readFileSync(authPath, "utf8")).team_id).toBe("team_next");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
+      await session.sendText("Use the validated team.");
+      await session.waitForText("TEAM_PREPARATION_OK", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.captureFullScrollbackEscapes();
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(3000);
+      session = null;
+    } finally { release(); }
+  }, TIMEOUT);
+}
+
+tmuxTest("provider preparation cancellation stops logout fallback", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-preparation-cancel-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.waitForText("Provider preparation cancelled.", 1500);
+    release();
+    await Bun.sleep(100);
+    expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(3000);
+    session = null;
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
