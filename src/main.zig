@@ -465,20 +465,8 @@ const App = struct {
             .agent_stream_or_unavailable();
     }
 
-    pub fn fetchProviderCatalog(
-        self: *Self,
-        provider: model_provider.ProviderId,
-        access: credentials.CatalogAccess,
-    ) !model_catalog.ProviderResult {
-        const catalog = self.providerSet().select(provider).model_catalog orelse
-            return error.ModelCatalogUnavailable;
-        var cancel_requested = std.atomic.Value(bool).init(false);
-        return catalog.fetch(self.alloc, .{
-            .access = access,
-            .endpoint = builtin_gateway.models_path,
-            .cancel_flag = &cancel_requested,
-            .view = .picker,
-        });
+    pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
+        return self.providerSet().select(provider).model_catalog;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -840,6 +828,7 @@ const App = struct {
     }
 
     fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
+        self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream();
@@ -2898,6 +2887,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+            try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
         }
@@ -4149,6 +4139,7 @@ test {
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
+    _ = auth_runtime;
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
