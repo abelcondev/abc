@@ -862,10 +862,6 @@ fn buildWithStyleAndStats(
     try projection.entry_actions.appendNTimes(alloc, .keep, entries.len);
     if (mode == .compact) {
         for (entries, projection.entry_actions.items) |entry, *action| {
-            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) {
-                action.* = .hide;
-                continue;
-            }
             switch (entry) {
                 .raw_bytes => |raw| if (raw.class == .command_output) {
                     action.* = .hide;
