@@ -28,7 +28,6 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import {
-  classifierEvidenceFromRequest,
   composerContains,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -2361,7 +2360,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         [
           partialEofResponse(partialText),
           ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-          fakeGatewayFinalText(`${partialText}${finalText}`),
+          fakeGatewayFinalText(finalText),
         ],
       );
 
@@ -2377,6 +2376,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(11);
       expect(scrollback.split(partialText).length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).toContain("Response interrupted. Restarting.");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -2447,10 +2447,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider error after assistant output continues the same visible response",
+    "provider error after assistant output restarts a separate visible response",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
-      const finalText = "partial unsafe output completed";
+      const finalText = "A complete replacement response.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-unsafe-text-",
         [providerErrorAfterTextResponse(), fakeGatewayFinalText(finalText)],

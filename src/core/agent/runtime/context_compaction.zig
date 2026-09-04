@@ -292,10 +292,11 @@ fn runSummaryCall(
     generation_tokens: usize,
     max_bytes: usize,
 ) !SummaryCall {
-    const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = summarySystemPrompt() },
-        .{ .role = .user, .content = source_text },
-    };
+    const instructions = [_]types.ChatMessage{.{
+        .role = .system,
+        .content = summarySystemPrompt(),
+    }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = source_text }};
     var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
@@ -321,6 +322,7 @@ fn runSummaryCall(
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
+            .instructions = &instructions,
             .messages = &messages,
             .tools = .{},
             .tool_choice = .none,
@@ -455,7 +457,7 @@ const FakeProvider = struct {
                 self.saw_no_tool_state_input = false;
             }
         }
-        const system = request.messages[0].content orelse "";
+        const system = request.instructions[0].content orelse "";
         self.saw_only_summary_prompt = self.saw_only_summary_prompt and
             std.mem.startsWith(u8, system, "Summarize the conversation goals");
         self.max_output_tokens = request.max_output_tokens;
