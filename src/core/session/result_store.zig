@@ -25,7 +25,7 @@ const StorageTarget = union(enum) {
     managed: *session_child_store.SessionChildCapability,
 };
 
-/// Read-only, validated access to a persisted redacted tool result. The
+/// Read-only, validated access to persisted tool-result text. The
 /// caller chooses bounded raw pages and owns each returned allocation.
 pub const ResultReader = struct {
     file: session_child_store.ManagedFile,

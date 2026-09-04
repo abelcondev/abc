@@ -680,6 +680,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
         context.config.tool_context.tool_registry,
         context.config.tool_context.workspace_root,
         context.config.tool_context.terminal_client,
+        context.config.tool_context.managed_executions,
         call,
     );
 }

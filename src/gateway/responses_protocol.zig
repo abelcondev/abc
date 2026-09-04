@@ -14,20 +14,30 @@ pub const ReplayLimits = struct {
     provider_state_bytes: usize,
 };
 
+/// Verifies captured image files and releases replay/image scratch before returning.
+/// Scratch must be independent of the writer's request-body arena.
 pub fn writeInput(
     writer: *std.Io.Writer,
-    alloc: std.mem.Allocator,
+    scratch_alloc: std.mem.Allocator,
     messages: []const types.ChatMessage,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
     limits: ReplayLimits,
+    budget: image_attachments.CaptureBudget,
 ) !void {
-    for (messages) |message| {
-        if (message.role == .assistant) try validateReplayMessage(alloc, message, limits);
+    try budget.check();
+    if (verified_images != null and (messages.len != 1 or
+        messages[0].role != .user or messages[0].images.len != 0))
+    {
+        return error.InvalidVerifiedImagePlacement;
     }
-    var ids = try tool_call_ids.Projection.init(alloc, messages);
-    defer ids.deinit(alloc);
+    for (messages) |message| {
+        if (message.role == .assistant) try validateReplayMessage(scratch_alloc, message, limits);
+    }
+    var ids = try tool_call_ids.Projection.init(scratch_alloc, messages);
+    defer ids.deinit(scratch_alloc);
     var first = true;
-    for (messages, 0..) |message, message_index| {
+    for (messages) |message| {
+        try budget.check();
         switch (message.role) {
             .system => continue,
             .user => {
@@ -41,19 +51,25 @@ pub fn writeInput(
                     first_part = false;
                 };
                 if (verified_images) |images| {
-                    if (message_index == messages.len - 1) {
-                        for (images) |image| {
-                            if (!first_part) try writer.writeByte(',');
-                            try writeInputImage(writer, alloc, image);
-                            first_part = false;
-                        }
+                    for (images) |image| {
+                        if (!first_part) try writer.writeByte(',');
+                        try writeInputImage(writer, image, budget);
+                        first_part = false;
+                    }
+                } else {
+                    for (message.images) |attachment| {
+                        var image = try image_attachments.loadVerifiedSnapshot(scratch_alloc, attachment, budget);
+                        defer image.deinit(scratch_alloc);
+                        if (!first_part) try writer.writeByte(',');
+                        try writeInputImage(writer, image, budget);
+                        first_part = false;
                     }
                 }
                 try writer.writeAll("]}");
             },
             .assistant => {
                 if (message.provider_state_json) |state_json| {
-                    var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
+                    var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
                     defer state.deinit();
                     if (state.value != .array) return error.InvalidProviderState;
@@ -90,8 +106,8 @@ pub fn writeInput(
                     try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 } else {
                     const failed = message.tool_result_status == .failure;
-                    const text = if (failed) try std.fmt.allocPrint(alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
-                    defer if (failed) alloc.free(text);
+                    const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
+                    defer if (failed) scratch_alloc.free(text);
                     try writer.writeByte('[');
                     if (text.len > 0) {
                         try writer.writeAll("{\"type\":\"input_text\",\"text\":");
@@ -99,12 +115,14 @@ pub fn writeInput(
                         try writer.writeByte('}');
                     }
                     for (tool_images, 0..) |image, index| {
-                        const url = try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                        defer alloc.free(url);
+                        try budget.check();
+                        const url = try std.fmt.allocPrint(scratch_alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                        defer scratch_alloc.free(url);
                         if (index > 0 or text.len > 0) try writer.writeByte(',');
                         try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
                         try std.json.Stringify.value(url, .{}, writer);
                         try writer.writeByte('}');
+                        try budget.check();
                     }
                     try writer.writeByte(']');
                 }
@@ -126,7 +144,7 @@ test "Responses request projects long call ids with matching outputs" {
         var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer out.deinit();
         try out.writer.writeByte('[');
-        try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+        try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
         try out.writer.writeByte(']');
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
         defer parsed.deinit();
@@ -157,7 +175,7 @@ test "Responses request preserves opaque tool-call identity" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try out.writer.writeByte('[');
-    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
     try out.writer.writeByte(']');
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
     defer parsed.deinit();
@@ -173,7 +191,7 @@ test "non-object provider-owned arguments retain their Responses representation"
     const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
     try std.testing.expect(std.mem.find(u8, out.written(), "\"arguments\":\"[]\"") != null);
 }
 
@@ -188,7 +206,7 @@ test "non-object function arguments cannot enter a Responses request" {
             .tool_identity_bytes = 256,
             .tool_arguments_bytes = 4096,
             .provider_state_bytes = 4096,
-        }));
+        }, .{}));
     }
 }
 
@@ -214,20 +232,220 @@ fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, l
     }
 }
 
+const ImageInputTest = struct {
+    const limits = ReplayLimits{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 };
+
+    fn capture(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, bytes: []const u8, id: usize) !types.ImageAttachment {
+        const io_mod = @import("../core/shared/io.zig");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(path);
+        const source = [_]types.ImageAttachment{.{ .id = id, .path = @constCast(path), .media_type = @constCast("image/png") }};
+        const owned = try types.dupeImageAttachmentSlice(alloc, &source);
+        defer alloc.free(owned);
+        var attachment = owned[0];
+        errdefer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(snapshot_dir);
+        try image_attachments.captureImageSnapshot(alloc, &attachment, snapshot_dir);
+        return attachment;
+    }
+
+    fn write(alloc: std.mem.Allocator, writer: *std.Io.Writer, messages: []const types.ChatMessage, verified: ?[]const image_attachments.VerifiedSnapshot) !void {
+        try writer.writeByte('[');
+        try writeInput(writer, alloc, messages, verified, limits, .{});
+        try writer.writeByte(']');
+    }
+};
+
+test "Responses images remain on their owning users across tools and later prompts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first = try ImageInputTest.capture(alloc, &tmp, "first.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, first);
+    const second = try ImageInputTest.capture(alloc, &tmp, "second.png", "\x89PNG\r\n\x1a\nB", 2);
+    defer types.freeImageAttachment(alloc, second);
+    const calls = [_]types.ToolCall{.{ .id = "read_1", .name = "read_file", .arguments_json = "{}" }};
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "first", .images = &.{first} },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "read_1", .tool_name = "read_file", .content = "read result", .tool_result_memory = .{ .tool_images = &tool_images } },
+        .{ .role = .user, .content = "second", .images = &.{ second, first } },
+        .{ .role = .assistant, .content = "response" },
+        .{ .role = .user, .content = "continue" },
+    };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &messages, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 6), items.len);
+    const first_parts = items[0].object.get("content").?.array.items;
+    const second_parts = items[3].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), first_parts.len);
+    try std.testing.expectEqual(@as(usize, 3), second_parts.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", first_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpC", second_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", second_parts[2].object.get("image_url").?.string);
+    const tool_parts = items[2].object.get("output").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tool_parts.len);
+    try std.testing.expectEqualStrings("read result", tool_parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,cG5n", tool_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqual(@as(usize, 1), items[5].object.get("content").?.array.items.len);
+}
+
+test "Responses preverified image input rejects ambiguous message ownership" {
+    const images = [_]image_attachments.VerifiedSnapshot{.{ .bytes = @constCast("verified"), .media_type = "image/png" }};
+    const attachment = types.ImageAttachment{ .path = @constCast("must-not-read"), .media_type = @constCast("image/png") };
+    const cases = [_][]const types.ChatMessage{
+        &.{},
+        &.{.{ .role = .assistant, .content = "not a user" }},
+        &.{ .{ .role = .user, .content = "first" }, .{ .role = .user, .content = "second" } },
+        &.{.{ .role = .user, .content = "mixed", .images = &.{attachment} }},
+    };
+    for (cases) |messages| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidVerifiedImagePlacement, ImageInputTest.write(std.testing.allocator, &out.writer, messages, &images));
+    }
+}
+
+test "Responses images use captured bytes and reject unavailable snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{attachment} }};
+    try tmp.dir.deleteFile(std.testing.io, "source.png");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &messages, null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "data:image/png;base64,iVBORw0KGgpB") != null);
+    const snapshot_name = std.fs.path.basename(attachment.snapshot_path.?);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = snapshot_name, .data = "\x89PNG\r\n\x1a\nB" });
+    try std.testing.expectError(error.ImageSnapshotCorrupt, ImageInputTest.write(alloc, &out.writer, &messages, null));
+    try tmp.dir.deleteFile(std.testing.io, snapshot_name);
+    try std.testing.expectError(error.FileNotFound, ImageInputTest.write(alloc, &out.writer, &messages, null));
+}
+
+test "Responses images release scratch between images and on writer failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: [32 * 1024]u8 = undefined;
+    @memset(&bytes, 'x');
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", &bytes, 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{ attachment, attachment, attachment } }};
+    var scratch_bytes: [96 * 1024]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&scratch_bytes);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(scratch.allocator(), &out.writer, &messages, null);
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const parts = parsed.value.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    for (parts) |part| {
+        const url = part.object.get("image_url").?.string;
+        const encoded = url["data:image/png;base64,".len..];
+        var decoded: [bytes.len]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&decoded, encoded);
+        try std.testing.expectEqualSlices(u8, &bytes, &decoded);
+    }
+    var small_buffer: [80]u8 = undefined;
+    var small_writer: std.Io.Writer = .fixed(&small_buffer);
+    try std.testing.expectError(error.WriteFailed, ImageInputTest.write(scratch.allocator(), &small_writer, &messages, null));
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+}
+
+fn expectImageInputAllocations(alloc: std.mem.Allocator, attachment: types.ImageAttachment) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &.{.{ .role = .user, .images = &.{attachment} }}, null);
+}
+
+test "Responses images release verification allocations on failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    try std.testing.checkAllAllocationFailures(alloc, expectImageInputAllocations, .{attachment});
+}
+
+test "Responses image requests obey cancellation and expired deadlines before loading" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const attachment = types.ImageAttachment{ .path = @constCast("must-not-read"), .media_type = @constCast("image/png") };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{attachment} }};
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Cancelled, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .cancel_flag = &cancelled }));
+    try std.testing.expectError(error.TimedOut, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .deadline = .fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(-1) }) }));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "Responses image encoding observes cancellation after partial output" {
+    const Cancel = struct {
+        fn check(raw: *anyopaque) !void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(raw));
+            if (out.written().len > 1024) return error.Cancelled;
+        }
+    };
+    var bytes: [32 * 1024]u8 = undefined;
+    @memset(&bytes, 'x');
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.Cancelled, writeInputImage(&out.writer, .{ .bytes = &bytes, .media_type = "image/png" }, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expect(out.written().len > 1024);
+    try std.testing.expect(out.written().len < bytes.len);
+}
+
+test "Responses tool images observe cancellation after bounded image output" {
+    const Cancel = struct {
+        fn check(raw: *anyopaque) !void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(raw));
+            if (out.written().len > 1024) return error.Cancelled;
+        }
+    };
+    var data: [32 * 1024]u8 = undefined;
+    @memset(&data, 'A');
+    const images = [_]types.ToolImage{.{ .data = &data, .mime_type = @constCast("image/png") }};
+    const calls = [_]types.ToolCall{.{ .id = "capture_1", .name = "capture", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "capture_1", .tool_name = "capture", .content = "capture", .tool_result_memory = .{ .tool_images = &images } },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.Cancelled, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expect(out.written().len > data.len);
+}
+
 fn writeInputImage(
     writer: *std.Io.Writer,
-    alloc: std.mem.Allocator,
     image: image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
 ) !void {
-    const encoded_len = std.base64.standard.Encoder.calcSize(image.bytes.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, image.bytes);
+    try budget.check();
     try writer.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
     try writer.writeAll(image.media_type);
     try writer.writeAll(";base64,");
-    try writer.writeAll(encoded);
+    var offset: usize = 0;
+    while (offset < image.bytes.len) {
+        try budget.check();
+        const end = @min(offset + 3 * 1024, image.bytes.len);
+        try std.base64.standard.Encoder.encodeWriter(writer, image.bytes[offset..end]);
+        offset = end;
+    }
     try writer.writeAll("\"}");
+    try budget.check();
 }
 
 fn writeComma(writer: *std.Io.Writer, first: *bool) !void {

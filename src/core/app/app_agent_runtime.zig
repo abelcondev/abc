@@ -508,6 +508,7 @@ pub fn Runtime(comptime App: type) type {
                 ctx.tool_registry,
                 ctx.workspace_root,
                 ctx.terminal_client,
+                ctx.managed_executions,
                 call,
             );
         }
