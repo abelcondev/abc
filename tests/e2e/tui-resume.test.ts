@@ -3130,6 +3130,86 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "Ctrl-O restores wrapped primary rows after resize without losing the draft",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-resize-")));
+    const response = Array.from({ length: 28 }, (_, index) => {
+      const row = String(index + 1).padStart(2, "0");
+      return `ROW${row} ALPHA${row}_abcdefghijklmnopqrstuvwxyz0123456789 BRAVO${row}_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`;
+    }).join("\n\n");
+    const draft = "retained café 日本語";
+    let narrowGrid: string[] = [];
+    try {
+      for (const width of [88, 120]) {
+        const home = join(root, String(width), "home");
+        const workspace = join(root, String(width), "workspace");
+        const stderrPath = join(root, String(width), "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace);
+        const gateway = startFakeGateway([fakeGatewayFinalText(response)]);
+        let active: TmuxSession | null = null;
+        try {
+          active = await TmuxSession.create({
+            cmd: FX_BIN,
+            cwd: workspace,
+            env: gatewayEnv(home, gateway),
+            stderrPath,
+            width,
+            height: width === 88 ? 24 : 36,
+          });
+          await active.waitForComposer(TIMEOUT);
+          await active.sendText("Show the prepared paragraphs.");
+          await active.waitForText("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", TIMEOUT);
+          await active.waitForStableComposer(TIMEOUT);
+          await active.sendLiteral(draft);
+          await active.waitForText(`┃ ${draft}`, TIMEOUT);
+          const before = await active.capturePaneGrid();
+          if (width === 88) narrowGrid = before;
+          const historyBefore = await active.captureFullScrollback();
+
+          await active.sendKeys("C-o");
+          await active.waitForText("Full detail · ctrl o close", TIMEOUT);
+          if (width === 120) await active.resizeWindow(88, 24, 500);
+          await active.sendKeys("Escape");
+          const restored = await active.waitForStableGrid(
+            narrowGrid, normalizeVolatileStatusRows, 5_000,
+          );
+          expect(normalizeVolatileStatusRows(restored)).toEqual(
+            normalizeVolatileStatusRows(narrowGrid),
+          );
+          const historyAfter = await active.captureFullScrollback();
+          expect(historyAfter).toContain(`┃ ${draft}`);
+          if (width === 120) {
+            const historyMarker = "ROW14 ALPHA14_abcdefghijklmnopqrstuvwxyz0123456789";
+            expect(historyBefore).toContain(historyMarker);
+            expect(historyAfter).toContain(historyMarker);
+          }
+          const events = readFileSync(
+            join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
+          );
+          expect(events).toContain("ROW28 ALPHA28_abcdefghijklmnopqrstuvwxyz0123456789");
+
+          await active.sendKeys("C-u");
+          await active.sendText("/quit");
+          await waitForCondition(
+            () => active?.paneStatus().dead === true,
+            "fx to exit after resized transcript restoration",
+          );
+          expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          if (active) await active.kill();
+          gateway.stop();
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "Ctrl-O renders read_file results as readable content",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-read-")));

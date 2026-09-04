@@ -2059,6 +2059,7 @@ test "full transcript primary restore consumes the pending settled resize" {
     };
     runtime.terminal_reset_pending = true;
     runtime.resize_history_row_delta = 4;
+    runtime.owned_top_row = 5;
 
     runtime.repaintRestoredPrimaryTranscriptAfterResize();
 
@@ -2066,6 +2067,26 @@ test "full transcript primary restore consumes the pending settled resize" {
     try std.testing.expectEqual(@as(?ResizeObservation, null), runtime.pending_resize_observation);
     try std.testing.expect(!runtime.terminal_reset_pending);
     try std.testing.expectEqual(@as(?i32, null), runtime.resize_history_row_delta);
+    const invalidations = runtime.render_requests.pendingInvalidations();
+    try std.testing.expectEqual(@as(u8, 1), invalidations.len);
+    try std.testing.expectEqual(@as(u16, 5), invalidations.ranges()[0].top);
+    try std.testing.expectEqual(@as(u16, 24), invalidations.ranges()[0].bottom);
+    try std.testing.expect(runtime.render_requests.hasReason(.external_damage));
+}
+
+test "full transcript resized restore bounds invalidation to the current terminal" {
+    for ([_]u16{ 0, 25 }) |owned_top| {
+        var runtime = TranscriptRuntime{ .layout = std.mem.zeroes(Layout), .owned_top_row = owned_top };
+        runtime.layout.rows = 24;
+        runtime.repaintRestoredPrimaryTranscriptAfterResize();
+        const invalidations = runtime.render_requests.pendingInvalidations();
+        try std.testing.expectEqual(@as(u8, 1), invalidations.len);
+        try std.testing.expectEqual(@as(u16, 1), invalidations.ranges()[0].top);
+        try std.testing.expectEqual(@as(u16, 24), invalidations.ranges()[0].bottom);
+    }
+    var empty = TranscriptRuntime{ .layout = std.mem.zeroes(Layout) };
+    empty.repaintRestoredPrimaryTranscriptAfterResize();
+    try std.testing.expect(empty.render_requests.pendingInvalidations().isEmpty());
 }
 
 test "full transcript recovery starts at closest visible entry before a hidden anchor" {
@@ -6361,6 +6382,15 @@ pub const TranscriptRuntime = struct {
         self.pending_resize_observation = null;
         self.render_requests.acknowledgeSettledResizeCommit();
         self.invalidateTranscriptAnchor("full transcript restored resized primary");
+        // The terminal may reflow its saved primary grid differently from the shadow.
+        // Repaint owned cells without erasing the primary scrollback.
+        if (self.layout.rows > 0) {
+            self.render_requests.requestInvalidation(.{
+                .reason = .external_clear,
+                .top = if (self.owned_top_row == 0 or self.owned_top_row > self.layout.rows) 1 else self.owned_top_row,
+                .bottom = self.layout.rows,
+            });
+        }
         debug_trace.logf(
             "full_transcript_cache",
             "close repaints restored resized primary revision={d} layout={d}x{d}",
