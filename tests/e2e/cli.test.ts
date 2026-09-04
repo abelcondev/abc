@@ -4030,7 +4030,7 @@ describe("cli: ask success", () => {
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
-        expect(request).not.toHaveProperty("providerOptions");
+        expect(request.providerOptions).toEqual({ gateway: { caching: "auto" } });
         expect(
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",
