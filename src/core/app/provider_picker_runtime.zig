@@ -71,7 +71,8 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id == active_provider) "current" else "";
+                        column.annotations[i] = if (id == active_provider and
+                            model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
                 .method => {
@@ -660,6 +661,7 @@ test "provider column lists every provider and marks the active one" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
+    app.auth.source = .ai_gateway_api_key;
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
@@ -668,6 +670,20 @@ test "provider column lists every provider and marks the active one" {
     for (column.annotations[1..column.count]) |annotation| {
         try std.testing.expectEqualStrings("", annotation);
     }
+}
+
+test "provider column requires matching authentication for a current annotation" {
+    var app = ColumnTestApp.init(std.testing.allocator);
+    defer app.deinit();
+    for ([_]?credentials.Source{ null, .chatgpt_subscription }) |source| {
+        app.auth.source = source;
+        const column = columnFor(&app, .provider, "");
+        for (column.annotations[0..column.count]) |annotation| {
+            try std.testing.expectEqualStrings("", annotation);
+        }
+    }
+    app.auth.source = .host_managed;
+    try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
 }
 
 test "provider column narrows to what was typed" {

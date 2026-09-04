@@ -53,6 +53,63 @@ pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     return .gateway;
 }
 
+pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId {
+    var candidates: [2]?model_provider.ProviderId = .{ null, null };
+    const removed = decideLogoutProvider(facts);
+    if (removed != facts.selected or removed == .gateway) return candidates;
+
+    var count: usize = 0;
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        if (provider == removed) continue;
+        const available = switch (provider) {
+            .gateway => facts.available_sources.contains(.vercel_oidc_token) or
+                facts.available_sources.contains(.ai_gateway_api_key) or
+                facts.available_sources.contains(.fx_login) or
+                facts.available_sources.contains(.stored_key),
+            .codex => facts.available_sources.contains(.chatgpt_subscription),
+            .grok => facts.available_sources.contains(.grok_subscription),
+        };
+        if (!available) continue;
+        candidates[count] = provider;
+        count += 1;
+    }
+    return candidates;
+}
+
+test "logout fallback prefers Gateway then the remaining subscription" {
+    const sources = std.EnumSet(credentials.Source).initMany(&.{
+        .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription,
+    });
+    for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+        const candidates = logoutFallbackProviders(.{
+            .requested = provider,
+            .selected = provider,
+            .active_source = null,
+            .available_sources = sources,
+        });
+        try std.testing.expectEqual(model_provider.ProviderId.gateway, candidates[0].?);
+        try std.testing.expectEqual(
+            if (provider == .codex) model_provider.ProviderId.grok else model_provider.ProviderId.codex,
+            candidates[1].?,
+        );
+    }
+}
+
+test "logout fallback excludes inactive removal and disconnected providers" {
+    var facts: LogoutFacts = .{
+        .requested = .codex,
+        .selected = .grok,
+        .active_source = .grok_subscription,
+        .available_sources = .initMany(&.{ .ai_gateway_api_key, .grok_subscription }),
+    };
+    try std.testing.expectEqual([2]?model_provider.ProviderId{ null, null }, logoutFallbackProviders(facts));
+    facts.selected = .codex;
+    facts.available_sources = .initOne(.grok_subscription);
+    try std.testing.expectEqual([2]?model_provider.ProviderId{ .grok, null }, logoutFallbackProviders(facts));
+    facts.available_sources = .empty;
+    try std.testing.expectEqual([2]?model_provider.ProviderId{ null, null }, logoutFallbackProviders(facts));
+}
+
 pub const SignInCompletionAction = union(enum) {
     vercel,
     switch_provider: model_provider.ProviderId,

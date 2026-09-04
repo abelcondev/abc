@@ -1267,6 +1267,237 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
   }, TIMEOUT);
 }
 
+for (const provider of ["codex", "grok"] as const) {
+  tmuxTest(`provider recovery switches from ${provider} after logout and preserves the fallback on restart`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-logout-fallback-${provider}-`));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText("LOGOUT_GATEWAY_RESPONSE")]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      const settingsPath = join(home, ".fx", "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({
+        provider, models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.6" },
+      }), { mode: 0o600 });
+      const env = { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined };
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      const inactive = provider === "codex" ? "grok" : "codex";
+      await session.sendText(`/logout ${inactive}`);
+      await session.waitForText(`Signed out of ${inactive === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
+      await session.sendText("/logout");
+      await session.waitForText(`Signed out of ${provider === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("vercel · current");
+      expect(existsSync(join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"))).toBe(false);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("Use the remaining provider.");
+      await session.waitForText("LOGOUT_GATEWAY_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      session = null;
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("vercel · current");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, 60_000);
+
+  tmuxTest(`provider recovery activates ${provider} sign-in after a cancelled turn`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-cancel-login-${provider}-`));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateway = startFakeGateway([async () => {
+      await held;
+      return fakeGatewayFinalText("CANCELLED_GATEWAY_RESPONSE");
+    }]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Hold this request until cancelled.");
+      const deadline = Date.now() + TIMEOUT;
+      while (gateway.requests.length === 0) {
+        if (Date.now() > deadline) throw new Error("Gateway request did not start");
+        await Bun.sleep(20);
+      }
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      release();
+      await openProviderPicker(session);
+      await session.sendKeys("Down");
+      if (provider === "grok") await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      if (provider === "codex") await completeDisplayedCodexLogin(session, chatgptOauth);
+      else await completeDisplayedGrokLogin(session, grok);
+      const label = provider === "codex" ? "Codex" : "Grok";
+      const outcome = await session.waitForPane(
+        (pane) => pane.includes(`Switched to ${label} subscription`) ||
+          pane.includes("Subscription sign-in completed, but"),
+        TIMEOUT,
+      );
+      expect(outcome).toContain(`Switched to ${label} subscription`);
+      await session.sendText("Use the subscription immediately after sign-in.");
+      await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      release();
+      grok.stop();
+    }
+  }, 60_000);
+}
+
+for (const gatewayState of ["absent", "rejected"] as const) {
+  tmuxTest(`provider recovery uses the remaining subscription when Gateway is ${gatewayState}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-logout-other-subscription-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], { models: () => [] });
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", models: { codex: "gpt-5.6-sol", grok: "grok-4.6" },
+      }), { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+        AI_GATEWAY_API_KEY: gatewayState === "absent" ? undefined : ENV_TOKEN,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/logout");
+      await session.waitForText("Signed out of Codex.", TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("grok · current");
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("Use the remaining subscription.");
+      await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+      expect(grok.requests.filter((request) => request.path === "/oauth2/token")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, 60_000);
+}
+
+tmuxTest("provider recovery stays signed out when no replacement is connected", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-no-provider-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/logout");
+  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await openProviderPicker(session);
+  const pane = await session.capturePane();
+  expect(pane).not.toContain("codex · current");
+  expect(pane).not.toContain("vercel · current");
+  expect(pane).not.toContain("grok · current");
+  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  expect(gateway.requests).toHaveLength(0);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("provider recovery refuses active logout before deleting a busy subscription", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-busy-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ responseDelayMs: 10_000 });
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("Keep this response open.");
+  const deadline = Date.now() + TIMEOUT;
+  while (!chatgptOauth.requests.some((request) => request.path === "/chatgpt/responses")) {
+    if (Date.now() > deadline) throw new Error("Codex request did not start");
+    await Bun.sleep(20);
+  }
+  await session.sendText("/logout");
+  const outcome = await session.waitForPane(
+    (pane) => pane.includes("Sign out is unavailable until active and queued work finishes.") ||
+      pane.includes("Signed out of Codex."),
+    TIMEOUT,
+  );
+  expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
+  expect(existsSync(authPath)).toBe(true);
+  await session.sendKeys("C-c");
+  await session.waitForText("What can fx do differently?", TIMEOUT);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("provider recovery validates a Gateway team after a cancelled turn", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cancel-team-selection-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([
+    async () => { await held; return fakeGatewayFinalText("CANCELLED_TEAM_RESPONSE"); },
+    fakeGatewayFinalText("TEAM_AFTER_CANCEL_RESPONSE"),
+  ]);
+  oauth = startFakeOAuth(LOGIN_TOKEN, undefined, 3600, Infinity, {
+    teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+  });
+  writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+  try {
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Hold this request until cancelled.");
+    const deadline = Date.now() + TIMEOUT;
+    while (gateway.requests.length === 0) {
+      if (Date.now() > deadline) throw new Error("Gateway request did not start");
+      await Bun.sleep(20);
+    }
+    await session.sendKeys("C-c");
+    await session.waitForText("What can fx do differently?", TIMEOUT);
+    release();
+    await selectFxLoginCredential(session);
+    expect(gateway.modelRequests.some((request) =>
+      request.headers.get("authorization") === `Bearer ${LOGIN_TOKEN}`)).toBe(true);
+    await session.sendText("Use the selected Vercel team.");
+    await session.waitForText("TEAM_AFTER_CANCEL_RESPONSE", TIMEOUT);
+    expect(gateway.requests.at(-1)?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    release();
+  }
+}, 60_000);
+
 tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaired login", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-prompt-preference-retry-"));
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
@@ -2112,7 +2343,8 @@ tmuxTest(
     await session.waitForText("Signed out of Codex.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     await session.sendText("/status");
-    await session.waitForText("model_source=Codex subscription", TIMEOUT);
+    await session.waitForText(`model=${gatewayModelBefore}`, TIMEOUT);
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
     chatgptOauth.setModels([
       { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
       { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
