@@ -95,7 +95,7 @@ fx session resume last
 fx session resume --id <id>
 ```
 
-Interactive terminal tabs show `fx v<version>` using the running binary's version. The title stays the same when you rename or resume a session or switch models. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
+Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
