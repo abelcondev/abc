@@ -4831,8 +4831,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           stderrPath: resumedStderrPath,
         });
         await tui.waitForComposer(15_000);
+        const resumedTranscript = await tui.captureFullScrollback();
+        expect(resumedTranscript).toContain("compaction restart complete");
+        expect(resumedTranscript).not.toContain("context_handoff");
+        expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
         await tui.sendText("/compact");
         await tui.waitForText("Context compacted.", 15_000);
+        expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
