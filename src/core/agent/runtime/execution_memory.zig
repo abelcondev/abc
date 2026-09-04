@@ -10,6 +10,7 @@ const io_mod = @import("../../shared/io.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -410,13 +411,24 @@ pub fn prepareCapturedToolModelOutput(
             raw_output,
             config.max_tool_result_bytes,
         );
+        var memory: types.ToolResultMemory = .{
+            .output_bytes = raw_output.len,
+            .stored_output_bytes = prepared.model_output.len,
+            .truncated = prepared.truncated,
+        };
+        if (prepared.truncated and
+            (config.session_child_capability != null or config.tool_result_dir != null))
+        {
+            const complete_output = try text_utils.sanitizeModelText(arena, raw_output);
+            memory.output_handle = if (config.session_child_capability) |capability|
+                try result_store.storeLargeResultManaged(arena, capability, tool_call.id, tool_call.name, complete_output)
+            else
+                try result_store.storeLargeResult(arena, config.tool_result_dir.?, tool_call.id, tool_call.name, complete_output);
+            memory.stored_output_bytes = complete_output.len;
+        }
         return .{
             .model_output = prepared.model_output,
-            .memory = .{
-                .output_bytes = raw_output.len,
-                .stored_output_bytes = prepared.model_output.len,
-                .truncated = prepared.truncated,
-            },
+            .memory = memory,
         };
     }
     const required_command_replay = if (capture) |candidate|
@@ -1156,6 +1168,124 @@ test "saved read_tool_result preparation preserves exact secret-like output" {
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
     try std.testing.expect(!prepared.memory.truncated);
     try std.testing.expect(prepared.memory.output_handle == null);
+}
+
+test "retrieved output remains backed across the inline cap" {
+    const compaction = @import("context_compaction.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer capability.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const stores = [_]enum { legacy, managed, unavailable }{ .legacy, .managed, .unavailable };
+    const cases = [_]struct { cap: usize, bytes: usize }{
+        .{ .cap = 65536, .bytes = 65536 },
+        .{ .cap = 65536, .bytes = 65537 },
+        .{ .cap = 65536, .bytes = 65689 },
+        .{ .cap = 1024, .bytes = 1025 },
+    };
+    for (stores) |storage| for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const raw = try arena.alloc(u8, case.bytes);
+        @memset(raw, 'x');
+        const head = "PROBE_TOKEN=0123456789abcdef\n";
+        const tail = "\nRETRIEVAL_COMPLETE_TAIL";
+        @memcpy(raw[0..head.len], head);
+        @memcpy(raw[raw.len - tail.len ..], tail);
+        const prepared = try prepareToolModelOutput(arena, .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel,
+            .max_tool_result_bytes = case.cap,
+            .tool_result_dir = if (storage == .legacy) dir else null,
+            .session_child_capability = if (storage == .managed) &capability else null,
+        }, toolCall("retrieval-cap", "read_tool_result", "{}"), raw);
+        try std.testing.expectEqual(case.bytes > case.cap, prepared.memory.truncated);
+        try std.testing.expectEqual(@min(case.bytes, case.cap), prepared.model_output.len);
+        try std.testing.expect(std.mem.startsWith(u8, prepared.model_output, head));
+        try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
+        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "retrieval-cap", .tool_name = "read_tool_result", .content = prepared.model_output, .tool_result_memory = prepared.memory }};
+        if (case.bytes > case.cap and storage != .unavailable) {
+            const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredRetrieval;
+            try std.testing.expectEqual(case.bytes, prepared.memory.stored_output_bytes);
+            const stored = try result_store.readForReplayManaged(arena, &capability, handle, case.bytes);
+            try std.testing.expectEqualStrings(raw, stored);
+            try compaction.promoteMessageResults(arena, &messages, .{ .managed = &capability }, 0);
+            try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
+        } else {
+            try std.testing.expect(prepared.memory.output_handle == null);
+            if (case.bytes > case.cap) {
+                try std.testing.expectError(error.IncompleteCompactionResult, compaction.promoteMessageResults(arena, &messages, .unavailable, 0));
+            } else {
+                try std.testing.expectEqualStrings(raw, prepared.model_output);
+            }
+        }
+    };
+}
+
+test "retrieved output storage failure does not publish an unbacked result" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var writable = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer writable.deinit();
+    var readonly = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .read_only);
+    defer readonly.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(error.SessionChildReadOnly, prepareToolModelOutput(arena_state.allocator(), .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .cancel_flag = &cancel,
+        .max_tool_result_bytes = 1024,
+        .session_child_capability = &readonly,
+    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), "x" ** 1025));
+}
+
+test "saved tool output preparation keeps builtins and dynamic tools compactable" {
+    const builtins = @import("../../../builtins/tools.zig");
+    const compaction = @import("context_compaction.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var cancel = std.atomic.Value(bool).init(false);
+    for (0..builtins.all.len + 1) |index| {
+        const name = if (index < builtins.all.len) builtins.all[index].name else "mcp_fixture_lookup";
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const raw = "COMPLETE_TOOL_BODY\n" ++ "x" ** 8192;
+        const prepared = try prepareToolModelOutput(arena, .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel,
+            .max_tool_result_bytes = 1024,
+            .tool_result_dir = dir,
+        }, toolCall("tool-preparation", name, "{}"), raw);
+        const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredOutput;
+        try std.testing.expectEqual(raw.len, prepared.memory.stored_output_bytes);
+        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "tool-preparation", .tool_name = name, .content = prepared.model_output, .tool_result_memory = prepared.memory }};
+        try compaction.promoteMessageResults(arena, &messages, .{ .legacy_dir = dir }, 0);
+        try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
+        const stored = try result_store.readByRange(arena, dir, handle, 1, 16384);
+        try std.testing.expect(std.mem.find(u8, stored, raw) != null);
+    }
 }
 
 test "saved preparation externalizes complete redacted output without cap loss" {

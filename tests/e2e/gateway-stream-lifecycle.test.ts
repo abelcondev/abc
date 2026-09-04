@@ -4848,6 +4848,116 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     60_000,
   );
 
+  for (const trigger of ["automatic", "manual"] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `oversized result retrieval survives ${trigger} compaction and restart`,
+      async () => {
+        const root = createFixtureRoot(`retrieval-compaction-${trigger}`);
+        const tracePath = join(root.root, "trace.log");
+        const stderrPath = join(root.root, "stderr.log");
+        const token = "PROBE_TOKEN=0123456789abcdef01234567";
+        const prefix = `RETRIEVAL_MATCH ${token} `;
+        const tail = "RETRIEVAL_EDGE_SENTINEL";
+        writeFileSync(join(root.workspace, "source.txt"), prefix + "x".repeat(65480 - prefix.length) + tail + "x".repeat(1024) + "\n");
+        writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
+        let step = 0;
+        let compactions = 0;
+        let snapshotHandle = "";
+        const gateway = startDynamicFakeGateway((body) => {
+          const request = JSON.parse(body);
+          if (request.tools.length === 0) {
+            compactions++;
+            snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
+            expect(snapshotHandle).not.toBe("");
+            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+          }
+          switch (step++) {
+            case 0:
+              return fakeGatewayToolCall("retrieval-source", "shell", {
+                request: { action: "run", command: "printf 'once\\n' >> effects.txt; cat source.txt", profile: "clean", yield_time_ms: 30000 },
+              });
+            case 1: {
+              const source = JSON.parse(toolResultOutput(body, "retrieval-source"));
+              expect(source.exit_code).toBe(0);
+              expect(source.full_output_handle).toBeString();
+              return fakeGatewayToolCall("retrieval-page", "read_tool_result", {
+                request: { handle: source.full_output_handle, query: "RETRIEVAL_MATCH" },
+              });
+            }
+            case 2: {
+              const page = toolResultOutput(body, "retrieval-page");
+              expect(page).toContain(token);
+              expect(page).toContain("tool result truncated");
+              expect(page).not.toContain(tail);
+              return fakeGatewaySse([
+                { type: "tool-call", toolCallId: "retrieval-follow-up", toolName: "read_file", input: { path: "small.txt" } },
+                { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, ...(trigger === "automatic" ? { usage: { inputTokens: { total: 120000 }, outputTokens: { total: 10 } } } : {}) },
+              ]);
+            }
+            case 3:
+              if (trigger === "automatic") {
+                expect(compactions).toBe(1);
+                expect(body).toContain("context_handoff");
+              }
+              return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
+            case 4:
+              expect(body).toContain(snapshotHandle);
+              return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
+                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+              });
+            case 5:
+              expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);
+              return fakeGatewayFinalText("RETRIEVAL_RESTART_COMPLETE");
+            default:
+              return new Response("unexpected request", { status: 500 });
+          }
+        }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+        let tui: TmuxSession | null = null;
+        try {
+          const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0", FX_TRACE_SCOPES: "agent,tool,session,context_compaction" };
+          tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+          await tui.waitForComposer(15000);
+          await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
+          expect(pane).not.toContain("request failed:");
+          expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
+          if (trigger === "manual") {
+            await tui.sendText("/compact");
+            const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
+            expect(compacted).not.toContain("request failed:");
+            expect(compacted).toContain("Context compacted.");
+          }
+          expect(compactions).toBe(1);
+          await tui.sendText("/quit");
+          expect(await tui.waitForSessionEnd(15000)).toBe(true);
+          tui = null;
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
+          expect(latest.code).toBe(0);
+          const sessionId = JSON.parse(latest.stdout).id;
+          const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+          const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
+          expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
+          expect(snapshot).toContain(token);
+          expect(snapshot).toContain(tail);
+          expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
+          expect(resumed.code).toBe(0);
+          expect(resumed.stderr).toBe("Reading tool result\n");
+          expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
+          expect(gateway.requests).toHaveLength(7);
+          expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
+        } finally {
+          await tui?.kill();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      120000,
+    );
+  }
+
   test.skipIf(!tmuxAvailable())(
     "manual context compaction survives restart without changing canonical history",
     async () => {
