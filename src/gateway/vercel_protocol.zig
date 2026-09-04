@@ -5,6 +5,7 @@ const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const types = @import("../core/shared/types.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
@@ -28,20 +29,20 @@ pub fn roleName(role: ChatRole) []const u8 {
     };
 }
 
-pub fn writeChatMessageJson(
+fn writeChatMessageJson(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: ChatMessage,
 ) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, false, null, null) catch |err| return err;
+    writeChatMessageJsonInner(scratch_alloc, writer, message, false, null, null, &.{}) catch |err| return err;
 }
 
-pub fn writeChatMessageJsonCached(
+fn writeChatMessageJsonCached(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: ChatMessage,
 ) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, true, null, null) catch |err| return err;
+    writeChatMessageJsonInner(scratch_alloc, writer, message, true, null, null, &.{}) catch |err| return err;
 }
 
 pub fn buildGatewayRequestBody(
@@ -342,6 +343,8 @@ fn buildGatewayRequestBodyValidated(
         }
     }
 
+    var ids = try tool_call_ids.Projection.init(alloc, messages);
+    defer ids.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -356,7 +359,7 @@ fn buildGatewayRequestBodyValidated(
         if (i > 0) try out.writer.writeByte(',');
         if (message.role == .tool) {
             const results = tool_result_prefix(messages[i..]);
-            try write_tool_result_group(alloc, &out.writer, results, budget);
+            try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
             for (results) |result| {
                 if (result.cache_policy == .no_cache) prefix_cacheable = false;
             }
@@ -369,20 +372,15 @@ fn buildGatewayRequestBodyValidated(
             if (override.message_index == i) override.images else null
         else
             null;
-        if (budget) |active| {
-            try writeChatMessageJsonInner(
-                std.heap.c_allocator,
-                &out.writer,
-                message,
-                use_cache,
-                active,
-                verified_images,
-            );
-        } else if (use_cache) {
-            try writeChatMessageJsonCached(std.heap.c_allocator, &out.writer, message);
-        } else {
-            try writeChatMessageJson(std.heap.c_allocator, &out.writer, message);
-        }
+        try writeChatMessageJsonInner(
+            std.heap.c_allocator,
+            &out.writer,
+            message,
+            use_cache,
+            budget,
+            verified_images,
+            &ids,
+        );
         if (message.cache_policy == .no_cache) prefix_cacheable = false;
         if (budget) |active| try active.check();
         i += 1;
@@ -551,6 +549,49 @@ fn validateAssistantToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall)
     }
 }
 
+test "Gateway request projects nonportable call ids without changing source history" {
+    const source_id = "functions.read_file:0";
+    const second_id = "functions/read_file:0";
+    const calls = [_]ToolCall{
+        .{ .id = source_id, .name = "read_file", .arguments_json = "{}" },
+        .{ .id = second_id, .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = second_id, .tool_name = "read_file", .content = "second" },
+        .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    const call_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
+    const results = prompt[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    const result_id = results[1].object.get("toolCallId").?.string;
+    try std.testing.expect(!std.mem.eql(u8, source_id, call_id));
+    try std.testing.expect(call_id.len <= 64);
+    for (call_id) |byte| try std.testing.expect(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-');
+    try std.testing.expectEqualStrings(call_id, result_id);
+    const second_call_id = prompt[0].object.get("content").?.array.items[1].object.get("toolCallId").?.string;
+    try std.testing.expect(!std.mem.eql(u8, call_id, second_call_id));
+    try std.testing.expectEqualStrings(second_call_id, results[0].object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings(source_id, calls[0].id);
+    try std.testing.expectEqualStrings(source_id, messages[2].tool_call_id.?);
+}
+
+test "Gateway request preserves provider-owned call ids" {
+    const calls = [_]ToolCall{.{ .id = "native:0", .name = "native", .arguments_json = "{}", .provenance = .provider_executed, .provider_result = "result" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "native:0", .tool_name = "native", .content = "result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"toolCallId\":\"native:0\"") != null);
+}
+
 test "non-object provider-owned arguments retain their Gateway representation" {
     const calls = [_]ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
     const messages = [_]ChatMessage{
@@ -606,19 +647,20 @@ fn write_tool_result_group(
     writer: *std.Io.Writer,
     results: []const ChatMessage,
     budget: ?BuildBudget,
+    ids: *const tool_call_ids.Projection,
 ) !void {
     try writer.writeAll("{\"role\":\"tool\",\"content\":[");
     for (results, 0..) |result, index| {
         if (budget) |active| try active.check();
         if (index > 0) try writer.writeByte(',');
-        try write_tool_result_part(alloc, writer, result);
+        try write_tool_result_part(alloc, writer, result, ids);
     }
     try writer.writeAll("]}");
 }
 
-fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage) !void {
+fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
-    try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
+    try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
     try writer.writeAll(",\"toolName\":");
     try std.json.Stringify.value(message.tool_name orelse "unknown", .{}, writer);
     const content = message.content orelse "";
@@ -666,6 +708,7 @@ fn writeChatMessageJsonInner(
     cached: bool,
     budget: ?BuildBudget,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    ids: *const tool_call_ids.Projection,
 ) !void {
     try writer.writeAll("{\"role\":");
     try std.json.Stringify.value(roleName(message.role), .{}, writer);
@@ -738,7 +781,7 @@ fn writeChatMessageJsonInner(
             for (message.tool_calls) |tool_call| {
                 if (wrote_part) try writer.writeByte(',');
                 try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-                try std.json.Stringify.value(tool_call.id, .{}, writer);
+                try std.json.Stringify.value(ids.resolve(tool_call.id), .{}, writer);
                 try writer.writeAll(",\"toolName\":");
                 try std.json.Stringify.value(tool_call.name, .{}, writer);
                 try writer.writeAll(",\"input\":");
@@ -750,7 +793,7 @@ fn writeChatMessageJsonInner(
         },
         .tool => {
             try writer.writeAll(",\"content\":[");
-            try write_tool_result_part(scratch_alloc, writer, message);
+            try write_tool_result_part(scratch_alloc, writer, message, ids);
             try writer.writeByte(']');
         },
     }
@@ -1675,14 +1718,15 @@ test "gateway request serialization keeps each tool result group together" {
 test "grouped tool results retain images and individual error status" {
     const alloc = std.testing.allocator;
     const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    const source_id = "functions.capture:0";
     const calls = [_]ToolCall{
-        .{ .id = "screenshot", .name = "capture", .arguments_json = "{}" },
+        .{ .id = source_id, .name = "capture", .arguments_json = "{}" },
         .{ .id = "labels", .name = "read_labels", .arguments_json = "{}" },
     };
     for ([_]types.PersistedToolStatus{ .success, .failure }) |status| {
         const messages = [_]ChatMessage{
             .{ .role = .assistant, .tool_calls = &calls },
-            .{ .role = .tool, .tool_call_id = "screenshot", .tool_name = "capture", .content = "capture", .tool_result_status = status, .tool_result_memory = .{ .tool_images = &images } },
+            .{ .role = .tool, .tool_call_id = source_id, .tool_name = "capture", .content = "capture", .tool_result_status = status, .tool_result_memory = .{ .tool_images = &images } },
             .{ .role = .tool, .tool_call_id = "labels", .tool_name = "read_labels", .content = "labels", .tool_result_status = .success },
         };
         const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto);
@@ -1693,7 +1737,10 @@ test "grouped tool results retain images and individual error status" {
         try std.testing.expectEqual(@as(usize, 2), prompt.len);
         const results = prompt[1].object.get("content").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), results.len);
-        try std.testing.expectEqualStrings("screenshot", results[0].object.get("toolCallId").?.string);
+        const projected_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
+        try std.testing.expect(!std.mem.eql(u8, source_id, projected_id));
+        try std.testing.expectEqualStrings(projected_id, results[0].object.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings(source_id, messages[1].tool_call_id.?);
         const media = results[0].object.get("output").?.object;
         try std.testing.expectEqualStrings("content", media.get("type").?.string);
         const parts = media.get("value").?.array.items;

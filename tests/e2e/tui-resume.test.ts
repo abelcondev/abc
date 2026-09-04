@@ -714,6 +714,115 @@ function expectExpandedCodeColors(scrollback: string): void {
   expect(scrollback).toContain("\x1b[38;5;250m\"json_ready\"\x1b[39m");
 }
 
+test.skipIf(!tmuxAvailable())(
+  "resumed compaction handoffs stay internal after legacy conversion and restart",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-resume-internal-handoff-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const sessionId = "internal-handoff-resume";
+    const sessionDir = join(home, ".fx", "sessions", sessionId);
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    const summary = "<context_handoff>\n## Authoritative continuation state\n" +
+      Array.from({ length: 507 }, (_, i) =>
+        `- operation sequence=${i + 1} call_id=INTERNAL_CALL_${i} result_handle=INTERNAL_RESULT_${i}`
+      ).join("\n") +
+      "\n## Conversation summary\nINTERNAL_SUMMARY_ONLY\n</context_handoff>";
+    writeFileSync(join(sessionDir, "session.json"), JSON.stringify({
+      schema_version: 2, id: sessionId, created_at_ms: 1, updated_at_ms: 2,
+      workspace_root: realpathSync(workspace), conversation_language: "en",
+      history_len: 3, context_history_start: 1,
+      history: [
+        { kind: "assistant", user: { text: "ARCHIVED_VISIBLE_REQUEST", images: [] }, assistant: "ARCHIVED_VISIBLE_REPLY" },
+        { kind: "compacted_summary", summary, removed_turn_count: 1, compaction_count: 1 },
+        {
+          kind: "assistant", user: { text: "RECENT_VISIBLE_REQUEST", images: [] }, assistant: "RECENT_VISIBLE_REPLY",
+          execution: {
+            schema_version: 2,
+            tool_steps: [{
+              assistant: null,
+              tool_calls: [{ id: "past-read", name: "read_file", arguments_json: '{"path":"previous.txt"}', provider_result: null }],
+              tool_results: [{
+                tool_call_id: "past-read", tool_name: "read_file", status: "success",
+                output: "VISIBLE_TOOL_RESULT", output_handle: null, preview: null,
+                output_bytes: 19, stored_output_bytes: 19, truncated: false,
+                provider_native: false, created_at_ms: 2, permission_feedback: [],
+              }],
+            }], files: [], steering: [],
+          },
+        },
+      ],
+      total_input_tokens: 0, total_output_tokens: 0,
+    }) + "\n", { mode: 0o600 });
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_CONTINUATION_OK"),
+      fakeGatewayFinalText("SECOND_CONTINUATION_OK"),
+    ]);
+    let active: TmuxSession | null = null;
+    const expectInternal = (text: string) => {
+      for (const marker of ["context_handoff", "Authoritative continuation state", "operation sequence=", "INTERNAL_", "Recent conversation turns are preserved verbatim"]) {
+        expect(text).not.toContain(marker);
+      }
+    };
+    try {
+      for (const [index, mode] of ["startup", "picker"].entries()) {
+        const stderrPath = join(root, `${mode}.stderr`);
+        const tapePath = join(root, `${mode}.fxtape`);
+        active = await TmuxSession.create({
+          cmd: mode === "startup" ? `${FX_BIN} --resume ${sessionId}` : FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+          stderrPath,
+        });
+        await active.waitForComposer(TIMEOUT);
+        if (mode === "picker") {
+          await active.sendText("/resume");
+          await waitForSessionPicker(active);
+          await active.sendKeys("Enter");
+        }
+        const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
+        expect(resumed).toContain("RECENT_VISIBLE_REQUEST");
+        expect(resumed).toContain("Read previous.txt");
+        expectInternal(resumed);
+
+        await active.sendKeys("C-o");
+        await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+        const full = await collectFullTranscriptPages(active, 40);
+        expect(full).toContain("ARCHIVED_VISIBLE_REPLY");
+        expect(full).toContain("VISIBLE_TOOL_RESULT");
+        expectInternal(full);
+        await active.sendKeys("C-o");
+        await active.waitForComposer(TIMEOUT);
+
+        await active.sendText("Continue without using tools.");
+        const answer = index === 0 ? "FIRST_CONTINUATION_OK" : "SECOND_CONTINUATION_OK";
+        expectInternal(await waitForScrollback(active, answer));
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(gateway.requests).toHaveLength(index + 1);
+        expect(gateway.requests[index]!.body).toContain("INTERNAL_SUMMARY_ONLY");
+        expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
+        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.event.context_checkpoint).map((event) => event.event.context_checkpoint.summary)).toEqual([summary]);
+        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(4);
+        const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
+        expect(replay.code).toBe(0);
+        expect(replay.stderr).toBe("");
+        expect(replay.stdout).toContain("RECENT_VISIBLE_REPLY");
+        expectInternal(replay.stdout);
+      }
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  180_000,
+);
+
 function expectNoRawToolReplay(scrollback: string): void {
   expect(scrollback).not.toContain("Previous tool execution");
   expect(scrollback).not.toContain("[system] Previous tool execution");
