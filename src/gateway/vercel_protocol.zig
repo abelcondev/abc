@@ -537,13 +537,45 @@ fn validateAssistantToolResultBlock(
 fn validateAssistantToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall) !void {
     for (calls, 0..) |call, i| {
         if (call.id.len == 0 or call.name.len == 0 or call.arguments_json.len == 0) return error.InvalidGatewayHistory;
-        if (try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json) == .malformed_json) {
+        const integrity = if (call.provenance == .provider_executed)
+            try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json)
+        else
+            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json);
+        if (integrity != .valid) {
             return error.InvalidGatewayHistory;
         }
         var j = i + 1;
         while (j < calls.len) : (j += 1) {
             if (std.mem.eql(u8, call.id, calls[j].id)) return error.InvalidGatewayHistory;
         }
+    }
+}
+
+test "non-object provider-owned arguments retain their Gateway representation" {
+    const calls = [_]ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "native", .tool_name = "native_tool", .content = "native result" },
+    };
+    const body = try buildGatewayRequestBody(std.testing.allocator, "[]", &messages);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":[]") != null);
+}
+
+test "non-object function arguments cannot enter a Gateway request" {
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"" }) |arguments| {
+        const calls = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+        const messages = [_]ChatMessage{
+            .{ .role = .user, .content = "read" },
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "not executed", .tool_result_status = .failure },
+        };
+        const body = buildGatewayRequestBody(std.testing.allocator, "[]", &messages) catch |err| {
+            try std.testing.expectEqual(error.InvalidGatewayHistory, err);
+            continue;
+        };
+        defer std.testing.allocator.free(body);
+        return error.TestExpectedError;
     }
 }
 

@@ -1693,7 +1693,7 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     errdefer alloc.free(name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
     errdefer alloc.free(arguments_json);
-    const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments_json);
+    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
         alloc.free(arguments_json);
@@ -1717,7 +1717,8 @@ fn parseOptionalToolCall(alloc: Allocator, value: std.json.Value) !?session.Tool
         .null => null,
         .object => blk: {
             var call = try parseToolCall(alloc, value);
-            session.repairPersistedInterruptedToolArguments(&call, .schema_v3);
+            errdefer session.freeToolCall(alloc, call);
+            try session.repairPersistedInterruptedToolArguments(alloc, &call, .schema_v3);
             break :blk call;
         },
         else => error.InvalidSessionFormat,
@@ -2791,6 +2792,83 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     const interrupted = decoded.history[1].interrupted.tool_call.?;
     try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
+}
+
+test "non-object saved function inputs are repaired without changing recorded outcomes" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"" }) |arguments| {
+        for ([_]session.PersistedToolStatus{ .success, .failure }) |status| {
+            for (0..3) |native_kind| {
+                var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+                calls[0].provider_result = if (native_kind == 1) "provider result" else null;
+                var results = [_]session.PersistedToolResult{persistedResultForTest("call", "read_file")};
+                results[0].status = status;
+                results[0].provider_native = native_kind == 2;
+                results[0].output_handle = @constCast("retained-handle");
+                results[0].preview = @constCast("retained-preview");
+                var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+                const turn: session.HistoryTurn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("read") },
+                    .assistant = @constCast("done"),
+                    .execution = .{ .tool_steps = &steps },
+                } };
+                var encoded: std.Io.Writer.Allocating = .init(alloc);
+                defer encoded.deinit();
+                try writeHistoryTurn(&encoded.writer, turn);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+                defer parsed.deinit();
+                const decoded = try parseHistoryTurn(alloc, parsed.value);
+                defer session.freeHistoryTurn(alloc, decoded);
+                const step = decoded.assistant.execution.tool_steps[0];
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
+                try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+                try std.testing.expectEqual(status, step.tool_results[0].status);
+                try std.testing.expectEqualStrings("stale", step.tool_results[0].output);
+                try std.testing.expectEqualStrings("retained-handle", step.tool_results[0].output_handle.?);
+                try std.testing.expectEqualStrings("retained-preview", step.tool_results[0].preview.?);
+                try std.testing.expectEqualStrings(arguments, calls[0].arguments_json);
+                try session.repairPersistedToolArguments(alloc, step.tool_calls, step.tool_results, .schema_v3);
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                if (native_kind == 0 and status == .failure and std.mem.eql(u8, arguments, "[]")) {
+                    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectHistoryAllocationFailures, .{parsed.value});
+                }
+            }
+        }
+    }
+}
+
+fn checkNonObjectHistoryAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const decoded = try parseHistoryTurn(alloc, value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    try std.testing.expectEqualStrings("{}", decoded.assistant.execution.tool_steps[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqual(session.PersistedToolStatus.failure, decoded.assistant.execution.tool_steps[0].tool_results[0].status);
+}
+
+test "non-object interrupted inputs repair locally and preserve provider-owned records" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |native| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeToolCall(&out.writer, .{
+            .id = "interrupted",
+            .name = "read_file",
+            .arguments_json = "[]",
+            .provider_result = if (native) "provider result" else null,
+        });
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
+        defer session.freeToolCall(alloc, repaired);
+        try std.testing.expectEqualStrings(if (native) "[]" else "{}", repaired.arguments_json);
+        if (!native) try std.testing.checkAllAllocationFailures(alloc, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
+    }
+}
+
+fn checkNonObjectInterruptedAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const call = (try parseOptionalToolCall(alloc, value)).?;
+    defer session.freeToolCall(alloc, call);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
 }
 
 test "current history decode rejects ambiguous malformed tool result pairings" {

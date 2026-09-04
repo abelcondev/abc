@@ -365,6 +365,14 @@ pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Alloc
     });
 }
 
+pub fn nonObjectToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = "Tool arguments must be a JSON object. The call was not executed.",
+        .suggestion = "Reissue the tool call with a JSON object matching the tool schema.",
+    });
+}
+
 pub fn preToolUseBlockedJson(
     alloc: Allocator,
     tool_name: []const u8,
