@@ -128,7 +128,7 @@ try {
     warm: { prompt_to_first_text_ms: { count: 100, p50: 0.6 } },
     streams: [{ samples: 30 }, { samples: 30 }, { samples: 30 }],
   });
-  await write("competitive-node.json", {
+  const slowerCompetitor = {
     rounds: [
       { order: ["libfx", "pi"], libfx_request_count: 103, pi_request_count: 103 },
       { order: ["pi", "libfx"], libfx_request_count: 103, pi_request_count: 103 },
@@ -136,10 +136,30 @@ try {
     ],
     libfx: { prompt_to_first_text_ms: { count: 300, p50: 1.1, p95: 1.4, p99: 1.8 } },
     pi: { prompt_to_first_text_ms: { count: 300, p50: 0.7, p95: 1.0, p99: 1.5 } },
-  });
-  const competitorFailed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
-  assert.notEqual(competitorFailed.status, 0);
-  assert.match(competitorFailed.stderr, /Node native versus Pi p50/);
+  };
+  await write("competitive-node.json", slowerCompetitor);
+  const nodeReport = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+  assert.equal(nodeReport.status, 0, nodeReport.stderr);
+  assert.match(nodeReport.stdout, /Node native versus Pi \(report only\)/);
+  assert.match(nodeReport.stdout, /p50 1\.100ms \/ 0\.700ms/);
+  assert.match(nodeReport.stdout, /p95 1\.400ms \/ 1\.000ms/);
+  assert.match(nodeReport.stdout, /p99 1\.800ms \/ 1\.500ms/);
+
+  for (const [timings, error] of [
+    [{ count: 299, p50: 1.1, p95: 1.4, p99: 1.8 }, /needs 300 samples/],
+    [{ count: 300, p50: null, p95: 1.4, p99: 1.8 }, /competitor timings are invalid/],
+  ]) {
+    await write("competitive-node.json", { ...slowerCompetitor, libfx: { prompt_to_first_text_ms: timings } });
+    const invalid = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, error);
+  }
+  await write("competitive-node.json", slowerCompetitor);
+  await write("competitive-bun.json", slowerCompetitor);
+  const bunFailed = spawnSync(command, [benchmarkCheck, "--dir", checkDir], { encoding: "utf8" });
+  assert.notEqual(bunFailed.status, 0);
+  assert.match(bunFailed.stderr, /Bun native versus Pi p50/);
+  assert.match(bunFailed.stderr, /Bun native versus Pi p95/);
 } finally {
   await rm(checkDir, { recursive: true, force: true });
 }

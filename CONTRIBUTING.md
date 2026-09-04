@@ -464,9 +464,13 @@ workflow builds ReleaseSafe first. Results are written to
 
 The libfx runtime job measures cold startup, warm prompts, host-tool calls,
 stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
-Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. Native
-libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95; p99 is reported
-from 300 samples. Live model latency and bulk-stream throughput remain informational.
+Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
+native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
+The Node comparison is report-only because Node's bundled fetch client and
+Pi's dispatcher have different warm-request overhead. Both runtimes still
+require valid measurements, 300 samples, and exactly one inference request per
+prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
+Live model latency and bulk-stream throughput remain informational.
 
 ```sh
 zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
