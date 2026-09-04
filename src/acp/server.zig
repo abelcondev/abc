@@ -2176,10 +2176,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     staged_credential.?.gatewayTeam(),
                     staged_credential.?.accountId(),
                 );
+            // Provider selection is independent of earlier prompt cancellation.
+            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
                 .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
+                .cancel_flag = &catalog_cancel_flag,
                 .view = .picker,
             });
             var catalog = switch (fetched) {

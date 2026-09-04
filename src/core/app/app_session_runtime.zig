@@ -1867,12 +1867,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
+            if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
             if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
             if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
                 !@hasDecl(@TypeOf(app.auth), "accountId") or
                 !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
 
             const source = app.auth.credentialSource() orelse return;
+            if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
             const credential = app.auth.apiKey() orelse return;
             app.session.usage.replaceProviderReconciliationCredential(
                 app.alloc,
@@ -1956,6 +1958,7 @@ pub fn Runtime(comptime App: type) type {
             display_title: []const u8,
             notice: ResumeNotice,
         ) !void {
+            const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResumedHistory(
                     app.alloc,
@@ -2029,6 +2032,9 @@ pub fn Runtime(comptime App: type) type {
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
+            }
+            if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                try app.restoreSessionCredential(previous_provider);
             }
         }
 
@@ -10163,6 +10169,24 @@ test "resumed sessions install provider-scoped usage reconciliation authority" {
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
+}
+
+test "resumed usage reconciliation rejects the previous provider credential" {
+    const cases = .{
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
+        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
+        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
+    };
+    inline for (cases) |case| {
+        var app = ReconciliationOriginApp{
+            .auth = .{ .source = case[1] },
+            .selected_provider = case[0],
+        };
+        Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
+        try std.testing.expect(app.session.usage.replaced_provider == null);
+        try std.testing.expect(app.session.usage.replaced_source == null);
+    }
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

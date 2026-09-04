@@ -325,9 +325,10 @@ async function startFx(
   tracePath?: string,
   envOverrides: Record<string, string | undefined> = {},
   cwd?: string,
+  resumeId?: string,
 ): Promise<TmuxSession> {
   return TmuxSession.create({
-    cmd: FX_BIN,
+    cmd: resumeId ? `${FX_BIN} --resume '${resumeId}'` : FX_BIN,
     cwd,
     env: {
       HOME: testHome,
@@ -1209,6 +1210,153 @@ function startFakeGrokResourceRecovery() {
   };
 }
 
+for (const provider of ["gateway", "codex", "grok"] as const) {
+  tmuxTest(`pending ${provider} prompt retries repaired credential storage without changing accounts`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-prompt-storage-retry-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_STORAGE_RECOVERED")]);
+    oauth = startFakeOAuth("unused-token");
+    chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: 0 });
+    const grok = startFakeGrokOAuth({ unauthorizedResponses: 0 });
+    try {
+      writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+      writeSeededChatGptLogin(home);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider,
+        credential_source: "fx_login",
+        models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" },
+      }));
+      const name = provider === "gateway" ? "auth.json" : provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
+      const alias = join(home, "auth.alias");
+      linkSync(join(home, ".fx", name), alias);
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        FX_MODEL: undefined,
+        ...chatgptOauth.env,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const prompt = `STORAGE_RETRY_${provider}`;
+      await session.sendText(prompt);
+      await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("Auth:"), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
+      expect(gateway.requests).toHaveLength(0);
+      expect(oauth.requests).toHaveLength(0);
+      expect(chatgptOauth.requests).toHaveLength(0);
+      expect(grok.requests).toHaveLength(0);
+
+      unlinkSync(alias);
+      await session.sendKeys("Enter");
+      await session.waitForText(provider === "gateway" ? "GATEWAY_STORAGE_RECOVERED" : provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+      const requests = provider === "gateway" ? gateway.requests : provider === "codex"
+        ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
+        : grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(requests).toHaveLength(1);
+      expect(JSON.stringify(requests[0]!.body)).toContain(prompt);
+      if (provider === "gateway") {
+        expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+      } else {
+        expect(gateway.requests).toHaveLength(0);
+      }
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, TIMEOUT);
+}
+
+tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaired login", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-prompt-preference-retry-"));
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  const settingsPath = join(home, ".fx", "settings.json");
+  const settings = JSON.stringify({ provider: "gateway", credential_source: "fx_login", models: { gateway: FAKE_GATEWAY_MODEL } });
+  writeFileSync(settingsPath, settings);
+  stderrPath = join(home, "stderr.log");
+  gateway = startFakeGateway([fakeGatewayFinalText("PREFERENCE_REPAIRED")]);
+  oauth = startFakeOAuth("unused-token");
+  session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { FX_MODEL: undefined });
+  await session.waitForComposer(TIMEOUT);
+  writeFileSync(settingsPath, "not-json");
+  await session.sendText("PREFERENCE_RETRY_PROMPT");
+  await session.waitForText("Could not load authentication settings", TIMEOUT);
+  expect(gateway.requests).toHaveLength(0);
+
+  writeFileSync(settingsPath, settings);
+  await session.sendKeys("Enter");
+  await session.waitForPane(
+    (pane) => pane.lastIndexOf("fx needs access to Vercel AI Gateway") > pane.lastIndexOf("Could not load authentication settings"),
+    TIMEOUT,
+  );
+  expect(gateway.requests).toHaveLength(0);
+  writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+  await session.sendKeys("Enter");
+  await session.waitForText("PREFERENCE_REPAIRED", TIMEOUT);
+  expect(gateway.requests).toHaveLength(1);
+  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("PREFERENCE_RETRY_PROMPT");
+  expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+  expect(oauth.requests).toHaveLength(0);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
+
+test("Vercel CLI keeps an issuer authorization denial distinct from persistence failure", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-vercel-authorization-denied-"));
+  oauth = startFakeOAuth("unused-token", undefined, 3600, Number.POSITIVE_INFINITY, {
+    deviceError: "access_denied",
+    rejectAllDeviceClients: true,
+  });
+  const result = await runFx(["login", "vercel"], { env: {
+    HOME: home,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+  }, timeoutMs: TIMEOUT });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("authorization denied");
+  expect(result.stderr).not.toContain("Credential could not be saved");
+  expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+  expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+}, TIMEOUT);
+
+test("Vercel CLI reports a post-authorization save failure without claiming authorization was denied", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-vercel-save-failure-"));
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth("new-token", undefined, 3600, Number.POSITIVE_INFINITY, {
+    tokenDelayMs: 300,
+    teams: [{ id: "team_fixture", slug: "fixture", name: "Fixture" }],
+  });
+  writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+  const authPath = join(home, ".fx", "auth.json");
+  const previous = readFileSync(authPath, "utf8");
+  const login = runFx(["login", "vercel"], { env: {
+    HOME: home,
+    AI_GATEWAY_API_KEY: ENV_TOKEN,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  }, timeoutMs: TIMEOUT });
+  const deadline = Date.now() + 10_000;
+  while (!oauth.requests.some((request) => request.path === "/oauth/token") && Date.now() < deadline) await Bun.sleep(5);
+  expect(oauth.requests.some((request) => request.path === "/oauth/token")).toBe(true);
+  chmodSync(authPath, 0o400);
+  const result = await login;
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("Credential could not be saved");
+  expect(result.stderr).not.toContain("authorization denied");
+  expect(result.stdout).not.toContain("Signed in");
+  expect(readFileSync(authPath, "utf8")).toBe(previous);
+  expect(gateway.requests).toHaveLength(0);
+}, TIMEOUT);
+
 tmuxTest(
   "malformed sessions and read-only locks never become missing authentication",
   async () => {
@@ -1632,6 +1780,144 @@ tmuxTest(
   },
   60_000,
 );
+
+for (const [provider, previousProvider] of [
+  ["codex", "gateway"],
+  ["grok", "gateway"],
+  ["gateway", "codex"],
+  ["gateway", "grok"],
+] as const) {
+  for (const resumeMode of ["startup", "picker"] as const) {
+    tmuxTest(
+      `${provider} ${resumeMode} resume authenticates the model catalog before the first prompt from ${previousProvider}`,
+      async () => {
+        home = mkdtempSync(join(tmpdir(), "fx-auth-resume-"));
+        stderrPath = join(home, "stderr.log");
+        gateway = startFakeGateway(provider === "gateway" ? [
+          fakeGatewayFinalText("GATEWAY_RESUME_SEED"),
+          fakeGatewayFinalText("GATEWAY_RESUME_REPLY"),
+        ] : []);
+        oauth = startFakeOAuth(null);
+        chatgptOauth = startFakeChatGptOAuth();
+        const grok = startFakeGrokOAuth();
+        try {
+          writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+          writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+          writeSeededGrokLogin(home, grok.initialAccessToken);
+          const models = { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" };
+          const model = models[provider];
+          const otherModel = provider === "codex" ? "gpt-5.4-mini" : provider === "grok" ? "grok-4.6" : model;
+          const settingsPath = join(home, ".fx", "settings.json");
+          writeFileSync(settingsPath, JSON.stringify({ provider, credential_source: "fx_login", models }) + "\n", { mode: 0o600 });
+          const env = {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+            ...chatgptOauth.env,
+            ...grok.env,
+          };
+          const seeded = await runFx(["ask", "--json", "--auto", "Save the provider resume fixture."], {
+            env,
+            timeoutMs: TIMEOUT,
+          });
+          expect(seeded.code, `stdout: ${seeded.stdout}\nstderr: ${seeded.stderr}`).toBe(0);
+          const saved = JSON.parse(seeded.stdout) as { session_id: string; output: string };
+          expect(saved.session_id).toMatch(/^[a-zA-Z0-9_-]+$/);
+          expect(saved.output).toContain(provider === "gateway" ? "GATEWAY_RESUME_SEED" : provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE");
+          const preferences = { provider: previousProvider, credential_source: "fx_login", models };
+          writeFileSync(settingsPath, JSON.stringify(preferences) + "\n", { mode: 0o600 });
+          chatgptOauth.requests.length = 0;
+          grok.requests.length = 0;
+          gateway.requests.length = 0;
+          gateway.modelRequests.length = 0;
+
+          session = await startFx(
+            home,
+            stderrPath,
+            gateway,
+            oauth.issuerUrl,
+            undefined,
+            env,
+            undefined,
+            resumeMode === "startup" ? saved.session_id : undefined,
+          );
+          await session.waitForComposer(TIMEOUT);
+          if (resumeMode === "picker") {
+            await session.sendText("/resume");
+            await session.waitForPane((pane) => pane.includes("Sessions") && /\bturns?\b/.test(pane), TIMEOUT);
+            await session.sendKeys("Enter");
+            await session.waitForText("● Session resumed:", TIMEOUT);
+          }
+          await session.sendText("/model");
+          const catalog = await session.waitForPane(
+            (pane) => pane.includes("Models") && pane.includes(model) && pane.includes(otherModel),
+            10_000,
+          );
+          if (provider !== "gateway") expect(catalog).not.toContain(FAKE_GATEWAY_MODEL);
+          const direct = provider === "codex" ? chatgptOauth : grok;
+          const catalogPath = provider === "codex" ? "/chatgpt/models" : "/v1/models";
+          const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
+          const token = provider === "gateway" ? LOGIN_TOKEN : provider === "codex" ? chatgptOauth.accessToken : grok.initialAccessToken;
+          const catalogAuthorizations = provider === "gateway"
+            ? gateway.modelRequests.map((request) => request.headers.get("authorization"))
+            : direct.requests.filter((request) => request.path === catalogPath).map((request) => request.authorization);
+          const responses = () => provider === "gateway"
+            ? gateway!.requests.map((request) => ({ authorization: request.headers.get("authorization"), body: request.body }))
+            : direct.requests.filter((request) => request.path === responsePath);
+          expect(catalogAuthorizations.length).toBeGreaterThan(0);
+          const catalogSources = catalogAuthorizations.map((authorization) =>
+            authorization === `Bearer ${LOGIN_TOKEN}` ? "fx_login"
+              : authorization === `Bearer ${chatgptOauth!.accessToken}` ? "codex"
+                : authorization === `Bearer ${grok.initialAccessToken}` ? "grok"
+                  : authorization === null ? "public" : "other");
+          expect(catalogSources).toEqual(Array(catalogSources.length).fill(provider === "gateway" ? "fx_login" : provider));
+          expect(gateway.requests).toHaveLength(0);
+          expect(chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+          expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
+          expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(preferences);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+          await session.sendKeys("C-u");
+          await session.waitForComposer(TIMEOUT);
+          await session.sendText("Continue the restored provider session.");
+          await session.waitForPane(() => responses().length > 0, 10_000);
+          expect(responses()).toHaveLength(1);
+          expect(responses()[0]!.authorization).toBe(`Bearer ${token}`);
+          expect(responses()[0]!.body).toContain("Continue the restored provider session.");
+          if (provider === "gateway") await session.waitForText("GATEWAY_RESUME_REPLY", TIMEOUT);
+          if (provider !== "gateway") expect(gateway.requests).toHaveLength(0);
+          if (provider !== "codex") expect(chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+          if (provider !== "grok") expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
+          for (const [authorizations, expected] of [
+            [[...gateway.requests, ...gateway.modelRequests].map((request) => request.headers.get("authorization")), LOGIN_TOKEN],
+            [chatgptOauth.requests.map((request) => request.authorization), chatgptOauth.accessToken],
+            [grok.requests.map((request) => request.authorization), grok.initialAccessToken],
+          ] as const) {
+            for (const authorization of authorizations) {
+              if (authorization !== null) expect(authorization).toBe(`Bearer ${expected}`);
+            }
+          }
+          expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(preferences);
+          const scrollback = await session.captureFullScrollback();
+          expect(scrollback).not.toContain(token);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          await session.sendText("/quit");
+          await session.waitForSessionEnd();
+        } finally {
+          grok.stop();
+        }
+      },
+      60_000,
+    );
+  }
+}
 
 tmuxTest(
   "provider switch before the first prompt discards the previous credential prewarm",
