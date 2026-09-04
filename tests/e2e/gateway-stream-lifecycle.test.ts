@@ -7027,6 +7027,89 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("tool call ids remain canonical in storage and portable on model switch", async () => {
+    const root = createFixtureRoot("portable-call-ids");
+    const tracePath = join(root.root, "trace.log");
+    const ids = ["functions.read_file:0", "c".repeat(256), "call_keep"];
+    writeFileSync(join(root.workspace, "fixture.txt"), "id projection fixture\n");
+    const responses = [
+      fakeGatewaySse([
+        ...ids.map((id) => ({ type: "tool-call", toolCallId: id, toolName: "read_file", input: { path: "fixture.txt" } })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Read the fixture."),
+    ];
+    const gateway = startDynamicFakeGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Read fixture.txt."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      const json = parseAskJson(result.stdout);
+      expect(json.tool_calls).toEqual(ids.map(() => ({ name: "read_file", status: "success" })));
+      expect(gateway.requests).toHaveLength(2);
+      const firstParts = JSON.parse(gateway.requests[1]!.body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+      const wireIds = firstParts.filter((part: { type: string }) => part.type === "tool-call").map((part: { toolCallId: string }) => part.toolCallId);
+      expect(wireIds).toHaveLength(3);
+      expect(new Set(wireIds).size).toBe(3);
+      for (const id of wireIds) {
+        expect(id).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+        expect(toolResultOutput(gateway.requests[1]!.body, id)).toContain("id projection fixture");
+      }
+      expect(wireIds[0]).not.toBe(ids[0]);
+      expect(wireIds[1]).not.toBe(ids[1]);
+      expect(wireIds[2]).toBe(ids[2]);
+      const detail = await runFx(["session", "--id", json.session_id, "--json"], {
+        cwd: root.workspace, env: { HOME: root.home },
+      });
+      expect(detail.code).toBe(0);
+      const step = JSON.parse(detail.stdout).history[0].execution.tool_steps[0];
+      expect(step.tool_calls.map((call: { id: string }) => call.id)).toEqual(ids);
+      expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
+
+      responses.push(fakeGatewayFinalText("Resumed without more tools."));
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const id of wireIds) expect(toolResultOutput(gateway.requests[2]!.body, id)).toContain("id projection fixture");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("blank current tool id is rejected before file execution", async () => {
+    const root = createFixtureRoot("blank-call-id");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => fakeGatewayToolCall(" \t", "write_file", {
+      path: "must-not-exist.txt", content: "unexpected effect",
+    }));
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Write the fixture file."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("MalformedAuthoritativeToolIdentity");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(1);
+      expect(existsSync(join(root.workspace, "must-not-exist.txt"))).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("silent-tool continuation omits blank assistant text and keeps settled results", async () => {
     const root = createFixtureRoot("blank-continuation");
     const tracePath = join(root.root, "trace.log");

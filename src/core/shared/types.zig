@@ -1491,7 +1491,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and call.id.len == 0)
+        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
             FinalToolIdentity.empty
         else
             call.final_identity;
@@ -1529,6 +1529,16 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     return .admitted;
+}
+
+test "authoritative tool admission rejects blank current call ids" {
+    for ([_][]const u8{ "", " ", "\t\r\n" }) |id| {
+        const calls = [_]ToolCall{.{ .id = id, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+    }
 }
 
 test "authoritative tool admission rejects duplicate final ids across provenance" {
