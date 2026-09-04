@@ -3183,10 +3183,17 @@ test.skipIf(!tmuxAvailable())(
           );
           const historyAfter = await active.captureFullScrollback();
           expect(historyAfter).toContain(`┃ ${draft}`);
-          if (width === 120) {
-            const historyMarker = "ROW14 ALPHA14_abcdefghijklmnopqrstuvwxyz0123456789";
-            expect(historyBefore).toContain(historyMarker);
-            expect(historyAfter).toContain(historyMarker);
+          const beforeText = historyBefore.replace(/\s+/g, "");
+          const afterText = historyAfter.replace(/\s+/g, "");
+          let previousEnd = 0;
+          for (const paragraph of response.split("\n\n")) {
+            const text = paragraph.replace(/\s+/g, "");
+            expect(beforeText).toContain(text);
+            expect(afterText).toContain(text);
+            expect(afterText.split(text)).toHaveLength(2);
+            const start = afterText.indexOf(text, previousEnd);
+            expect(start).toBeGreaterThanOrEqual(previousEnd);
+            previousEnd = start + text.length;
           }
           const events = readFileSync(
             join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
