@@ -2615,7 +2615,7 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     };
 }
 
-test "queued fresh prompt waits for paused turn closure before provider execution" {
+test "queued fresh prompt closes only a still-paused turn before provider execution" {
     const session_codec = @import("../session/session_codec.zig");
     const session_store = @import("../session/session_store.zig");
     const Probe = struct {
@@ -2650,8 +2650,8 @@ test "queued fresh prompt waits for paused turn closure before provider executio
     };
     const alloc = std.testing.allocator;
     const queue_alloc = std.heap.c_allocator;
-    const Outcome = enum { success, preflight_oom, cancel_after_prepare };
-    for ([_]Outcome{ .success, .preflight_oom, .cancel_after_prepare }) |outcome| {
+    const Outcome = enum { success, preflight_oom, cancel_after_prepare, finished_before_prepare };
+    for ([_]Outcome{ .success, .preflight_oom, .cancel_after_prepare, .finished_before_prepare }) |outcome| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -2700,6 +2700,14 @@ test "queued fresh prompt waits for paused turn closure before provider executio
         queued.history = try app.session.snapshotHistory(queue_alloc);
         try app.worker.admitInteractivePrompt(queue_alloc, queued);
         try app.worker.enqueuePrompt(queue_alloc, try makeQueuedPrompt(queue_alloc));
+        const previous_finished = types.FinishedPrompt{ .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("same prompt") },
+            .assistant = @constCast("old completed answer"),
+        } } };
+        if (outcome == .finished_before_prepare) {
+            try app.worker.propagateHistoryTurn(queue_alloc, previous_finished.turn, 0);
+            try app.worker.pushEvent(queue_alloc, .{ .finish_prompt = previous_finished });
+        }
         app.worker.finishProcessing();
         const job = (try app.worker.tryTakeNextPrompt(queue_alloc)).?;
         defer worker_runtime.freeQueuedPrompt(queue_alloc, job);
@@ -2718,15 +2726,29 @@ test "queued fresh prompt waits for paused turn closure before provider executio
         };
         const deadline = io_mod.milliTimestamp() + 5_000;
         var observed = false;
+        while (true) {
+            app.worker.worker_mutex.lockUncancelable(io_mod.getIo());
+            const waiting = app.worker.history_publication_response == .waiting;
+            app.worker.worker_mutex.unlock(io_mod.getIo());
+            if (waiting) break;
+            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedFreshPromptPreparation;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
         while (!observed) {
             var events = app.worker.takeEvents();
             defer events.deinit(queue_alloc);
             defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
             for (events.items) |event| {
+                if (event == .finish_prompt) {
+                    try app_session_runtime.Runtime(FakeApp).appendFinishedPrompt(&app, event.finish_prompt);
+                    continue;
+                }
                 if (event != .prepare_fresh_prompt) continue;
                 try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
                 try std.testing.expect(!probe.returned.load(.acquire));
-                app.worker.resolveFreshPrompt(queue_alloc, event.prepare_fresh_prompt, &probe, Probe.prepare);
+                try std.testing.expectEqual(outcome != .finished_before_prepare, app.session_persistence.writable.?.conversation_writer.turn_open);
+                const current = app_session_runtime.Runtime(FakeApp).normalizeFreshPromptPreparation(&app, event.prepare_fresh_prompt);
+                app.worker.resolveFreshPrompt(queue_alloc, current, &probe, Probe.prepare);
                 observed = true;
             }
             if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedFreshPromptPreparation;
@@ -2746,7 +2768,11 @@ test "queued fresh prompt waits for paused turn closure before provider executio
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), probe.requests.load(.seq_cst));
-        try std.testing.expectEqualStrings("old partial answer", app.worker.queued_history[1].interrupted.assistant.?);
+        if (outcome == .finished_before_prepare) {
+            for (app.worker.queued_history) |turn| try std.testing.expect(turn != .interrupted);
+        } else {
+            try std.testing.expectEqualStrings("old partial answer", app.worker.queued_history[1].interrupted.assistant.?);
+        }
         var events = app.worker.takeEvents();
         defer events.deinit(queue_alloc);
         defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
@@ -2756,8 +2782,13 @@ test "queued fresh prompt waits for paused turn closure before provider executio
         var page = try app.session_persistence.store.?.loadHistoryPage(alloc, "queued-pause", null, 10);
         defer page.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 2), page.turns.len);
-        try std.testing.expectEqualStrings("same prompt", page.turns[0].interrupted.user.text);
-        try std.testing.expectEqualStrings("old partial answer", page.turns[0].interrupted.assistant.?);
+        if (outcome == .finished_before_prepare) {
+            try std.testing.expectEqualStrings("same prompt", page.turns[0].assistant.user.text);
+            try std.testing.expectEqualStrings("old completed answer", page.turns[0].assistant.assistant);
+        } else {
+            try std.testing.expectEqualStrings("same prompt", page.turns[0].interrupted.user.text);
+            try std.testing.expectEqualStrings("old partial answer", page.turns[0].interrupted.assistant.?);
+        }
         try std.testing.expectEqualStrings("same prompt", page.turns[1].assistant.user.text);
         try std.testing.expectEqualStrings("new answer", page.turns[1].assistant.assistant);
     }

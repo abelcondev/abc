@@ -1266,7 +1266,8 @@ pub fn Bindings(comptime App: type) type {
 
         pub fn prepareFreshPrompt(app: *App, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
             if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                return app.worker.publishFreshPrompt(std.heap.c_allocator, value, app, workerBridgePrepareFreshPrompt);
+                const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                return app.worker.publishFreshPrompt(std.heap.c_allocator, current, app, workerBridgePrepareFreshPrompt);
             }
             return app.worker.prepareFreshPrompt(std.heap.c_allocator, value);
         }

@@ -1625,43 +1625,6 @@ fn retainLatestCheckpointHistory(
     state.context_history_start = 0;
 }
 
-fn removeCompactedSummaries(
-    alloc: Allocator,
-    state: *session_codec.DurableSessionState,
-) !void {
-    var raw_count: usize = 0;
-    for (state.history) |turn| if (turn != .compacted_summary) {
-        raw_count += 1;
-    };
-    if (raw_count == 0 and state.history.len > 0) {
-        const retained = try alloc.alloc(session.HistoryTurn, 1);
-        retained[0] = state.history[state.history.len - 1];
-        for (state.history[0 .. state.history.len - 1]) |turn| {
-            session.freeHistoryTurn(alloc, turn);
-        }
-        alloc.free(state.history);
-        state.history = retained;
-        state.context_history_start = 0;
-        return;
-    }
-    if (raw_count == state.history.len) {
-        state.context_history_start = 0;
-        return;
-    }
-    const raw = try alloc.alloc(session.HistoryTurn, raw_count);
-    var index: usize = 0;
-    for (state.history) |turn| switch (turn) {
-        .compacted_summary => session.freeHistoryTurn(alloc, turn),
-        else => {
-            raw[index] = turn;
-            index += 1;
-        },
-    };
-    alloc.free(state.history);
-    state.history = raw;
-    state.context_history_start = 0;
-}
-
 fn projectConversationSnapshotLocators(
     alloc: Allocator,
     history: []session.HistoryTurn,
@@ -2370,7 +2333,6 @@ fn importLegacySnapshotStateWithOps(
     try recoverInterruptedLegacyImport(alloc, writable);
     var converted = try state.dupe(alloc);
     errdefer converted.deinit(alloc);
-    try removeCompactedSummaries(alloc, &converted);
     try projectConversationSnapshotLocators(alloc, converted.history);
 
     const display_path = try io_mod.dirRealpathAlloc(
@@ -2404,8 +2366,21 @@ fn importLegacySnapshotStateWithOps(
     };
     var writer_owned = true;
     defer if (writer_owned) writer.deinit();
-    for (converted.history) |turn| {
-        try writer.appendHistoryTurn(alloc, converted.updated_at_ms, turn);
+    for (converted.history, 0..) |turn, index| {
+        if (turn == .compacted_summary) {
+            // Legacy archives can retain raw turns before the active summary.
+            // Earlier summaries stay archived without advancing that cut.
+            const coverage = if (index > 0 and index == converted.context_history_start)
+                try writer.contextCoverage(alloc, .{ .turns = turn.compacted_summary.removed_turn_count }, &.{})
+            else
+                writer.latest_checkpoint_coverage;
+            _ = try writer.append(alloc, converted.updated_at_ms, .{ .context_checkpoint = .{
+                .covers_through_seq = coverage,
+                .summary = turn.compacted_summary.summary,
+            } });
+        } else {
+            try writer.appendHistoryTurn(alloc, converted.updated_at_ms, turn);
+        }
     }
     const conversation_seq = writer.last_seq;
     writer.deinit();
@@ -2471,6 +2446,14 @@ fn importLegacySnapshotStateWithOps(
         return err;
     };
     metadata_published = true;
+
+    var hydrated = (try loadConversationStateIfPresent(alloc, &writable.dir, converted.id)) orelse
+        return error.InvalidSessionMetadata;
+    defer hydrated.deinit(alloc);
+    session.freeHistoryTurnSlice(alloc, converted.history);
+    converted.history = hydrated.history;
+    hydrated.history = &.{};
+    converted.context_history_start = hydrated.context_history_start;
 
     var event_file = try openManagedFile(
         &writable.dir,
@@ -3552,6 +3535,48 @@ test "legacy import recovery restores old authority or keeps published current d
         try std.testing.expectEqualStrings(current, retained);
         try std.testing.expect(!try legacyImportRecoveryNeeded(&writable.dir));
     }
+}
+
+test "legacy import preserves the active retained tail and complete archive" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-retained-tail", 10);
+    defer initial.deinit(alloc);
+    const history = [_]session.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("removed request") }, .assistant = @constCast("removed answer") } },
+        .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>earlier summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 1 } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("retained request") }, .assistant = @constCast("retained answer") } },
+        .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>active summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 2 } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("later request") }, .assistant = @constCast("later answer") } },
+    };
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    initial.context_history_start = 3;
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), migrated.state.history.len);
+        try std.testing.expectEqualStrings(history[3].compacted_summary.summary, migrated.state.history[0].compacted_summary.summary);
+        try std.testing.expectEqualStrings("retained answer", migrated.state.history[1].assistant.assistant);
+        try std.testing.expectEqualStrings("later answer", migrated.state.history[2].assistant.assistant);
+        const archive = try loadConversationArchive(alloc, &migrated.log.dir);
+        defer session.freeHistoryTurnSlice(alloc, archive);
+        try std.testing.expectEqual(history.len, archive.len);
+        try std.testing.expectEqualStrings("removed answer", archive[0].assistant.assistant);
+        try std.testing.expectEqualStrings(history[1].compacted_summary.summary, archive[1].compacted_summary.summary);
+    }
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), resumed.state.history.len);
+    try std.testing.expectEqualStrings(history[3].compacted_summary.summary, resumed.state.history[0].compacted_summary.summary);
+    try std.testing.expectEqualStrings("retained answer", resumed.state.history[1].assistant.assistant);
+    try std.testing.expectEqualStrings("later answer", resumed.state.history[2].assistant.assistant);
 }
 
 test "legacy import preserves published events and active recovery after metadata sync failure" {

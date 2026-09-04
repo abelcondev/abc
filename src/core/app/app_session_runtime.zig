@@ -2237,19 +2237,33 @@ pub fn Runtime(comptime App: type) type {
             return try value.dupe(alloc);
         }
 
+        pub fn normalizeFreshPromptPreparation(app: *App, request: worker_runtime.FreshPromptPreparation) worker_runtime.FreshPromptPreparation {
+            if (comptime !@hasField(App, "session_persistence")) return request;
+            var current = request;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.writable) |*loaded| {
+                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
+                    debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
+                    current.prior_turn = null;
+                }
+            }
+            return current;
+        }
+
         pub fn prepareFreshPrompt(app: *App, request: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
             const alloc = std.heap.c_allocator;
             var source: std.ArrayList(types.HistoryTurn) = .empty;
             defer source.deinit(alloc);
             try source.appendSlice(alloc, app.session.agent.history.items);
-            try source.append(alloc, request.prior_turn);
+            if (request.prior_turn) |prior| try source.append(alloc, prior);
             const history = try session_runtime.snapshotOwnedContextHistory(alloc, source.items, 0, 0);
             errdefer types.freeHistoryTurnSlice(alloc, history);
             const images = try session_runtime.collect_image_catalog(alloc, history, request.user.images);
             errdefer types.freeImageAttachmentSlice(alloc, images);
             const intent = try auto_classifier_context.buildCanonicalRootUserContext(alloc, request.user.text, history);
             errdefer alloc.free(intent);
-            try appendHistoryTurn(app, request.prior_turn);
+            if (request.prior_turn) |prior| try appendHistoryTurn(app, prior);
             return .{
                 .history = history,
                 .authorized_image_catalog = images,

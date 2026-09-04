@@ -883,7 +883,8 @@ pub fn Runtime(comptime App: type) type {
                         }
                     },
                     .prepare_fresh_prompt => |value| {
-                        app.worker.resolveFreshPrompt(std.heap.c_allocator, value, handlers.ctx, handlers.prepare_fresh_prompt);
+                        const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                        app.worker.resolveFreshPrompt(std.heap.c_allocator, current, handlers.ctx, handlers.prepare_fresh_prompt);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {

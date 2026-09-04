@@ -4316,13 +4316,19 @@ fn writeLegacyIncompleteAuthorityFixture(
     workspace_root: []const u8,
     updated_at_ms: i64,
 ) !void {
-    const history = [_]session.HistoryTurn{.{ .compacted_summary = .{
-        .summary = @constCast("legacy summary"),
-        .removed_turn_count = 2,
-        .compaction_count = 1,
-        .root_user_messages_complete = false,
-        .permission_feedback_complete = false,
-    } }};
+    const history = [_]session.HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("legacy summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+            .root_user_messages_complete = false,
+            .permission_feedback_complete = false,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("recent request") },
+            .assistant = @constCast("recent answer"),
+        } },
+    };
     const rendered = try session_json.renderSessionJson(
         alloc,
         id,
@@ -6639,7 +6645,7 @@ test "writable resume migrates legacy storage" {
     try std.testing.expectEqual(StorageFormat.conversation, detail.storage_format);
 }
 
-test "writable legacy resume preserves incomplete authority through migration and reload" {
+test "writable legacy resume preserves summary tail and incomplete authority through migration and reload" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6657,7 +6663,10 @@ test "writable legacy resume preserves incomplete authority through migration an
     {
         var resumed = try ctx.store.resumeForWrite(alloc, session_id);
         defer resumed.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+        try std.testing.expectEqual(@as(usize, 2), resumed.state.history.len);
+        try std.testing.expectEqualStrings("legacy summary", resumed.state.history[0].compacted_summary.summary);
+        try std.testing.expectEqualStrings("recent request", resumed.state.history[1].assistant.user.text);
+        try std.testing.expectEqualStrings("recent answer", resumed.state.history[1].assistant.assistant);
         try std.testing.expect(
             !resumed.state.history[0].compacted_summary.root_user_messages_complete,
         );
@@ -6668,7 +6677,10 @@ test "writable legacy resume preserves incomplete authority through migration an
 
     var reloaded = try ctx.store.loadReadOnly(alloc, session_id);
     defer reloaded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), reloaded.history.len);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.history.len);
+    try std.testing.expectEqualStrings("legacy summary", reloaded.history[0].compacted_summary.summary);
+    try std.testing.expectEqualStrings("recent request", reloaded.history[1].assistant.user.text);
+    try std.testing.expectEqualStrings("recent answer", reloaded.history[1].assistant.assistant);
     try std.testing.expect(
         !reloaded.history[0].compacted_summary.root_user_messages_complete,
     );

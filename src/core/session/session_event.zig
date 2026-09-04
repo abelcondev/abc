@@ -159,12 +159,8 @@ pub fn validateConversationTransition(
             }
         },
         .context_checkpoint => |checkpoint| {
-            const initial_empty_checkpoint = state.last_seq == 0 and
-                state.latest_checkpoint_coverage == 0 and
-                checkpoint.covers_through_seq == 0;
-            if (!initial_empty_checkpoint and
-                (checkpoint.covers_through_seq <= state.latest_checkpoint_coverage or
-                    checkpoint.covers_through_seq > state.last_seq))
+            if (checkpoint.covers_through_seq < state.latest_checkpoint_coverage or
+                checkpoint.covers_through_seq > state.last_seq)
             {
                 return error.InvalidCheckpointCoverage;
             }
@@ -3144,6 +3140,22 @@ test "conversation transition validates sequence tool identity and checkpoint sa
         .timestamp_ms = 10,
         .event = .{ .context_checkpoint = .{ .covers_through_seq = 1, .summary = "checkpoint" } },
     });
+    const checkpointed = ConversationStateView{ .last_seq = 3, .latest_checkpoint_coverage = 1, .pending_tool_calls = &pending };
+    try validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 1, .summary = "same covered prefix" } },
+    });
+    try std.testing.expectError(error.InvalidCheckpointCoverage, validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 0, .summary = "backwards coverage" } },
+    }));
+    try std.testing.expectError(error.InvalidCheckpointCoverage, validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 4, .summary = "future coverage" } },
+    }));
     try std.testing.expectError(error.OutOfOrderConversationEvent, validateConversationTransition(state, .{
         .seq = 4,
         .timestamp_ms = 10,

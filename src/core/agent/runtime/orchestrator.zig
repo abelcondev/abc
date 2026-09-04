@@ -5284,7 +5284,7 @@ fn processQueuedPromptLoop(
                 pending_auto_retry_status = null;
                 return;
             }
-            const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null;
+            const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
             } else {

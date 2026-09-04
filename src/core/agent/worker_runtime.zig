@@ -427,7 +427,7 @@ pub const ContextCompactionHandler = *const fn (*anyopaque, ContextCompaction) a
 pub const FreshPromptPreparation = struct {
     turn_id: u64 = 0,
     user: types.UserTurn,
-    prior_turn: types.HistoryTurn,
+    prior_turn: ?types.HistoryTurn = null,
 };
 
 pub const FreshPromptHistory = struct {
@@ -1723,6 +1723,7 @@ pub const WorkerRuntime = struct {
     }
 
     fn publishFreshPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) !FreshPromptHistory {
+        const prior_turn = event.prior_turn orelse return handler(ctx, event);
         const Publication = struct {
             ctx: *anyopaque,
             handler: FreshPromptHandler,
@@ -1735,7 +1736,7 @@ pub const WorkerRuntime = struct {
             }
         };
         var publication: Publication = .{ .ctx = ctx, .handler = handler, .event = event };
-        try self.propagateHistoryTurnLocked(alloc, event.prior_turn, 0, .{ .ctx = &publication, .commit_fn = Publication.commit });
+        try self.propagateHistoryTurnLocked(alloc, prior_turn, 0, .{ .ctx = &publication, .commit_fn = Publication.commit });
         return publication.result.?;
     }
 
@@ -3681,7 +3682,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             break :blk .{ .prepare_fresh_prompt = .{
                 .turn_id = value.turn_id,
                 .user = user,
-                .prior_turn = try types.dupeHistoryTurn(alloc, value.prior_turn),
+                .prior_turn = if (value.prior_turn) |prior| try types.dupeHistoryTurn(alloc, prior) else null,
             } };
         },
         .context_compaction => |value| blk: {
@@ -3748,7 +3749,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
         .prepare_fresh_prompt => |value| {
             types.freeUserTurn(alloc, value.user);
-            types.freeHistoryTurn(alloc, value.prior_turn);
+            if (value.prior_turn) |prior| types.freeHistoryTurn(alloc, prior);
         },
         .context_compaction => |value| {
             types.freeHistoryTurn(alloc, .{ .compacted_summary = value.summary });

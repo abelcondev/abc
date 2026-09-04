@@ -3429,6 +3429,60 @@ test "interruption after automatic compaction retains the recent and new executi
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
 }
 
+test "context overflow after automatic compaction retries with new execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const first_calls = [_]ToolCall{toolCall("before-checkpoint", "read_file", "{\"path\":\"first.txt\"}")};
+    const later_calls = [_]ToolCall{toolCall("after-checkpoint", "read_file", "{\"path\":\"later.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .content = "The first read completed." },
+        .{ .tool_calls = &later_calls },
+        .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"input exceeds the context window\"}}" },
+        .{ .content = "The prior reads both completed." },
+        .{ .content = "Recovered after a second compaction." },
+    });
+    defer gateway.deinit();
+    const model = "provider/compaction-interruption";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 28_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = "later result" } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier work") },
+        .assistant = @constCast("o" ** 80_000),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("Recovered after a second compaction.", hooks.finish_assistant_text.?);
+    const finished = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), finished.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", finished.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 2), finished.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+}
+
 test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
     const alloc = std.testing.allocator;
     const model = "provider/capacity-failure";

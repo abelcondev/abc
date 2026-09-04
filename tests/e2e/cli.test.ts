@@ -4253,8 +4253,14 @@ describe("cli: ask success", () => {
         const legacyPath = join(sessionDir, "session.json");
         const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
         const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
-        legacy.history_len = 1;
+        const legacySummary = "LEGACY_ONLY_EARLIER_CONTEXT: deploy to eu-west-1.";
+        legacy.history_len = 2;
         legacy.history = [{
+          kind: "compacted_summary",
+          summary: legacySummary,
+          removed_turn_count: 12,
+          compaction_count: 1,
+        }, {
           kind: "assistant",
           user: { text: "LEGACY_ORIGINAL_REQUEST", images: [] },
           assistant: "LEGACY_ORIGINAL_ANSWER",
@@ -4319,6 +4325,7 @@ describe("cli: ask success", () => {
           .map((line) => JSON.parse(line));
         const events = records.map((record) => Object.keys(record.event)[0]);
         expect(events).toEqual([
+          "context_checkpoint",
           "user",
           "tool_call",
           "tool_result",
@@ -4333,6 +4340,7 @@ describe("cli: ask success", () => {
         ]);
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
+          expect(request.body).toContain(legacySummary);
           expect(request.body).toContain("LEGACY_ORIGINAL_REQUEST");
           expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
           expect(request.body).toContain(legacyOutput);
