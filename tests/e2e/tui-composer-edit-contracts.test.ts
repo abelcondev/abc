@@ -99,7 +99,8 @@ async function startFx(
           id: FAKE_GATEWAY_MODEL,
           type: "language",
           tags: ["vision", "file-input", "tool-use"],
-          context_window: 256_000,
+          // Exercise composer byte limits independently of context compaction.
+          context_window: 16_000_000,
           max_tokens: 64_000,
         }],
       },

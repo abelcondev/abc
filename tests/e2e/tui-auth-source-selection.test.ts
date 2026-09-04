@@ -114,11 +114,11 @@ function startFakeDirectUsageProvider(
 
 function startFakeProviderCompaction(provider: "codex" | "grok") {
   const workingModel = provider === "codex" ? "gpt-5.6-sol" : "grok-4.6";
-  const compactionModel = provider === "codex" ? "gpt-5.6-luna" : "grok-4.5";
   const accessToken = provider === "codex"
     ? chatgptAccessToken()
     : "grok-compaction-token";
   const bodies: string[] = [];
+  const urls: string[] = [];
   const authorizations: Array<string | null> = [];
   const modelOverrides: Array<string | null> = [];
   let workingRequests = 0;
@@ -126,52 +126,37 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
+      urls.push(request.url);
       const path = new URL(request.url).pathname;
       if (path === "/models") {
         return provider === "codex"
           ? Response.json({ models: [
-            { slug: workingModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 200_000 },
-            { slug: compactionModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272_000 },
+            { slug: workingModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 1_050_000 },
+            { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272_000 },
             { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128_000 },
           ] })
           : Response.json({ data: [
-            grokSubscriptionModel(workingModel, 200_000),
-            grokSubscriptionModel(compactionModel, 500_000),
+            grokSubscriptionModel(workingModel, 1_050_000),
           ] });
       }
       if (path === "/modalities") {
         return Response.json({ models: [
           grokModalityModel(workingModel, false),
-          grokModalityModel(compactionModel, false),
         ] });
       }
       const body = await request.text();
       bodies.push(body);
       authorizations.push(request.headers.get("authorization"));
       modelOverrides.push(request.headers.get("x-grok-model-override"));
-      const model = (JSON.parse(body) as { model?: string }).model;
-      if (model !== compactionModel) workingRequests += 1;
-      if (model !== compactionModel && workingRequests === 1) {
-        const pressure = Array.from(
-          { length: 10_000 },
-          (_, index) => createHash("sha256").update(`${provider}:${index}`).digest("hex"),
-        ).join("");
-        const input = JSON.stringify({
-          action: "exec",
-          command: `printf TOOL_PRESSURE_OK >/dev/null # ${pressure}`,
-          timeout_ms: 600_000,
-        });
-        return new Response(
-          'data: {"type":"response.output_text.delta","delta":"Running the requested pressure fixture."}\n\n' +
-            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pressure","name":"terminal"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: input })}\n\n` +
-            'data: {"type":"response.completed","response":{"id":"response-tool","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
-          { headers: { "content-type": "text/event-stream" } },
-        );
+      const parsed = JSON.parse(body) as { tools?: unknown[] };
+      const compacting = (parsed.tools?.length ?? 0) === 0;
+      if (!compacting) workingRequests += 1;
+      if (!compacting && workingRequests === 2) {
+        return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
-      const text = model === compactionModel
-        ? "Continue after provider-local compaction."
-        : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+      const text = compacting
+        ? "The earlier request established the saved facts."
+        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS" : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
           `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
@@ -185,7 +170,7 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
     authorizations,
     modelOverrides,
     workingModel,
-    compactionModel,
+    urls,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
@@ -4530,9 +4515,8 @@ test(
             : { provider, grok_model: direct.workingModel }) + "\n",
           { mode: 0o600 },
         );
-        const result = await runFx(
-          ["ask", "--json", "--yolo", `Run the pressure fixture and continue as requested for ${provider}.`],
-          {
+        const options = {
+            cwd: testHome,
             env: {
               HOME: testHome,
               AI_GATEWAY_API_KEY: "gateway-compaction-sentinel",
@@ -4540,6 +4524,8 @@ test(
               FX_DISABLE_KEYCHAIN: "1",
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+              FX_TRACE_LOG: join(testHome, "compaction.log"),
+              FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction,session",
               FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
               FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
               FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
@@ -4548,10 +4534,14 @@ test(
               FX_E2E_XAI_GROK_MODALITIES_URL: direct.modalitiesUrl,
             },
             timeoutMs: 60_000,
-          },
-        );
+          };
+        const catalog = await runFx(["models", "--json"], options);
+        expect(catalog.code, `${catalog.stdout}\n${catalog.stderr}\n${JSON.stringify(direct.urls)}`).toBe(0);
+        const seeded = await runFx(["ask", "--json", "--yolo", "Keep these provider facts."], options);
+        expect(seeded.code).toBe(0);
+        const result = await runFx(["ask", "--json", "--yolo", "--resume-id", JSON.parse(seeded.stdout).session_id, "Continue from those facts."], options);
 
-        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}\nrequests=${direct.bodies.length}\n${readFileSync(join(testHome, "compaction.log"), "utf8").split("\n").filter((line) => line.includes("context_compaction")).join("\n")}`).toBe(0);
         expect(JSON.parse(result.stdout).output).toContain(`${provider.toUpperCase()}_COMPACTION_CONTINUED`);
         expect(
           direct.bodies.map((body) => (JSON.parse(body) as { model: string }).model),
@@ -4559,14 +4549,10 @@ test(
             body_lengths: direct.bodies.map((body) => body.length),
           }),
         )
-          .toEqual([direct.workingModel, direct.compactionModel, direct.workingModel]);
-        expect(direct.authorizations).toEqual(Array(3).fill(`Bearer ${direct.accessToken}`));
+          .toEqual(Array(4).fill(direct.workingModel));
+        expect(direct.authorizations).toEqual(Array(4).fill(`Bearer ${direct.accessToken}`));
         if (provider === "grok") {
-          expect(direct.modelOverrides).toEqual([
-            direct.workingModel,
-            direct.compactionModel,
-            direct.workingModel,
-          ]);
+          expect(direct.modelOverrides).toEqual(Array(4).fill(direct.workingModel));
         }
         expect(testGateway.requests).toHaveLength(0);
       } finally {

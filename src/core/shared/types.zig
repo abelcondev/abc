@@ -1021,6 +1021,13 @@ pub const ExecutionMemory = struct {
     }
 };
 
+/// A cut in the active context, not a second persisted history.
+pub const ContextHistoryCut = struct {
+    turns: usize = 0,
+    tool_steps: usize = 0,
+    steering: usize = 0,
+};
+
 pub const ImageAttachment = struct {
     id: usize = 0,
     path: []u8,
