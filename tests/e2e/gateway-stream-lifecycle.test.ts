@@ -2295,6 +2295,73 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("non-object tool inputs remain failed and replay-safe across a mixed batch and model switch", async () => {
+    const root = createFixtureRoot("non-object-inputs");
+    const tracePath = join(root.root, "trace.log");
+    const inputs: unknown[] = [[], "[]", "[1]", "42", "null", "true", '"text"'];
+    const badCalls = inputs.map((input, index) => ({
+      type: "tool-call", toolCallId: `invalid_${index}`, toolName: "read_file", input,
+    }));
+    const invalidSubagent = { type: "tool-call", toolCallId: "invalid_subagent", toolName: "subagent", input: "[]" };
+    const responses = [
+      fakeGatewaySse([
+        ...badCalls,
+        invalidSubagent,
+        { type: "tool-call", toolCallId: "valid_write", toolName: "write_file", input: { path: "valid.txt", content: "written once\n" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Rejected invalid calls and completed the valid write."),
+      fakeGatewayFinalText("Resumed safely with another model."),
+    ];
+    const gateway = startDynamicFakeGateway(
+      () => responses.shift() ?? new Response("unexpected request", { status: 500 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Run the fixture batch."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,tool" },
+        timeoutMs: 20_000,
+      });
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.tool_calls.filter((call) => call.name === "read_file")).toEqual(
+        badCalls.map(() => ({ name: "read_file", status: "error" })),
+      );
+      expect(firstJson.tool_calls.filter((call) => call.name === "write_file")).toEqual([{ name: "write_file", status: "success" }]);
+      expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error" }]);
+      expect(readFileSync(join(root.workspace, "valid.txt"), "utf8")).toBe("written once\n");
+      expect(readFileSync(tracePath, "utf8")).toContain("failure=non_object_json");
+      expect(first.stderr).not.toContain("Reading");
+      expect(gateway.requests).toHaveLength(2);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 20_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const request of gateway.requests.slice(1)) {
+        const prompt = parseGatewayRequest(request.body).prompt;
+        const parts = prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+        for (const call of [...badCalls, invalidSubagent]) {
+          expect(parts).toContainEqual({ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: {} });
+          expect(parts).toContainEqual(expect.objectContaining({
+            type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName,
+            output: expect.objectContaining({ type: "error-text", value: expect.stringContaining("not executed") }),
+          }));
+        }
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("default ask stops a consecutive malformed argument loop", async () => {
     const root = createFixtureRoot("repeated-malformed-arguments");
     const tracePath = join(root.root, "trace.log");

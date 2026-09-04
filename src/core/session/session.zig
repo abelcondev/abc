@@ -1465,14 +1465,29 @@ pub fn repairPersistedToolArguments(
     source: PersistedToolArgumentsSource,
 ) !void {
     for (calls) |call| {
-        if (call.argument_integrity == .malformed_json) {
+        if (call.argument_integrity != .valid) {
             _ = try persistedResultForMalformedCall(calls, results, call);
         }
     }
 
     for (calls) |*call| {
-        if (call.argument_integrity != .malformed_json) continue;
+        if (call.argument_integrity == .valid) continue;
         const result = try persistedResultForMalformedCall(calls, results, call.*);
+        const integrity = call.argument_integrity;
+        if (integrity == .non_object_json) {
+            // Repair replay input without changing what the stored result says happened.
+            if (call.provider_result != null or result.provider_native) {
+                call.provenance = .provider_executed;
+                call.argument_integrity = .valid;
+                continue;
+            }
+            const safe_arguments = try alloc.dupe(u8, "{}");
+            alloc.free(call.arguments_json);
+            call.arguments_json = safe_arguments;
+            call.argument_integrity = .valid;
+            tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
+            continue;
+        }
         const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name);
 
         alloc.free(result.output);
@@ -1487,17 +1502,29 @@ pub fn repairPersistedToolArguments(
         result.truncated = false;
         result.provider_native = false;
         call.argument_integrity = .valid;
-        tracePersistedToolArgumentsRepair(call.*, source, true);
+        tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
     }
 }
 
 pub fn repairPersistedInterruptedToolArguments(
+    alloc: Allocator,
     call: *ToolCall,
     source: PersistedToolArgumentsSource,
-) void {
-    if (call.argument_integrity != .malformed_json) return;
+) Allocator.Error!void {
+    if (call.argument_integrity == .valid) return;
+    const integrity = call.argument_integrity;
+    if (integrity == .non_object_json) {
+        if (call.provider_result != null) {
+            call.provenance = .provider_executed;
+            call.argument_integrity = .valid;
+            return;
+        }
+        const safe_arguments = try alloc.dupe(u8, "{}");
+        alloc.free(call.arguments_json);
+        call.arguments_json = safe_arguments;
+    }
     call.argument_integrity = .valid;
-    tracePersistedToolArgumentsRepair(call.*, source, false);
+    tracePersistedToolArgumentsRepair(call.*, source, false, integrity);
 }
 
 fn persistedResultForMalformedCall(
@@ -1527,13 +1554,14 @@ fn tracePersistedToolArgumentsRepair(
     call: ToolCall,
     source: PersistedToolArgumentsSource,
     paired_result: bool,
+    integrity: core_types.ToolArgumentIntegrity,
 ) void {
     debug_trace.eventf(
         "session",
         "persisted_tool_arguments_repaired",
         .{},
-        "source={s} call_id={s} tool={s} failure=malformed_json paired_result={s}",
-        .{ @tagName(source), call.id, call.name, if (paired_result) "true" else "false" },
+        "source={s} call_id={s} tool={s} failure={s} paired_result={s}",
+        .{ @tagName(source), call.id, call.name, @tagName(integrity), if (paired_result) "true" else "false" },
     );
 }
 
