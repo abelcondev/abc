@@ -2145,11 +2145,12 @@ describe("gateway stream lifecycle", () => {
   }, 30_000);
 
   test.skipIf(!tmuxAvailable())("skill location calls show names and resource paths in the transcript", async () => {
+    const binary = process.env.FX_TEST_PRODUCT_EXE ?? FX_BIN;
     const root = createFixtureRoot("skill-location-labels");
     const skillName = "visible-workflow";
     const skillDirectory = join(root.home, ".fx", "skills", "different-directory");
     mkdirSync(join(skillDirectory, "references"), { recursive: true });
-    writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n`);
+    writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n${"Required instructions.\n".repeat(1200)}`);
     writeFileSync(join(skillDirectory, "references", "rules.md"), "REFERENCE_LABEL_BODY\n");
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway((body) => {
@@ -2170,6 +2171,7 @@ describe("gateway stream lifecycle", () => {
     let tui: TmuxSession | null = null;
     try {
       tui = await TmuxSession.create({
+        cmd: binary,
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
         stderrPath,
@@ -2186,6 +2188,33 @@ describe("gateway stream lifecycle", () => {
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const sessionsDirectory = join(root.home, ".fx", "sessions");
+      const sessionIds = readdirSync(sessionsDirectory);
+      expect(sessionIds).toHaveLength(1);
+      const resultsDirectory = join(sessionsDirectory, sessionIds[0]!, "tool-results");
+      const mainArtifacts = readdirSync(resultsDirectory).filter((name) =>
+        readFileSync(join(resultsDirectory, name), "utf8").includes("MAIN_LABEL_BODY"));
+      expect(mainArtifacts).toHaveLength(1);
+      rmSync(join(resultsDirectory, mainArtifacts[0]!));
+      rmSync(skillDirectory, { recursive: true, force: true });
+      const resumeStderr = join(root.root, "resume-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${binary} --resume-last`,
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        stderrPath: resumeStderr,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("SKILL_LABEL_CHECK_COMPLETE", 15_000);
+      const restored = await tui.captureFullScrollback();
+      expect(restored).toContain(`Loaded skill ${skillName}`);
+      expect(restored).toContain("Read skill resource references/rules.md");
+      expect(restored).not.toContain("Loaded skill skill");
+      expect(gateway.requestCount()).toBe(2);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumeStderr, "utf8")).toBe("");
     } finally {
       if (tui) await tui.kill();
       gateway.stop();

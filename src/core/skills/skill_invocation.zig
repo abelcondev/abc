@@ -14,6 +14,7 @@ else
 const Allocator = std.mem.Allocator;
 const ambiguous_skill_suffix_fmt = "; {d} additional advertised location{s} omitted by the {d}-byte tool-result limit. Refresh available skills and retry with an advertised name and location.";
 const discovery_model_notice = "<skill_discovery_warning details=\"context_notice\" />\n";
+const content_name_prefix = "<skill_content name=\"";
 const test_workspace_roots = [_]skill_contract.RootSpec{
     .{ .source = .workspace_shared, .path = "skills" },
 };
@@ -21,6 +22,101 @@ const test_root_policy: skill_contract.RootPolicy = .{
     .workspace_roots = &test_workspace_roots,
     .managed_root_source = .global_fx,
 };
+
+/// Returns a name borrowed from buffer for display only, never skill resolution.
+pub fn displayNameFromOutput(output: []const u8, buffer: *[skill_contract.max_name_bytes]u8) ?[]const u8 {
+    const content = if (std.mem.startsWith(u8, output, discovery_model_notice)) output[discovery_model_notice.len..] else output;
+    if (!std.mem.startsWith(u8, content, content_name_prefix)) return null;
+    const rest = content[content_name_prefix.len..];
+    const end = std.mem.findScalar(u8, rest[0..@min(rest.len, skill_contract.max_name_bytes * 6 + 1)], '"') orelse return null;
+    if (!std.mem.startsWith(u8, rest[end..], "\" location=\"") and
+        !std.mem.startsWith(u8, rest[end..], "\" resource=\"")) return null;
+    const encoded = rest[0..end];
+    const entities = [_]struct { encoded: []const u8, decoded: []const u8 }{
+        .{ .encoded = "&amp;", .decoded = "&" },
+        .{ .encoded = "&lt;", .decoded = "<" },
+        .{ .encoded = "&gt;", .decoded = ">" },
+        .{ .encoded = "&quot;", .decoded = "\"" },
+        .{ .encoded = "&#x85;", .decoded = "\xc2\x85" },
+        .{ .encoded = "&#x2028;", .decoded = "\xe2\x80\xa8" },
+        .{ .encoded = "&#x2029;", .decoded = "\xe2\x80\xa9" },
+    };
+    var cursor: usize = 0;
+    var written: usize = 0;
+    while (cursor < encoded.len) {
+        const bytes = if (encoded[cursor] == '&') entity: {
+            for (entities) |pair| {
+                if (!std.mem.startsWith(u8, encoded[cursor..], pair.encoded)) continue;
+                cursor += pair.encoded.len;
+                break :entity pair.decoded;
+            }
+            return null;
+        } else literal: {
+            if (encoded[cursor] == '<' or encoded[cursor] == '>') return null;
+            cursor += 1;
+            break :literal encoded[cursor - 1 .. cursor];
+        };
+        if (bytes.len > buffer.len - written) return null;
+        @memcpy(buffer[written..][0..bytes.len], bytes);
+        written += bytes.len;
+    }
+    const name = buffer[0..written];
+    return if (skill_contract.invalidSkillNameCause(name) == null) name else null;
+}
+
+test "skill display names round trip the generated result header within its preview" {
+    const names = [_][]const u8{ "workflow", "quotes\" & <name> ' café", "literal &quot; &amp;", "line\u{0085}\u{2028}\u{2029}break", "\"" ** skill_contract.max_name_bytes };
+    for (names) |name| {
+        for ([_]bool{ false, true }) |with_notice| {
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            if (with_notice) try out.writer.writeAll(discovery_model_notice);
+            try out.writer.writeAll(content_name_prefix);
+            try model_context_encoding.writeScalar(&out.writer, name);
+            try out.writer.writeAll("\" location=\"/skills/" ++ ("long-path" ** 600));
+            var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+            const preview = out.written()[0..@min(out.written().len, @import("../session/result_store.zig").preview_bytes)];
+            try std.testing.expectEqualStrings(name, displayNameFromOutput(preview, &buffer).?);
+        }
+    }
+}
+
+test "skill display names reject unrelated malformed and invalid metadata" {
+    const invalid = [_][]const u8{
+        "A quoted result: <skill_content name=\"workflow\" location=\"/skills/workflow\">",
+        "<skill_content>body <skill_content name=\"workflow\" location=\"/skills/workflow\">",
+        "<skill_content name=\"unfinished",
+        "<skill_content name=\"workflow\">",
+        "<skill_content name=\"\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad&unknown;\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad<value\" location=\"/skills/workflow\">",
+        "<skill_content name=\"bad&#x0a;value\" location=\"/skills/workflow\">",
+        "<skill_content name=\"../escape\" location=\"/skills/workflow\">",
+        "<skill_content name=\"\xff\" location=\"/skills/workflow\">",
+        "<skill_content name=\"" ++ ("a" ** (skill_contract.max_name_bytes + 1)) ++ "\" location=\"/skills/workflow\">",
+    };
+    for (invalid) |output| {
+        var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+        try std.testing.expect(displayNameFromOutput(output, &buffer) == null);
+    }
+}
+
+test "skill display name parsing stays bounded" {
+    try std.testing.fuzz({}, struct {
+        fn check(_: void, smith: *std.testing.Smith) !void {
+            var input_buffer: [4096]u8 = undefined;
+            const input = input_buffer[0..smith.slice(&input_buffer)];
+            var buffer: [skill_contract.max_name_bytes]u8 = undefined;
+            const name = displayNameFromOutput(input, &buffer) orelse return;
+            try std.testing.expect(name.len <= buffer.len);
+            try std.testing.expect(skill_contract.invalidSkillNameCause(name) == null);
+        }
+    }.check, .{ .corpus = &.{
+        content_name_prefix ++ "workflow\" location=\"/skills/workflow\">",
+        discovery_model_notice ++ content_name_prefix ++ "name&amp;value\" resource=\"SKILL.md\">",
+        content_name_prefix ++ "bad&unknown;\" location=\"/skills/workflow\">",
+    } });
+}
 
 /// Borrows a previously discovered skill inventory for one invocation.
 pub const Catalog = struct {
@@ -654,7 +750,7 @@ fn loadByIdentityWithOptions(
         }
         var full: std.Io.Writer.Allocating = .init(alloc);
         defer full.deinit();
-        full.writer.writeAll("<skill_content name=\"") catch return error.OutOfMemory;
+        full.writer.writeAll(content_name_prefix) catch return error.OutOfMemory;
         model_context_encoding.writeScalar(&full.writer, skill.name) catch return error.OutOfMemory;
         full.writer.writeAll("\" location=\"") catch return error.OutOfMemory;
         model_context_encoding.writeScalar(&full.writer, skill.path) catch return error.OutOfMemory;
@@ -710,7 +806,7 @@ fn loadByIdentityWithOptions(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    out.writer.writeAll("<skill_content name=\"") catch return error.OutOfMemory;
+    out.writer.writeAll(content_name_prefix) catch return error.OutOfMemory;
     model_context_encoding.writeScalar(&out.writer, skill.name) catch return error.OutOfMemory;
     out.writer.writeAll("\" resource=\"") catch return error.OutOfMemory;
     model_context_encoding.writeScalar(&out.writer, resource_path) catch return error.OutOfMemory;
