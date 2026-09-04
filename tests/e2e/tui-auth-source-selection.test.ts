@@ -4448,6 +4448,104 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("direct providers keep images with their users through tools and resume", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-native-image-history-"));
+    const model = "fixture-model";
+    const testGateway = startFakeGateway([]);
+    const terminal = { type: "response.completed", response: { status: "completed" } };
+    const responses = [
+      fakeGatewaySse([
+        { type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "read_1", name: "read_file", arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "fixture.txt" }) },
+        terminal,
+      ]),
+      ...Array.from({ length: 3 }, () => fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "IMAGE_HISTORY_OK" }, terminal,
+      ])),
+    ];
+    const direct = provider === "codex"
+      ? startFakeCodexToolLoop({ responses, model, inputModalities: ["text", "image"] })
+      : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "fixture.txt"), "fixture text");
+      const firstImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"));
+      const secondImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"));
+      const firstPath = join(profile, "first.png"), secondPath = join(profile, "second.png");
+      writeFileSync(firstPath, firstImage); writeFileSync(secondPath, secondImage);
+      const firstUrl = "data:image/png;base64," + firstImage.toString("base64");
+      const secondUrl = "data:image/png;base64," + secondImage.toString("base64");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const firstPrompt = "Read fixture.txt, then describe the attached image.";
+      const secondPrompt = "Compare the earlier image with this new image.";
+      const imageOwners = (raw: string): Array<{ text: string; images: string[] }> => JSON.parse(raw).input
+        .filter((entry: { role?: string }) => entry.role === "user")
+        .map((entry: { content: Array<{ type: string; text?: string; image_url?: string }> }) => ({
+          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join(""),
+          images: entry.content.filter(part => part.type === "input_image").map(part => part.image_url!),
+        }))
+        .filter((entry: { images: string[] }) => entry.images.length > 0);
+      const firstOwner = { text: firstPrompt, images: [firstUrl] };
+      const secondOwner = { text: secondPrompt, images: [secondUrl] };
+      const first = await runFx(["ask", "--json", "--auto", "--image", firstPath, firstPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      expect(first.signal).toBeNull();
+      const sessionId = JSON.parse(first.stdout).session_id;
+      expect(JSON.parse(first.stdout).tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(direct.bodies).toHaveLength(2);
+      expect(imageOwners(direct.bodies[0])).toEqual([firstOwner]);
+      expect(imageOwners(direct.bodies[1])).toEqual([firstOwner]);
+      unlinkSync(firstPath);
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "--image", secondPath, secondPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(second.code, second.stdout + second.stderr).toBe(0);
+      expect(second.signal).toBeNull();
+      expect(second.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(3);
+      expect(imageOwners(direct.bodies[2])).toEqual([firstOwner, secondOwner]);
+      const third = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Look again at both earlier images."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(third.code, third.stdout + third.stderr).toBe(0);
+      expect(third.signal).toBeNull();
+      expect(third.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(4);
+      expect(imageOwners(direct.bodies[3])).toEqual([firstOwner, secondOwner]);
+      const detail = await runFx(["session", "--json", "--id", sessionId], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      const history = JSON.parse(detail.stdout).history;
+      expect(history).toHaveLength(3);
+      expect(history.map((turn: { user: { images?: unknown[] } }) => turn.user.images?.length ?? 0)).toEqual([1, 1, 0]);
+      const imageDir = join(profile, ".fx", "sessions", sessionId, "images");
+      const snapshotName = readdirSync(imageDir).find(name => name.endsWith(".bin") && readFileSync(join(imageDir, name)).equals(firstImage));
+      expect(snapshotName).toBeDefined();
+      writeFileSync(join(imageDir, snapshotName!), secondImage);
+      const rejected = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Inspect the earlier images again."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
+      expect(rejected.signal).toBeNull();
+      expect(rejected.stdout + rejected.stderr).toContain("ImageSnapshotCorrupt");
+      expect(direct.bodies).toHaveLength(4);
+      const retained = await runFx(["session", "--json", "--id", sessionId], { cwd: profile, env });
+      expect(retained.code).toBe(0);
+      expect(JSON.parse(retained.stdout).history).toEqual(history);
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("direct provider tool identities obey the session boundary before execution", async () => {
   for (const provider of ["codex", "grok"] as const) {
     for (const bytes of [256, 257]) {

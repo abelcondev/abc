@@ -5608,19 +5608,6 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
-            if (job.provider != .gateway and job.images.len > 0 and
-                vision_policy.route == .native)
-            {
-                try verified_images.ensureTotalCapacity(overlay_arena, job.images.len);
-                for (job.images) |attachment| {
-                    verified_images.appendAssumeCapacity(try image_attachments.loadVerifiedSnapshot(
-                        overlay_arena,
-                        attachment,
-                        .{ .cancel_flag = config.cancel_flag },
-                    ));
-                }
-            }
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
@@ -5636,10 +5623,6 @@ fn processQueuedPromptLoop(
                 .provider_options = provider_opts,
                 .max_output_tokens = request_max_output_tokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
-                .verified_images = if (verified_images.items.len > 0)
-                    verified_images.items
-                else
-                    null,
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
@@ -5913,7 +5896,6 @@ fn processQueuedPromptLoop(
                 .provider_options = request_data.provider_options,
                 .max_output_tokens = request_data.max_output_tokens,
                 .budget = request_data.budget,
-                .verified_images = request_data.verified_images,
                 .prepared_request_body = prepared_request_body,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
