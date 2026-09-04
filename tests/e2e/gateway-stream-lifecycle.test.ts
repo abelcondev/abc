@@ -378,6 +378,17 @@ function gatewayRequest(body: string): GatewayRequestBody {
   return JSON.parse(body) as GatewayRequestBody;
 }
 
+function expectOnlyLeadingSystemMessages(body: string): void {
+  let sawConversation = false;
+  for (const message of gatewayRequest(body).prompt) {
+    if (message.role === "system") {
+      expect(sawConversation).toBe(false);
+    } else {
+      sawConversation = true;
+    }
+  }
+}
+
 function promptText(body: string): string {
   return gatewayRequest(body).prompt.map((message) => contentText(message.content)).join("\n");
 }
@@ -738,6 +749,7 @@ describe("gateway stream lifecycle", () => {
       });
       expect(request.prompt[0]?.role).toBe("system");
       expect(request.prompt[1]?.role).toBe("system");
+      expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
         "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.",
@@ -6463,7 +6475,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
-      expect(gateway.requests[1]!.body).toContain("uncertain outcome");
+      expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
+      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
       expect(gateway.requests[1]!.body).toContain(
         '"toolChoice":{"type":"none"}',
       );
@@ -6869,7 +6882,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         })}\n\n`,
       ),
       ...Array.from({ length: 9 }, () => unavailableResponse("0")),
-      fakeGatewayFinalText(`${partialText}${finalText}`),
+      fakeGatewayFinalText(finalText),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -6886,6 +6899,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const paused = parseAskJson(first.stdout);
       expect(first.code).toBe(1);
       expect(paused.output).toBe(partialText);
+      expect(paused.final_output).toBe("");
       expect(paused.recovery?.state).toBe("paused");
       expect(gateway.requestCount()).toBe(10);
 
@@ -6906,12 +6920,139 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
-      expect(recovered.output).toBe(`${partialText}${finalText}`);
+      expect(recovered.output).toBe(finalText);
+      expect(recovered.final_output).toBe(finalText);
       expect(recovered.recovery?.state).toBe("recovered");
       expect(recovered.recovery?.message).not.toContain(
         "provider temporarily unavailable",
       );
       expect(gateway.requestCount()).toBe(11);
+      expect(gateway.requests[10]!.body).not.toContain(partialText);
+      expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepted tool-only replacement discards only the obsolete JSON preview", async () => {
+    const root = createFixtureRoot("tool-only-replacement");
+    const tracePath = join(root.root, "trace.log");
+    const commentary = "Completed tool commentary.";
+    const partialText = "OBSOLETE_PREVIEW";
+    writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const responses = [
+      fakeGatewaySerializedToolCall("first_read", "read_file", '{"path":"fixture.txt"}', commentary),
+      sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`),
+      fakeGatewayToolCall("replacement_read", "read_file", { path: "fixture.txt" }),
+      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the fixture."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.output).toBe(commentary);
+      expect(json.final_output).toBe("");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requestCount()).toBe(12);
+      expect(gateway.requests[3]!.body).not.toContain(partialText);
+      expect(toolResultOutput(gateway.requests[3]!.body, "replacement_read")).toContain("settled evidence");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  for (const variant of ["duplicate-provider", "empty-completion"] as const) {
+    test(`accepted ${variant} response discards an obsolete JSON preview`, async () => {
+      const root = createFixtureRoot(`empty-replacement-${variant}`);
+      const tracePath = join(root.root, "trace.log");
+      const partialText = `OBSOLETE_${variant}`;
+      writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+      const partial = sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`);
+      const responses = variant === "duplicate-provider"
+        ? [
+          providerToolResultResponse("provider_error"),
+          partial,
+          providerToolResultResponse("tool-calls"),
+          ...Array.from({ length: 8 }, () => unavailableResponse("0")),
+        ]
+        : [
+          fakeGatewayToolCall("silent_read_1", "read_file", { path: "fixture.txt" }),
+          fakeGatewayToolCall("silent_read_2", "read_file", { path: "fixture.txt" }),
+          partial,
+          fakeGatewayFinalText(""),
+          ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+        ];
+      const gateway = startGateway(() =>
+        responses.shift() ?? new Response("unexpected request", { status: 500 })
+      );
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Inspect the available evidence."],
+          { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+        );
+        const json = parseAskJson(result.stdout);
+        expect(result.code).toBe(1);
+        expect(json.output).toBe("");
+        expect(json.final_output).toBe("");
+        expect(gateway.requestCount()).toBe(variant === "duplicate-provider" ? 11 : 13);
+        expect(readFileSync(tracePath, "utf8")).toContain(
+          variant === "duplicate-provider"
+            ? "event=provider_tool_recovery_duplicate_suppressed"
+            : "injecting continuation after 2 silent tool steps",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("malformed duplicate-provider response retains the interrupted JSON preview", async () => {
+    const root = createFixtureRoot("malformed-duplicate-replacement");
+    const tracePath = join(root.root, "trace.log");
+    const partialText = "LAST_INTERRUPTED_PREVIEW";
+    const validReplay = await providerToolResultResponse("tool-calls").text();
+    const repeatedResult = `data: ${JSON.stringify({
+      type: "tool-result",
+      toolCallId: "provider_search_recovery_1",
+      result: { content: "exact provider-side result" },
+    })}\n\n`;
+    const responses = [
+      providerToolResultResponse("provider_error"),
+      sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partialText })}\n\n`),
+      sse(validReplay.replace('data: {"type":"finish"', `${repeatedResult}data: {"type":"finish"`)),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? unavailableResponse("0"));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the available evidence."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(result.code).toBe(1);
+      expect(json.output).toBe(partialText);
+      expect(json.final_output).toBe("");
+      expect(json.error).toBe("MalformedProviderResultIdentity");
+      expect(gateway.requestCount()).toBe(3);
+      expect(trace).toContain("event=authoritative_tool_admission_rejected");
+      expect(trace).toContain("failure=duplicate_result provenance=provider_executed");
+      expect(trace).not.toContain("event=provider_tool_recovery_duplicate_suppressed");
+      expect(trace).not.toContain("event=before_tool_execution");
+      expect(gateway.requests[2]!.body).not.toContain(partialText);
+      expect(toolResultOutput(gateway.requests[2]!.body, "provider_search_recovery_1"))
+        .toContain("exact provider-side result");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -7135,15 +7276,19 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expectedCause: "eof_without_finish",
         streamedText: "visible partial text",
       },
+      ...["cons", "Sentence without punctuation", "```zig\nconst n =", "caf\u00e9"].map((partial, index) => ({
+        name: `boundary-${index}`,
+        response: () => sse(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: partial })}\n\n`),
+        expectedCause: "eof_without_finish",
+        streamedText: partial,
+      })),
     ] as const;
 
     for (const fixture of cases) {
       const root = createFixtureRoot(fixture.name);
       const tracePath = join(root.root, "trace.log");
       let requestIndex = 0;
-      const recoveredText = fixture.streamedText
-        ? `${fixture.streamedText} completed`
-        : "Recovered after missing finish.";
+      const recoveredText = "A complete replacement response.";
       const gateway = startGateway(() =>
         requestIndex++ === 0 ? fixture.response() : fakeGatewayFinalText(recoveredText)
       );
@@ -7165,12 +7310,27 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(gateway.requestCount()).toBe(2);
         expect(trace).toContain(`termination cause=${fixture.expectedCause}`);
-        expect(gateway.requests[1]!.body).toContain("<network_recovery>");
+        const retryBody = gateway.requests[1]!.body;
+        const retryPrompt = gatewayRequest(retryBody).prompt;
+        expectOnlyLeadingSystemMessages(retryBody);
+        if (fixture.streamedText) {
+          expect(retryPrompt.some(message => message.role === "assistant")).toBe(false);
+          expect(retryPrompt.some(message => contentText(message.content) === fixture.streamedText)).toBe(false);
+          expect(retryPrompt.at(-1)?.role).toBe("user");
+          expect(contentText(retryPrompt.at(-1)?.content)).toContain(
+            "Restart that response from the beginning",
+          );
+          if (fixture.name === "partial") {
+            expect(result.stderr).toContain("Response interrupted. Restarting.");
+          }
+        } else {
+          expect(retryBody).not.toContain("Restart that response");
+        }
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
         expect(result.stderr).toContain("Response ended early");
         expect(result.stderr).toContain(
-          fixture.streamedText ? "continuing response" : "retrying request",
+          fixture.streamedText ? "restarting response" : "retrying request",
         );
         expect(result.stderr).toContain("attempt 1/10");
         expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
@@ -7189,7 +7349,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("post-tool provider retry keeps recovery system provider-valid", async () => {
+  test("post-tool provider retry keeps instructions leading", async () => {
     const root = createFixtureRoot("post-tool-retry-order");
     const tracePath = join(root.root, "trace.log");
     writeFileSync(join(root.workspace, "fixture.txt"), "deterministic fixture\n");
@@ -7205,21 +7365,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (requestIndex === 2) return unavailableResponse();
 
       const prompt = gatewayRequest(body).prompt;
-      let sawNonSystem = false;
-      const invalidSystemIndex = prompt.findIndex((message, index) => {
-        if (message.role !== "system") {
-          sawNonSystem = true;
-          return false;
-        }
-        if (!sawNonSystem || index === prompt.length - 1) return false;
-        return prompt[index + 1]?.role !== "assistant";
+      let sawConversation = false;
+      const invalidSystemIndex = prompt.findIndex((message) => {
+        if (message.role === "system") return sawConversation;
+        sawConversation = true;
+        return false;
       });
       if (invalidSystemIndex >= 0) {
         return new Response(
           JSON.stringify({
             error: {
               message:
-                `messages.${invalidSystemIndex}: role 'system' must precede an 'assistant' message or end the array`,
+                `messages.${invalidSystemIndex}: system messages must precede conversation`,
             },
           }),
           { status: 400, headers: { "content-type": "application/json" } },
@@ -7246,12 +7403,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe(recoveredText);
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
-      expect(retryPrompt.at(-2)?.role).toBe("tool");
+      expectOnlyLeadingSystemMessages(gateway.requests[2]!.body);
+      expect(retryPrompt.at(-1)?.role).toBe("tool");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_retry_order")).toContain(
         "deterministic fixture",
       );
-      expect(retryPrompt.at(-1)?.role).toBe("system");
-      expect(contentText(retryPrompt.at(-1)?.content)).toContain("<network_recovery>");
+      expect(gateway.requests[2]!.body).not.toContain("network_recovery");
       expect(result.stderr).not.toContain("HTTP 400");
     } finally {
       gateway.stop();
@@ -7293,7 +7450,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
       expect(trace).toContain("termination cause=done_without_finish");
-      expect(gateway.requests[1]!.body).toContain("<network_recovery>");
+      expectOnlyLeadingSystemMessages(gateway.requests[1]!.body);
+      expect(gateway.requests[1]!.body).toContain("Reconcile the available tool evidence");
+      expect(gateway.requests[1]!.body).not.toContain("network_recovery");
       expect(gateway.requests[1]!.body).toContain(
         '"toolChoice":{"type":"none"}',
       );
