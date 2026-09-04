@@ -1409,11 +1409,19 @@ export async function createFxAgent(options = {}) {
     void result.catch(() => {});
     return {
       cancel() { rawTurn.cancel(); },
-      async *[Symbol.asyncIterator]() {
-        for await (const update of rawTurn) {
-          const event = eventFor(update);
-          if (event) yield event;
-        }
+      [Symbol.asyncIterator]() {
+        const iterator = (async function* () {
+          for await (const update of rawTurn) {
+            const event = eventFor(update);
+            if (event) yield event;
+          }
+        })();
+        return {
+          next(value) { return iterator.next(value); },
+          return(value) { rawTurn.cancel(); return iterator.return(value); },
+          throw(error) { rawTurn.cancel(); return iterator.throw(error); },
+          [Symbol.asyncIterator]() { return this; },
+        };
       },
       result,
     };

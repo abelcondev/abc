@@ -154,6 +154,39 @@ try {
   assert.equal((await callbackTurn.result).stopReason, "cancelled");
   await agent.close();
   agent = null;
+  console.log(`${backend}: iterator close interrupts a pending read`);
+  for (const operation of ["return", "throw"]) {
+    let fetchStarted = false;
+    aborted = false;
+    await start(async (_url, options) => {
+      fetchStarted = true;
+      return new Promise((_, reject) => options.signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(options.signal.reason);
+      }, { once: true }));
+    });
+    const unread = agent.prompt("close the pending iterator");
+    const iterator = unread[Symbol.asyncIterator]();
+    const next = iterator.next();
+    while (!fetchStarted) await pause(5);
+    const reason = new Error("stop consuming");
+    const stopped = iterator[operation](reason);
+    assert.equal(aborted, true, "iterator close did not abort the active fetch immediately");
+    const closingResult = operation === "throw" ? assert.rejects(stopped, (error) => error === reason) : stopped;
+    assert.equal((await unread.result).stopReason, "cancelled");
+    assert.equal((await next).done, true);
+    await closingResult;
+    await agent.close();
+    agent = null;
+  }
+  let earlyFetches = 0;
+  await start(async () => { earlyFetches++; return new Response(delta("unexpected") + finish); });
+  const neverRead = agent.prompt("close before the first read");
+  await neverRead[Symbol.asyncIterator]().return();
+  assert.equal((await neverRead.result).stopReason, "cancelled");
+  assert.equal(earlyFetches, 0);
+  await agent.close();
+  agent = null;
   if (backend === "native") {
     const addon = createRequire(import.meta.url)(nativeAddon);
     let corrupt = false;
