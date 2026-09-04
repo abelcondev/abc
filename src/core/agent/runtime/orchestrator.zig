@@ -4257,7 +4257,7 @@ fn processQueuedPromptInner(
     defer if (skill_section) |*section| section.deinit(arena);
     var explicit_section: ?skill_invocation.ExplicitPromptSection = null;
     defer if (explicit_section) |*section| section.deinit(arena);
-    if (skill_section != null) {
+    if (skill_section != null or config.skill_bindings.len > 0) {
         explicit_section = load_explicit: while (true) {
             const prepared = skill_invocation.buildExplicitPromptSection(arena, config.skill_catalog, job.prompt, config.skill_bindings, config.context_limits, config.cancel_flag) catch |err| {
                 if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;

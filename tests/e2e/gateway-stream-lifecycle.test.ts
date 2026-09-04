@@ -683,6 +683,15 @@ describe("gateway stream lifecycle", () => {
           expect(toolResultOutput(body, "whole_reference")).not.toContain("Read full output");
           expect(toolResultOutput(body, "stale_skill")).toContain("StaleSkillLocation");
           return fakeGatewayFinalText("Complete resources received.");
+        case 3:
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Complete resources restored.");
+        case 4:
+          expect(toolResultOutput(body, "whole_main")).toContain("unavailable");
+          expect(toolResultOutput(body, "whole_main")).not.toContain('complete="true"');
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Missing saved resource reported.");
         default:
           return new Response("unexpected request", { status: 500 });
       }
@@ -705,6 +714,22 @@ describe("gateway stream lifecycle", () => {
       ]));
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).not.toContain("panic");
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      const restored = await resume();
+      expect(restored.code).toBe(0);
+      expect(parseAskJson(restored.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(4);
+      const resultDirectory = join(root.home, ".fx", "sessions", output.session_id, "tool-results");
+      const mainArtifacts = readdirSync(resultDirectory).filter((name) =>
+        readFileSync(join(resultDirectory, name), "utf8").includes("MAIN_RESOURCE_TAIL"));
+      expect(mainArtifacts).toHaveLength(1);
+      rmSync(join(resultDirectory, mainArtifacts[0]!));
+      const missing = await resume();
+      expect(missing.code).toBe(0);
+      expect(parseAskJson(missing.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(5);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -5090,7 +5115,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after semantic compaction",
+    "complete skill reads remain repeatable after semantic compaction",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -5098,29 +5123,35 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const skillName = "compaction-explicit";
       const skillDirectory = join(root.home, ".fx", "skills", skillName);
       const bodySentinel = "COMPACTION_EXPLICIT_BODY_SENTINEL";
+      const tailSentinel = "COMPACTION_COMPLETE_SKILL_TAIL";
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n${tailSentinel}\n`,
       );
       writeFileSync(
         join(root.workspace, ".fx.json"),
-        JSON.stringify({ max_tool_result_bytes: 1024 }),
+        JSON.stringify({ max_tool_result_bytes: 64 * 1024 }),
       );
 
       const beforeCallId = "skill_before_compaction";
       const afterCallId = "skill_after_compaction";
-      const responses = [
-        fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
-        fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
-        fakeGatewayFinalText("Continue the explicit skill workflow when the user asks."),
-        fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
-      ];
-      const gateway = startGateway(() =>
-        responses.shift() ?? new Response("unexpected request", { status: 500 })
-      );
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway((body) => {
+        const index = requestIndex++;
+        if (index === 0 || index === 4) {
+          const locations = advertisedSkillLocations(body, skillName);
+          expect(locations).toHaveLength(1);
+          return fakeGatewayToolCall(index === 0 ? beforeCallId : afterCallId, "skill", { location: locations[0]! });
+        }
+        switch (index) {
+          case 1: return fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE");
+          case 2: return fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE");
+          case 3: return fakeGatewayFinalText("Continue the explicit skill workflow when the user asks.");
+          case 5: return fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE");
+          default: return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       let tui: TmuxSession | null = null;
       try {
         tui = await TmuxSession.create({
@@ -5167,10 +5198,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(before).toContain(bodySentinel);
         expect(after).toContain(bodySentinel);
+        expect(before).toContain(tailSentinel);
+        expect(after).toContain(tailSentinel);
+        expect(before).toContain('complete="true"');
+        expect(after).toContain('complete="true"');
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
         expect(compactionRequest).toContain("Read the explicit skill before compaction.");
         expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
         expect(compactionRequest).toContain("Result handle:");
         expect(postCompactionRequest).toContain("context_handoff");

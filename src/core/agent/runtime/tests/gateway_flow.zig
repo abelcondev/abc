@@ -4239,6 +4239,28 @@ test "processQueuedPrompt prepares skill metadata from the supplied inventory" {
     try expectGatewayPromptTextCount(&gateway, 0, "- release: Release the package", 1);
 }
 
+test "processQueuedPrompt reports a retained skill binding when discovery becomes empty" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "Final" }});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_bindings = &.{.{ .name = "removed-workflow", .path = "/skills/removed-workflow" }};
+    var job = fixture.job();
+    job.prompt = @constCast("Apply the workflow selected in the picker.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "was not found at advertised location");
+    try expectBodyContains(&gateway, 0, "removed-workflow");
+    try expectBodyContains(&gateway, 0, "/skills/removed-workflow");
+    try expectBodyNotContains(&gateway, 0, "<skill_content");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
 test "processQueuedPrompt skill catalog is invariant under harmless request expansion" {
     const alloc = std.testing.allocator;
     const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{

@@ -1584,8 +1584,10 @@ fn restoreContextResultBodies(alloc: Allocator, dir: *io_mod.VerifiedDir, histor
                 break :blk result_store.readForReplayManaged(alloc, &capability.?, handle, result.stored_output_bytes) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
-                        debug_trace.logf("session", "event=context_result_unavailable handle={s} err={s}; retaining preview", .{ handle, @errorName(err) });
-                        continue;
+                        debug_trace.logf("session", "event=context_result_unavailable handle={s} err={s}; marking content unavailable", .{ handle, @errorName(err) });
+                        const unavailable = try alloc.dupe(u8, "Saved tool-result content is unavailable. The complete output could not be restored.");
+                        result.truncated = true;
+                        break :blk unavailable;
                     },
                 };
             };
@@ -4399,6 +4401,101 @@ test "cache-free resume rebuilds tool calls and external result references" {
         },
         .unavailable => return error.TestExpectedCommandReplay,
     }
+}
+
+fn checkCompleteSkillReplayArtifact(artifact: enum { intact, missing, mismatched }) !void {
+    const alloc = std.testing.allocator;
+    const runtime_memory = @import("../agent/runtime/execution_memory.zig");
+    const execution_memory = @import("../agent/execution_memory.zig");
+    const full_output = "<skill_content name=\"workflow\" location=\"/skills/workflow\" resource=\"SKILL.md\" complete=\"true\">\n" ++
+        ("required instruction\n" ** 1200) ++ "COMPLETE_SKILL_TAIL\n</skill_content>";
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "complete-skill-replay", 10);
+    defer initial.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var calls = [_]types.ToolCall{.{ .id = "load-skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}" }};
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        const session_path = try io_mod.dirRealpathAlloc(alloc, loaded.log.dir.dir, ".");
+        defer alloc.free(session_path);
+        var capability = try session_child_store.SessionChildCapability.init(alloc, loaded.log.dir.dir, session_path, .writable);
+        defer capability.deinit();
+        const prepared = try runtime_memory.prepareToolExecutionOutput(arena, .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel_flag,
+            .session_child_capability = &capability,
+        }, calls[0], .{ .status = .success, .model_content_kind = .complete_skill, .model_output = full_output }, null);
+        try std.testing.expect(full_output.len > result_store.large_result_threshold_bytes);
+        try std.testing.expect(!prepared.memory.truncated);
+        try std.testing.expectEqualStrings(full_output, prepared.model_output);
+        var results = [_]types.PersistedToolResult{try execution_memory.makePersistedToolResult(
+            alloc,
+            calls[0].id,
+            calls[0].name,
+            .success,
+            prepared.model_output,
+            prepared.memory,
+        )};
+        defer freeConversationToolResult(alloc, results[0]);
+        var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("Use this skill.") },
+                .assistant = @constCast("Loaded the instructions."),
+                .execution = .{ .tool_steps = &steps },
+            } },
+        } }, 20);
+        const handle = prepared.memory.output_handle.?;
+        switch (artifact) {
+            .intact => {},
+            .missing => try capability.delete(.tool_results, handle),
+            .mismatched => {
+                var replacement = try capability.atomicReplace(alloc, .tool_results, handle, "different-sized content");
+                replacement.deinit(alloc);
+            },
+        }
+    }
+    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    const execution = resumed.history[0].assistant.execution;
+    const replayed = execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(types.PersistedToolStatus.success, replayed.status);
+    try std.testing.expectEqual(full_output.len, replayed.stored_output_bytes);
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(arena, &messages, execution);
+    const projected = messages.items[1].content.?;
+    if (artifact == .intact) {
+        try std.testing.expect(!replayed.truncated);
+        try std.testing.expectEqualStrings(full_output, projected);
+    } else {
+        try std.testing.expect(replayed.truncated);
+        try std.testing.expect(std.mem.find(u8, projected, "unavailable") != null);
+        try std.testing.expect(std.mem.find(u8, projected, "complete=\"true\"") == null);
+        try std.testing.expect(std.mem.find(u8, projected, "required instruction") == null);
+    }
+}
+
+test "complete skill replay retains intact full artifacts" {
+    try checkCompleteSkillReplayArtifact(.intact);
+}
+
+test "complete skill replay marks missing artifacts unavailable" {
+    try checkCompleteSkillReplayArtifact(.missing);
+}
+
+test "complete skill replay marks mismatched artifacts unavailable" {
+    try checkCompleteSkillReplayArtifact(.mismatched);
 }
 
 test "cache-free resume loads only the latest checkpoint and suffix" {
