@@ -895,6 +895,7 @@ async function runCodexLoginWithBrowser(
 }
 
 function startFakeCodexToolLoop(options: {
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -922,7 +923,7 @@ function startFakeCodexToolLoop(options: {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -985,6 +986,7 @@ function startFakeCodexCapacityLoop() {
 }
 
 function startFakeGrokToolLoop(options: {
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -1010,7 +1012,7 @@ function startFakeGrokToolLoop(options: {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-grok-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -4337,6 +4339,53 @@ tmuxTest(
   },
   60_000,
 );
+
+test("direct provider tool identities obey the session boundary before execution", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    for (const bytes of [256, 257]) {
+      const profile = mkdtempSync(join(tmpdir(), `fx-${provider}-identity-`));
+      const testGateway = startFakeGateway([]);
+      const options = { toolCallId: "i".repeat(bytes), toolName: "write_file", toolArguments: { path: "result.txt", content: "saved" } };
+      const direct = provider === "codex" ? startFakeCodexToolLoop(options) : startFakeGrokToolLoop(options);
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        const catalog = await (await fetch(direct.modelsUrl)).json();
+        const model = provider === "codex" ? catalog.models[0].slug : catalog.data[0].id;
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [`${provider}_model`]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        const accepted = bytes === 256;
+        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(accepted ? 0 : 1);
+        expect(result.signal).toBeNull();
+        expect(existsSync(join(profile, "result.txt"))).toBe(accepted);
+        expect(direct.bodies).toHaveLength(accepted ? 2 : 1);
+        expect(testGateway.requests).toHaveLength(0);
+        const json = JSON.parse(result.stdout);
+        expect(json.tool_calls).toEqual(accepted ? [{ name: "write_file", status: "success" }] : []);
+        if (!accepted) expect(json.error).toBe("MalformedAuthoritativeToolIdentity");
+        const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(accepted ? 1 : 0);
+        if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }
+}, 60_000);
 
 test(
   "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",

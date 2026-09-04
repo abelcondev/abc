@@ -7226,6 +7226,12 @@ fn processQueuedPromptLoop(
                     finish_trace.finish("malformed_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
+                .reject_unstorable_identity => |failure| {
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "field={s} failure={s}", .{ @tagName(failure.field), @tagName(failure.reason) });
+                    finish_trace.finish("unstorable_tool_identity");
+                    return error.MalformedAuthoritativeToolIdentity;
+                },
                 .reject_malformed_provider_result => |failure| {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure={s} provenance=provider_executed", .{@tagName(failure)});
