@@ -545,6 +545,13 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         await session.sendText("/mcp");
         const servers = await session.waitForText("MCP 1", 10_000);
         expect(servers).toContain("fixture");
+        await session.waitForText("Ready", 10_000);
+        const beforeReloadWire = readFileSync(wireLogPath, "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        const originalPid = beforeReloadWire[0].pid;
+        const discoveryCount = beforeReloadWire.filter((entry) =>
+          entry.message.method === "server/discover"
+        ).length;
 
         await session.sendKeys("R");
         const reloaded = await session.waitForText(
@@ -552,6 +559,12 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
           15_000,
         );
         expect(reloaded).toContain("[Servers]");
+        const afterReloadWire = readFileSync(wireLogPath, "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        expect(new Set(afterReloadWire.map((entry) => entry.pid))).toEqual(new Set([originalPid]));
+        expect(afterReloadWire.filter((entry) =>
+          entry.message.method === "server/discover"
+        )).toHaveLength(discoveryCount);
 
         await session.sendKeys("Right");
         const tools = await session.waitForText("mcp_fixture_echo", 10_000);
@@ -567,7 +580,10 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         const toolPreview = await session.waitForText("untrusted metadata", 10_000);
         expect(toolPreview).toContain("mcp_fixture_echo");
         await session.sendKeys("Escape");
-        await session.waitForText("mcp_fixture_echo", 5_000);
+        await session.waitForPane(
+          (pane) => pane.includes("mcp_fixture_echo") && !pane.includes("untrusted metadata"),
+          5_000,
+        );
 
         await session.sendKeys("Right");
         const resources = await session.waitForText("[Resources]", 10_000);

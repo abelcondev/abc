@@ -446,7 +446,7 @@ fn runRuntimeScopedHttpAuth(
         }
         return error.ScopedAuthServerDidNotConnect;
     }
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     if (expired) {
         server.auth_lock.lockUncancelable(io);
         if (server.auth_credentials) |*credentials| {
@@ -555,7 +555,7 @@ fn runRuntimeLegacyRefreshLocks(
     {
         return error.LegacyRefreshServerDidNotConnect;
     }
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     server.auth_lock.lockUncancelable(io);
     if (server.auth_credentials) |*credentials| {
         credentials.expires_at_ms = 0;
@@ -649,7 +649,7 @@ fn runRuntimeLogoutRefreshRace(
         {
             return error.LogoutRefreshServerDidNotConnect;
         }
-        const server = &runtime.servers.items[0];
+        const server = runtime.servers.items[0];
         server.auth_lock.lockUncancelable(io);
         if (server.auth_credentials) |*credentials| {
             credentials.expires_at_ms = 0;
@@ -798,7 +798,7 @@ fn runRuntimeInteractiveAuthLocks(
     var runtime = mcp.McpRuntime.init(alloc);
     defer runtime.deinit();
     try addInteractiveAuthServer(&runtime, alloc, server_url);
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     var opener = InteractiveAuthOpener{
         .io = io,
         .started_path = auth_started_path,
@@ -847,7 +847,7 @@ fn runRuntimeInteractiveAuthRetirement(
     var runtime = mcp.McpRuntime.init(alloc);
     defer runtime.deinit();
     try addInteractiveAuthServer(&runtime, alloc, server_url);
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     var opener = InteractiveAuthOpener{
         .io = io,
         .started_path = auth_started_path,

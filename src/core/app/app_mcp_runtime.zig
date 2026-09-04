@@ -134,12 +134,11 @@ const PendingReload = struct {
     result: ?PendingResult = null,
     policy: ReloadPolicy = .transactional,
     rebuild: bool = true,
-    detached_runtime: ?*mcp_runtime.McpRuntime = null,
     superseded_reload: ?*PendingReload = null,
     superseded_authentication: ?*PendingAuthentication = null,
 
     fn run(self: *PendingReload) void {
-        if (self.policy == .authority_reducing) self.quiesceDetachedAuthority();
+        if (self.policy == .authority_reducing) self.quiesceSupersededWork();
         const outcome = switch (self.policy) {
             .transactional => self.owner.reloadControlled(
                 self.alloc,
@@ -175,7 +174,7 @@ const PendingReload = struct {
         self.done.store(true, .release);
     }
 
-    fn quiesceDetachedAuthority(self: *PendingReload) void {
+    fn quiesceSupersededWork(self: *PendingReload) void {
         // Authentication can hold the lease that a retiring reload is waiting for.
         if (self.superseded_authentication) |task| {
             self.superseded_authentication = null;
@@ -184,10 +183,6 @@ const PendingReload = struct {
         if (self.superseded_reload) |task| {
             self.superseded_reload = null;
             task.deinit();
-        }
-        if (self.detached_runtime) |runtime| {
-            self.detached_runtime = null;
-            destroyRuntime(self.alloc, runtime);
         }
     }
 
@@ -204,7 +199,7 @@ const PendingReload = struct {
 
     fn deinit(self: *PendingReload) void {
         self.join();
-        self.quiesceDetachedAuthority();
+        self.quiesceSupersededWork();
         if (self.result) |*result| switch (result.*) {
             .outcome => |*outcome| outcome.deinit(self.alloc),
             .failed, .cancelled => {},
@@ -2273,10 +2268,9 @@ pub const State = struct {
         if (superseded_authentication) |task| task.cancel_requested.store(true, .release);
         pending.superseded_reload = superseded_reload;
         pending.superseded_authentication = superseded_authentication;
-        pending.detached_runtime = self.runtime;
+        if (self.runtime) |runtime| _ = runtime.revokeWorkspaceExceptNames(&.{});
         self.pending_reload = pending;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
         if (comptime builtin.single_threaded) {
@@ -2289,7 +2283,7 @@ pub const State = struct {
         }
     }
 
-    pub fn retireAuthoritySynchronously(self: *State, alloc: Allocator) void {
+    pub fn retireAuthoritySynchronously(self: *State, _: Allocator) void {
         self.lock.lockUncancelable(io_mod.getIo());
         const pending_reload = self.pending_reload;
         if (pending_reload) |task| task.cancel_requested.store(true, .release);
@@ -2298,14 +2292,13 @@ pub const State = struct {
         const runtime = self.runtime;
         self.pending_reload = null;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
         if (pending_authentication) |task| {
             cancelAndDeinitAuthentication(task, "authority_reduction_sync");
         }
         if (pending_reload) |task| task.deinit();
-        if (runtime) |value| destroyRuntime(alloc, value);
+        if (runtime) |value| _ = value.revokeWorkspaceExceptNames(&.{});
     }
 
     pub fn takeReloadCompletion(self: *State) ?ReloadCompletion {
@@ -2368,133 +2361,21 @@ pub const State = struct {
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
+        var lease = self.acquire();
+        defer if (lease) |*current| current.deinit();
         const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
-            const detached = try self.detachForReducingReload(cancel_requested, pending);
-            if (detached) |runtime| {
-                destroyRuntime(alloc, runtime);
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload preflight failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
+            if (lease) |current| {
+                if (current.runtime.revokeWorkspaceExceptNames(&.{})) return error.McpAuthorityReducedReloadFailed;
             }
             return err;
         };
         defer mcp_contract.freeOwnedStrings(alloc, next_authority);
-        var authority_reduced = false;
-        var detached_reduced_runtime: ?*mcp_runtime.McpRuntime = null;
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        if (self.runtime) |current| {
-            authority_reduced = current.workspaceAuthorityReducedAgainstNames(
-                next_authority,
-                .all,
-            );
-            if (authority_reduced) {
-                detached_reduced_runtime = current;
-                self.runtime = null;
-            }
-        }
-        self.lock.unlock(io_mod.getIo());
-        if (detached_reduced_runtime) |runtime| {
-            detached_reduced_runtime = null;
-            destroyRuntime(alloc, runtime);
-        }
-
+        const authority_reduced = if (lease) |current| current.runtime.revokeWorkspaceExceptNames(next_authority) else false;
         const candidate = loader(alloc, workspace_root, elicitation_capabilities) catch |err| {
-            if (authority_reduced) {
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
-            }
+            if (authority_reduced) return error.McpAuthorityReducedReloadFailed;
             return err;
         };
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
-
-        if (!authority_reduced) {
-            if (candidate) |next| {
-                self.lock.lockUncancelable(io_mod.getIo());
-                if (cancel_requested.load(.acquire) or
-                    (pending != null and self.pending_reload != pending.?))
-                {
-                    self.lock.unlock(io_mod.getIo());
-                    return error.Cancelled;
-                }
-                if (self.runtime) |current| {
-                    authority_reduced = current.workspaceAuthorityReducedAgainst(next, .all);
-                    if (authority_reduced) {
-                        detached_reduced_runtime = current;
-                        self.runtime = null;
-                    }
-                }
-                self.lock.unlock(io_mod.getIo());
-            }
-        }
-        if (detached_reduced_runtime) |runtime| destroyRuntime(alloc, runtime);
-
-        var published = if (candidate) |runtime| published: {
-            runtime.connectAllCancellable(registry, cancel_requested);
-            if (cancel_requested.load(.acquire)) return error.Cancelled;
-            var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
-            defer snapshot.deinit(alloc);
-            const value = mcp_health.startupDecision(snapshot.servers);
-            if (!authority_reduced and !mcp_health.publishCandidateForDecision(value)) {
-                const failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse
-                    try alloc.dupe(u8, "A required MCP server is unavailable.");
-                destroyRuntime(alloc, runtime);
-                candidate_owned = false;
-                return .{ .retained_required_failure = failure };
-            }
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
-        } else try PublishedReload.init(alloc, null, &.{});
-        errdefer published.deinit(alloc);
-
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        const previous = self.runtime;
-        self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
-        candidate_owned = false;
-
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
-        return .{ .published = published };
-    }
-
-    fn detachForReducingReload(
-        self: *State,
-        cancel_requested: *std.atomic.Value(bool),
-        pending: ?*PendingReload,
-    ) !?*mcp_runtime.McpRuntime {
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            return error.Cancelled;
-        }
-        const runtime = self.runtime;
-        self.runtime = null;
-        return runtime;
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, !authority_reduced);
     }
 
     fn reloadAuthorityReducedControlled(
@@ -2510,35 +2391,67 @@ pub const State = struct {
         rebuild: bool,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const candidate = if (rebuild)
-            try loader(alloc, workspace_root, elicitation_capabilities)
-        else
-            null;
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
+        if (!rebuild) {
+            if (self.acquire()) |owned| {
+                var lease = owned;
+                defer lease.deinit();
+                try lease.runtime.drainRetiredServers();
+                var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+                defer snapshot.deinit(alloc);
+                return .{ .published = try PublishedReload.init(alloc, if (snapshot.servers.len == 0) null else lease.runtime.generation, snapshot.servers) };
+            }
+            return .{ .published = try PublishedReload.init(alloc, null, &.{}) };
+        }
+        const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false);
+    }
 
-        var published = if (candidate) |runtime| published: {
+    /// Takes ownership of the unloaded candidate, including all error paths.
+    fn applyReloadCandidate(
+        self: *State,
+        alloc: Allocator,
+        candidate: ?*mcp_runtime.McpRuntime,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        cancel_requested: *std.atomic.Value(bool),
+        pending: ?*PendingReload,
+        retain_on_required_failure: bool,
+    ) !ReloadOutcome {
+        var candidate_owned = candidate != null;
+        defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
+        self.lock.unlockShared(io_mod.getIo());
+        if (stale) return error.Cancelled;
+        if (self.acquire()) |owned| {
+            var lease = owned;
+            defer lease.deinit();
+            if (try lease.runtime.reconcile(candidate, cancel_requested, retain_on_required_failure)) |failure| {
+                return .{ .retained_required_failure = failure };
+            }
+            var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+            defer snapshot.deinit(alloc);
+            return .{ .published = try PublishedReload.init(
+                alloc,
+                if (snapshot.servers.len == 0) null else lease.runtime.generation,
+                snapshot.servers,
+            ) };
+        }
+        var published = if (candidate) |runtime| result: {
             runtime.connectAllCancellable(registry, cancel_requested);
             if (cancel_requested.load(.acquire)) return error.Cancelled;
             var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
             defer snapshot.deinit(alloc);
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
+            if (retain_on_required_failure and !mcp_health.publishCandidateForDecision(mcp_health.startupDecision(snapshot.servers))) {
+                return .{ .retained_required_failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse try alloc.dupe(u8, "A required MCP server is unavailable.") };
+            }
+            break :result try PublishedReload.init(alloc, runtime.generation, snapshot.servers);
         } else try PublishedReload.init(alloc, null, &.{});
         errdefer published.deinit(alloc);
-
         self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or self.pending_reload != pending) {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        std.debug.assert(self.runtime == null);
+        defer self.lock.unlock(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?) or self.runtime != null) return error.Cancelled;
         self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
         candidate_owned = false;
         return .{ .published = published };
     }
@@ -2846,6 +2759,14 @@ fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
     return error.TestSpawnFailed;
 }
 
+fn expectNoActiveMcpServers(state: *State) !void {
+    var lease = state.acquire() orelse return;
+    defer lease.deinit();
+    var snapshot = try lease.runtime.snapshotHealth(std.testing.allocator, 0);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.servers.len);
+}
+
 test "transactional reload retains old runtime and publishes only accepted candidates" {
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -2872,7 +2793,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (rejected) {
         .retained_required_failure => |failure| {
             try std.testing.expect(std.mem.find(u8, failure, "candidate") != null);
-            try std.testing.expect(std.mem.find(u8, failure, "required") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "Required MCP server") != null);
         },
         .published => return error.TestUnexpectedResult,
     }
@@ -2888,23 +2809,20 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (degraded) {
         .published => |published| {
             try std.testing.expectEqual(mcp_health.StartupDecision.degraded, published.health);
-            try std.testing.expect(published.generation.? != original_generation);
+            try std.testing.expectEqual(original_generation, published.generation.?);
             try std.testing.expectEqual(@as(usize, 1), published.configured_server_count);
             try std.testing.expectEqual(@as(usize, 1), published.unavailable_server_names.len);
             try std.testing.expectEqualStrings("candidate", published.unavailable_server_names[0]);
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        state.callTool(
-            alloc,
-            "mcp_candidate_echo",
-            "{}",
-            1024,
-            .{ .expected_runtime_generation = original_generation },
-        ),
-    );
+    try std.testing.expectEqual(@as(?tool_mcp_runtime.CallResult, null), try state.callTool(
+        alloc,
+        "mcp_candidate_echo",
+        "{}",
+        1024,
+        .{ .expected_runtime_generation = original_generation },
+    ));
 
     test_reload_mode = .empty;
     var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 40);
@@ -2918,7 +2836,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "reducing preflight retires workspace authority before strict loader failure" {
@@ -2950,7 +2868,7 @@ test "reducing preflight retires workspace authority before strict loader failur
             10,
         ),
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "project prompt display escapes repository control bytes" {
@@ -3039,7 +2957,7 @@ test "pending reload returns immediately and publishes one completion" {
         .failed => return error.TestUnexpectedResult,
     }
     try std.testing.expect(state.takeReloadCompletion() == null);
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "reload thread start failure frees the task and copied workspace root once" {
@@ -3063,7 +2981,7 @@ test "reload thread start failure frees the task and copied workspace root once"
     try std.testing.expect(state.pending_reload == null);
 }
 
-test "authority reduction quiesces superseded tasks before detached runtime retirement" {
+test "authority reduction drains revoked servers without waiting for unrelated runtime leases" {
     if (comptime builtin.single_threaded) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -3133,12 +3051,9 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         60,
         false,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 
-    try std.testing.expect(state.takeReloadCompletion() == null);
-
-    active_lease.deinit();
-    active_lease_owned = false;
+    try std.testing.expect(!runtime.retiring.load(.acquire));
     var completion: ?ReloadCompletion = null;
     const completion_deadline = io_mod.milliTimestamp() + 2_000;
     while (completion == null and io_mod.milliTimestamp() < completion_deadline) {
@@ -3146,6 +3061,8 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         completion = state.takeReloadCompletion();
     }
     var loaded = completion orelse return error.TestUnexpectedResult;
+    active_lease.deinit();
+    active_lease_owned = false;
     defer loaded.deinit(alloc);
     switch (loaded) {
         .outcome => |outcome| switch (outcome) {
@@ -3156,7 +3073,7 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         },
         .failed => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "authority reduction thread start failure falls back synchronously" {
@@ -3186,7 +3103,7 @@ test "authority reduction thread start failure falls back synchronously" {
         false,
         failPendingReloadSpawn,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
     var completion = state.takeReloadCompletion() orelse
         return error.TestUnexpectedResult;
     defer completion.deinit(alloc);

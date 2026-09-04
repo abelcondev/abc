@@ -373,6 +373,7 @@ fn composeServerRow(
 }
 
 fn serverStateLabel(server: mcp_health.ServerSnapshot) []const u8 {
+    if (server.reloading) return "Reloading";
     if (server.workspace_admission == .pending) return "Pending trust";
     if (server.authentication == .required) return "Needs authentication";
     return switch (server.connection) {

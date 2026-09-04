@@ -709,18 +709,16 @@ pub const ToolArgumentIntegrity = enum {
 /// Identifies the server and catalog offered to one model step.
 pub const McpToolBinding = struct {
     runtime_generation: u64,
-    server_index: usize,
     connection_generation: u64,
     catalog_generation: u64,
     auth_generation: u64,
-    credential_authority: u64 = 0,
+    authority_id: u64 = 0,
     definition_digest: [32]u8 = .{0} ** 32,
 
     /// Transport renewal may change epochs without changing the advertised action.
     pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
         return self.runtime_generation == other.runtime_generation and
-            self.server_index == other.server_index and
-            self.credential_authority == other.credential_authority and
+            self.authority_id == other.authority_id and
             std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
     }
 };

@@ -2948,7 +2948,7 @@ test "ACP lifecycle resolves dynamic MCP availability through session context" {
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "fixture"),
     });
-    const mcp_server = &runtime.servers.items[0];
+    const mcp_server = runtime.servers.items[0];
     mcp_server.state = .ready;
     try mcp_server.tool_catalog.tools.append(alloc, .{
         .original_name = try alloc.dupe(u8, "echo"),

@@ -508,7 +508,7 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
 test "tool result extracts all content" {
     const alloc = std.testing.allocator;
     const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"world"}]}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=","mimeType":"image/png"},{"type":"text","text":"world"}]}}
     ;
     var result = try extract_legacy(alloc, response);
     defer result.deinit(alloc);
@@ -526,7 +526,10 @@ test "tool result extracts all content" {
     );
     const content = parsed.value.object.get("result").?.object.get("content").?.array.items;
     try std.testing.expectEqualStrings("hello ", content[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings("AA==", content[1].object.get("data").?.string);
+    try std.testing.expect(content[1].object.get("data") == null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
 }
 

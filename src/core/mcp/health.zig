@@ -89,6 +89,7 @@ pub const ServerSnapshot = struct {
     transport: mcp_contract.McpTransport,
     protocol_version: ?[]u8,
     connection: ConnectionState,
+    reloading: bool = false,
     authentication: AuthenticationState,
     counts: CapabilityCounts,
     cache_freshness: CacheFreshness,
@@ -130,8 +131,8 @@ pub fn sameState(a: Snapshot, b: Snapshot) bool {
             } else if (y != null) return false;
         }
         if (!std.meta.eql(
-            .{ left.source, left.scope, left.workspace_admission, left.required, left.transport, left.connection, left.authentication, left.counts, left.cache_freshness, left.subscription, left.runtime_generation, left.catalog_generation, left.retry_attempt, left.retry_in_ms, left.last_successful_discovery_ms },
-            .{ right.source, right.scope, right.workspace_admission, right.required, right.transport, right.connection, right.authentication, right.counts, right.cache_freshness, right.subscription, right.runtime_generation, right.catalog_generation, right.retry_attempt, right.retry_in_ms, right.last_successful_discovery_ms },
+            .{ left.source, left.scope, left.workspace_admission, left.required, left.transport, left.connection, left.reloading, left.authentication, left.counts, left.cache_freshness, left.subscription, left.runtime_generation, left.catalog_generation, left.retry_attempt, left.retry_in_ms, left.last_successful_discovery_ms },
+            .{ right.source, right.scope, right.workspace_admission, right.required, right.transport, right.connection, right.reloading, right.authentication, right.counts, right.cache_freshness, right.subscription, right.runtime_generation, right.catalog_generation, right.retry_attempt, right.retry_in_ms, right.last_successful_discovery_ms },
         )) return false;
     }
     return true;
@@ -565,6 +566,9 @@ test "health equality compares values and ignores capture time" {
     const a: Snapshot = .{ .captured_at_ms = 1, .servers = @as(*[1]ServerSnapshot, &left) };
     const b: Snapshot = .{ .captured_at_ms = 200, .servers = @as(*[1]ServerSnapshot, &right) };
     try std.testing.expect(sameState(a, b));
+    right.reloading = true;
+    try std.testing.expect(!sameState(a, b));
+    right.reloading = false;
     right.connection = .failed;
     try std.testing.expect(!sameState(a, b));
 }
