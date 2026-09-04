@@ -342,6 +342,12 @@ fn checkOptionalIdentity(fields: std.json.ObjectMap, key: []const u8, expected: 
     }
 }
 
+fn optionalOutputIndex(fields: std.json.ObjectMap) error{InvalidEvent}!?i64 {
+    const value = fields.get("output_index") orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidEvent;
+    return value.integer;
+}
+
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
     provider_state: std.Io.Writer.Allocating,
@@ -398,7 +404,7 @@ pub const Reducer = struct {
         const event_type = stringField(parsed.value.object, "type") orelse return false;
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -436,7 +442,7 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, "\n\n");
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             const index = findTool(self.tools.items, output_index) orelse return false;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
@@ -444,13 +450,13 @@ pub const Reducer = struct {
             try appendToolArguments(alloc, &self.tools.items[index].arguments, delta, limits.tool_arguments_bytes);
             if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
             const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
             try self.tools.items[index].finalizeArguments(alloc, arguments, callbacks, limits);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -796,6 +802,31 @@ test "Responses finalization retains cancellation and terminal requirements" {
     stream.cancelled.store(true, .seq_cst);
     try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.terminal));
     try std.testing.expectError(error.Cancelled, stream.finish());
+}
+
+test "Responses rejects malformed supplied output indexes without requiring omitted metadata" {
+    const cases = [_][]const u8{
+        "{\"type\":\"response.function_call_arguments.done\",\"output_index\":\"0\",\"arguments\":\"{}\"}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":null,\"item\":{\"type\":\"function_call\",\"arguments\":\"{}\"}}",
+        "{\"type\":\"response.output_item.added\",\"output_index\":-1,\"item\":{\"type\":\"function_call\",\"call_id\":\"bad\",\"name\":\"read_file\"}}",
+        "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0.0,\"delta\":\"{}\"}",
+    };
+    for (cases) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply(ToolRecordTest.finalized);
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+    }
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
 }
 
 test "Responses finalization preserves the length finish disposition" {

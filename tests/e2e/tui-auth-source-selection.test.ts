@@ -4350,8 +4350,9 @@ tmuxTest(
   60_000,
 );
 
-for (const conflict of [false, true]) {
-  test("direct Responses final records " + (conflict ? "reject the current group and preserve earlier work" : "replace progressive arguments before execution"), async () => {
+for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
+  test("direct Responses final records " + scenario, async () => {
+    const conflict = scenario !== "replace";
     for (const provider of ["codex", "grok"] as const) {
       const profile = mkdtempSync(join(tmpdir(), "fx-" + provider + "-final-record-"));
       const testGateway = startFakeGateway([]);
@@ -4381,8 +4382,8 @@ for (const conflict of [false, true]) {
         { type: "response.function_call_arguments.done", output_index: 1, arguments: sibling.arguments },
       );
       events.push(
-        { type: "response.output_item.done", output_index: 0, item: final },
-        { type: "response.completed", response: { status: "completed", output: conflict ? [final, sibling] : [final] } },
+        { type: "response.output_item.done", output_index: scenario === "invalid-index" ? "0" : 0, item: final },
+        scenario === "invalid-index" ? completed : { type: "response.completed", response: { status: "completed", output: conflict ? [final, sibling] : [final] } },
       );
       responses.push(fakeGatewaySse(events), fakeGatewaySse([
         { type: "response.output_text.delta", delta: "FINAL_RECORD_OK" }, completed,
@@ -4414,7 +4415,7 @@ for (const conflict of [false, true]) {
         expect(existsSync(join(profile, "final.txt"))).toBe(!conflict);
         expect(readFileSync(join(profile, conflict ? "prior.txt" : "final.txt"), "utf8")).toBe("saved");
         const resultJson = JSON.parse(result.stdout);
-        if (conflict) expect(resultJson.error).toBe("ResponsesToolCallConflict");
+        if (conflict) expect(resultJson.error).toBe(scenario === "invalid-index" ? (provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent") : "ResponsesToolCallConflict");
         else {
           expect(resultJson.output).toBe("FINAL_RECORD_OK");
           expect(result.stderr).toBe("Writing final.txt\n");
