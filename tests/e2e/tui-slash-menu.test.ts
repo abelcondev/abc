@@ -243,7 +243,12 @@ async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
-    if (pane.includes("Workspace") && pane.includes("Enter Use")) return latest;
+    if (
+      pane.includes("Workspace") &&
+      pane.includes("Additional directories") &&
+      pane.includes("Add directory…") &&
+      pane.includes("Enter Use")
+    ) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for workspace menu.\nPane:\n${latest.join("\n")}`);
@@ -1813,7 +1818,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
+      await waitForStatuslineValue(settingsPath, "context", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
@@ -1821,7 +1826,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
       expect(pane).not.toContain("● Statusline:");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.session).toBe(true);
+      await waitForStatuslineValue(settingsPath, "session", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
