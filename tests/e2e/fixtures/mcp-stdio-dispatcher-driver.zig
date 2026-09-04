@@ -431,14 +431,14 @@ fn runRuntimeScopedHttpAuth(
         .operation_timeout_ms = 10_000,
     });
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         if (runtime.servers.items.len == 1) {
             var stderr_buf: [1024]u8 = undefined;
             var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
             try stderr.interface.print(
                 "scoped auth connect failed state={s} error={s}\n",
                 .{
-                    @tagName(runtime.servers.items[0].state),
+                    @tagName(runtime.servers.items[0].state.load(.acquire)),
                     runtime.servers.items[0].last_error orelse "none",
                 },
             );
@@ -550,7 +550,7 @@ fn runRuntimeLegacyRefreshLocks(
     });
     runtime.connectAll(.{});
     if (runtime.servers.items.len != 1 or
-        runtime.servers.items[0].state != .ready or
+        runtime.servers.items[0].state.load(.acquire) != .ready or
         runtime.servers.items[0].legacy_http == null)
     {
         return error.LegacyRefreshServerDidNotConnect;
@@ -644,7 +644,7 @@ fn runRuntimeLogoutRefreshRace(
         });
         runtime.connectAll(.{});
         if (runtime.servers.items.len != 1 or
-            runtime.servers.items[0].state != .ready or
+            runtime.servers.items[0].state.load(.acquire) != .ready or
             runtime.servers.items[0].legacy_http == null)
         {
             return error.LogoutRefreshServerDidNotConnect;
@@ -931,7 +931,7 @@ fn runRuntimeScopedRecovery(
         1,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.ScopedRecoveryServerDidNotConnect;
     }
     const owner_id = try std.fmt.allocPrint(alloc, "{s}-child", .{child_mode});
@@ -1105,7 +1105,7 @@ fn runRuntimeMrtrGuards(
         0,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.MrtrGuardServerDidNotConnect;
     }
 
@@ -1197,7 +1197,7 @@ fn runRuntimeRecovery(
 
     const config_args = try alloc.alloc([]const u8, 1);
     config_args[0] = try alloc.dupe(u8, fixture_path);
-    const config_env = try alloc.alloc(mcp.McpEnvVar, 4);
+    const config_env = try alloc.alloc(mcp.McpEnvVar, 5);
     config_env[0] = .{
         .key = try alloc.dupe(u8, "FX_MCP_MODE"),
         .value = try alloc.dupe(u8, "block_operation_write_once"),
@@ -1213,6 +1213,11 @@ fn runRuntimeRecovery(
     config_env[3] = .{
         .key = try alloc.dupe(u8, "FX_MCP_PID_PATH"),
         .value = try alloc.dupe(u8, pid_path),
+    };
+
+    config_env[4] = .{
+        .key = try alloc.dupe(u8, "FX_MCP_PROTOCOL_VERSION"),
+        .value = try alloc.dupe(u8, "2026-07-28"),
     };
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1614,7 +1619,7 @@ fn runRuntimeRecoveryControl(
         1,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.RuntimeRecoveryControlServerDidNotConnect;
     }
     runtime.servers.items[0].config.startup_timeout_ms = if (std.mem.eql(u8, control, "cancel"))
@@ -1839,8 +1844,9 @@ fn addRecoveryTestServer(
 ) !void {
     const config_args = try alloc.alloc([]const u8, 1);
     config_args[0] = try alloc.dupe(u8, fixture_path);
-    const config_env = try alloc.alloc(mcp.McpEnvVar, 9);
+    const config_env = try alloc.alloc(mcp.McpEnvVar, 10);
     const entries = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "FX_MCP_PROTOCOL_VERSION", .value = "2026-07-28" },
         .{ .key = "FX_MCP_MODE", .value = mode },
         .{ .key = "FX_MCP_CRASH_MARKER", .value = marker_path },
         .{ .key = "FX_MCP_WIRE_LOG", .value = wire_log_path },

@@ -2222,8 +2222,10 @@ fn runTopLevelMcp(
     deps: RunDeps,
 ) !RunResult {
     if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
+        const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
+        defer alloc.free(help);
+        try writeStdout(deps, help);
+        return .handled_success;
     }
     const operation = rest[0];
     if (std.mem.eql(u8, operation, "add")) {

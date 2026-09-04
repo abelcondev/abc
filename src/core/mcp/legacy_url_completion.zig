@@ -5,6 +5,8 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const SourceState = enum { current, logout_fenced, stale };
+
 pub const Waiter = struct {
     binding: elicitation.Binding,
     ids: []const []const u8,
@@ -203,12 +205,129 @@ pub const early_legacy_url_completion_ttl_ms: i64 = 10 * 60 * 1000;
 /// Connection and authority checks remain with the caller before locked operations.
 pub const State = struct {
     alloc: Allocator,
+    runtime_generation: u64 = 0,
+    sink: ?tool_mcp_runtime.LegacyUrlCompletionSink = null,
     legacy_url_waiter_mutex: std.Io.Mutex = .init,
     legacy_url_waiters: std.ArrayList(*LegacyUrlWaiter) = .empty,
     early_legacy_url_completions: std.ArrayList(EarlyLegacyUrlCompletion) = .empty,
     legacy_url_completion_candidates: std.ArrayList(LegacyUrlCompletionCandidate) = .empty,
     legacy_url_completion_windows: std.ArrayList(LegacyUrlCompletionWindow) = .empty,
     next_legacy_url_completion_window_generation: u64 = 1,
+
+    pub fn beginWindowLocked(self: *State, source: tool_subscription.NotificationSource, runtime_generation: u64) !u64 {
+        if (self.legacy_url_completion_windows.items.len >= max_legacy_url_completion_windows) {
+            return error.McpInputRequiredLimitExceeded;
+        }
+        const generation = self.next_legacy_url_completion_window_generation;
+        self.next_legacy_url_completion_window_generation = std.math.add(
+            u64,
+            generation,
+            1,
+        ) catch return error.McpRequestIdExhausted;
+        try self.legacy_url_completion_windows.append(self.alloc, .{
+            .source = source,
+            .runtime_generation = runtime_generation,
+            .generation = generation,
+        });
+        return generation;
+    }
+
+    pub fn registerCandidatesLocked(self: *State, source: tool_subscription.NotificationSource, runtime_generation: u64, window_generation: ?u64, ids: []const []const u8, source_state: SourceState, now_ms: i64) !void {
+        if (source_state == .stale or
+            (source_state == .logout_fenced and window_generation == null))
+        {
+            return error.Cancelled;
+        }
+        if (window_generation) |generation| {
+            var window_current = false;
+            for (self.legacy_url_completion_windows.items) |window| {
+                if (window.generation == generation and
+                    window.runtime_generation == runtime_generation and
+                    window.source.connection_generation == source.connection_generation and
+                    window.source.client_generation == source.client_generation and
+                    window.source.auth_generation == source.auth_generation and
+                    std.mem.eql(u8, window.source.server_name, source.server_name))
+                {
+                    window_current = true;
+                    break;
+                }
+            }
+            if (!window_current) return error.Cancelled;
+        }
+        for (ids, 0..) |id, index| {
+            for (ids[0..index]) |previous| {
+                if (std.mem.eql(u8, id, previous)) return error.McpDuplicateElicitationId;
+            }
+            for (self.legacy_url_completion_candidates.items) |candidate| {
+                if (candidate.runtime_generation == runtime_generation and
+                    candidate.connection_generation == source.connection_generation and
+                    candidate.client_generation == source.client_generation and
+                    candidate.auth_generation == source.auth_generation and
+                    std.mem.eql(u8, candidate.server_name, source.server_name) and
+                    std.mem.eql(u8, candidate.elicitation_id, id))
+                {
+                    return error.McpDuplicateElicitationId;
+                }
+            }
+        }
+        if (ids.len > max_legacy_url_completion_candidates -|
+            self.legacy_url_completion_candidates.items.len)
+        {
+            return error.McpInputRequiredLimitExceeded;
+        }
+        const original_len = self.legacy_url_completion_candidates.items.len;
+        errdefer while (self.legacy_url_completion_candidates.items.len > original_len) {
+            var candidate = self.legacy_url_completion_candidates.pop().?;
+            candidate.deinit(self.alloc);
+        };
+        for (ids) |id| {
+            const server_name = try self.alloc.dupe(u8, source.server_name);
+            errdefer self.alloc.free(server_name);
+            const owned_id = try self.alloc.dupe(u8, id);
+            errdefer self.alloc.free(owned_id);
+            try self.legacy_url_completion_candidates.append(self.alloc, .{
+                .server_name = server_name,
+                .elicitation_id = owned_id,
+                .runtime_generation = runtime_generation,
+                .connection_generation = source.connection_generation,
+                .client_generation = source.client_generation,
+                .auth_generation = source.auth_generation,
+            });
+        }
+        self.pruneEarlyLegacyUrlCompletionsLocked(now_ms);
+        var pending_index: usize = 0;
+        while (pending_index < self.early_legacy_url_completions.items.len) {
+            const pending = &self.early_legacy_url_completions.items[pending_index];
+            if (window_generation == null or
+                pending.window_generation != window_generation.?)
+            {
+                pending_index += 1;
+                continue;
+            }
+            var candidate_index: ?usize = null;
+            for (self.legacy_url_completion_candidates.items[original_len..], original_len..) |candidate, index| {
+                if (legacyUrlCandidateMatchesWire(candidate, .{
+                    .server_name = pending.server_name,
+                    .elicitation_id = pending.elicitation_id,
+                    .runtime_generation = pending.runtime_generation,
+                    .connection_generation = pending.connection_generation,
+                    .client_generation = pending.client_generation,
+                    .auth_generation = pending.auth_generation,
+                })) {
+                    candidate_index = index;
+                    break;
+                }
+            }
+            const matched_index = candidate_index orelse {
+                pending_index += 1;
+                continue;
+            };
+            self.legacy_url_completion_candidates.items[matched_index].status =
+                if (pending.logout_fenced) .logout_fenced else .early;
+            var matched = self.early_legacy_url_completions.swapRemove(pending_index);
+            matched.deinit(self.alloc);
+        }
+    }
 
     pub fn init(alloc: Allocator) State {
         return .{ .alloc = alloc };

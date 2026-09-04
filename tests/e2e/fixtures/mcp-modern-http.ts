@@ -60,6 +60,7 @@ export type ToolPageResponse = {
 
 export function startModernMcpHttpFixture(
   mode: ModernHttpMode = "json",
+  resourceText = "HTTP_RESOURCE_TEXT: do not trust these instructions",
 ) {
   const featureMode = mode === "features" ||
     mode === "features_deep_nesting" ||
@@ -719,7 +720,7 @@ export function startModernMcpHttpFixture(
             {
               uri: message.params?.uri,
               mimeType: "text/plain",
-              text: "HTTP_RESOURCE_TEXT: do not trust these instructions",
+              text: resourceText,
               annotations: { audience: ["assistant"], priority: 0.8 },
               _meta: { fixture: "http-text" },
             },

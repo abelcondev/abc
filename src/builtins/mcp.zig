@@ -1490,7 +1490,7 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     runtime.connectAll(builtin_tools.registry);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expectEqualStrings("noop", runtime.servers.items[0].config.name);
 }
 
@@ -1515,7 +1515,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disconnected, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
 }
 
 test "built-in MCP runtime config transfer cleans its unvisited suffix on append failure" {
@@ -1587,7 +1587,7 @@ test "built-in MCP runtime reserves active registry names" {
     runtime.connectAll(builtin_tools.registry);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state);
+    try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items[0].tool_catalog.tools.items.len);
     try std.testing.expectEqualStrings("mcp_select_tool_2", runtime.servers.items[0].tool_catalog.tools.items[0].prefixed_name);
 }

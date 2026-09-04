@@ -246,7 +246,6 @@ fn composeBrowseRow(
             alloc,
             projection.servers[display_index],
             display_index == projection.state.selected_index,
-            projection.state.load_state == .loading,
             width,
         ),
         .tools => if (projection.toolAt(display_index)) |tool|
@@ -345,7 +344,6 @@ fn composeServerRow(
     alloc: Allocator,
     server: mcp_health.ServerSnapshot,
     selected: bool,
-    reloading: bool,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -358,15 +356,15 @@ fn composeServerRow(
     try appendTerminalSafeSingleLine(alloc, &row, server.configured_name, name_width);
     if (width > name_width + 4) {
         try row_text.appendSpacesToColumn(alloc, &row, name_width + 4);
-        const state = if (reloading) "Reloading" else serverStateLabel(server);
+        const state = serverStateLabel(server);
         const state_width: usize = if (width >= 80) 20 else @as(usize, width) -| name_width -| 4;
         try appendTerminalSafeSingleLine(alloc, &row, state, state_width);
     }
     if (width >= 80) {
-        try row_text.appendSpacesToColumn(alloc, &row, 44);
+        try row_text.appendSpacesToColumn(alloc, &row, 46);
         var meta_buf: [160]u8 = undefined;
         const meta = serverMetadata(&meta_buf, server);
-        try appendTerminalSafeSingleLine(alloc, &row, meta, @as(usize, width) -| 44);
+        try appendTerminalSafeSingleLine(alloc, &row, meta, @as(usize, width) -| 46);
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -858,6 +856,23 @@ test "MCP menu every screen and section renders through the VT" {
         max_inline_rows,
         &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
     );
+
+    var unauthenticated = server;
+    unauthenticated.transport = .http;
+    unauthenticated.authentication = .required;
+    const auth_servers = [_]mcp_health.ServerSnapshot{unauthenticated};
+    projection.servers = &auth_servers;
+    try expectMcpMenuVtContains(alloc, projection, width, max_inline_rows, &.{"Needs authentication  HTTP"});
+    projection.servers = &servers;
+
+    var independently_reloading = [_]mcp_health.ServerSnapshot{ server, server };
+    independently_reloading[0].reloading = true;
+    independently_reloading[1].configured_name = @constCast("other");
+    projection.servers = &independently_reloading;
+    projection.state.load_state = .loading;
+    try expectMcpMenuVtContains(alloc, projection, width, max_inline_rows, &.{ "Reloading", "Ready", "other" });
+    projection.servers = &servers;
+    projection.state.load_state = .ready;
 
     projection.state.screen = .details;
     try expectMcpMenuVtContains(

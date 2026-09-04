@@ -150,6 +150,20 @@ pub const InputResponder = struct {
     legacy_url_manual_completion: bool = false,
     callback: *const fn (*anyopaque, Allocator, InputOrigin, InputRequired) anyerror![]const u8,
     continuation_terminal: ?*const fn (*anyopaque, Allocator, InputOrigin, ContinuationTerminal) void = null,
+
+    pub fn finish(self: InputResponder, alloc: Allocator, origin: InputOrigin, outcome: ContinuationTerminal) void {
+        const callback = self.continuation_terminal orelse return;
+        callback(self.context, alloc, origin, outcome);
+    }
+};
+
+pub const InputCompletion = struct {
+    responder: InputResponder,
+    origin: InputOrigin,
+
+    pub fn finish(self: InputCompletion, alloc: Allocator, outcome: ContinuationTerminal) void {
+        self.responder.finish(alloc, self.origin, outcome);
+    }
 };
 
 pub const LegacyUrlCompletion = struct {

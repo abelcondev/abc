@@ -2949,7 +2949,7 @@ test "ACP lifecycle resolves dynamic MCP availability through session context" {
         .name = try alloc.dupe(u8, "fixture"),
     });
     const mcp_server = runtime.servers.items[0];
-    mcp_server.state = .ready;
+    mcp_server.state.store(.ready, .release);
     try mcp_server.tool_catalog.tools.append(alloc, .{
         .original_name = try alloc.dupe(u8, "echo"),
         .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),

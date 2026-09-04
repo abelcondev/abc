@@ -612,6 +612,7 @@ function createRoot(
         fixture: {
           type: transport,
           url: serverUrl,
+          environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           ...(configureOauth
             ? {
                 oauth: {
@@ -656,6 +657,7 @@ function baseEnv(root: ReturnType<typeof createRoot>) {
     AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.trace,
@@ -1212,7 +1214,7 @@ describe("MCP remote authentication lifecycle", () => {
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       delete profile.mcp.fixture.oauth.scopes;
       profile.mcp.canary = {
-        type: "http",
+        type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
         url: canary.url,
         startup_timeout_ms: 5_000,
         operation_timeout_ms: 5_000,
@@ -1982,13 +1984,13 @@ describe("MCP remote authentication lifecycle", () => {
         JSON.stringify({
           mcp: {
             linear: {
-              type: "http",
+              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
               url: upstream.url,
               startup_timeout_ms: 5_000,
               operation_timeout_ms: 5_000,
             },
             slack: {
-              type: "http",
+              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
               url: auth.url,
               oauth: {
                 client_id: "fx-mcp-auth-test",
@@ -2403,7 +2405,7 @@ describe("MCP remote authentication lifecycle", () => {
       const root = createRoot(auth);
       const profilePath = join(root.home, ".fx", "mcp.json");
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.healthy = { type: "http", url: upstream.url, headers: { "x-test-healthy": "1" }, startup_timeout_ms: 5_000 };
+      profile.mcp.healthy = { type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" }, url: upstream.url, headers: { "x-test-healthy": "1" }, startup_timeout_ms: 5_000 };
       writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startFakeGateway([
         fakeGatewayFinalText("TUI idle."),

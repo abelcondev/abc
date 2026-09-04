@@ -178,6 +178,7 @@ function createRoot(
               ? scriptPath
               : undefined,
             FX_MCP_PID_PATH: join(root, "mcp.pid"),
+            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
@@ -377,6 +378,30 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  for (const version of ["2025-11-25", "2025-06-18", "2024-11-05"] as const) {
+    test(`default MCP v1 starts ${version} stdio without a discovery probe or process restart`, async () => {
+      const root = createRoot(`default-v1-${version}`, LEGACY_FIXTURE, { legacyVersion: version });
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      gateway = startToolGateway("Default MCP v1 complete.");
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the MCP tool."],
+        { cwd: root.workspace, env: { ...fixtureEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined }, timeoutMs: 20_000 },
+      );
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain("Default MCP v1 complete.");
+      const wire = readWire(root.wireLogPath);
+      expect(wire[0]?.message.method).toBe("initialize");
+      expect(wire.filter((entry) => entry.message.method === "server/discover")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(1);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
   test("direct docker run servers are cleaned through the injected cidfile", async () => {
     const root = createRoot("docker-cidfile-cleanup", MODERN_FIXTURE);
     const fakeDocker = join(root.root, "docker");
@@ -626,6 +651,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       FX_MCP_RESULT_TEXT: "${WORKSPACE_MCP_RESULT:-MODERN_MCP_TOOL_RESULT}",
       FX_MCP_WIRE_LOG: "${WORKSPACE_MCP_WIRE_LOG}",
       FX_MCP_PID_PATH: "${WORKSPACE_MCP_PID_PATH}",
+      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "${WORKSPACE_MCP_MODE:-normal}",
     };
     delete project.mcpServers.fixture.environment;
@@ -767,6 +793,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       ...fixtureEnv(root, gateway),
       FX_MCP_WIRE_LOG: root.wireLogPath,
       FX_MCP_PID_PATH: join(root.root, "mcp.pid"),
+      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "normal",
     };
     const added = await runFx(
@@ -2552,6 +2579,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       const unrelatedWire = join(root.root, "unrelated-wire.jsonl");
       profile.mcp.unrelated = { ...profile.mcp.fixture, environment: {
         ...profile.mcp.fixture.environment,
+        FX_MCP_PROTOCOL_VERSION: "2026-07-28",
         FX_MCP_MODE: "stall_startup", FX_MCP_WIRE_LOG: unrelatedWire,
         FX_MCP_PID_PATH: join(root.root, "unrelated.pid"),
       } };

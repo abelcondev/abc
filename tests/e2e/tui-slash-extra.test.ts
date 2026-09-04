@@ -522,6 +522,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
                 join(import.meta.dir, "fixtures", "mcp-modern-stdio.mjs"),
               ],
               environment: {
+                FX_MCP_PROTOCOL_VERSION: "2026-07-28",
                 FX_MCP_MODE: "features",
                 FX_MCP_WIRE_LOG: wireLogPath,
                 FX_MCP_CATALOG_DELAY_MS: "25",
@@ -552,6 +553,9 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         const discoveryCount = beforeReloadWire.filter((entry) =>
           entry.message.method === "server/discover"
         ).length;
+        const catalogCount = beforeReloadWire.filter((entry) =>
+          entry.message.method === "tools/list"
+        ).length;
 
         await session.sendKeys("R");
         const reloaded = await session.waitForText(
@@ -565,6 +569,9 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         expect(afterReloadWire.filter((entry) =>
           entry.message.method === "server/discover"
         )).toHaveLength(discoveryCount);
+        expect(afterReloadWire.filter((entry) =>
+          entry.message.method === "tools/list"
+        )).toHaveLength(catalogCount + 1);
 
         await session.sendKeys("Right");
         const tools = await session.waitForText("mcp_fixture_echo", 10_000);
@@ -702,7 +709,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const fixture = join(import.meta.dir, "fixtures", "mcp-modern-stdio.mjs");
+      const fixture = join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs");
 
       try {
         session = await TmuxSession.create({
@@ -770,7 +777,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
           mcpServers: {
             project_fixture: {
               command: process.execPath,
-              args: [join(import.meta.dir, "fixtures", "mcp-modern-stdio.mjs")],
+              args: [join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs")],
               enabled: true,
             },
           },

@@ -1467,10 +1467,6 @@ pub const State = struct {
             .failed => |err| {
                 if (kind == .catalog and (err == error.McpResourcesUnsupported or err == error.McpPromptsUnsupported)) {
                     self.completeEmptyMenuCatalog(alloc, request);
-                    self.menu_feedback = try alloc.dupe(u8, if (err == error.McpResourcesUnsupported)
-                        "This server does not provide MCP resources."
-                    else
-                        "This server does not provide MCP prompts.");
                     return .repaint;
                 }
                 self.menu_feedback = try allocMenuText(
@@ -2375,7 +2371,7 @@ pub const State = struct {
             if (authority_reduced) return error.McpAuthorityReducedReloadFailed;
             return err;
         };
-        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, !authority_reduced);
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, !authority_reduced, true);
     }
 
     fn reloadAuthorityReducedControlled(
@@ -2403,7 +2399,7 @@ pub const State = struct {
             return .{ .published = try PublishedReload.init(alloc, null, &.{}) };
         }
         const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
-        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false);
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false, false);
     }
 
     /// Takes ownership of the unloaded candidate, including all error paths.
@@ -2416,6 +2412,7 @@ pub const State = struct {
         cancel_requested: *std.atomic.Value(bool),
         pending: ?*PendingReload,
         retain_on_required_failure: bool,
+        refresh_catalogs: bool,
     ) !ReloadOutcome {
         var candidate_owned = candidate != null;
         defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
@@ -2429,6 +2426,7 @@ pub const State = struct {
             if (try lease.runtime.reconcile(candidate, cancel_requested, retain_on_required_failure)) |failure| {
                 return .{ .retained_required_failure = failure };
             }
+            if (refresh_catalogs) try lease.runtime.reloadCatalogs(cancel_requested);
             var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
             defer snapshot.deinit(alloc);
             return .{ .published = try PublishedReload.init(
@@ -3017,12 +3015,15 @@ test "authority reduction drains revoked servers without waiting for unrelated r
     );
 
     const retirement_deadline = io_mod.milliTimestamp() + 2_000;
-    while (!runtime.retiring.load(.acquire) and
-        io_mod.milliTimestamp() < retirement_deadline)
-    {
+    while (true) {
+        var snapshot = try runtime.snapshotHealth(alloc, 0);
+        const revoked = snapshot.servers.len == 0;
+        snapshot.deinit(alloc);
+        if (revoked) break;
+        if (io_mod.milliTimestamp() >= retirement_deadline) return error.TestWorkspaceAuthorityNotRetired;
         io_mod.sleep(std.time.ns_per_ms);
     }
-    try std.testing.expect(runtime.retiring.load(.acquire));
+    try std.testing.expect(!runtime.retiring.load(.acquire));
 
     const authentication_name = try alloc.dupe(u8, "workspace");
     const authentication = alloc.create(PendingAuthentication) catch |err| {

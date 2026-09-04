@@ -1,6 +1,8 @@
 const std = @import("std");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const Allocator = std.mem.Allocator;
+const collections = @import("../shared/collections.zig");
+const max_mcp_tool_tags: usize = 16;
 
 /// One alias authority for a session. Retired names remain reserved so a later
 /// catalog cannot silently assign an advertised name to a different tool.
@@ -9,7 +11,7 @@ pub const Registry = struct {
     alloc: Allocator,
     mutex: std.Io.Mutex = .init,
     by_identity: std.StringHashMapUnmanaged([]u8) = .empty,
-    aliases: std.StringHashMapUnmanaged(void) = .empty,
+    aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .alloc = alloc };
@@ -23,6 +25,14 @@ pub const Registry = struct {
         }
         self.by_identity.deinit(self.alloc);
         self.aliases.deinit(self.alloc);
+    }
+
+    /// Borrows the server identity until the registry is destroyed.
+    pub fn serverName(self: *Registry, alias: []const u8) ?[]const u8 {
+        const io = @import("../shared/io.zig").getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.aliases.get(alias);
     }
 
     /// Returns an owned alias. Concurrent startup, refresh, and recovery share
@@ -53,7 +63,8 @@ pub const Registry = struct {
             try self.by_identity.ensureUnusedCapacity(self.alloc, 1);
             try self.aliases.ensureUnusedCapacity(self.alloc, 1);
             self.by_identity.putAssumeCapacityNoClobber(owned_key, candidate);
-            self.aliases.putAssumeCapacityNoClobber(candidate, {});
+            const server_end = owned_key.len - tool.len;
+            self.aliases.putAssumeCapacityNoClobber(candidate, owned_key[server_end - server.len .. server_end]);
             return result;
         }
     }
@@ -66,7 +77,7 @@ pub fn matchesServer(name: []const u8, server_name: []const u8) bool {
     const segment = name[4..];
     for (source, 0..) |byte, index| {
         if (index >= segment.len) return false;
-        const normalized = if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') byte else '_';
+        const normalized = if (isIdentifierByte(byte)) byte else '_';
         if (segment[index] != normalized) return false;
     }
     return segment.len > source.len and segment[source.len] == '_';
@@ -94,7 +105,7 @@ fn buildBaseToolName(alloc: Allocator, server_name: []const u8, tool_name: []con
 
 fn writeSanitizedSegment(writer: *std.Io.Writer, segment: []const u8) !void {
     for (segment) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') {
+        if (isIdentifierByte(byte)) {
             try writer.writeByte(byte);
         } else {
             try writer.writeByte('_');
@@ -130,4 +141,48 @@ test "session tool aliases survive replacement and cannot retarget a collision" 
     const recovered = try registry.name(alloc, .{}, "a_b", "c");
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings(collision, recovered);
+}
+
+pub fn tagsFor(alloc: Allocator, server_name: []const u8, tool_name: []const u8) ![]const []u8 {
+    var tags: std.ArrayList([]u8) = .empty;
+    errdefer collections.freeStringList(alloc, &tags);
+
+    try appendTag(alloc, &tags, "mcp");
+    try appendTagTokens(alloc, &tags, server_name);
+    try appendTagTokens(alloc, &tags, tool_name);
+
+    return try tags.toOwnedSlice(alloc);
+}
+
+fn appendTagTokens(alloc: Allocator, tags: *std.ArrayList([]u8), text: []const u8) !void {
+    var start: ?usize = null;
+    for (text, 0..) |byte, index| {
+        if (isIdentifierByte(byte)) {
+            if (start == null) start = index;
+            continue;
+        }
+        if (start) |s| {
+            try appendTag(alloc, tags, text[s..index]);
+            start = null;
+        }
+    }
+    if (start) |s| try appendTag(alloc, tags, text[s..]);
+}
+
+fn appendTag(alloc: Allocator, tags: *std.ArrayList([]u8), raw: []const u8) !void {
+    if (raw.len == 0 or tags.items.len >= max_mcp_tool_tags) return;
+
+    const normalized = try std.ascii.allocLowerString(alloc, raw);
+    errdefer alloc.free(normalized);
+    for (tags.items) |tag| {
+        if (std.mem.eql(u8, tag, normalized)) {
+            alloc.free(normalized);
+            return;
+        }
+    }
+    try tags.append(alloc, normalized);
+}
+
+pub fn isIdentifierByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
 }

@@ -1,6 +1,13 @@
 const std = @import("std");
 const operation_control = @import("operation_control.zig");
 
+pub fn check(io: std.Io, control: Control) error{ Cancelled, McpRequestTimedOut }!void {
+    if (control.cancellation().cancelled()) return error.Cancelled;
+    if (control.deadline) |deadline| {
+        if (!std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io, .awake), .lt, deadline)) return error.McpRequestTimedOut;
+    }
+}
+
 pub const Control = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,

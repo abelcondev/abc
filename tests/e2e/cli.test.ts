@@ -5073,6 +5073,10 @@ describe("cli: MCP profile add", () => {
         ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
+      const bare = await runFx(["mcp"], { env: { HOME: home, ...NO_GATEWAY_AUTH } });
+      expect(bare.code).toBe(0);
+      expect(bare.stdout).toBe(help.stdout);
+      expect(existsSync(marker)).toBe(false);
       expect(local.code).toBe(0);
       expect(local.stderr).toBe("");
       expect(local.stdout).toContain("Saved MCP server 'local'");

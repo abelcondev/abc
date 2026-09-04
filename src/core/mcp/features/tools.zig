@@ -1,5 +1,5 @@
 const std = @import("std");
-const feature_cache = @import("../feature_cache.zig");
+const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
@@ -106,6 +106,8 @@ pub const Catalog = struct {
 pub const CatalogBuilder = struct {
     tools: std.ArrayList(Tool) = .empty,
     cursors: std.StringHashMap(void),
+    /// Borrows a key owned by cursors, independent of the parsed page lifetime.
+    next_cursor: ?[]const u8 = null,
     protocol: Protocol,
     pages: usize = 0,
     first_received_at_ms: ?u64 = null,
@@ -128,6 +130,15 @@ pub const CatalogBuilder = struct {
         self.* = undefined;
     }
 
+    /// Decodes one response and owns its continuation until the next page.
+    pub fn appendResponse(self: *CatalogBuilder, alloc: Allocator, response: []const u8, received_at_ms: u64, limits: Limits) Error!bool {
+        var page = try parseListPage(alloc, response, self.protocol, limits);
+        defer page.deinit(alloc);
+        try self.appendPage(alloc, &page, received_at_ms, limits);
+        return self.next_cursor == null;
+    }
+
+    /// Consumes the page's tools and cursor on successful append.
     pub fn appendPage(
         self: *CatalogBuilder,
         alloc: Allocator,
@@ -153,7 +164,7 @@ pub const CatalogBuilder = struct {
         if (self.first_received_at_ms == null) {
             self.first_received_at_ms = received_at_ms;
         }
-        const page_expiry_ms = feature_cache.pageExpiry(
+        const page_expiry_ms = catalog_freshness.pageExpiry(
             switch (self.protocol) {
                 .legacy => .legacy,
                 .modern => .modern,
@@ -162,7 +173,7 @@ pub const CatalogBuilder = struct {
             page.ttl_present,
             page.ttl_ms,
         );
-        self.expires_at_ms = feature_cache.earliestExpiry(
+        self.expires_at_ms = catalog_freshness.earliestExpiry(
             self.expires_at_ms,
             page_expiry_ms,
         );
@@ -184,10 +195,10 @@ pub const CatalogBuilder = struct {
         page.tools = &.{};
 
         if (page.next_cursor) |cursor| {
-            const owned = try alloc.dupe(u8, cursor);
-            errdefer alloc.free(owned);
-            try self.cursors.put(owned, {});
-        }
+            try self.cursors.put(cursor, {});
+            self.next_cursor = cursor;
+            page.next_cursor = null;
+        } else self.next_cursor = null;
     }
 
     /// Returns one complete owned catalog sorted by protocol name. Cache expiry
@@ -853,9 +864,28 @@ test "tools list tolerates negative TTL and accepts an empty opaque cursor" {
     var builder = CatalogBuilder.init(alloc, .modern);
     defer builder.deinit(alloc);
     try builder.appendPage(alloc, &page, 1_000, .{});
+    try std.testing.expectEqualStrings("", builder.next_cursor.?);
     var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1_000), catalog.expires_at_ms);
+}
+
+test "catalog response assembly retains its cursor after parsed page cleanup" {
+    const alloc = std.testing.allocator;
+    var builder = CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    try std.testing.expect(!try builder.appendResponse(alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}],"nextCursor":"page two"}}
+    , 100, .{}));
+    try std.testing.expectEqualStrings("page two", builder.next_cursor.?);
+    try std.testing.expect(try builder.appendResponse(alloc,
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"}}]}}
+    , 110, .{}));
+    var catalog = try builder.finish(alloc);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), catalog.tools.len);
+    try std.testing.expectEqualStrings("first", catalog.tools[0].name);
+    try std.testing.expectEqualStrings("second", catalog.tools[1].name);
 }
 
 test "tools catalog rejects cache scope changes across pages" {

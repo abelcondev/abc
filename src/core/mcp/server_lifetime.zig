@@ -1,4 +1,13 @@
 const std = @import("std");
+const atomic_value = @import("atomic_value.zig");
+
+var next_identity: atomic_value.Value(u64) = .init(1);
+
+pub fn allocateIdentity() u64 {
+    const identity = next_identity.fetchAdd(1, .monotonic);
+    std.debug.assert(identity != 0);
+    return identity;
+}
 
 /// A server may leave the session table while an operation still owns a lease.
 /// Retirement rejects new leases and cancels existing work before waiting.

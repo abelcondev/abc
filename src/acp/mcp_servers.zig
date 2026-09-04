@@ -130,8 +130,8 @@ pub fn prepare(
     runtime.connectAllForAcp(builtin_tools.registry);
 
     for (runtime.servers.items) |server_state| {
-        if (server_state.state == .ready or !server_state.config.required) continue;
-        const reason = server_state.last_error orelse @tagName(server_state.state);
+        if (server_state.state.load(.acquire) == .ready or !server_state.config.required) continue;
+        const reason = server_state.last_error orelse @tagName(server_state.state.load(.acquire));
         const acp_reason = if (std.mem.startsWith(
             u8,
             reason,

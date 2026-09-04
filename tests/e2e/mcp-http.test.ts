@@ -82,7 +82,7 @@ function createRoot(
     JSON.stringify({
       mcp: {
         fixture: {
-          type: "http",
+          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           url: activeFixture.url,
           headers: { "X-Workspace": "one" },
           ...(required ? { required: true } : {}),
@@ -116,6 +116,7 @@ function fixtureEnv(
     AI_GATEWAY_API_KEY: "fake-mcp-http-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
@@ -225,7 +226,7 @@ describe("modern MCP Streamable HTTP", () => {
     writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({
       mcp: {
         fixture: {
-          type: "http",
+          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           url: `http://127.0.0.1:${failing.port}/mcp`,
           oauth: { client_id: "fixture-client" },
           startup_timeout_ms: 1_000,
@@ -752,6 +753,57 @@ describe("modern MCP Streamable HTTP", () => {
       "JsonDepthLimitExceeded",
     );
     expect(fixture.resourcesListCalls).toBe(1);
+  }, 30_000);
+
+  test("private resource caches isolate servers and URIs with identical credentials", async () => {
+    fixture = startModernMcpHttpFixture("features", "FIRST_SERVER_RESOURCE");
+    const second = startModernMcpHttpFixture("features", "SECOND_SERVER_RESOURCE");
+    try {
+      const root = createRoot("private-server-isolation", fixture);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.bearer_token_env = "FX_TEST_SHARED_MCP_TOKEN";
+      profile.mcp.second = { ...profile.mcp.fixture, url: second.url };
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const calls = [
+        ["first_read", "fixture", "FIRST_SERVER_RESOURCE", "custom://alpha"],
+        ["second_read", "second", "SECOND_SERVER_RESOURCE", "custom://alpha"],
+        ["first_beta", "fixture", "FIRST_SERVER_RESOURCE", "custom://beta"],
+        ["second_beta", "second", "SECOND_SERVER_RESOURCE", "custom://beta"],
+        ["first_cached", "fixture", "FIRST_SERVER_RESOURCE", "custom://alpha"],
+        ["second_cached", "second", "SECOND_SERVER_RESOURCE", "custom://alpha"],
+        ["first_beta_cached", "fixture", "FIRST_SERVER_RESOURCE", "custom://beta"],
+        ["second_beta_cached", "second", "SECOND_SERVER_RESOURCE", "custom://beta"],
+      ];
+      gateway = startFakeGateway([
+        ...calls.map(([id, server, , uri]) => fakeGatewayToolCall(id, "mcp_features", {
+          action: "resource_read", server, uri,
+        })),
+        fakeGatewayFinalText("Private resource caches stayed separate."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the same resource on both configured servers twice."],
+        { cwd: root.workspace, env: { ...fixtureEnv(root, gateway), FX_TEST_SHARED_MCP_TOKEN: "shared-fixture-token" }, timeoutMs: 25_000 },
+      );
+      preserveHttpFailure("private-server-isolation", root, result, fixture, gateway);
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(calls.length + 1);
+      const finalRequest = gateway.requests.at(-1)!.body;
+      for (const [id, , expected, uri] of calls) {
+        const text = toolResultText(finalRequest, id);
+        expect(text).toContain(expected);
+        expect(JSON.parse(text).contents[0].uri).toBe(uri);
+        expect(text).not.toContain(expected === "FIRST_SERVER_RESOURCE" ? "SECOND_SERVER_RESOURCE" : "FIRST_SERVER_RESOURCE");
+      }
+      for (const source of [fixture, second]) {
+        const reads = source.requests.filter((entry) => entry.message.method === "resources/read");
+        // Watching beta replaces the subscription and expires alpha; the final beta read stays cached.
+        expect(reads.map((entry) => entry.message.params?.uri)).toEqual(["custom://alpha", "custom://beta", "custom://alpha"]);
+        expect(reads[0].headers.authorization).toBe("Bearer shared-fixture-token");
+      }
+    } finally {
+      second.stop();
+    }
   }, 30_000);
 
   test("typed Resources Prompts Completion and resource updates use modern HTTP", async () => {
@@ -1509,7 +1561,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcp: {
           fixture: {
-            type: "http",
+            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
             url: fixture.url,
             header_env: { "X-Workspace": "MCP_WORKSPACE" },
             bearer_token_env: "MCP_BEARER_TOKEN",
@@ -1558,7 +1610,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcpServers: {
           fixture: {
-            type: "http",
+            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
             url: fixture.url,
             headers: {
               Authorization: "Bearer ${WORKSPACE_HTTP_TOKEN}",

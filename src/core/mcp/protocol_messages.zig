@@ -288,3 +288,12 @@ pub const ParsedServerCapabilities = struct {
     tools_list_changed: bool = false,
     features: ServerCapabilities = .{},
 };
+
+pub fn metadataWriterForCapabilities(
+    capabilities: elicitation.Capabilities,
+) *const fn (*std.Io.Writer) anyerror!void {
+    if (capabilities.form and capabilities.url) return writeModernRequestMetadataFormAndUrl;
+    if (capabilities.form) return writeModernRequestMetadataForm;
+    if (capabilities.url) return writeModernRequestMetadataUrl;
+    return writeModernRequestMetadata;
+}
