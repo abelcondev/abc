@@ -268,9 +268,8 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
-            if (logout_provider == selected_provider and logout_provider != .gateway and
-                (app.stream.active or app.worker.isProcessing() or app.worker.queuedPromptCount() > 0))
-            {
+            const hold_turn_start = logout_provider == selected_provider and logout_provider != .gateway;
+            if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
@@ -278,6 +277,7 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return;
             }
+            defer if (hold_turn_start) app.worker.releaseTurnStartHold();
             if (logout_provider == .grok) {
                 const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
                     try writeAuthNotice(app, .{
