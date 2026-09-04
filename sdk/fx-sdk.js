@@ -1238,15 +1238,24 @@ export async function createFxAgent(options = {}) {
     if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
     const controller = new AbortController();
     turn.toolControllers.add(controller);
-    let content;
+    let onAbort;
+    const aborted = new Promise((resolve) => { onAbort = () => resolve(); });
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    let content = "";
     let isError = false;
     try {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
-      content = hostToolContent(await execute(input, { signal: controller.signal }));
+      const execution = Promise.resolve().then(() => {
+        if (controller.signal.aborted || !isCurrentTurn(turn)) return;
+        return execute(input, { signal: controller.signal });
+      });
+      const value = await Promise.race([execution, aborted]);
+      if (!controller.signal.aborted) content = hostToolContent(value);
     } catch (error) {
       isError = true;
       content = error instanceof Error ? error.message : String(error);
     } finally {
+      controller.signal.removeEventListener("abort", onAbort);
       turn.toolControllers.delete(controller);
     }
     return { content, isError, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
