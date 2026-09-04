@@ -6729,3 +6729,109 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
     session = null;
   } finally { release(); grok.stop(); }
 }, TIMEOUT);
+
+tmuxTest("provider recovery continues after a held prompt and failed catalog", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-fallback-prompt-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendText("Use the remaining subscription after recovery.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("GROK_DIRECT_RESPONSE", 5000);
+    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+    expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+
+tmuxTest("provider preparation resumes a held prompt after explicit provider retry", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-explicit-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => {
+    entered++;
+    if (entered === 1) {
+      await held;
+      return new Response("unavailable", { status: 503 });
+    }
+  } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered === 1, 5000);
+    await session.sendText("Retain this prompt across the explicit provider retry.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", 5000);
+    const requests = chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.body).toContain("Retain this prompt across the explicit provider retry.");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); }
+}, TIMEOUT);
+
+tmuxTest("provider preparation completes existing-key recovery for a held prompt", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-key-recovery-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([fakeGatewayFinalText("KEY_RECOVERY_OK")]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  linkSync(join(home, ".fx", "chatgpt-auth.json"), join(home, "auth-alias"));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+  const trace = join(home, "trace.log");
+  session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("Use the Gateway after repair.");
+  await waitForTrace(trace, "pending_prompt_awaiting_auth", 5000);
+  await openProviderPicker(session);
+  await session.sendLiteral("vercel");
+  await session.sendKeys("Enter");
+  await session.waitForText("api-key", TIMEOUT);
+  await session.sendLiteral("api-key");
+  await session.sendKeys("Enter");
+  await session.waitForText("env", TIMEOUT);
+  await session.sendLiteral("env");
+  await session.sendKeys("Enter");
+  await session.waitForText("KEY_RECOVERY_OK", 5000);
+  expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("gateway");
+  expect(gateway.requests).toHaveLength(1);
+  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("Use the Gateway after repair.");
+  expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);

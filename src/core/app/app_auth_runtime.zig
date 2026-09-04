@@ -1093,7 +1093,7 @@ pub fn Runtime(comptime App: type) type {
         fn pendingPromptBlocksPreparation(app: *const App) bool {
             if (comptime !@hasField(App, "submission")) return false;
             const pending = app.submission.pending orelse return false;
-            return pending.phase != .awaiting_auth;
+            return pending.credential_admitted or pending.phase == .queued;
         }
 
         fn pendingPromptNeedsAdoption(app: *const App) bool {
@@ -1151,6 +1151,11 @@ pub fn Runtime(comptime App: type) type {
                 .team => try finishTeamPreparation(app, task),
             };
             if (applied) {
+                if (comptime @hasField(App, "submission")) {
+                    if (app.submission.pending) |pending| {
+                        if (pending.phase == .awaiting_auth) requestPromptRetryAfterAuth(app);
+                    }
+                }
                 try resumePromptAfterAuth(app);
                 return;
             }
@@ -2011,10 +2016,15 @@ test "provider preparation waits for prompt adoption and protects admitted promp
     app.submission.pending = .{ .draft = .{ .turn_id = 1, .prompt = &.{}, .images = &.{}, .skill_display_spans = &.{} } };
     for ([_]submission.PendingPhase{ .awaiting_frame, .awaiting_adoption }) |phase| {
         app.submission.pending.?.phase = phase;
-        try std.testing.expect(Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+        try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
         try std.testing.expect(Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
     }
-    for ([_]submission.PendingPhase{ .adopted, .queued }) |phase| {
+    app.submission.pending.?.phase = .adopted;
+    try std.testing.expect(!Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    app.submission.pending.?.credential_admitted = true;
+    try std.testing.expect(Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
+    app.submission.pending.?.credential_admitted = false;
+    for ([_]submission.PendingPhase{.queued}) |phase| {
         app.submission.pending.?.phase = phase;
         try std.testing.expect(Runtime(FakeApp).pendingPromptBlocksPreparation(&app));
         try std.testing.expect(!Runtime(FakeApp).pendingPromptNeedsAdoption(&app));
