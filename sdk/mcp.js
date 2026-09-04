@@ -68,7 +68,7 @@ export async function createMcpAdapter(client, options = {}) {
       description: tool.description || "MCP tool",
       inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
       async execute(input, { signal }) {
-        const result = await client.callTool({ name: tool.name, arguments: input }, { signal });
+        const result = await client.callTool({ name: tool.name, arguments: input }, undefined, { signal });
         const text = resultText(result);
         const images = (Array.isArray(result?.content) ? result.content : []).flatMap((item) => item?.type === "image" ? [item] : item?.type === "resource" && item.resource?.mimeType?.startsWith("image/") && typeof item.resource?.blob === "string" ? [{ type: "image", mimeType: item.resource.mimeType, data: item.resource.blob }] : []).map((item) => ({
           type: "image", mimeType: item.mimeType, data: item.data,

@@ -17,6 +17,7 @@ let toolCalls = 0;
 const transport = process.argv[2] || "stdio";
 const backend = process.argv[3] || (transport === "stdio" ? "native" : "wasm");
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const toolDescription = "MCP tool usage and parameter guidance. ".repeat(64);
 let mcpClosed = false;
 
 function rpcClient(send, close) {
@@ -40,7 +41,12 @@ function rpcClient(send, close) {
   return {
     initialize: () => request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "libfx-test", version: "1" } }),
     listTools: (params) => request("tools/list", params),
-    callTool: (params) => { toolCalls += 1; return request("tools/call", params); },
+    callTool: (params, resultSchema, options) => {
+      assert.equal(resultSchema, undefined);
+      assert.ok(options?.signal instanceof AbortSignal);
+      toolCalls += 1;
+      return request("tools/call", params);
+    },
     readResource: (params) => request("resources/read", params),
     getPrompt: (params) => request("prompts/get", params),
     async close() { await close(); mcpClosed = true; },
@@ -63,7 +69,7 @@ if (transport === "stdio") {
   const dispatch = ({ id, method, params }) => {
     if (method === "initialize") return { jsonrpc: "2.0", id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {}, resources: {}, prompts: {} }, serverInfo: { name: "http-fixture", version: "1" } } };
     if (method === "tools/list" && params.cursor === undefined) return { jsonrpc: "2.0", id, result: { tools: [], nextCursor: "tools-page" } };
-    if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: [{ name: "echo", inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }] } };
+    if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: [{ name: "echo", description: toolDescription, inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }] } };
     if (method === "tools/call") return { jsonrpc: "2.0", id, result: imageMode ? { isError: imageError, content: [{ type: "image", mimeType: "image/png", data: imageData }], structuredContent: imageOnly ? undefined : { label: "screenshot" } } : { content: [{ type: "text", text: `mcp:${params.arguments.value}` }] } };
     if (method === "resources/read") return { jsonrpc: "2.0", id, result: { contents: [{ uri: params.uri, text: "resource context" }] } };
     if (method === "prompts/get") return { jsonrpc: "2.0", id, result: { messages: [{ role: "user", content: { type: "text", text: "prompt context" } }] } };
@@ -111,6 +117,7 @@ const gateway = createServer((request, response) => {
     if (gatewayRequests === 1) {
       assert.ok(body.includes("resource context") && body.includes("prompt context"));
       assert.ok(JSON.parse(body).tools.some((tool) => tool.name === "mcp_echo"));
+      if (transport === "http") assert.equal(JSON.parse(body).tools.find((tool) => tool.name === "mcp_echo").description, toolDescription);
       response.end('data: {"type":"tool-call","toolCallId":"mcp_1","toolName":"mcp_echo","input":{"value":"hello"}}\n\ndata: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\ndata: [DONE]\n\n');
       return;
     }

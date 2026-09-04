@@ -2376,7 +2376,7 @@ fn runTopLevelMcp(
             try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
             return .handled_failure;
         };
-        var opener = cfg.url_opener;
+        var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
         var result = runtime.authenticateServer(
             rest[1],
             &opener,
@@ -2519,13 +2519,26 @@ fn writeMcpTrustSuccess(
     try writeStdout(deps, out.written());
 }
 
+const McpCliAuthorization = struct {
+    opener: host.UrlOpener,
+    deps: RunDeps,
+};
+
 fn openTopLevelMcpUrl(
     raw: ?*anyopaque,
     alloc: Allocator,
     url: []const u8,
 ) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
+    const presentation: *const McpCliAuthorization = @ptrCast(@alignCast(raw.?));
+    var encoded_url = try text_utils.encodeTerminalSafe(alloc, url, std.math.maxInt(usize));
+    defer encoded_url.deinit(alloc);
+    try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
+    try writeStdout(presentation.deps, encoded_url.bytes);
+    try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+        _ = try presentation.opener.open(alloc, url);
+    }
+    return true;
 }
 
 fn writeMcpProfileMutationSuccess(

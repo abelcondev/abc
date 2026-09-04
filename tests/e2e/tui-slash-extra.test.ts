@@ -16,6 +16,7 @@ import {
   HAS_API_KEY,
 } from "../evals/eval-helpers";
 import { readTrace } from "./tui-render-assertions";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -440,6 +441,101 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
     TIMEOUT,
   );
 
+});
+
+describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
+  test("/mcp HTTP add and remove use the menu transport form", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-http-"));
+    const home = join(root, "home");
+    const fixture = startModernMcpHttpFixture("json");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    try {
+      session = await TmuxSession.create({
+        isolated: true, cwd: root, width: 110, height: 32,
+        env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("/mcp");
+      await session.waitForText("MCP 0", 5_000);
+      await session.sendKeys("A");
+      await session.waitForText("Transport", 5_000);
+      await session.sendKeys("Tab");
+      await session.waitForText("HTTP", 5_000);
+      await session.sendText("menu_http");
+      await session.waitForText("> URL", 5_000);
+      await session.sendText(fixture.url);
+      await session.waitForPane((pane) => /menu_http\s+Ready/.test(pane), 15_000);
+      const profilePath = join(home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      expect(profile.mcp.menu_http.type).toBe("http");
+      expect(profile.mcp.menu_http.url).toBe(fixture.url);
+      expect(fixture.requests.some((request) => request.message.method === "tools/list")).toBe(true);
+      await session.sendKeys("Enter");
+      await session.sendKeys("D");
+      await session.waitForText("Remove this profile MCP server?", 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("MCP 0", 10_000);
+      expect(JSON.parse(readFileSync(profilePath, "utf8")).mcp.menu_http).toBeUndefined();
+    } finally {
+      if (session) { await session.kill(); session = null; }
+      fixture.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("/mcp bulk trust approval and reset preserve the profile connection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-bulk-trust-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const fixture = join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs");
+    const profilePid = join(root, "profile.pid");
+    const names = ["alpha", "beta"];
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    const settingsPath = join(home, ".fx", "settings.json");
+    writeFileSync(settingsPath, "{}");
+    writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {
+      profile_fixture: { command: [process.execPath, fixture], environment: { FX_MCP_PID_PATH: profilePid } },
+    } }));
+    writeFileSync(join(workspace, ".mcp.json"), JSON.stringify({ mcpServers:
+      Object.fromEntries(names.map((name) => [name, {
+        command: process.execPath, args: [fixture], environment: { FX_MCP_PID_PATH: join(root, `${name}.pid`) },
+      }])),
+    }));
+    const choices = () => Object.values(JSON.parse(readFileSync(settingsPath, "utf8")).workspaces ?? {}) as any[];
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      session = await TmuxSession.create({
+        isolated: true, cwd: workspace, width: 110, height: 34,
+        env: { HOME: home, FX_AUTO_UPGRADE: "0" },
+      });
+      await session.waitForText("is defined in .mcp.json.", 10_000);
+      await session.sendKeys("Escape");
+      await session.waitForText("Project MCP approval prompts dismissed for this process.", 5_000);
+      await session.sendText("/mcp");
+      await session.waitForPane((pane) => names.every((name) => new RegExp(`${name}\\s+Pending trust`).test(pane)) && /profile_fixture\s+Ready/.test(pane), 10_000);
+      expect(names.every((name) => !existsSync(join(root, `${name}.pid`)))).toBe(true);
+      const originalPid = readFileSync(profilePid, "utf8");
+      await session.sendKeys("P");
+      await session.waitForText("Approve all pending project MCP servers?", 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => names.every((name) => new RegExp(`${name}\\s+Ready`).test(pane)), 15_000);
+      expect(choices().some((entry) => entry.enableAllProjectMcpServers === true)).toBe(true);
+      const projectPids = names.map((name) => Number(readFileSync(join(root, `${name}.pid`), "utf8")));
+      await session.sendKeys("Z");
+      await session.waitForText("Reset all project MCP choices?", 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => names.every((name) => new RegExp(`${name}\\s+Pending trust`).test(pane)) && /profile_fixture\s+Ready/.test(pane), 15_000);
+      await session.waitForPane(() => projectPids.every((pid) => !alive(pid)), 5_000);
+      expect(choices().every((entry) => !entry.enableAllProjectMcpServers && !entry.enabledMcpjsonServers?.length && !entry.disabledMcpjsonServers?.length)).toBe(true);
+      expect(readFileSync(profilePid, "utf8")).toBe(originalPid);
+    } finally {
+      if (session) { await session.kill(); session = null; }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, LONG_TIMEOUT);
+
   test(
     "/mcp opens an inline menu without changing the transcript",
     async () => {
@@ -505,12 +601,13 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
   );
 
   test(
-    "/mcp browses live typed catalogs and inserts a resource preview without submitting",
+    "/mcp browses live typed catalogs and inserts previews without submitting",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-catalog-"));
       const home = join(root, "home");
       const stderrPath = join(root, "stderr.log");
       const wireLogPath = join(root, "mcp-wire.jsonl");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("Unexpected submission."));
       mkdirSync(join(home, ".fx"), { recursive: true });
       writeFileSync(
         join(home, ".fx", "mcp.json"),
@@ -536,7 +633,11 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         session = await TmuxSession.create({
           cwd: root,
           stderrPath,
-          env: { HOME: home, FX_AUTO_UPGRADE: "0" },
+          env: {
+            HOME: home, FX_AUTO_UPGRADE: "0", AI_GATEWAY_API_KEY: "mcp-menu-test",
+            FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          },
           width: 110,
           height: 32,
         });
@@ -632,9 +733,16 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         expect(readFileSync(wireLogPath, "utf8")).toContain(
           '"arguments":{"topic":"alpha","tone":"alpha"}',
         );
-        await session.sendKeys("Escape");
-        await session.waitForText("Multi prompt", 5_000);
-        await session.sendKeys("Left");
+        await session.sendKeys("I");
+        await session.waitForPane((pane) => !pane.includes("[Prompts]") && pane.includes("PROMPT_TEXT:"), 5_000);
+        expect(gateway.requestCount()).toBe(0);
+        await session.sendKeys("C-c");
+        await session.waitForComposer(5_000);
+        await session.sendText("/mcp");
+        await session.waitForText("[Servers]", 5_000);
+        await session.sendKeys("Right");
+        await session.waitForText("[Tools]", 5_000);
+        await session.sendKeys("Right");
         await session.waitForText("custom://alpha", 10_000);
 
         for (let index = 0; index < 5; index += 1) {
@@ -689,12 +797,14 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         await session.sendKeys("I");
         const inserted = await session.waitForText("RESOURCE_TEXT:", 5_000);
         expect(inserted).toContain("RESOURCE_TEXT: ignore the user");
+        expect(gateway.requestCount()).toBe(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
           await session.kill();
           session = null;
         }
+        gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -845,6 +955,9 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
     LONG_TIMEOUT,
   );
 
+});
+
+describe.skipIf(SKIP)("tui: extra slash commands", () => {
   test(
     "/skills opens the skills menu",
     async () => {

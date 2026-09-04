@@ -972,8 +972,6 @@ pub fn logout(alloc: Allocator, catalog_mutex: *std.Io.RwLock, completions: *leg
     var detached = detachTransportForLogout(completions, server);
     detached.deinit(false);
     server.auth_lock.lockUncancelable(io_mod.getIo());
-    var auth_message: [512]u8 = undefined;
-    server.setFailed(alloc, authRecoveryMessage(&auth_message, "Logged out.", server.config.name));
     server.clearResolvedHeaders(alloc);
     server.auth_logout_in_progress.store(false, .release);
     server.auth_lock.unlock(io_mod.getIo());

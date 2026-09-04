@@ -677,7 +677,7 @@ const PendingMenuOperation = struct {
         else
             try allocMenuText(
                 self.alloc,
-                &.{ "Logged out of MCP server '", server_name, "'." },
+                &.{ "Logged out of MCP server '", server_name, "'. Run /mcp auth ", server_name, " --open to sign in again." },
             );
         return .{ .feedback = feedback };
     }
