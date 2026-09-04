@@ -7127,8 +7127,17 @@ fn processQueuedPromptLoop(
             if (needs_continuation) {
                 continuation_injected = true;
                 const continuation_prompt = "Summarize what you just did.";
-                debug_trace.logf("agent", "injecting continuation after {d} silent tool steps", .{silent_tool_steps});
-                try within_turn_suffix.append(arena, .{ .role = .assistant, .content = completion.content });
+                debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
+                    silent_tool_steps,
+                    if (completion.content) |content| content.len else 0,
+                    if (completion.provider_state_json != null) "true" else "false",
+                });
+                if (completion.provider_state_json) |state| {
+                    try within_turn_suffix.append(arena, .{
+                        .role = .assistant,
+                        .provider_state_json = state,
+                    });
+                }
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
                 continue;
             }

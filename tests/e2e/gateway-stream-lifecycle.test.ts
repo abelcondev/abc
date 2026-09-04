@@ -7018,6 +7018,66 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("silent-tool continuation omits blank assistant text and keeps settled results", async () => {
+    const root = createFixtureRoot("blank-continuation");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const responses = [
+      fakeGatewayToolCall("read_1", "read_file", { path: "fixture.txt" }),
+      fakeGatewayToolCall("read_2", "read_file", { path: "fixture.txt" }),
+      fakeGatewayFinalText(" \t\r\n"),
+      fakeGatewayFinalText("Finished reading the fixture."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Read fixture.txt twice, then summarize it."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.stderr).toBe("Reading fixture.txt\nReading fixture.txt\n");
+      const json = parseAskJson(result.stdout);
+      expect(json.output).toContain("Finished reading the fixture.");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requests).toHaveLength(4);
+      const request = JSON.parse(gateway.requests[3]!.body);
+      const assistants = request.prompt.filter((message: { role: string }) => message.role === "assistant");
+      expect(assistants).toHaveLength(2);
+      expect(assistants.map((message: { content: Array<{ type: string; toolCallId: string }> }) => message.content.map((part) => [part.type, part.toolCallId])))
+        .toEqual([[["tool-call", "read_1"]], [["tool-call", "read_2"]]]);
+      expect(request.prompt.at(-1)).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "Summarize what you just did." }],
+      });
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[3]!.body, id)).toContain("settled evidence");
+      }
+      responses.push(fakeGatewayFinalText("Resume complete."));
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(5);
+      expect(gateway.requests[4]!.body).toContain("Finished reading the fixture.");
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[4]!.body, id)).toContain("settled evidence");
+      }
+      expect(readFileSync(tracePath, "utf8")).toContain("injecting continuation after 2 silent tool steps");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("accepted tool-only replacement discards only the obsolete JSON preview", async () => {
     const root = createFixtureRoot("tool-only-replacement");
     const tracePath = join(root.root, "trace.log");
