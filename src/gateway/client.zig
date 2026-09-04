@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const json_comparison = @import("json_comparison.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -2395,54 +2396,6 @@ fn findStreamedToolInput(records: []const SseStreamedToolInput, id: []const u8) 
     return null;
 }
 
-fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
-    return switch (lhs) {
-        .null => true,
-        .bool => |value| value == rhs.bool,
-        .integer => |value| value == rhs.integer,
-        .float => |value| value == rhs.float,
-        .number_string => |value| std.mem.eql(u8, value, rhs.number_string),
-        .string => |value| std.mem.eql(u8, value, rhs.string),
-        .array => |values| blk: {
-            if (values.items.len != rhs.array.items.len) break :blk false;
-            for (values.items, rhs.array.items) |left, right| {
-                if (!jsonValuesEqual(left, right)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |fields| blk: {
-            if (fields.count() != rhs.object.count()) break :blk false;
-            var iterator = fields.iterator();
-            while (iterator.next()) |field| {
-                const right = rhs.object.get(field.key_ptr.*) orelse break :blk false;
-                if (!jsonValuesEqual(field.value_ptr.*, right)) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
-
-fn serializedJsonEqual(
-    alloc: std.mem.Allocator,
-    lhs: []const u8,
-    rhs: []const u8,
-) std.mem.Allocator.Error!bool {
-    if (std.mem.eql(u8, lhs, rhs)) return true;
-
-    var left = std.json.parseFromSlice(std.json.Value, alloc, lhs, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer left.deinit();
-    var right = std.json.parseFromSlice(std.json.Value, alloc, rhs, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer right.deinit();
-    return jsonValuesEqual(left.value, right.value);
-}
-
 fn findEquivalentEndedStreamedToolInput(
     alloc: std.mem.Allocator,
     records: []const SseStreamedToolInput,
@@ -2454,7 +2407,7 @@ fn findEquivalentEndedStreamedToolInput(
     for (records, 0..) |record, i| {
         if (record.state != .ended) continue;
         if (!std.mem.eql(u8, record.name.items, final_name)) continue;
-        if (try serializedJsonEqual(alloc, record.arguments.items, final_arguments)) return i;
+        if (try json_comparison.serializedEqual(alloc, record.arguments.items, final_arguments)) return i;
     }
     return null;
 }

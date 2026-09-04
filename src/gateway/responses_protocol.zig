@@ -5,6 +5,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
+const json_comparison = @import("json_comparison.zig");
 
 pub const ReplayLimits = struct {
     tool_calls: usize,
@@ -276,15 +277,76 @@ const ToolAccumulator = struct {
     output_index: i64,
     id: []u8,
     name: []u8,
+    item_id: ?[]u8 = null,
     arguments: std.ArrayList(u8) = .empty,
+    arguments_finalized: bool = false,
 
     fn deinit(self: *ToolAccumulator, alloc: std.mem.Allocator) void {
         alloc.free(self.id);
         alloc.free(self.name);
+        if (self.item_id) |id| alloc.free(id);
         self.arguments.deinit(alloc);
         self.* = undefined;
     }
+
+    fn reconcileIdentity(
+        self: *ToolAccumulator,
+        alloc: std.mem.Allocator,
+        fields: std.json.ObjectMap,
+        item_id_key: []const u8,
+        limits: StreamLimits,
+    ) !void {
+        try checkOptionalIdentity(fields, "call_id", self.id);
+        try checkOptionalIdentity(fields, "name", self.name);
+        if (fields.get(item_id_key)) |value| {
+            if (value != .string or value.string.len == 0) return error.InvalidEvent;
+            if (value.string.len > limits.tool_identity_bytes) return error.ToolCallLimitExceeded;
+            if (self.item_id) |id| {
+                if (!std.mem.eql(u8, id, value.string)) return error.ResponsesToolCallConflict;
+            } else {
+                self.item_id = try alloc.dupe(u8, value.string);
+            }
+        }
+    }
+
+    fn finalizeArguments(
+        self: *ToolAccumulator,
+        alloc: std.mem.Allocator,
+        arguments: []const u8,
+        callbacks: StreamCallbacks,
+        limits: StreamLimits,
+    ) !void {
+        if (arguments.len > limits.tool_arguments_bytes) return error.ToolArgumentsTooLarge;
+        if (self.arguments_finalized) {
+            if (!try json_comparison.serializedEqual(alloc, self.arguments.items, arguments)) return error.ResponsesToolCallConflict;
+            return;
+        }
+        const previous_len = self.arguments.items.len;
+        if (std.mem.startsWith(u8, arguments, self.arguments.items)) {
+            const suffix = arguments[previous_len..];
+            try appendToolArguments(alloc, &self.arguments, suffix, limits.tool_arguments_bytes);
+            if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, suffix);
+        } else {
+            try self.arguments.ensureTotalCapacity(alloc, arguments.len);
+            self.arguments.clearRetainingCapacity();
+            self.arguments.appendSliceAssumeCapacity(arguments);
+        }
+        self.arguments_finalized = true;
+    }
 };
+
+fn checkOptionalIdentity(fields: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
+    if (fields.get(key)) |value| {
+        if (value != .string) return error.InvalidEvent;
+        if (!std.mem.eql(u8, value.string, expected)) return error.ResponsesToolCallConflict;
+    }
+}
+
+fn optionalOutputIndex(fields: std.json.ObjectMap) error{InvalidEvent}!?i64 {
+    const value = fields.get("output_index") orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidEvent;
+    return value.integer;
+}
 
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
@@ -324,6 +386,7 @@ pub const Reducer = struct {
         limits: StreamLimits,
     ) !bool {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (self.terminal_seen) return true;
         self.event_count = try checkedAccumulatedSize(self.event_count, 1, limits.events);
         if (limits.count_json_bytes) {
             self.aggregate_bytes = try checkedAccumulatedSize(
@@ -332,14 +395,16 @@ pub const Reducer = struct {
                 limits.aggregate_bytes,
             );
         }
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
-            return error.InvalidEvent;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidEvent,
+        };
         defer parsed.deinit();
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -348,9 +413,18 @@ pub const Reducer = struct {
                 const name = stringField(item.object, "name") orelse return false;
                 if (findTool(self.tools.items, output_index) == null) {
                     try appendTool(alloc, &self.tools, output_index, call_id, name, limits);
+                    const tool = &self.tools.items[self.tools.items.len - 1];
+                    try tool.reconcileIdentity(alloc, item.object, "id", limits);
+                    if (item.object.get("arguments")) |value| {
+                        if (value != .string) return error.InvalidEvent;
+                        try appendToolArguments(alloc, &tool.arguments, value.string, limits.tool_arguments_bytes);
+                    }
                     if (callbacks.on_tool_start) |callback| {
                         callback(callbacks.context, call_id, name, null);
                     }
+                } else {
+                    const index = findTool(self.tools.items, output_index).?;
+                    try self.tools.items[index].reconcileIdentity(alloc, item.object, "id", limits);
                 }
             }
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
@@ -368,37 +442,26 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, "\n\n");
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             const index = findTool(self.tools.items, output_index) orelse return false;
+            try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
+            if (self.tools.items[index].arguments_finalized and delta.len > 0) return error.ResponsesToolCallConflict;
             try appendToolArguments(alloc, &self.tools.items[index].arguments, delta, limits.tool_arguments_bytes);
             if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
-            const arguments = stringField(parsed.value.object, "arguments") orelse return false;
-            const index = findTool(self.tools.items, output_index) orelse return false;
-            const previous_len = self.tools.items[index].arguments.items.len;
-            if (std.mem.startsWith(u8, arguments, self.tools.items[index].arguments.items)) {
-                const suffix = arguments[previous_len..];
-                try appendToolArguments(alloc, &self.tools.items[index].arguments, suffix, limits.tool_arguments_bytes);
-                if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, suffix);
-            } else {
-                self.tools.items[index].arguments.clearRetainingCapacity();
-                try appendToolArguments(alloc, &self.tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
-            }
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
+            const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
+            const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
+            try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
+            try self.tools.items[index].finalizeArguments(alloc, arguments, callbacks, limits);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
             if (std.mem.eql(u8, item_type, "function_call")) {
-                if (findTool(self.tools.items, output_index)) |index| {
-                    if (stringField(item.object, "arguments")) |arguments| {
-                        if (self.tools.items[index].arguments.items.len == 0) {
-                            try appendToolArguments(alloc, &self.tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
-                        }
-                    }
-                }
+                try self.reconcileToolItem(alloc, output_index, item.object, callbacks, limits);
             } else if (std.mem.eql(u8, item_type, "reasoning") and
                 stringField(item.object, "encrypted_content") != null)
             {
@@ -440,6 +503,15 @@ pub const Reducer = struct {
         {
             const response_value = parsed.value.object.get("response") orelse return false;
             if (response_value != .object) return false;
+            if (response_value.object.get("output")) |output| {
+                if (output != .array) return error.InvalidEvent;
+                for (output.array.items, 0..) |item, output_index| {
+                    if (item != .object) continue;
+                    const item_type = stringField(item.object, "type") orelse continue;
+                    if (!std.mem.eql(u8, item_type, "function_call")) continue;
+                    try self.reconcileToolItem(alloc, std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded, item.object, callbacks, limits);
+                }
+            }
             self.terminal_seen = true;
             self.finish_reason = finishReason(
                 stringField(response_value.object, "status"),
@@ -458,6 +530,23 @@ pub const Reducer = struct {
             return error.ResponseFailed;
         }
         return false;
+    }
+
+    fn reconcileToolItem(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        output_index: i64,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        limits: StreamLimits,
+    ) !void {
+        const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
+        const tool = &self.tools.items[index];
+        try tool.reconcileIdentity(alloc, fields, "id", limits);
+        if (fields.get("arguments")) |value| {
+            if (value != .string) return error.InvalidEvent;
+            try tool.finalizeArguments(alloc, value.string, callbacks, limits);
+        }
     }
 
     pub fn finish(
@@ -495,7 +584,7 @@ pub const Reducer = struct {
             alloc.free(call.arguments_json);
         };
         for (self.tools.items, 0..) |*tool, index| {
-            const arguments = if (tool.arguments.items.len > 0)
+            const arguments = if (tool.arguments_finalized or tool.arguments.items.len > 0)
                 try tool.arguments.toOwnedSlice(alloc)
             else
                 try alloc.dupe(u8, "{}");
@@ -521,6 +610,253 @@ pub const Reducer = struct {
         };
     }
 };
+
+const ToolRecordTest = struct {
+    alloc: std.mem.Allocator,
+    reducer: Reducer,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    context: u8 = 0,
+    const limits = StreamLimits{ .aggregate_bytes = 64 * 1024, .events = 100, .tool_calls = 4, .tool_identity_bytes = 1024, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 };
+    const start = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"\"}}";
+    const finalized = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"fc_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}";
+    const terminal = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
+
+    fn init(alloc: std.mem.Allocator) ToolRecordTest {
+        return .{ .alloc = alloc, .reducer = .init(alloc) };
+    }
+
+    fn deinit(self: *ToolRecordTest) void {
+        self.reducer.deinit(self.alloc);
+    }
+
+    fn apply(self: *ToolRecordTest, event: []const u8) !void {
+        _ = try self.reducer.applyJson(self.alloc, event, .{ .context = &self.context, .on_content = ignore }, &self.cancelled, null, limits);
+    }
+
+    fn finish(self: *ToolRecordTest) !types.ModelCompletion {
+        return self.reducer.finish(self.alloc, &self.cancelled, limits);
+    }
+
+    fn freeCompletion(self: *ToolRecordTest, completion: types.ModelCompletion) void {
+        types.freeToolCallSlice(self.alloc, @constCast(completion.tool_calls));
+        if (completion.content) |value| self.alloc.free(value);
+        if (completion.provider_state_json) |value| self.alloc.free(value);
+        if (completion.generation_id) |value| self.alloc.free(value);
+    }
+
+    fn ignore(_: *anyopaque, _: []const u8) void {}
+};
+
+test "Responses rejects conflicting completed tool records" {
+    const records = [_][]const u8{
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"other\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"other\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}}",
+    };
+    for (records) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply(ToolRecordTest.finalized);
+        try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply(event));
+    }
+}
+
+test "Responses completed item replaces progressive arguments" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"final.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses completed response validates supplied tool snapshots" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}]}}"));
+}
+
+test "Responses completed response can finalize progressive arguments within the byte limit" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ ToolRecordTest.limits.tool_arguments_bytes, ToolRecordTest.limits.tool_arguments_bytes + 1 }) |size| {
+        var stream = ToolRecordTest.init(alloc);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\"}");
+        const arguments = try alloc.alloc(u8, size);
+        defer alloc.free(arguments);
+        @memset(arguments, ' ');
+        arguments[0] = '{';
+        arguments[size - 1] = '}';
+        const event = try std.json.Stringify.valueAlloc(alloc, .{
+            .type = "response.completed",
+            .response = .{ .status = "completed", .output = .{.{
+                .type = "function_call",
+                .call_id = "call_1",
+                .name = "write_file",
+                .arguments = arguments,
+            }} },
+        }, .{});
+        defer alloc.free(event);
+        if (size > ToolRecordTest.limits.tool_arguments_bytes) {
+            try std.testing.expectError(error.ToolArgumentsTooLarge, stream.apply(event));
+        } else {
+            try stream.apply(event);
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqualStrings(arguments, completion.tool_calls[0].arguments_json);
+        }
+    }
+}
+
+test "Responses finalized arguments cannot receive more deltas" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\" \"}"));
+}
+
+test "Responses equivalent finalized records retain one accepted argument representation" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    const equivalent = "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\" { \\\"path\\\" : \\\"preview.txt\\\" } \"}}";
+    try stream.apply(equivalent);
+    try stream.apply(equivalent);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses final argument evidence does not manufacture an empty object" {
+    const cases = [_]struct { event: []const u8, arguments: []const u8 }{
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"\"}", .arguments = "" },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"[]\"}", .arguments = "[]" },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{]\"}", .arguments = "{]" },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\"}");
+        try stream.apply(case.event);
+        try stream.apply(ToolRecordTest.terminal);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings(case.arguments, completion.tool_calls[0].arguments_json);
+        try std.testing.expect(try types.ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, completion.tool_calls[0].arguments_json) != .valid);
+    }
+}
+
+test "Responses interleaved calls keep independent finalization" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"read_file\",\"arguments\":\"{\"}}");
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_2\",\"delta\":\"\\\"path\\\":\\\"second.txt\\\"}\"}");
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"item_id\":\"fc_2\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"second.txt\\\"}\"}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"path\":\"second.txt\"}", completion.tool_calls[1].arguments_json);
+}
+
+test "Responses finalization checks correlation types and rejects unmatched final calls" {
+    const cases = [_]struct { event: []const u8, failure: anyerror }{
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"other\",\"arguments\":\"{}\"}", .failure = error.ResponsesToolCallConflict },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"name\":\"read_file\",\"arguments\":\"{}\"}", .failure = error.ResponsesToolCallConflict },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":null,\"arguments\":\"{}\"}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":{}}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":null,\"arguments\":\"{}\"}}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"arguments\":\"{}\"}}", .failure = error.ResponsesToolCallConflict },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try std.testing.expectError(case.failure, stream.apply(case.event));
+    }
+}
+
+test "Responses finalization retains cancellation and terminal requirements" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.StreamIncomplete, stream.finish());
+    stream.cancelled.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.terminal));
+    try std.testing.expectError(error.Cancelled, stream.finish());
+}
+
+test "Responses rejects malformed supplied output indexes without requiring omitted metadata" {
+    const cases = [_][]const u8{
+        "{\"type\":\"response.function_call_arguments.done\",\"output_index\":\"0\",\"arguments\":\"{}\"}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":null,\"item\":{\"type\":\"function_call\",\"arguments\":\"{}\"}}",
+        "{\"type\":\"response.output_item.added\",\"output_index\":-1,\"item\":{\"type\":\"function_call\",\"call_id\":\"bad\",\"name\":\"read_file\"}}",
+        "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0.0,\"delta\":\"{}\"}",
+    };
+    for (cases) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply(ToolRecordTest.finalized);
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+    }
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses finalization preserves the length finish disposition" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason);
+}
+
+fn expectToolFinalizationAllocations(alloc: std.mem.Allocator) !void {
+    var stream = ToolRecordTest.init(alloc);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"discarded preview\"}");
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"arguments\":\" {\\\"path\\\":\\\"preview.txt\\\"} \"}}");
+    try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"finished\"}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses finalization releases owned state on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectToolFinalizationAllocations, .{});
+}
 
 fn appendTool(
     alloc: std.mem.Allocator,
