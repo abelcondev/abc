@@ -2059,8 +2059,8 @@ describe("MCP remote authentication lifecycle", () => {
     30_000,
   );
 
-  test(
-    "fx ask reports an actionable auth requirement without opening a browser",
+  for (const targeted of [false, true]) test(
+    `fx ask reports an actionable auth requirement for ${targeted ? "named" : "broad"} search without opening a browser`,
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
@@ -2068,6 +2068,7 @@ describe("MCP remote authentication lifecycle", () => {
       gateway = startFakeGateway([
         fakeGatewayToolCall("search_auth", "capability_search", {
           query: "fixture",
+          ...(targeted ? { server: "fixture" } : {}),
         }),
         fakeGatewayFinalText("MCP authentication is required."),
       ], {
@@ -2396,6 +2397,47 @@ describe("MCP remote authentication lifecycle", () => {
     expect(auth.revocations).toBe(0);
     expect(auth.requests).toHaveLength(requestsBeforeLogout);
   }, 30_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "reauthentication replaces a modern HTTP connection with an active subscription",
+    async () => {
+      upstream = startModernMcpHttpFixture("features");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const initial = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env: baseEnv(root),
+        timeoutMs: 20_000,
+      });
+      expect(initial.code).toBe(0);
+      gateway = startToolGateway();
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+      });
+      await tui.waitForComposer(15_000);
+      await upstream.waitForSubscription();
+      const subscriptions = () => upstream!.requests.filter((entry) =>
+        entry.message.method === "subscriptions/listen"
+      ).length;
+      const before = subscriptions();
+      expect(before).toBeGreaterThan(0);
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      const deadline = Date.now() + 8_000;
+      while (subscriptions() === before && Date.now() < deadline) await Bun.sleep(25);
+      expect(subscriptions()).toBe(before + 1);
+      await tui.sendText("Call the authenticated MCP echo tool.");
+      await tui.waitForText("Authenticated MCP call complete.", 15_000);
+      expect(upstream.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    },
+    45_000,
+  );
 
   test.skipIf(!tmuxAvailable())(
     "fresh TUI login persists, ask refreshes after restart, and logout revokes",

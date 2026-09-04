@@ -345,6 +345,7 @@ function createRuntime(options) {
   const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
+  const httpRequests = new Set();
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -571,17 +572,35 @@ function createRuntime(options) {
   }
 
   function httpRequest(methodPtr, methodLen, urlPtr, urlLen, headersPtr, headersLen, bodyPtr, bodyLen, statusOut, responsePtr, responseCap) {
-    return options.fetch(text(urlPtr, urlLen), {
-      method: text(methodPtr, methodLen),
-      headers: headersFromJson(headersPtr, headersLen),
-      body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
-    }).then(async (response) => {
+    const controller = new AbortController();
+    httpRequests.add(controller);
+    let onAbort;
+    const cancelled = new Promise((resolve) => {
+      onAbort = () => resolve(-1);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const request = (async () => {
+      const response = await options.fetch(text(urlPtr, urlLen), {
+        method: text(methodPtr, methodLen),
+        headers: headersFromJson(headersPtr, headersLen),
+        body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        void cancelResponseBody(response);
+        return -1;
+      }
       const body = new Uint8Array(await response.arrayBuffer());
+      if (controller.signal.aborted) return -1;
       new DataView(memory().buffer).setUint16(statusOut, response.status, true);
       if (body.length > responseCap) return -2;
       bytes(responsePtr, body.length).set(body);
       return body.length;
-    }).catch(() => -1);
+    })().catch(() => -1);
+    return Promise.race([request, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", onAbort);
+      httpRequests.delete(controller);
+    });
   }
 
   let pendingHostToolResult = null;
@@ -867,6 +886,7 @@ function createRuntime(options) {
   function abortHostEffects() {
     pendingHostToolResult = null;
     streams.forEach((state) => state.controller.abort(abortReason));
+    httpRequests.forEach((controller) => controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -1332,7 +1352,11 @@ export async function createFxAgent(options = {}) {
         message.params?.sessionId,
       );
       if (cancelled || closing) return;
-      send({ jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } });
+      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
+        response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
+      }
+      send(response);
       return;
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);

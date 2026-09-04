@@ -8466,3 +8466,51 @@ test "unrelated server timeouts do not shorten a named tool operation" {
     try runtime.addServer(unrelated);
     try std.testing.expectEqual(original, runtime.catalogOperationDeadline(alias, started));
 }
+
+test "connection retirement waits for the admitted transport commit" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    var config = try shellMcpConfigForTest(alloc, "fixture", "exit 0");
+    config.restart_limit = 0;
+    try runtime.addServer(config);
+    const server = runtime.servers.items[0];
+    server.state.store(.ready, .release);
+    try parseAndStoreTools(alloc, server, .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    , &runtime.tool_aliases);
+    var snapshot = try ToolCallSnapshot.init(alloc, server, &server.tool_catalog.tools.items[0]);
+    defer snapshot.deinit(alloc);
+    var guard = tool_snapshot.CommitGuard{
+        .alloc = alloc,
+        .runtime_generation = runtime.generation,
+        .catalog_mutex = &runtime.catalog_mutex,
+        .server = server,
+        .snapshot = &snapshot,
+        .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(1) }),
+        .cancel_flag = null,
+    };
+    var precommit = guard.transport();
+    try precommit.acquire();
+    var held = true;
+    defer if (held) precommit.release();
+    const failed_generation: u64 = 1;
+    try std.testing.expectError(error.McpRequestTimedOut, runtime.lifecycle().recoverServer(
+        server,
+        failed_generation,
+        std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(10) }),
+        null,
+        null,
+    ));
+    try std.testing.expect(tool_snapshot.current(server, &snapshot));
+    precommit.release();
+    held = false;
+    try std.testing.expectError(error.McpRestartLimitReached, runtime.lifecycle().recoverServer(
+        server,
+        failed_generation,
+        std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(1) }),
+        null,
+        null,
+    ));
+    try std.testing.expect(!tool_snapshot.current(server, &snapshot));
+}

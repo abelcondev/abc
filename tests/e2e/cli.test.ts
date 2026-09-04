@@ -5077,6 +5077,12 @@ describe("cli: MCP profile add", () => {
       expect(bare.code).toBe(0);
       expect(bare.stdout).toBe(help.stdout);
       expect(existsSync(marker)).toBe(false);
+      const missingAuthName = await runFx(["mcp", "auth"], {
+        env: { HOME: home, ...NO_GATEWAY_AUTH },
+      });
+      expect(missingAuthName.code).toBe(1);
+      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
+      expect(existsSync(marker)).toBe(false);
       expect(local.code).toBe(0);
       expect(local.stderr).toBe("");
       expect(local.stdout).toContain("Saved MCP server 'local'");

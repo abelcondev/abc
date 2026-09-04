@@ -3386,7 +3386,10 @@ fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runti
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (request.server) |server_name| {
-        try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag());
+        mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
+            error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
+            else => return err,
+        };
     } else {
         try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
     }

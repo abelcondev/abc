@@ -413,6 +413,7 @@ pub fn detachFailedConnectionPreservingFeatureCaches(server: *Server) DetachedCo
     return detached;
 }
 
+/// The caller holds the connection, catalog commit, and catalog publication locks.
 pub fn publishConnection(server: *Server, connected: *Server) void {
     std.debug.assert(server.dispatcher == null);
     std.debug.assert(server.legacy_http == null);

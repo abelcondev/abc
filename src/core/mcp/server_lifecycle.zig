@@ -98,10 +98,17 @@ pub const Operations = struct {
             }
         }
         if (server.restart_attempts >= server.config.restart_limit) {
+            self.catalog_mutex.unlock(io_mod.getIo());
+            try lockMutexUntil(&server.catalog_commit_lock, deadline, cancel_flag);
+            var failure_commit_locked = true;
+            defer if (failure_commit_locked) server.catalog_commit_lock.unlock(io_mod.getIo());
+            try lockRwUntil(self.catalog_mutex, deadline, cancel_flag);
             server.last_recovery_generation = failed_generation;
             var retired = server_connection.detachFailedConnectionPreservingFeatureCaches(server);
             server.setFailed(self.alloc, "MCP restart limit reached");
             self.catalog_mutex.unlock(io_mod.getIo());
+            server.catalog_commit_lock.unlock(io_mod.getIo());
+            failure_commit_locked = false;
             retired.deinit(self.alloc);
             return error.McpRestartLimitReached;
         }
@@ -156,12 +163,17 @@ pub const Operations = struct {
         };
 
         try checkOperationControl(io_mod.getIo(), deadline, cancel_flag);
+        try lockMutexUntil(&server.catalog_commit_lock, deadline, cancel_flag);
+        var commit_locked = true;
+        defer if (commit_locked) server.catalog_commit_lock.unlock(io_mod.getIo());
         try lockRwUntil(self.catalog_mutex, deadline, cancel_flag);
         var retired = server_connection.detachPublishedConnection(server);
         server_connection.publishConnection(server, &connected);
         server.last_recovery_generation = failed_generation;
         connected_published = true;
         self.catalog_mutex.unlock(io_mod.getIo());
+        server.catalog_commit_lock.unlock(io_mod.getIo());
+        commit_locked = false;
         retired.deinit(self.alloc);
     }
 
@@ -174,6 +186,9 @@ pub const Operations = struct {
     ) !void {
         try lockMutexUntil(&server.recovery_lock, deadline, cancel_flag);
         defer server.recovery_lock.unlock(io_mod.getIo());
+        // Keep a resource watch from replacing the listener while it is being stopped.
+        try lockMutexUntil(&server.subscription_lifecycle_lock, deadline, cancel_flag);
+        defer server.subscription_lifecycle_lock.unlock(io_mod.getIo());
 
         try lockRwSharedUntil(&server.connection_lock, deadline, cancel_flag);
         const has_legacy_transport = server.legacy_http != null or server.legacy_sse != null;
@@ -186,6 +201,13 @@ pub const Operations = struct {
             .lifecycle_cancel_flag = server.cancellation(),
         });
 
+        if (mode == .negotiate) {
+            try lockRwSharedUntil(&server.connection_lock, deadline, cancel_flag);
+            defer server.connection_lock.unlockShared(io_mod.getIo());
+            try lockMutexUntil(&server.catalog_commit_lock, deadline, cancel_flag);
+            defer server.catalog_commit_lock.unlock(io_mod.getIo());
+            server.signalToolSubscriptionStop();
+        }
         try lockRwUntil(&server.connection_lock, deadline, cancel_flag);
         defer server.connection_lock.unlock(io_mod.getIo());
         server.startup_state.store(.loading, .release);
@@ -282,11 +304,16 @@ pub const Operations = struct {
         }
 
         try checkOperationControl(io_mod.getIo(), deadline, cancel_flag);
+        try lockMutexUntil(&server.catalog_commit_lock, deadline, cancel_flag);
+        var commit_locked = true;
+        defer if (commit_locked) server.catalog_commit_lock.unlock(io_mod.getIo());
         try lockRwUntil(self.catalog_mutex, deadline, cancel_flag);
         var retired = server_connection.detachPublishedConnection(server);
         server_connection.publishConnection(server, &connected);
         connected_published = true;
         self.catalog_mutex.unlock(io_mod.getIo());
+        server.catalog_commit_lock.unlock(io_mod.getIo());
+        commit_locked = false;
         retired.deinit(self.alloc);
         debug_trace.logf(
             "mcp",
@@ -372,6 +399,9 @@ pub const Operations = struct {
         );
 
         try checkOperationControl(io_mod.getIo(), deadline, cancel_flag);
+        try lockMutexUntil(&server.catalog_commit_lock, deadline, cancel_flag);
+        var commit_locked = true;
+        defer if (commit_locked) server.catalog_commit_lock.unlock(io_mod.getIo());
         try lockRwUntil(self.catalog_mutex, deadline, cancel_flag);
         if (server.legacy_http != expired_client) {
             self.catalog_mutex.unlock(io_mod.getIo());
@@ -382,6 +412,8 @@ pub const Operations = struct {
         server_connection.publishConnection(server, &connected);
         connected_published = true;
         self.catalog_mutex.unlock(io_mod.getIo());
+        server.catalog_commit_lock.unlock(io_mod.getIo());
+        commit_locked = false;
         retired.deinit(self.alloc);
         debug_trace.logf(
             "mcp",

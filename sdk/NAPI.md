@@ -172,14 +172,19 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Gateway URL | 16 KiB |
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
-| Fetch request record | 8 MiB |
+| Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
+| Fetch request record | 11,184,812 bytes including body base64 encoding |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
 | Active runtimes | 64 per process |
-| ACP tool result | 64 KiB |
+| ACP tool result | 64 KiB text; 8 MiB tagged rich result |
 | ACP history | 100 turns |
 | Agent steps | 64 |
+
+The fetch request budget covers the full model request, including retained history and metadata. Its base64 transfer frame has a separate derived bound; accepting one tool result does not reserve space for later requests.
+
+Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
 
 Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output overflow causes the ACP runtime to exit with a failure status rather than allowing unbounded native memory growth. Limits must remain checked with overflow-safe subtraction before append operations.
 

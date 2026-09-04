@@ -2363,7 +2363,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
