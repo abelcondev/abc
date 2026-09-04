@@ -2574,6 +2574,22 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(firstPath, "utf8")).toBe("first\n");
       expect(readFileSync(secondPath, "utf8")).toBe("second\n");
+      const nextPrompt = parseGatewayRequest(gateway.requests[1]!.body).prompt;
+      const results = nextPrompt.filter((message) => message.role === "tool");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.content).toEqual([
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_a",
+          toolName: "write_file",
+        }),
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_b",
+          toolName: "write_file",
+        }),
+      ]);
+      expect(parseAskJson(result.stdout).output).toContain("same-batch writes complete");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
