@@ -28,6 +28,7 @@ const ProviderSwitchDecision = auth_transition.ProviderSwitchDecision;
 const ProviderSwitchIntent = auth_transition.ProviderSwitchIntent;
 const ProviderSwitchFacts = auth_transition.ProviderSwitchFacts;
 const decideProviderSwitch = auth_transition.decideProviderSwitch;
+const provider_busy_message = "Provider switching is unavailable until active and queued work finishes.";
 
 fn providerFailureMessage(
     intent: ProviderSwitchIntent,
@@ -268,6 +269,16 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            const hold_turn_start = logout_provider == selected_provider and logout_provider != .gateway;
+            if (hold_turn_start and (app.stream.active or !app.worker.tryHoldTurnStart())) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Sign out is unavailable until active and queued work finishes.",
+                });
+                return;
+            }
+            defer if (hold_turn_start) app.worker.releaseTurnStartHold();
             if (logout_provider == .grok) {
                 const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
                     try writeAuthNotice(app, .{
@@ -294,6 +305,7 @@ pub fn Runtime(comptime App: type) type {
                         .body = "The local Grok session was removed, but remote revocation could not be confirmed.",
                     });
                 }
+                try reconcileSubscriptionLogout(app, .grok);
                 return;
             }
             if (logout_provider == .codex) {
@@ -315,6 +327,7 @@ pub fn Runtime(comptime App: type) type {
                     .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
                     .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
                 });
+                try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
@@ -328,6 +341,28 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             try applyLogoutResult(app, result);
+        }
+
+        fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
+            const selected = provider_runtime.provider(app);
+            if (selected != removed) return;
+            const candidates = auth_transition.logoutFallbackProviders(.{
+                .requested = removed,
+                .selected = selected,
+                .active_source = app.auth.credentialSource(),
+                .available_sources = app.auth.pickerView().available_sources,
+            });
+            for (candidates) |candidate| {
+                const target = candidate orelse continue;
+                try switchProvider(app, target, false, .manual);
+                if (provider_runtime.provider(app) == target and
+                    model_provider.authorizesCredential(target, app.auth.credentialSource())) return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .warning,
+                .body = "No connected provider is available. Use /provider to sign in.",
+            }, true);
         }
 
         pub fn runProviderCommand(app: *App) !void {
@@ -372,15 +407,38 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Reports blocked provider interaction without changing the composer.
+        pub fn reject_provider_picker_if_busy(app: *App) !bool {
+            if (!auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) return false;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .neutral,
+                .body = provider_busy_message,
+            }, true);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn beginProviderPickerInventoryRefresh(
             app: *App,
             destination: auth_runtime.InventoryRefreshDestination,
         ) !void {
+            if (try reject_provider_picker_if_busy(app)) return;
+            const prefix = switch (destination) {
+                .provider_picker_login => picker_state.login_prefix,
+                .provider_picker_command => picker_state.provider_prefix,
+                .auth_picker => unreachable,
+            };
+            var prepared = try app.input_runtime.textReplacementState().prepare(app.alloc, prefix);
+            defer prepared.deinit(app.alloc);
             switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
                 .provider = provider_runtime.provider(app),
                 .destination = destination,
             })) {
-                .started => {},
+                .started => {
+                    app.input_runtime.textReplacementState().commit(app.alloc, &prepared);
+                    app.shell.render_requests.request(.footer);
+                },
                 .busy => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
@@ -398,6 +456,15 @@ pub fn Runtime(comptime App: type) type {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
                 .ready => |action| {
+                    if (action.destination != .auth_picker and try reject_provider_picker_if_busy(app)) {
+                        debug_trace.logf("auth", "provider picker publication dropped destination={t} reason=work_in_progress", .{action.destination});
+                        if (comptime @hasField(App, "input_runtime")) {
+                            if (app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) != null) {
+                                app.input_runtime.picker.dismissInlinePicker(.provider);
+                            }
+                        }
+                        return;
+                    }
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
                         const body = try std.fmt.allocPrint(
@@ -410,20 +477,18 @@ pub fn Runtime(comptime App: type) type {
                     }
                     switch (action.destination) {
                         .auth_picker => app.auth.openPickerForProvider(app.alloc, action.provider),
-                        .provider_picker_login, .provider_picker_command => if (comptime @hasField(App, "input_runtime")) {
-                            app.input_runtime.picker.clearProviderPickerFlow();
-                            app.input_runtime.picker.resetInlinePickerEpisode();
-                            const prefix = switch (action.destination) {
-                                .provider_picker_login => picker_state.login_prefix,
-                                .provider_picker_command => picker_state.provider_prefix,
-                                .auth_picker => unreachable,
-                            };
-                            try app.input_runtime.textReplacementState().replace(app.alloc, prefix);
-                        },
+                        .provider_picker_login, .provider_picker_command => {},
                     }
                     app.shell.render_requests.request(.footer);
                 },
-                .failed => {
+                .failed => |action| {
+                    if (comptime @hasField(App, "input_runtime")) {
+                        if (action.destination != .auth_picker and
+                            app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) != null)
+                        {
+                            app.input_runtime.picker.dismissInlinePicker(.provider);
+                        }
+                    }
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -996,7 +1061,7 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .warning,
                         .body = providerFailureMessage(
                             intent,
-                            "Provider switching is unavailable until active and queued work finishes.",
+                            provider_busy_message,
                             "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                         ),
                     }, true);
@@ -1094,7 +1159,11 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(
+                        .body = if (failure.category == .cancellation) providerFailureMessage(
+                            intent,
+                            "Provider switching was cancelled. The current provider is unchanged.",
+                            "Subscription sign-in completed, but provider activation was cancelled. The current provider is unchanged.",
+                        ) else providerFailureMessage(
                             intent,
                             "The target provider catalog could not be validated. The current provider is unchanged.",
                             "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
@@ -1130,13 +1199,13 @@ pub fn Runtime(comptime App: type) type {
             var owned_model = try app.alloc.dupe(u8, selected_model);
             errdefer app.alloc.free(owned_model);
 
-            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+            if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
                     .body = providerFailureMessage(
                         intent,
-                        "Provider switching is unavailable until active and queued work finishes.",
+                        provider_busy_message,
                         "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                     ),
                 }, true);
@@ -2380,6 +2449,15 @@ const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
     selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
+    input_runtime: @import("../input/runtime.zig").Runtime = .{},
+    stream: struct { active: bool = false } = .{},
+    worker: struct {
+        queued_prompts: usize = 0,
+
+        fn queuedPromptCount(self: @This()) usize {
+            return self.queued_prompts;
+        }
+    } = .{},
     model_cache: TestModelCache = .{},
     session: struct {
         usage: TestUsage = .{},
@@ -2397,6 +2475,7 @@ const TestApp = struct {
     } = .{},
 
     fn deinit(self: *TestApp) void {
+        self.input_runtime.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
     }
 
@@ -2455,7 +2534,7 @@ test "setup hub projects the selected provider into the auth picker" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
 }
 
-test "login queues the inline picker until its asynchronous inventory refresh completes" {
+test "login prepares the inline picker before its asynchronous inventory refresh completes" {
     var app: TestApp = .{ .selected_provider = .grok };
     defer app.deinit();
 
@@ -2471,15 +2550,174 @@ test "login queues the inline picker until its asynchronous inventory refresh co
     try std.testing.expect(app.shell.render_requests.footer_requested);
 }
 
+test "provider picker preserves type-ahead cursor undo and dismissal through inventory completion" {
+    for ([_]bool{ false, true }) |login| {
+        var app: TestApp = .{};
+        defer app.deinit();
+        if (login) {
+            try Runtime(TestApp).runLoginCommand(&app);
+        } else {
+            try Runtime(TestApp).runProviderCommand(&app);
+        }
+        const prefix = if (login) picker_state.login_prefix else picker_state.provider_prefix;
+        try std.testing.expectEqualStrings(prefix, app.input_runtime.edit_state.input.items);
+        try app.input_runtime.insertionState().insertSlice(app.alloc, "codex", .preserve);
+        _ = app.input_runtime.edit_state.setCursor(prefix.len + 2);
+        app.input_runtime.picker.dismissInlinePicker(.provider);
+
+        try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+        try std.testing.expectEqualStrings(if (login) "/login codex" else "/provider codex", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(prefix.len + 2, app.input_runtime.edit_state.cursor);
+        try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.provider));
+        try std.testing.expect(try app.input_runtime.undoState().undo(app.alloc));
+        try std.testing.expectEqualStrings(prefix, app.input_runtime.edit_state.input.items);
+    }
+}
+
+test "provider inventory completion does not reclaim a changed composer" {
+    for ([_]bool{ false, true }) |fails| {
+        var app: TestApp = .{};
+        defer app.deinit();
+        app.auth.inventory_refresh_fails = fails;
+        try Runtime(TestApp).runProviderCommand(&app);
+        try app.input_runtime.textReplacementState().replace(app.alloc, "/model other");
+        _ = app.input_runtime.edit_state.setCursor(8);
+
+        try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+        try std.testing.expectEqualStrings("/model other", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 8), app.input_runtime.edit_state.cursor);
+        try std.testing.expect(!app.input_runtime.picker.isInlinePickerSuppressed(.provider));
+    }
+}
+
+test "provider picker preparation failure starts no inventory task" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var app: TestApp = .{ .alloc = failing.allocator() };
+    defer app.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, Runtime(TestApp).runProviderCommand(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
+    try std.testing.expect(app.auth.inventory_refresh_action == null);
+}
+
+test "provider picker repeated opening preserves input while inventory is pending" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    try Runtime(TestApp).runProviderCommand(&app);
+    try app.input_runtime.insertionState().insertSlice(app.alloc, "codex", .preserve);
+
+    try Runtime(TestApp).runLoginCommand(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+}
+
+test "provider picker stays dismissed when work starts during inventory refresh" {
+    for ([_]bool{ false, true }) |active| {
+        var app: TestApp = .{};
+        defer app.deinit();
+        try Runtime(TestApp).runProviderCommand(&app);
+        try app.input_runtime.insertionState().insertSlice(app.alloc, "codex", .preserve);
+        app.stream.active = active;
+        app.worker.queued_prompts = if (active) 0 else 1;
+
+        try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+        try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+        try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.provider));
+        try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    }
+}
+
+test "provider picker rejects active and queued work before refreshing inventory" {
+    const cases = [_]struct { active: bool, queued: usize }{
+        .{ .active = true, .queued = 0 },
+        .{ .active = false, .queued = 1 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |login| {
+            var app: TestApp = .{};
+            defer app.deinit();
+            app.stream.active = case.active;
+            app.worker.queued_prompts = case.queued;
+            try app.input_runtime.textReplacementState().replace(app.alloc, "existing draft");
+
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+            try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
+            try std.testing.expect(app.auth.inventory_refresh_action == null);
+            try std.testing.expectEqualStrings("existing draft", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+            try std.testing.expectEqualStrings(provider_busy_message ++ "\n", app.transcript.items);
+        }
+    }
+}
+
+test "provider picker rechecks work before publishing a completed refresh" {
+    const cases = [_]struct { active: bool, queued: usize }{
+        .{ .active = true, .queued = 0 },
+        .{ .active = false, .queued = 1 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |login| {
+            var app: TestApp = .{};
+            defer app.deinit();
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+            app.stream.active = case.active;
+            app.worker.queued_prompts = case.queued;
+            try app.input_runtime.textReplacementState().replace(app.alloc, "new draft");
+
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+            try std.testing.expect(app.auth.inventory_refresh_action == null);
+            try std.testing.expectEqualStrings("new draft", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+            try std.testing.expectEqualStrings(provider_busy_message ++ "\n", app.transcript.items);
+
+            app.stream.active = false;
+            app.worker.queued_prompts = 0;
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+            try std.testing.expectEqualStrings(
+                if (login) picker_state.login_prefix else picker_state.provider_prefix,
+                app.input_runtime.edit_state.input.items,
+            );
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+        }
+    }
+}
+
 test "login inventory failure leaves the picker closed and reports one error" {
     var app: TestApp = .{ .selected_provider = .gateway };
     defer app.deinit();
     app.auth.inventory_refresh_fails = true;
 
     try Runtime(TestApp).runLoginCommand(&app);
+    try app.input_runtime.insertionState().insertSlice(app.alloc, "codex", .preserve);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
     try Runtime(TestApp).collectSourceInventoryFacts(&app);
 
     try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqualStrings("/login codex", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.provider));
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expect(std.mem.find(
         u8,

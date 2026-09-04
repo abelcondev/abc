@@ -45,7 +45,7 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                try validateReplayMessage(message, limits);
+                try validateReplayMessage(alloc, message, limits);
                 if (message.provider_state_json) |state_json| {
                     var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
@@ -108,7 +108,31 @@ pub fn writeInput(
     }
 }
 
-fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void {
+test "non-object provider-owned arguments retain their Responses representation" {
+    const calls = [_]types.ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
+    const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"arguments\":\"[]\"") != null);
+}
+
+test "non-object function arguments cannot enter a Responses request" {
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"", "{]" }) |arguments| {
+        const calls = [_]types.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+        const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidToolArguments, writeInput(&out.writer, std.testing.allocator, &messages, null, .{
+            .tool_calls = 128,
+            .tool_identity_bytes = 256,
+            .tool_arguments_bytes = 4096,
+            .provider_state_bytes = 4096,
+        }));
+    }
+}
+
+fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
     if (message.provider_state_json) |state_json| {
         if (state_json.len > limits.provider_state_bytes) return error.ProviderStateTooLarge;
     }
@@ -121,6 +145,11 @@ fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void
         }
         if (call.arguments_json.len > limits.tool_arguments_bytes) {
             return error.ToolArgumentsTooLarge;
+        }
+        if (call.provenance != .provider_executed and
+            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json) != .valid)
+        {
+            return error.InvalidToolArguments;
         }
     }
 }

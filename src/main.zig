@@ -472,10 +472,11 @@ const App = struct {
     ) !model_catalog.ProviderResult {
         const catalog = self.providerSet().select(provider).model_catalog orelse
             return error.ModelCatalogUnavailable;
+        var cancel_requested = std.atomic.Value(bool).init(false);
         return catalog.fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,
-            .cancel_flag = &self.worker.worker_cancel_requested,
+            .cancel_flag = &cancel_requested,
             .view = .picker,
         });
     }
@@ -1241,11 +1242,8 @@ const App = struct {
         try SessionAppRuntime.resetSession(self);
     }
 
-    pub fn prepareLiveSessionResume(
-        self: *App,
-        log_options: session_log.Options,
-    ) !void {
-        try SessionAppRuntime.prepareLiveSessionResume(self, log_options);
+    pub fn prepareLiveSessionResume(self: *App) !void {
+        try SessionAppRuntime.prepareLiveSessionResume(self);
     }
 
     pub fn finishLiveSessionResume(self: *App) !void {
@@ -1299,10 +1297,6 @@ const App = struct {
 
     pub fn commitStartupResumeReplayAnchor(self: *App) !void {
         try self.flushRequestedFrame();
-    }
-
-    pub fn persistResumeViewAfterFrame(self: *App) void {
-        SessionAppRuntime.persistResumeViewAfterFrame(self);
     }
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
@@ -1471,7 +1465,6 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
@@ -1516,7 +1509,6 @@ const App = struct {
             .credential_source = credential.source,
             .account_id = account_id,
             .history = history,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
         HerdrAppRuntime.reportWorking(self);
@@ -4150,6 +4142,8 @@ test {
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
+    _ = @import("core/auth/auth_transition.zig");
+    _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/workspace_commands.zig");
