@@ -7233,7 +7233,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7242,7 +7242,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7251,7 +7251,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -7786,7 +7786,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "● fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+        "● fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
