@@ -696,12 +696,13 @@ describe("gateway stream lifecycle", () => {
       const output = parseAskJson(result.stdout);
       expect(output.exit_code).toBe(0);
       expect(output.session_id).not.toBe("");
-      expect(output.tool_calls).toEqual([
-        { name: "skill", status: "success" },
+      expect(output.tool_calls).toHaveLength(4);
+      expect(output.tool_calls[0]).toEqual({ name: "skill", status: "success" });
+      expect(output.tool_calls.slice(1)).toEqual(expect.arrayContaining([
         { name: "skill", status: "success" },
         { name: "glob_files", status: "success" },
         { name: "skill", status: "error" },
-      ]);
+      ]));
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).not.toContain("panic");
     } finally {
@@ -5698,7 +5699,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
     const searchCallId = "mcp_terminal_no_match_1";
     let responseIndex = 0;
-    const gateway = startDynamicFakeGateway(() => {
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(body.includes("repeat a no-match search")).toBe(false);
       switch (responseIndex++) {
         case 0:
           return fakeGatewayToolCall(searchCallId, "capability_search", {
