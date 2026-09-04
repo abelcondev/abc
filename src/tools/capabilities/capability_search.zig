@@ -73,14 +73,6 @@ pub fn decode(
     errdefer ctx.allocator.free(query);
     const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
         error.QueryTooLong => unreachable,
-        error.TooManyTokens => {
-            const result = try failure(
-                ctx.allocator,
-                "capability_search query must not exceed 64 tokens",
-            );
-            ctx.allocator.free(query);
-            return result;
-        },
     };
     const server = if (server_value) |value|
         try ctx.allocator.dupe(u8, value.string)

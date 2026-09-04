@@ -360,6 +360,27 @@ fn hasToolResultForCall(
     return false;
 }
 
+pub fn prepareToolExecutionOutput(
+    arena: Allocator,
+    config: Config,
+    tool_call: ToolCall,
+    execution: runtime_tool_contracts.ToolExecutionResult,
+    capture: ?*command_replay_store.Capture,
+) !result_store.PreparedResult {
+    if (execution.model_content_kind != .complete_skill or execution.status != .success) {
+        return prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
+    }
+    if (capture != null) return error.InvalidSkillContentResult;
+    const full = try tool_result_limits.prepareRedactedOutput(arena, execution.model_output);
+    errdefer arena.free(full);
+    if (full.len > config.max_tool_result_bytes) return error.SkillContentLimitExceeded;
+    var prepared = try prepareCapturedToolModelOutput(arena, config, tool_call, full, null);
+    arena.free(prepared.model_output);
+    prepared.model_output = full;
+    prepared.memory.truncated = false;
+    return prepared;
+}
+
 pub fn prepareToolModelOutput(
     arena: Allocator,
     config: Config,

@@ -36,6 +36,10 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tooling_presentation = @import("../tooling/tool_presentation.zig");
+const tool_args = @import("../tooling/tool_args.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -3659,21 +3663,34 @@ pub fn Runtime(comptime App: type) type {
                     decision.label,
                     &.{},
                 )
-            else if (result.status == .success)
-                try app.describeToolActionCompletedWithAdvertised(
+            else if (result.status == .success) success: {
+                var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
+                const registry = app.toolAdvertisementSet().registry;
+                const display_target = target: {
+                    const spec = registry.lookup(call.name) orelse break :target null;
+                    if (spec.prepare_skill_call_fn == null) break :target null;
+                    const args = tool_args.parseToolArgsObject(action_arena.allocator(), call.arguments_json) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => break :target null,
+                    };
+                    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+                    if (presentation.label_arg_kind != .name or
+                        tool_dispatch.presentationLabelValue(presentation, args) != null) break :target null;
+                    break :target skill_invocation.displayNameFromOutput(result.preview orelse result.output, &skill_name_buffer);
+                };
+                break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    null,
-                    &.{},
-                )
-            else
-                try app.describeToolActionDeniedWithAdvertised(
-                    action_arena.allocator(),
-                    call,
-                    null,
-                    "Failed",
+                    display_target,
                     &.{},
                 );
+            } else try app.describeToolActionDeniedWithAdvertised(
+                action_arena.allocator(),
+                call,
+                null,
+                "Failed",
+                &.{},
+            );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
                     try std.fmt.allocPrint(

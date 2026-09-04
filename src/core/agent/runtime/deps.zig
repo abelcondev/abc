@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -203,6 +204,7 @@ pub const AgentRuntimeDeps = struct {
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
+    prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -289,6 +290,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
+                .prepare_skill_call = if (comptime @hasField(App, "skills") and @hasDecl(App, "toolRegistry")) agentPrepareSkillCall else null,
                 .check_tool_availability = agentCheckToolAvailability,
                 .request_tool_permission = agentRequestToolPermission,
                 .request_prepared_file_mutation_permission = agentRequestPreparedFileMutationPermission,
@@ -735,6 +737,24 @@ pub fn Bindings(comptime App: type) type {
         fn agentCheckToolAvailability(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             return app.checkToolAvailability(arena, call);
+        }
+
+        fn agentPrepareSkillCall(ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const tool = app.toolRegistry().lookup(call.name) orelse return error.UnsupportedTool;
+            const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
+            const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+            else
+                app.workspace_root;
+            return prepare(.{
+                .allocator = arena,
+                .workspace_root = workspace_root,
+                .skills_dir = app.skills.dir,
+                .skill_locations = locations,
+                .max_tool_result_bytes = app.worker.effectiveAgentTurnSettings().max_tool_result_bytes,
+                .cancel_flag = &app.worker.worker_cancel_requested,
+            }, call.arguments_json);
         }
 
         fn agentResolveToolActionDisplayTarget(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1521,6 +1541,41 @@ const FakeShell = struct {
         return self.lifecycle.finalizedToolTurnWatermark();
     }
 };
+
+test "skill preparation uses the active turn tool result budget" {
+    const alloc = std.testing.allocator;
+    const SkillApp = struct {
+        const dispatch = @import("../tooling/tool_dispatch.zig");
+        const tool = registered: {
+            var value = @import("../../builtins/tools.zig").skill;
+            value.prepare_skill_call_fn = observeBudget;
+            break :registered value;
+        };
+        workspace_root: []const u8 = "/workspace",
+        skills: struct { dir: []const u8 = "/skills" } = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+
+        pub fn toolRegistry(_: *@This()) dispatch.Registry {
+            return .{ .tools = &.{tool} };
+        }
+
+        fn observeBudget(ctx: dispatch.DispatchContext, _: []const u8) dispatch.DispatchError!skill_contract.CallPreparation {
+            return .{ .failure = .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{d}", .{ctx.max_tool_result_bytes}) } };
+        }
+    };
+    var app: SkillApp = .{};
+    defer app.worker.deinit(alloc);
+    app.worker.agent_turn_settings.max_tool_result_bytes = 16 * 1024;
+    app.worker.active_agent_turn_settings = .{ .max_tool_result_bytes = 4096 };
+    const call: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{}" };
+    const active = try Bindings(SkillApp).agentPrepareSkillCall(&app, alloc, call, null);
+    defer @import("../skills/skill_invocation.zig").freeCallPreparation(alloc, active);
+    try std.testing.expectEqualStrings("4096", active.failure.model_output);
+    app.worker.active_agent_turn_settings = null;
+    const current = try Bindings(SkillApp).agentPrepareSkillCall(&app, alloc, call, null);
+    defer @import("../skills/skill_invocation.zig").freeCallPreparation(alloc, current);
+    try std.testing.expectEqualStrings("16384", current.failure.model_output);
+}
 
 const FakeApp = struct {
     alloc: std.mem.Allocator,

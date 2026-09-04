@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
@@ -73,6 +74,7 @@ pub const SecondaryPublicationReport = struct {
 };
 
 pub const ToolExecutionResult = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
@@ -127,6 +129,7 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,
     call: ToolCall,
