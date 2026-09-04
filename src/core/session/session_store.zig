@@ -1154,6 +1154,27 @@ pub const Store = struct {
         return state;
     }
 
+    /// Replays complete canonical conversation turns without retaining the archive.
+    /// The visitor borrows each turn only for the duration of append().
+    pub fn visitConversationHistory(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        visitor: anytype,
+    ) !void {
+        try validateSessionId(session_id);
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir);
+        defer reader.deinit();
+        while (try reader.next()) |turn| {
+            var turns = [_]session.HistoryTurn{turn};
+            defer session.freeHistoryTurn(alloc, turns[0]);
+            try resolveSessionSnapshotLocators(alloc, &turns, self.sessions_dir, session_id);
+            try visitor.append(turns[0]);
+        }
+    }
+
     /// Reads only the immutable initial-event child identity for a materialized
     /// schema-v3 session. Index-only and legacy rows have no such payload.
     pub fn loadSubagentChildIdentity(

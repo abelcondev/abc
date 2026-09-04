@@ -566,9 +566,7 @@ fn handleRestoreSession(
             }
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
-                for (active.session_rt.agent.history.items) |turn| {
-                    try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-                }
+                try sendActiveHistoryUpdates(state, alloc, session_id);
             }
             try sendPendingRecoveryUpdate(
                 state,
@@ -693,9 +691,7 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_mcp_owned = false;
     if (kind.replaysHistory()) {
-        for (state.active_session.?.session_rt.agent.history.items) |turn| {
-            try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-        }
+        try sendActiveHistoryUpdates(state, alloc, session_id);
     }
     try sendPendingRecoveryUpdate(
         state,
@@ -1175,11 +1171,31 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
+fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    const active = &state.active_session.?;
+    if (active.store) |store| {
+        const Visitor = struct {
+            state: *server.ServerState,
+            alloc: Allocator,
+            session_id: []const u8,
+
+            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+            }
+        };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        return store.visitConversationHistory(alloc, session_id, &visitor);
+    }
+    for (active.session_rt.agent.history.items) |turn| {
+        try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    }
+}
+
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
     switch (turn) {
         .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
         .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
-        .compacted_summary => |compacted| try sendUserHistoryText(state, alloc, session_id, compacted.summary),
+        .compacted_summary => return,
     }
 
     switch (turn) {
@@ -1325,6 +1341,12 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
         active.session_rt.agent.history.items,
     );
     defer metadata.deinit(alloc);
+    if (active.writable) |*writable| {
+        if (try writable.conversationTitle(alloc)) |title| {
+            metadata.deinit(alloc);
+            metadata = .{ .present = true, .title = title };
+        }
+    }
     const updated_at_ms = if (active.writable) |*writable|
         writable.state.updated_at_ms
     else if (active.wasm_state) |durable|

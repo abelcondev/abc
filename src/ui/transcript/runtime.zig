@@ -9734,6 +9734,21 @@ pub const TranscriptRuntime = struct {
                 return false;
             }
             const page = if (self.full_transcript_installed_page) |*value| value else null;
+            if (page) |installed| {
+                if (installed.measurement_snapshot_ready and
+                    full_transcript_page.sameRequest(installed.source.request, window_task.request.page_request) and
+                    installed.projection.measurement_cols != installed.source.request.cols)
+                {
+                    debug_trace.logf(
+                        "full_transcript_cache",
+                        "page_invalidated reason=stored_result_changed revision={d} cols={d}",
+                        .{ installed.source.request.content_revision, installed.source.request.cols },
+                    );
+                    self.discardInstalledFullTranscriptPage();
+                    self.full_transcript_failed_request = null;
+                    return true;
+                }
+            }
             if (window_task.cancel_requested.load(.acquire)) {
                 // Superseded scroll windows are expected and have no visible
                 // failure state; the latest offset schedules on the next tick.
@@ -13040,4 +13055,37 @@ test "notification bell writes standalone BEL bytes" {
 
 test {
     _ = @import("runtime_tests.zig");
+}
+
+test "changed stored result retires stale full transcript geometry" {
+    for ([_]bool{ false, true }) |cancelled| {
+        const request = full_transcript_page.Request{
+            .content_revision = 1,
+            .cols = 80,
+            .anchor = .tail,
+        };
+        var runtime = TranscriptRuntime{
+            .layout = testLayoutWithRows(24),
+            .full_transcript = .{ .depth = .full },
+            .full_transcript_installed_page = .{
+                .source = .{ .request = request, .range = .{ .start = 0, .end = 0 } },
+                .projection = .{ .styles = .{}, .measurement_cols = null },
+                .measured_total_rows = 800,
+                .measurement_snapshot_ready = true,
+            },
+        };
+        defer runtime.deinit(std.testing.allocator);
+        const task = try std.heap.c_allocator.create(full_transcript_worker.WindowTask);
+        task.* = .{
+            .request = full_transcript_worker.preparedWindowRequest(request, 800, 700, 20),
+            .projection = &runtime.full_transcript_installed_page.?.projection,
+            .capability = null,
+        };
+        task.cancel_requested.store(cancelled, .release);
+        task.done.store(true, .release);
+        runtime.full_transcript_window_load.task = task;
+
+        try std.testing.expect(try runtime.pollFullTranscriptPageLoad());
+        try std.testing.expect(runtime.full_transcript_installed_page == null);
+    }
 }
