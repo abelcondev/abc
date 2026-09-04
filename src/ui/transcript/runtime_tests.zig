@@ -14234,11 +14234,178 @@ test "pinned status replacement preserves authoritative cache changes and rebase
     }
 }
 
-test "visual epoch replaces ordinary entries and preserves live tool identities" {
+test "visual epoch retains full history across repeated clears and compact rebuilds" {
     const alloc = std.testing.allocator;
     var runtime = lifecycleTestRuntime(null);
     defer runtime.deinit(alloc);
 
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "old welcome\n", .welcome);
+    const old_id = try runtime.appendRawTranscriptEntryClassified(alloc, "retained answer\n", .subagent_status);
+    _ = try runtime.appendSemanticNotice(alloc, .{
+        .topic = "history",
+        .tone = .information,
+        .body = "retained notice",
+    });
+    const retained_bytes = runtime.entries.items[1].raw_bytes.bytes.ptr;
+
+    for (0..3) |_| {
+        try runtime.resetVisualEpoch(alloc, "current welcome\n");
+        try std.testing.expectEqual(@as(usize, 3), runtime.entries.items.len);
+        try std.testing.expectEqual(old_id, runtime.entries.items[1].id());
+        try std.testing.expectEqual(retained_bytes, runtime.entries.items[1].raw_bytes.bytes.ptr);
+        try std.testing.expect(runtime.entries.items[1].raw_bytes.inline_hidden);
+        try std.testing.expect(runtime.entries.items[2].semantic_notice.inline_hidden);
+        try std.testing.expectEqualStrings("current welcome\n", runtime.transcript.items);
+
+        var compact = try runtime.prepareTranscriptSource(alloc, null);
+        defer compact.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, compact.bytes, "retained") == null);
+
+        var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+        defer projection.deinit(alloc);
+        const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+            alloc,
+            &projection,
+            null,
+            runtime.layout.cols,
+            64,
+            0,
+            null,
+        );
+        defer alloc.free(full);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "retained answer"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "retained notice"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "current welcome"));
+        try std.testing.expect(std.mem.find(u8, full, "old welcome") == null);
+    }
+
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "new answer\n", .subagent_status);
+    var compact = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "new answer") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "retained") == null);
+
+    runtime.clearTranscript(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runtime.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
+}
+
+test "visual epoch preserves monotonic entry IDs across repeated clears" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |has_original_welcome| {
+        var runtime = lifecycleTestRuntime(null);
+        defer runtime.deinit(alloc);
+        if (has_original_welcome) {
+            _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
+            runtime.entries.items[0].raw_bytes.created_at_ms = 1234;
+        }
+        var ordinary_ids: [300]u32 = undefined;
+        for (&ordinary_ids) |*id| {
+            id.* = try runtime.appendRawTranscriptEntryClassified(alloc, "retained answer\n", .subagent_status);
+        }
+        const welcome_index: usize = if (has_original_welcome) 0 else ordinary_ids.len;
+        const welcome_id = if (has_original_welcome) runtime.entries.items[0].id() else runtime.next_entry_id;
+        var welcome_created_at: ?i64 = if (has_original_welcome) 1234 else null;
+        const expected_next_id = runtime.next_entry_id + @as(u32, if (has_original_welcome) 0 else 1);
+
+        for (0..3) |_| {
+            try runtime.resetVisualEpoch(alloc, "current welcome\n");
+            try std.testing.expectEqual(@as(usize, ordinary_ids.len + 1), runtime.entries.items.len);
+            try std.testing.expectEqual(expected_next_id, runtime.next_entry_id);
+            const welcome_entry = runtime.entries.items[welcome_index].raw_bytes;
+            try std.testing.expectEqual(welcome_id, welcome_entry.id);
+            try std.testing.expectEqualStrings("current welcome\n", welcome_entry.bytes);
+            if (welcome_created_at) |created_at| {
+                try std.testing.expectEqual(created_at, welcome_entry.created_at_ms);
+            } else {
+                welcome_created_at = welcome_entry.created_at_ms;
+            }
+            var welcome_count: usize = 0;
+            var ordinary_index: usize = 0;
+            for (runtime.entries.items, 0..) |entry, index| {
+                if (index > 0) try std.testing.expect(runtime.entries.items[index - 1].id() < entry.id());
+                if (entry == .raw_bytes and entry.raw_bytes.class == .welcome) {
+                    welcome_count += 1;
+                } else {
+                    try std.testing.expectEqual(ordinary_ids[ordinary_index], entry.id());
+                    try std.testing.expect(entry.raw_bytes.inline_hidden);
+                    ordinary_index += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), welcome_count);
+            try std.testing.expectEqual(ordinary_ids.len, ordinary_index);
+            try std.testing.expectEqualStrings("current welcome\n", runtime.transcript.items);
+        }
+    }
+}
+
+fn checkVisualEpochAllocationFailuresImpl(alloc: Allocator) !void {
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
+    const old_id = try runtime.appendRawTranscriptEntryClassified(alloc, "borrowed answer\n", .subagent_status);
+    const pinned_id = try transcript_store.appendPinnedToolStatusAtomic(&runtime, alloc, "running\n");
+    const old_entries = runtime.entries.items.ptr;
+    const old_payload = runtime.entries.items[1].raw_bytes.bytes.ptr;
+    const old_next_id = runtime.next_entry_id;
+    const before = try std.testing.allocator.dupe(u8, runtime.transcript.items);
+    defer std.testing.allocator.free(before);
+
+    runtime.resetVisualEpoch(alloc, "replacement welcome\n") catch |err| {
+        try std.testing.expectEqual(old_entries, runtime.entries.items.ptr);
+        try std.testing.expectEqual(@as(usize, 3), runtime.entries.items.len);
+        try std.testing.expectEqual(old_next_id, runtime.next_entry_id);
+        try std.testing.expectEqualStrings(before, runtime.transcript.items);
+        try std.testing.expectEqual(old_payload, runtime.entries.items[1].raw_bytes.bytes.ptr);
+        try std.testing.expect(!runtime.entries.items[1].raw_bytes.inline_hidden);
+        try std.testing.expectEqualStrings("borrowed answer\n", runtime.entries.items[1].raw_bytes.bytes);
+        try std.testing.expect(runtime.isLifecyclePinned(pinned_id));
+        return err;
+    };
+    try std.testing.expectEqual(old_id, runtime.entries.items[1].id());
+    try std.testing.expectEqual(old_payload, runtime.entries.items[1].raw_bytes.bytes.ptr);
+    try std.testing.expect(runtime.entries.items[1].raw_bytes.inline_hidden);
+    try std.testing.expect(runtime.isLifecyclePinned(pinned_id));
+}
+
+fn checkVisualEpochAllocationFailures(alloc: Allocator) !void {
+    return checkVisualEpochAllocationFailuresImpl(alloc) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+test "visual epoch starts a visible assistant tail without resurrecting cleared text" {
+    const alloc = std.testing.allocator;
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+    var metrics = Metrics{};
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "welcome\n", .welcome);
+    const before_id = try runtime.streamAssistantChunk(alloc, &metrics, "before clear");
+    try runtime.resetVisualEpoch(alloc, "welcome\n");
+    const after_id = try runtime.streamAssistantChunk(alloc, &metrics, "after clear");
+    try std.testing.expect(before_id != after_id);
+    try std.testing.expectEqualStrings("before clear", runtime.lookupAssistantSegments(before_id).?.text.items);
+    var compact = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "before clear") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "after clear") != null);
+}
+
+test "visual epoch reset is atomic across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkVisualEpochAllocationFailures,
+        .{},
+    );
+}
+
+test "visual epoch hides ordinary entries and preserves live tool identities through settlement" {
+    const alloc = std.testing.allocator;
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "original welcome\n", .welcome);
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "old transcript\n", .subagent_status);
     const entry_id = try startLifecycle(&runtime, alloc, 7, "call-7");
 
@@ -14258,6 +14425,99 @@ test "visual epoch replaces ordinary entries and preserves live tool identities"
         .outcome = .{ .kind = .completed, .summary = "finished" },
     } });
     try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "finished") != null);
+    try std.testing.expectEqual(@as(usize, 3), runtime.entries.items.len);
+    try std.testing.expectEqual(entry_id, runtime.entries.items[2].id());
+    try std.testing.expect(!runtime.entries.items[2].raw_bytes.inline_hidden);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = 7,
+        .outcome = .completed,
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    try std.testing.expect(!runtime.isLifecyclePinned(entry_id));
+    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "finished") != null);
+    try runtime.resetVisualEpoch(alloc, "welcome again\n");
+    try std.testing.expectEqual(@as(usize, 3), runtime.entries.items.len);
+    try std.testing.expectEqual(entry_id, runtime.entries.items[2].id());
+    try std.testing.expect(runtime.entries.items[2].raw_bytes.inline_hidden);
+    try std.testing.expectEqualStrings("welcome again\n", runtime.transcript.items);
+
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        64,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.find(u8, full, "old transcript") != null);
+    try std.testing.expect(std.mem.find(u8, full, "finished") != null);
+}
+
+test "visual epoch retains command output blocks and detail associations" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var runtime = commandOutputTestRuntime(sink);
+    defer runtime.deinit(alloc);
+    var metrics = Metrics{};
+    const styles = commandOutputTestStyles();
+    const id = lifecycleId(1, "retained-command");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}",
+    } });
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, id, .stdout, "retained command result\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, id, true);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Retained command complete" },
+        .result = "retained command result\n",
+        .result_memory = .{ .command_process_presentation = .{ .exit_code = 0 } },
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = 1,
+        .outcome = .completed,
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    const output_id = runtime.toolDetailForEntry(entry_id).?.command_output_entry_id.?;
+    const block_count = runtime.command_output_blocks.items.len;
+    try std.testing.expect(block_count > 0);
+    const blocks_ptr = runtime.command_output_blocks.items.ptr;
+
+    for (0..2) |_| {
+        try runtime.resetVisualEpoch(alloc, "welcome\n");
+        try std.testing.expectEqual(block_count, runtime.command_output_blocks.items.len);
+        try std.testing.expectEqual(blocks_ptr, runtime.command_output_blocks.items.ptr);
+        try std.testing.expectEqual(output_id, runtime.toolDetailForEntry(entry_id).?.command_output_entry_id.?);
+        try std.testing.expect(transcriptContainsEntry(&runtime, output_id));
+        try std.testing.expectEqualStrings("welcome\n", runtime.transcript.items);
+        var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+        defer projection.deinit(alloc);
+        const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+            alloc,
+            &projection,
+            null,
+            runtime.layout.cols,
+            64,
+            0,
+            null,
+        );
+        defer alloc.free(full);
+        try std.testing.expect(std.mem.find(u8, full, "Retained command complete") != null);
+        try std.testing.expect(std.mem.find(u8, full, "retained command result") != null);
+    }
+    runtime.clearTranscript(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runtime.command_output_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.tool_details.items.len);
 }
 
 test "transcript lifecycle identity updates are idempotent and atomic" {

@@ -862,6 +862,10 @@ fn buildWithStyleAndStats(
     try projection.entry_actions.appendNTimes(alloc, .keep, entries.len);
     if (mode == .compact) {
         for (entries, projection.entry_actions.items) |entry, *action| {
+            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) {
+                action.* = .hide;
+                continue;
+            }
             switch (entry) {
                 .raw_bytes => |raw| if (raw.class == .command_output) {
                     action.* = .hide;
@@ -896,6 +900,7 @@ fn buildWithStyleAndStats(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
+        if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail)) continue;
@@ -1047,6 +1052,7 @@ fn buildWithStyleAndStats(
 
         while (index < entries.len) : (index += 1) {
             try build_checkpoint.tick(checkpoint);
+            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
