@@ -35,64 +35,47 @@ const runtime_handle_type_tag = c.napi_type_tag{
 };
 
 const ReadyNotifier = struct {
-    function: c.napi_threadsafe_function,
-    pending: std.atomic.Value(bool) = .init(false),
+    reader: ?c_int,
+    writer: c_int,
 
-    fn init(env: c.napi_env, callback: c.napi_value) !*ReadyNotifier {
-        var callback_type: c.napi_valuetype = undefined;
-        if (c.napi_typeof(env, callback, &callback_type) != c.napi_ok or callback_type != c.napi_function) {
-            return error.InvalidReadyCallback;
-        }
-        var resource_name: c.napi_value = undefined;
-        if (c.napi_create_string_utf8(env, "libfx core ready", c.NAPI_AUTO_LENGTH, &resource_name) != c.napi_ok) {
-            return error.ReadyCallbackFailed;
-        }
-        const self = std.heap.c_allocator.create(ReadyNotifier) catch return error.ReadyCallbackFailed;
-        errdefer std.heap.c_allocator.destroy(self);
-        self.* = .{ .function = undefined };
-        // pending bounds this to one queued wake plus the callback currently running.
-        if (c.napi_create_threadsafe_function(
-            env,
-            callback,
-            null,
-            resource_name,
-            0,
-            1,
-            self,
-            finalize,
-            self,
-            deliver,
-            &self.function,
-        ) != c.napi_ok) return error.ReadyCallbackFailed;
-        return self;
+    fn init() error{ReadyChannelFailed}!ReadyNotifier {
+        var pair: [2]c_int = undefined;
+        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const socket_type = std.c.SOCK.STREAM | flags;
+        if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
+        errdefer for (pair) |fd| {
+            _ = std.c.close(fd);
+        };
+        // Darwin does not accept close-on-exec/nonblocking bits in socketpair's type.
+        if (flags == 0) for (pair) |fd| {
+            if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) != 0 or
+                std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) != 0)
+                return error.ReadyChannelFailed;
+        };
+        return .{ .reader = pair[0], .writer = pair[1] };
     }
 
     fn notify(self: *ReadyNotifier) void {
-        if (self.pending.swap(true, .acq_rel)) return;
-        if (c.napi_call_threadsafe_function(self.function, null, c.napi_tsfn_nonblocking) != c.napi_ok) {
-            self.pending.store(false, .release);
+        const byte: u8 = 1;
+        while (true) {
+            const written = std.c.send(self.writer, &byte, 1, std.c.MSG.NOSIGNAL);
+            if (written == 1) return;
+            switch (std.posix.errno(written)) {
+                .INTR => continue,
+                // A full socket already has a wake pending; queue contents are authoritative.
+                .AGAIN => return,
+                else => {
+                    // Surface a broken notification channel as EOF instead of silently hanging.
+                    _ = std.c.shutdown(self.writer, std.c.SHUT.WR);
+                    return;
+                },
+            }
         }
     }
 
-    fn deliver(env: c.napi_env, callback: c.napi_value, context: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        // Node can discard queued calls after finalize has freed their context.
-        if (env == null or callback == null) return;
-        const self: *ReadyNotifier = @ptrCast(@alignCast(context.?));
-        // Disarm before draining: a producer can queue one more wake while this callback runs.
-        self.pending.store(false, .release);
-        var receiver: c.napi_value = undefined;
-        if (c.napi_get_undefined(env, &receiver) != c.napi_ok) return;
-        _ = c.napi_call_function(env, receiver, callback, 0, null, null);
-    }
-
-    fn finalize(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        // Teardown callbacks do not dereference this context after it is released.
-        const self: *ReadyNotifier = @ptrCast(@alignCast(data.?));
-        std.heap.c_allocator.destroy(self);
-    }
-
-    fn abort(self: *ReadyNotifier) void {
-        _ = c.napi_release_threadsafe_function(self.function, c.napi_tsfn_abort);
+    fn deinit(self: *ReadyNotifier) void {
+        if (self.reader) |fd| _ = std.c.close(fd);
+        _ = std.c.close(self.writer);
     }
 };
 
@@ -450,7 +433,7 @@ const Runtime = struct {
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
-    ready: *ReadyNotifier,
+    ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(0),
@@ -473,11 +456,12 @@ const Runtime = struct {
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
-        var gateway = builtin_gateway.provider_bundle;
-        gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
-        gateway.model_catalog = null;
-        gateway.permission_reviewer = null;
-        const providers = provider_set.gateway_only(gateway);
+        const providers = provider_set.gateway_only(.{
+            .presentation = builtin_gateway.provider_bundle.presentation,
+            .auth_strategy = .vercel,
+            .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
+            .agent_stream = host_stream_provider.provider(&self.stream_context),
+        });
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -529,7 +513,7 @@ const Runtime = struct {
         self.closeInput();
         self.fetch.shutdown();
         self.thread.join();
-        self.ready.abort();
+        self.ready.deinit();
         self.fetch.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
@@ -611,11 +595,6 @@ fn throw(env: c.napi_env, code: [*:0]const u8, message: [*:0]const u8) c.napi_va
     return null;
 }
 
-fn throwType(env: c.napi_env, code: [*:0]const u8, message: [*:0]const u8) c.napi_value {
-    _ = c.napi_throw_type_error(env, code, message);
-    return null;
-}
-
 fn statusOk(env: c.napi_env, status: c.napi_status, message: [*:0]const u8) bool {
     if (status == c.napi_ok) return true;
     _ = c.napi_throw_error(env, "LIBFX_NAPI", message);
@@ -679,9 +658,10 @@ const CreateError = error{
     InvalidGatewayUrl,
     OutOfMemory,
     ThreadFailed,
+    ReadyChannelFailed,
 };
 
-fn createRuntime(env: c.napi_env, options: c.napi_value, ready: *ReadyNotifier) CreateError!*Runtime {
+fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
@@ -724,6 +704,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value, ready: *ReadyNotifier) 
 
     const runtime = alloc.create(Runtime) catch return error.OutOfMemory;
     errdefer alloc.destroy(runtime);
+    var ready = try ReadyNotifier.init();
+    errdefer ready.deinit();
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
@@ -734,8 +716,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value, ready: *ReadyNotifier) 
         .ready = ready,
         .thread = undefined,
     };
-    runtime.fetch.ready = runtime.ready;
-    runtime.output.ready = runtime.ready;
+    runtime.fetch.ready = &runtime.ready;
+    runtime.output.ready = &runtime.ready;
     runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
@@ -758,6 +740,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
         error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not allocate native runtime"),
         error.ThreadFailed => throw(env, "LIBFX_NATIVE_THREAD", "could not start native runtime thread"),
+        error.ReadyChannelFailed => throw(env, "LIBFX_NATIVE_IO", "could not create native readiness channel"),
     };
 }
 
@@ -769,18 +752,9 @@ fn finalizeRuntimeHandle(env: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) cal
 }
 
 fn createCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [2]c.napi_value = undefined;
+    var argv: [1]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
-
-    const ready = ReadyNotifier.init(env, argv[1]) catch |err| return switch (err) {
-        error.InvalidReadyCallback => throwType(env, "LIBFX_INVALID_ARGUMENT", "ready callback must be a function"),
-        error.ReadyCallbackFailed => throw(env, "LIBFX_NAPI", "could not create ready callback"),
-    };
-    var ready_owned = true;
-    defer if (ready_owned) ready.abort();
-
-    const runtime = createRuntime(env, argv[0], ready) catch |err| return throwCreateError(env, err);
-    ready_owned = false;
+    const runtime = createRuntime(env, argv[0]) catch |err| return throwCreateError(env, err);
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit();
     const handle = std.heap.c_allocator.create(RuntimeHandle) catch
@@ -845,6 +819,19 @@ fn lockRuntime(env: c.napi_env, handle: *RuntimeHandle) ?*Runtime {
 
 fn unlockRuntime(handle: *RuntimeHandle) void {
     handle.mutex.unlock(io_mod.getIo());
+}
+
+fn takeCoreReadyFd(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    const reader = runtime.ready.reader orelse
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "readiness descriptor already transferred");
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_int32(env, reader, &value), "could not transfer readiness descriptor")) return null;
+    runtime.ready.reader = null;
+    return value;
 }
 
 fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
@@ -1045,6 +1032,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
+    if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;
     if (!exportFunction(env, exports, "closeCore", closeCore)) return null;
     if (!exportFunction(env, exports, "drainCore", drainCore)) return null;

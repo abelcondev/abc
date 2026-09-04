@@ -31,7 +31,7 @@ JavaScript createFxAgent()
 sdk/node.js selects native backend
         |
         v
-createCore(options, onReady) in libfx.node
+createCore(options) in libfx.node
         |
         v
 Zig Runtime thread runs acp_server.runWithTransport()
@@ -57,9 +57,11 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-The adapter supplies one readiness callback when it creates the core. The runtime schedules that callback when a fetch request becomes pending, output changes from empty to non-empty, or the core exits. The callback carries no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. While a body pump exists it calls `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next readiness callback. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. While a body pump exists it calls `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next readiness event. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
+
+The native kernel installs only the host-stream provider and static model metadata. It does not inherit CLI billing reconciliation, model discovery, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
 
 ## Native module ABI
 
@@ -68,7 +70,8 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 | Export | Purpose |
 | --- | --- |
 | `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `3`. Low-level `createCore` backends must declare this exact version. |
-| `createCore(options, onReady)` | Allocates a runtime, installs its readiness callback, and starts its ACP thread. |
+| `createCore(options)` | Allocates a runtime and readiness socketpair, then starts its ACP thread. |
+| `takeCoreReadyFd(handle)` | Transfers the readiness reader descriptor to JavaScript exactly once. The caller owns its close. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
@@ -103,13 +106,13 @@ Creating a core performs these steps:
 5. Spawn one native thread.
 6. Run `acp_server.runWithTransport()` on that thread using callback-backed ACP queues and the shared host-stream provider.
 
-The runtime thread never reads or mutates JavaScript values. It blocks on the fetch bridge while Node owns `fetch`, response-body iteration, and `AbortController`; its only Node-API effect is scheduling the thread-safe readiness callback. Queue state remains authoritative when callbacks coalesce. An environment cleanup hook shuts down and joins every runtime before Node tears down its callback handle, including worker termination. Explicit destruction unregisters that hook. Destruction marks the bridge shutting down, wakes every wait, joins the runtime thread, and then releases the callback and native memory.
+The runtime thread never reads or mutates JavaScript values or calls Node-API. It blocks on the fetch bridge while Node owns `fetch`, response-body iteration, and `AbortController`. Queue state remains authoritative when readiness writes coalesce. An environment cleanup hook shuts down and joins every runtime, including worker termination. Explicit destruction unregisters that hook. Destruction marks the bridge shutting down, wakes every wait, joins the runtime thread, and then closes the readiness writer and any unclaimed reader before freeing native memory. The JavaScript adapter destroys its reader socket and waits for its close before settling `exited`.
 
 The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
 Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
 
-Readiness uses one atomic pending flag, cleared before JavaScript drains the queues. This permits one queued wake while the current callback runs without losing a producer's notification. The thread-safe function owns the notifier until its finalizer runs. Discarded teardown callbacks return without accessing that context.
+Readiness has no callback queue or pending flag. A full socket already contains a wake, so a nonblocking `EAGAIN` needs no retry. Other write failures shut down the writer so the reader observes EOF and fails the runtime instead of hanging. Writes suppress `SIGPIPE`, and descriptors are close-on-exec. This avoids depending on a thread-safe-function dispatcher's drain/idle race.
 
 The runtime handle has a separate mutex that serializes access to the runtime pointer against destruction. Destruction removes the pointer first, then closes input and joins the thread. No runtime allocation is freed while its thread is still running.
 

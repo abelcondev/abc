@@ -1,5 +1,7 @@
 import { access, readFile } from "node:fs/promises";
+import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -129,7 +131,20 @@ function createNativeCoreRuntime(addon, options) {
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
-  }, drainReady);
+  });
+  let readyFd;
+  let readySocket;
+  try {
+    readyFd = addon.takeCoreReadyFd(core);
+    readySocket = new Socket({ fd: readyFd, readable: true, writable: false });
+  } catch (error) {
+    if (readyFd !== undefined) {
+      try { closeSync(readyFd); } catch {}
+    }
+    addon.destroyCore(core);
+    throw error;
+  }
+  const readyClosed = new Promise((resolve) => readySocket.once("close", resolve));
   let exitedResolve;
   let lineHandler = null;
   let lineBuffer = "";
@@ -146,7 +161,8 @@ function createNativeCoreRuntime(addon, options) {
     settled = true;
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
-    exitedResolve(code);
+    readySocket.destroy();
+    void readyClosed.then(() => exitedResolve(code));
   };
   const pumpFetch = async (request) => {
     const controller = new AbortController();
@@ -223,6 +239,15 @@ function createNativeCoreRuntime(addon, options) {
     } catch {
       finish(1);
     }
+  }
+
+  readySocket.on("data", drainReady);
+  readySocket.on("end", () => { drainReady(); if (!settled) finish(1); });
+  readySocket.on("error", () => finish(1));
+  readySocket.on("close", () => { if (!settled) finish(1); });
+  // Some runtimes defer descriptor adoption until connect().
+  if (readySocket.pending) {
+    try { readySocket.connect({ fd: readyFd }); } catch (error) { finish(1); throw error; }
   }
 
   return {

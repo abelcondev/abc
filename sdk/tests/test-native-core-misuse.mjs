@@ -18,14 +18,13 @@ if (!ambientTraceChild) {
   delete process.env.FX_TRACE_STDERR;
 }
 const addon = require(addonPath);
-const noop = () => {};
 
 if (ambientTraceChild) {
   const traceCore = addon.createCore({
     apiKey: "trace-test-key",
     home: "/tmp",
     workspaceRoot: "/tmp",
-  }, noop);
+  });
   try {
     assert.equal(addon.pushCoreFetchResponse(traceCore, 17, Buffer.from("secret-response-payload")), 0);
   } finally {
@@ -37,6 +36,7 @@ if (ambientTraceChild) {
 
 for (const [name, args] of [
   ["createCore", []],
+  ["takeCoreReadyFd", []],
   ["writeCore", []],
   ["writeCore", [{}]],
   ["closeCore", []],
@@ -58,18 +58,13 @@ for (const [name, args] of [
   });
 }
 
-assert.throws(
-  () => addon.createCore({ apiKey: "key", home: "/tmp", workspaceRoot: "/tmp" }, null),
-  { name: "TypeError", code: "LIBFX_INVALID_ARGUMENT", message: "ready callback must be a function" },
-);
-
 const getterError = new Error("host getter failed");
 assert.throws(
-  () => addon.createCore(Object.defineProperty({}, "apiKey", { get() { throw getterError; } }), noop),
+  () => addon.createCore(Object.defineProperty({}, "apiKey", { get() { throw getterError; } })),
   (error) => error === getterError,
 );
 assert.throws(
-  () => addon.createCore(new Proxy({}, { has() { throw getterError; } }), noop),
+  () => addon.createCore(new Proxy({}, { has() { throw getterError; } })),
   (error) => error === getterError,
 );
 
@@ -81,7 +76,7 @@ for (const [options, message] of [
   [{ apiKey: "key", home: "/tmp", workspaceRoot: "/tmp", gatewayChatUrl: "https://user:pass@example.com/chat" }, /gatewayChatUrl/],
   [{ apiKey: "key", home: "/tmp", workspaceRoot: "/tmp", gatewayChatUrl: "https://example.com/chat" }, /gatewayChatUrl/],
 ]) {
-  assert.throws(() => addon.createCore(options, noop), message);
+  assert.throws(() => addon.createCore(options), message);
 }
 
 for (const fakeHandle of [null, undefined, {}, Buffer.alloc(0), 0, "handle"]) {
@@ -91,7 +86,7 @@ for (const fakeHandle of [null, undefined, {}, Buffer.alloc(0), 0, "handle"]) {
   );
 }
 
-const core = addon.createCore({ apiKey: "misuse-test-key", home: "/tmp", workspaceRoot: "/tmp" }, noop);
+const core = addon.createCore({ apiKey: "misuse-test-key", home: "/tmp", workspaceRoot: "/tmp" });
 assert.throws(
   () => addon.writeCore(core, Buffer.alloc(8 * 1024 * 1024 + 1)),
   (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
@@ -110,7 +105,7 @@ const lifecycleCore = addon.createCore({
   home: "/tmp",
   workspaceRoot: "/tmp",
   gatewayChatUrl: "http://127.0.0.1:31337/chat",
-}, noop);
+});
 let nextId = 1;
 let buffered = "";
 const timeout = (label, ms = 5000) => new Promise((_, reject) => {

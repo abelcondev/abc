@@ -48,6 +48,8 @@ fn serveConnection(stream: std.Io.net.Stream) void {
 
 fn serveConnectionFallible(io: std.Io, stream: std.Io.net.Stream) !void {
     defer stream.close(io);
+    const no_delay: c_int = 1;
+    try std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&no_delay));
     var read_buffer: [64 * 1024]u8 = undefined;
     var write_buffer: [64 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);

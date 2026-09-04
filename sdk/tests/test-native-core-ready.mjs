@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { createRequire } from "node:module";
+import { Socket } from "node:net";
+import { once } from "node:events";
+import { closeSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,7 +36,14 @@ const core = addon.createCore({
   apiKey: "ready-test-key",
   home: process.cwd(),
   workspaceRoot: process.cwd(),
-}, notify);
+});
+const reader = addon.takeCoreReadyFd(core);
+assert.throws(() => addon.takeCoreReadyFd(core), /already transferred/);
+const socket = new Socket({ fd: reader, readable: true, writable: false });
+socket.on("data", notify);
+socket.on("end", notify);
+if (socket.pending) socket.connect({ fd: reader });
+const socketClosed = once(socket, "close");
 
 try {
   addon.writeCore(core, Buffer.from(`${JSON.stringify({
@@ -82,14 +92,19 @@ try {
 } finally {
   addon.closeCore(core);
   addon.destroyCore(core);
+  socket.destroy();
+  await socketClosed;
 }
 
-// Exit wakes remain queued when a core is destroyed before JavaScript yields.
+const beforeFds = readdirSync("/dev/fd").length;
+// Unclaimed readers and pending exit wakes are released with their runtime.
 for (let index = 0; index < 32; index++) {
-  const closing = addon.createCore({ apiKey: "ready-close-key", home: "/tmp", workspaceRoot: "/tmp" }, () => {});
+  const closing = addon.createCore({ apiKey: "ready-close-key", home: "/tmp", workspaceRoot: "/tmp" });
+  if (index % 2 === 0) closeSync(addon.takeCoreReadyFd(closing));
   addon.closeCore(closing);
   addon.destroyCore(closing);
 }
 await new Promise((resolveReady) => setImmediate(resolveReady));
+assert.equal(readdirSync("/dev/fd").length, beforeFds);
 
 console.log("native core readiness notification passed");
