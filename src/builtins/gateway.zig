@@ -1245,6 +1245,16 @@ fn normalizeGatewayCompletion(
             ) });
             break :blk false;
         },
+        .reject_unstorable_identity => |failure| blk: {
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "provider search tool identity cannot be stored ({s}: {s})",
+                .{ @tagName(failure.field), @tagName(failure.reason) },
+            );
+            errdefer alloc.free(detail);
+            try content.append(alloc, .{ .error_text = detail });
+            break :blk false;
+        },
         .reject_malformed_provider_result => |failure| blk: {
             try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(
                 alloc,
@@ -1321,9 +1331,11 @@ fn normalizeGatewayCompletion(
         } });
     }
 
+    const stop_reason = if (completion.finish_reason) |reason| try alloc.dupe(u8, reason.label()) else null;
+    errdefer if (stop_reason) |value| alloc.free(value);
     return .{
         .content = try content.toOwnedSlice(alloc),
-        .stop_reason = if (completion.finish_reason) |reason| try alloc.dupe(u8, reason.label()) else null,
+        .stop_reason = stop_reason,
         .usage = .{
             .input_tokens = completion.usage.input_tokens orelse 0,
             .output_tokens = completion.usage.output_tokens orelse 0,
@@ -1706,6 +1718,33 @@ test "gateway worker returns one bounded error for malformed provider result ide
         try std.testing.expectEqualStrings(expected, response.content[0].error_text);
         try std.testing.expectEqual(@as(u32, 0), response.usage.?.web_search_requests);
     }
+}
+
+test "gateway worker rejects unstorable provider identities without returning search results" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectUnstorableProviderIdentity, .{});
+}
+
+fn expectUnstorableProviderIdentity(alloc: Allocator) !void {
+    const oversized = [_]u8{'i'} ** 257;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var response = try normalizeGatewayCompletion(alloc, .{
+        .backend = perplexity_search_backend_id,
+        .query = "Zig documentation",
+        .cancel_flag = &cancel_flag,
+    }, .{
+        .tool_calls = &.{.{
+            .id = &oversized,
+            .name = "perplexity_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        }},
+        .finish_reason = .stop,
+    }, null, null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), response.content.len);
+    try std.testing.expect(response.content[0] == .error_text);
+    try std.testing.expect(std.mem.find(u8, response.content[0].error_text, "id: too_long") != null);
 }
 
 test "gateway worker rejects malformed provider arguments before accepting search results" {

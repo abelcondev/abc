@@ -1722,6 +1722,22 @@ fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !v
     try std.testing.expect(logContains(&hooks, "event:turn_finished"));
 }
 
+test "processQueuedPrompt rejects unstorable tool batches before permissions or execution" {
+    const oversized = [_]u8{'i'} ** 257;
+    const invalid = [_]ToolCall{
+        .{ .id = "bad", .name = "", .arguments_json = "{}" },
+        .{ .id = &oversized, .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "bad", .name = "read_file", .provisional_id = &oversized, .arguments_json = "{}" },
+    };
+    const valid = toolCall("good", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}");
+    for (invalid) |bad| {
+        for ([_]bool{ false, true }) |bad_first| {
+            const calls = if (bad_first) [_]ToolCall{ bad, valid } else [_]ToolCall{ valid, bad };
+            try expectRejectedPrompt(.{ .tool_calls = &calls }, error.MalformedAuthoritativeToolIdentity);
+        }
+    }
+}
+
 fn lifecycleCallId(event: types.ToolLifecycleEvent) ?[]const u8 {
     return switch (event) {
         .provisional => |value| value.id.call_id,
