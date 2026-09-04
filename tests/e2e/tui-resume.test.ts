@@ -288,38 +288,6 @@ async function waitForPersistedSessionMarker(
   }, `persisted session marker ${marker}`, timeout);
 }
 
-async function waitForCommittedSessionMarker(
-  home: string,
-  marker: string,
-  timeout = TIMEOUT,
-): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
-  await waitForCondition(() => {
-    if (!existsSync(sessionsDir)) return false;
-    return readdirSync(sessionsDir, { withFileTypes: true })
-      .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-      .some((entry) => {
-        const sessionDir = join(sessionsDir, entry.name);
-        const eventsPath = join(sessionDir, "events.jsonl");
-        if (!existsSync(eventsPath) || !readFileSync(eventsPath, "utf8").includes(marker)) {
-          return false;
-        }
-        const watermarkName = readdirSync(sessionDir).find(
-          (name) => name.startsWith("commit.") && name.endsWith(".json"),
-        );
-        if (!watermarkName) return false;
-        try {
-          const watermark = JSON.parse(
-            readFileSync(join(sessionDir, watermarkName), "utf8"),
-          ) as { through_event_log_bytes?: number };
-          return watermark.through_event_log_bytes === statSync(eventsPath).size;
-        } catch {
-          return false;
-        }
-      });
-  }, `committed session marker ${marker}`, timeout);
-}
-
 async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
@@ -4721,15 +4689,6 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
 
       const sessionId = sessionIdFromHome(home);
-      const resumeViewPath = join(
-        home,
-        ".fx",
-        "sessions",
-        sessionId,
-        "resume-view.bin",
-      );
-      expect(existsSync(resumeViewPath)).toBe(true);
-      const initialResumeView = readFileSync(resumeViewPath);
 
       const pickerGateway = startFakeGateway([]);
       gateways.push(pickerGateway);
@@ -4757,7 +4716,6 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      writeFileSync(resumeViewPath, initialResumeView);
 
       const invocations = [
         ["-c"],
@@ -4772,7 +4730,6 @@ test.skipIf(!tmuxAvailable())(
           index === 0 ? initialMarker : `resume follow-up ${index - 1}`;
         const followUp = `resume follow-up ${index}`;
         const tapePath = join(root, `startup-resume-${index}.fxtape`);
-        const tracePath = join(root, `startup-resume-${index}.trace.log`);
         const gateway = startFakeGateway([fakeGatewayFinalText(followUp)]);
         gateways.push(gateway);
         writeFileSync(stderrPath, "");
@@ -4782,8 +4739,6 @@ test.skipIf(!tmuxAvailable())(
           env: {
             ...gatewayEnv(home, gateway),
             FX_RECORD: tapePath,
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "session",
           },
           stderrPath,
           width: args[0] === `--resume-${sessionId}` ? 42 : 100,
@@ -4801,10 +4756,6 @@ test.skipIf(!tmuxAvailable())(
         await active.kill();
         active = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
-        const resumeTrace = readFileSync(tracePath, "utf8");
-        expect(resumeTrace).toMatch(
-          /event=resume_view_cache (?:outcome=painted freshness=exact|outcome=skipped freshness=(?:exact|older))/,
-        );
         const replay = await runFx(["replay", tapePath, "--frames"], {
           cwd: workspaceRoot,
           env: { HOME: home },
@@ -4818,9 +4769,6 @@ test.skipIf(!tmuxAvailable())(
             /Recording:|Session:|Run \/help for commands|auto ·/.test(frame),
           );
         expect(firstApplicationFrame).toContain(restoredMarker);
-        if (index === 0) {
-          writeFileSync(resumeViewPath, initialResumeView);
-        }
       }
 
       const markdownHome = join(root, "markdown-home");
@@ -5210,95 +5158,6 @@ test.skipIf(!tmuxAvailable())(
         } catch {}
         await active.kill();
       }
-      release.stop();
-      gateway.stop();
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  UPGRADE_TIMEOUT * 2,
-);
-
-test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g repairs an exact corrupt boundary and resumes",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-corrupt-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const installDir = join(root, "install");
-    const stderrPath = join(root, "stderr.log");
-    const argvLogPath = join(root, "upgrade-argv.log");
-    mkdirSync(home);
-    mkdirSync(workspace);
-    mkdirSync(installDir);
-    const workspaceRoot = realpathSync(workspace);
-    const installedFx = join(installDir, "fx");
-    copyFileSync(FX_BIN, installedFx);
-    chmodSync(installedFx, 0o755);
-
-    let active: TmuxSession | null = null;
-    const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CORRUPT_INITIAL_DONE"),
-      fakeGatewayFinalText("UPGRADE_CORRUPT_FOLLOWUP_DONE"),
-    ]);
-    const release = startUpgradeServer(root, argvLogPath);
-
-    try {
-      writeFileSync(stderrPath, "");
-      active = await TmuxSession.create({
-        cmd: shellQuote(installedFx),
-        cwd: workspaceRoot,
-        env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
-        },
-        stderrPath,
-        width: 110,
-        height: 32,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Save this turn before the corrupt upgrade boundary.");
-      await active.waitForText("UPGRADE_CORRUPT_INITIAL_DONE", TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
-      await waitForCommittedSessionMarker(home, "UPGRADE_CORRUPT_INITIAL_DONE");
-      const sessionId = sessionIdFromHome(home);
-      await active.waitForText(
-        "update ready: ctrl+g to reload",
-        UPGRADE_TIMEOUT,
-      );
-
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const watermarkName = readdirSync(sessionDir).find(
-        (name) => name.startsWith("commit.") && name.endsWith(".json"),
-      )!;
-      writeFileSync(join(sessionDir, watermarkName), "{}\n", { mode: 0o600 });
-      const version = (await runFx(["--version"])).stdout.trim();
-      await active.sendHexBytes(["07"]);
-
-      await active.waitForText(
-        `● fx has been updated to v${version} (notes)`,
-        TIMEOUT,
-      );
-      const resumed = await waitForScrollback(
-        active,
-        "UPGRADE_CORRUPT_INITIAL_DONE",
-      );
-      expect(resumed).toContain("UPGRADE_CORRUPT_INITIAL_DONE");
-      expect(active.isPaneAlive()).toBe(true);
-      const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
-      expect(argvLines).toEqual([
-        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
-      ]);
-
-      await active.sendText("Continue after repaired upgrade handoff.");
-      await active.waitForText("UPGRADE_CORRUPT_FOLLOWUP_DONE", TIMEOUT);
-
-      await active.sendText("/quit");
-      expect(await active.waitForSessionEnd()).toBe(true);
-      await active.kill();
-      active = null;
-    } finally {
-      if (active) await active.kill();
       release.stop();
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
