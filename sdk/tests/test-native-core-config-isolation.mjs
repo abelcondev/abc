@@ -70,6 +70,7 @@ try {
     "native addon host must not start workspace MCP",
   );
   const turn = agent.prompt("read the explicit workspace context");
+  for await (const _ of turn) {}
   await turn.result;
   assert.match(requestBody, new RegExp(marker), "native startup omitted explicit host instructions");
   assert.doesNotMatch(requestBody, new RegExp(workspaceMarker), "minimal kernel scanned workspace context");
