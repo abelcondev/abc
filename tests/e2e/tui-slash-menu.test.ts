@@ -84,6 +84,22 @@ function captureViewportEscapes(session: TmuxSession): string {
   });
 }
 
+function runningBinaryTitle(): string {
+  const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+  expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  return `fx v${version}`;
+}
+
+async function expectCleanTitleTranscript(session: TmuxSession, title: string): Promise<void> {
+  const transcript = await session.captureFullScrollback();
+  expect(transcript.trim().length).toBeGreaterThan(0);
+  expect(transcript).not.toContain(title);
+  expect(transcript).not.toContain("]0;");
+  expect(transcript).not.toContain("]2;");
+  expect(transcript).not.toContain("\x1b");
+  expect(transcript).not.toContain("\x07");
+}
+
 async function waitForPaneTitle(
   session: TmuxSession,
   expected: string,
@@ -796,8 +812,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "terminal tab title follows the session name across rename and resume",
+    "terminal tab title stays at the running binary version across rename, resume, and new session",
     async () => {
+      const title = runningBinaryTitle();
       const workDir = mkdtempSync(join(tmpdir(), "fx-title-rename-e2e-"));
       workDirs.push(workDir);
       const home = join(workDir, "home");
@@ -833,27 +850,34 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         width: 120,
         height: 32,
         isolated: true,
+        remainOnExit: true,
       });
       await session.waitForComposer(10_000);
+      await waitForPaneTitle(session, title, 5_000);
+      await expectCleanTitleTranscript(session, title);
 
-      // Before the first turn names the session, the workspace distinguishes
-      // parallel tabs while the model remains visible.
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${model}`);
-
-      // The first prompt names the session, and the tab follows it.
+      // Naming the session must not add session or model context to the title.
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
-      await waitForPaneTitle(session, `fx · generate the release notes · ${model}`, 5_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, title, 5_000);
+      await expectCleanTitleTranscript(session, title);
 
       await session.sendText("/rename deploy pipeline fix");
       await session.waitForText("renamed: deploy pipeline fix", 10_000);
-      await waitForPaneTitle(session, `fx · deploy pipeline fix · ${model}`, 5_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, title, 5_000);
+      await expectCleanTitleTranscript(session, title);
 
       await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      await expectCleanTitleTranscript(session, title);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
         withFileTypes: true,
@@ -862,7 +886,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
 
-      // Resuming restores both the chosen name and active model context.
+      // Restoring a named session must keep the same version-only title.
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
@@ -877,15 +901,27 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         width: 120,
         height: 32,
         isolated: true,
+        remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      await waitForPaneTitle(session, `fx · deploy pipeline fix · ${model}`, 5_000);
+      await waitForPaneTitle(session, title, 5_000);
+      expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
+      await expectCleanTitleTranscript(session, title);
+
+      await session.sendText("/new");
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, title, 5_000);
+      await expectCleanTitleTranscript(session, title);
 
       await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      await expectCleanTitleTranscript(session, title);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;
-      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
     TEST_TIMEOUT,
   );
@@ -2791,7 +2827,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 32,
       });
       await session.waitForComposer(10_000);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${currentModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle());
 
       const alternateCount = (sequence: string) =>
         countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
@@ -2906,7 +2942,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle());
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/quit");
@@ -3020,7 +3056,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Reasoning effort");
       expect(pane).not.toContain("default");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle());
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
