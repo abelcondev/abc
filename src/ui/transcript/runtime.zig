@@ -2036,10 +2036,10 @@ test "full transcript primary restore repairs resize debt after geometry returns
     runtime.terminal_reset_pending = true;
     try std.testing.expectEqual(FullTranscriptPrimaryRestore.resized, runtime.fullTranscriptPrimaryRestore());
     runtime.full_transcript_content_revision = 8;
-    try std.testing.expectEqual(FullTranscriptPrimaryRestore.changed_resized, runtime.fullTranscriptPrimaryRestore());
+    try std.testing.expectEqual(FullTranscriptPrimaryRestore.resized, runtime.fullTranscriptPrimaryRestore());
 }
 
-test "full transcript primary restore consumes the pending settled resize" {
+test "full transcript resized close queues primary recovery" {
     var runtime = TranscriptRuntime{ .layout = .{
         .rows = 24,
         .cols = 80,
@@ -2065,7 +2065,7 @@ test "full transcript primary restore consumes the pending settled resize" {
 
     try std.testing.expect(!runtime.render_requests.pending_settled_width_reflow);
     try std.testing.expectEqual(@as(?ResizeObservation, null), runtime.pending_resize_observation);
-    try std.testing.expect(!runtime.terminal_reset_pending);
+    try std.testing.expect(runtime.terminal_reset_pending);
     try std.testing.expectEqual(@as(?i32, null), runtime.resize_history_row_delta);
     const invalidations = runtime.render_requests.pendingInvalidations();
     try std.testing.expectEqual(@as(u8, 1), invalidations.len);
@@ -2107,30 +2107,6 @@ test "full transcript opening waits for primary damage and remains cancellable" 
     committed.commit(0, 0, false);
     try std.testing.expect(runtime.requestFullTranscriptOpen());
     try std.testing.expect(runtime.full_transcript_open_request == null);
-}
-
-test "full transcript recovery starts at closest visible entry before a hidden anchor" {
-    const provenance = [_]transcript_blocks.LineProvenance{
-        .{ .entry = .{ .entry_id = 10, .entry_class = .unknown_raw } },
-        .{ .entry = .{ .entry_id = 10, .entry_class = .unknown_raw } },
-        .block_separator,
-        .{ .entry = .{ .entry_id = 14, .entry_class = .tool_status } },
-        .{ .entry = .{ .entry_id = 14, .entry_class = .tool_status } },
-        .{ .entry = .{ .entry_id = 22, .entry_class = .assistant_turn } },
-    };
-
-    try std.testing.expectEqual(
-        @as(?usize, 3),
-        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 18),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, 0),
-        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 10),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, null),
-        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 9),
-    );
 }
 
 test "authoritative lifecycle detail is retained by its compact status entry" {
@@ -4029,7 +4005,6 @@ pub fn renderEntriesToBytes(
 
 pub const FullTranscriptPrimaryRestore = enum {
     changed,
-    changed_resized,
     exact,
     resized,
 };
@@ -4186,7 +4161,6 @@ pub const TranscriptRuntime = struct {
     full_transcript_open_content_revision: ?u64 = null,
     full_transcript_open_cols: u16 = 0,
     full_transcript_open_rows: u16 = 0,
-    full_transcript_primary_recovery_entry_id: ?u32 = null,
     full_transcript_page_load: full_transcript_worker.Load = .{},
     full_transcript_window_load: full_transcript_worker.WindowLoad = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
@@ -6296,7 +6270,6 @@ pub const TranscriptRuntime = struct {
             self.full_transcript_open_content_revision = null;
             self.full_transcript_open_cols = 0;
             self.full_transcript_open_rows = 0;
-            self.full_transcript_primary_recovery_entry_id = null;
             self.resetFullTranscriptPageNavigation();
         }
         self.markTranscriptDirty();
@@ -6310,79 +6283,8 @@ pub const TranscriptRuntime = struct {
         const needs_repair = !same_geometry or
             self.terminal_reset_pending or
             self.resize_history_row_delta != null;
-        if (open_revision != self.full_transcript_content_revision) {
-            return if (needs_repair) .changed_resized else .changed;
-        }
-        return if (needs_repair) .resized else .exact;
-    }
-
-    pub fn prepareRestoredPrimaryTranscriptRecovery(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-    ) !?[]u8 {
-        const anchor_entry_id = self.full_transcript_primary_recovery_entry_id orelse {
-            debug_trace.logf(
-                "full_transcript_cache",
-                "primary recovery unavailable reason=missing_entry_id revision={d}",
-                .{self.full_transcript_content_revision},
-            );
-            return null;
-        };
-        var source = try self.prepareTranscriptSourceWithFocusedEntry(
-            alloc,
-            anchor_entry_id,
-        );
-        defer source.deinit(alloc);
-        try source.ensureLineIndex(alloc);
-        const start_line = source.tracked_entry_start_line orelse
-            fullTranscriptRecoveryPredecessorStartLine(
-                source.line_provenance,
-                anchor_entry_id,
-            ) orelse {
-            debug_trace.logf(
-                "full_transcript_cache",
-                "primary recovery unavailable reason=no_visible_predecessor entry_id={d} revision={d}",
-                .{ anchor_entry_id, self.full_transcript_content_revision },
-            );
-            return null;
-        };
-        if (start_line >= source.transcript_visible_lines.len or
-            source.transcript_visible_lines.len != source.transcript_line_visual_rows.len)
-        {
-            debug_trace.logf(
-                "full_transcript_cache",
-                "primary recovery unavailable reason=line_index entry_id={d} start_line={d} visible_lines={d} visual_rows={d}",
-                .{
-                    anchor_entry_id,
-                    start_line,
-                    source.transcript_visible_lines.len,
-                    source.transcript_line_visual_rows.len,
-                },
-            );
-            return null;
-        }
-
-        const replay = try transcript_painter.prepareResetReplayDocument(
-            self,
-            alloc,
-            source.bytes,
-            source.transcript_visible_lines[start_line..],
-            source.transcript_line_visual_rows[start_line..],
-            source.hard_lines_end_with_newline,
-            self.layout.rows -| self.layout.content_bottom,
-        );
-        defer if (replay.len > 0) alloc.free(replay);
-
-        const clear_visible = "\x1b[0m\x1b[2J\x1b[H";
-        const recovery = try alloc.alloc(u8, clear_visible.len + replay.len);
-        @memcpy(recovery[0..clear_visible.len], clear_visible);
-        @memcpy(recovery[clear_visible.len..], replay);
-        debug_trace.logf(
-            "full_transcript_cache",
-            "primary recovery prepared entry_id={d} start_line={d} total_lines={d} bytes={d}",
-            .{ anchor_entry_id, start_line, source.transcript_visible_lines.len, recovery.len },
-        );
-        return recovery;
+        if (needs_repair) return .resized;
+        return if (open_revision != self.full_transcript_content_revision) .changed else .exact;
     }
 
     pub fn retainRestoredPrimaryTranscript(self: *TranscriptRuntime) void {
@@ -6397,13 +6299,13 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn repaintRestoredPrimaryTranscriptAfterResize(self: *TranscriptRuntime) void {
-        self.terminal_reset_pending = false;
+        self.terminal_reset_pending = true;
         self.resize_history_row_delta = null;
         self.pending_resize_observation = null;
         self.render_requests.acknowledgeSettledResizeCommit();
         self.invalidateTranscriptAnchor("full transcript restored resized primary");
-        // The terminal may reflow its saved primary grid differently from the shadow.
-        // Repaint owned cells without erasing the primary scrollback.
+        // A visible-band repaint can discard rows displaced by terminal reflow.
+        // Rebuild them through normal resize recovery after restoring the primary screen.
         if (self.layout.rows > 0) {
             self.render_requests.requestInvalidation(.{
                 .reason = .external_clear,
@@ -6421,8 +6323,6 @@ pub const TranscriptRuntime = struct {
     fn captureFullTranscriptAnchor(self: *TranscriptRuntime, alloc: Allocator) !void {
         _ = alloc;
         self.full_transcript = self.full_transcript.clear_anchor();
-        const fallback_recovery_entry_id = self.primaryRecoveryFallbackEntryId();
-        self.full_transcript_primary_recovery_entry_id = fallback_recovery_entry_id;
         const selection = self.last_viewport_selection orelse return;
         const provenance = self.committedRowProvenance();
         var source: ?transcript_blocks.LineProvenance = null;
@@ -6440,39 +6340,7 @@ pub const TranscriptRuntime = struct {
             self.detailEntryIdForCommandOutputSource(entry_id) orelse entry_id
         else
             null;
-        self.full_transcript_primary_recovery_entry_id =
-            source_entry_id orelse fallback_recovery_entry_id;
         self.full_transcript = self.full_transcript.capture_anchor(anchor_entry_id);
-    }
-
-    fn primaryRecoveryFallbackEntryId(self: *const TranscriptRuntime) ?u32 {
-        if (self.entries.items.len == 0) return null;
-        const retained_entries = @min(
-            self.entries.items.len,
-            @max(@as(usize, self.layout.rows), 1),
-        );
-        return self.entries.items[self.entries.items.len - retained_entries].id();
-    }
-
-    fn fullTranscriptRecoveryPredecessorStartLine(
-        provenance: []const transcript_blocks.LineProvenance,
-        target_entry_id: u32,
-    ) ?usize {
-        var candidate_entry_id: ?u32 = null;
-        var candidate_start_line: ?usize = null;
-        for (provenance, 0..) |source, line_index| {
-            const entry_id = switch (source) {
-                .entry => |entry| entry.entry_id,
-                .folded_command_output => |output| output.entry_id orelse continue,
-                else => continue,
-            };
-            if (entry_id > target_entry_id) continue;
-            if (candidate_entry_id == null or entry_id > candidate_entry_id.?) {
-                candidate_entry_id = entry_id;
-                candidate_start_line = line_index;
-            }
-        }
-        return candidate_start_line;
     }
 
     pub fn fullTranscriptActive(self: *const TranscriptRuntime) bool {
