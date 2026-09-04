@@ -900,6 +900,7 @@ async function runCodexLoginWithBrowser(
 
 function startFakeCodexToolLoop(options: {
   responses?: Response[];
+  model?: string;
   toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
@@ -921,7 +922,7 @@ function startFakeCodexToolLoop(options: {
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: inputModalities, context_window: 272000 },
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
-        ] });
+        ].map((model, index) => index === 0 && options.model ? { ...model, slug: options.model } : model) });
       }
       bodies.push(await request.text());
       if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
@@ -993,6 +994,7 @@ function startFakeCodexCapacityLoop() {
 
 function startFakeGrokToolLoop(options: {
   responses?: Response[];
+  model?: string;
   toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
@@ -1009,10 +1011,10 @@ function startFakeGrokToolLoop(options: {
     async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
-        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 1_000_000)] });
+        return Response.json({ data: [grokSubscriptionModel(options.model ?? "grok-4.20", 1_000_000)] });
       }
       if (path === "/modalities") {
-        return Response.json({ models: [grokModalityModel("grok-4.20", true)] });
+        return Response.json({ models: [grokModalityModel(options.model ?? "grok-4.20", true)] });
       }
       bodies.push(await request.text());
       if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
@@ -4385,11 +4387,11 @@ for (const conflict of [false, true]) {
       responses.push(fakeGatewaySse(events), fakeGatewaySse([
         { type: "response.output_text.delta", delta: "FINAL_RECORD_OK" }, completed,
       ]));
-      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses }) : startFakeGrokToolLoop({ responses });
+      const model = "fixture-model";
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
       try {
         if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
         else writeSeededGrokLogin(profile, direct.accessToken);
-        const model = provider === "codex" ? "gpt-5.6-sol" : "grok-4.20";
         writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
         const env = {
           HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
