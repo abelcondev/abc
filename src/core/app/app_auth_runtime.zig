@@ -98,33 +98,47 @@ pub fn Runtime(comptime App: type) type {
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
-                const required_source: credentials.Source = switch (provider) {
-                    .codex => .chatgpt_subscription,
-                    .grok => .grok_subscription,
-                    .gateway => app.auth.credentialSource() orelse .fx_login,
-                };
-                const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => return recoverCredentialFailure(app, required_source, err),
-                };
-                if (route_change) |changed| {
-                    applyCredentialChange(app, changed);
-                } else if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = if (provider == .grok)
-                            credentials.missing_grok_interactive_credential_message
-                        else if (provider == .codex)
-                            credentials.missing_chatgpt_interactive_credential_message
-                        else
-                            credentials.missing_interactive_credential_message,
-                    }, true);
-                    app.shell.render_requests.request(.footer);
-                    return false;
+                if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
+                    var preferred: ?credentials.Source = null;
+                    if (provider == .gateway and !host_target.is_wasm) {
+                        var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            debug_trace.logf("auth", "prompt credential preference load failed err={s}", .{@errorName(err)});
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .@"error",
+                                .body = "Could not load authentication settings. Check user settings, then press Enter to retry.",
+                            });
+                            return false;
+                        };
+                        defer settings.deinit(app.alloc);
+                        preferred = settings.credential_source;
+                    }
+                    switch (try app.auth.selectForProvider(app.alloc, provider, preferred)) {
+                        .selected => applyCredentialChange(app, true),
+                        .unchanged => {},
+                        .failed => |failure| return recoverCredentialFailure(app, failure.source, failure.err),
+                        .missing => return missingPromptCredential(app, provider),
+                    }
                 }
             }
             if (app.auth.credentialSource() != null) return true;
+            return missingPromptCredential(app, .gateway);
+        }
+
+        fn missingPromptCredential(app: *App, provider: model_provider.ProviderId) !bool {
+            if (provider != .gateway) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = if (provider == .grok)
+                        credentials.missing_grok_interactive_credential_message
+                    else
+                        credentials.missing_chatgpt_interactive_credential_message,
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
 
             const auth_view = app.auth.view();
             if (auth_view.onboarding_skipped) {
@@ -1494,6 +1508,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime host_target.is_wasm) {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
+            if (!try ensurePromptCredential(app)) return .rejected;
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (!failure.retryable()) {
@@ -1611,7 +1626,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .invalid_storage => std.fmt.allocPrint(
                     alloc,
-                    "{s} saved sign-in is unreadable.\nCheck credential storage, then press Enter to retry. Your prompt is saved.",
+                    "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press Enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
                 .persistence_uncertain => std.fmt.allocPrint(

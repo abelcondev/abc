@@ -6018,6 +6018,18 @@ describe("acp: model-independent", () => {
           message: "Prompt already in progress",
         });
 
+        client.send({
+          jsonrpc: "2.0",
+          id: 98,
+          method: "session/set_config_option",
+          params: { configId: "provider", value: "codex" },
+        });
+        const providerChange = await readResponse(client, 98);
+        expect(providerChange.error).toEqual({
+          code: -32600,
+          message: "Prompt already in progress",
+        });
+
         heldResponse.resolve(finalText("held prompt complete"));
         const prompt = await readResponse(client, 96);
         expect(prompt.error).toBeUndefined();
@@ -8177,6 +8189,78 @@ describe("acp: model catalog authentication", () => {
     },
     TIMEOUT,
   );
+
+  for (const provider of ["codex", "grok"] as const) {
+    for (const transition of ["cancel", "load", "resume"] as const) {
+      test(`provider selection after session/${transition} activates ${provider}`, async () => {
+        const root = createIsolatedRoot("fx-acp-recovery-");
+        const gateway = startFakeGateway([]);
+        const codex = startAcpFakeCodex();
+        const grok = startAcpFakeGrok();
+        writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+        writeSeededAcpGrokLogin(root.home, grok.accessToken);
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: {
+              ...fakeGatewayEnv(root, gateway),
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_SOUND: "0",
+              FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+              FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+              FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+              FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+              FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+              FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+              FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
+              FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
+            },
+          });
+          const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+          expect(initialized.error).toBeUndefined();
+          const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+          expect(created.error).toBeUndefined();
+          const transitioned = await client.request(`session/${transition}`, {
+            sessionId: created.result.sessionId,
+            ...(transition === "cancel" ? {} : { cwd: root.workspace, mcpServers: [] }),
+          }, 3) as any;
+          expect(transitioned.error).toBeUndefined();
+
+          const changed = await client.request("session/set_config_option", {
+            configId: "provider",
+            value: provider,
+          }, 4) as any;
+          expect(changed.error).toBeUndefined();
+          expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+            .toBe(provider);
+          const selected = provider === "codex" ? codex : grok;
+          const other = provider === "codex" ? grok : codex;
+          expect(selected.modelRequests.filter((request) => request.path === "/models")).toHaveLength(1);
+          expect(other.modelRequests).toHaveLength(0);
+
+          const prompt = await runPrompt(client, "Answer after changing providers.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(JSON.stringify(prompt.messages)).toContain(
+            provider === "codex" ? "ACP_CHATGPT_RESPONSE" : "ACP_GROK_RESPONSE",
+          );
+          expect(selected.requests).toHaveLength(1);
+          expect(selected.requests[0]!.authorization).toBe(`Bearer ${selected.accessToken}`);
+          expect(selected.tokenRequests).toHaveLength(0);
+          expect(other.requests).toHaveLength(0);
+          expect(gateway.requests).toHaveLength(0);
+          client.endStdin();
+          expect(await client.waitForExit()).toBe(0);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          codex.stop();
+          grok.stop();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }, TIMEOUT);
+    }
+  }
 
   test("an open ACP connection refreshes subscription model options before selection", async () => {
     const root = createIsolatedRoot("fx-acp-catalog-refresh-");

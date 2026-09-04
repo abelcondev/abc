@@ -1209,6 +1209,153 @@ function startFakeGrokResourceRecovery() {
   };
 }
 
+for (const provider of ["gateway", "codex", "grok"] as const) {
+  tmuxTest(`pending ${provider} prompt retries repaired credential storage without changing accounts`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-prompt-storage-retry-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_STORAGE_RECOVERED")]);
+    oauth = startFakeOAuth("unused-token");
+    chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: 0 });
+    const grok = startFakeGrokOAuth({ unauthorizedResponses: 0 });
+    try {
+      writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+      writeSeededChatGptLogin(home);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider,
+        credential_source: "fx_login",
+        models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" },
+      }));
+      const name = provider === "gateway" ? "auth.json" : provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
+      const alias = join(home, "auth.alias");
+      linkSync(join(home, ".fx", name), alias);
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        FX_MODEL: undefined,
+        ...chatgptOauth.env,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const prompt = `STORAGE_RETRY_${provider}`;
+      await session.sendText(prompt);
+      await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("Auth:"), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
+      expect(gateway.requests).toHaveLength(0);
+      expect(oauth.requests).toHaveLength(0);
+      expect(chatgptOauth.requests).toHaveLength(0);
+      expect(grok.requests).toHaveLength(0);
+
+      unlinkSync(alias);
+      await session.sendKeys("Enter");
+      await session.waitForText(provider === "gateway" ? "GATEWAY_STORAGE_RECOVERED" : provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+      const requests = provider === "gateway" ? gateway.requests : provider === "codex"
+        ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
+        : grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(requests).toHaveLength(1);
+      expect(JSON.stringify(requests[0]!.body)).toContain(prompt);
+      if (provider === "gateway") {
+        expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+      } else {
+        expect(gateway.requests).toHaveLength(0);
+      }
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, TIMEOUT);
+}
+
+tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaired login", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-prompt-preference-retry-"));
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  const settingsPath = join(home, ".fx", "settings.json");
+  const settings = JSON.stringify({ provider: "gateway", credential_source: "fx_login", models: { gateway: FAKE_GATEWAY_MODEL } });
+  writeFileSync(settingsPath, settings);
+  stderrPath = join(home, "stderr.log");
+  gateway = startFakeGateway([fakeGatewayFinalText("PREFERENCE_REPAIRED")]);
+  oauth = startFakeOAuth("unused-token");
+  session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { FX_MODEL: undefined });
+  await session.waitForComposer(TIMEOUT);
+  writeFileSync(settingsPath, "not-json");
+  await session.sendText("PREFERENCE_RETRY_PROMPT");
+  await session.waitForText("Could not load authentication settings", TIMEOUT);
+  expect(gateway.requests).toHaveLength(0);
+
+  writeFileSync(settingsPath, settings);
+  await session.sendKeys("Enter");
+  await session.waitForPane(
+    (pane) => pane.lastIndexOf("fx needs access to Vercel AI Gateway") > pane.lastIndexOf("Could not load authentication settings"),
+    TIMEOUT,
+  );
+  expect(gateway.requests).toHaveLength(0);
+  writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+  await session.sendKeys("Enter");
+  await session.waitForText("PREFERENCE_REPAIRED", TIMEOUT);
+  expect(gateway.requests).toHaveLength(1);
+  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("PREFERENCE_RETRY_PROMPT");
+  expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+  expect(oauth.requests).toHaveLength(0);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
+
+test("Vercel CLI keeps an issuer authorization denial distinct from persistence failure", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-vercel-authorization-denied-"));
+  oauth = startFakeOAuth("unused-token", undefined, 3600, Number.POSITIVE_INFINITY, {
+    deviceError: "access_denied",
+    rejectAllDeviceClients: true,
+  });
+  const result = await runFx(["login", "vercel"], { env: {
+    HOME: home,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+  }, timeoutMs: TIMEOUT });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("authorization denied");
+  expect(result.stderr).not.toContain("Credential could not be saved");
+  expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+  expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+}, TIMEOUT);
+
+test("Vercel CLI reports a post-authorization save failure without claiming authorization was denied", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-vercel-save-failure-"));
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth("new-token", undefined, 3600, Number.POSITIVE_INFINITY, {
+    tokenDelayMs: 300,
+    teams: [{ id: "team_fixture", slug: "fixture", name: "Fixture" }],
+  });
+  writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+  const authPath = join(home, ".fx", "auth.json");
+  const previous = readFileSync(authPath, "utf8");
+  const login = runFx(["login", "vercel"], { env: {
+    HOME: home,
+    AI_GATEWAY_API_KEY: ENV_TOKEN,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  }, timeoutMs: TIMEOUT });
+  const deadline = Date.now() + 10_000;
+  while (!oauth.requests.some((request) => request.path === "/oauth/token") && Date.now() < deadline) await Bun.sleep(5);
+  expect(oauth.requests.some((request) => request.path === "/oauth/token")).toBe(true);
+  chmodSync(authPath, 0o400);
+  const result = await login;
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("Credential could not be saved");
+  expect(result.stderr).not.toContain("authorization denied");
+  expect(result.stdout).not.toContain("Signed in");
+  expect(readFileSync(authPath, "utf8")).toBe(previous);
+  expect(gateway.requests).toHaveLength(0);
+}, TIMEOUT);
+
 tmuxTest(
   "malformed sessions and read-only locks never become missing authentication",
   async () => {
