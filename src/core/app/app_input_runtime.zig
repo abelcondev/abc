@@ -1851,7 +1851,9 @@ pub fn Runtime(comptime App: type) type {
                     mcpMenuProjection(app).itemCount() > 0)
                 {
                     _ = applyMcpMenuEvent(app, .show_details);
-                } else if (state.screen == .browse and state.section != .servers) {
+                } else if (state.screen == .browse and state.section != .servers and
+                    mcpMenuProjection(app).itemCount() > 0)
+                {
                     if (try app.mcp.prepareMenuArguments(app.alloc)) {
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                         app.shell.render_requests.request(.footer);

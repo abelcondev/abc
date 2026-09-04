@@ -4450,6 +4450,35 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(!tmuxAvailable())(
+    "empty MCP catalogs ignore Enter and preserve menu navigation",
+    async () => {
+      const root = createRoot("tui-empty-catalog", LEGACY_FIXTURE, {});
+      gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, env: fixtureEnv(root, gateway) });
+      await tui.waitForComposer(5_000);
+      await tui.sendText("/mcp");
+      await tui.waitForText("[Servers]", 5_000);
+      await tui.sendKeys("Right");
+      await tui.waitForText("[Tools]", 5_000);
+      for (const [section, empty] of [["Resources", "No MCP resources available."], ["Prompts", "No MCP prompts available."]]) {
+        await tui.sendKeys("Right");
+        await tui.waitForText(empty!, 5_000);
+        await tui.sendKeys("Enter");
+        await Bun.sleep(100);
+        const pane = await tui.capturePane();
+        expect(pane).toContain(`[${section}]`);
+        expect(pane).toContain(empty!);
+        expect(pane).not.toContain("MCP operation failed");
+      }
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Prompts]"), 2_000);
+      await tui.sendText("/mcp auth");
+      await tui.waitForText("/mcp auth <name> [--open]", 2_000);
+    },
+    20_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "the TUI cancels a stalled stdio request and accepts a follow-up prompt",
     async () => {
       const root = createRoot("tui-cancel", MODERN_FIXTURE, {
