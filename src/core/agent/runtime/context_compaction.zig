@@ -358,10 +358,6 @@ fn runSummaryCall(
         .content = summarySystemPrompt(),
     }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = source_text }};
-    var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
-    defer capture.deinit();
-    var delivery = runtime_gateway_step.DeliveryCertainty.init();
-    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(provider_timeout_ms),
@@ -375,61 +371,70 @@ fn runSummaryCall(
             .account_id = request.account_id,
             .tenant_context = request.gateway_team,
         } };
-    var streamed = try runtime_gateway_step.streamModelCompletion(
-        request.stream_provider,
-        alloc,
-        .{
-            .credential = credential,
-            .session_id = request.session_id,
-            .model = request.model,
-            .retry_count = request.retry_count,
-            .instructions = &instructions,
-            .messages = &messages,
-            .tools = .{},
-            .tool_choice = .none,
-            .provider_options = request.provider_options,
-            .max_output_tokens = @intCast(@min(generation_tokens, std.math.maxInt(u32))),
-            .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
-            .deadline = deadline,
-            .content_capture_limit = max_bytes,
-            .delivery = &delivery,
-            .attempt_evidence = &attempt_evidence,
-            .events = .{ .context = &capture, .emit_fn = onEvent },
-            .admission = .{},
-            .cancel_flag = request.cancel_flag,
-            .trace_ctx = request.trace_ctx,
-        },
-        request.usage,
-        request.usage_allocator,
-    );
-    defer streamed.deinit(alloc);
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const completion = switch (streamed) {
-        .failed => return error.ContextCompactionUnavailable,
-        .completed => |completed| completed.completion,
-    };
-    if (completion.finish_reason != .stop) return error.IncompleteCompactionHandoff;
-    if (capture.failed) return error.OutOfMemory;
-    if (!capture.saw_content) {
-        if (completion.content) |content| try capture.append(content);
-    }
-    if (capture.saw_tool_call or completion.tool_calls.len > 0) {
-        return error.CompactionToolCallRejected;
-    }
-    if (capture.observed_bytes > capture.text.items.len) {
-        return error.CompactionHandoffTooLarge;
-    }
-    const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
-    if (trimmed.len == 0 or !std.unicode.utf8ValidateSlice(trimmed)) {
-        return error.InvalidCompactionHandoff;
-    }
-    return .{
-        .text = try alloc.dupe(u8, trimmed),
-        .usage = .{
+    var usage: types.ToolUsage = .{};
+    for (0..2) |attempt| {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
+        defer capture.deinit();
+        var delivery = runtime_gateway_step.DeliveryCertainty.init();
+        var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
+        var streamed = try runtime_gateway_step.streamModelCompletion(
+            request.stream_provider,
+            alloc,
+            .{
+                .credential = credential,
+                .session_id = request.session_id,
+                .model = request.model,
+                .retry_count = if (attempt == 0) request.retry_count else 1,
+                .instructions = &instructions,
+                .messages = &messages,
+                .tools = .{},
+                .tool_choice = .none,
+                .provider_options = request.provider_options,
+                .max_output_tokens = @intCast(@min(generation_tokens, std.math.maxInt(u32))),
+                .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
+                .deadline = deadline,
+                .content_capture_limit = max_bytes,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &capture, .emit_fn = onEvent },
+                .admission = .{},
+                .cancel_flag = request.cancel_flag,
+                .trace_ctx = request.trace_ctx,
+            },
+            request.usage,
+            request.usage_allocator,
+        );
+        defer streamed.deinit(alloc);
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const completion = switch (streamed) {
+            .failed => return error.ContextCompactionUnavailable,
+            .completed => |completed| completed.completion,
+        };
+        addUsage(&usage, .{
             .input_tokens = completion.usage.input_tokens orelse 0,
             .output_tokens = completion.usage.output_tokens orelse 0,
-        },
-    };
+        });
+        if (completion.finish_reason != .stop) return error.IncompleteCompactionHandoff;
+        if (capture.failed) return error.OutOfMemory;
+        if (!capture.saw_content) {
+            if (completion.content) |content| try capture.append(content);
+        }
+        if (capture.saw_tool_call or completion.tool_calls.len > 0) {
+            return error.CompactionToolCallRejected;
+        }
+        if (capture.observed_bytes > capture.text.items.len) {
+            return error.CompactionHandoffTooLarge;
+        }
+        const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
+        if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidCompactionHandoff;
+        if (trimmed.len == 0) {
+            if (attempt == 0) debug_trace.eventf("context_compaction", "empty_summary_retry", request.trace_ctx, "attempt=2 model={s}", .{request.model});
+            continue;
+        }
+        return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
+    }
+    return error.InvalidCompactionHandoff;
 }
 
 fn addUsage(total: *types.ToolUsage, item: types.ToolUsage) void {
@@ -479,6 +484,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 
 const FakeProvider = struct {
     response: []const u8,
+    retry_response: ?[]const u8 = null,
     finish_reason: types.ProviderFinishReason = .stop,
     emit_tool_call: bool = false,
     cancel: bool = false,
@@ -492,6 +498,11 @@ const FakeProvider = struct {
     observed_model: ?[]const u8 = null,
     observed_credential_source: ?types.CredentialSource = null,
     observed_secret: ?[]const u8 = null,
+    observed_deadline: ?std.Io.Clock.Timestamp = null,
+    observed_source_hash: ?u64 = null,
+    same_deadline: bool = true,
+    same_source: bool = true,
+    retry_counts: [2]usize = .{ std.math.maxInt(usize), std.math.maxInt(usize) },
 
     fn provider(self: *FakeProvider) agent_stream_provider.Provider {
         return .{ .context = self, .stream_fn = stream };
@@ -503,7 +514,15 @@ const FakeProvider = struct {
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
         const self: *FakeProvider = @ptrCast(@alignCast(raw.?));
+        if (self.request_count < self.retry_counts.len) self.retry_counts[self.request_count] = request.retry_count;
         self.request_count += 1;
+        if (self.request_count == 1) {
+            self.observed_deadline = request.deadline;
+            self.observed_source_hash = std.hash.Wyhash.hash(0, request.messages[0].content orelse "");
+        } else {
+            self.same_deadline = self.same_deadline and std.meta.eql(self.observed_deadline, request.deadline);
+            self.same_source = self.same_source and self.observed_source_hash.? == std.hash.Wyhash.hash(0, request.messages[0].content orelse "");
+        }
         self.saw_no_tools = self.saw_no_tools or
             (request.tools.advertised_names.len == 0 and
                 request.tools.advertised_functions.len == 0 and
@@ -529,13 +548,14 @@ const FakeProvider = struct {
         self.observed_secret = request.credential.secret();
         try request.admission.admit();
         request.delivery.markPossiblySent();
-        request.events.emit(.{ .content_delta = self.response });
+        const response = if (self.request_count > 1) self.retry_response orelse self.response else self.response;
+        request.events.emit(.{ .content_delta = response });
         if (self.emit_tool_call) {
             request.events.emit(.{ .tool_started = .{ .id = "call-1", .name = "read_file" } });
         }
         if (self.cancel) request.cancel_flag.store(true, .seq_cst);
         return .{ .completed = .{ .completion = .{
-            .content = self.response,
+            .content = response,
             .finish_reason = self.finish_reason,
             .usage = .{ .input_tokens = 30, .output_tokens = 12 },
         } } };
@@ -544,6 +564,78 @@ const FakeProvider = struct {
 
 test "compaction result exposes only caller-consumed state" {
     try std.testing.expect(!@hasField(Result, "usage"));
+}
+
+test "empty summary recovery preserves the source model deadline and usage" {
+    for ([_][]const u8{ "", " \n\t " }) |empty| {
+        var provider = FakeProvider{ .response = empty, .retry_response = "The recorded command completed." };
+        var cancel = std.atomic.Value(bool).init(false);
+        const result = try runSummaryCall(std.testing.allocator, .{
+            .stream_provider = provider.provider(),
+            .model = "working-model",
+            .api_key = "test-key",
+            .retry_count = 3,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 256,
+            .generation_tokens = 128,
+            .trace_ctx = .{},
+        }, "Preserve this completed command.", 128, 1024);
+        defer std.testing.allocator.free(result.text);
+        try std.testing.expectEqualStrings("The recorded command completed.", result.text);
+        try std.testing.expectEqual(@as(usize, 2), provider.request_count);
+        try std.testing.expectEqualSlices(usize, &.{ 3, 1 }, &provider.retry_counts);
+        try std.testing.expect(provider.same_source and provider.same_deadline and provider.saw_deadline);
+        try std.testing.expect(provider.saw_no_tools and provider.saw_only_summary_prompt);
+        try std.testing.expectEqualStrings("working-model", provider.observed_model.?);
+        try std.testing.expectEqual(@as(u64, 60), result.usage.input_tokens);
+        try std.testing.expectEqual(@as(u64, 24), result.usage.output_tokens);
+    }
+}
+
+test "empty summary recovery stops after two empty replies" {
+    var provider = FakeProvider{ .response = "" };
+    var cancel = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(error.InvalidCompactionHandoff, runSummaryCall(std.testing.allocator, .{
+        .stream_provider = provider.provider(),
+        .model = "working-model",
+        .api_key = "test-key",
+        .retry_count = 0,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 256,
+        .generation_tokens = 128,
+        .trace_ctx = .{},
+    }, "Preserve the original conversation.", 128, 1024));
+    try std.testing.expectEqual(@as(usize, 2), provider.request_count);
+}
+
+test "empty summary recovery does not retry cancelled or invalid responses" {
+    const cases = [_]struct {
+        response: []const u8,
+        cancel: bool = false,
+        tool_call: bool = false,
+        finish_reason: types.ProviderFinishReason = .stop,
+        expected: error{ Cancelled, InvalidCompactionHandoff, IncompleteCompactionHandoff, CompactionToolCallRejected },
+    }{
+        .{ .response = "", .cancel = true, .expected = error.Cancelled },
+        .{ .response = "\xff", .expected = error.InvalidCompactionHandoff },
+        .{ .response = "", .finish_reason = .length, .expected = error.IncompleteCompactionHandoff },
+        .{ .response = "", .tool_call = true, .expected = error.CompactionToolCallRejected },
+    };
+    for (cases) |case| {
+        var provider = FakeProvider{ .response = case.response, .cancel = case.cancel, .emit_tool_call = case.tool_call, .finish_reason = case.finish_reason };
+        var cancel = std.atomic.Value(bool).init(false);
+        try std.testing.expectError(case.expected, runSummaryCall(std.testing.allocator, .{
+            .stream_provider = provider.provider(),
+            .model = "working-model",
+            .api_key = "test-key",
+            .retry_count = 0,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 256,
+            .generation_tokens = 128,
+            .trace_ctx = .{},
+        }, "Preserve the original conversation.", 128, 1024));
+        try std.testing.expectEqual(@as(usize, 1), provider.request_count);
+    }
 }
 
 test "host-managed compaction carries authority without secret bytes" {

@@ -2571,7 +2571,8 @@ fn dupeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) !FileEvidence 
     };
 }
 
-fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
+/// Frees one entry's owned strings, not its containing slice.
+pub fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
     alloc.free(file.path);
     if (file.new_path) |new_path| alloc.free(new_path);
     alloc.free(file.tool_call_id);
