@@ -117,14 +117,14 @@ pub const RetainedContext = struct {
 };
 
 /// Selects complete execution steps. Payloads are measured, never shortened.
-pub fn selectRecentContext(history: []const HistoryTurn, target: usize) RetainedContext {
+pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize) RetainedContext {
     var raw_count = session_runtime.rawHistoryTurnCount(history);
     var selected = types.ContextHistoryCut{ .turns = raw_count };
     var total: usize = 0;
     var newest: usize = 0;
     var selected_any = false;
     var index = history.len;
-    while (index > 0) {
+    history_scan: while (index > 0) {
         index -= 1;
         const turn = history[index];
         if (turn == .compacted_summary) continue;
@@ -152,6 +152,9 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize) Retained
                 base +|= textTokens(entry.text);
                 if (entry.assistant_prefix) |prefix| base +|= textTokens(prefix);
             }
+            if (input_capacity) |capacity| {
+                if (!selected_any and base >= capacity) break :history_scan;
+            }
             if (selected_any and (raw_count == 0 or total +| base > target)) break;
             total +|= base;
             selected = .{ .turns = raw_count };
@@ -167,6 +170,9 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize) Retained
                 next_steering -= 1;
                 cost +|= textTokens(execution.steering[next_steering].text);
                 if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
+            }
+            if (input_capacity) |capacity| {
+                if (!selected_any and cost >= capacity) break :history_scan;
             }
             if (selected_any and ((raw_count == 0 and step_index == 0) or total +| cost > target)) return .{
                 .cut = selected,
@@ -660,10 +666,16 @@ test "retained context selects whole parallel tool exchanges without shortening 
         .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
         .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
     };
-    const selected = selectRecentContext(&history, 5000);
+    const selected = selectRecentContext(&history, 5000, null);
     try std.testing.expectEqual(@as(usize, 1), selected.cut.turns);
     try std.testing.expectEqual(@as(usize, 1), selected.cut.tool_steps);
     try std.testing.expect(selected.newest_exchange_tokens > 5000);
+    try std.testing.expectEqualStrings(body, results[0].output);
+    try std.testing.expectEqualStrings(body, results[1].output);
+    const over_capacity = selectRecentContext(&history, 5000, 10_000);
+    try std.testing.expectEqual(@as(usize, 2), over_capacity.cut.turns);
+    try std.testing.expectEqual(@as(usize, 0), over_capacity.cut.tool_steps);
+    try std.testing.expectEqual(@as(usize, 0), over_capacity.estimated_tokens);
     try std.testing.expectEqualStrings(body, results[0].output);
     try std.testing.expectEqualStrings(body, results[1].output);
 }

@@ -4643,8 +4643,21 @@ pub fn prepareRetainedCompactionWindow(
     var combined: std.ArrayList(HistoryTurn) = .empty;
     try combined.appendSlice(arena, history);
     if (active) |turn| try combined.append(arena, .{ .assistant = turn });
-    const selection = runtime_prompt_context.selectRecentContext(combined.items, runtime_prompt_context.recentContextTarget(capabilities, source_tokens));
-    const older = try session_runtime.contextHistoryRange(arena, combined.items, .{}, selection.cut);
+    const selection = runtime_prompt_context.selectRecentContext(
+        combined.items,
+        runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
+        runtime_prompt_context.usableInputTokens(capabilities),
+    );
+    var cut = selection.cut;
+    if (active) |turn| {
+        const active_index = session_runtime.rawHistoryTurnCount(history);
+        if (cut.turns > active_index) cut = .{
+            .turns = active_index,
+            .tool_steps = turn.execution.tool_steps.len,
+            .steering = turn.execution.steering.len,
+        };
+    }
+    const older = try session_runtime.contextHistoryRange(arena, combined.items, .{}, cut);
     var source: std.ArrayList(ChatMessage) = .empty;
     var index = history.len;
     while (index > 0 and older.len > 0) {
@@ -4655,16 +4668,44 @@ pub fn prepareRetainedCompactionWindow(
         }
     }
     try session_runtime.appendHistoryChatMessages(arena, &source, older);
-    const retained = try session_runtime.contextHistoryRange(arena, history, selection.cut, null);
+    const retained = try session_runtime.contextHistoryRange(arena, history, cut, null);
     var messages: std.ArrayList(ChatMessage) = .empty;
     try session_runtime.appendHistoryChatMessages(arena, &messages, retained);
     return .{
         .source = source.items,
         .retained_history = retained,
         .retained_messages = messages.items,
-        .cut = selection.cut,
+        .cut = cut,
         .newest_exchange_tokens = selection.newest_exchange_tokens,
     };
+}
+
+test "retained context ends an unfinished turn at its completed exchange" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const calls = [_]types.ToolCall{.{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("large-write"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("written"),
+        .output_bytes = 7,
+        .stored_output_bytes = 7,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("write once") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    };
+    const capabilities = model_capabilities.Capabilities{ .context_window = 4_000 };
+    const active = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{}, turn, capabilities, 9_000);
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, active.cut);
+    try std.testing.expectEqual(@as(usize, 3), active.source.len);
+    try std.testing.expectEqual(@as(usize, 0), active.retained_messages.len);
+    const saved = try prepareRetainedCompactionWindow(arena_state.allocator(), &.{.{ .assistant = turn }}, null, capabilities, 9_000);
+    try std.testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
+    try std.testing.expectEqual(@as(usize, 0), saved.retained_messages.len);
 }
 
 /// Builds arena-owned fixed request inputs for manual compaction without
