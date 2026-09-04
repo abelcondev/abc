@@ -103,6 +103,8 @@ Run `/trace` to create a private Markdown diagnostic with logs, session context,
 
 fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt.
 
+Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries or operation ledgers.
+
 Use `fx ask` for a single request:
 
 ```bash

@@ -3396,15 +3396,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             for (history) |turn| {
                 switch (turn) {
-                    .compacted_summary => |entry| {
-                        const text = try session_runtime.formatCompactedContinuationMessage(app.alloc, entry.summary);
-                        defer app.alloc.free(text);
-                        try sink.appendNotice(.{
-                            .topic = "session",
-                            .tone = .neutral,
-                            .body = text,
-                        });
-                    },
+                    .compacted_summary => {},
                     .assistant => |entry| {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
@@ -7869,6 +7861,48 @@ test "cancelled durable terminal action preserves exec metadata" {
     const pending = app.session_persistence.pending_cancelled_command orelse
         return error.TestExpectedEqual;
     try std.testing.expect(pending.matches(exec_id));
+}
+
+test "history replay keeps compaction handoffs internal" {
+    const alloc = std.testing.allocator;
+    const summaries = [_][]const u8{
+        "",
+        "PRIVATE_LEGACY_SUMMARY",
+        "<context_handoff>\n## Authoritative continuation state\n" ++
+            "- operation sequence=507 call_id=PRIVATE_CALL result_handle=PRIVATE_RESULT\n" ++
+            "## Conversation summary\nPRIVATE_SUMMARY\n</context_handoff>",
+    };
+    for (summaries) |summary| {
+        var app = try TestApp.init(alloc, "/workspace");
+        defer app.deinit();
+        const history = [_]types.HistoryTurn{
+            .{ .compacted_summary = .{ .summary = @constCast(summary), .removed_turn_count = 1, .compaction_count = 1 } },
+            .{ .assistant = .{
+                .user = .{ .text = @constCast("Visible request") },
+                .assistant = @constCast("Visible response"),
+            } },
+            .{ .compacted_summary = .{ .summary = @constCast(summary), .removed_turn_count = 1, .compaction_count = 2 } },
+        };
+
+        try Runtime(TestApp).replayHistory(&app, &history);
+
+        try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
+        try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
+        try std.testing.expectEqualStrings("Visible request", app.cards.items[0].text);
+        try std.testing.expect(!app.cards.items[0].has_prior_turns);
+        try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "Visible response") != null);
+        try std.testing.expect(std.mem.find(u8, app.transcript.items, "PRIVATE_") == null);
+        try std.testing.expect(std.mem.find(u8, app.transcript.items, "context_handoff") == null);
+        try std.testing.expectEqualStrings(summary, history[0].compacted_summary.summary);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var messages: std.ArrayList(types.ChatMessage) = .empty;
+        try session_runtime.appendHistoryChatMessages(arena.allocator(), &messages, &history);
+        try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+        try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, summary) != null);
+        try std.testing.expect(std.mem.find(u8, messages.items[3].content.?, summary) != null);
+    }
 }
 
 test "zero-output cancelled command restores detail without an output block" {
