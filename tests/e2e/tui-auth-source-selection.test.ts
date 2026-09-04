@@ -1643,6 +1643,57 @@ tmuxTest(
   60_000,
 );
 
+for (const command of ["/provider", "/login", "/setup"]) {
+  tmuxTest(`provider picker retains type-ahead after ${command} Enter`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-typeahead-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+
+    await session.sendLiteral(`${command}\rcodex`);
+    const prefix = command === "/login" ? "/login" : "/provider";
+    await session.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} codex`) && /^\s+codex\s*$/m.test(pane),
+      TIMEOUT,
+    );
+    await session.sendKeys("BSpace");
+    await session.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} code`),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
+    await session.sendLiteral("retained draft");
+    await session.waitForText("retained draft", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
+    expect(await session.captureFullScrollback()).not.toContain("Authorize with Codex");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+}
+
+tmuxTest("provider picker consumes selection keys while inventory is pending", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-pending-"));
+  stderrPath = join(home, "stderr.log");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, chatgptOauth.env);
+  await session.waitForComposer(TIMEOUT);
+
+  await session.sendLiteral("/provider\rco\t\r");
+  await session.waitForPane(
+    (pane) => pane.split("\n").some((line) => line.trim() === "┃ /provider co") && /^\s+codex\s*$/m.test(pane),
+    TIMEOUT,
+  );
+  expect(gateway.requests).toHaveLength(0);
+  expect(chatgptOauth.requests).toHaveLength(0);
+  await session.sendKeys("Tab");
+  await session.waitForText("/provider codex", TIMEOUT);
+  await session.sendKeys("Escape");
+  await session.sendKeys("C-u");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT * 2);
+
 for (const scenario of [
   { name: "bare provider", command: "/provider" },
   { name: "setup alias", command: "/setup" },
