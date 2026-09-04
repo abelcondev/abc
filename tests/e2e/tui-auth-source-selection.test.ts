@@ -1423,11 +1423,14 @@ for (const command of ["/provider", "/login", "/setup"]) {
     await session.sendLiteral(`${command}\rcodex`);
     const prefix = command === "/login" ? "/login" : "/provider";
     await session.waitForPane(
-      (pane) => pane.split("\n").some((line) => line.includes(`┃ ${prefix} codex`)) && /^\s+codex\s*$/m.test(pane),
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} codex`) && /^\s+codex\s*$/m.test(pane),
       TIMEOUT,
     );
     await session.sendKeys("BSpace");
-    await session.waitForText(`${prefix} code`, TIMEOUT);
+    await session.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} code`),
+      TIMEOUT,
+    );
     await session.sendKeys("Escape");
     await session.sendKeys("C-u");
     await session.sendLiteral("retained draft");
