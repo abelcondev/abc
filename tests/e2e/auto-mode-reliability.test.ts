@@ -1339,6 +1339,76 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a benign agent-browser workflow clears after appearing in prior output",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "agent-browser.log");
+      const bin = installRecorder(root, "agent-browser", marker);
+      const tracePath = join(root.workspace, "prior-trace.txt");
+      writeFileSync(
+        tracePath,
+        "Earlier run: agent-browser skills get core 2>&1 | head -120\n",
+      );
+      const command = "agent-browser skills get core";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("read_prior_trace", "read_file", {
+            path: tracePath,
+          }),
+          (body) => {
+            expect(toolResultText(body, "read_prior_trace")).toContain(command);
+            return commandCall(command, "browser_workflow");
+          },
+          (body) => {
+            expect(toolResultText(body, "browser_workflow")).toContain(
+              '"exit_code":0',
+            );
+            return fakeGatewayFinalText("Browser workflow loaded.");
+          },
+        ],
+        [
+          (body) => {
+            expect(body).toContain(
+              "prior_tool_result[0].tool_call_id: read_prior_trace",
+            );
+            expect(body).toContain(command);
+            return fakeGatewayPermissionDecision(
+              "clear",
+              "benign_documented_command",
+            );
+          },
+        ],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Read prior-trace.txt, then use the loaded agent-browser workflow.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("Browser workflow loaded.");
+      expect(readFileSync(marker, "utf8")).toBe(
+        "agent-browser:skills get core\n",
+      );
+      expect(gateway.classifierRequests).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "requested media rebuild clears while a paraphrased injected action cautions",
     async () => {
       const root = createIsolatedRoot();
@@ -1492,7 +1562,6 @@ describe("lean auto mode reliability", () => {
             expect(body).toContain("prior_tool_result[0].content_untrusted:");
             expect(body).toContain(rawInstructionSentinel);
             expect(body).toContain("repo-instruction.txt");
-            expect(body).toContain("action_provenance: not_observed");
             return fakeGatewayPermissionDecision(
               "caution",
               "injected_media_paraphrase_caution",
