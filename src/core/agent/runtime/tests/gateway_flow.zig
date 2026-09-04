@@ -6745,18 +6745,81 @@ test "processQueuedPrompt uses configured tool choice only for first call" {
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"auto\"}");
 }
 
-test "processQueuedPrompt injects silent-tool continuation without synthetic assistant text" {
+test "processQueuedPrompt omits blank assistant messages from silent-tool continuation" {
+    const alloc = std.testing.allocator;
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    for ([_]?[]const u8{ null, "", " ", "\t\r\n" }) |blank| {
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &call_one },
+            .{ .tool_calls = &call_two },
+            .{ .content = blank },
+            .{ .content = "Summary" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+        try expectBodyNotContains(&gateway, 3, "Done.");
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[3], .{});
+        defer parsed.deinit();
+        var assistant_count: usize = 0;
+        for (parsed.value.object.get("prompt").?.array.items) |message| {
+            if (!std.mem.eql(u8, message.object.get("role").?.string, "assistant")) continue;
+            assistant_count += 1;
+            const content = message.object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), content.len);
+            try std.testing.expectEqualStrings("tool-call", content[0].object.get("type").?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 2), assistant_count);
+        try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+        try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
+    }
+}
+
+test "processQueuedPrompt preserves provider state during silent-tool continuation" {
+    const StateObserver = struct {
+        const state = "[{\"type\":\"reasoning\",\"id\":\"state_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
+
+        fn observe(request: agent_stream_provider.ModelRequest) !void {
+            const last = request.messages[request.messages.len - 1];
+            if (!std.mem.eql(u8, last.content orelse "", "Summarize what you just did.")) return;
+            const previous = request.messages[request.messages.len - 2];
+            try std.testing.expectEqual(types.ChatRole.assistant, previous.role);
+            try std.testing.expectEqual(@as(?[]const u8, null), previous.content);
+            try std.testing.expectEqualStrings(state, previous.provider_state_json orelse "");
+            try std.testing.expectEqual(@as(usize, 0), previous.tool_calls.len);
+            var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer wire.deinit();
+            try @import("../../../../gateway/responses_protocol.zig").writeInput(
+                &wire.writer,
+                std.testing.allocator,
+                &.{previous},
+                null,
+                .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 },
+            );
+            try std.testing.expectEqualStrings(state[1 .. state.len - 1], wire.written());
+        }
+    };
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
-        .{},
+        .{ .content = " \n", .provider_state_json = StateObserver.state },
         .{ .content = "Summary" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
+    gateway.observe_request = StateObserver.observe;
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -6764,8 +6827,8 @@ test "processQueuedPrompt injects silent-tool continuation without synthetic ass
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 3, "Summarize what you just did.");
-    try expectBodyNotContains(&gateway, 3, "Done.");
+    try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+    try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {

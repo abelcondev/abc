@@ -199,6 +199,7 @@ pub const FakeCompletion = struct {
     chunks: []const []const u8 = &.{},
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
+    provider_state_json: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
@@ -227,6 +228,7 @@ pub const FakeGateway = struct {
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -257,6 +259,7 @@ pub const FakeGateway = struct {
         alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
+        if (self.observe_request) |observe| try observe(request);
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
@@ -335,6 +338,7 @@ pub const FakeGateway = struct {
         return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
+                .provider_state_json = completion.provider_state_json,
                 .tool_calls = completion.tool_calls,
                 .provider_result_identity_failure = completion.provider_result_identity_failure,
                 .provider_failure_cause = completion.provider_failure_cause,
