@@ -2044,6 +2044,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
+                try refreshModelCatalogForOptions(state);
                 var model_available = false;
                 if (state.capability_resolver.catalogEntries()) |entries| {
                     for (entries) |entry| {
@@ -2225,7 +2226,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to persist session provider",
                 });
             };
-            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            state.capability_resolver.adoptOwnedCatalog(alloc, catalog_provider, access, &catalog);
             if (staged_credential) |*credential| {
                 adoptServerCredential(state, credential);
             } else {
@@ -2243,6 +2244,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         }
     }
 
+    try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
     const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
 
@@ -2265,6 +2267,29 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
+    if (comptime host_target.is_wasm) return;
+    if (state.cfg.minimal_kernel) return;
+    const active = if (state.active_session) |*session| session else return;
+    const provider = catalogProviderFor(state, active.provider) orelse return;
+    std.debug.assert(state.active_prompt == null);
+    // Restoring the same session can leave its previous cancellation flag set.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+        .access = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                active.credential_source,
+                active.api_key,
+                state.gateway_team,
+                active.account_id,
+            ),
+        .endpoint = state.cfg.gateway_models_path,
+        .cancel_flag = &cancel_flag,
+    });
 }
 
 fn commitActiveSessionProvider(
