@@ -3518,7 +3518,7 @@ test "context overflow after automatic compaction retries with new execution" {
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
 }
 
-test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
+test "compaction preserves an incomplete handle-free result when it cannot fit" {
     const alloc = std.testing.allocator;
     const model = "provider/capacity-failure";
     const available_overrides = [_]ModelCapabilityOverride{.{
@@ -3545,11 +3545,23 @@ test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
     job.model = @constCast(model);
 
     try std.testing.expectError(
-        error.ContextCapacityExceeded,
+        error.IncompleteCompactionResult,
         runFakePrompt(&gateway, &hooks, fixture.config(), job),
     );
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finish_terminal_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
+    const retained = execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings("capacity_result_1", retained.tool_call_id);
+    try std.testing.expect(retained.truncated);
+    try std.testing.expect(retained.output_handle == null);
+    try std.testing.expect(std.mem.find(u8, retained.output, "ineligible result") != null);
 }
 
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
