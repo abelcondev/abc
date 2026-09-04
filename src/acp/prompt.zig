@@ -1672,6 +1672,7 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
         ctx.toolRegistry(),
         ctx.state.workspace_root,
         &ctx.state.terminal_client,
+        &ctx.state.managed_executions,
         call,
     );
 }
