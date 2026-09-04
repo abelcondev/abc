@@ -60,7 +60,7 @@ pub fn listActionableCatalog(
     const keep = try alloc.alloc(bool, summaries.items.len);
     defer alloc.free(keep);
     for (summaries.items, keep) |summary, *retain| {
-        retain.* = summary.history_len != 0 or summary.has_managed_children;
+        retain.* = summary.hasResumableContent();
         if (retain.*) {
             if (active_id) |id| {
                 retain.* = !std.mem.eql(u8, summary.id, id);

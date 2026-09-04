@@ -66,7 +66,12 @@ pub const SessionSummary = struct {
     updated_at_ms: i64,
     conversation_language: session.ConversationLanguage,
     history_len: usize,
+    has_checkpoint: bool = false,
     has_managed_children: bool = false,
+
+    pub fn hasResumableContent(self: SessionSummary) bool {
+        return self.history_len != 0 or self.has_checkpoint or self.has_managed_children;
+    }
 
     /// Frees owned summary strings and poisons the value.
     pub fn deinit(self: *SessionSummary, alloc: Allocator) void {

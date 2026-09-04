@@ -16,6 +16,8 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -89,6 +91,56 @@ async function continueSession(
 }
 
 describe("session recovery", () => {
+  test.skipIf(!tmuxAvailable())("resume picker discovers a checkpoint from an unfinished first turn", async () => {
+    const fixture = createFixture("fx-session-first-checkpoint-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_TURN_SAVED"),
+      fakeGatewayFinalText("CHECKPOINT_TURN_RECOVERED"),
+    ]);
+    let tui: TmuxSession | null = null;
+    try {
+      const sessionId = await createSavedSession(fixture, gateway);
+      const eventsPath = join(fixture.home, ".fx", "sessions", sessionId, "events.jsonl");
+      const checkpoint = [
+        { user: { text: "unfinished first request", images: [], work_id: null } },
+        { context_checkpoint: { covers_through_seq: 1, summary: "<context_handoff>FIRST_CHECKPOINT_FACT</context_handoff>" } },
+      ].map((event, index) => JSON.stringify({
+        schema_version: 1, seq: index + 1, timestamp_ms: Date.now(), event,
+      })).join("\n") + "\n";
+      writeFileSync(eventsPath, checkpoint, { mode: 0o600 });
+      const listed = await runFx(["sessions", "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.stdout).sessions.map((entry: { id: string }) => entry.id))
+        .toContain(sessionId);
+      expect(JSON.parse(listed.stdout).sessions[0].history_len).toBe(0);
+      expect(JSON.parse(listed.stdout).sessions[0]).not.toHaveProperty("has_checkpoint");
+      expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
+
+      const stderrPath = join(fixture.root, "tui.stderr");
+      tui = await TmuxSession.create({ cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), stderrPath });
+      await tui.waitForComposer(TIMEOUT);
+      await tui.sendText("/resume");
+      await tui.waitForText("Create the first saved turn.", TIMEOUT);
+      expect(readFileSync(eventsPath, "utf8")).toBe(checkpoint);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("unfinished first request", TIMEOUT);
+      await tui.waitForComposer(TIMEOUT);
+      await tui.sendText("Continue after checkpoint.");
+      await tui.waitForPane(() => readFileSync(eventsPath, "utf8").includes("CHECKPOINT_TURN_RECOVERED"), TIMEOUT);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("FIRST_CHECKPOINT_FACT");
+    } finally {
+      await tui?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test("latest resume discovers and repairs a partial final JSONL record", async () => {
     const fixture = createFixture("fx-session-partial-record-");
     const gateway = startFakeGateway([

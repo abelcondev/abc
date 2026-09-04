@@ -409,7 +409,7 @@ pub const SessionPicker = struct {
         alloc: Allocator,
         source: *const session_store.SessionSummary,
     ) !void {
-        if (source.history_len == 0 and !source.has_managed_children) return;
+        if (!source.hasResumableContent()) return;
 
         var summary = try session_summary_codec.cloneSessionSummary(alloc, source.*);
         errdefer summary.deinit(alloc);
@@ -578,7 +578,7 @@ fn replaceSessionPickerPage(
         replacement.deinit(alloc);
     }
     for (source.summaries.items) |*summary| {
-        if (summary.history_len == 0 and !summary.has_managed_children) continue;
+        if (!summary.hasResumableContent()) continue;
         var copied = try session_summary_codec.cloneSessionSummary(alloc, summary.*);
         replacement.append(alloc, copied) catch |err| {
             copied.deinit(alloc);

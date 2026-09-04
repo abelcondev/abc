@@ -299,6 +299,7 @@ fn classifyConversationCandidate(
         return error.SessionPathUnsafe;
     }
     var history_len: usize = 0;
+    var has_checkpoint = false;
     if (event_stat.size > 0) {
         var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
         defer event_file.close(io_mod.getIo());
@@ -317,6 +318,7 @@ fn classifyConversationCandidate(
             var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
             defer decoded.deinit();
             switch (decoded.value.event) {
+                .context_checkpoint => has_checkpoint = true,
                 .turn_completed, .interrupted => history_len = std.math.add(
                     usize,
                     history_len,
@@ -342,7 +344,7 @@ fn classifyConversationCandidate(
             .origin_workspace_root = origin,
             .title = title,
             .created_at_ms = metadata.value.created_at_ms,
-            .updated_at_ms = if (history_len == 0)
+            .updated_at_ms = if (history_len == 0 and !has_checkpoint)
                 metadata.value.updated_at_ms
             else
                 @max(
@@ -356,6 +358,7 @@ fn classifyConversationCandidate(
                 metadata.value.conversation_language,
             ) catch return error.InvalidSessionFormat,
             .history_len = history_len,
+            .has_checkpoint = has_checkpoint,
         },
         .storage = .conversation,
         .projection_state = .current,

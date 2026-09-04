@@ -7,6 +7,27 @@ const SessionSummary = types.SessionSummary;
 const ResumableSessionContinuation = types.ResumableSessionContinuation;
 const ResumableSessionPage = types.ResumableSessionPage;
 
+test "checkpoint-only summaries are resumable without changing turn counts" {
+    const alloc = std.testing.allocator;
+    const checkpoint = SessionSummary{
+        .id = @constCast("checkpoint"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = .literal("en"),
+        .history_len = 0,
+        .has_checkpoint = true,
+    };
+    var empty = checkpoint;
+    empty.id = @constCast("empty");
+    empty.has_checkpoint = false;
+    var page = try resumablePageFromSummaries(alloc, &.{ checkpoint, empty }, null, null, null, 10);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqualStrings("checkpoint", page.summaries.items[0].id);
+    try std.testing.expect(page.summaries.items[0].has_checkpoint);
+    try std.testing.expectEqual(@as(usize, 0), page.summaries.items[0].history_len);
+}
+
 pub fn freeSummaries(
     alloc: Allocator,
     sessions: *std.ArrayList(SessionSummary),
@@ -46,6 +67,7 @@ pub fn cloneSessionSummary(
         .updated_at_ms = source.updated_at_ms,
         .conversation_language = source.conversation_language,
         .history_len = source.history_len,
+        .has_checkpoint = source.has_checkpoint,
         .has_managed_children = source.has_managed_children,
     };
 }
@@ -66,7 +88,7 @@ pub fn resumablePageFromSummaries(
             const summary_workspace = summary.workspace_root orelse continue;
             if (!std.mem.eql(u8, summary_workspace, root)) continue;
         }
-        if (summary.history_len == 0 and !summary.has_managed_children) continue;
+        if (!summary.hasResumableContent()) continue;
         if (active_id) |id| {
             if (std.mem.eql(u8, summary.id, id)) continue;
         }
