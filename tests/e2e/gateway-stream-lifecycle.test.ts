@@ -405,12 +405,22 @@ function taggedBlock(body: string, tag: string): string {
 
 function advertisedSkillLocations(body: string, name: string): string[] {
   const block = taggedBlock(body, "available_skills");
-  const locations: string[] = [];
-  const entryPattern = /<skill>\s*<name>([^<]*)<\/name>[\s\S]*?<location>([^<]*)<\/location>\s*<\/skill>/g;
-  for (const match of block.matchAll(entryPattern)) {
-    if (match[1] === name) locations.push(match[2]!);
-  }
-  return locations;
+  return block.split("\n")
+    .filter((line) => line.startsWith(`- ${name}: `))
+    .map((line) => {
+      const start = line.lastIndexOf(" (location: ");
+      if (start < 0 || !line.endsWith(")")) throw new Error("Malformed skill location");
+      return line.slice(start + " (location: ".length, -1);
+    });
+}
+
+function advertisedSkillPath(body: string, location: string): string {
+  const match = /^skill:[0-9a-f]{16}:(\d+)\/(.+)$/.exec(location);
+  if (!match) throw new Error(`Invalid scoped skill location: ${location}`);
+  const prefix = `Root ${match[1]}: `;
+  const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
+  if (!root) throw new Error(`Missing root for ${location}`);
+  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -631,6 +641,144 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  test("skill context keeps complete scoped resources visible through saved tool results", async () => {
+    const root = createFixtureRoot("complete-skill-resources");
+    writeLargeSkillCatalog(root.workspace, 48);
+    const malformed = join(root.workspace, ".agents", "skills", "invalid-neighbor");
+    mkdirSync(malformed, { recursive: true });
+    writeFileSync(join(malformed, "SKILL.md"), "---\ndescription: missing name\n---\nINVALID_NEIGHBOR_BODY\n");
+    const directory = join(root.workspace, ".agents", "skills", "z-complete&workflow");
+    mkdirSync(join(directory, "references"), { recursive: true });
+    writeFileSync(join(directory, "SKILL.md"),
+      "---\nname: complete-workflow\ndescription: Complete resource workflow\n---\n" +
+      "Required main instructions.\n".repeat(1100) + "MAIN_RESOURCE_TAIL\n");
+    writeFileSync(join(directory, "references", "rules.txt"),
+      "Required reference instructions.\n".repeat(900) + "REFERENCE_RESOURCE_TAIL\n");
+    const tracePath = join(root.root, "trace.log");
+    let location = "";
+    let index = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (index++) {
+        case 0: {
+          const locations = advertisedSkillLocations(body, "complete-workflow");
+          expect(locations).toHaveLength(1);
+          location = locations[0]!;
+          expect(advertisedSkillPath(body, location)).toBe(directory);
+          return fakeGatewayToolCall("whole_main", "skill", { location });
+        }
+        case 1:
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_main")).toContain('complete="true"');
+          expect(toolResultOutput(body, "whole_main")).toContain("skill_discovery_warning");
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "whole_reference", toolName: "skill", input: { location, resource: "references/rules.txt" } },
+            { type: "tool-call", toolCallId: "ordinary_glob", toolName: "glob_files", input: { pattern: "*.txt" } },
+            { type: "tool-call", toolCallId: "stale_skill", toolName: "skill", input: { location: "skill:0000000000000000:0/missing" } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+          ]);
+        case 2:
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_reference")).toContain("skill_discovery_warning");
+          expect(promptText(body)).not.toContain("INVALID_NEIGHBOR_BODY");
+          expect(toolResultOutput(body, "whole_reference")).not.toContain("Read full output");
+          expect(toolResultOutput(body, "stale_skill")).toContain("StaleSkillLocation");
+          return fakeGatewayFinalText("Complete resources received.");
+        case 3:
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Complete resources restored.");
+        case 4:
+          expect(toolResultOutput(body, "whole_main")).toContain("unavailable");
+          expect(toolResultOutput(body, "whole_main")).not.toContain('complete="true"');
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Missing saved resource reported.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 }] });
+    try {
+      const result = await runFx(["ask", "--auto", "--json", "Inspect the complete resource workflow." + " Keep existing behavior unchanged.".repeat(24)], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      if (result.code !== 0) throw new Error(`Skill resource flow failed: ${result.stderr}\n${result.stdout}`);
+      expect(result.code).toBe(0);
+      const output = parseAskJson(result.stdout);
+      expect(output.exit_code).toBe(0);
+      expect(output.session_id).not.toBe("");
+      expect(output.tool_calls).toHaveLength(4);
+      expect(output.tool_calls[0]).toEqual({ name: "skill", status: "success" });
+      expect(output.tool_calls.slice(1)).toEqual(expect.arrayContaining([
+        { name: "skill", status: "success" },
+        { name: "glob_files", status: "success" },
+        { name: "skill", status: "error" },
+      ]));
+      expect(gateway.requestCount()).toBe(3);
+      expect(result.stderr).not.toContain("panic");
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      const restored = await resume();
+      expect(restored.code).toBe(0);
+      expect(parseAskJson(restored.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(4);
+      const resultDirectory = join(root.home, ".fx", "sessions", output.session_id, "tool-results");
+      const mainArtifacts = readdirSync(resultDirectory).filter((name) =>
+        readFileSync(join(resultDirectory, name), "utf8").includes("MAIN_RESOURCE_TAIL"));
+      expect(mainArtifacts).toHaveLength(1);
+      rmSync(join(resultDirectory, mainArtifacts[0]!));
+      const missing = await resume();
+      expect(missing.code).toBe(0);
+      expect(parseAskJson(missing.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(5);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test.skipIf(!tmuxAvailable())("explicit skill context survives cancellation and a fresh turn", async () => {
+    const root = createFixtureRoot("skill-cancel-recover");
+    const directory = join(root.workspace, ".agents", "skills", "cancel-workflow");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "SKILL.md"), "---\nname: cancel-workflow\ndescription: Cancellation fixture\n---\n" + "Required instructions.\n".repeat(1200) + "CANCEL_SKILL_TAIL\n");
+    const held = heldFakeGatewayFinalText();
+    let requestCount = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(promptText(body)).toContain("CANCEL_SKILL_TAIL");
+      return requestCount++ === 0 ? held.response : fakeGatewayFinalText("SKILL_RECOVERY_COMPLETE");
+    });
+    const stderrPath = join(root.root, "stderr.log");
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Please use $cancel-workflow for this task.");
+      const deadline = Date.now() + 10_000;
+      while (requestCount === 0 && Date.now() < deadline) await Bun.sleep(25);
+      expect(requestCount).toBe(1);
+      await tui.sendKeys("C-c");
+      await tui.waitForComposer(10_000);
+      await tui.sendText("Please use $cancel-workflow again after cancellation.");
+      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      expect(gateway.requests).toHaveLength(2);
+      const first = advertisedSkillLocations(gateway.requests[0]!.body, "cancel-workflow")[0]!;
+      const second = advertisedSkillLocations(gateway.requests[1]!.body, "cancel-workflow")[0]!;
+      expect(first).not.toBe(second);
+      expect(advertisedSkillPath(gateway.requests[0]!.body, first)).toBe(directory);
+      expect(advertisedSkillPath(gateway.requests[1]!.body, second)).toBe(directory);
+      expect(await tui.captureFullScrollback()).toContain("SKILL_RECOVERY_COMPLETE");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (tui) await tui.kill();
+      held.dispose();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("bounded conditional guidance oracle distinguishes capabilities from ordinary prose", () => {
     const fixture = (
       systemText: string,
@@ -944,7 +1092,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
-  test("source context limits reach ask with workspace precedence, explicit skill chunks, and CLI off", async () => {
+  test("source context limits reach ask with workspace precedence, complete skill blocking, and CLI off", async () => {
     const root = createFixtureRoot("source-context-limits-ask");
     writeContextLimitFixture(root);
     const tracePath = join(root.root, "trace.log");
@@ -977,7 +1125,7 @@ describe("gateway stream lifecycle", () => {
       expect(limitedJson.output).toContain("CONTEXT_LIMIT_ASK_COMPLETE");
       expect(limited.stderr).toContain("project instruction file");
       expect(limited.stderr).toContain("skill description");
-      expect(limited.stderr).toContain("skill resource");
+      expect(limited.stderr).toContain('name="skill_chunk_bytes" action="blocked"');
       expect(limited.stderr).toContain("source=workspace settings");
       expect(gateway.requestCount()).toBe(1);
       const limitedPrompt = promptText(gateway.requests[0]!.body);
@@ -990,10 +1138,8 @@ describe("gateway stream lifecycle", () => {
       expect(limitedPrompt).toContain("PROJECT_FIRST_LINE");
       expect(limitedPrompt).not.toContain("PROJECT_TAIL_SENTINEL");
       expect(limitedPrompt).toContain("project_instruction_file_bytes");
-      expect(limitedPrompt).toContain(
-        "<skill_content name=\"oversized-context\" resource=\"SKILL.md\" offset=\"0\"",
-      );
-      expect(limitedPrompt).toContain("SKILL_FIRST_LINE");
+      expect(limitedPrompt).not.toContain("<skill_content");
+      expect(limitedPrompt).not.toContain("SKILL_FIRST_LINE");
       expect(limitedPrompt).not.toContain("SKILL_TAIL_SENTINEL");
       expect(limitedPrompt).toContain("skill_chunk_bytes");
 
@@ -1125,11 +1271,11 @@ describe("gateway stream lifecycle", () => {
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
-        '<skill_content name="linked-skill" resource="SKILL.md"',
+        '<skill_content name="linked-skill"',
       );
-      expect(prompt).toContain(
-        `<location>${join(root.workspace, ".codex", "skills", "linked-skill")}</location>`,
-      );
+      expect(advertisedSkillLocations(gateway.requests[0]!.body, "linked-skill").map(
+        (location) => advertisedSkillPath(gateway.requests[0]!.body, location),
+      )).toEqual([join(skillsRoot, "linked-skill")]);
       expect(prompt).not.toContain("symlinked rule file");
       expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
@@ -1191,9 +1337,9 @@ describe("gateway stream lifecycle", () => {
         }
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("project instruction file");
-        expect(compact).not.toContain("skill catalog omitted");
+        expect(compact).not.toContain("skill catalog shortened");
         expect(compactScrollback).not.toContain("project instruction file");
-        expect(compactScrollback).not.toContain("skill catalog omitted");
+        expect(compactScrollback).not.toContain("skill catalog shortened");
         expect(gateway.requestCount()).toBe(1);
         expect(promptText(gateway.requests[0]!.body)).toContain(
           "project_instruction_file_bytes",
@@ -1203,11 +1349,11 @@ describe("gateway stream lifecycle", () => {
         const full = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog omitted"),
+            text.includes("skill catalog shortened"),
           15_000,
         );
         expect(full.indexOf("project instruction file")).toBeLessThan(
-          full.indexOf("skill catalog omitted"),
+          full.indexOf("skill catalog shortened"),
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
@@ -1222,11 +1368,11 @@ describe("gateway stream lifecycle", () => {
           (text) =>
             text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") &&
             !text.includes("project instruction file") &&
-            !text.includes("skill catalog omitted"),
+            !text.includes("skill catalog shortened"),
           15_000,
         );
         expect(restored).not.toContain("project instruction file");
-        expect(restored).not.toContain("skill catalog omitted");
+        expect(restored).not.toContain("skill catalog shortened");
 
         await tui.sendText("verify the bounded project context again");
         await tui.waitForText("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
@@ -1236,17 +1382,17 @@ describe("gateway stream lifecycle", () => {
         const resizedCompact = await tui.capturePane();
         expect(resizedCompact).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
         expect(resizedCompact).not.toContain("project instruction file");
-        expect(resizedCompact).not.toContain("skill catalog omitted");
+        expect(resizedCompact).not.toContain("skill catalog shortened");
 
         await tui.sendKeys("C-o");
         const finalFull = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog omitted"),
+            text.includes("skill catalog shortened"),
           15_000,
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
-        expect(finalFull.split("skill catalog omitted").length - 1).toBe(1);
+        expect(finalFull.split("skill catalog shortened").length - 1).toBe(1);
         await tui.sendKeys("C-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1269,7 +1415,7 @@ describe("gateway stream lifecycle", () => {
         const replay = replayFrames.stdout.toString();
         expect(replay).toContain("CONTEXT_LIMIT_FIRST_COMPLETE");
         expect(replay).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
-        expect(replay).toContain("skill catalog omitted");
+        expect(replay).toContain("skill catalog shortened");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -1663,7 +1809,9 @@ describe("gateway stream lifecycle", () => {
     gateway = startGateway(() => {
       switch (responseIndex++) {
         case 0: {
-          const locations = advertisedSkillLocations(gateway.requests[0]!.body, skillName);
+          const locations = advertisedSkillLocations(gateway.requests[0]!.body, skillName).map(
+            (location) => advertisedSkillPath(gateway.requests[0]!.body, location),
+          );
           if (locations.length !== 2) {
             throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
           }
@@ -1735,9 +1883,9 @@ describe("gateway stream lifecycle", () => {
       );
       expect(skillSchema).toBeDefined();
       expect(skillSchema?.inputSchema.type).toBe("object");
-      expect(skillSchema?.inputSchema.properties.name.type).toBe("string");
+      expect(skillSchema?.inputSchema.properties.name).toBeUndefined();
       expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
-      expect(skillSchema?.inputSchema.required).toEqual(["name"]);
+      expect(skillSchema?.inputSchema.required).toEqual(["location"]);
       expect(capabilitySearchSchema).toBeDefined();
       expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
       expect((capabilitySearchSchema?.inputSchema.properties.query as {
@@ -1752,10 +1900,9 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />',
       );
-      expect(available).toContain(advertisedA);
-      expect(available).toContain(advertisedB);
-      expect(available).toContain("<description>workspace exact duplicate&#x0a;</description>");
-      expect(available).toContain("<description>managed exact&#x0a;duplicate&#x0a;</description>");
+      expect(advertisedSkillLocations(gateway.requests[0]!.body, skillName)).toHaveLength(2);
+      expect(available).toContain("workspace exact duplicate&#x0a;");
+      expect(available).toContain("managed exact&#x0a;duplicate&#x0a;");
       expect(available).not.toContain("malformed-neighbor");
       expect(available).not.toContain(malformedBody);
       expect(available).not.toContain(bodyA);
@@ -1902,9 +2049,8 @@ describe("gateway stream lifecycle", () => {
         { name: "skill", status: "success" },
       ]);
       const initialSkills = taggedBlock(gateway.requests[0]!.body, "available_skills");
-      expect(initialSkills).toContain("<name>mail-helper</name>");
-      expect(initialSkills).toContain("<description>Send email messages.");
-      expect(initialSkills).not.toContain("<name>animation-vocabulary</name>");
+      expect(initialSkills).toContain("- animation-vocabulary:");
+      expect(initialSkills).not.toContain("- mail-helper:");
       expect(projectedSearch?.skills[0]).toEqual({
         name: "mail-helper",
         description: "Send email messages. API_KEY=[redacted]",
@@ -1950,11 +2096,9 @@ describe("gateway stream lifecycle", () => {
     const resourceCallId = "skill_resource";
     const responses = [
       fakeGatewayToolCall(mainCallId, "skill", {
-        name: skillName,
         location: skillDirectory,
       }),
       fakeGatewayToolCall(resourceCallId, "skill", {
-        name: skillName,
         location: skillDirectory,
         resource: "references/contract-design.md",
       }),
@@ -1999,6 +2143,55 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("skill location calls show names and resource paths in the transcript", async () => {
+    const root = createFixtureRoot("skill-location-labels");
+    const skillName = "visible-workflow";
+    const skillDirectory = join(root.home, ".fx", "skills", "different-directory");
+    mkdirSync(join(skillDirectory, "references"), { recursive: true });
+    writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n`);
+    writeFileSync(join(skillDirectory, "references", "rules.md"), "REFERENCE_LABEL_BODY\n");
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (requestIndex++ === 0) {
+        const locations = advertisedSkillLocations(body, skillName);
+        expect(locations).toHaveLength(1);
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "label_main", toolName: "skill", input: { location: locations[0]! } },
+          { type: "tool-call", toolCallId: "label_reference", toolName: "skill", input: { location: locations[0]!, resource: "references/rules.md" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+        ]);
+      }
+      expect(toolResultOutput(body, "label_main")).toContain("MAIN_LABEL_BODY");
+      expect(toolResultOutput(body, "label_reference")).toContain("REFERENCE_LABEL_BODY");
+      return fakeGatewayFinalText("SKILL_LABEL_CHECK_COMPLETE");
+    });
+    const stderrPath = join(root.root, "stderr.log");
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        stderrPath,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Read the workflow and its supporting rules.");
+      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`Loaded skill ${skillName}`);
+      expect(scrollback).toContain("Read skill resource references/rules.md");
+      expect(scrollback).not.toContain("Loaded skill skill");
+      expect(scrollback).not.toContain("Loaded skill different-directory");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("dynamic model-context values stay data", async () => {
     const root = createFixtureRoot(
@@ -2106,13 +2299,13 @@ describe("gateway stream lifecycle", () => {
         "shell_path: /bin/zsh&#x0a;injected_shell: yes&lt;/fx-turn-context&gt;",
       );
       expect(firstText).toContain(
-        "<name>dynamic-context-skill</name>",
+        "- dynamic-context-skill:",
       );
       expect(firstText).toContain(
-        "<description>inspect &lt;/description&gt;&lt;injected&gt;description&lt;/injected&gt;</description>",
+        "inspect &lt;/description&gt;&lt;injected&gt;description&lt;/injected&gt;",
       );
       expect(firstText).toContain(
-        "dynamic-context&lt;location&gt;&#x0a;injected_location",
+        "dynamic-context%3Clocation%3E%0Ainjected_location",
       );
       expect(firstText).toContain(rulesSentinel);
       expect(firstText).not.toContain(bodySentinel);
@@ -4969,7 +5162,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after semantic compaction",
+    "complete skill reads remain repeatable after semantic compaction",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -4977,29 +5170,35 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const skillName = "compaction-explicit";
       const skillDirectory = join(root.home, ".fx", "skills", skillName);
       const bodySentinel = "COMPACTION_EXPLICIT_BODY_SENTINEL";
+      const tailSentinel = "COMPACTION_COMPLETE_SKILL_TAIL";
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n${tailSentinel}\n`,
       );
       writeFileSync(
         join(root.workspace, ".fx.json"),
-        JSON.stringify({ max_tool_result_bytes: 1024 }),
+        JSON.stringify({ max_tool_result_bytes: 64 * 1024 }),
       );
 
       const beforeCallId = "skill_before_compaction";
       const afterCallId = "skill_after_compaction";
-      const responses = [
-        fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
-        fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
-        fakeGatewayFinalText("Continue the explicit skill workflow when the user asks."),
-        fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
-      ];
-      const gateway = startGateway(() =>
-        responses.shift() ?? new Response("unexpected request", { status: 500 })
-      );
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway((body) => {
+        const index = requestIndex++;
+        if (index === 0 || index === 4) {
+          const locations = advertisedSkillLocations(body, skillName);
+          expect(locations).toHaveLength(1);
+          return fakeGatewayToolCall(index === 0 ? beforeCallId : afterCallId, "skill", { location: locations[0]! });
+        }
+        switch (index) {
+          case 1: return fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE");
+          case 2: return fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE");
+          case 3: return fakeGatewayFinalText("Continue the explicit skill workflow when the user asks.");
+          case 5: return fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE");
+          default: return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       let tui: TmuxSession | null = null;
       try {
         tui = await TmuxSession.create({
@@ -5046,10 +5245,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(before).toContain(bodySentinel);
         expect(after).toContain(bodySentinel);
+        expect(before).toContain(tailSentinel);
+        expect(after).toContain(tailSentinel);
+        expect(before).toContain('complete="true"');
+        expect(after).toContain('complete="true"');
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
         expect(compactionRequest).toContain("Read the explicit skill before compaction.");
         expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
         expect(compactionRequest).toContain("Result handle:");
         expect(postCompactionRequest).toContain("context_handoff");
@@ -5573,7 +5777,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("empty MCP capability search is terminal and does not broaden or execute", async () => {
+  test("empty capability search remains available for a corrected query without executing tools", async () => {
     const root = createFixtureRoot("mcp-terminal-no-match");
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, {
@@ -5582,7 +5786,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
     const searchCallId = "mcp_terminal_no_match_1";
     let responseIndex = 0;
-    const gateway = startDynamicFakeGateway(() => {
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(body.includes("repeat a no-match search")).toBe(false);
       switch (responseIndex++) {
         case 0:
           return fakeGatewayToolCall(searchCallId, "capability_search", {
@@ -5605,8 +5810,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               tool.name === "capability_search"
             ),
           ).toBe(
-            false,
+            true,
           );
+          return fakeGatewayToolCall("mcp_corrected_search", "capability_search", {
+            query: "fixture input public tools " + "fixture ".repeat(80),
+            server: "fixture",
+          });
+        }
+        case 2: {
+          const corrected = JSON.parse(toolResultOutput(gateway.requests[2]!.body, "mcp_corrected_search"));
+          expect(corrected.mcp_tools.map((tool: { name: string }) => tool.name)).toContain(DYNAMIC_MCP_TOOL_NAME);
           return fakeGatewayFinalText("No matching monitoring capability is configured.");
         }
         default:
@@ -5635,8 +5848,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toContain("No matching monitoring capability is configured.");
       expect(json.tool_calls).toEqual([
         { name: "capability_search", status: "success" },
+        { name: "capability_search", status: "success" },
       ]);
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(3);
       expect(existsSync(mcp.callLogPath)).toBe(false);
       await waitForProcessExit(pid);
     } finally {
@@ -6065,6 +6279,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
+    const resumedWorkspace = join(root.root, "resumed-workspace");
+    const smallModel = "fixture/small-context";
+    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check"];
+    for (const name of skillNames) {
+      const directory = join(resumedWorkspace, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: ${"Context description. ".repeat(45)}\n---\nUNSELECTED_BODY\n`);
+    }
+    const oldSkill = join(root.workspace, ".agents", "skills", "original-workspace-only");
+    mkdirSync(oldSkill, { recursive: true });
+    writeFileSync(join(oldSkill, "SKILL.md"), "---\nname: original-workspace-only\ndescription: Original workspace task\n---\nUNSELECTED_OLD_BODY\n");
     const tracePath = join(root.root, "trace.log");
     const persistentInstructions = "Remember earlier turns and answer exactly as requested.";
     const firstMessage = "Reply exactly PERSISTED_FIRST.";
@@ -6116,7 +6341,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
     }, {
       classifierDecision: "clear",
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      models: [
+        { id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 },
+        { id: smallModel, type: "language", tags: ["tool-use"], context_window: 20_000 },
+      ],
     });
     try {
       const first = await runFx(
@@ -6147,17 +6375,27 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "RESUME_PERSISTENT_SECOND",
         ],
         {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
+          cwd: resumedWorkspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: smallModel },
           timeoutMs: 15_000,
         },
       );
-      expect(second.code).toBe(0);
+      if (second.code !== 0) throw new Error(`Resumed child failed: ${second.stderr}\n${second.stdout}`);
       const secondOutput = parseAskJson(second.stdout).output;
       if (!secondOutput.includes("PARENT_SECOND_COMPLETE")) {
         throw new Error(`persistent resume output=${secondOutput} requests=${gateway.requestCount()} bodies=${gateway.requests.map((request) => promptText(request.body)).join("\n---\n")}`);
       }
       expect(gateway.requestCount()).toBe(6);
+      const parentCatalog = taggedBlock(gateway.requests[3]!.body, "available_skills");
+      const childCatalog = taggedBlock(gateway.requests[4]!.body, "available_skills");
+      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
+      expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      for (const catalog of [parentCatalog, childCatalog]) {
+        expect(catalog).toContain(resumedWorkspace);
+        expect(catalog).not.toContain("original-workspace-only");
+        for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
+      }
+      expect(childCatalog.length).toBeGreaterThan(parentCatalog.length);
 
       const directChildResume = await runFx(
         [

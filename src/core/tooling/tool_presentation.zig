@@ -335,6 +335,13 @@ fn formatTerminalDisplayTarget(
     return encoded.bytes;
 }
 
+/// Borrows the name from the prepared action without replacing resource labels.
+pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
+    if (presentation.label_arg_kind != .name) return null;
+    const selected = call.resolved_skill orelse return null;
+    return selected.skill.name;
+}
+
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
@@ -377,6 +384,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
+        resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
@@ -937,6 +945,29 @@ test "tool presentation preserves plain action fallbacks" {
 
     for (cases) |case| {
         const label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = case.call });
+        defer alloc.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
+}
+
+test "tool presentation uses the resolved skill name for location calls" {
+    const alloc = std.testing.allocator;
+    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
+        .name = "workflow",
+        .description = "",
+        .path = "/skills/different-directory",
+        .source = .workspace_fx,
+    } };
+    const cases = [_]struct { args: []const u8, expected: []const u8 }{
+        .{ .args = "{\"location\":\"skill:0000000000000001:0/different-directory\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"SKILL.md\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}", .expected = "Reading skill resource references/rules.md" },
+    };
+    for (cases) |case| {
+        const label = try formatPlainAction(alloc, .{
+            .tool_registry = test_tool_registry,
+            .call = .{ .id = "load", .name = "skill", .arguments_json = case.args, .resolved_skill = &selected },
+        });
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }

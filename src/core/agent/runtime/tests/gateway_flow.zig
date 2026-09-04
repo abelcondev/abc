@@ -3001,6 +3001,13 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
+    config.host_instructions = "AUTO_COMPACTION_HOST_INSTRUCTIONS";
+    config.skill_catalog = .{ .skills = &.{.{
+        .name = "auto-compaction-workflow",
+        .description = "Keep the selected workflow available during compaction.",
+        .path = "/skills/auto-compaction-workflow",
+        .source = .global_fx,
+    }} };
     var job = fixture.job();
     job.model = @constCast(model);
     var restored_calls = [_]ToolCall{toolCall(
@@ -3053,8 +3060,13 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     try expectBodyContains(&gateway, 0, "\"tools\":[]");
     try expectBodyContains(&gateway, 1, "context_handoff");
     try std.testing.expect(prompt_context.measureProviderRequest(gateway.request_bodies.items[1]).estimated_input_tokens <= 4_500);
+    try expectBodyContains(&gateway, 1, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectBodyContains(&gateway, 1, "auto-compaction-workflow");
+    try expectBodyContains(&gateway, 1, "available_skills");
     try expectBodyNotContains(&gateway, 1, "AUTO_HISTORY_ASSISTANT_SENTINEL");
     try expectBodyContains(&gateway, 2, "AUTO_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectBodyContains(&gateway, 2, "auto-compaction-workflow");
     try std.testing.expectEqual(
         @as(usize, 1),
         hooks.successful_effect_count.load(.seq_cst),
@@ -4130,6 +4142,222 @@ test "processQueuedPrompt places transient overlay before history and current pr
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
+test "processQueuedPrompt keeps search advertised after an empty search" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("search_empty", "capability_search", "{\"query\":\"missing capability\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "{\"state\":\"no_match\",\"skills\":[],\"tools\":[]}" } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &.{ "capability_search", "skill" };
+    config.advertised_functions = &.{ builtin_tools.capability_search.model_schema, builtin_tools.skill.model_schema };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    for (gateway.request_bodies.items, 0..) |body, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        var found = false;
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            const name = tool.object.get("name") orelse continue;
+            if (name == .string and std.mem.eql(u8, name.string, "capability_search")) found = true;
+        }
+        if (!found) return if (index == 0) error.MissingInitialSearchSchema else error.SearchSchemaLostAfterNoMatch;
+    }
+}
+
+test "processQueuedPrompt retains complete skill content without granting ordinary results that status" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { kind: tool_dispatch.ModelContentKind, parallel: bool }{
+        .{ .kind = .ordinary, .parallel = false },
+        .{ .kind = .ordinary, .parallel = true },
+        .{ .kind = .complete_skill, .parallel = false },
+        .{ .kind = .complete_skill, .parallel = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        const calls = [_]ToolCall{
+            toolCall("skill_one", "skill", "{\"location\":\"/skills/one\"}"),
+            toolCall("skill_two", "skill", "{\"location\":\"/skills/two\"}"),
+        };
+        const count: usize = if (case.parallel) 2 else 1;
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = calls[0..count] },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.tool_registry = builtin_tools.registry;
+        const result: runtime_tool_contracts.ToolExecutionResult = .{
+            .model_content_kind = case.kind,
+            .model_output = "SKILL START\n" ++ ("required instruction\n" ** 1400) ++ "COMPLETE_SKILL_TAIL",
+        };
+        hooks.exec_plans = &.{ .{ .result = result }, .{ .result = result } };
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.tool_result_dir = result_dir;
+        config.advertised_tool_names = &.{"skill"};
+        config.advertised_functions = &.{builtin_tools.skill.model_schema};
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        try std.testing.expectEqual(count, hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        if (case.kind == .complete_skill) {
+            try expectBodyContains(&gateway, 1, "COMPLETE_SKILL_TAIL");
+        } else {
+            try expectBodyNotContains(&gateway, 1, "COMPLETE_SKILL_TAIL");
+        }
+    }
+}
+
+test "processQueuedPrompt prepares skill metadata from the supplied inventory" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "release",
+        .description = "Release the package",
+        .path = "/tmp/skills/release",
+        .source = .global_fx,
+    }};
+    config.skill_catalog = .{ .skills = &skills };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try expectGatewayPromptTextCount(&gateway, 0, "- release: Release the package", 1);
+}
+
+test "processQueuedPrompt reports a retained skill binding when discovery becomes empty" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "Final" }});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_bindings = &.{.{ .name = "removed-workflow", .path = "/skills/removed-workflow" }};
+    var job = fixture.job();
+    job.prompt = @constCast("Apply the workflow selected in the picker.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "was not found at advertised location");
+    try expectBodyContains(&gateway, 0, "removed-workflow");
+    try expectBodyContains(&gateway, 0, "/skills/removed-workflow");
+    try expectBodyNotContains(&gateway, 0, "<skill_content");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "processQueuedPrompt skill catalog is invariant under harmless request expansion" {
+    const alloc = std.testing.allocator;
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{
+        .{ .name = "alpha", .description = "Unrelated instructions", .path = "/tmp/skills/alpha", .source = .global_fx },
+        .{ .name = "release", .description = "Release the package", .path = "/tmp/skills/release", .source = .global_fx },
+    };
+    const prompts = [_][]const u8{ "Release the package", "Release the package." ++ (" Keep existing behavior unchanged." ** 24) };
+    var first: ?[]u8 = null;
+    defer if (first) |value| alloc.free(value);
+    for (prompts) |prompt| {
+        const completions = [_]FakeCompletion{.{ .content = "Final" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.skill_catalog = .{ .skills = &skills };
+        var job = fixture.job();
+        job.prompt = @constCast(prompt);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        const body = gateway.request_bodies.items[0];
+        const start = std.mem.find(u8, body, "<available_skills>") orelse return error.SkillCatalogMissing;
+        const end = std.mem.find(u8, body[start..], "</available_skills>") orelse return error.SkillCatalogMissing;
+        const catalog = body[start..][0..end];
+        const namespace_start = (std.mem.find(u8, catalog, "skill:") orelse return error.SkillLocationMissing) + "skill:".len;
+        const namespace_len = std.mem.findScalar(u8, catalog[namespace_start..], ':') orelse return error.SkillLocationMissing;
+        const normalized = try std.mem.replaceOwned(u8, alloc, catalog, catalog[namespace_start..][0..namespace_len], "turn");
+        if (first) |expected| {
+            defer alloc.free(normalized);
+            try std.testing.expectEqualStrings(expected, normalized);
+        } else first = normalized;
+    }
+}
+
+test "processQueuedPrompt prepares each origin skill catalog with its supplied model and workspace" {
+    const alloc = std.testing.allocator;
+    const Skill = @import("../../../skills/skill_runtime.zig").Skill;
+    const description = "Instruction detail. " ** 50;
+    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    const cases = [_]struct { model: []const u8, workspace: []const u8, context_window: u32, child: bool }{
+        .{ .model = "fixture/parent-model", .workspace = "/tmp/parent-workspace", .context_window = 64_000, .child = false },
+        .{ .model = "fixture/child-model", .workspace = "/tmp/child-workspace", .context_window = 16_000, .child = true },
+    };
+    var parent_catalog_bytes: usize = 0;
+    for (cases) |case| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var skills: [names.len]Skill = undefined;
+        for (names, &skills) |name, *skill| {
+            skill.* = .{
+                .name = name,
+                .description = description,
+                .path = try std.fs.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
+                .source = .workspace_shared,
+            };
+        }
+        const completions = [_]FakeCompletion{.{ .content = "Final" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const overrides = [_]ModelCapabilityOverride{.{
+            .model = case.model,
+            .capabilities = .{ .context_window = case.context_window },
+        }};
+        hooks.available_capability_overrides = &overrides;
+        var fixture = PromptFixture{ .workspace_root = case.workspace };
+        var config = fixture.config();
+        config.origin = if (case.child) .subagent else .root;
+        config.skill_catalog = .{ .skills = &skills };
+        var job = fixture.job();
+        job.model = @constCast(case.model);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqualStrings(case.model, gateway.request_models.items[0]);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[0], .{});
+        defer parsed.deinit();
+        const catalog = parsed.value.object.get("prompt").?.array.items[1].object.get("content").?.string;
+        try std.testing.expect(std.mem.find(u8, catalog, "<available_skills>") != null);
+        try std.testing.expect(catalog.len <= @as(usize, case.context_window) * 2 / 100 * 4);
+        for (names) |name| {
+            const entry = try std.fmt.allocPrint(scratch.allocator(), "- {s}: ", .{name});
+            try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
+        }
+        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
+        if (case.child) {
+            try std.testing.expect(catalog.len < parent_catalog_bytes);
+            try std.testing.expect(std.mem.find(u8, catalog, cases[0].workspace) == null);
+            try std.testing.expect(std.mem.find(u8, catalog, description) == null);
+        } else {
+            parent_catalog_bytes = catalog.len;
+            try std.testing.expect(std.mem.find(u8, catalog, description) != null);
+        }
+    }
+}
+
 test "processQueuedPrompt keeps supplied system prompt components in stable order without duplication" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
@@ -4151,7 +4379,15 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     var config = fixture.config();
     config.system_prompt = "base guidance-order prompt";
     config.custom_tool_guidance = "custom tool guidance unique needle";
-    config.skills_prompt_section = "skills guidance-order section";
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "order",
+        .description = "skills guidance-order section",
+        .path = "/tmp/skills/order",
+        .source = .global_fx,
+    }};
+    config.skill_catalog = .{ .skills = &skills };
+    config.context_limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1024 }, .source = .command_line };
+    config.host_instructions = "host guidance-order instructions\n" ++ ("Required host instruction.\n" ** 80);
     config.model_prompt_overlay = "model guidance-order overlay";
     var job = fixture.job();
     job.history = history[0..];
@@ -4159,21 +4395,24 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
         try expectGatewayPromptStringEntry(&gateway, request_index, 0, "base guidance-order prompt");
         try expectGatewayPromptStringEntry(&gateway, request_index, 1, "custom tool guidance unique needle");
-        try expectGatewayPromptStringEntry(&gateway, request_index, 2, "skills guidance-order section");
-        try expectGatewayPromptStringEntry(&gateway, request_index, 3, "model guidance-order overlay");
+        try expectGatewayPromptTextCount(&gateway, request_index, "skills guidance-order section", 1);
+        try expectGatewayPromptStringEntry(&gateway, request_index, 3, config.host_instructions);
+        try expectGatewayPromptStringEntry(&gateway, request_index, 4, "model guidance-order overlay");
         try expectGatewayPromptTextCount(&gateway, request_index, "custom tool guidance unique needle", 1);
+        try expectGatewayPromptTextCount(&gateway, request_index, "host guidance-order instructions", 1);
         try expectGatewayPromptTextCount(&gateway, request_index, "model guidance-order overlay", 1);
         const order = [_][]const u8{
             "base guidance-order prompt",
             "custom tool guidance unique needle",
             "skills guidance-order section",
+            "host guidance-order instructions",
             "model guidance-order overlay",
             "static guidance-order context",
             "transient guidance-order context",
@@ -4189,6 +4428,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try std.testing.expectEqualStrings("Final guidance-order answer", persisted.assistant);
     try std.testing.expect(std.mem.find(u8, persisted.user.text, "custom tool guidance unique needle") == null);
     try std.testing.expect(std.mem.find(u8, persisted.assistant, "custom tool guidance unique needle") == null);
+    try std.testing.expect(std.mem.find(u8, persisted.user.text, "host guidance-order instructions") == null);
+    try std.testing.expect(std.mem.find(u8, persisted.assistant, "host guidance-order instructions") == null);
 }
 
 test "processQueuedPrompt omits an empty custom tool guidance message" {

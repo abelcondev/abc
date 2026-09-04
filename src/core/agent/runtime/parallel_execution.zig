@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -94,6 +95,7 @@ pub const ParallelRunResult = struct {
 };
 
 pub const ParallelHookExecContext = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     hooks: *const AgentRuntimeDeps,
     turn_id: u64,
     root_user_intent_context: []const u8,
@@ -277,6 +279,7 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
     return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
+        .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
         .call = call,
@@ -322,6 +325,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         };
     }
     var duplicated_execution: ToolExecutionResult = .{
+        .model_content_kind = execution.model_content_kind,
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
         .web_search_completion = execution.web_search_completion,

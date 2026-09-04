@@ -1,4 +1,7 @@
 const std = @import("std");
+const skill_runtime = @import("../../skills/skill_runtime.zig");
+const skill_contract = @import("../../skills/skill_contract.zig");
+const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
@@ -21,7 +24,6 @@ const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
-const tool_projection = @import("../../tooling/tool_projection.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -2006,6 +2008,34 @@ const PreparationClassifierContext = struct {
     deps: *const AgentRuntimeDeps,
 };
 
+fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !?skill_contract.CallPreparation {
+    const tool = deps.tool_registry.lookup(call.name) orelse return null;
+    if (tool.prepare_skill_call_fn == null) return null;
+    const prepare = deps.prepare_skill_call orelse return null;
+    return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => .{ .failure = .{ .model_output = try std.fmt.allocPrint(arena, "skill failed: {s}", .{@errorName(err)}) } },
+    };
+}
+
+fn skillPreparationFailure(arena: Allocator, output: skill_contract.ExecuteOutput) !ToolExecutionResult {
+    var notices: [2][]const u8 = undefined;
+    var count: usize = 0;
+    if (output.notice) |notice| {
+        notices[count] = notice;
+        count += 1;
+    }
+    if (output.diagnostic_notice) |notice| {
+        notices[count] = notice;
+        count += 1;
+    }
+    return .{
+        .status = .failure,
+        .model_output = output.model_output,
+        .context_notices = try arena.dupe([]const u8, notices[0..count]),
+    };
+}
+
 fn preparationExecutionStatus(status: runtime_tool_contracts.ToolExecutionStatus) tool_preparation.ToolStatus {
     return switch (status) {
         .success => .success,
@@ -2442,12 +2472,7 @@ fn appendProviderExecutedToolResult(
     const provider_status = runtime_execution_memory.classifyProviderExecutedResultStatus(
         provider_result,
     );
-    const prepared = try runtime_execution_memory.prepareToolModelOutput(
-        arena,
-        config,
-        call,
-        execution.model_output,
-    );
+    const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, call, execution, null);
     const safe_tool_output = prepared.model_output;
     const visible_id = stream_ctx.provisional_statuses.visibleId(call);
     const ProviderVisibleLifecycle = struct {
@@ -2623,12 +2648,7 @@ fn finishPendingParallelCancelled(
     for (calls, results, status_started, status_terminalized) |call, result, started, terminalized| {
         if (terminalized) continue;
         if (result) |execution| {
-            var prepared = try runtime_execution_memory.prepareToolModelOutput(
-                arena,
-                config,
-                call,
-                execution.model_output,
-            );
+            var prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, call, execution, null);
             runtime_execution_memory.applyToolResultMemory(
                 &prepared.memory,
                 execution.tool_result_memory,
@@ -2748,12 +2768,7 @@ fn finishPendingCancelledCalls(
 ) !void {
     for (calls) |call| {
         if (providerExecutedResult(call)) |execution| {
-            const prepared = try runtime_execution_memory.prepareToolModelOutput(
-                arena,
-                config,
-                call,
-                execution.model_output,
-            );
+            const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, call, execution, null);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -4064,6 +4079,34 @@ test "request output limit follows capability bounds" {
     }
 }
 
+const PreparedSkills = struct {
+    catalog: ?*const skill_runtime.BoundedPromptSection = null,
+    explicit: ?*const skill_invocation.ExplicitPromptSection = null,
+};
+
+fn prepareSkillCatalog(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    context_window: ?u32,
+) !?skill_runtime.BoundedPromptSection {
+    if (config.skill_catalog.skills.len == 0 and config.skill_catalog.diagnostics.len == 0) return null;
+    var namespace_bytes: [8]u8 = undefined;
+    std.Io.random(io_mod.getIo(), &namespace_bytes);
+    var section = try skill_runtime.buildSkillPrompt(
+        alloc,
+        config.skill_catalog.skills,
+        config.skill_catalog.diagnostics,
+        config.context_limits,
+        context_window,
+        std.mem.readInt(u64, &namespace_bytes, .little),
+    );
+    errdefer section.deinit(alloc);
+    if (section.notice) |notice| try deps.pushContextNotice(notice);
+    if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+    return section;
+}
+
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -4142,7 +4185,6 @@ fn processQueuedPromptInner(
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
 
-    try appendStablePromptContext(arena, deps, config, &stable_prefix);
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
@@ -4211,6 +4253,39 @@ fn processQueuedPromptInner(
             return;
         }
     }
+    var skill_section = try prepareSkillCatalog(arena, deps, config, request_capabilities.context_window);
+    defer if (skill_section) |*section| section.deinit(arena);
+    var explicit_section: ?skill_invocation.ExplicitPromptSection = null;
+    defer if (explicit_section) |*section| section.deinit(arena);
+    if (skill_section != null or config.skill_bindings.len > 0) {
+        explicit_section = load_explicit: while (true) {
+            const prepared = skill_invocation.buildExplicitPromptSection(arena, config.skill_catalog, job.prompt, config.skill_bindings, config.context_limits, config.cancel_flag) catch |err| {
+                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) continue :load_explicit;
+                runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
+                var terminal_materializing = false;
+                try runtime_interruption.persistInterruptedTurnOnce(
+                    deps,
+                    finalization,
+                    job,
+                    null,
+                    null,
+                    completed_tool_names.items,
+                    &interrupted_persisted,
+                    finish_trace.ctx,
+                    within_turn_suffix.items,
+                    null,
+                    &terminal_materializing,
+                );
+                finish_trace.finish("interrupted");
+                return;
+            };
+            break :load_explicit prepared;
+        };
+        if (explicit_section.?.notice) |notice| try deps.pushContextNotice(notice);
+        if (explicit_section.?.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+    }
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -4266,6 +4341,7 @@ fn processQueuedPromptInner(
         lifecycle,
         config,
         job,
+        .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
         base_nested_terminal_advertised,
         base_nested_subagent_advertised,
@@ -4623,12 +4699,14 @@ fn appendStablePromptContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
+    skill_catalog_text: ?[]const u8,
     messages: *std.ArrayList(ChatMessage),
 ) !void {
     for ([_][]const u8{
         config.system_prompt,
         config.custom_tool_guidance,
-        config.skills_prompt_section,
+        skill_catalog_text orelse "",
+        config.host_instructions,
     }) |content| {
         if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
     }
@@ -4754,7 +4832,8 @@ pub fn prepareManualCompactionContinuation(
     capabilities: model_capabilities.Capabilities,
 ) !CompactionContinuation {
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
-    try appendStablePromptContext(arena, deps, config, &stable_prefix);
+    const skill_section = try prepareSkillCatalog(arena, deps, config, capabilities.context_window);
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     var overlay: std.ArrayList(ChatMessage) = .empty;
     try deps.append_runtime_context(deps.ctx, arena, &overlay);
     const projection = try build_provider_prompt_with_response_language_control(
@@ -4788,6 +4867,46 @@ pub fn prepareManualCompactionContinuation(
         },
         .handoff_message_index = projection.current_user_index,
     };
+}
+
+test "manual compaction fixed context measures prepared skills and host instructions" {
+    const alloc = std.testing.allocator;
+    const support = @import("tests/support.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var test_deps = support.FakeAgentRuntimeDeps.init(alloc);
+    defer test_deps.deinit();
+    var gateway = support.FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var deps = test_deps.deps();
+    deps.agent_stream_provider = gateway.provider();
+    var fixture = support.PromptFixture{};
+    var config = fixture.config();
+    config.host_instructions = "HOST_COMPACTION_INSTRUCTIONS";
+    config.skill_catalog = .{ .skills = &.{.{
+        .name = "compaction-workflow",
+        .description = "workflow description " ** 100,
+        .path = "/skills/compaction-workflow",
+        .source = .global_fx,
+    }} };
+    const small = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 8_000 });
+    const body = (try deps.agent_stream_provider.buildRequest(arena, small.request)).?;
+    try std.testing.expect(std.mem.find(u8, body, "available_skills") != null);
+    try std.testing.expect(std.mem.find(u8, body, "compaction-workflow") != null);
+    try std.testing.expect(std.mem.find(u8, body, "HOST_COMPACTION_INSTRUCTIONS") != null);
+    const measured = try small.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expectEqual(runtime_prompt_context.measureProviderRequest(body), measured);
+    const large = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 1_000_000 });
+    const large_cost = try large.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expect(large_cost.estimated_input_tokens > measured.estimated_input_tokens);
+    config.skill_catalog = .{ .skills = &.{} };
+    config.host_instructions = "";
+    const without = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 8_000 });
+    const without_cost = try without.measure(arena, deps.agent_stream_provider, "");
+    try std.testing.expect(measured.estimated_input_tokens > without_cost.estimated_input_tokens);
+    try std.testing.expectEqual(@as(usize, 0), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), test_deps.capability_queries.items.len);
 }
 
 pub const ContextCompactionTransactionRequest = struct {
@@ -4933,6 +5052,7 @@ fn processQueuedPromptLoop(
     lifecycle: LifecycleContext,
     config: Config,
     job: QueuedPrompt,
+    skills: PreparedSkills,
     request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
     base_nested_subagent_advertised: bool,
@@ -5174,8 +5294,8 @@ fn processQueuedPromptLoop(
             .none, .interrupt => {},
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (config.explicit_skills_prompt_section.len > 0) {
-            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
+        if (skills.explicit) |section| {
+            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(
@@ -5505,20 +5625,14 @@ fn processQueuedPromptLoop(
                     ));
                 }
             }
-            const turn_tool_projection = try tool_projection.projectForTurn(
-                arena,
-                config.advertised_tool_names,
-                config.advertised_functions,
-                within_turn_suffix.items,
-            );
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
                 .tools = .{
                     .registry = deps.tool_registry,
-                    .advertised_names = turn_tool_projection.advertised_names,
-                    .advertised_functions = turn_tool_projection.advertised_functions,
+                    .advertised_names = config.advertised_tool_names,
+                    .advertised_functions = config.advertised_functions,
                     .selected_dynamic = selected_dynamic_tools.items,
                 },
                 .tool_choice = tool_choice,
@@ -7900,7 +8014,7 @@ fn processQueuedPromptLoop(
         var parallel_skip_until: usize = 0;
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
-            const tool_call = prepared_tool_call.call();
+            var tool_call = prepared_tool_call.call();
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
                 job.permission_mode,
@@ -7950,6 +8064,15 @@ fn processQueuedPromptLoop(
             if (parallel_len > 1) {
                 const parallel_calls = effective_tool_calls[tool_call_index .. tool_call_index + parallel_len];
                 const parallel_prepared = prepared_tool_calls[tool_call_index .. tool_call_index + parallel_len];
+                const parallel_skill_preparations = try arena.alloc(?skill_contract.CallPreparation, parallel_calls.len);
+                @memset(parallel_skill_preparations, null);
+                defer {
+                    for (parallel_calls) |*call| call.resolved_skill = null;
+                    for (parallel_skill_preparations) |maybe_prepared| {
+                        if (maybe_prepared) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
+                    }
+                    arena.free(parallel_skill_preparations);
+                }
                 const precomputed_results = try arena.alloc(?ToolExecutionResult, parallel_calls.len);
                 @memset(precomputed_results, null);
                 const parallel_status_started = try arena.alloc(bool, parallel_calls.len);
@@ -8039,8 +8162,9 @@ fn processQueuedPromptLoop(
                 defer mem_utils.deinitList(arena, &executable_calls);
                 var executable_classification_complete: std.ArrayList(bool) = .empty;
                 defer mem_utils.deinitList(arena, &executable_classification_complete);
-                for (parallel_calls, precomputed_results, 0..) |parallel_call, precomputed, group_index| {
+                for (parallel_calls, precomputed_results, 0..) |unbound_call, precomputed, group_index| {
                     if (precomputed != null) continue;
+                    var parallel_call = unbound_call;
                     if (config.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
@@ -8061,6 +8185,37 @@ fn processQueuedPromptLoop(
                         finish_trace.finish("interrupted");
                         return;
                     }
+                    parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
+                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                        runtime_telemetry.traceCancelObserved(step_ctx, true);
+                        try finishPendingParallelCancelled(
+                            deps,
+                            &stream_ctx.provisional_statuses,
+                            stream_ctx.alloc,
+                            arena,
+                            config,
+                            turn_id,
+                            parallel_calls,
+                            precomputed_results,
+                            parallel_status_started,
+                            parallel_status_terminalized,
+                            advertised_dynamic_tool_names,
+                        );
+                        try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        finish_trace.finish("interrupted");
+                        return;
+                    };
+                    if (parallel_skill_preparations[group_index]) |*prepared| switch (prepared.*) {
+                        .selected => |*skill| {
+                            parallel_call.resolved_skill = skill;
+                            parallel_calls[group_index].resolved_skill = skill;
+                        },
+                        .failure => |output| {
+                            precomputed_results[group_index] = try skillPreparationFailure(arena, output);
+                            continue;
+                        },
+                    };
                     if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(parallel_call.name)) {
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
@@ -8257,6 +8412,7 @@ fn processQueuedPromptLoop(
                         step_batch.pending_user_suffix.items,
                     );
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
+                        .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
                         .turn_id = turn_id,
                         .root_user_intent_context = parallel_execution_root_user_context,
@@ -8396,12 +8552,7 @@ fn processQueuedPromptLoop(
                         .status = .failure,
                         .model_output = blocked.model_output.?,
                     };
-                    const prepared = try runtime_execution_memory.prepareToolModelOutput(
-                        arena,
-                        config,
-                        tool_call,
-                        execution.model_output,
-                    );
+                    const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
                     if (blocked.kind != .malformed_arguments and
                         blocked.kind != .route_unavailable and
                         blocked.kind != .required_vision)
@@ -8708,12 +8859,7 @@ fn processQueuedPromptLoop(
                 tool_call,
                 advertised_dynamic_tool_names,
             )) |execution| {
-                const prepared = try runtime_execution_memory.prepareToolModelOutput(
-                    arena,
-                    config,
-                    tool_call,
-                    execution.model_output,
-                );
+                const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
                 const safe_tool_output = prepared.model_output;
                 _ = try stream_ctx.provisional_statuses.finishExecutedCall(
                     deps,
@@ -8786,7 +8932,7 @@ fn processQueuedPromptLoop(
                         tool_call,
                         execution.model_output,
                     );
-                    const prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
+                    const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
                     const safe_tool_output = prepared.model_output;
                     _ = try stream_ctx.provisional_statuses.finishExecutedCall(
                         deps,
@@ -8823,7 +8969,7 @@ fn processQueuedPromptLoop(
                     continue;
                 }
                 if (try runtime_tool_admission.toolAvailabilityFailure(deps, arena, tool_call)) |execution| {
-                    const prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
+                    const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
                     const safe_tool_output = prepared.model_output;
                     _ = try stream_ctx.provisional_statuses.finishExecutedCall(
                         deps,
@@ -8858,6 +9004,61 @@ fn processQueuedPromptLoop(
                         .{ .increment_error = true },
                     );
                     continue;
+                }
+            }
+            var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
+                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                runtime_telemetry.traceCancelObserved(step_ctx, true);
+                try finishPendingCancelledCalls(
+                    deps,
+                    &stream_ctx.provisional_statuses,
+                    stream_ctx.alloc,
+                    arena,
+                    config,
+                    turn_id,
+                    effective_tool_calls[tool_call_index..],
+                    advertised_dynamic_tool_names,
+                );
+                try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                finish_trace.finish("interrupted");
+                return;
+            };
+            defer if (skill_preparation) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
+            if (skill_preparation) |*skill_prepared| {
+                switch (skill_prepared.*) {
+                    .selected => |*skill| tool_call.resolved_skill = skill,
+                    .failure => |output| {
+                        const execution = try skillPreparationFailure(arena, output);
+                        const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
+                        _ = try stream_ctx.provisional_statuses.finishExecutedCall(
+                            deps,
+                            stream_ctx.alloc,
+                            arena,
+                            turn_id,
+                            tool_call,
+                            false,
+                            tool_display_target,
+                            execution,
+                            prepared.model_output,
+                            prepared.memory,
+                            null,
+                            advertised_dynamic_tool_names,
+                        );
+                        try runtime_tool_admission.recordRejectedToolCall(deps, arena, tool_call, prepared.model_output, null);
+                        for (execution.context_notices) |notice| try deps.pushContextNotice(notice);
+                        try runtime_tool_batch.appendToolResultContent(
+                            arena,
+                            &within_turn_suffix,
+                            &completed_tool_names,
+                            &step_batch,
+                            tool_call,
+                            prepared.model_output,
+                            prepared.memory,
+                            .{ .increment_error = true },
+                        );
+                        continue;
+                    },
                 }
             }
             const is_file_mutation = file_mutation_contract.isToolName(tool_call.name);
@@ -9551,6 +9752,7 @@ fn processQueuedPromptLoop(
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
+                .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
                 .call = execution_call,
@@ -9766,11 +9968,11 @@ fn processQueuedPromptLoop(
             defer if (!replay_handed_off) {
                 execution.command_replay_capture.?.discard(arena);
             };
-            var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
+            var prepared = try runtime_execution_memory.prepareToolExecutionOutput(
                 arena,
                 config,
                 tool_call,
-                execution.model_output,
+                execution,
                 execution.command_replay_capture,
             );
             runtime_execution_memory.applyToolResultMemory(
