@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { spawn as nodeSpawn } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -6273,6 +6273,76 @@ for (const scenario of [
     },
     60_000,
   );
+}
+
+for (const provider of ["codex", "grok"] as const) {
+  test.skipIf(process.platform === "win32")(`${provider} model discovery ignores a FIFO version cache without a writer`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-${provider}-version-fifo-`));
+    const chatgpt = provider === "codex" ? startFakeChatGptOAuth() : undefined;
+    const grok = provider === "grok" ? startFakeGrokOAuth() : undefined;
+    const model = provider === "codex" ? "gpt-5.6-luna" : "grok-4.20";
+    const version = "1.999.1";
+    let releaseRequests = 0;
+    const releases = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        releaseRequests++;
+        return provider === "codex" ? Response.json({ version }) : new Response(version);
+      },
+    });
+    try {
+      if (chatgpt) writeSeededChatGptLogin(home);
+      else writeSeededGrokLogin(home, grok!.initialAccessToken);
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        provider, models: { [provider]: model },
+      }), { mode: 0o600 });
+      mkdirSync(join(home, ".fx/provider-versions"), { mode: 0o700 });
+      const cachePath = join(home, ".fx/provider-versions", `${provider}.json`);
+      expect(spawnSync("mkfifo", ["-m", "600", cachePath]).status).toBe(0);
+      const env = {
+        HOME: home,
+        PATH: "/usr/bin:/bin",
+        FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        ...(chatgpt?.env ?? grok!.env),
+        FX_E2E_CODEX_CLIENT_VERSION: undefined,
+        FX_E2E_GROK_CLIENT_VERSION: undefined,
+        [provider === "codex" ? "FX_E2E_CODEX_VERSION_URL" : "FX_E2E_GROK_VERSION_URL"]:
+          `http://127.0.0.1:${releases.port}/version`,
+      };
+
+      const listed = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(listed.timedOut).toBe(false);
+      expect(listed.code, listed.stderr).toBe(0);
+      expect(JSON.parse(listed.stdout).models.map((entry: { id: string }) => entry.id)).toContain(model);
+      expect(listed.stderr).toBe("");
+      expect(releaseRequests).toBe(1);
+      expect(statSync(cachePath).isFIFO()).toBe(true);
+
+      const asked = await runFx(["ask", "--json", "--auto", "--no-save", "Reply briefly."], { env, timeoutMs: 8000 });
+      expect(asked.timedOut).toBe(false);
+      expect(asked.code, asked.stderr).toBe(0);
+      expect(asked.stdout).toContain(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE");
+      const beforeRepair = releaseRequests;
+      expect(beforeRepair).toBeGreaterThan(1);
+      unlinkSync(cachePath);
+      const repaired = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(repaired.code, repaired.stderr).toBe(0);
+      expect(releaseRequests).toBe(beforeRepair + 1);
+      expect(JSON.parse(readFileSync(cachePath, "utf8")).version).toBe(version);
+      const cached = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(cached.code, cached.stderr).toBe(0);
+      expect(cached.stdout).toBe(repaired.stdout);
+      expect(releaseRequests).toBe(beforeRepair + 1);
+    } finally {
+      chatgpt?.stop();
+      grok?.stop();
+      releases.stop(true);
+    }
+  }, 30_000);
 }
 
 tmuxTest("Codex discovers upstream versions and refreshes models in an open session without a CLI", async () => {
