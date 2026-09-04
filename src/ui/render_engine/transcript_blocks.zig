@@ -226,9 +226,8 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
 
 pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
     return switch (entry) {
-        .raw_bytes => true,
-        .semantic_notice => |notice| notice.visibility == .compact_and_full,
-        else => true,
+        .semantic_notice => |notice| !notice.inline_hidden and notice.visibility == .compact_and_full,
+        inline else => |payload| !payload.inline_hidden,
     };
 }
 
@@ -317,6 +316,7 @@ pub const TranscriptEntry = union(enum) {
     pub const RawBytesEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         bytes: []const u8,
         class: RawEntryClass = .unknown_raw,
         lifecycle_pinned: bool = false,
@@ -325,6 +325,7 @@ pub const TranscriptEntry = union(enum) {
     pub const SemanticNoticeEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         topic: []const u8,
         tone: types.NoticeTone,
         body: []const u8,
@@ -337,6 +338,7 @@ pub const TranscriptEntry = union(enum) {
     pub const UserTurnEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         turn: types.UserTurn,
         skill_tokens: []input_visual_layout.SkillTokenSpan = &.{},
     };
@@ -344,25 +346,35 @@ pub const TranscriptEntry = union(enum) {
     pub const AssistantTurnEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         segments: AssistantTurnSegments,
     };
 
     pub const AssistantTableEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         table: assistant_presentation.TablePayload,
     };
 
     pub const AssistantCodeBlockEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
         block: assistant_presentation.CodeBlockPayload,
     };
 
     pub const AssistantThematicRuleEntry = struct {
         id: u32,
         created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
     };
+
+    pub fn hideInline(self: *TranscriptEntry) void {
+        switch (self.*) {
+            inline else => |*payload| payload.inline_hidden = true,
+        }
+    }
 
     pub fn id(self: TranscriptEntry) u32 {
         return switch (self) {
@@ -2098,7 +2110,7 @@ fn renderEntriesInterruptible(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
-        if (options.shouldOmit(entry_index, entry)) continue;
+        if (!isEntryVisibleInCompactPresentation(entry) or options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
             const block = try normalizeRenderedBlockTail(
                 alloc,

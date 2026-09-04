@@ -6992,6 +6992,37 @@ test "visual epoch reset reanchors at row one and preserves viewport reservation
     try std.testing.expect(std.mem.find(u8, emitted, "\x1b[3J") != null);
     try expectGridContains(&h, "welcome after clear");
     try expectGridNotContains(&h, "old visual epoch");
+    try std.testing.expectEqual(@as(usize, 2), h.shell.entries.items.len);
+
+    var projection = try h.shell.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        h.shell.layout.cols,
+        64,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "old visual epoch"));
+
+    h.shell.closeFullTranscriptState();
+    try h.driveResize(40, 18, 4, true);
+    try expectGridContains(&h, "welcome after clear");
+    try expectGridNotContains(&h, "old visual epoch");
+    _ = try h.shell.appendRawTranscriptEntryClassified(alloc, "new visual epoch\n", .subagent_status);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "new visual epoch");
+    try expectGridNotContains(&h, "old visual epoch");
+
+    try h.driveResize(96, 24, 4, true);
+    try expectGridContains(&h, "new visual epoch");
+    try expectGridNotContains(&h, "old visual epoch");
+    try std.testing.expectEqual(min_rows, h.shell.min_visible_viewport_rows);
 }
 
 test "multi-row replaceable line clears every old visual row on replace" {
