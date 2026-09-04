@@ -1264,17 +1264,6 @@ fn sendUserHistoryTurn(
     }
 }
 
-fn sendUserHistoryText(state: *server.ServerState, alloc: Allocator, session_id: []const u8, user_text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
-    try sendUserHistoryChunk(
-        state,
-        alloc,
-        session_id,
-        acp_types.generateMessageId(&message_id),
-        user_text,
-    );
-}
-
 fn sendUserHistoryChunk(
     state: *server.ServerState,
     alloc: Allocator,
