@@ -112,7 +112,7 @@ The runtime thread never reads or mutates JavaScript values or calls Node-API. I
 
 The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
-Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
+Input and output queues have independent `std.Io.Mutex` protection and condition variables. The ACP reader sleeps while input is empty. An output writer fills available byte capacity, then sleeps until JavaScript drains space. The JSON-RPC writer lock preserves record ordering across these partial writes. Closing the core closes both queues and wakes their waiters before joining the native thread.
 
 Readiness has no callback queue or pending flag. A full socket already contains a wake, so a nonblocking `EAGAIN` needs no retry. Other write failures shut down the writer so the reader observes EOF and fails the runtime instead of hanging. Writes suppress `SIGPIPE`, and descriptors are close-on-exec. This avoids depending on a thread-safe-function dispatcher's drain/idle race.
 
@@ -172,6 +172,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Gateway URL | 16 KiB |
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
+| Encoded output message | 64 MiB |
 | Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
 | Fetch request record | 11,184,812 bytes including body base64 encoding |
 | Fetch response queue | 8 MiB |
@@ -186,9 +187,9 @@ The fetch request budget covers the full model request, including retained histo
 
 Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
 
-Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output overflow causes the ACP runtime to exit with a failure status rather than allowing unbounded native memory growth. Limits must remain checked with overflow-safe subtraction before append operations.
+Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output queue pressure blocks the writer until space is available; a single message does not need to fit the queue. Allocation failure or an oversized output message permanently fails the output transport, notifies JavaScript, closes input, and shuts down host fetch. Later writes cannot publish a successful response after that failure.
 
-The JavaScript adapter drains output to quiescence on every readiness callback. Changes that pause notification or consumption must account for the fixed output bound.
+The JavaScript adapter has one ordered output drain. A shared byte-framing parser preserves UTF-8 characters across native drain boundaries, rejects malformed or oversized records, and waits for SDK event admission before consuming another message. Readiness still services fetch cancellation while output is blocked. The unread event queue applies the same limits and cancellation rules on native and WebAssembly backends. Cancelling a turn releases event admission and discards subsequent cancelled-turn updates while transport framing continues, so the next turn starts on a complete record boundary. Destroying the runtime closes output before joining, including worker cleanup without an active JavaScript reader.
 
 ## Argument and handle safety
 

@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const scripts = [
+  "test-core-output.mjs",
+  "test-core-output-pressure.mjs",
   "test-native-core-ready.mjs",
   "test-native-core-misuse.mjs",
   "test-native-core-workers.mjs",
