@@ -382,6 +382,22 @@ pub fn prepareCapturedToolModelOutput(
     raw_output: []const u8,
     capture: ?*command_replay_store.Capture,
 ) !result_store.PreparedResult {
+    if (std.mem.eql(u8, tool_call.name, "read_tool_result")) {
+        const prepared = try tool_result_limits.prepareUnmaskedModelOutputWithTruncation(
+            arena,
+            tool_call.name,
+            raw_output,
+            config.max_tool_result_bytes,
+        );
+        return .{
+            .model_output = prepared.model_output,
+            .memory = .{
+                .output_bytes = raw_output.len,
+                .stored_output_bytes = prepared.model_output.len,
+                .truncated = prepared.truncated,
+            },
+        };
+    }
     const required_command_replay = if (capture) |candidate|
         candidate.policy() == .required
     else
@@ -1082,6 +1098,43 @@ test "no-save preparation preserves capped success without a result handle" {
     try std.testing.expect(prepared.memory.truncated);
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "tool result truncated") != null);
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "abc123") == null);
+}
+
+test "saved read_tool_result preparation preserves exact secret-like output" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw =
+        "<command_output_query handle=\"fixture.bin\">\n" ++
+        "query: \"TOOL_DATA_TOKEN=\"\n" ++
+        "[stdout]\nTOOL_DATA_TOKEN=0123456789abcdef01234567\n[/stdout]\n" ++
+        "</command_output_query>";
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("read_exact_output", "read_tool_result", "{}"),
+        raw,
+    );
+
+    try std.testing.expectEqualStrings(raw, prepared.model_output);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
+    try std.testing.expect(!prepared.memory.truncated);
+    try std.testing.expect(prepared.memory.output_handle == null);
 }
 
 test "saved preparation externalizes complete redacted output without cap loss" {

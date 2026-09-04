@@ -216,7 +216,7 @@ fn permissionDeniedSuggestion(
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
         .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
-        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; remove literal secret material, use a symbolic reference, or choose a materially different action.",
+        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
