@@ -1412,6 +1412,59 @@ tmuxTest(
   60_000,
 );
 
+for (const scenario of [
+  { name: "bare provider", command: "/provider" },
+  { name: "setup alias", command: "/setup" },
+  { name: "login alias", command: "/login" },
+  { name: "typed provider query", command: "/provider " },
+]) {
+  tmuxTest(`first Enter reports busy provider flow for ${scenario.name}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-picker-busy-"));
+    stderrPath = join(home, "stderr.log");
+    let cancelled = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const encoder = new TextEncoder();
+    gateway = startFakeGateway([() => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"text-delta","delta":"The response remains active.\\n\\n"}\n\n'));
+        heartbeat = setInterval(() => controller.enqueue(encoder.encode(": keep-alive\n\n")), 100);
+      },
+      cancel() {
+        cancelled = true;
+        clearInterval(heartbeat);
+      },
+    }), { headers: { "content-type": "text/event-stream" } })]);
+    try {
+      session = await startFx(home, stderrPath, gateway);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Keep the response active while I inspect provider settings.");
+      await session.waitForText("Generating", TIMEOUT);
+
+      await session.sendText(scenario.command);
+      const notice = "Provider switching is unavailable until active and queued work finishes.";
+      await session.waitForText(notice, TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback.split(notice)).toHaveLength(2);
+      expect(cancelled).toBe(false);
+      expect(gateway.requests).toHaveLength(1);
+
+      await session.sendKeys("C-u");
+      await session.sendKeys("Escape");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.sendText(scenario.command.trim());
+      await session.waitForPane(
+        (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+        TIMEOUT,
+      );
+      expect(cancelled).toBe(true);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }, TIMEOUT * 2);
+}
+
 tmuxTest(
   "unavailable configured credentials remain recoverable in TUI ask and ACP",
   async () => {

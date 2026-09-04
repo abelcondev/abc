@@ -22,11 +22,15 @@ pub const ProviderSwitchFacts = struct {
     queued_prompts: usize,
 };
 
+pub fn provider_work_busy(stream_active: bool, queued_prompts: usize) bool {
+    return stream_active or queued_prompts > 0;
+}
+
 pub fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
     if (facts.intent == .manual and facts.current == facts.target and facts.target_credential_ready) {
         return .no_change;
     }
-    if (facts.stream_active or facts.queued_prompts > 0) return .busy;
+    if (provider_work_busy(facts.stream_active, facts.queued_prompts)) return .busy;
     return .prepare;
 }
 
