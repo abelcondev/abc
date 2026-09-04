@@ -1883,13 +1883,11 @@ for (const [provider, previousProvider] of [
           expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
           expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(preferences);
           await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+          await session.sendKeys("C-u");
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Continue the restored provider session.");
-          const responseDeadline = Date.now() + 10_000;
-          while (responses().length === 0) {
-            if (Date.now() >= responseDeadline) throw new Error("Restored prompt did not reach its provider");
-            await Bun.sleep(25);
-          }
+          await session.waitForPane(() => responses().length > 0, 10_000);
           expect(responses()).toHaveLength(1);
           expect(responses()[0]!.authorization).toBe(`Bearer ${token}`);
           expect(responses()[0]!.body).toContain("Continue the restored provider session.");
