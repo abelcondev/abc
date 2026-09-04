@@ -34,15 +34,7 @@ fn writeChatMessageJson(
     writer: *std.Io.Writer,
     message: ChatMessage,
 ) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, false, null, null, &.{}) catch |err| return err;
-}
-
-fn writeChatMessageJsonCached(
-    scratch_alloc: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    message: ChatMessage,
-) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, true, null, null, &.{}) catch |err| return err;
+    writeChatMessageJsonInner(scratch_alloc, writer, message, null, null, &.{}) catch |err| return err;
 }
 
 pub fn buildGatewayRequestBody(
@@ -348,9 +340,6 @@ fn buildGatewayRequestBodyValidated(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const cache_breakpoint_idx = if (options.prompt_caching) findCacheBreakpoint(messages) else null;
-    var prefix_cacheable = true;
-
     try out.writer.writeAll("{\"prompt\":[");
     var i: usize = 0;
     while (i < messages.len) {
@@ -360,14 +349,10 @@ fn buildGatewayRequestBodyValidated(
         if (message.role == .tool) {
             const results = tool_result_prefix(messages[i..]);
             try write_tool_result_group(&out.writer, results, budget, &ids);
-            for (results) |result| {
-                if (result.cache_policy == .no_cache) prefix_cacheable = false;
-            }
             i += results.len;
             if (budget) |active| try active.check();
             continue;
         }
-        const use_cache = prefix_cacheable and shouldCacheMessage(message, i, cache_breakpoint_idx, options.prompt_caching);
         const verified_images = if (verified_image_override) |override|
             if (override.message_index == i) override.images else null
         else
@@ -376,12 +361,10 @@ fn buildGatewayRequestBodyValidated(
             std.heap.c_allocator,
             &out.writer,
             message,
-            use_cache,
             budget,
             verified_images,
             &ids,
         );
-        if (message.cache_policy == .no_cache) prefix_cacheable = false;
         if (budget) |active| try active.check();
         i += 1;
     }
@@ -474,12 +457,21 @@ fn validatePendingToolReviewMessages(
 }
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
-    if (!options.fast and options.parallel_tool_calls == null) return;
+    const gateway_options = options.fast or options.prompt_caching;
+    if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
-    if (options.fast) try writer.writeAll("\"gateway\":{\"speed\":\"fast\"}");
+    if (gateway_options) {
+        try writer.writeAll("\"gateway\":{");
+        if (options.fast) try writer.writeAll("\"speed\":\"fast\"");
+        if (options.prompt_caching) {
+            if (options.fast) try writer.writeByte(',');
+            try writer.writeAll("\"caching\":\"auto\"");
+        }
+        try writer.writeByte('}');
+    }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
-        if (options.fast) try writer.writeByte(',');
+        if (gateway_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
@@ -627,13 +619,6 @@ fn findToolCallIndex(calls: []const ToolCall, id: []const u8) ?usize {
     return null;
 }
 
-pub fn shouldCacheMessage(message: ChatMessage, index: usize, cache_breakpoint_idx: ?usize, prompt_caching: bool) bool {
-    if (!prompt_caching) return false;
-    if (message.cache_policy == .no_cache) return false;
-    return message.role == .system or (cache_breakpoint_idx != null and index == cache_breakpoint_idx.?);
-}
-
-const anthropic_cache_meta = ",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
 const max_prompt_shape_entries: usize = 12;
 
 fn tool_result_prefix(messages: []const ChatMessage) []const ChatMessage {
@@ -683,7 +668,6 @@ fn writeChatMessageJsonInner(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: ChatMessage,
-    cached: bool,
     budget: ?BuildBudget,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
     ids: *const tool_call_ids.Projection,
@@ -776,7 +760,6 @@ fn writeChatMessageJsonInner(
         },
     }
 
-    if (cached) try writer.writeAll(anthropic_cache_meta);
     try writer.writeAll("}");
 }
 
@@ -895,16 +878,6 @@ fn jsonKindName(value: std.json.Value) []const u8 {
         .array => "array",
         .object => "object",
     };
-}
-
-fn findCacheBreakpoint(messages: []const ChatMessage) ?usize {
-    if (messages.len < 3) return null;
-    var i = messages.len - 2;
-    while (i > 0) : (i -= 1) {
-        const role = messages[i].role;
-        if (role == .user or role == .assistant) return i;
-    }
-    return null;
 }
 
 pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !GatewayCompletion {
@@ -1214,60 +1187,50 @@ test "writeChatMessageJson maps tool result status to the Vercel output variant"
     }
 }
 
-test "writeChatMessageJsonCached adds provider options and non-cached omits them" {
+test "Gateway automatic caching preserves transient context and grouped tool results" {
     const alloc = std.testing.allocator;
-    var cached_out: std.Io.Writer.Allocating = .init(alloc);
-    defer cached_out.deinit();
-    var uncached_out: std.Io.Writer.Allocating = .init(alloc);
-    defer uncached_out.deinit();
-
-    const message: ChatMessage = .{ .role = .system, .content = "rules" };
-    try writeChatMessageJsonCached(alloc, &cached_out.writer, message);
-    try writeChatMessageJson(alloc, &uncached_out.writer, message);
-
-    try std.testing.expect(std.mem.find(u8, cached_out.written(), "\"providerOptions\"") != null);
-    try std.testing.expect(std.mem.find(u8, cached_out.written(), "\"cacheControl\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.find(u8, uncached_out.written(), "providerOptions") == null);
-}
-
-fn promptStringEntryHasCacheControl(body: []const u8, needle: []const u8) !bool {
-    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        .{ .id = "first", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "second", .name = "read_file", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable instructions" },
+        .{ .role = .system, .content = "runtime context" },
+        .{ .role = .user, .content = "read both" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "first", .tool_name = "read_file", .content = "A" },
+        .{ .role = .tool, .tool_call_id = "second", .tool_name = "read_file", .content = "B" },
+    };
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .prompt_caching = true,
+        .fast = true,
+        .parallel_tool_calls = false,
+    }, .auto);
+    defer alloc.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
+    const options = parsed.value.object.get("providerOptions").?.object;
+    const gateway = options.get("gateway").?.object;
+    const caching = gateway.get("caching") orelse return error.TestExpectedAutomaticCaching;
+    try std.testing.expectEqualStrings("auto", caching.string);
+    try std.testing.expectEqualStrings("fast", gateway.get("speed").?.string);
+    try std.testing.expect(!options.get("xai").?.object.get("parallelToolCalls").?.bool);
+    try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqualStrings("runtime context", prompt[1].object.get("content").?.string);
+    const results = prompt[4].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("A", results[0].object.get("output").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("B", results[1].object.get("output").?.object.get("value").?.string);
 
-    const prompt = parsed.value.object.get("prompt") orelse return error.TestExpectedPromptMissing;
-    if (prompt != .array) return error.TestExpectedPromptMissing;
-    for (prompt.array.items) |entry| {
-        if (entry != .object) continue;
-        const content = entry.object.get("content") orelse continue;
-        if (content != .string) continue;
-        if (std.mem.find(u8, content.string, needle) == null) continue;
-        return entry.object.get("providerOptions") != null;
-    }
-    return error.TestExpectedPromptMessageMissing;
-}
-
-test "buildGatewayRequestBodyWithOptions leaves transient system messages uncached" {
-    const alloc = std.testing.allocator;
-    const msgs = [_]ChatMessage{
-        .{ .role = .system, .content = "stable system prompt" },
-        .{ .role = .system, .content = "static project context" },
-        .{ .role = .system, .content = "volatile runtime overlay", .cache_policy = .no_cache },
-        .{ .role = .user, .content = "first question" },
-        .{ .role = .assistant, .content = "answer" },
-        .{ .role = .user, .content = "follow up" },
-    };
-    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &msgs, .{ .prompt_caching = true }, .auto);
-    defer alloc.free(body);
-
-    const cache_marker = "\"cacheControl\":{\"type\":\"ephemeral\"}";
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, cache_marker));
-    try std.testing.expect(try promptStringEntryHasCacheControl(body, "stable system prompt"));
-    try std.testing.expect(try promptStringEntryHasCacheControl(body, "static project context"));
-    try std.testing.expect(!try promptStringEntryHasCacheControl(body, "volatile runtime overlay"));
-
-    const overlay_idx = std.mem.indexOf(u8, body, "volatile runtime overlay") orelse return error.TestExpectedPromptMessageMissing;
-    try std.testing.expect(std.mem.find(u8, body[overlay_idx..], "cacheControl") == null);
+    const default_body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .fast = true,
+        .parallel_tool_calls = false,
+    }, .auto);
+    defer alloc.free(default_body);
+    const without_cache_option = try std.mem.replaceOwned(u8, alloc, body, ",\"caching\":\"auto\"", "");
+    defer alloc.free(without_cache_option);
+    try std.testing.expectEqualStrings(default_body, without_cache_option);
 }
 
 test "buildGatewayRequestBodyWithOptions keeps Anthropic default silent and named effort provider neutral" {
@@ -1562,58 +1525,7 @@ test "formatGatewayRequestShapeSummary reports content kinds without request con
     try std.testing.expect(std.mem.find(u8, mutated_summary, "SECRET_MUTATED_SYSTEM") == null);
 }
 
-test "findCacheBreakpoint returns null for short conversations" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "hi" },
-    };
-    try std.testing.expect(findCacheBreakpoint(&messages) == null);
-}
-
-test "findCacheBreakpoint returns last user/assistant before final message" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "first" },
-        .{ .role = .assistant, .content = "reply" },
-        .{ .role = .user, .content = "second" },
-    };
-    try std.testing.expectEqual(@as(?usize, 2), findCacheBreakpoint(&messages));
-}
-
-test "findCacheBreakpoint skips tool messages" {
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "sys" },
-        .{ .role = .user, .content = "do it" },
-        .{ .role = .assistant, .content = "ok" },
-        .{ .role = .tool, .content = "result", .tool_call_id = "t1", .tool_name = "read_file" },
-        .{ .role = .user, .content = "next" },
-    };
-    try std.testing.expectEqual(@as(?usize, 2), findCacheBreakpoint(&messages));
-}
-
-test "buildGatewayRequestBodyWithOptions includes cache markers for anthropic" {
-    const alloc = std.testing.allocator;
-    const messages = [_]ChatMessage{
-        .{ .role = .system, .content = "system prompt" },
-        .{ .role = .user, .content = "first question" },
-        .{ .role = .assistant, .content = "answer" },
-        .{ .role = .user, .content = "follow up" },
-    };
-    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto);
-    defer alloc.free(body);
-
-    const cache_marker = "\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
-
-    var count: usize = 0;
-    var pos: usize = 0;
-    while (std.mem.find(u8, body[pos..], cache_marker)) |idx| {
-        count += 1;
-        pos += idx + cache_marker.len;
-    }
-    try std.testing.expectEqual(@as(usize, 2), count);
-}
-
-test "buildGatewayRequestBodyWithOptions omits cache markers when disabled" {
+test "buildGatewayRequestBodyWithOptions leaves one-shot caching to the provider" {
     const alloc = std.testing.allocator;
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "system prompt" },
@@ -1623,6 +1535,7 @@ test "buildGatewayRequestBodyWithOptions omits cache markers when disabled" {
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+    try std.testing.expect(std.mem.find(u8, body, "providerOptions") == null);
 }
 
 test "tool result grouping borrows only the leading contiguous results" {
@@ -1693,13 +1606,13 @@ test "gateway request serialization keeps each tool result group together" {
     try std.testing.expectEqualStrings(denial, messages[4].content.?);
 }
 
-test "grouped tool results preserve cache fences and request budgets" {
+test "grouped tool results preserve request budgets with automatic caching" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         .{ .id = "a", .name = "read_file", .arguments_json = "{}" },
         .{ .id = "b", .name = "read_file", .arguments_json = "{}" },
     };
-    var messages = [_]ChatMessage{
+    const messages = [_]ChatMessage{
         .{ .role = .system, .content = "rules" },
         .{ .role = .user, .content = "read" },
         .{ .role = .assistant, .tool_calls = &calls },
@@ -1708,24 +1621,18 @@ test "grouped tool results preserve cache fences and request budgets" {
         .{ .role = .assistant, .content = "summary" },
         .{ .role = .user, .content = "continue" },
     };
-    for ([_]?usize{ null, 3, 4 }) |fence| {
-        messages[3].cache_policy = .default;
-        messages[4].cache_policy = .default;
-        if (fence) |index| messages[index].cache_policy = .no_cache;
-        const body = try buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{});
-        defer alloc.free(body);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-        defer parsed.deinit();
-        const prompt = parsed.value.object.get("prompt").?.array.items;
-        try std.testing.expectEqual(@as(usize, 6), prompt.len);
-        try std.testing.expect(prompt[0].object.contains("providerOptions"));
-        try std.testing.expectEqual(fence == null, prompt[4].object.contains("providerOptions"));
-        try std.testing.expectEqual(@as(usize, 2), prompt[3].object.get("content").?.array.items.len);
-    }
+    const body = try buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 6), prompt.len);
+    try std.testing.expectEqual(@as(usize, 2), prompt[3].object.get("content").?.array.items.len);
+    try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
     var cancel = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Cancelled, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{}, .auto, null, .{ .cancel_flag = &cancel }));
+    try std.testing.expectError(error.Cancelled, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{ .cancel_flag = &cancel }));
     const expired = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(-1) });
-    try std.testing.expectError(error.TimedOut, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{}, .auto, null, .{ .deadline = expired }));
+    try std.testing.expectError(error.TimedOut, buildGatewayRequestBodyWithOptionsAndBudget(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto, null, .{ .deadline = expired }));
 }
 
 fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
@@ -1738,7 +1645,7 @@ fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
         .{ .role = .tool, .tool_call_id = "a", .tool_name = "read_file", .content = "first" },
         .{ .role = .tool, .tool_call_id = "b", .tool_name = "read_file", .content = "second" },
     };
-    const body = buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto) catch |err| switch (err) {
+    const body = buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto) catch |err| switch (err) {
         // The allocation checker expects OOM; this writer has no other failure source.
         error.WriteFailed => return error.OutOfMemory,
         else => return err,

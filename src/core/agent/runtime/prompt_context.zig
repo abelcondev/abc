@@ -354,7 +354,7 @@ pub fn buildProviderPrompt(
     errdefer messages.deinit(alloc);
 
     try instructions.appendSlice(alloc, stable_prefix);
-    try appendEphemeralOverlayMessages(alloc, &instructions, ephemeral_overlay);
+    try instructions.appendSlice(alloc, ephemeral_overlay);
     try messages.appendSlice(alloc, durable_history);
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
@@ -362,14 +362,6 @@ pub fn buildProviderPrompt(
         .instructions = instructions,
         .messages = messages,
     };
-}
-
-fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(ChatMessage), ephemeral_overlay: []const ChatMessage) !void {
-    for (ephemeral_overlay) |overlay_message| {
-        var copy = overlay_message;
-        copy.cache_policy = .no_cache;
-        try messages.append(alloc, copy);
-    }
 }
 
 test "buildProviderPrompt separates instructions from chronological messages" {
@@ -402,7 +394,6 @@ test "buildProviderPrompt separates instructions from chronological messages" {
     try std.testing.expectEqualStrings("history assistant answer", prompt.messages.items[1].content.?);
     try std.testing.expectEqualStrings("current user prompt", prompt.messages.items[2].content.?);
     try std.testing.expectEqualStrings("within turn assistant", prompt.messages.items[3].content.?);
-    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, prompt.instructions.items[2].cache_policy);
 }
 
 test "buildProviderPrompt keeps compacted session context out of instructions" {

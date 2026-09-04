@@ -1482,7 +1482,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
-        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]", .cache_policy = .no_cache },
+        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]" },
         .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
     };
 
@@ -1492,7 +1492,6 @@ test "shell request projection wraps eligible flat objects without changing sour
     try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
     try std.testing.expectEqualStrings("assistant", projected[1].content.?);
     try std.testing.expectEqualStrings("[]", projected[1].provider_state_json.?);
-    try std.testing.expectEqual(.no_cache, projected[1].cache_policy);
     try std.testing.expectEqualStrings("keep result", projected[2].content.?);
     for (cases, 0..) |case, index| {
         try std.testing.expectEqualStrings(case.expected, projected[1].tool_calls[index].arguments_json);
@@ -2830,7 +2829,6 @@ fn appendRecoveryConversationContext(
     try messages.append(alloc, .{
         .role = .user,
         .content = prompt,
-        .cache_policy = .no_cache,
     });
 }
 
@@ -2853,7 +2851,6 @@ test "recovery conversation context is chronological and system free" {
         try std.testing.expectEqual(@as(usize, 2), messages.items.len);
         try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
         try std.testing.expectEqualStrings(continue_response_recovery_prompt, messages.items[1].content.?);
-        try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[1].cache_policy);
     }
 
     const prompted = [_]model_response_recovery.Strategy{
@@ -2868,7 +2865,6 @@ test "recovery conversation context is chronological and system free" {
         try appendRecoveryConversationContext(alloc, &messages, strategy);
         try std.testing.expectEqual(@as(usize, 2), messages.items.len);
         try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-        try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[1].cache_policy);
     }
 
     for ([_]model_response_recovery.Strategy{ .pause, .stop }) |strategy| {
@@ -2906,7 +2902,6 @@ fn build_provider_prompt_with_response_language_control(
         projected[ephemeral_overlay.len] = .{
             .role = .system,
             .content = response_language_control,
-            .cache_policy = .no_cache,
         };
         break :blk projected;
     } else ephemeral_overlay;
@@ -2926,7 +2921,6 @@ fn build_provider_prompt_with_response_language_control(
         try prompt.messages.append(alloc, .{
             .role = .user,
             .content = response_language_correction_control,
-            .cache_policy = .no_cache,
         });
     }
     return .{
@@ -4583,7 +4577,6 @@ fn buildProviderPromptForCompactionWindow(
     try compacted_history.append(alloc, .{
         .role = .user,
         .content = handoff.?,
-        .cache_policy = .no_cache,
     });
     try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildProviderPrompt(
@@ -4762,7 +4755,7 @@ pub fn prepareManualCompactionContinuation(
         stable_prefix.items,
         overlay.items,
         &.{},
-        .{ .role = .user, .content = "", .cache_policy = .no_cache },
+        .{ .role = .user, .content = "" },
         &.{},
         config.origin,
         config.enforce_response_language,
@@ -4771,6 +4764,8 @@ pub fn prepareManualCompactionContinuation(
         &.{},
         0,
     );
+    var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
+    provider_options.prompt_caching = true;
     return .{
         .request = .{
             .model = model,
@@ -4782,7 +4777,7 @@ pub fn prepareManualCompactionContinuation(
                 .advertised_functions = config.advertised_functions,
             },
             .tool_choice = config.first_call_tool_choice,
-            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode),
+            .provider_options = provider_options,
             .max_output_tokens = request_max_output_tokens(capabilities),
             .budget = .{ .cancel_flag = config.cancel_flag },
         },
@@ -5482,7 +5477,8 @@ fn processQueuedPromptLoop(
                 subagent_request_messages,
             );
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            provider_opts.prompt_caching = true;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
@@ -6392,7 +6388,6 @@ fn processQueuedPromptLoop(
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
                     .content = assistant_prefill_recovery_prompt,
-                    .cache_policy = .no_cache,
                 });
                 debug_trace.eventf(
                     "gateway",
@@ -9933,7 +9928,6 @@ fn processQueuedPromptLoop(
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
                     .content = notice,
-                    .cache_policy = .no_cache,
                 });
             }
             if (execution.interactive_notice) |notice| {

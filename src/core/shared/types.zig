@@ -1055,11 +1055,6 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
-pub const ChatCachePolicy = enum {
-    default,
-    no_cache,
-};
-
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1073,7 +1068,6 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
-    cache_policy: ChatCachePolicy = .default,
 };
 
 pub const Usage = struct {
