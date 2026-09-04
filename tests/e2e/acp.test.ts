@@ -1326,6 +1326,97 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP cancellation preserves earlier preview while replacement language is rejected",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-rejected-replacement-");
+      const tracePath = join(root.root, "trace.log");
+      const partialText = "The accepted English preview before the connection stopped.";
+      const rejectedText = "我会先检查锁文件和依赖清单。";
+      const laterText = "The later English answer is complete.";
+      const heldReplacement = new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            `data: ${JSON.stringify({ type: "text-delta", id: "replacement", delta: rejectedText })}\n\n`,
+          ));
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+      const gateway = startFakeGateway([
+        partialEofResponse(partialText),
+        heldReplacement,
+        finalText(laterText),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "sse",
+          },
+        });
+        const sessionId = await startCodeSession(client);
+        sendPrompt(client, 40, "Explain the repository findings in English without using tools.");
+        await waitForCondition("both response text events", () => {
+          if (!existsSync(tracePath)) return false;
+          return (readFileSync(tracePath, "utf8").match(/event type=text-delta/g) ?? []).length === 2;
+        }, TIMEOUT);
+        expect(client.rawLines.join("\n")).toContain(partialText);
+        expect(client.rawLines.join("\n")).not.toContain(rejectedText);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).not.toContain(partialText);
+
+        client.send({ jsonrpc: "2.0", id: 41, method: "session/cancel", params: {} });
+        const responses = new Map<number, any>();
+        while (responses.size < 2) {
+          const message = await client.readLine() as any;
+          if (message.id === 40 || message.id === 41) responses.set(message.id, message);
+        }
+        expect(responses.get(40)?.result?.stopReason).toBe("cancelled");
+        expect(responses.get(41)?.result).toBeNull();
+        expect(gateway.requests).toHaveLength(2);
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 50);
+        client.send({
+          jsonrpc: "2.0",
+          id: 51,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loaded: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 51) {
+            expect(message.error).toBeUndefined();
+            break;
+          }
+          loaded.push(message);
+        }
+        expect(occurrenceCount(JSON.stringify(loaded), partialText)).toBe(1);
+        expect(JSON.stringify(loaded)).not.toContain(rejectedText);
+
+        const later = await runPrompt(client, "Return another English answer.", TIMEOUT);
+        expect(later.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(later.messages)).toContain(laterText);
+        expect(JSON.stringify(later.messages)).not.toContain(partialText);
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body).toContain(partialText);
+        expect(gateway.requests[2]!.body).not.toContain(rejectedText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP sends continuation text normally with the full tool surface",
     async () => {
       const root = createIsolatedRoot("fx-acp-continuation-text-");
