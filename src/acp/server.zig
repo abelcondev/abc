@@ -820,9 +820,10 @@ pub fn runWithTransport(
         }
 
         dispatch(&state, alloc, &msg) catch |err| {
+            const auth_notice = auth_runtime.preparationFailureNotice(err);
             state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = @errorName(err),
+                .code = if (auth_notice != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+                .message = auth_notice orelse @errorName(err),
             }) catch break;
         };
         if (state.terminate_connection) break;
@@ -1764,6 +1765,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    if (state.cfg.auth_mode == .local and startup.credential == null and
+        !(startup.provider == .gateway and state.cfg.credential_override != null))
+    {
+        if (startup.credential_load_failure) |failure| {
+            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+        }
+    }
     if (!state.cfg.minimal_kernel) {
         try app_lifecycle.applyWorkspaceLaunch(
             &startup,
