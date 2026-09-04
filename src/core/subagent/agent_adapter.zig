@@ -1,4 +1,6 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -46,8 +48,7 @@ pub const Config = struct {
     provider_set: provider_set.Set,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
-    skills_prompt_section: []const u8 = "",
-    explicit_skills_prompt_section: []const u8 = "",
+    skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -275,8 +276,7 @@ pub fn run(
         .{
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
-            .skills_prompt_section = config.skills_prompt_section,
-            .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
+            .skill_catalog = config.skill_catalog,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -366,6 +366,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
@@ -578,6 +579,11 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(

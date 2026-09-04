@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../core/skills/skill_contract.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
@@ -749,32 +750,11 @@ pub fn handlePrompt(
     );
     defer alloc.free(owned_prompt);
 
-    var bounded_skills = try state.skills.buildRoutedSystemPromptSection(alloc, owned_prompt, state.context_limits);
-    defer bounded_skills.deinit(alloc);
-    if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
+    var skill_catalog = state.skills.acquireCatalog();
+    defer skill_catalog.deinit();
+    const host_instructions = try alloc.dupe(u8, state.host_instructions);
+    defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    const skills_section = bounded_skills.text;
-    const combined_skills_section = if (state.host_instructions.len == 0)
-        skills_section
-    else if (skills_section.len == 0)
-        state.host_instructions
-    else
-        try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ skills_section, state.host_instructions });
-    defer if (state.host_instructions.len > 0 and skills_section.len > 0) {
-        alloc.free(@constCast(combined_skills_section));
-    };
-
-    var explicit_skills = try skill_invocation.buildExplicitPromptSection(
-        alloc,
-        .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
-        owned_prompt,
-        &.{},
-        state.context_limits,
-    );
-    defer explicit_skills.deinit(alloc);
-    if (explicit_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
     session.session_rt.setConversationLanguageFromUserMessage(owned_prompt);
     const context_history = try session.session_rt.snapshotHistory(alloc);
@@ -851,8 +831,8 @@ pub fn handlePrompt(
         false;
     ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
-        .skills_prompt_section = combined_skills_section,
-        .explicit_skills_prompt_section = explicit_skills.text,
+        .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
+        .host_instructions = host_instructions,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
@@ -926,28 +906,15 @@ pub fn runSubagentChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
-    var bounded_skills = state.skills.buildRoutedSystemPromptSection(
-        alloc,
-        message.content,
-        state.context_limits,
-    ) catch return error.OutOfMemory;
-    defer bounded_skills.deinit(alloc);
-    var explicit_skills = skill_invocation.buildExplicitPromptSection(
-        alloc,
-        .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
-        message.content,
-        &.{},
-        state.context_limits,
-    ) catch return error.OutOfMemory;
-    defer explicit_skills.deinit(alloc);
+    var skill_catalog = state.skills.acquireCatalog();
+    defer skill_catalog.deinit();
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skills_prompt_section = bounded_skills.text,
-        .explicit_skills_prompt_section = explicit_skills.text,
+        .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
@@ -982,8 +949,8 @@ fn refreshProjectContext(
 }
 
 const AgentConfigSections = struct {
-    skills_prompt_section: []const u8,
-    explicit_skills_prompt_section: []const u8,
+    host_instructions: []const u8 = "",
+    skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8,
@@ -997,9 +964,9 @@ fn buildAgentConfig(
 ) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.system_prompt,
+        .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
-        .skills_prompt_section = sections.skills_prompt_section,
-        .explicit_skills_prompt_section = sections.explicit_skills_prompt_section,
+        .skill_catalog = sections.skill_catalog,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
@@ -1337,6 +1304,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -1548,6 +1516,11 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -4814,8 +4787,6 @@ test "ACP prompt agent config carries request options from active session" {
 
     const session = &state.active_session.?;
     const config = buildAgentConfig(&state, session, .{
-        .skills_prompt_section = "",
-        .explicit_skills_prompt_section = "",
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",

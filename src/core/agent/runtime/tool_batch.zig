@@ -164,7 +164,7 @@ pub fn assembleParallelToolResults(
                 },
             }
         };
-        var prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, original_call, execution.model_output);
+        var prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, original_call, execution, null);
         runtime_execution_memory.applyToolResultMemory(
             &prepared.memory,
             execution.tool_result_memory,

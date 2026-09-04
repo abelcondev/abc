@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -715,6 +716,8 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -2510,6 +2513,15 @@ test "dupeToolCall preserves argument integrity" {
     defer freeToolCall(std.testing.allocator, copy);
 
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "dupeToolCall drops action scoped skill bindings" {
+    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
+    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 
 test "ToolArgumentIntegrity accepts complete serialized JSON roots" {

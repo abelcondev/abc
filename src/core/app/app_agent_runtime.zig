@@ -956,48 +956,16 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
             defer preflight_context_notices.deinit();
-            var postflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-            defer postflight_context_notices.deinit();
             for (job.context_snapshot.notices) |notice| {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
             var skill_catalog = app.skills.acquireCatalog();
-            var skill_catalog_owned = true;
-            defer if (skill_catalog_owned) skill_catalog.deinit();
-            var bounded_skills = try skill_catalog.buildRoutedSystemPromptSection(
-                std.heap.c_allocator,
-                job.prompt,
-                if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
-            );
-            defer bounded_skills.deinit(std.heap.c_allocator);
-            if (bounded_skills.notice) |notice| {
-                try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
-            }
-            if (bounded_skills.diagnostic_notice) |notice| {
-                try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
-            }
-            const skills_section = bounded_skills.text;
+            defer skill_catalog.deinit();
             const explicit_bindings = try std.heap.c_allocator.alloc(skill_invocation.ExplicitBinding, job.skill_bindings.len);
             defer std.heap.c_allocator.free(explicit_bindings);
             for (job.skill_bindings, 0..) |binding, index| {
                 explicit_bindings[index] = .{ .name = binding.name, .path = binding.path };
-            }
-            var explicit_skills = try skill_invocation.buildExplicitPromptSection(
-                std.heap.c_allocator,
-                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
-                job.prompt,
-                explicit_bindings,
-                if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
-            );
-            defer explicit_skills.deinit(std.heap.c_allocator);
-            skill_catalog.deinit();
-            skill_catalog_owned = false;
-            if (explicit_skills.notice) |notice| {
-                try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
-            }
-            if (explicit_skills.diagnostic_notice) |notice| {
-                try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
             }
             if (preflight_context_notices.written().len > 0) {
                 try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
@@ -1038,22 +1006,14 @@ pub fn Runtime(comptime App: type) type {
             const config = buildQueuedPromptConfig(
                 app,
                 job,
-                skills_section,
-                explicit_skills.text,
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
+                explicit_bindings,
                 gateway_retry_count,
                 gateway_chat_url,
                 &tool_projection,
                 session_child_capability,
             );
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
-            if (postflight_context_notices.written().len > 0) {
-                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                    .topic = "context",
-                    .tone = .warning,
-                    .body = postflight_context_notices.written(),
-                    .visibility = .full_only,
-                });
-            }
             try process_result;
         }
 
@@ -1193,24 +1153,7 @@ pub fn Runtime(comptime App: type) type {
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
             var skill_catalog = app.skills.acquireCatalog();
-            var skill_catalog_owned = true;
-            defer if (skill_catalog_owned) skill_catalog.deinit();
-            var bounded_skills = skill_catalog.buildRoutedSystemPromptSection(
-                alloc,
-                message.content,
-                if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
-            ) catch return error.OutOfMemory;
-            defer bounded_skills.deinit(alloc);
-            var explicit_skills = skill_invocation.buildExplicitPromptSection(
-                alloc,
-                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
-                message.content,
-                &.{},
-                if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
-            ) catch return error.OutOfMemory;
-            defer explicit_skills.deinit(alloc);
-            skill_catalog.deinit();
-            skill_catalog_owned = false;
+            defer skill_catalog.deinit();
             const prompt_policy = app.promptPolicy();
             var tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
             tool_context.managed_executions = turn.managedExecutionRuntime();
@@ -1242,8 +1185,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
-                .skills_prompt_section = bounded_skills.text,
-                .explicit_skills_prompt_section = explicit_skills.text,
+                .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 .advertised_tool_names = child_projection.advertised_names,
                 .advertised_functions = child_projection.advertised_functions,
                 .custom_tool_guidance = child_projection.custom_guidance,
@@ -1271,8 +1213,8 @@ pub fn Runtime(comptime App: type) type {
         fn buildQueuedPromptConfig(
             app: *App,
             job: worker_runtime.QueuedPrompt,
-            skills_section: []const u8,
-            explicit_skills_section: []const u8,
+            catalog: skill_invocation.Catalog,
+            bindings: []const skill_invocation.ExplicitBinding,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
             tool_projection: *const tool_projection_mod.EffectiveToolProjection,
@@ -1282,8 +1224,8 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
-                .skills_prompt_section = skills_section,
-                .explicit_skills_prompt_section = explicit_skills_section,
+                .skill_catalog = catalog,
+                .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,
                 .recovery_pause_flag = if (comptime @hasField(@TypeOf(app.worker), "worker_recovery_pause_requested"))
                     &app.worker.worker_recovery_pause_requested
@@ -3082,7 +3024,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .custom_guidance = custom_guidance,
     };
     defer tool_projection.deinit(alloc);
-    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, "", "", 1, test_gateway_chat_url, &tool_projection, null);
+    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, .{ .skills = &.{} }, &.{}, 1, test_gateway_chat_url, &tool_projection, null);
 
     try std.testing.expect(config.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
