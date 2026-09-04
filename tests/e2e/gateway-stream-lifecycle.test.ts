@@ -4850,7 +4850,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   for (const trigger of ["automatic", "manual"] as const) {
     test.skipIf(!tmuxAvailable())(
-      `oversized result retrieval survives ${trigger} compaction and restart`,
+      `oversized result retrieval survives empty ${trigger} summary recovery and restart`,
       async () => {
         const root = createFixtureRoot(`retrieval-compaction-${trigger}`);
         const tracePath = join(root.root, "trace.log");
@@ -4869,6 +4869,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             compactions++;
             snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
             expect(snapshotHandle).not.toBe("");
+            if (compactions === 1) return fakeGatewayFinalText("");
             return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
           }
           switch (step++) {
@@ -4896,7 +4897,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             }
             case 3:
               if (trigger === "automatic") {
-                expect(compactions).toBe(1);
+                expect(compactions).toBe(2);
                 expect(body).toContain("context_handoff");
               }
               return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
@@ -4927,7 +4928,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             expect(compacted).not.toContain("request failed:");
             expect(compacted).toContain("Context compacted.");
           }
-          expect(compactions).toBe(1);
+          expect(compactions).toBe(2);
+          const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
+          expect(summaryRequests).toHaveLength(2);
+          expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
           await tui.sendText("/quit");
           expect(await tui.waitForSessionEnd(15000)).toBe(true);
           tui = null;
@@ -4945,7 +4949,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
-          expect(gateway.requests).toHaveLength(7);
+          expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
           expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
         } finally {
@@ -5296,6 +5300,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(tracePath, "utf8")).not.toContain(
           "[context_compaction] event=installed",
         );
+        responses.push(fakeGatewayFinalText(""), fakeGatewayFinalText(""));
+        await tui.sendText("/compact");
+        const failedSummary = await tui.waitForPane(
+          (pane) => pane.includes("context was kept") && hasEmptyComposer(pane),
+          15_000,
+        );
+        expect(failedSummary.replace(/\s+/g, " ")).toContain("Try /compact again or send a follow-up");
+        expect(gateway.requests).toHaveLength(6);
+        const afterFailure = await runFx(["session", "--id", sessionId, "--json"], {
+          cwd: root.workspace, env: { HOME: root.home },
+        });
+        expect(afterFailure.code).toBe(0);
+        expect(JSON.parse(afterFailure.stdout).history).toHaveLength(3);
+        expect(JSON.parse(afterFailure.stdout).history.some((turn: { kind: string }) => turn.kind === "compacted_summary")).toBe(false);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         held.dispose();

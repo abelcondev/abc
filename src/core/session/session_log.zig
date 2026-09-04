@@ -1862,6 +1862,7 @@ pub const CommitPosition = session_replay.CommitPosition;
 
 test {
     _ = session_replay;
+    _ = session_permission_state;
 }
 
 pub const CleanupReport = struct {
@@ -2323,6 +2324,37 @@ pub fn importLegacySnapshotState(
     );
 }
 
+fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
+    var discarded: usize = 0;
+    for (history) |*turn| {
+        const execution = switch (turn.*) {
+            .assistant => |*entry| &entry.execution,
+            .interrupted => |*entry| &entry.execution,
+            .compacted_summary => continue,
+        };
+        const files = execution.files;
+        var retained_count: usize = 0;
+        for (files) |file| if (file.path.len > 0) {
+            retained_count += 1;
+        };
+        if (retained_count == files.len) continue;
+        const retained = try alloc.alloc(types.FileEvidence, retained_count);
+        var index: usize = 0;
+        for (files) |file| {
+            if (file.path.len == 0) {
+                types.freeFileEvidence(alloc, file);
+            } else {
+                retained[index] = file;
+                index += 1;
+            }
+        }
+        discarded += files.len - retained_count;
+        alloc.free(files);
+        execution.files = retained;
+    }
+    return discarded;
+}
+
 fn importLegacySnapshotStateWithOps(
     alloc: Allocator,
     writable: *WritableSessionDir,
@@ -2333,8 +2365,17 @@ fn importLegacySnapshotStateWithOps(
     metadata_ops: io_mod.DurableOps,
 ) !LoadedWritableSession {
     try recoverInterruptedLegacyImport(alloc, writable);
-    var converted = try state.dupe(alloc);
+    var migrated_permissions = if (state.permission_state.version != session_permission_state.schema_version)
+        try session_permission_state.migrateV1ToV2(alloc, state.permission_state)
+    else
+        null;
+    defer if (migrated_permissions) |*permissions| permissions.deinit(alloc);
+    var import_state = state;
+    if (migrated_permissions) |permissions| import_state.permission_state = permissions;
+    var converted = try import_state.dupe(alloc);
     errdefer converted.deinit(alloc);
+    const discarded = try discardEmptyLegacyFileEvidence(alloc, converted.history);
+    if (discarded > 0) debug_trace.logf("session", "legacy import discarded file evidence count={d} reason=empty_path", .{discarded});
     try projectConversationSnapshotLocators(alloc, converted.history);
 
     const display_path = try io_mod.dirRealpathAlloc(
@@ -3537,6 +3578,115 @@ test "legacy import recovery restores old authority or keeps published current d
         try std.testing.expectEqualStrings(current, retained);
         try std.testing.expect(!try legacyImportRecoveryNeeded(&writable.dir));
     }
+}
+
+test "legacy import migrates permissions before publishing controls" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-permission-import", 20);
+    defer initial.deinit(alloc);
+    initial.permission_state.version = 1;
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("existing question") },
+        .assistant = @constCast("existing answer"),
+    } }};
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqual(@as(u8, 2), migrated.state.permission_state.version);
+        try std.testing.expectEqual(@as(u8, 1), initial.permission_state.version);
+        try std.testing.expectEqualStrings("existing answer", migrated.state.history[0].assistant.assistant);
+    }
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), reopened.state.permission_state.version);
+    try std.testing.expectEqualStrings("existing question", reopened.state.history[0].assistant.user.text);
+}
+
+test "legacy import omits empty file paths without losing execution history" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-empty-file-import", 20);
+    defer initial.deinit(alloc);
+    var calls = [_]types.ToolCall{.{ .id = "recorded-read", .name = "read_file", .arguments_json = "{\"path\":\"source.txt\"}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recorded-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("recorded output"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]types.FileEvidence{
+        .{ .path = @constCast("source.txt"), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+        .{ .path = @constCast(""), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+        .{ .path = @constCast("before.txt"), .new_path = @constCast("after.txt"), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+    };
+    const history = [_]session.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("read existing file") }, .assistant = @constCast("read finished"), .execution = .{ .tool_steps = &steps, .files = &files } } },
+        .{ .interrupted = .{ .user = .{ .text = @constCast("cancelled follow-up") }, .execution = .{ .files = files[1..2] } } },
+    };
+    try std.testing.expectError(error.InvalidConversationEvent, session_event.encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 20,
+        .event = .{ .turn_completed = .{ .files = &files } },
+    }));
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), initial.history[0].assistant.execution.files.len);
+        try std.testing.expectEqualStrings("", initial.history[0].assistant.execution.files[1].path);
+    }
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    const execution = reopened.state.history[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), reopened.state.history.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings("recorded-read", execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("recorded output", execution.tool_steps[0].tool_results[0].preview.?);
+    try std.testing.expectEqual(@as(usize, 2), execution.files.len);
+    try std.testing.expectEqualStrings("source.txt", execution.files[0].path);
+    try std.testing.expectEqualStrings("before.txt", execution.files[1].path);
+    try std.testing.expectEqualStrings("after.txt", execution.files[1].new_path.?);
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.history[1].interrupted.execution.files.len);
+    try std.testing.expectEqualStrings("cancelled follow-up", reopened.state.history[1].interrupted.user.text);
+}
+
+test "legacy import file projection cleans up allocation failures" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            const files = [_]types.FileEvidence{
+                .{ .path = @constCast(""), .new_path = @constCast("unusable.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
+                .{ .path = @constCast("retained.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
+            };
+            var history = [_]session.HistoryTurn{.{ .assistant = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast("response"),
+                .execution = .{ .files = try types.dupeFileEvidenceSlice(alloc, &files) },
+            } }};
+            defer types.freeFileEvidenceSlice(alloc, history[0].assistant.execution.files);
+            try std.testing.expectEqual(@as(usize, 1), try discardEmptyLegacyFileEvidence(alloc, &history));
+            try std.testing.expectEqualStrings("retained.txt", history[0].assistant.execution.files[0].path);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "legacy import preserves the active retained tail and complete archive" {

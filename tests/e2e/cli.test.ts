@@ -4278,7 +4278,10 @@ describe("cli: ask success", () => {
                 truncated: false, provider_native: false, created_at_ms: 2, permission_feedback: [],
               }],
             }],
-            files: [], steering: [],
+            files: [
+              { path: "", new_path: null, tool_call_id: "legacy-read", tool_name: "read_file", action: "unknown", status: "success", model_view_covers_full_file: false, stale: false },
+              { path: "past.txt", new_path: null, tool_call_id: "legacy-read", tool_name: "read_file", action: "unknown", status: "success", model_view_covers_full_file: false, stale: false },
+            ], steering: [],
           },
         }];
         writeFileSync(legacyPath, JSON.stringify(legacy) + "\n", { mode: 0o600 });
@@ -4297,7 +4300,7 @@ describe("cli: ask success", () => {
           ["ask", "--json", "--auto", "--resume-id", sessionId, "Convert and continue."],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
-        expect(first.code).toBe(0);
+        expect(first.code, first.stderr + first.stdout).toBe(0);
         expect(first.stderr).toBe("");
         expect(JSON.parse(first.stdout)).toMatchObject({
           session_id: sessionId,
@@ -4351,6 +4354,8 @@ describe("cli: ask success", () => {
         expect(preserved.call_id).toBe("legacy-read");
         expect(preserved.completeness).not.toBe("complete");
         expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
+        const files = records.find((record) => record.event.turn_completed)?.event.turn_completed.files;
+        expect(files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
