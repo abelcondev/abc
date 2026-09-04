@@ -7057,6 +7057,7 @@ test "processQueuedPrompt preserves provider state during silent-tool continuati
                 &.{previous},
                 null,
                 .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 },
+                .{},
             );
             try std.testing.expectEqualStrings(state[1 .. state.len - 1], wire.written());
         }
