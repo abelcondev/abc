@@ -28,6 +28,7 @@ const ProviderSwitchDecision = auth_transition.ProviderSwitchDecision;
 const ProviderSwitchIntent = auth_transition.ProviderSwitchIntent;
 const ProviderSwitchFacts = auth_transition.ProviderSwitchFacts;
 const decideProviderSwitch = auth_transition.decideProviderSwitch;
+const provider_busy_message = "Provider switching is unavailable until active and queued work finishes.";
 
 fn providerFailureMessage(
     intent: ProviderSwitchIntent,
@@ -372,10 +373,23 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Reports blocked provider interaction without changing the composer.
+        pub fn reject_provider_picker_if_busy(app: *App) !bool {
+            if (!auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) return false;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .neutral,
+                .body = provider_busy_message,
+            }, true);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn beginProviderPickerInventoryRefresh(
             app: *App,
             destination: auth_runtime.InventoryRefreshDestination,
         ) !void {
+            if (try reject_provider_picker_if_busy(app)) return;
             switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
                 .provider = provider_runtime.provider(app),
                 .destination = destination,
@@ -398,6 +412,10 @@ pub fn Runtime(comptime App: type) type {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
                 .ready => |action| {
+                    if (action.destination != .auth_picker and try reject_provider_picker_if_busy(app)) {
+                        debug_trace.logf("auth", "provider picker publication dropped destination={t} reason=work_in_progress", .{action.destination});
+                        return;
+                    }
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
                         const body = try std.fmt.allocPrint(
@@ -996,7 +1014,7 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .warning,
                         .body = providerFailureMessage(
                             intent,
-                            "Provider switching is unavailable until active and queued work finishes.",
+                            provider_busy_message,
                             "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                         ),
                     }, true);
@@ -1130,13 +1148,13 @@ pub fn Runtime(comptime App: type) type {
             var owned_model = try app.alloc.dupe(u8, selected_model);
             errdefer app.alloc.free(owned_model);
 
-            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+            if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
                     .body = providerFailureMessage(
                         intent,
-                        "Provider switching is unavailable until active and queued work finishes.",
+                        provider_busy_message,
                         "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                     ),
                 }, true);
@@ -2380,6 +2398,15 @@ const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
     selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
+    input_runtime: @import("../input/runtime.zig").Runtime = .{},
+    stream: struct { active: bool = false } = .{},
+    worker: struct {
+        queued_prompts: usize = 0,
+
+        fn queuedPromptCount(self: @This()) usize {
+            return self.queued_prompts;
+        }
+    } = .{},
     model_cache: TestModelCache = .{},
     session: struct {
         usage: TestUsage = .{},
@@ -2397,6 +2424,7 @@ const TestApp = struct {
     } = .{},
 
     fn deinit(self: *TestApp) void {
+        self.input_runtime.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
     }
 
@@ -2469,6 +2497,78 @@ test "login queues the inline picker until its asynchronous inventory refresh co
     try Runtime(TestApp).collectSourceInventoryFacts(&app);
     try std.testing.expect(!app.auth.picker_opened);
     try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "provider picker rejects active and queued work before refreshing inventory" {
+    const cases = [_]struct { active: bool, queued: usize }{
+        .{ .active = true, .queued = 0 },
+        .{ .active = false, .queued = 1 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |login| {
+            var app: TestApp = .{};
+            defer app.deinit();
+            app.stream.active = case.active;
+            app.worker.queued_prompts = case.queued;
+            try app.input_runtime.textReplacementState().replace(app.alloc, "existing draft");
+
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+            try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
+            try std.testing.expect(app.auth.inventory_refresh_action == null);
+            try std.testing.expectEqualStrings("existing draft", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+            try std.testing.expectEqualStrings(provider_busy_message ++ "\n", app.transcript.items);
+        }
+    }
+}
+
+test "provider picker rechecks work before publishing a completed refresh" {
+    const cases = [_]struct { active: bool, queued: usize }{
+        .{ .active = true, .queued = 0 },
+        .{ .active = false, .queued = 1 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |login| {
+            var app: TestApp = .{};
+            defer app.deinit();
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+            app.stream.active = case.active;
+            app.worker.queued_prompts = case.queued;
+            try app.input_runtime.textReplacementState().replace(app.alloc, "new draft");
+
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+            try std.testing.expect(app.auth.inventory_refresh_action == null);
+            try std.testing.expectEqualStrings("new draft", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+            try std.testing.expectEqualStrings(provider_busy_message ++ "\n", app.transcript.items);
+
+            app.stream.active = false;
+            app.worker.queued_prompts = 0;
+            if (login) {
+                try Runtime(TestApp).runLoginCommand(&app);
+            } else {
+                try Runtime(TestApp).runProviderCommand(&app);
+            }
+            try Runtime(TestApp).collectSourceInventoryFacts(&app);
+            try std.testing.expectEqualStrings(
+                if (login) picker_state.login_prefix else picker_state.provider_prefix,
+                app.input_runtime.edit_state.input.items,
+            );
+            try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+        }
+    }
 }
 
 test "login inventory failure leaves the picker closed and reports one error" {
