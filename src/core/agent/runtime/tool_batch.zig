@@ -279,6 +279,8 @@ pub fn processCommittedFileResult(
     tool_call: ToolCall,
     execution_call: ToolCall,
     execution: ToolExecutionResult,
+    model_output: []const u8,
+    result_memory: types.ToolResultMemory,
     committed_file_tool_name: []u8,
     status_started: bool,
     display_target: ?[]const u8,
@@ -336,14 +338,7 @@ pub fn processCommittedFileResult(
         }
     }
 
-    const fallback_memory = types.ToolResultMemory{
-        .output_bytes = execution.model_output.len,
-        .stored_output_bytes = execution.model_output.len,
-    };
-    var prepared_memory = if (execution.tool_result_memory_prepared)
-        execution.tool_result_memory orelse fallback_memory
-    else
-        fallback_memory;
+    var prepared_memory = result_memory;
     prepared_memory.committed_file_presentation = runtime_execution_memory.captureCommittedFilePresentation(
         history_allocator,
         handoff,
@@ -357,12 +352,12 @@ pub fn processCommittedFileResult(
     };
     within_turn_suffix.appendAssumeCapacity(.{
         .role = .tool,
-        .content = execution.model_output,
+        .content = model_output,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .tool_result_status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
             execution.status,
-            execution.model_output,
+            model_output,
         ),
         .tool_result_memory = prepared_memory,
     });
@@ -371,7 +366,7 @@ pub fn processCommittedFileResult(
         "committed_result_appended",
         step_ctx,
         "call_id={s} name={s} model_output_bytes={d}",
-        .{ tool_call.id, tool_call.name, execution.model_output.len },
+        .{ tool_call.id, tool_call.name, model_output.len },
     );
 
     const publication = hooks.publish_committed_file_handoff(
@@ -456,14 +451,14 @@ pub fn processCommittedFileResult(
         "after_tool_execution",
         step_ctx,
         "call_id={s} name={s} result_kind=committed_file model_output_bytes={d}",
-        .{ tool_call.id, tool_call.name, execution.model_output.len },
+        .{ tool_call.id, tool_call.name, model_output.len },
     );
     debug_trace.eventf(
         "tool",
         "execution_result",
         step_ctx,
         "call_id={s} name={s} result_kind=committed_file model_output_bytes={d}",
-        .{ tool_call.id, tool_call.name, execution.model_output.len },
+        .{ tool_call.id, tool_call.name, model_output.len },
     );
     batch.step_total_count += 1;
     batch.step_had_writes = true;
