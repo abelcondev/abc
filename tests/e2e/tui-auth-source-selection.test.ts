@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { readTapeFrames } from "./render-lab/tape";
+import { equivalentPngEncodings } from "./fixtures/image-encoding";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -4453,7 +4454,7 @@ test("direct providers keep images with their users through tools and resume", a
     const profile = mkdtempSync(join(tmpdir(), "fx-native-image-history-"));
     const model = "fixture-model";
     const testGateway = startFakeGateway([]);
-    const terminal = { type: "response.completed", response: { status: "completed" } };
+    const terminal = { type: "response.completed", response: { status: "completed", usage: { input_tokens: 50_000, output_tokens: 10 } } };
     const responses = [
       fakeGatewaySse([
         { type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "read_1", name: "read_file", arguments: "" } },
@@ -4488,6 +4489,7 @@ test("direct providers keep images with their users through tools and resume", a
         FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
         FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
         FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_TRACE_LOG: join(profile, "trace.log"), FX_TRACE_SCOPES: "context_compaction",
       };
       const firstPrompt = "Read fixture.txt, then describe the attached image.";
       const secondPrompt = "Compare the earlier image with this new image.";
@@ -4508,6 +4510,7 @@ test("direct providers keep images with their users through tools and resume", a
       expect(direct.bodies).toHaveLength(2);
       expect(imageOwners(direct.bodies[0])).toEqual([firstOwner]);
       expect(imageOwners(direct.bodies[1])).toEqual([firstOwner]);
+      expect(readFileSync(join(profile, "trace.log"), "utf8")).toContain("has_images=true image_baseline=true");
       unlinkSync(firstPath);
       const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "--image", secondPath, secondPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(second.code, second.stdout + second.stderr).toBe(0);
@@ -4543,6 +4546,67 @@ test("direct providers keep images with their users through tools and resume", a
       direct.stop(); testGateway.stop();
       rmSync(profile, { recursive: true, force: true });
     }
+  }
+}, 60_000);
+
+test("provider context accounting is independent of image encoding size", async () => {
+  const encodings = equivalentPngEncodings();
+  for (const provider of ["gateway", "codex", "grok"] as const) {
+    const estimates: number[] = [];
+    for (const bytes of encodings) {
+      const profile = mkdtempSync(join(tmpdir(), "fx-image-context-"));
+      const model = provider === "gateway" ? "fixture/image" : "fixture-model";
+      const gateway = startFakeGateway([fakeGatewayFinalText("IMAGE_CONTEXT_OK")], {
+        models: [{ id: model, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 1_000_000 }],
+      });
+      const responses = [fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "IMAGE_CONTEXT_OK" },
+        { type: "response.completed", response: { status: "completed" } },
+      ])];
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model, inputModalities: ["text", "image"] })
+        : provider === "grok" ? startFakeGrokToolLoop({ responses, model }) : null;
+      try {
+        mkdirSync(join(profile, ".fx"), { recursive: true });
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
+        if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        const path = join(profile, "image.png"), trace = join(profile, "trace.log");
+        writeFileSync(path, bytes);
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "--image", path, "Describe the attached image."], {
+          cwd: profile, timeoutMs: TIMEOUT,
+          env: {
+            HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined,
+            FX_MODEL: provider === "gateway" ? model : undefined, FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+            FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+            FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context_compaction",
+          },
+        });
+        expect(result.code, provider + ": " + result.stdout + result.stderr).toBe(0);
+        expect(result.signal).toBeNull();
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output).toBe("IMAGE_CONTEXT_OK");
+        const bodies = direct?.bodies ?? gateway.requests;
+        expect(bodies).toHaveLength(1);
+        const request = JSON.parse(typeof bodies[0] === "string" ? bodies[0] : bodies[0].body);
+        const parts = (request.input ?? request.prompt).flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+        const image = parts.find((part: { type?: string }) => part.type === (provider === "gateway" ? "file" : "input_image"));
+        expect(image).toBeDefined();
+        expect(provider === "gateway" ? image.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
+        const decision = readFileSync(trace, "utf8");
+        expect(decision).toContain("decision=no_op");
+        expect(decision).toContain("has_images=true image_baseline=false");
+        estimates.push(Number(decision.match(/estimated_tokens=(\d+)/)![1]));
+        if (direct) expect(gateway.requests).toHaveLength(0);
+      } finally {
+        direct?.stop(); gateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+    expect(estimates[0]).toBe(estimates[1]);
   }
 }, 60_000);
 

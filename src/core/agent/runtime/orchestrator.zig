@@ -4728,7 +4728,7 @@ const CompactionContinuation = struct {
         const body = (try provider.buildRequest(alloc, candidate)) orelse
             return error.ContextCompactionUnavailable;
         defer alloc.free(body);
-        return runtime_prompt_context.measureProviderRequest(body);
+        return runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, body, candidate);
     }
 };
 
@@ -4891,7 +4891,7 @@ test "manual compaction fixed context measures prepared skills and host instruct
     try std.testing.expect(std.mem.find(u8, body, "compaction-workflow") != null);
     try std.testing.expect(std.mem.find(u8, body, "HOST_COMPACTION_INSTRUCTIONS") != null);
     const measured = try small.measure(arena, deps.agent_stream_provider, "");
-    try std.testing.expectEqual(runtime_prompt_context.measureProviderRequest(body), measured);
+    try std.testing.expectEqual(try runtime_prompt_context.measureProviderRequest(arena, body, small.request), measured);
     const large = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 1_000_000 });
     const large_cost = try large.measure(arena, deps.agent_stream_provider, "");
     try std.testing.expect(large_cost.estimated_input_tokens > measured.estimated_input_tokens);
@@ -5631,15 +5631,16 @@ fn processQueuedPromptLoop(
                 request_data,
             )) |request_body| {
                 prepared_request_body = request_body;
-                const measured_request_cost = runtime_prompt_context.measureProviderRequest(request_body);
-                const request_cost = if (request_token_calibration) |calibration|
-                    if (std.mem.eql(u8, calibration.model, gateway_model))
-                        runtime_prompt_context.calibrateProviderRequest(
-                            measured_request_cost,
-                            calibration.cost,
-                        )
+                const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
+                const applicable_calibration = if (request_token_calibration) |calibration|
+                    if (std.mem.eql(u8, calibration.model, gateway_model) and calibration.cost.applies(measured_request_cost))
+                        calibration.cost
                     else
-                        measured_request_cost
+                        null
+                else
+                    null;
+                const request_cost = if (applicable_calibration) |calibration|
+                    runtime_prompt_context.calibrateProviderRequest(measured_request_cost, calibration)
                 else
                     measured_request_cost;
                 request_cost_for_attempt = request_cost;
@@ -5659,11 +5660,15 @@ fn processQueuedPromptLoop(
                     "context_compaction",
                     "decision",
                     step_ctx,
-                    "decision={s} request_bytes={d} estimated_tokens={d} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
+                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
                         request_cost.serialized_bytes,
                         request_cost.estimated_input_tokens,
+                        request_cost.text_tokens,
+                        request_cost.image_identity != null,
+                        request_cost.image_identity != null and applicable_calibration != null,
+                        if (applicable_calibration) |calibration| calibration.exact_input_tokens else null,
                         projection_plan.usable_input_tokens,
                         projection_plan.high_water_tokens,
                         projection_plan.session_target_tokens,
@@ -7088,7 +7093,7 @@ fn processQueuedPromptLoop(
                 request_token_calibration = .{
                     .model = successful_gateway_model,
                     .cost = .{
-                        .serialized_bytes = request_cost.serialized_bytes,
+                        .request = request_cost,
                         .exact_input_tokens = @intCast(@min(
                             exact_input_tokens,
                             std.math.maxInt(usize),
