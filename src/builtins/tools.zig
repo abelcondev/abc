@@ -549,7 +549,7 @@ pub const skill = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
-                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Defaults to SKILL.md." },
+                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Omit or pass an empty string to read SKILL.md." },
             },
             .required = &.{"location"},
             .additional_properties = false,

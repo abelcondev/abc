@@ -282,6 +282,40 @@ test "explicit skills include complete instructions beyond the default chunk" {
     try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
 }
 
+test "skill resource defaults preserve whole and legacy reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workflow");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workflow/SKILL.md", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\n---\nMAIN DOCUMENT\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workflow");
+    defer alloc.free(path);
+    const skills = [_]skill_runtime.Skill{.{ .name = "workflow", .description = "", .path = path, .source = .global_fx }};
+    const catalog: Catalog = .{ .skills = &skills };
+    const whole = try loadWholeByLocation(alloc, catalog, path, "SKILL.md", .{}, null, null);
+    defer freeExecuteResult(alloc, whole);
+    try std.testing.expect(whole == .loaded and whole.loaded.complete);
+    try expectContains(whole.modelOutput(), "MAIN DOCUMENT");
+    for ([_]?[]const u8{ null, "" }) |resource| {
+        const result = try loadWholeByLocation(alloc, catalog, path, resource, .{}, null, null);
+        defer freeExecuteResult(alloc, result);
+        try std.testing.expectEqualStrings(whole.modelOutput(), result.modelOutput());
+        for ([_]usize{ 0, 4 }) |offset| {
+            const expected = try loadByIdentity(alloc, catalog, "workflow", path, "SKILL.md", offset, .{}, null);
+            defer freeExecuteResult(alloc, expected);
+            const legacy = try loadByIdentity(alloc, catalog, "workflow", path, resource, offset, .{}, null);
+            defer freeExecuteResult(alloc, legacy);
+            try std.testing.expectEqualStrings(expected.modelOutput(), legacy.modelOutput());
+        }
+    }
+    for ([_][]const u8{ " ", "../outside.txt", "/outside.txt" }) |resource| {
+        try std.testing.expectError(error.InvalidSkillResourcePath, loadWholeByLocation(alloc, catalog, path, resource, .{}, null, null));
+    }
+    try std.testing.expectError(error.FileNotFound, loadWholeByLocation(alloc, catalog, path, "missing.md", .{}, null, null));
+}
+
 test "whole skill reads respect explicit bounds cancellation and recovery" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -640,6 +674,7 @@ fn loadByIdentityWithOptions(
     options: LoadOptions,
 ) !ExecuteResult {
     if (options.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    const resource_path = skill_contract.resource_path_or_main(resource);
     const resolution = skill_runtime.resolveSkill(catalog.skills, name, location);
     var opened_candidate: ?skill_runtime.OpenedSkillCandidate = null;
     defer if (opened_candidate) |*candidate| candidate.deinit();
@@ -714,7 +749,6 @@ fn loadByIdentityWithOptions(
         if (options.test_after_candidate_validation) |hook| try hook.check(hook.ctx);
     }
 
-    const resource_path = resource orelse "SKILL.md";
     const candidate = if (opened_candidate) |*current| current else unreachable;
     const resource_read = try readSkillResource(alloc, candidate, resource_path, limits.skill_file_bytes, options.cancel_flag);
     defer alloc.free(resource_read.bytes);
