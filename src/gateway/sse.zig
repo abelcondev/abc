@@ -13,6 +13,21 @@ fn classify(line: []const u8) Line {
     return .{ .data = value };
 }
 
+fn line_end(bytes: []const u8) usize {
+    const width = std.simd.suggestVectorLength(u8) orelse 1;
+    const Vector = @Vector(width, u8);
+    var offset: usize = 0;
+    while (bytes.len - offset >= width) : (offset += width) {
+        const chunk: Vector = bytes[offset..][0..width].*;
+        const matches = @select(bool, chunk == @as(Vector, @splat('\r')), @as(@Vector(width, bool), @splat(true)), chunk == @as(Vector, @splat('\n')));
+        if (std.simd.firstTrue(matches)) |index| return offset + index;
+    }
+    for (bytes[offset..], offset..) |byte, index| {
+        if (byte == '\r' or byte == '\n') return index;
+    }
+    return bytes.len;
+}
+
 /// Request-local SSE framing. The caller owns the source and all allocations.
 /// Returned data is borrowed until the next next() call or deinit().
 pub const Reader = struct {
@@ -86,8 +101,7 @@ pub const Reader = struct {
                     if (bytes.len == 0) continue;
                 }
             }
-            const lf = std.mem.findScalar(u8, bytes, '\n') orelse bytes.len;
-            const end = std.mem.findScalar(u8, bytes[0..lf], '\r') orelse lf;
+            const end = line_end(bytes);
             if (end > self.max_event_bytes - self.line.items.len) return error.EventTooLarge;
             if (end < bytes.len) {
                 self.skip_lf = bytes[end] == '\r';
@@ -129,6 +143,22 @@ test "provider framing never dispatches an unfinished event" {
         defer reader.deinit(std.testing.allocator);
         const cancelled = std.atomic.Value(bool).init(false);
         try std.testing.expectEqual(null, try reader.next(std.testing.allocator, &source, &cancelled));
+    }
+}
+
+test "provider framing preserves long fields with mixed delimiters" {
+    var text: [129]u8 = undefined;
+    @memset(&text, 'x');
+    const alloc = std.testing.allocator;
+    for (0..text.len + 1) |size| {
+        const wire = try std.mem.concat(alloc, u8, &.{ "data:", text[0..size], "\r\rdata:tail\n\n" });
+        defer alloc.free(wire);
+        var source = std.Io.Reader.fixed(wire);
+        var reader = Reader{ .max_event_bytes = 256 };
+        defer reader.deinit(alloc);
+        const cancelled = std.atomic.Value(bool).init(false);
+        try std.testing.expectEqualStrings(text[0..size], (try reader.next(alloc, &source, &cancelled)).?);
+        try std.testing.expectEqualStrings("tail", (try reader.next(alloc, &source, &cancelled)).?);
     }
 }
 
