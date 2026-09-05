@@ -4271,6 +4271,12 @@ fn processQueuedPromptInner(
         if (explicit_section.?.notice) |notice| try deps.pushContextNotice(notice);
         if (explicit_section.?.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
         if (deps.push_interactive_notice) |push_notice| {
+            if (explicit_section.?.load_details) |details| try push_notice(deps.ctx, .{
+                .topic = "skills",
+                .tone = .warning,
+                .body = details,
+                .visibility = .full_only,
+            });
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
