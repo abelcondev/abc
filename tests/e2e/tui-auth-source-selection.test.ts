@@ -6243,6 +6243,132 @@ tmuxTest(
 );
 
 tmuxTest(
+  "manual compaction refreshes the selected login without losing the draft",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-compact-auth-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("COMPACT_AUTH_FIRST_REPLY"),
+      fakeGatewayFinalText("COMPACT_AUTH_SECOND_REPLY"),
+      fakeGatewayFinalText("The conversation established COMPACT_AUTH_FIRST and COMPACT_AUTH_SECOND."),
+      fakeGatewayFinalText("COMPACT_AUTH_CONTINUED"),
+    ]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, { tokenDelayMs: 2_000 });
+    const expiresAt = Date.now() + 80_000;
+    writeSeededFxLogin(home, expiresAt, oauth.issuerUrl, "team_123");
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TRACE_SCOPES: "auth,input,worker,context_compaction,session",
+    }, home);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Remember COMPACT_AUTH_FIRST.");
+    await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
+    await session.sendText("Remember COMPACT_AUTH_SECOND.");
+    await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
+    await session.sendText("/status");
+    await session.waitForText("auth_expired=true", TIMEOUT);
+    await session.sendText("/compact");
+    await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendText("/compact");
+    await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
+    await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
+    await session.waitForText("Context compacted.", TIMEOUT);
+    expect(await session.captureFullScrollback()).toContain("PRESERVE_COMPACTION_DRAFT");
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
+    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    expect(sessionIds).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+    await session.sendKeys("C-u");
+    await session.sendText("Continue after the manual compaction.");
+    await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(4);
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const trace = readFileSync(tracePath, "utf8");
+    for (const secret of [LOGIN_TOKEN, ACQUIRED_LOGIN_TOKEN, "seeded-refresh-token", "acquired-refresh-token"]) expect(trace).not.toContain(secret);
+  },
+  90_000,
+);
+
+for (const outcome of ["failure", "cancel"] as const) {
+  tmuxTest(`manual compaction auth ${outcome} preserves the session and accepts a later prompt`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-compact-auth-${outcome}-`));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("AUTH_BOUNDARY_FIRST_REPLY"),
+      fakeGatewayFinalText("AUTH_BOUNDARY_SECOND_REPLY"),
+      fakeGatewayFinalText("AUTH_BOUNDARY_RECOVERED"),
+    ]);
+    oauth = startFakeOAuth(outcome === "failure" ? null : ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      tokenDelayMs: outcome === "cancel" ? 10_000 : 1_000,
+    });
+    const expiresAt = Date.now() + 80_000;
+    writeSeededFxLogin(home, expiresAt, oauth.issuerUrl, "team_123");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ credential_source: "fx_login" }));
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      FX_TRACE_SCOPES: "auth,input,worker,context_compaction,session",
+    }, home);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Remember AUTH_BOUNDARY_FIRST.");
+    await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
+    await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
+    await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
+    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    expect(sessionIds).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const before = readFileSync(historyPath, "utf8");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
+    await session.sendText("/compact");
+    await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
+    await session.sendLiteral("DRAFT_DURING_AUTH_BOUNDARY");
+    await session.waitForText("DRAFT_DURING_AUTH_BOUNDARY", 1_000);
+    if (outcome === "cancel") {
+      await session.sendKeys("C-c");
+      await session.waitForText("Context compaction cancelled.", 3_000);
+    } else {
+      await session.waitForText("Your conversation is unchanged.", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("/compact again");
+      expect(scrollback).not.toContain("Your prompt is saved.");
+    }
+    expect(await session.captureFullScrollback()).toContain("DRAFT_DURING_AUTH_BOUNDARY");
+    expect(readFileSync(historyPath, "utf8")).toBe(before);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendKeys("C-u");
+    await selectEnvKeyCredential(session);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendText("Continue the original conversation without tools.");
+    await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(readFileSync(historyPath, "utf8")).not.toContain('"context_checkpoint"');
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).not.toContain("context_compaction_enqueue");
+    for (const secret of [LOGIN_TOKEN, ACQUIRED_LOGIN_TOKEN, ENV_TOKEN, "seeded-refresh-token", "acquired-refresh-token"]) expect(trace).not.toContain(secret);
+  }, 90_000);
+}
+
+tmuxTest(
   "expired selected login preserves the prompt and avoids Gateway before explicit recovery",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-source-failure-"));
