@@ -467,7 +467,7 @@ function occurrenceCount(text: string, needle: string): number {
 
 function writeMcpFixture(
   root: FixtureRoot,
-  options: { required?: boolean; toolCount?: number; toolDescription?: string } = {},
+  options: { required?: boolean; toolCount?: number; toolDescription?: string; initializeDelayMs?: number } = {},
 ) {
   const toolCount = options.toolCount ?? 1;
   const toolDescription = JSON.stringify(
@@ -498,7 +498,7 @@ function handle(message) {
     return;
   }
   if (message.method === "initialize") {
-    send({
+    const response = {
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -507,7 +507,9 @@ function handle(message) {
         serverInfo: { name: "fixture", version: "1.0.0" },
         instructions: "SECRET_SERVER_INSTRUCTION_SENTINEL",
       },
-    });
+    };
+    if (${options.initializeDelayMs ?? 0} > 0) setTimeout(() => send(response), ${options.initializeDelayMs ?? 0});
+    else send(response);
     return;
   }
   if (message.method === "tools/list") {
@@ -6053,16 +6055,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("canonical subagent executes through the current parent MCP adapters", async () => {
+  test.each([0, 4_000])("canonical subagent executes through parent MCP adapters after %d ms", async (initializeDelayMs) => {
     const root = createFixtureRoot("subagent-mcp-inheritance");
     const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root);
+    const mcp = writeMcpFixture(root, { initializeDelayMs });
     writeFileSync(
       join(root.home, ".fx", "settings.json"),
       JSON.stringify({ permission: { [DYNAMIC_MCP_TOOL_NAME]: "allow" } }),
     );
     const childPrompt = "Select and call the inherited MCP echo fixture.";
     let childCompleted = false;
+    let parentResult = "";
     const gateway = startDynamicFakeGateway(async (body) => {
       if (body.includes('"toolCallId":"child_mcp_call_1"')) {
         expect(toolResultOutput(body, "child_mcp_call_1")).toContain(
@@ -6082,10 +6085,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
       }
       if (body.includes('"toolCallId":"parent_subagent_create_1"')) {
-        expect(toolResultOutput(body, "parent_subagent_create_1")).toContain(
-          "Child MCP execution complete.",
-        );
-        expect(toolResultOutput(body, "parent_subagent_create_1")).not.toContain("child_id");
+        parentResult = toolResultOutput(body, "parent_subagent_create_1");
         return fakeGatewayFinalText("Parent observed child MCP completion.");
       }
       if (body.includes(childPrompt)) {
@@ -6131,6 +6131,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
 
       expect(result.code).toBe(0);
+      expect(parentResult).toContain("Child MCP execution complete.");
+      expect(parentResult).not.toContain("child_id");
       expect(json.output).toContain("Parent observed child MCP completion.");
       expect(childCompleted).toBe(true);
       expect(gateway.requestCount()).toBe(5);
@@ -6148,6 +6150,52 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       await waitForProcessExit(pid);
     } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("cancelling delegation during MCP startup leaves no child effect or server", async () => {
+    const root = createFixtureRoot("subagent-mcp-startup-cancel");
+    const tracePath = join(root.root, "trace.log");
+    const mcp = writeMcpFixture(root, { initializeDelayMs: 4_000 });
+    const gateway = startDynamicFakeGateway(() => fakeGatewayToolCall("cancelled_child", "subagent", {
+      request: { action: "run", task: "Call the inherited MCP echo tool." },
+    }), {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const proc = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Delegate the MCP call."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, tracePath),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new Response(proc.stdout).text();
+    const stderr = new Response(proc.stderr).text();
+    let exited = false;
+    void proc.exited.then(() => { exited = true; });
+    try {
+      const startedDeadline = Date.now() + 10_000;
+      while (!existsSync(mcp.pidPath) && !exited && Date.now() < startedDeadline) await Bun.sleep(25);
+      expect(existsSync(mcp.pidPath)).toBe(true);
+      expect(existsSync(mcp.readyPath)).toBe(false);
+      expect(gateway.requestCount()).toBe(1);
+      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
+      proc.kill("SIGINT");
+      const exitDeadline = Date.now() + 10_000;
+      while (!exited && Date.now() < exitDeadline) await Bun.sleep(25);
+      expect(exited).toBe(true);
+      await waitForProcessExit(pid, 8_000);
+      expect(gateway.requestCount()).toBe(1);
+      expect(existsSync(mcp.callLogPath)).toBe(false);
+      expect(await stderr).not.toContain("panic:");
+      expect(await stdout).not.toContain("state_unavailable");
+    } finally {
+      if (!exited) proc.kill("SIGKILL");
+      await proc.exited;
+      await Promise.all([stdout, stderr]);
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
