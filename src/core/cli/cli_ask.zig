@@ -9276,7 +9276,7 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
     } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
@@ -9293,7 +9293,7 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
     } });
 
     try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
