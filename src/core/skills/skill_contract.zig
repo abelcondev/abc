@@ -4,6 +4,31 @@ const io_mod = @import("../shared/io.zig");
 pub const max_frontmatter_bytes: usize = 64 * 1024;
 pub const max_name_bytes: usize = 256;
 
+/// Returns the nonempty input unchanged, or the static main-document path.
+pub fn resource_path_or_main(resource: ?[]const u8) []const u8 {
+    const path = resource orelse return "SKILL.md";
+    return if (path.len == 0) "SKILL.md" else path;
+}
+
+test "skill resource defaulting preserves explicit paths" {
+    const cases = [_]struct { input: ?[]const u8, expected: []const u8 }{
+        .{ .input = null, .expected = "SKILL.md" },
+        .{ .input = "", .expected = "SKILL.md" },
+        .{ .input = "SKILL.md", .expected = "SKILL.md" },
+        .{ .input = "references/rules.md", .expected = "references/rules.md" },
+        .{ .input = " ", .expected = " " },
+        .{ .input = "../outside", .expected = "../outside" },
+    };
+    for (cases) |case| {
+        const path = resource_path_or_main(case.input);
+        try std.testing.expectEqualStrings(case.expected, path);
+        try std.testing.expectEqualStrings(path, resource_path_or_main(path));
+        if (case.input) |input| if (input.len > 0) {
+            try std.testing.expectEqual(input.ptr, path.ptr);
+        };
+    }
+}
+
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,

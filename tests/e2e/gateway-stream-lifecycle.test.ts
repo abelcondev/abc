@@ -2160,18 +2160,29 @@ describe("gateway stream lifecycle", () => {
     mkdirSync(join(skillDirectory, "references"), { recursive: true });
     writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n${"Required instructions.\n".repeat(1200)}`);
     writeFileSync(join(skillDirectory, "references", "rules.md"), "REFERENCE_LABEL_BODY\n");
+    const additionalSkills = ["second-workflow", "third-workflow"];
+    for (const name of additionalSkills) {
+      const directory = join(root.home, ".fx", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Label fixture\n---\n${name} INSTRUCTIONS\n`);
+    }
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway((body) => {
       if (requestIndex++ === 0) {
         const locations = advertisedSkillLocations(body, skillName);
         expect(locations).toHaveLength(1);
         return fakeGatewaySse([
-          { type: "tool-call", toolCallId: "label_main", toolName: "skill", input: { location: locations[0]! } },
+          { type: "tool-call", toolCallId: "label_main", toolName: "skill", input: { location: locations[0]!, resource: "" } },
+          ...additionalSkills.map((name) => ({ type: "tool-call", toolCallId: name, toolName: "skill", input: { location: advertisedSkillLocations(body, name)[0]!, resource: "" } })),
           { type: "tool-call", toolCallId: "label_reference", toolName: "skill", input: { location: locations[0]!, resource: "references/rules.md" } },
           { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
         ]);
       }
       expect(toolResultOutput(body, "label_main")).toContain("MAIN_LABEL_BODY");
+      expect(toolResultOutput(body, "label_main")).toContain('complete="true"');
+      for (const name of additionalSkills) {
+        expect(toolResultOutput(body, name)).toContain(`${name} INSTRUCTIONS`);
+      }
       expect(toolResultOutput(body, "label_reference")).toContain("REFERENCE_LABEL_BODY");
       return fakeGatewayFinalText("SKILL_LABEL_CHECK_COMPLETE");
     });
@@ -2192,6 +2203,8 @@ describe("gateway stream lifecycle", () => {
       expect(scrollback).toContain("Read skill resource references/rules.md");
       expect(scrollback).not.toContain("Loaded skill skill");
       expect(scrollback).not.toContain("Loaded skill different-directory");
+      for (const name of additionalSkills) expect(scrollback).toContain(`Loaded skill ${name}`);
+      expect(scrollback).not.toContain("Failed");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;

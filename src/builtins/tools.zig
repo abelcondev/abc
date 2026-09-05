@@ -549,7 +549,7 @@ pub const skill = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
-                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Defaults to SKILL.md." },
+                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Omit or pass an empty string to read SKILL.md." },
             },
             .required = &.{"location"},
             .additional_properties = false,
@@ -938,7 +938,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "1d6ad9ee3289b7568831f4e05c92befc52c4123b71f7bbe2141fe939a60faece",
+        "ccc1e489bf536f2f518a0b32c02ddc99a9f2af6fd3466c6456da3b22fbed23d4",
         &actual_hex,
     );
 }
