@@ -4316,6 +4316,67 @@ test "processQueuedPrompt prepares skill metadata from the supplied inventory" {
     try expectGatewayPromptTextCount(&gateway, 0, "- release: Release the package", 1);
 }
 
+test "explicit skill loads publish one interactive summary without extra tool calls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "requested-workflow");
+    var file = try tmp.dir.createFile(std.testing.io, "requested-workflow/SKILL.md", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "---\nname: requested-workflow\ndescription: Requested workflow\n---\nREQUESTED_SKILL_CONTENT\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "requested-workflow");
+    defer alloc.free(path);
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "requested-workflow",
+        .description = "Requested workflow",
+        .path = path,
+        .source = .workspace_shared,
+    }};
+    const read_call = [_]ToolCall{toolCall("status_read", "read_file", "{\"path\":\"file.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "Finished", .chunks = &.{"Finished"} },
+        .{ .content = "Finished" },
+        .{ .tool_calls = &read_call },
+        .{ .content = "Finished after read" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_interactive_notices = true;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    var job = fixture.job();
+    job.prompt = @constCast("Use $requested-workflow.");
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "REQUESTED_SKILL_CONTENT");
+    try expectBodyNotContains(&gateway, 0, "1 requested skill loaded");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ Loaded skill requested-workflow") orelse return error.TestExpectedEqual;
+    const reply_index = reply: {
+        for (hooks.log.items, 0..) |entry, index| {
+            if (std.mem.startsWith(u8, entry, "text:") and std.mem.find(u8, entry, "Finished") != null) break :reply index;
+        }
+        return error.TestExpectedReply;
+    };
+    try std.testing.expect(notice_index < reply_index);
+
+    hooks.enable_interactive_notices = false;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+
+    hooks.enable_interactive_notices = true;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 2), hooks.interactive_notices.items.len);
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+}
+
 test "unchanged skill catalog keeps its request prefix across user turns" {
     const alloc = std.testing.allocator;
     const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{

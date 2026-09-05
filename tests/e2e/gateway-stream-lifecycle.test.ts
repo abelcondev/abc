@@ -743,6 +743,70 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
+  test.skipIf(!tmuxAvailable())("requested skill status reflects prepared content without tool activity", async () => {
+    const root = createFixtureRoot("requested-skill-status");
+    for (const [directory, name, body] of [
+      ["first", "status-first", "FIRST_REQUESTED_CONTENT"],
+      ["second", "status-second", "SECOND_REQUESTED_CONTENT"],
+      ["duplicate-a", "status-duplicate", "AMBIGUOUS_CONTENT_A"],
+      ["duplicate-b", "status-duplicate", "AMBIGUOUS_CONTENT_B"],
+    ]) {
+      const path = join(root.workspace, ".agents", "skills", directory!);
+      mkdirSync(path, { recursive: true });
+      writeFileSync(join(path, "SKILL.md"), `---\nname: ${name}\ndescription: Status fixture\n---\n${body}\n`);
+    }
+    let requestCount = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const text = promptText(body);
+      expect(text).toContain("FIRST_REQUESTED_CONTENT");
+      expect(text).not.toContain("requested skills loaded");
+      expect(text).not.toContain("AMBIGUOUS_CONTENT_A");
+      expect(text).not.toContain("AMBIGUOUS_CONTENT_B");
+      if (requestCount++ === 0) {
+        expect(text).toContain("SECOND_REQUESTED_CONTENT");
+        return fakeGatewayFinalText("STATUS_FIRST_COMPLETE");
+      }
+      expect(text).toContain('Skill "status-duplicate" is ambiguous');
+      return fakeGatewayFinalText("STATUS_MIXED_COMPLETE");
+    });
+    const stderrPath = join(root.root, "stderr.log");
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath, width: 100, height: 36 });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Use $status-first and $status-second.");
+      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      const first = await tui.captureFullScrollback();
+      expect(first).toContain("2 requested skills loaded");
+      expect(first).toContain("Loaded skill status-first");
+      expect(first).toContain("Loaded skill status-second");
+      expect(first.indexOf("2 requested skills loaded")).toBeLessThan(first.indexOf("STATUS_FIRST_COMPLETE"));
+      expect(first).not.toContain("tool call");
+      await tui.resizeWindow(48, 36);
+      await tui.sendText("Use $status-first and $status-duplicate.");
+      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      const mixed = await tui.captureFullScrollback();
+      expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
+      expect(mixed).toContain("Could not load status-duplicate");
+      expect(mixed).toContain("ambiguous");
+      expect(mixed).not.toContain("Loaded skill status-duplicate");
+      expect(mixed).not.toContain("tool call");
+      await tui.sendKeys("C-o");
+      await tui.waitForText("Could not load status-duplicate", 5_000);
+      await tui.sendKeys("C-o");
+      await tui.waitForComposer(5_000);
+      expect(gateway.requests).toHaveLength(2);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test.skipIf(!tmuxAvailable())("explicit skill context survives cancellation and a fresh turn", async () => {
     const root = createFixtureRoot("skill-cancel-recover");
     const directory = join(root.workspace, ".agents", "skills", "cancel-workflow");
@@ -774,6 +838,7 @@ describe("gateway stream lifecycle", () => {
       expect(advertisedSkillPath(gateway.requests[0]!.body, first)).toBe(directory);
       expect(advertisedSkillPath(gateway.requests[1]!.body, second)).toBe(directory);
       expect(await tui.captureFullScrollback()).toContain("SKILL_RECOVERY_COMPLETE");
+      expect((await tui.captureFullScrollback()).match(/1 requested skill loaded/g)).toHaveLength(2);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;

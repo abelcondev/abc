@@ -4271,6 +4271,9 @@ fn processQueuedPromptInner(
         };
         if (explicit_section.?.notice) |notice| try deps.pushContextNotice(notice);
         if (explicit_section.?.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
+        if (deps.push_interactive_notice) |push_notice| {
+            if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
+        }
     }
     try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
