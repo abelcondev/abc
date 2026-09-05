@@ -83,7 +83,12 @@ pub fn writeInput(
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
                     try std.json.Stringify.value(content, .{}, writer);
-                    try writer.writeAll(",\"annotations\":[]}]}");
+                    try writer.writeAll(",\"annotations\":[]}]");
+                    if (message.assistant_phase) |phase| {
+                        try writer.writeAll(",\"phase\":");
+                        try std.json.Stringify.value(@tagName(phase), .{}, writer);
+                    }
+                    try writer.writeByte('}');
                 };
                 for (message.tool_calls) |call| {
                     try writeComma(writer, &first);
@@ -184,6 +189,49 @@ test "Responses request preserves opaque tool-call identity" {
     try std.testing.expectEqualStrings("signed:0", items[1].object.get("call_id").?.string);
     try std.testing.expectEqualStrings("signed:0", items[2].object.get("call_id").?.string);
     try std.testing.expectEqualStrings(state, messages[0].provider_state_json.?);
+}
+
+test "Responses request preserves assistant commentary phase" {
+    const calls = [_]types.ToolCall{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{
+            .role = .assistant,
+            .content = "I will inspect the file first.",
+            .tool_calls = &calls,
+            .assistant_phase = .commentary,
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "call_1",
+            .tool_name = "read_file",
+            .content = "contents",
+        },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{
+        .tool_calls = 128,
+        .tool_identity_bytes = 256,
+        .tool_arguments_bytes = 4096,
+        .provider_state_bytes = 4096,
+    }, .{});
+    try out.writer.writeByte(']');
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        out.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const item = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("message", item.get("type").?.string);
+    try std.testing.expectEqualStrings("commentary", item.get("phase").?.string);
 }
 
 test "non-object provider-owned arguments retain their Responses representation" {
@@ -599,6 +647,33 @@ fn optionalOutputIndex(fields: std.json.ObjectMap) error{InvalidEvent}!?i64 {
     return value.integer;
 }
 
+const AssistantPhaseAccumulator = union(enum) {
+    empty,
+    value: types.AssistantMessagePhase,
+    conflicting,
+
+    fn observe(self: *AssistantPhaseAccumulator, candidate: ?types.AssistantMessagePhase) void {
+        const phase = candidate orelse return;
+        self.* = switch (self.*) {
+            .empty => .{ .value = phase },
+            .value => |current| if (current == phase) .{ .value = current } else .conflicting,
+            .conflicting => .conflicting,
+        };
+    }
+
+    fn resolved(self: AssistantPhaseAccumulator) ?types.AssistantMessagePhase {
+        return switch (self) {
+            .value => |phase| phase,
+            .empty, .conflicting => null,
+        };
+    }
+};
+
+fn assistantMessagePhase(fields: std.json.ObjectMap) ?types.AssistantMessagePhase {
+    const raw = stringField(fields, "phase") orelse return null;
+    return std.meta.stringToEnum(types.AssistantMessagePhase, raw);
+}
+
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
     provider_state: std.Io.Writer.Allocating,
@@ -609,6 +684,7 @@ pub const Reducer = struct {
     generation_id: ?[]u8 = null,
     terminal_seen: bool = false,
     saw_content_delta: bool = false,
+    assistant_phase: AssistantPhaseAccumulator = .empty,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
@@ -677,6 +753,8 @@ pub const Reducer = struct {
                     const index = findTool(self.tools.items, output_index).?;
                     try self.tools.items[index].reconcileIdentity(alloc, item.object, "id", limits);
                 }
+            } else if (std.mem.eql(u8, item_type, "message")) {
+                self.assistant_phase.observe(assistantMessagePhase(item.object));
             }
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
             std.mem.eql(u8, event_type, "response.refusal.delta"))
@@ -737,16 +815,19 @@ pub const Reducer = struct {
                 }
                 try self.provider_state.writer.writeAll(encoded.written());
                 self.provider_state_count += 1;
-            } else if (std.mem.eql(u8, item_type, "message") and !self.saw_content_delta) {
-                if (item.object.get("content")) |parts| if (parts == .array) {
-                    for (parts.array.items) |part| {
-                        if (part != .object) continue;
-                        const text = stringField(part.object, "text") orelse
-                            stringField(part.object, "refusal") orelse continue;
-                        callbacks.on_content(callbacks.context, text);
-                        try appendCaptured(alloc, &self.content, text, content_capture_limit);
-                    }
-                };
+            } else if (std.mem.eql(u8, item_type, "message")) {
+                self.assistant_phase.observe(assistantMessagePhase(item.object));
+                if (!self.saw_content_delta) {
+                    if (item.object.get("content")) |parts| if (parts == .array) {
+                        for (parts.array.items) |part| {
+                            if (part != .object) continue;
+                            const text = stringField(part.object, "text") orelse
+                                stringField(part.object, "refusal") orelse continue;
+                            callbacks.on_content(callbacks.context, text);
+                            try appendCaptured(alloc, &self.content, text, content_capture_limit);
+                        }
+                    };
+                }
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -759,8 +840,11 @@ pub const Reducer = struct {
                 for (output.array.items, 0..) |item, output_index| {
                     if (item != .object) continue;
                     const item_type = stringField(item.object, "type") orelse continue;
-                    if (!std.mem.eql(u8, item_type, "function_call")) continue;
-                    try self.reconcileToolItem(alloc, std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded, item.object, callbacks, limits);
+                    if (std.mem.eql(u8, item_type, "function_call")) {
+                        try self.reconcileToolItem(alloc, std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded, item.object, callbacks, limits);
+                    } else if (std.mem.eql(u8, item_type, "message")) {
+                        self.assistant_phase.observe(assistantMessagePhase(item.object));
+                    }
                 }
             }
             self.terminal_seen = true;
@@ -854,6 +938,7 @@ pub const Reducer = struct {
         return .{
             .content = owned_content,
             .tool_calls = owned_tools,
+            .assistant_phase = self.assistant_phase.resolved(),
             .generation_id = generation_id,
             .provider_state_json = owned_provider_state,
             .finish_reason = self.finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
@@ -897,6 +982,65 @@ const ToolRecordTest = struct {
 
     fn ignore(_: *anyopaque, _: []const u8) void {}
 };
+
+test "Responses captures assistant commentary phase" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\"}}",
+    );
+    try stream.apply(
+        "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"I will inspect the file first.\"}",
+    );
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+
+    try std.testing.expectEqual(
+        types.AssistantMessagePhase.commentary,
+        completion.assistant_phase.?,
+    );
+}
+
+test "Responses captures assistant phase from terminal output" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"Finished.\"}]}]}}",
+    );
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+
+    try std.testing.expectEqual(
+        types.AssistantMessagePhase.final_answer,
+        completion.assistant_phase.?,
+    );
+}
+
+test "Responses ignores unknown and conflicting assistant phases" {
+    var unknown = ToolRecordTest.init(std.testing.allocator);
+    defer unknown.deinit();
+    try unknown.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"future_phase\"}}",
+    );
+    try unknown.apply(ToolRecordTest.terminal);
+    const unknown_completion = try unknown.finish();
+    defer unknown.freeCompletion(unknown_completion);
+    try std.testing.expect(unknown_completion.assistant_phase == null);
+
+    var conflicting = ToolRecordTest.init(std.testing.allocator);
+    defer conflicting.deinit();
+    try conflicting.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}",
+    );
+    try conflicting.apply(
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[]}}",
+    );
+    try conflicting.apply(ToolRecordTest.terminal);
+    const conflicting_completion = try conflicting.finish();
+    defer conflicting.freeCompletion(conflicting_completion);
+    try std.testing.expect(conflicting_completion.assistant_phase == null);
+}
 
 test "Responses rejects conflicting completed tool records" {
     const records = [_][]const u8{
