@@ -547,7 +547,10 @@ async function runStress(config: Config): Promise<Paths> {
     cacheBuildMs = performance.now() - buildStarted;
     expect(existsSync(cachePath)).toBe(true);
     await session.sendKeys("Escape");
-    await session.waitForComposer(TIMEOUT);
+    await session.waitForPane((pane) => {
+      const plain = stripAnsi(pane);
+      return hasEmptyComposer(plain) && !plain.includes("[Current workspace]");
+    }, TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
     await session.kill();

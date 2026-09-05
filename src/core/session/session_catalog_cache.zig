@@ -365,7 +365,7 @@ test "catalog fingerprint detects event appends and child directory permissions"
     try events.writePositionalAll(std.testing.io, "more\n", 3);
     const appended = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expect(!std.mem.eql(u8, &first, &appended));
-    var child = try tmp.dir.openDir(std.testing.io, "session/subagent", .{});
+    var child = try tmp.dir.openDir(std.testing.io, "session/subagent", .{ .iterate = true });
     defer child.close(std.testing.io);
     try child.setPermissions(std.testing.io, .fromMode(0o700));
     const private = (try fingerprint(tmp.dir, "session")).?;
