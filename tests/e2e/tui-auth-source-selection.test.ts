@@ -4486,7 +4486,8 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
 }
 
 test("native reasoning snapshots survive tools and saved resume exactly once", async () => {
-  for (const provider of ["codex", "grok"] as const) for (const shape of ["both", "terminal-only", "enriched", "conflict"] as const) {
+  for (const provider of ["codex", "grok"] as const) for (const shape of ["both", "terminal-only", "enriched", "conflict", "identity-conflict"] as const) {
+    const conflict = shape === "conflict" || shape === "identity-conflict";
     const profile = mkdtempSync(join(tmpdir(), "fx-reasoning-snapshot-"));
     const testGateway = startFakeGateway([]);
     const model = "fixture-model";
@@ -4494,11 +4495,11 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
     const reasoning = { id: "rs_snapshot", type: "reasoning", summary: [], encrypted_content: signature };
     const call = { id: "fc_snapshot", type: "function_call", call_id: "call_snapshot", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
     const events: object[] = [{ type: "response.output_item.added", output_index: 0, item: { id: reasoning.id, type: reasoning.type, summary: [] } }];
-    if (shape !== "terminal-only") events.push({ type: "response.output_item.done", output_index: 0, item: shape === "enriched" ? { id: reasoning.id, type: reasoning.type, summary: [] } : reasoning });
+    if (shape !== "terminal-only") events.push({ type: "response.output_item.done", output_index: 0, item: shape === "enriched" || shape === "identity-conflict" ? { id: reasoning.id, type: reasoning.type, summary: [] } : reasoning });
     events.push(
       { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "" } },
       { type: "response.function_call_arguments.done", output_index: 1, item_id: call.id, arguments: call.arguments },
-      { type: "response.completed", response: { status: "completed", output: [{ ...reasoning, encrypted_content: shape === "conflict" ? "CONFLICTING_CONTEXT" : signature }, call] } },
+      { type: "response.completed", response: { status: "completed", output: [{ ...reasoning, id: shape === "identity-conflict" ? "rs_replacement" : reasoning.id, encrypted_content: shape === "conflict" ? "CONFLICTING_CONTEXT" : signature }, call] } },
     );
     const answer = () => fakeGatewaySse([
       { type: "response.output_text.delta", delta: "REASONING_SNAPSHOT_OK" },
@@ -4521,10 +4522,10 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
         FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and summarize it."], { cwd: profile, env, timeoutMs: TIMEOUT });
-      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(shape === "conflict" ? 1 : 0);
+      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
       expect(first.signal).toBeNull();
       const result = JSON.parse(first.stdout);
-      if (shape === "conflict") {
+      if (conflict) {
         expect(result.error).toBe("ResponsesReasoningConflict");
         expect(result.tool_calls).toEqual([]);
         expect(direct.bodies).toHaveLength(1);
