@@ -44,6 +44,7 @@ type Config = {
 };
 
 type Metrics = {
+  coldProcessOpenMs?: number;
   open: number[];
   scope: number[];
   page: number[];
@@ -451,6 +452,7 @@ async function thrash(
   config: Config,
   metrics: Metrics,
   pid: number,
+  coldStarted: number,
 ): Promise<void> {
   const sizes = [
     [60, 12],
@@ -464,11 +466,17 @@ async function thrash(
       () => session.sendText("/resume"),
       () => waitForMenu(session, REAL_TITLE, "Current workspace"),
     );
+    if (cycle === 0) {
+      metrics.coldProcessOpenMs = performance.now() - coldStarted;
+      expect(metrics.coldProcessOpenMs).toBeLessThan(2_000);
+      expect(metrics.open[0]).toBeLessThan(2_000);
+    }
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
       () => waitForMenu(session, FOREIGN_TITLE, "All workspaces"),
     );
+    if (cycle === 0) expect(metrics.scope[0]).toBeLessThan(2_000);
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
@@ -522,7 +530,31 @@ async function runStress(config: Config): Promise<Paths> {
   let session: TmuxSession | null = null;
   let profiler: ReturnType<typeof Bun.spawn> | null = null;
   let passed = false;
+  let cacheBuildMs = 0;
   try {
+    const cachePath = join(paths.home, ".fx", "sessions", ".resume-catalog");
+    rmSync(cachePath, { force: true });
+    const buildStarted = performance.now();
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: realpathSync(paths.workspace),
+      env: { ...gatewayEnv(paths.home, gateway), FX_TRACE_LOG: paths.trace, FX_TRACE_SCOPES: "core,session" },
+      stderrPath: paths.stderr, width: 112, height: 32, minimumHistoryLines: 50_000,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/resume");
+    await waitForMenu(session, REAL_TITLE, "Current workspace");
+    cacheBuildMs = performance.now() - buildStarted;
+    expect(existsSync(cachePath)).toBe(true);
+    await session.sendKeys("Escape");
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
+    await session.kill();
+    session = null;
+    expect(readFileSync(paths.stderr, "utf8")).toBe("");
+    writeFileSync(paths.stderr, "");
+    const coldStarted = performance.now();
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
@@ -534,6 +566,7 @@ async function runStress(config: Config): Promise<Paths> {
       stderrPath: paths.stderr,
       width: 112,
       height: 32,
+      startupWaitMs: 0,
       minimumHistoryLines: Math.max(
         50_000,
         config.chatBatches * config.chatLinesPerBatch * 2,
@@ -558,7 +591,7 @@ async function runStress(config: Config): Promise<Paths> {
       ], { stdout: "pipe", stderr: "pipe" });
     }
 
-    await thrash(session, config, metrics, pid);
+    await thrash(session, config, metrics, pid, coldStarted);
 
     await session.sendText("/resume");
     await waitForMenu(session, REAL_TITLE, "Current workspace");
@@ -591,7 +624,10 @@ async function runStress(config: Config): Promise<Paths> {
         close: summarize(metrics.close),
         resume: summarize(metrics.resume),
       },
+      cacheBuildMs: Number(cacheBuildMs.toFixed(3)),
+      coldProcessOpenMs: Number(metrics.coldProcessOpenMs!.toFixed(3)),
       firstOpenMs: Number(metrics.open[0]!.toFixed(3)),
+      firstScopeSwitchMs: Number(metrics.scope[0]!.toFixed(3)),
       samples: metrics,
       resources: {
         startRssKib: metrics.rssKib[0],
@@ -628,6 +664,9 @@ async function runStress(config: Config): Promise<Paths> {
     passed = true;
     return paths;
   } finally {
+    if (!passed) {
+      writeFileSync(paths.metrics, `${JSON.stringify({ config, cacheBuildMs, samples: metrics }, null, 2)}\n`);
+    }
     if (profiler) {
       try {
         profiler.kill();

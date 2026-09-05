@@ -45,6 +45,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_store = @import("../session/session_store.zig");
+const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -562,16 +563,6 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn sessionPickerCacheForScope(
-    persistence: *Persistence,
-    scope: SessionPickerScope,
-) *SessionPickerCatalogCache {
-    return switch (scope) {
-        .current_workspace => &persistence.session_picker_current_cache,
-        .all_workspaces => &persistence.session_picker_all_cache,
-    };
-}
-
 fn replaceSessionPickerPage(
     picker: *SessionPicker,
     alloc: Allocator,
@@ -599,27 +590,35 @@ fn applySessionPickerCatalogPage(
     picker: *SessionPicker,
     alloc: Allocator,
     cache: *const SessionPickerCatalogCache,
+    workspace_root: []const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
     append: bool,
 ) !void {
+    const workspace = if (picker.scope == .current_workspace) workspace_root else null;
     var selected_index: ?usize = null;
     var page_limit = limit;
     if (!append) {
         page_limit = @max(page_limit, picker.summaries.items.len);
         if (picker.selectedId()) |selected_id| {
-            for (cache.catalog.summaries.items, 0..) |summary, index| {
-                if (!std.mem.eql(u8, summary.id, selected_id)) continue;
-                selected_index = index;
-                page_limit = @max(page_limit, index + 1);
-                break;
+            var index: usize = 0;
+            for (cache.catalog.summaries.items) |summary| {
+                if (workspace) |root| {
+                    if (summary.workspace_root == null or !std.mem.eql(u8, summary.workspace_root.?, root)) continue;
+                }
+                if (std.mem.eql(u8, summary.id, selected_id)) {
+                    selected_index = index;
+                    page_limit = @max(page_limit, index + 1);
+                    break;
+                }
+                index += 1;
             }
         }
     }
     var page = try session_summary_codec.resumablePageFromSummaries(
         alloc,
         cache.catalog.summaries.items,
-        null,
+        workspace,
         null,
         continuation,
         page_limit,
@@ -678,18 +677,14 @@ fn selectionAfterLoadedPage(
 const SessionPickerLoad = struct {
     const PageRequest = struct {
         generation: u64,
-        scope: SessionPickerScope,
         active_id: ?[]u8 = null,
-        limit: usize = session_store.default_resume_page_limit,
 
         fn init(
             generation: u64,
-            scope: SessionPickerScope,
             active_id: ?[]const u8,
-            limit: usize,
         ) !PageRequest {
             const alloc = std.heap.c_allocator;
-            var request: PageRequest = .{ .generation = generation, .scope = scope, .limit = limit };
+            var request: PageRequest = .{ .generation = generation };
             errdefer request.deinit();
             if (active_id) |id| request.active_id = try alloc.dupe(u8, id);
             return request;
@@ -705,10 +700,13 @@ const SessionPickerLoad = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        // Main-loop-owned; worker failures may also set cancel_requested.
+        abandoned: bool = false,
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
         catalog: ?subagent_resume_admission.ActionableSessionCatalog = null,
+        cache_writer: ?session_catalog_cache.Writer = null,
         failure: ?anyerror = null,
 
         fn requestStop(self: *Task) void {
@@ -727,6 +725,7 @@ const SessionPickerLoad = struct {
             self.requestStop();
             if (self.thread) |thread| thread.join();
             if (self.catalog) |*catalog| catalog.deinit(std.heap.c_allocator);
+            if (self.cache_writer) |*writer| writer.deinit();
             self.request.deinit();
             std.heap.c_allocator.free(self.home_dir);
             std.heap.c_allocator.free(self.workspace_root);
@@ -736,7 +735,6 @@ const SessionPickerLoad = struct {
 
     task: ?*Task = null,
     pending: ?PageRequest = null,
-    abandoned_generation: ?u64 = null,
     next_generation: u64 = 1,
 
     fn deinit(self: *SessionPickerLoad) void {
@@ -792,7 +790,7 @@ const SessionPickerLoad = struct {
     fn cancelGeneration(self: *SessionPickerLoad, generation: u64) void {
         if (self.task) |task| {
             if (task.request.generation == generation) {
-                self.abandoned_generation = generation;
+                task.abandoned = true;
                 task.requestStop();
                 debug_trace.logf(
                     "core",
@@ -821,33 +819,21 @@ const SessionPickerLoad = struct {
 
     fn matchingInitialGeneration(
         self: *const SessionPickerLoad,
-        scope: SessionPickerScope,
         active_id: ?[]const u8,
-        limit: usize,
     ) ?u64 {
         if (self.task) |task| {
-            if (self.abandoned_generation != task.request.generation and
-                initialRequestMatches(task.request, scope, active_id, limit))
+            if (!task.abandoned and
+                optionalStringEql(task.request.active_id, active_id))
             {
                 return task.request.generation;
             }
         }
         if (self.pending) |request| {
-            if (initialRequestMatches(request, scope, active_id, limit)) {
+            if (optionalStringEql(request.active_id, active_id)) {
                 return request.generation;
             }
         }
         return null;
-    }
-
-    fn initialRequestMatches(
-        request: PageRequest,
-        scope: SessionPickerScope,
-        active_id: ?[]const u8,
-        limit: usize,
-    ) bool {
-        return request.scope == scope and
-            request.limit >= limit and optionalStringEql(request.active_id, active_id);
     }
 
     fn startPending(self: *SessionPickerLoad, store: *const session_store.Store) !?u64 {
@@ -887,7 +873,12 @@ const SessionPickerLoad = struct {
             .workspace_root = workspace_root,
             .request = owned_request,
         };
+        task.cache_writer = session_catalog_cache.Writer.init(store.*) catch |err| blk: {
+            debug_trace.logf("core", "session catalog cache writer unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
         task.thread = std.Thread.spawn(.{}, threadMain, .{task}) catch |err| {
+            if (task.cache_writer) |*writer| writer.deinit();
             task.request.deinit();
             alloc.free(task.workspace_root);
             alloc.free(task.home_dir);
@@ -901,14 +892,12 @@ const SessionPickerLoad = struct {
         const task = self.task orelse return null;
         if (!task.done.load(.acquire)) return null;
         self.task = null;
-        if (self.abandoned_generation == task.request.generation) {
-            self.abandoned_generation = null;
-        }
         return task;
     }
 
     fn threadMain(task: *Task) void {
         defer task.done.store(true, .release);
+        const started = io_mod.nanoTimestamp();
         var read_only = session_store.Store.initReadOnlyFromHome(
             std.heap.c_allocator,
             task.home_dir,
@@ -918,20 +907,19 @@ const SessionPickerLoad = struct {
             return;
         };
         defer read_only.deinit(std.heap.c_allocator);
-        read_only.resume_cancel_flag = &task.cancel_requested;
 
         task.catalog = subagent_resume_admission.listActionableCatalog(
             read_only,
             std.heap.c_allocator,
-            switch (task.request.scope) {
-                .current_workspace => .current_workspace,
-                .all_workspaces => .all_workspaces,
-            },
             task.request.active_id,
+            &task.cancel_requested,
+            if (task.cache_writer) |*writer| writer else null,
         ) catch |err| {
+            debug_trace.logf("core", "session picker catalog stopped err={s} elapsed_us={d}", .{ @errorName(err), @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
             task.failure = err;
             return;
         };
+        debug_trace.logf("core", "session picker catalog loaded sessions={d} elapsed_us={d}", .{ task.catalog.?.summaries.items.len, @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
     }
 };
 
@@ -1043,8 +1031,7 @@ pub const Persistence = struct {
     process_model_override: ?[]u8 = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
-    session_picker_current_cache: SessionPickerCatalogCache = .{},
-    session_picker_all_cache: SessionPickerCatalogCache = .{},
+    session_picker_cache: SessionPickerCatalogCache = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -1055,7 +1042,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 18) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1072,8 +1059,7 @@ pub const Persistence = struct {
         storage.process_model_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
-        storage.session_picker_current_cache = .{};
-        storage.session_picker_all_cache = .{};
+        storage.session_picker_cache = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.image_snapshot_temp_dir = null;
@@ -1103,8 +1089,7 @@ pub const Persistence = struct {
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
-        self.session_picker_current_cache.deinit();
-        self.session_picker_all_cache.deinit();
+        self.session_picker_cache.deinit();
         self.* = undefined;
     }
 };
@@ -1120,8 +1105,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(!persistence.fast_mode_model_bound);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
-    try std.testing.expect(!persistence.session_picker_current_cache.ready);
-    try std.testing.expect(!persistence.session_picker_all_cache.ready);
+    try std.testing.expect(!persistence.session_picker_cache.ready);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
 }
 
@@ -1826,9 +1810,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var picker = &app.session_persistence.session_picker;
-            if (picker.load_state != .ready) {
-                app.session_persistence.session_picker_load.cancelGeneration(picker.generation);
-            }
+            const previous_generation = picker.generation;
             picker.deinit(app.alloc);
             picker.active = true;
             picker.load_state = .loading;
@@ -1850,13 +1832,17 @@ pub fn Runtime(comptime App: type) type {
                 resumePageLimitForRows(app.shell.layout.rows)
             else
                 session_store.default_resume_page_limit;
-            const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
+            const loader = &app.session_persistence.session_picker_load;
+            const matching = loader.matchingInitialGeneration(active_id);
+            if (matching != previous_generation) loader.cancelGeneration(previous_generation);
+            const cache = &app.session_persistence.session_picker_cache;
             var cache_visible = false;
             if (cache.matches(active_id)) {
                 try applySessionPickerCatalogPage(
                     picker,
                     app.alloc,
                     cache,
+                    store.workspace_root,
                     null,
                     limit,
                     false,
@@ -1868,16 +1854,13 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const loader = &app.session_persistence.session_picker_load;
-            if (loader.matchingInitialGeneration(scope, active_id, limit)) |generation| {
+            if (matching) |generation| {
                 picker.generation = generation;
                 return;
             }
             const request = SessionPickerLoad.PageRequest.init(
                 loader.allocateGeneration(),
-                picker.scope,
                 active_id,
-                limit,
             ) catch |err| {
                 if (!cache_visible) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
@@ -1897,36 +1880,20 @@ pub fn Runtime(comptime App: type) type {
                 loaded.active_id
             else
                 null;
-            const limit = if (comptime @hasField(App, "shell"))
-                resumePageLimitForRows(app.shell.layout.rows)
-            else
-                session_store.default_resume_page_limit;
             const loader = &app.session_persistence.session_picker_load;
-            for ([_]SessionPickerScope{ .current_workspace, .all_workspaces }) |scope| {
-                const cache = sessionPickerCacheForScope(&app.session_persistence, scope);
-                if (cache.matches(active_id) and cache.isFresh()) continue;
-                if (loader.matchingInitialGeneration(scope, active_id, limit) != null) continue;
-                const request = SessionPickerLoad.PageRequest.init(
-                    loader.allocateGeneration(),
-                    scope,
-                    active_id,
-                    limit,
-                ) catch |err| {
-                    debug_trace.logf(
-                        "core",
-                        "session picker prewarm unavailable scope={s} err={s}",
-                        .{ @tagName(scope), @errorName(err) },
-                    );
-                    continue;
-                };
-                loader.schedule(store, request) catch |err| {
-                    debug_trace.logf(
-                        "core",
-                        "session picker prewarm unavailable scope={s} err={s}",
-                        .{ @tagName(scope), @errorName(err) },
-                    );
-                };
-            }
+            const cache = &app.session_persistence.session_picker_cache;
+            if (cache.matches(active_id) and cache.isFresh()) return;
+            if (loader.matchingInitialGeneration(active_id) != null) return;
+            const request = SessionPickerLoad.PageRequest.init(
+                loader.allocateGeneration(),
+                active_id,
+            ) catch |err| {
+                debug_trace.logf("core", "session picker prewarm unavailable err={s}", .{@errorName(err)});
+                return;
+            };
+            loader.schedule(store, request) catch |err| {
+                debug_trace.logf("core", "session picker prewarm unavailable err={s}", .{@errorName(err)});
+            };
         }
 
         pub fn toggleSessionPickerScope(app: *App) !bool {
@@ -1946,13 +1913,13 @@ pub fn Runtime(comptime App: type) type {
             var task_owned = true;
             defer if (task_owned) task.deinit();
 
+            const active_id = if (app.session_persistence.writable) |*loaded| loaded.active_id else null;
+            const valid = app.session_persistence.store != null and
+                !task.abandoned and optionalStringEql(task.request.active_id, active_id);
             var cache_installed = false;
-            if (task.failure == null) {
+            if (valid and task.failure == null) {
                 if (task.catalog) |*catalog| {
-                    const cache = sessionPickerCacheForScope(
-                        &app.session_persistence,
-                        task.request.scope,
-                    );
+                    const cache = &app.session_persistence.session_picker_cache;
                     cache.install(catalog, task.request.active_id) catch |err| {
                         task.failure = err;
                     };
@@ -1961,14 +1928,13 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const picker = &app.session_persistence.session_picker;
-            const current = picker.active and picker.generation == task.request.generation;
+            const current = valid and picker.active and picker.generation == task.request.generation;
             if (!current) {
                 debug_trace.logf(
                     "core",
-                    "session picker completion {s} scope={s} generation={d}",
+                    "session picker completion {s} generation={d}",
                     .{
                         if (cache_installed) "cached" else "dropped",
-                        @tagName(task.request.scope),
                         task.request.generation,
                     },
                 );
@@ -1976,16 +1942,18 @@ pub fn Runtime(comptime App: type) type {
                 if (picker.load_state != .ready) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
             } else {
-                const cache = sessionPickerCacheForScope(
-                    &app.session_persistence,
-                    task.request.scope,
-                );
+                const cache = &app.session_persistence.session_picker_cache;
+                const limit = if (comptime @hasField(App, "shell"))
+                    resumePageLimitForRows(app.shell.layout.rows)
+                else
+                    session_store.default_resume_page_limit;
                 applySessionPickerCatalogPage(
                     picker,
                     app.alloc,
                     cache,
+                    app.session_persistence.store.?.workspace_root,
                     null,
-                    task.request.limit,
+                    limit,
                     false,
                 ) catch |err| {
                     picker.load_state = .failed;
@@ -2049,10 +2017,7 @@ pub fn Runtime(comptime App: type) type {
                 loaded.active_id
             else
                 null;
-            const cache = sessionPickerCacheForScope(
-                &app.session_persistence,
-                picker.scope,
-            );
+            const cache = &app.session_persistence.session_picker_cache;
             if (!cache.matches(active_id)) return error.SessionStoreUnavailable;
             const limit = if (comptime @hasField(App, "shell"))
                 resumePageLimitForRows(app.shell.layout.rows)
@@ -2064,6 +2029,7 @@ pub fn Runtime(comptime App: type) type {
                 picker,
                 app.alloc,
                 cache,
+                app.session_persistence.store.?.workspace_root,
                 continuation.view(),
                 limit,
                 true,
@@ -2097,9 +2063,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn cancelSessionPicker(app: *App) void {
             const picker = &app.session_persistence.session_picker;
-            if (picker.load_state != .ready) {
-                app.session_persistence.session_picker_load.cancelGeneration(picker.generation);
-            }
+            const loader = &app.session_persistence.session_picker_load;
+            if (loader.task) |task| loader.cancelGeneration(task.request.generation);
+            if (loader.pending) |pending| loader.cancelGeneration(pending.generation);
             picker.deinit(app.alloc);
         }
 
@@ -2119,8 +2085,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn invalidateSessionPickerCaches(app: *App) void {
-            app.session_persistence.session_picker_current_cache.deinit();
-            app.session_persistence.session_picker_all_cache.deinit();
+            const loader = &app.session_persistence.session_picker_load;
+            if (loader.task) |task| loader.cancelGeneration(task.request.generation);
+            if (loader.pending) |pending| loader.cancelGeneration(pending.generation);
+            app.session_persistence.session_picker_cache.deinit();
         }
 
         pub fn moveSessionPicker(app: *App, delta: i32, visible_items: u16) bool {
@@ -8651,7 +8619,7 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
         defer renamed.deinit(alloc);
         try std.testing.expect(try renamed.renameConversation(alloc, "renamed externally"));
     }
-    app.session_persistence.session_picker_current_cache.loaded_at_ns = 0;
+    app.session_persistence.session_picker_cache.loaded_at_ns = 0;
     try Runtime(TestApp).openSessionPicker(&app);
 
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
@@ -8675,7 +8643,7 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
         );
         _ = app.session_persistence.store.?.deleteCommittedSession(alloc, &removed);
     }
-    app.session_persistence.session_picker_current_cache.loaded_at_ns = 0;
+    app.session_persistence.session_picker_cache.loaded_at_ns = 0;
     try Runtime(TestApp).openSessionPicker(&app);
     try waitForSessionPickerPrewarm(&app);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
@@ -8696,12 +8664,13 @@ test "session picker refresh preserves selection and loaded pagination" {
             .updated_at_ms = @intCast(3 - index),
             .conversation_language = .literal("en"),
             .history_len = 1,
+            .workspace_root = @constCast("/workspace"),
         });
         errdefer summary.deinit(alloc);
         try cache.catalog.summaries.append(alloc, summary);
     }
-    try applySessionPickerCatalogPage(&picker, alloc, &cache, null, 1, false);
-    try applySessionPickerCatalogPage(&picker, alloc, &cache, picker.continuation.?.view(), 1, true);
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, "/workspace", null, 1, false);
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, "/workspace", picker.continuation.?.view(), 1, true);
     picker.selected = 1;
     try std.testing.expectEqualStrings("two", picker.selectedId().?);
 
@@ -8711,25 +8680,26 @@ test "session picker refresh preserves selection and loaded pagination" {
         .updated_at_ms = 4,
         .conversation_language = .literal("en"),
         .history_len = 1,
+        .workspace_root = @constCast("/workspace"),
     });
     cache.catalog.summaries.insert(alloc, 0, added) catch |err| {
         added.deinit(alloc);
         return err;
     };
-    try applySessionPickerCatalogPage(&picker, alloc, &cache, null, 1, false);
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, "/workspace", null, 1, false);
     try std.testing.expectEqual(@as(usize, 3), picker.summaries.items.len);
     try std.testing.expectEqual(@as(usize, 2), picker.selected);
     try std.testing.expectEqualStrings("two", picker.selectedId().?);
     try std.testing.expectEqualStrings("two", picker.continuation.?.id);
 
-    try applySessionPickerCatalogPage(&picker, alloc, &cache, picker.continuation.?.view(), 1, true);
+    try applySessionPickerCatalogPage(&picker, alloc, &cache, "/workspace", picker.continuation.?.view(), 1, true);
     try std.testing.expectEqual(@as(usize, 4), picker.summaries.items.len);
     try std.testing.expectEqualStrings("three", picker.summaries.items[3].id);
     try std.testing.expect(!picker.has_more);
     try std.testing.expectEqualStrings("two", picker.selectedId().?);
 }
 
-test "session picker prewarms current and all workspace pages before opening" {
+test "session picker prewarms one catalog for both workspace views" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8763,8 +8733,7 @@ test "session picker prewarms current and all workspace pages before opening" {
     Runtime(TestApp).primeSessionPicker(&app);
     try waitForSessionPickerPrewarm(&app);
     try std.testing.expect(!app.session_persistence.session_picker.active);
-    try std.testing.expect(app.session_persistence.session_picker_current_cache.ready);
-    try std.testing.expect(app.session_persistence.session_picker_all_cache.ready);
+    try std.testing.expect(app.session_persistence.session_picker_cache.ready);
 
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
@@ -8779,6 +8748,78 @@ test "session picker prewarms current and all workspace pages before opening" {
         "prewarmed-session",
         app.session_persistence.session_picker.selectedId().?,
     );
+}
+
+test "session picker reuses a held catalog after resize and workspace switch" {
+    const alloc = std.testing.allocator;
+    const catalog_alloc = std.heap.c_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    for ([_]bool{ false, true }) |finished_before_switch| {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        try app.input_runtime.edit_state.input.appendSlice(alloc, "saved");
+
+        const loader = &app.session_persistence.session_picker_load;
+        const generation = loader.allocateGeneration();
+        const held = try createHeldSessionPickerTask(
+            generation,
+            app.session_persistence.writable.?.active_id,
+            app.session_persistence.store.?,
+        );
+        loader.task = held;
+        held.catalog = .{};
+        for (0..100) |index| {
+            var id_buffer: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "saved-{d}", .{index});
+            var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
+                .id = @constCast(id),
+                .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
+                .created_at_ms = 1,
+                .updated_at_ms = @intCast(100 - index),
+                .conversation_language = .literal("en"),
+                .history_len = 1,
+            });
+            held.catalog.?.summaries.append(catalog_alloc, summary) catch |err| {
+                summary.deinit(catalog_alloc);
+                return err;
+            };
+        }
+        try Runtime(TestApp).openSessionPicker(&app);
+        const picker = &app.session_persistence.session_picker;
+        try std.testing.expect(picker.isLoading());
+        held.done.store(finished_before_switch, .release);
+        app.shell.layout.rows = 80;
+        Runtime(TestApp).primeSessionPicker(&app);
+        try std.testing.expect(try Runtime(TestApp).toggleSessionPickerScope(&app));
+        try std.testing.expect(loader.task == held);
+        try std.testing.expect(loader.pending == null);
+        try std.testing.expectEqual(generation, picker.generation);
+        try std.testing.expect(!held.abandoned);
+        try std.testing.expect(!held.cancel_requested.load(.acquire));
+
+        held.done.store(true, .release);
+        try Runtime(TestApp).pollSessionPicker(&app);
+        try std.testing.expectEqual(SessionPickerScope.all_workspaces, picker.scope);
+        try std.testing.expectEqual(.ready, picker.load_state);
+        try std.testing.expectEqual(resumePageLimitForRows(80), picker.summaries.items.len);
+        try std.testing.expect(picker.has_more);
+        try std.testing.expectEqualStrings("saved", picker.query());
+        try std.testing.expectEqualStrings("saved", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqualStrings("/foreign-workspace", picker.summaries.items[1].workspace_root.?);
+        try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
+    }
 }
 
 test "session picker keeps the visible scope when a stale catalog completes" {
@@ -8801,8 +8842,6 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var current_catalog: subagent_resume_admission.ActionableSessionCatalog = .{};
-    defer current_catalog.deinit(catalog_alloc);
     var all_catalog: subagent_resume_admission.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
     try all_catalog.summaries.append(catalog_alloc, .{
@@ -8815,11 +8854,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     });
 
     const active_id = app.session_persistence.writable.?.active_id;
-    try app.session_persistence.session_picker_current_cache.install(
-        &current_catalog,
-        active_id,
-    );
-    try app.session_persistence.session_picker_all_cache.install(
+    try app.session_persistence.session_picker_cache.install(
         &all_catalog,
         active_id,
     );
@@ -8834,7 +8869,6 @@ test "session picker keeps the visible scope when a stale catalog completes" {
         active_id,
         app.session_persistence.store.?,
     );
-    stale.request.scope = .all_workspaces;
     stale.catalog = .{};
     try stale.catalog.?.summaries.append(catalog_alloc, .{
         .id = try catalog_alloc.dupe(u8, "stale-foreign-session"),
@@ -9096,6 +9130,11 @@ test "session picker discards a held stale request after cancellation and reopen
     Runtime(TestApp).cancelSessionPicker(&app);
     try std.testing.expect(!picker.active);
     try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
+    try std.testing.expect(held.abandoned);
+    try std.testing.expect(held.cancel_requested.load(.acquire));
+    try std.testing.expect(app.session_persistence.session_picker_load.matchingInitialGeneration(
+        app.session_persistence.writable.?.active_id,
+    ) == null);
     try std.testing.expectEqualStrings(app.session_persistence.writable.?.active_id, held.request.active_id.?);
 
     try Runtime(TestApp).openSessionPicker(&app);
@@ -9120,14 +9159,84 @@ test "session picker discards a held stale request after cancellation and reopen
     try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
 }
 
+test "session picker source invalidation discards a finished catalog and pending request" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    const loader = &app.session_persistence.session_picker_load;
+    const active_id = app.session_persistence.writable.?.active_id;
+    const held = try createHeldSessionPickerTask(loader.allocateGeneration(), active_id, app.session_persistence.store.?);
+    loader.task = held;
+    held.catalog = .{};
+    held.done.store(true, .release);
+    loader.pending = try SessionPickerLoad.PageRequest.init(loader.allocateGeneration(), active_id);
+
+    Runtime(TestApp).invalidateSessionPickerCaches(&app);
+    try std.testing.expect(held.abandoned);
+    try std.testing.expect(loader.pending == null);
+    try Runtime(TestApp).pollSessionPicker(&app);
+    try std.testing.expect(loader.task == null);
+    try std.testing.expect(!app.session_persistence.session_picker_cache.ready);
+    try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
+}
+
+test "session picker reports worker failure when the shared stop flag is set" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    const loader = &app.session_persistence.session_picker_load;
+    const generation = loader.allocateGeneration();
+    const active_id = app.session_persistence.writable.?.active_id;
+    const held = try createHeldSessionPickerTask(generation, active_id, app.session_persistence.store.?);
+    loader.task = held;
+    held.failure = error.OutOfMemory;
+    held.cancel_requested.store(true, .release);
+    held.done.store(true, .release);
+    const picker = &app.session_persistence.session_picker;
+    picker.active = true;
+    picker.generation = generation;
+    try std.testing.expectEqual(generation, loader.matchingInitialGeneration(active_id).?);
+
+    try Runtime(TestApp).pollSessionPicker(&app);
+    try std.testing.expect(picker.active);
+    try std.testing.expectEqual(.failed, picker.load_state);
+    try std.testing.expect(!app.session_persistence.session_picker_cache.ready);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "OutOfMemory") != null);
+}
+
 test "session picker page requests own the active session ID" {
     const alloc = std.testing.allocator;
     const active_id = try alloc.dupe(u8, "active-session");
     var request = try SessionPickerLoad.PageRequest.init(
         1,
-        .current_workspace,
         active_id,
-        session_store.default_resume_page_limit,
     );
     defer request.deinit();
     alloc.free(active_id);
@@ -9154,12 +9263,7 @@ test "persistence shutdown drops pending picker work" {
     try Runtime(TestApp).initializePersistence(&app, true);
 
     app.session_persistence.session_picker_load.pending =
-        try SessionPickerLoad.PageRequest.init(
-            1,
-            .current_workspace,
-            null,
-            session_store.default_resume_page_limit,
-        );
+        try SessionPickerLoad.PageRequest.init(1, null);
 
     Runtime(TestApp).requestPersistenceShutdown(&app);
 
@@ -9206,9 +9310,7 @@ fn createHeldSessionPickerTask(
     const alloc = std.heap.c_allocator;
     var request = try SessionPickerLoad.PageRequest.init(
         generation,
-        .current_workspace,
         active_id,
-        session_store.default_resume_page_limit,
     );
     errdefer request.deinit();
     const home_dir = try alloc.dupe(u8, store.home_dir);

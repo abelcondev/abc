@@ -350,6 +350,54 @@ const SessionSummaryScan = struct {
     }
 };
 
+/// Borrows its store's directory handles. The caller owns each returned candidate.
+pub const CandidateIterator = struct {
+    store: Store,
+    entries: ?std.Io.Dir.Iterator,
+    mode: DiscoveryMode = .read_only_list,
+    skipped_invalid: usize = 0,
+
+    pub fn next(self: *CandidateIterator, alloc: Allocator) !?ReadOnlyCandidate {
+        while (try self.nextName(null)) |name| {
+            return self.store.readOnlyCandidate(alloc, name, null) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logDiscoveryError(self.mode, name, null, null, err);
+                    self.skipped_invalid += 1;
+                    continue;
+                },
+            };
+        }
+        return null;
+    }
+
+    /// Returns an owned ID; callers sharing an iterator must serialize advancement.
+    pub fn nextId(
+        self: *CandidateIterator,
+        alloc: Allocator,
+        cancelled: ?*const std.atomic.Value(bool),
+    ) !?[]u8 {
+        const name = (try self.nextName(cancelled)) orelse return null;
+        return try alloc.dupe(u8, name);
+    }
+
+    fn nextName(self: *CandidateIterator, cancelled: ?*const std.atomic.Value(bool)) !?[]const u8 {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
+        const entries = if (self.entries) |*value| value else return null;
+        while (true) {
+            if (cancelled) |stop| {
+                if (stop.load(.acquire)) return error.Cancelled;
+            }
+            const entry = (try entries.next(io_mod.getIo())) orelse return null;
+            if (entry.kind != .directory or std.mem.eql(u8, entry.name, retired_latest_sessions_dir)) continue;
+            validateSessionId(entry.name) catch continue;
+            return entry.name;
+        }
+    }
+};
+
 test {
     _ = session_child_store;
     _ = session_layout;
@@ -492,13 +540,6 @@ pub const Store = struct {
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
-    resume_cancel_flag: ?*const std.atomic.Value(bool) = null,
-
-    pub fn checkResumeCancellation(self: Store) !void {
-        if (self.resume_cancel_flag) |flag| {
-            if (flag.load(.acquire)) return error.Cancelled;
-        }
-    }
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -1693,6 +1734,31 @@ pub const Store = struct {
         return scan.summaries;
     }
 
+    pub fn readOnlyCandidates(self: Store) CandidateIterator {
+        return .{
+            .store = self,
+            .entries = if (self.canonical_root.sessions) |dir| dir.dir.iterate() else null,
+        };
+    }
+
+    /// The caller owns the candidate. No directory handle escapes this read.
+    pub fn readOnlyCandidate(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        cancelled: ?*const std.atomic.Value(bool),
+    ) !ReadOnlyCandidate {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        return if (cancelled) |stop|
+            discovery.classifyReadOnlyCandidateCancellable(alloc, &dir, session_id, stop)
+        else
+            classifyReadOnlyCandidate(alloc, &dir, session_id);
+    }
+
     /// Invalidates the derived resume catalog after managed child ownership
     /// changes. The relationship index remains the canonical authority.
     /// Returns owned IDs for every readable ordinary session. Caller frees each
@@ -2172,42 +2238,14 @@ pub const Store = struct {
         errdefer scan.deinit(alloc);
         var metadata: std.ArrayList(DiscoveryCandidateMetadata) = .empty;
         defer metadata.deinit(alloc);
-        if (self.canonical_root.sessions == null) return scan;
-        var iter = self.canonical_root.sessions.?.dir.iterate();
-        while (try iter.next(io_mod.getIo())) |entry| {
-            try self.checkResumeCancellation();
-            if (entry.kind != .directory) continue;
-            if (std.mem.eql(u8, entry.name, retired_latest_sessions_dir)) {
-                continue;
-            }
-            validateSessionId(entry.name) catch continue;
-            var session_dir = self.openSessionDir(entry.name) catch |err| switch (err) {
-                else => {
-                    logDiscoveryError(mode, entry.name, null, null, err);
-                    scan.skipped_invalid += 1;
-                    continue;
-                },
-            };
-            var candidate = classifyReadOnlyCandidate(
-                alloc,
-                &session_dir,
-                entry.name,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    session_dir.close();
-                    return error.OutOfMemory;
-                },
-                else => {
-                    session_dir.close();
-                    logDiscoveryError(mode, entry.name, null, null, err);
-                    scan.skipped_invalid += 1;
-                    continue;
-                },
-            };
-            session_dir.close();
+        var iter = self.readOnlyCandidates();
+        iter.mode = mode;
+        while (try iter.next(alloc)) |value| {
+            var candidate = value;
+            const session_id = candidate.summary.id;
             if (probe_managed_children) {
                 candidate.summary.has_managed_children =
-                    self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
+                    self.sessionHasManagedChildren(alloc, session_id) catch |err| switch (err) {
                         error.OutOfMemory => {
                             candidate.deinit(alloc);
                             return error.OutOfMemory;
@@ -2217,7 +2255,7 @@ pub const Store = struct {
             }
             logDiscovery(
                 mode,
-                entry.name,
+                session_id,
                 candidate.storage,
                 candidate.projection_state,
                 .listable,
@@ -2238,7 +2276,7 @@ pub const Store = struct {
             };
             candidate.summary = undefined;
         }
-        try self.checkResumeCancellation();
+        scan.skipped_invalid = iter.skipped_invalid;
         sortSummariesNewestFirst(scan.summaries.items);
         if (mode == .global_read_only_last and scan.summaries.items.len > 0) {
             for (metadata.items) |candidate| {

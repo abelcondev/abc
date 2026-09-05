@@ -808,20 +808,45 @@ pub fn hasConversationMetadata(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
 ) !bool {
+    const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return false;
+    defer alloc.free(bytes);
+    return isConversationMetadata(alloc, bytes);
+}
+
+/// Reads and validates current metadata once. The caller owns the decoded value.
+pub fn readConversationMetadata(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !?session_codec.DecodedSessionMetadata {
+    const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return null;
+    defer alloc.free(bytes);
+    if (!try isConversationMetadata(alloc, bytes)) return null;
+    return session_codec.decodeSessionMetadata(alloc, bytes) catch |err| switch (err) {
+        error.SessionMetadataTooLarge => error.InvalidSessionFormat,
+        else => err,
+    };
+}
+
+fn readConversationMetadataBytes(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
     const bytes = readManagedFileAlloc(
         alloc,
         dir,
         manifest_file,
         session_codec.max_session_metadata_bytes,
     ) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        error.InvalidSessionFormat => return false,
+        error.FileNotFound, error.InvalidSessionFormat => return null,
         else => return err,
     };
-    defer alloc.free(bytes);
+    return bytes;
+}
+
+fn isConversationMetadata(alloc: Allocator, bytes: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
         .parse_numbers = false,
-    }) catch return false;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer parsed.deinit();
     const object = if (parsed.value == .object) parsed.value.object else return false;
     const version = object.get("schema_version") orelse return false;
