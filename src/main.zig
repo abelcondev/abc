@@ -675,7 +675,9 @@ const App = struct {
             }
         }
         if (comptime host_profile.durable_sessions) {
-            SessionAppRuntime.primeSessionPicker(&app);
+            if (launch.upgrade_relaunch == null) {
+                SessionAppRuntime.primeSessionPicker(&app);
+            }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
@@ -834,6 +836,7 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
         self.managed_executions.shutdown();
         self.upgrader.stop();
         self.file_index.requestStop();

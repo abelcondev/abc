@@ -5255,6 +5255,7 @@ test.skipIf(!tmuxAvailable())(
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const freshStderrPath = join(root, "fresh-stderr.log");
+    const tracePath = join(root, "trace.log");
     const argvLogPath = join(root, "upgrade-argv.log");
     mkdirSync(home);
     mkdirSync(freshHome);
@@ -5276,6 +5277,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(stderrPath, "");
       writeFileSync(freshStderrPath, "");
+      writeFileSync(tracePath, "");
       active = await TmuxSession.create({
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
@@ -5283,6 +5285,8 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,session",
         },
         stderrPath,
         width: 110,
@@ -5299,6 +5303,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
+      const traceBeforeUpgrade = readFileSync(tracePath, "utf8");
 
       fresh = await TmuxSession.create({
         cmd: shellQuote(installedFx),
@@ -5323,6 +5328,11 @@ test.skipIf(!tmuxAvailable())(
 
       const updatedNotice = `● fx has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const postUpgradeTrace = readFileSync(tracePath, "utf8");
+      expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
+        "session picker completion",
+      );
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
