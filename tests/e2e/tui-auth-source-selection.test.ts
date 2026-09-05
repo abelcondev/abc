@@ -4700,6 +4700,92 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
   }
 }, 60_000);
 
+test("native final snapshots preserve completed items and reject conflicting kinds", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const shape of ["null", "empty", "kind-at-item", "kind-at-terminal"] as const) {
+    const conflict = shape.startsWith("kind-");
+    const profile = mkdtempSync(join(tmpdir(), "fx-output-consistency-"));
+    const gateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const reasoning = { type: "reasoning", id: "rs_snapshot", summary: [], encrypted_content: "SNAPSHOT_REASONING" };
+    const message = (id: string, text: string, phase: string) => ({ type: "message", id, role: "assistant", status: "completed", phase, content: [{ type: "output_text", text, annotations: [] }] });
+    const progress = message("msg_progress", "Inspecting.", "commentary");
+    const call = { type: "function_call", id: "fc_snapshot", call_id: "call_snapshot", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const replacement = message("msg_replacement", "CONFLICTING_TEXT", "final_answer");
+    const events: object[] = [
+      { type: "response.output_item.done", output_index: 0, item: reasoning },
+      { type: "response.output_item.done", output_index: 1, item: progress },
+      { type: "response.output_item.added", output_index: 2, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: 2, item_id: call.id, arguments: call.arguments },
+      { type: "response.output_item.done", output_index: 2, item: shape === "kind-at-item" ? replacement : call },
+      { type: "response.completed", response: { status: "completed", output: shape === "kind-at-terminal" ? [reasoning, progress, replacement] : shape === "empty" ? [] : null } },
+    ];
+    const answer = (text: string) => fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: message("msg_answer", text, "final_answer") },
+      { type: "response.completed", response: { status: "completed", output: null } },
+    ]);
+    const responses = [fakeGatewaySse(events), answer("SNAPSHOT_OK"), answer("RESUMED_OK")];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "SNAPSHOT_READ_RESULT\n");
+      const tracePath = join(profile, "trace.log");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      expect(direct.bodies).toHaveLength(conflict ? 1 : 2);
+      const trace = readFileSync(tracePath, "utf8");
+      if (conflict) {
+        expect(result.error).toBe("ResponsesOutputItemConflict");
+        expect(result.tool_calls).toEqual([]);
+        expect(trace).not.toContain("after_tool_execution");
+        expect(result.output).not.toContain("CONFLICTING_TEXT");
+      } else {
+        expect(result.output).toBe("Inspecting.\n\nSNAPSHOT_OK");
+        expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+        expect(trace).toContain("after_tool_execution");
+      }
+      const detail = await runFx(["session", "--json", "--id", result.session_id], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      const history = JSON.parse(detail.stdout).history;
+      expect(history).toHaveLength(1);
+      expect(history[0].kind).toBe(conflict ? "interrupted" : "assistant");
+      expect(history[0].execution?.tool_steps ?? []).toHaveLength(conflict ? 0 : 1);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).output).toBe(conflict ? "SNAPSHOT_OK" : "RESUMED_OK");
+      expect(direct.bodies).toHaveLength(conflict ? 2 : 3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input;
+        const calls = input.filter((item: { type?: string }) => item.type === "function_call");
+        const outputs = input.filter((item: { type?: string }) => item.type === "function_call_output");
+        expect(calls.map((item: { call_id: string }) => item.call_id)).toEqual(conflict ? [] : ["call_snapshot"]);
+        expect(outputs).toHaveLength(conflict ? 0 : 1);
+        if (!conflict) {
+          expect(outputs[0].output).toContain("SNAPSHOT_READ_RESULT");
+          expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("Inspecting.");
+        }
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("native terminal outcomes preserve recovery and incomplete warnings", async () => {
   for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "rejected-partial", "length", "length-with-status"]) {
     const native = provider !== "gateway";

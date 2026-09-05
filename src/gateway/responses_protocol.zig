@@ -915,6 +915,7 @@ pub const Reducer = struct {
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
             if (std.mem.eql(u8, item_type, "function_call")) {
+                try self.check_output_kind(output_index, .function_call);
                 const call_id = stringField(item.object, "call_id") orelse return false;
                 const name = stringField(item.object, "name") orelse return false;
                 if (findTool(self.tools.items, output_index) == null) {
@@ -936,6 +937,8 @@ pub const Reducer = struct {
                 try self.reconcile_reasoning(alloc, output_index, item.object, .identity, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 _ = try self.reconcile_message(alloc, output_index, try text_identity(item.object, "id"), try assistantMessagePhase(item.object), limits);
+            } else {
+                try self.check_output_kind(output_index, .unknown);
             }
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
             std.mem.eql(u8, event_type, "response.refusal.delta"))
@@ -965,12 +968,15 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
             std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
         {
+            if (try optional_index(parsed.value.object, "output_index")) |index| try self.check_output_kind(index, .reasoning);
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
+            if (try optional_index(parsed.value.object, "output_index")) |index| try self.check_output_kind(index, .reasoning);
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, "\n\n");
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
+            try self.check_output_kind(output_index, .function_call);
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             const index = findTool(self.tools.items, output_index) orelse return false;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
@@ -979,6 +985,7 @@ pub const Reducer = struct {
             if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
+            try self.check_output_kind(output_index, .function_call);
             const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
             const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
@@ -994,6 +1001,8 @@ pub const Reducer = struct {
                 try self.reconcile_reasoning(alloc, output_index, item.object, .completed, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+            } else {
+                try self.check_output_kind(output_index, .unknown);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -1003,10 +1012,11 @@ pub const Reducer = struct {
             const response_value = parsed.value.object.get("response") orelse return error.InvalidEvent;
             if (response_value != .object) return error.InvalidEvent;
             const status = try terminal_status(event_type, response_value.object);
+            const output = response_value.object.get("output") orelse .null;
             if (status == .failed) {
                 const failure = response_value.object.get("error");
                 try self.accept_failure(alloc, if (failure != null and failure.? == .object) failure.?.object else .{});
-            } else if (response_value.object.get("output")) |output| {
+            } else if (output != .null) {
                 if (output != .array) return error.InvalidEvent;
                 for (output.array.items, 0..) |item, output_index| {
                     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -1019,6 +1029,8 @@ pub const Reducer = struct {
                         try self.reconcile_reasoning(alloc, index, item.object, .completed, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
                         try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                    } else {
+                        try self.check_output_kind(index, .unknown);
                     }
                 }
             }
@@ -1044,7 +1056,18 @@ pub const Reducer = struct {
         return false;
     }
 
+    fn check_output_kind(self: *const Reducer, output_index: i64, kind: enum { function_call, reasoning, message, unknown }) error{ResponsesOutputItemConflict}!void {
+        if (kind != .function_call and findTool(self.tools.items, output_index) != null) return error.ResponsesOutputItemConflict;
+        if (kind != .reasoning) for (self.reasoning_items.items) |item| {
+            if (item.output_index == output_index) return error.ResponsesOutputItemConflict;
+        };
+        if (kind != .message) for (self.message_items.items) |item| {
+            if (item.output_index == output_index) return error.ResponsesOutputItemConflict;
+        };
+    }
+
     fn reconcile_reasoning(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, fields: std.json.ObjectMap, evidence: enum { identity, completed }, limits: StreamLimits) !void {
+        try self.check_output_kind(output_index, .reasoning);
         const id_hash = try text_identity(fields, "id");
         var low: usize = 0;
         var high = self.reasoning_items.items.len;
@@ -1085,7 +1108,6 @@ pub const Reducer = struct {
             if (id_hash != null) prior.id_hash = id_hash;
             prior.json = json;
         } else {
-            if (id_hash == null and json == null) return;
             if (self.reasoning_items.items.len >= limits.events) return error.ResourceLimitExceeded;
             try self.reasoning_items.insert(alloc, low, .{ .output_index = output_index, .id_hash = id_hash, .json = json });
         }
@@ -1093,6 +1115,7 @@ pub const Reducer = struct {
     }
 
     fn reconcile_message(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, id_hash: ?[TextDigest.digest_length]u8, phase: ?AssistantMessagePhase, limits: StreamLimits) !*MessageItem {
+        try self.check_output_kind(output_index, .message);
         var low: usize = 0;
         var high = self.message_items.items.len;
         while (low < high) {
@@ -1231,6 +1254,7 @@ pub const Reducer = struct {
         callbacks: StreamCallbacks,
         limits: StreamLimits,
     ) !void {
+        try self.check_output_kind(output_index, .function_call);
         const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
         const tool = &self.tools.items[index];
         try tool.reconcileIdentity(alloc, fields, "id", limits);
@@ -1365,6 +1389,134 @@ const ToolRecordTest = struct {
 
     fn ignore(_: *anyopaque, _: []const u8) void {}
 };
+
+test "Responses absent final snapshot preserves completed stream evidence" {
+    for ([_][]const u8{ "", ",\"output\":[]", ",\"output\":null" }) |snapshot| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(
+            \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_done","phase":"final_answer","content":[{"type":"output_text","text":"Completed answer."}]}}
+        );
+        const terminal = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"{s}}}}}", .{snapshot});
+        defer stream.alloc.free(terminal);
+        try stream.apply(terminal);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings("Completed answer.", completion.content.?);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+        try std.testing.expect(completion.provider_state_json != null);
+    }
+}
+
+test "Responses output slot cannot change kind before completion" {
+    const conflicts = [_][]const u8{
+        \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_replacement","content":[{"type":"output_text","text":"conflicting text"}]}}
+        ,
+        \\{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_replacement","content":[{"type":"output_text","text":"conflicting text"}]}]}}
+        ,
+    };
+    for (conflicts) |event| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(
+            \\{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_original","call_id":"call_original","name":"read_file","arguments":"{}"}}
+        );
+        try std.testing.expectError(error.ResponsesOutputItemConflict, stream.apply(event));
+        try stream.expect_emitted("");
+        try std.testing.expectError(error.StreamIncomplete, stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits));
+    }
+}
+
+test "Responses output kinds remain exclusive across item event stages" {
+    const items = [_][]const u8{
+        \\{"type":"message","content":[]}
+        ,
+        \\{"type":"reasoning"}
+        ,
+        \\{"type":"function_call","id":"fc","call_id":"call","name":"read_file","arguments":"{}"}
+        ,
+        \\{"type":"future_item"}
+        ,
+    };
+    for (items[0..3], 0..) |initial, from| {
+        for (items, 0..) |replacement, to| {
+            for ([_][]const u8{ "response.output_item.added", "response.output_item.done", "response.completed" }) |stage| {
+                var stream = ToolRecordTest.init(std.testing.allocator);
+                defer stream.deinit();
+                const start = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{s}}}", .{initial});
+                defer stream.alloc.free(start);
+                try stream.apply(start);
+                const event = if (std.mem.eql(u8, stage, "response.completed"))
+                    try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{replacement})
+                else
+                    try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"{s}\",\"output_index\":0,\"item\":{s}}}", .{ stage, replacement });
+                defer stream.alloc.free(event);
+                if (from == to) {
+                    try stream.apply(event);
+                    try stream.apply(ToolRecordTest.terminal);
+                    const completion = try stream.finish();
+                    defer stream.freeCompletion(completion);
+                } else {
+                    try std.testing.expectError(error.ResponsesOutputItemConflict, stream.apply(event));
+                    try std.testing.expectError(error.StreamIncomplete, stream.finish());
+                }
+            }
+        }
+    }
+}
+
+test "Responses typed deltas cannot target a different owned kind" {
+    const cases = [_]struct { start: []const u8, event: []const u8 }{
+        .{ .start = ToolRecordTest.start, .event = "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"wrong\"}" },
+        .{ .start = ToolRecordTest.start, .event = "{\"type\":\"response.refusal.done\",\"output_index\":0,\"refusal\":\"wrong\"}" },
+        .{ .start = ToolRecordTest.start, .event = "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"wrong\"}" },
+        .{ .start = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}", .event = "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}" },
+        .{ .start = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}", .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{}\"}" },
+    };
+    for (cases) |case| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(case.start);
+        try std.testing.expectError(error.ResponsesOutputItemConflict, stream.apply(case.event));
+        try stream.expect_emitted("");
+    }
+}
+
+test "Responses non-null snapshot shapes remain invalid" {
+    for ([_][]const u8{ "{}", "false", "0", "\"invalid\"" }) |snapshot| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":{s}}}}}", .{snapshot});
+        defer stream.alloc.free(event);
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+        try std.testing.expectError(error.StreamIncomplete, stream.finish());
+    }
+}
+
+test "Responses null snapshot preserves separate item kinds without extra replay" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var stream = ToolRecordTest.init(alloc);
+            defer stream.deinit();
+            try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"reasoning\"}}");
+            try stream.apply(ToolRecordTest.start);
+            try stream.apply(ToolRecordTest.finalized);
+            const reasoning = "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}}";
+            try stream.apply(reasoning);
+            try stream.apply(reasoning);
+            try stream.apply("{\"type\":\"response.output_text.delta\",\"output_index\":2,\"delta\":\"done\"}");
+            try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":3,\"item\":{\"type\":\"future_item\"}}");
+            try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":null}}");
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqualStrings("done", completion.content.?);
+            try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+            try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+            try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}]", completion.provider_state_json.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
 
 test "Responses message replay preserves separate commentary and final text" {
     var stream = ToolRecordTest.init(std.testing.allocator);
@@ -1759,7 +1911,7 @@ test "Responses terminal failure retains progress without final-only output" {
     var stream = TextRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.delta(0, 0, "partial");
-    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"\"}}");
     try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"retry\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"must not publish\"}]}]}}");
     try stream.expect_emitted("partial");
     const completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits);
@@ -2258,7 +2410,7 @@ fn expectToolFinalizationAllocations(alloc: std.mem.Allocator) !void {
     try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"discarded preview\"}");
     try stream.apply(ToolRecordTest.finalized);
     try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"arguments\":\" {\\\"path\\\":\\\"preview.txt\\\"} \"}}");
-    try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"finished\"}");
+    try stream.apply("{\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"finished\"}");
     try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}");
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
