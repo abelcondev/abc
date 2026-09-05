@@ -2579,7 +2579,6 @@ fn materializeConfirmedProviderTools(
         within_turn_suffix,
         null,
         novel_calls,
-        completion.assistant_phase,
         try deps.agent_stream_provider.projectReplay(arena, if (completion.provider_state_json) |parts| .{ .source = selection, .parts_json = parts } else null, novel_calls, false, true),
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
@@ -7957,7 +7956,6 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             if (terminal_provider_completion) null else completion.content,
             effective_tool_calls,
-            completion.assistant_phase,
             if (terminal_provider_completion or filtered_provider_calls.removed > 0)
                 try deps.agent_stream_provider.projectReplay(arena, provider_replay, effective_tool_calls, !terminal_provider_completion, true)
             else

@@ -4560,6 +4560,75 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("native assistant messages keep their boundaries and phases through tools and resume", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-message-replay-"));
+    const testGateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const message = (id: string, phase: string, text: string) => ({ type: "message", id, role: "assistant", status: "completed", phase, content: [{ type: "output_text", text, annotations: [] }] });
+    const progress = message("msg_progress", "commentary", "Checking the file.");
+    const progressTwo = message("msg_progress_two", "commentary", "Reading its contents.");
+    const answer = message("msg_answer", "final_answer", "The value is 42.");
+    const reasoning = { type: "reasoning", id: "rs_messages", summary: [], encrypted_content: "MESSAGE_REPLAY_CONTEXT" };
+    const call = { type: "function_call", id: "fc_messages", call_id: "call_messages", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const responses = [fakeGatewaySse([
+      { type: "response.output_item.added", output_index: 0, item: { ...progress, content: [] } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: progress.id, delta: "Checking " },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: progress.id, delta: "the file." },
+      { type: "response.output_item.done", output_index: 0, item: progress },
+      { type: "response.output_item.added", output_index: 3, item: { ...call, arguments: "" } },
+      { type: "response.completed", response: { status: "completed", output: [progress, reasoning, progressTwo, call] } },
+    ]), fakeGatewaySse([
+      { type: "response.completed", response: { status: "completed", output: [message("msg_result", "commentary", "Read complete."), answer] } },
+    ]), fakeGatewaySse([
+      { type: "response.completed", response: { status: "completed", output: [message("msg_resume", "final_answer", "Still 42.")] } },
+    ])];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "42\n");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the value."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      const result = JSON.parse(first.stdout);
+      expect(result.output).toBe("Checking the file.\n\nReading its contents.\n\nRead complete.\n\nThe value is 42.");
+      expect(direct.bodies).toHaveLength(2);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(JSON.parse(resumed.stdout).output).toBe("Still 42.");
+      expect(direct.bodies).toHaveLength(3);
+      for (const [index, body] of direct.bodies.slice(1).entries()) {
+        const input = JSON.parse(body).input;
+        const messages = input.filter((item: { role?: string }) => item.role === "assistant");
+        expect(messages.map((item: { phase?: string; content: Array<{ text: string }> }) => ({ phase: item.phase, text: item.content.map((part) => part.text).join("") }))).toEqual([
+          { phase: "commentary", text: "Checking the file." },
+          { phase: "commentary", text: "Reading its contents." },
+          ...(index === 1 ? [{ phase: "commentary", text: "Read complete." }, { phase: "final_answer", text: "The value is 42." }] : []),
+        ]);
+        expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+        const calls = input.filter((item: { type?: string }) => item.type === "function_call");
+        const outputs = input.filter((item: { type?: string }) => item.type === "function_call_output");
+        expect(calls.map((item: { call_id: string }) => item.call_id)).toEqual(["call_messages"]);
+        expect(outputs.map((item: { call_id: string }) => item.call_id)).toEqual(["call_messages"]);
+        expect(outputs[0].output).toContain("42");
+      }
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("native reasoning snapshots survive tools and saved resume exactly once", async () => {
   for (const provider of ["codex", "grok"] as const) for (const shape of ["both", "terminal-only", "enriched", "conflict", "identity-conflict"] as const) {
     const conflict = shape === "conflict" || shape === "identity-conflict";
@@ -4710,6 +4779,7 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
 
 test("direct providers reconcile final text before saving or releasing tools", async () => {
   const prefix = "COMMENTARY_ITEM\n", answer = "FINAL_ANSWER_ITEM";
+  const display = prefix + "\n\n" + answer;
   for (const provider of ["codex", "grok"] as const) for (const mode of ["streamed", "final-only", "mixed", "terminal-only", "conflict"]) {
     const profile = mkdtempSync(join(tmpdir(), "fx-response-text-"));
     const model = "fixture-model";
@@ -4765,17 +4835,17 @@ test("direct providers reconcile final text before saving or releasing tools", a
       } else {
         expect(first.code, first.stdout + first.stderr).toBe(0);
         expect(first.stderr).toBe("");
-        expect(output.output).toBe(prefix + answer);
-        expect(output.final_output).toBe(prefix + answer);
+        expect(output.output).toBe(display);
+        expect(output.final_output).toBe(display);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
-        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
+        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(display);
         const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
         expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
         expect(resumed.stderr).toBe("");
         expect(direct.bodies).toHaveLength(2);
         const replay = JSON.parse(direct.bodies[1]).input.filter((entry: { role?: string }) => entry.role === "assistant");
-        expect(replay.some((entry: { content: Array<{ text?: string }> }) => entry.content.some(part => part.text === prefix + answer))).toBe(true);
+        expect(replay.map((entry: { content: Array<{ text?: string }> }) => entry.content.map(part => part.text).join(""))).toEqual([prefix, answer]);
       }
       expect(gateway.requests).toHaveLength(0);
     } finally {

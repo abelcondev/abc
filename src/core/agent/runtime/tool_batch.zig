@@ -46,14 +46,12 @@ pub fn appendAssistantToolCallStep(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     content: ?[]const u8,
     tool_calls: []const ToolCall,
-    assistant_phase: ?types.AssistantMessagePhase,
     provider_replay: ?types.ProviderReplay,
 ) !void {
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = content,
         .tool_calls = tool_calls,
-        .assistant_phase = assistant_phase,
         .provider_replay = provider_replay,
     });
 }
@@ -556,7 +554,7 @@ test "drained batch feedback follows all tool results and keeps its source call"
         .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
     };
 
-    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, .commentary, null);
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, null);
     try appendToolResultContent(
         alloc,
         &suffix,
@@ -587,10 +585,6 @@ test "drained batch feedback follows all tool results and keeps its source call"
 
     try std.testing.expectEqual(@as(usize, 4), suffix.items.len);
     try std.testing.expectEqual(.assistant, suffix.items[0].role);
-    try std.testing.expectEqual(
-        types.AssistantMessagePhase.commentary,
-        suffix.items[0].assistant_phase.?,
-    );
     try std.testing.expectEqual(.tool, suffix.items[1].role);
     try std.testing.expectEqual(.tool, suffix.items[2].role);
     try std.testing.expectEqual(.user, suffix.items[3].role);
