@@ -176,6 +176,8 @@ Skills are advertised in a stable catalog sized to the selected model's context 
 
 Explicit `$skill-name` mentions load the selected instructions before the model starts work. The `skill` tool accepts an advertised `location` and an optional relative `resource`, returning the complete document or a visible failure. Omitting `resource` or passing an empty string reads `SKILL.md`. File and tool-result limits still apply, and an explicit `skill_chunk_bytes` limit blocks a complete read that would exceed it. Existing named, offset-based calls remain supported.
 
+In the interactive shell, explicitly requested skills show a named load summary before the assistant replies. These automatic loads are not counted as tool calls; a loaded status confirms prepared instructions, not that the model followed them.
+
 ## Documentation
 
 Read the [fx documentation](https://fx.sh/docs).
