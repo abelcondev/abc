@@ -1161,6 +1161,27 @@ pub const Store = struct {
         return state;
     }
 
+    /// Replays complete canonical conversation turns without retaining the archive.
+    /// The visitor borrows each turn only for the duration of append().
+    pub fn visitConversationHistory(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        visitor: anytype,
+    ) !void {
+        try validateSessionId(session_id);
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        var reader = try session_log.ConversationHistoryReader.init(alloc, &dir);
+        defer reader.deinit();
+        while (try reader.next()) |turn| {
+            var turns = [_]session.HistoryTurn{turn};
+            defer session.freeHistoryTurn(alloc, turns[0]);
+            try resolveSessionSnapshotLocators(alloc, &turns, self.sessions_dir, session_id);
+            try visitor.append(turns[0]);
+        }
+    }
+
     /// Reads only the immutable initial-event child identity for a materialized
     /// schema-v3 session. Index-only and legacy rows have no such payload.
     pub fn loadSubagentChildIdentity(
@@ -7338,6 +7359,63 @@ test "history page streaming digest has fixed memory and cursor parser fuzz cove
         } else |err| {
             try std.testing.expectEqual(error.InvalidHistoryPageCursor, err);
         }
+    }
+}
+
+test "conversation visitation releases turns on consumer and allocation failure" {
+    const backing = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(backing, &tmp);
+    defer ctx.deinit(backing);
+    try createHistoryPageFixture(backing, ctx.store, "streamed-history", ctx.workspace, 3, "stream");
+    const Visitor = struct {
+        tracking: *std.testing.FailingAllocator,
+        count: usize = 0,
+        retained_bytes: ?usize = null,
+        reject: bool = false,
+
+        pub fn append(self: *@This(), turn: session.HistoryTurn) !void {
+            if (self.reject) return error.ConsumerFailed;
+            const expected = [_][]const u8{ "stream-0", "stream-1", "stream-2" };
+            try std.testing.expect(self.count < expected.len);
+            try std.testing.expect(turn == .assistant);
+            try std.testing.expectEqualStrings(expected[self.count], turn.assistant.user.text);
+            const retained = self.tracking.allocated_bytes - self.tracking.freed_bytes;
+            if (self.retained_bytes) |first| {
+                try std.testing.expectEqual(first, retained);
+            } else {
+                self.retained_bytes = retained;
+            }
+            self.count += 1;
+        }
+    };
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var visitor = Visitor{ .tracking = &probe };
+    try ctx.store.visitConversationHistory(probe.allocator(), "streamed-history", &visitor);
+    try std.testing.expectEqual(@as(usize, 3), visitor.count);
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    var rejected = std.testing.FailingAllocator.init(backing, .{});
+    var rejecting = Visitor{ .tracking = &rejected, .reject = true };
+    try std.testing.expectError(error.ConsumerFailed, ctx.store.visitConversationHistory(
+        rejected.allocator(),
+        "streamed-history",
+        &rejecting,
+    ));
+    try std.testing.expectEqual(rejected.allocated_bytes, rejected.freed_bytes);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var partial = Visitor{ .tracking = &failing };
+        try std.testing.expectError(error.OutOfMemory, ctx.store.visitConversationHistory(
+            failing.allocator(),
+            "streamed-history",
+            &partial,
+        ));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
 

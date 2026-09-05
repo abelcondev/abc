@@ -22,6 +22,7 @@ import {
   fakeGatewayToolCall,
   fakeGatewaySse,
   fakeShellRun,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -394,7 +395,16 @@ done
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));
 
-  return { paths, gateway: startFakeGateway(responses), totalTools };
+  const gateway = startDynamicFakeGateway((body) => {
+    const request = JSON.parse(body);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+      return fakeGatewayFinalText(
+        "Continue the prepared mixed-history workload without repeating completed tools, then run the requested live command.",
+      );
+    }
+    return responses.shift() ?? new Response("Unexpected stress-fixture request", { status: 500 });
+  });
+  return { paths, gateway, totalTools };
 }
 
 async function waitForScrollback(
@@ -817,7 +827,9 @@ async function verifyOldestTranscriptEntrySurvives(
   await session.sendHexBytes(CTRL_O);
   const newest = await waitForMode(session, "full", draft);
   expect(newest).toContain(LIVE_DONE);
-  const pageCount = config.oldestPageCount ?? 1_024;
+  const sourceLines = config.batches *
+    (config.chatLinesPerBatch + config.toolsPerBatch * config.fileLines) + config.liveLines;
+  const pageCount = config.oldestPageCount ?? Math.max(1_024, sourceLines);
   const pageChunk = 64;
   for (let sent = 0; sent < pageCount; sent += pageChunk) {
     await sendRepeatedKey(
@@ -864,12 +876,15 @@ async function verifyResumedTranscriptNavigation(
   const newest = await waitForMode(session, "full", draft);
   expect(newest).toContain(LIVE_DONE);
 
-  // Resume reconstructs the compact transcript under the product's 256 KiB
-  // retention cap, so the original first line is not expected to survive.
+  // The footer can stay visible while the scrolled page is still being built.
   let older = newest;
   for (let sent = 0; sent < 512; sent += 64) {
+    const previous = older;
     await sendRepeatedKey(session, "PPage", 64, 64, 300);
-    older = await waitForMode(session, "full", draft);
+    older = await session.waitForPane(
+      (pane) => pane.includes(FULL_FOOTER) && pane !== previous,
+      TIMEOUT,
+    );
     if (
       olderRetainedChatMarker(older, config) !== undefined ||
       [...older.matchAll(/CTRL_O_BRUTAL_TOOL_(\d{4})/g)]

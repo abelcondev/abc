@@ -566,9 +566,7 @@ fn handleRestoreSession(
             }
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
-                for (active.session_rt.agent.history.items) |turn| {
-                    try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-                }
+                try sendActiveHistoryUpdates(state, alloc, session_id);
             }
             try sendPendingRecoveryUpdate(
                 state,
@@ -693,9 +691,7 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_mcp_owned = false;
     if (kind.replaysHistory()) {
-        for (state.active_session.?.session_rt.agent.history.items) |turn| {
-            try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-        }
+        try sendActiveHistoryUpdates(state, alloc, session_id);
     }
     try sendPendingRecoveryUpdate(
         state,
@@ -1175,11 +1171,31 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
+fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    const active = &state.active_session.?;
+    if (active.store) |store| {
+        const Visitor = struct {
+            state: *server.ServerState,
+            alloc: Allocator,
+            session_id: []const u8,
+
+            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+            }
+        };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        return store.visitConversationHistory(alloc, session_id, &visitor);
+    }
+    for (active.session_rt.agent.history.items) |turn| {
+        try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    }
+}
+
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
     switch (turn) {
         .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
         .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
-        .compacted_summary => |compacted| try sendUserHistoryText(state, alloc, session_id, compacted.summary),
+        .compacted_summary => return,
     }
 
     switch (turn) {
@@ -1248,17 +1264,6 @@ fn sendUserHistoryTurn(
     }
 }
 
-fn sendUserHistoryText(state: *server.ServerState, alloc: Allocator, session_id: []const u8, user_text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
-    try sendUserHistoryChunk(
-        state,
-        alloc,
-        session_id,
-        acp_types.generateMessageId(&message_id),
-        user_text,
-    );
-}
-
 fn sendUserHistoryChunk(
     state: *server.ServerState,
     alloc: Allocator,
@@ -1325,6 +1330,12 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
         active.session_rt.agent.history.items,
     );
     defer metadata.deinit(alloc);
+    if (active.writable) |*writable| {
+        if (try writable.conversationTitle(alloc)) |title| {
+            metadata.deinit(alloc);
+            metadata = .{ .present = true, .title = title };
+        }
+    }
     const updated_at_ms = if (active.writable) |*writable|
         writable.state.updated_at_ms
     else if (active.wasm_state) |durable|
@@ -1563,6 +1574,41 @@ test "ACP load recognizes the retained active session exactly" {
         "release.2026.06",
         "release.2026",
     ));
+}
+
+test "ACP history excludes typed summaries without filtering original user text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .compacted_summary = .{
+        .summary = @constCast("internal summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } });
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+
+    const original = "Explain <context_handoff> without hiding my question.";
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+        .user = .{ .text = @constCast(original) },
+        .assistant = @constCast("original reply"),
+    } });
+    var file = try tmp.dir.openFile(io_mod.getIo(), "history.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, original) != null);
+    try std.testing.expect(std.mem.find(u8, captured, "original reply") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
 }
 
 test "ACP interrupted history replay hides model-only abort context" {

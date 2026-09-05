@@ -963,6 +963,78 @@ fn replayConversationHistory(
     return completed;
 }
 
+/// Reads complete canonical turns while retaining only the turn being built.
+/// Each returned turn is owned by the caller.
+pub const ConversationHistoryReader = struct {
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+    offset: u64 = 0,
+    builder: ConversationTurnBuilder,
+
+    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationHistoryReader {
+        var file = try openManagedFile(dir, events_file, .read_only);
+        errdefer file.close(io_mod.getIo());
+        return .{
+            .alloc = alloc,
+            .file = file,
+            .length = try file.length(io_mod.getIo()),
+            .builder = ConversationTurnBuilder.init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *ConversationHistoryReader) void {
+        self.builder.deinit();
+        self.file.close(io_mod.getIo());
+        self.* = undefined;
+    }
+
+    pub fn next(self: *ConversationHistoryReader) !?session.HistoryTurn {
+        while (self.offset < self.length) {
+            const line = session_replay.readLineAt(self.alloc, self.file, self.offset, self.length) catch |err| switch (err) {
+                error.TruncatedEventFrame => return null,
+                else => return err,
+            } orelse return null;
+            defer self.alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(self.alloc, line.bytes);
+            defer decoded.deinit();
+            const completed: ?session.HistoryTurn = switch (decoded.value.event) {
+                .user => |value| blk: {
+                    try self.builder.begin(value);
+                    break :blk null;
+                },
+                .assistant => |value| blk: {
+                    try self.builder.appendAssistant(value.text);
+                    break :blk null;
+                },
+                .tool_call => |value| blk: {
+                    try self.builder.appendToolCall(value);
+                    break :blk null;
+                },
+                .tool_result => |value| blk: {
+                    try self.builder.appendToolResult(value);
+                    break :blk null;
+                },
+                .steering => |value| blk: {
+                    try self.builder.appendSteering(value.text);
+                    break :blk null;
+                },
+                .turn_completed => |value| try self.builder.finishAssistant(value),
+                .interrupted => |value| try self.builder.finishInterrupted(value),
+                .context_checkpoint => blk: {
+                    if (self.builder.calls.items.len != 0 or self.builder.results.items.len != 0) {
+                        return error.InvalidConversationFrame;
+                    }
+                    break :blk null;
+                },
+            };
+            self.offset = line.next_offset;
+            if (completed) |turn| return turn;
+        }
+        return null;
+    }
+};
+
 pub fn loadConversationHistoryRange(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
@@ -970,66 +1042,22 @@ pub fn loadConversationHistoryRange(
     end: usize,
 ) ![]session.HistoryTurn {
     if (start > end) return error.InvalidHistoryPageCursor;
-    var file = try openManagedFile(dir, events_file, .read_only);
-    defer file.close(io_mod.getIo());
-    const length = try file.length(io_mod.getIo());
-    var offset: u64 = 0;
-    var turn_index: usize = 0;
+    var reader = try ConversationHistoryReader.init(alloc, dir);
+    defer reader.deinit();
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
         turns.deinit(alloc);
     }
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    while (offset < length and turn_index < end) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
-            error.TruncatedEventFrame => break,
-            else => return err,
-        } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const completed: ?session.HistoryTurn = switch (decoded.value.event) {
-            .user => |value| blk: {
-                try builder.begin(value);
-                break :blk null;
-            },
-            .assistant => |value| blk: {
-                try builder.appendAssistant(value.text);
-                break :blk null;
-            },
-            .tool_call => |value| blk: {
-                try builder.appendToolCall(value);
-                break :blk null;
-            },
-            .tool_result => |value| blk: {
-                try builder.appendToolResult(value);
-                break :blk null;
-            },
-            .steering => |value| blk: {
-                try builder.appendSteering(value.text);
-                break :blk null;
-            },
-            .turn_completed => |value| try builder.finishAssistant(value),
-            .interrupted => |value| try builder.finishInterrupted(value),
-            .context_checkpoint => blk: {
-                if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
-                    return error.InvalidConversationFrame;
-                }
-                break :blk null;
-            },
-        };
-        if (completed) |turn| {
-            if (turn_index >= start) {
-                errdefer session.freeHistoryTurn(alloc, turn);
-                try turns.append(alloc, turn);
-            } else {
-                session.freeHistoryTurn(alloc, turn);
-            }
-            turn_index += 1;
+    var turn_index: usize = 0;
+    while (turn_index < end) : (turn_index += 1) {
+        const turn = (try reader.next()) orelse break;
+        if (turn_index >= start) {
+            errdefer session.freeHistoryTurn(alloc, turn);
+            try turns.append(alloc, turn);
+        } else {
+            session.freeHistoryTurn(alloc, turn);
         }
-        offset = line.next_offset;
     }
     return turns.toOwnedSlice(alloc);
 }

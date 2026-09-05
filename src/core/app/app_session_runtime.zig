@@ -1779,7 +1779,7 @@ pub fn Runtime(comptime App: type) type {
                     .workspace_root = projection_workspace_root,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
-                try replayHistoryToSink(app, &sink, state.history);
+                try replayResumedHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
@@ -1799,7 +1799,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display_title, notice);
-                try replayHistoryToSink(app, &sink, state.history);
+                try replayResumedHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
@@ -3333,6 +3333,36 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.appendAssistantThematicRule();
                 }
             };
+        }
+
+        fn replayResumedHistoryToSink(
+            app: *App,
+            sink: anytype,
+            context_history: []const types.HistoryTurn,
+        ) !void {
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (app.session_persistence.writable) |*loaded| {
+                    if (app.session_persistence.store) |store| {
+                        const Visitor = struct {
+                            app: *App,
+                            sink: @TypeOf(sink),
+                            has_prior_turns: bool = false,
+
+                            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                                return replayHistoryToSinkIncremental(
+                                    self.app,
+                                    self.sink,
+                                    &.{turn},
+                                    &self.has_prior_turns,
+                                );
+                            }
+                        };
+                        var visitor = Visitor{ .app = app, .sink = sink };
+                        return store.visitConversationHistory(app.alloc, loaded.active_id, &visitor);
+                    }
+                }
+            }
+            return replayHistoryToSink(app, sink, context_history);
         }
 
         fn readNativeResumeDisplay(
