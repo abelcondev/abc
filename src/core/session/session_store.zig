@@ -1179,13 +1179,16 @@ pub const Store = struct {
             options,
         ) orelse return session_log.failLoadedWritableSession(error.NoSavedSessions);
         defer alloc.free(selected);
-        var loaded = try self.resumeExactForWrite(
+        var loaded = self.resumeExactForWrite(
             alloc,
             selected,
             workspace_root,
             false,
             options,
-        );
+        ) catch |err| {
+            logDiscoveryError(.workspace_writable_last, selected, null, null, err);
+            return err;
+        };
         errdefer loaded.deinit(alloc);
         return loaded;
     }
@@ -2686,6 +2689,18 @@ pub const Store = struct {
         return loaded;
     }
 
+    fn only_unpublished_lock(session_dir: *io_mod.VerifiedDir) !bool {
+        var dir = try session_dir.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true });
+        defer dir.close(io_mod.getIo());
+        var entries = dir.iterate();
+        while (try entries.next(io_mod.getIo())) |entry| {
+            if (entry.kind != .file or !std.mem.eql(u8, entry.name, "session.lock")) return false;
+            const stat = try dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
+            if (stat.kind != .file or stat.size != 0 or stat.nlink != 1) return false;
+        }
+        return true;
+    }
+
     fn selectWritableLastId(
         self: Store,
         alloc: Allocator,
@@ -2708,22 +2723,16 @@ pub const Store = struct {
                 entry.name,
                 workspace_root,
                 options,
-            ) catch |err| switch (err) {
-                error.OutOfMemory,
-                error.SessionAuthorityBoundaryUnavailable,
-                error.SessionCommitBoundaryUnavailable,
-                => return err,
-                else => {
-                    logDiscoveryError(
-                        .workspace_writable_last,
-                        entry.name,
-                        null,
-                        null,
-                        err,
-                    );
-                    return err;
-                },
-            };
+            ) catch |err| {
+                logDiscoveryError(
+                    .workspace_writable_last,
+                    entry.name,
+                    null,
+                    null,
+                    err,
+                );
+                return err;
+            } orelse continue;
             if (!std.mem.eql(u8, candidate.workspace_root, workspace_root)) {
                 logDiscovery(
                     .workspace_writable_last,
@@ -2774,34 +2783,40 @@ pub const Store = struct {
         session_id: []const u8,
         workspace_root: []const u8,
         _: ResumeOptions,
-    ) !WritableCandidate {
+    ) !?WritableCandidate {
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
-        if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
-            var candidate = try classifyReadOnlyCandidate(
+        if (try session_log.readConversationMetadata(alloc, &session_dir)) |value| {
+            var metadata = value;
+            defer metadata.deinit();
+            return try discovery.writable_conversation_candidate(
                 alloc,
                 &session_dir,
                 session_id,
+                metadata.value,
+                workspace_root,
             );
-            defer candidate.deinit(alloc);
-            return dupeWritableCandidate(
+        }
+        if (try authority_module.entryExistsRelative(&session_dir, "authority.pending.json")) {
+            return try discovery.fenced_legacy_writable_candidate(
                 alloc,
-                candidate.summary.id,
-                candidate.summary.workspace_root orelse self.workspace_root,
-                candidate.summary.updated_at_ms,
-                candidate.storage,
-                candidate.projection_state,
+                &session_dir,
+                session_id,
+                self.workspace_root,
             );
         }
         return switch (try classifyAuthority(alloc, &session_dir, session_id)) {
             .legacy => {
-                var candidate = try classifyLegacyCandidate(
+                var candidate = classifyLegacyCandidate(
                     alloc,
                     &session_dir,
                     session_id,
-                );
+                ) catch |err| {
+                    if (err == error.FileNotFound and try only_unpublished_lock(&session_dir)) return null;
+                    return err;
+                };
                 defer candidate.deinit(alloc);
-                return dupeWritableCandidate(
+                return try dupeWritableCandidate(
                     alloc,
                     candidate.summary.id,
                     candidate.summary.workspace_root orelse self.workspace_root,
@@ -2821,7 +2836,7 @@ pub const Store = struct {
                     projected = candidate_value;
                     const candidate = projected.?;
                     if (candidate.projection_state == .current) {
-                        return dupeWritableCandidate(
+                        return try dupeWritableCandidate(
                             alloc,
                             candidate.summary.id,
                             candidate.summary.workspace_root.?,
@@ -2849,7 +2864,7 @@ pub const Store = struct {
                         candidate.summary.workspace_root.?,
                         workspace_root,
                     )) return err;
-                    return dupeWritableCandidate(
+                    return try dupeWritableCandidate(
                         alloc,
                         candidate.summary.id,
                         candidate.summary.workspace_root.?,
@@ -2859,7 +2874,7 @@ pub const Store = struct {
                     );
                 };
                 defer source.deinit(alloc);
-                return dupeWritableCandidate(
+                return try dupeWritableCandidate(
                     alloc,
                     source.state.id,
                     source.state.workspace_root,
@@ -6489,6 +6504,152 @@ test "classifies conversation and legacy candidates" {
         CandidateStorage.legacy_v2,
         legacy_candidate.storage,
     );
+}
+
+test "writable last skips only unpublished lock directories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "local", ctx.workspace, 1, "saved");
+    try ctx.store.canonical_root.sessions.?.dir.createDir(std.testing.io, "empty", .fromMode(0o700));
+    try ctx.store.canonical_root.sessions.?.dir.createDir(std.testing.io, "lock-only", .fromMode(0o700));
+    try writeFixtureEntry(alloc, ctx.store, "lock-only", "session.lock", "");
+    {
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("local", resumed.active_id);
+    }
+    try writeFixtureEntry(alloc, ctx.store, "lock-only", "events.jsonl", "unidentified saved data\n");
+    try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+    const retained = try readFixtureFile(alloc, ctx.store, "lock-only", "events.jsonl", 1024);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("unidentified saved data\n", retained);
+}
+
+test "writable last ignores unrelated conversation history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "local", ctx.workspace, 1, "local-turn");
+    var foreign_state = try testDurableState(alloc, "foreign", "/foreign-workspace");
+    defer foreign_state.deinit(alloc);
+    var foreign = try ctx.store.startWritableSession(alloc, foreign_state);
+    foreign.deinit(alloc);
+    var foreign_dir = try ctx.store.openSessionDir("foreign");
+    defer foreign_dir.close();
+    var metadata = (try session_log.readConversationMetadata(alloc, &foreign_dir)).?;
+    defer metadata.deinit();
+    try std.testing.expectEqualStrings("/foreign-workspace", metadata.value.workspace_root);
+    try writeFixtureEntry(alloc, ctx.store, "foreign", "events.jsonl", "unreadable foreign history\n");
+
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("local", resumed.active_id);
+    try std.testing.expectEqualStrings("local-turn-0", resumed.state.history[0].assistant.user.text);
+    const unchanged = try readFixtureFile(alloc, ctx.store, "foreign", "events.jsonl", 1024);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("unreadable foreign history\n", unchanged);
+}
+
+test "writable last ignores an unrelated legacy authority fence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeLegacyFixture(alloc, ctx.store, "local", ctx.workspace, 10);
+    try writeLegacyFixture(alloc, ctx.store, "foreign-fenced", "/foreign-workspace", 20);
+    try writeFixtureEntry(alloc, ctx.store, "foreign-fenced", "authority.pending.json", "pending");
+
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("local", resumed.active_id);
+    const unchanged = try readFixtureFile(alloc, ctx.store, "foreign-fenced", "authority.pending.json", 1024);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("pending", unchanged);
+}
+
+test "writable last reaches selected legacy authority recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeLegacyFixture(alloc, ctx.store, "older", ctx.workspace, 10);
+    try writeLegacyFixture(alloc, ctx.store, "recover-latest", ctx.workspace, 20);
+    const stable = try readFixtureFile(alloc, ctx.store, "recover-latest", "session.json", 4096);
+    defer alloc.free(stable);
+    try writeFixtureEntry(alloc, ctx.store, "recover-latest", "session.legacy.json", stable);
+    try writeFixtureEntry(alloc, ctx.store, "recover-latest", "authority.pending.json", "pending");
+    try writeFixtureEntry(alloc, ctx.store, "recover-latest", "session.json", "interrupted replacement");
+
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("recover-latest", resumed.active_id);
+    var dir = try ctx.store.openSessionDir("recover-latest");
+    defer dir.close();
+    try requireAuthorityFenceAbsent(alloc, &dir, "recover-latest");
+}
+
+test "writable last only inspects the history needed for ranking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "older-prefix", ctx.workspace, 1, "older");
+    const prefix = try readFixtureFile(alloc, ctx.store, "older-prefix", "events.jsonl", 64 * 1024);
+    defer alloc.free(prefix);
+    const with_suffix = try std.mem.concat(alloc, u8, &.{ prefix, "unreadable suffix\n" });
+    defer alloc.free(with_suffix);
+    try writeFixtureEntry(alloc, ctx.store, "older-prefix", "events.jsonl", with_suffix);
+    var selected = try testDurableState(alloc, "newest", ctx.workspace);
+    defer selected.deinit(alloc);
+    selected.updated_at_ms = std.math.maxInt(i64);
+    var writable = try ctx.store.startWritableSession(alloc, selected);
+    writable.deinit(alloc);
+
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("newest", resumed.active_id);
+    const unchanged = try readFixtureFile(alloc, ctx.store, "older-prefix", "events.jsonl", 64 * 1024);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(with_suffix, unchanged);
+}
+
+test "writable last preserves conversation recency and allocation cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    const user = "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":20,\"event\":{\"user\":{\"text\":\"unfinished\"}}}\n";
+    const checkpoint = "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":21,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"saved context\"}}}\n";
+    for ([_][]const u8{ "empty", "unfinished", "completed", "checkpoint" }) |id| {
+        try createHistoryPageFixture(alloc, ctx.store, id, ctx.workspace, if (std.mem.eql(u8, id, "completed")) 1 else 0, "turn");
+        if (std.mem.eql(u8, id, "unfinished")) try writeFixtureEntry(alloc, ctx.store, id, "events.jsonl", user);
+        if (std.mem.eql(u8, id, "checkpoint")) try writeFixtureEntry(alloc, ctx.store, id, "events.jsonl", user ++ checkpoint);
+        var dir = try ctx.store.openSessionDir(id);
+        defer dir.close();
+        var reference = try classifyReadOnlyCandidate(alloc, &dir, id);
+        defer reference.deinit(alloc);
+        var candidate = (try ctx.store.resolveWritableCandidate(alloc, id, ctx.workspace, .{})).?;
+        defer candidate.deinit(alloc);
+        try std.testing.expectEqual(reference.summary.updated_at_ms, candidate.updated_at_ms);
+        try std.testing.expectEqualStrings(reference.summary.workspace_root.?, candidate.workspace_root);
+        var metadata = (try session_log.readConversationMetadata(alloc, &dir)).?;
+        defer metadata.deinit();
+        try std.testing.checkAllAllocationFailures(alloc, struct {
+            fn check(a: Allocator, d: *io_mod.VerifiedDir, m: session_codec.SessionMetadata) !void {
+                var value = try discovery.writable_conversation_candidate(a, d, m.id, m, m.workspace_root);
+                defer value.deinit(a);
+            }
+        }.check, .{ &dir, metadata.value });
+    }
 }
 
 test "writable last returns busy for the selected target" {

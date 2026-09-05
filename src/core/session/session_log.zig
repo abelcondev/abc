@@ -2880,6 +2880,9 @@ fn importLegacySnapshotStateWithOps(
     if (migrated_permissions) |permissions| import_state.permission_state = permissions;
     var converted = try import_state.dupe(alloc);
     errdefer converted.deinit(alloc);
+    if (try converted.archive_legacy_recovery(alloc)) {
+        debug_trace.logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{converted.id});
+    }
     const discarded = try discardEmptyLegacyFileEvidence(alloc, converted.history);
     if (discarded > 0) debug_trace.logf("session", "legacy import discarded file evidence count={d} reason=empty_path", .{discarded});
     try projectConversationSnapshotLocators(alloc, converted.history);
