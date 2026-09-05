@@ -1800,11 +1800,11 @@ pub const Runtime = struct {
         return credential.needsRefreshAt(now_ms);
     }
 
-    pub fn statusSnapshot(self: *const Self) StatusSnapshot {
-        return self.statusSnapshotAt(io_mod.milliTimestamp());
+    pub fn statusSnapshot(self: *const Self, provider: model_provider.ProviderId) StatusSnapshot {
+        return self.statusSnapshotAt(io_mod.milliTimestamp(), provider);
     }
 
-    fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+    fn statusSnapshotAt(self: *const Self, now_ms: i64, provider: model_provider.ProviderId) StatusSnapshot {
         if (self.auth_mode == .host_managed) return .{
             .active_source = .host_managed,
             .gateway_connected = true,
@@ -1818,6 +1818,7 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
+            .required_source = requestedSource(provider, null),
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
@@ -2897,7 +2898,7 @@ test "host-managed runtime exposes authority without local credential state" {
     try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
     try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
-    const status = runtime.statusSnapshot();
+    const status = runtime.statusSnapshot(.gateway);
     try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
     try std.testing.expect(status.gateway_connected);
     try std.testing.expect(status.chatgpt_connected);
@@ -3408,12 +3409,12 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
-    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000).active_source.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway).active_source.?);
 
     // The source is still reported; only its freshness changes across the boundary.
-    try std.testing.expect(!runtime.statusSnapshotAt(39_999).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).refreshable());
+    try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway).refreshable());
 
     var refreshed = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer refreshed.deinit(alloc);
@@ -3451,6 +3452,51 @@ test "auth runtime view preserves missing and loaded states" {
     try std.testing.expect(!loaded.available_inactive_sources.contains(.fx_login));
 }
 
+test "provider status snapshot retains required sources without selecting a credential" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.provider_picker_active = .grok;
+    runtime.source_inventory.insert(.grok_subscription);
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .codex, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .required = .grok_subscription },
+        .{ .provider = .gateway, .required = null },
+    };
+    for (cases) |case| {
+        const snapshot = runtime.statusSnapshotAt(100, case.provider);
+        try std.testing.expectEqual(case.required, snapshot.required_source);
+        try std.testing.expect(snapshot.active_source == null);
+        try std.testing.expect(snapshot.grok_connected);
+        try std.testing.expect(!snapshot.refreshable());
+    }
+    try std.testing.expect(runtime.selected_credential == null);
+}
+
+test "provider status snapshot preserves loaded and host-managed authority" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, "team_123", "team");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 100;
+    _ = runtime.adoptCredential(alloc, &credential);
+    const loaded = runtime.statusSnapshotAt(100, .gateway);
+    try std.testing.expectEqual(credentials.Source.fx_login, loaded.active_source.?);
+    try std.testing.expectEqualStrings("team", loaded.team.?);
+    try std.testing.expect(loaded.expired);
+    try std.testing.expect(loaded.required_source == null);
+    try std.testing.expect(loaded.missingHelp(.interactive) == null);
+
+    runtime.auth_mode = .host_managed;
+    const hosted = runtime.statusSnapshotAt(100, .codex);
+    try std.testing.expectEqual(credentials.Source.host_managed, hosted.active_source.?);
+    try std.testing.expect(hosted.required_source == null);
+    try std.testing.expect(hosted.missingHelp(.interactive) == null);
+}
+
 test "auth status snapshot labels every credential source without exposing tokens" {
     const alloc = std.testing.allocator;
     const sources = [_]credentials.Source{
@@ -3467,7 +3513,7 @@ test "auth status snapshot labels every credential source without exposing token
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
 
-        const snapshot = runtime.statusSnapshot();
+        const snapshot = runtime.statusSnapshot(.gateway);
         try std.testing.expectEqualStrings(credentials.sourceLabel(source), snapshot.activeSourceLabel());
         try std.testing.expectEqual(credentials.sourceRefreshable(source), snapshot.refreshable());
         const detail = try snapshot.formatDoctorDetail(alloc);
@@ -3482,7 +3528,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    const missing = runtime.statusSnapshot();
+    const missing = runtime.statusSnapshot(.gateway);
     try std.testing.expectEqualStrings(credentials.missing_credential_message, missing.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, missing.missingHelp(.interactive).?);
 
@@ -3490,7 +3536,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     defer credential.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &credential);
 
-    const selected = runtime.statusSnapshot();
+    const selected = runtime.statusSnapshot(.gateway);
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
 }
