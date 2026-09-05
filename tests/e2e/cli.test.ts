@@ -382,11 +382,12 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --yolo                Disable fx permission checks
+  --full-access         Disable fx permission checks
+  --yolo                Alias for --full-access
   --image PATH          Attach an image file; repeat for multiple images
   --system TEXT         Replace the built-in system prompt for this request
   --json                Emit machine-readable JSON instead of text
@@ -4740,7 +4741,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
