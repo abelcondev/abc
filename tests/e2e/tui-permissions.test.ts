@@ -177,7 +177,8 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
   expect(cursorHide).toBeGreaterThan(syncStart);
   if (resetClear >= 0) {
     expect(resetClear).toBeGreaterThan(cursorHide);
-    expect(resetClear).toBeLessThan(restoreIndex);
+    expect(resetClear).toBeGreaterThan(restoreIndex);
+    expect(resetClear).toBeLessThan(syncEnd);
   }
   expect(restoreIndex).toBeGreaterThan(syncStart);
   expect(syncEnd).toBeGreaterThan(restoreIndex);
@@ -364,6 +365,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const root = createIsolatedRoot();
       const target = join(root.workspace, "target.txt");
       const tracePath = join(root.root, "trace.log");
+      const tapePath = join(root.root, "approval-resize.fxtape");
       writeFileSync(target, "original line\n");
       let releaseEdit!: () => void;
       const editReady = new Promise<void>((resolve) => { releaseEdit = resolve; });
@@ -383,7 +385,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         width: 120,
         height: 36,
       }, {
-        FX_RECORD: join(root.root, "approval-resize.fxtape"),
+        FX_RECORD: tapePath,
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "agent,permission,frame_commit,scroll",
       });
@@ -411,11 +413,13 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         expect(readFileSync(target, "utf8")).toBe("original line\n");
         await session.resizeWindow(72, 18, 400);
         await waitForFileApproval(session);
+        const approvalExitFrameStart = stdoutFrames(tapePath).length;
         await session.sendKeys(decision);
         await session.waitForPane((pane) => {
           const finished = readFileSync(tracePath, "utf8").match(/event=prompt_finish /g)?.length ?? 0;
           return finished === 2 && composerContains(pane, draft) && !pane.includes(APPLY_QUESTION);
         }, TIMEOUT);
+        expectAtomicApprovalExit(tapePath, approvalExitFrameStart);
         await expectCompleteHistory();
         expect(readFileSync(target, "utf8")).toBe(
           decision === "1" ? "approved line\n" : "original line\n",
