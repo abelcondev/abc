@@ -572,6 +572,9 @@ describe("session recovery", () => {
     try {
       const id = await createSavedSession(fixture, gateway);
       const sessions = join(fixture.home, ".fx", "sessions");
+      const unpublished = join(sessions, "unpublished");
+      mkdirSync(unpublished, { mode: 0o700 });
+      writeFileSync(join(unpublished, "session.lock"), "", { mode: 0o600 });
       const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
       const foreign = join(sessions, "foreign-history");
       mkdirSync(foreign, { mode: 0o700 });
