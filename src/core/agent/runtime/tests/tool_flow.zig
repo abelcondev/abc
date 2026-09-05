@@ -3185,7 +3185,7 @@ test "modern context delta defers effectful call exactly once" {
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.deferred, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Not run — project instructions changed: write_file",
+        "Reading project instructions before continuing: write_file",
         terminal.outcome.summary,
     );
 }
