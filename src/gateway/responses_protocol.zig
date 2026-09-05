@@ -784,7 +784,6 @@ const TextUpdate = struct {
 
 const TextPart = struct {
     kind: TextKind,
-    item_id_hash: ?[TextDigest.digest_length]u8 = null,
     received_bytes: usize = 0,
     digest: TextDigest = .init(.{}),
     finalized: bool = false,
@@ -1151,11 +1150,6 @@ pub const Reducer = struct {
         if (!entry.found_existing) entry.value_ptr.* = .{ .kind = update.kind };
         const part = entry.value_ptr;
         if (part.kind != update.kind) return error.ResponsesTextConflict;
-        if (update.item_id_hash) |id| {
-            if (part.item_id_hash) |prior| {
-                if (!std.mem.eql(u8, &id, &prior)) return error.ResponsesTextConflict;
-            } else part.item_id_hash = id;
-        }
         const suffix = switch (update.mode) {
             .final => try part.final_suffix(update.text),
             .delta => blk: {
