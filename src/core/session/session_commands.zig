@@ -272,10 +272,11 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn showStatus(app: *App) !void {
-            const auth = app.auth.statusSnapshot();
+            const provider = provider_runtime.provider(app);
+            const auth = app.auth.statusSnapshot(provider);
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
-                .provider = provider_runtime.provider(app),
+                .provider = provider,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
