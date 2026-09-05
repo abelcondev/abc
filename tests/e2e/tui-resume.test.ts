@@ -3156,6 +3156,7 @@ test.skipIf(!tmuxAvailable())(
             stderrPath,
             width,
             height: width === 88 ? 24 : 36,
+            remainOnExit: true,
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Show the prepared paragraphs.");

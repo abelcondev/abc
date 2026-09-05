@@ -1470,6 +1470,8 @@ fn dupeConversationToolResult(
     errdefer alloc.free(output);
     const handle = try alloc.dupe(u8, value.artifact_ref);
     errdefer alloc.free(handle);
+    const image_handle = if (value.tool_image_handle) |image_ref| try alloc.dupe(u8, image_ref) else null;
+    errdefer if (image_handle) |image_ref| alloc.free(image_ref);
     const preview = if (value.preview) |text| try alloc.dupe(u8, text) else null;
     errdefer if (preview) |text| alloc.free(text);
     var permission_feedback: [][]u8 = if (value.permission_feedback.len > 0)
@@ -1520,6 +1522,7 @@ fn dupeConversationToolResult(
         .status = value.status,
         .output = output,
         .output_handle = handle,
+        .tool_image_handle = image_handle,
         .preview = preview,
         .output_bytes = output_bytes,
         .stored_output_bytes = stored_bytes,
@@ -1542,6 +1545,8 @@ fn freeConversationToolResult(
     alloc.free(result.tool_name);
     alloc.free(result.output);
     if (result.output_handle) |handle| alloc.free(handle);
+    types.freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     for (result.permission_feedback) |feedback| alloc.free(feedback);
     if (result.permission_feedback.len > 0) alloc.free(result.permission_feedback);
@@ -1715,6 +1720,15 @@ fn externalizeExecutionResults(
 ) !void {
     for (execution.tool_steps) |*step| {
         for (step.tool_results) |*result| {
+            if (result.tool_images.len > 0 and result.tool_image_handle == null) {
+                result.tool_image_handle = try result_store.storeToolImages(
+                    alloc,
+                    capability orelse return error.SessionChildCapabilityUnavailable,
+                    result.tool_call_id,
+                    result.tool_name,
+                    result.tool_images,
+                );
+            }
             if (result.output_handle == null) {
                 result.output_handle = try result_store.storeLargeResultManaged(
                     alloc,
@@ -3695,10 +3709,23 @@ test "legacy import preserves the active retained tail and complete archive" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-retained-tail", 10);
     defer initial.deinit(alloc);
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    var images = [_]types.ToolImage{.{ .data = @constCast(png), .mime_type = @constCast("image/png") }};
+    var calls = [_]types.ToolCall{.{ .id = "image-call", .name = "mcp_browser", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("image-call"),
+        .tool_name = @constCast("mcp_browser"),
+        .status = .success,
+        .output = @constCast(""),
+        .output_bytes = 0,
+        .stored_output_bytes = 0,
+        .tool_images = &images,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{ .user = .{ .text = @constCast("removed request") }, .assistant = @constCast("removed answer") } },
         .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>earlier summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 1 } },
-        .{ .assistant = .{ .user = .{ .text = @constCast("retained request") }, .assistant = @constCast("retained answer") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("retained request") }, .assistant = @constCast("retained answer"), .execution = .{ .tool_steps = &steps } } },
         .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>active summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 2 } },
         .{ .assistant = .{ .user = .{ .text = @constCast("later request") }, .assistant = @constCast("later answer") } },
     };
@@ -3729,6 +3756,17 @@ test "legacy import preserves the active retained tail and complete archive" {
     try std.testing.expectEqualStrings(history[3].compacted_summary.summary, resumed.state.history[0].compacted_summary.summary);
     try std.testing.expectEqualStrings("retained answer", resumed.state.history[1].assistant.assistant);
     try std.testing.expectEqualStrings("later answer", resumed.state.history[2].assistant.assistant);
+    const result = resumed.state.history[1].assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(@as(usize, 0), result.tool_images.len);
+    try std.testing.expect(result.tool_image_handle != null);
+    const resumed_path = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
+    defer alloc.free(resumed_path);
+    var capability = try session_child_store.SessionChildCapability.init(alloc, resumed.log.dir.dir, resumed_path, .read_only);
+    defer capability.deinit();
+    const stored_images = try result_store.loadToolImages(alloc, &capability, result.tool_image_handle.?);
+    defer types.freeToolImages(alloc, stored_images);
+    try std.testing.expectEqual(@as(usize, 1), stored_images.len);
+    try std.testing.expectEqualStrings(png, stored_images[0].data);
 }
 
 test "legacy import preserves published events and active recovery after metadata sync failure" {

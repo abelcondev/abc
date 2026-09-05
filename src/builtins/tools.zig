@@ -165,7 +165,7 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
 const skill_description =
     "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
 const capability_search_description =
-    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill, or exact MCP names with mcp_select_tool.";
+    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -524,7 +524,7 @@ pub const capability_search = ToolSpec{
             .additional_properties = false,
         },
     },
-    .executor_kind = .skill,
+    .executor_kind = .capability_search,
     .activity_kind = .read,
     .requires_approval = false,
     .action_label = "Searching capabilities",
@@ -938,7 +938,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "22561ff9023561f91d94f0d3489578d92dde4a275b88fe5ec0e172de1d5f1968",
+        "1d6ad9ee3289b7568831f4e05c92befc52c4123b71f7bbe2141fe939a60faece",
         &actual_hex,
     );
 }
@@ -1480,7 +1480,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.capability_search, capability_search.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
     try std.testing.expect(!capability_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
@@ -1760,6 +1760,7 @@ test "built-in registry uses executable web_fetch implementation" {
     defer result.deinit(std.testing.allocator);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestUnexpectedResult,
         .failure => |body| body,
     };

@@ -18,6 +18,8 @@ const scripts = [
   "test-agent-transport-retry.mjs",
   "test-native-core-stream.mjs",
   "test-native-core-fetch-failure.mjs",
+  "test-native-core-image-framing.mjs",
+  "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
   "test-native-host-tool-late-settle.mjs",

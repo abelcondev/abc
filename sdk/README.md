@@ -41,8 +41,9 @@ await agent.close();
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
 
-The host selects the model. Agent creation and prompting do not fetch the
-Gateway model catalog.
+The host selects the model. Agent creation does not fetch the Gateway model
+catalog. Prompting can resolve model capabilities and context capacity through
+the supplied `fetch`; fx caches that metadata for the agent.
 
 `onEvent` receives runtime diagnostics separately from model output. Transport
 events report request start, response status and elapsed time, safe Gateway
@@ -148,7 +149,19 @@ message.
 ## MCP
 
 `libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
-elicitation, and cleanup remain outside the kernel.
+elicitation, and cleanup remain outside the kernel. The client uses the MCP
+TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
+cancellation passed in `options`. Tool text and structured data
+reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
+advertise image input support; other models receive an explicit omission notice.
+Images are retained in checkpoints within the existing checkpoint size limit.
+Each image may contain up to 5 MiB of base64 data, with at most eight images and
+an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
+prompt options supply text instructions; non-text context has an omission notice.
+Tool catalogs are paginated up to the existing 64-tool bound. Tool names are
+normalized for model APIs, with collisions kept distinct and original names used
+for calls to the MCP client. Each tool description and JSON schema may contain up
+to 64 KiB, within the control message's 8 MiB limit.
 
 ```js
 import { createMcpAdapter } from "libfx/mcp";

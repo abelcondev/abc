@@ -157,11 +157,12 @@ The interactive agent can also install skills via the `install_skill` tool when 
 
 ## MCP
 
-fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
-Version-scoped adapters retain legacy stdio,
-`2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load trusted MCP configuration from the
-profile:
+Native fx connections use MCP v1 initialization by default over stdio,
+Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
+`2026-07-28` discovery lifecycle opt in with
+`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
+The SDK's host-owned client controls its own protocol negotiation. Native
+sessions load trusted MCP configuration from the profile:
 
 * `~/.fx/mcp.json`
 
@@ -200,10 +201,11 @@ Completion, pagination, cache-aware discovery, subscriptions, progress,
 cancellation, and form or URL elicitation. Keep modern and legacy protocol
 behavior in their existing version-scoped modules.
 
-Tool schemas without `$schema` use JSON Schema 2020-12. fx also accepts the
-canonical 2020-12 declaration and the canonical Draft 7 declaration used by
-legacy SDKs, evaluates each with dialect-specific semantics, and rejects other
-dialects or references that would require network fetching before publication.
+fx bounds schema size and structure before publication. It accepts schemas
+without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
+canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
+rejected. fx does not resolve network references or evaluate semantic schema
+assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
@@ -303,8 +305,20 @@ or `fx ask` model request; optional failures publish a reduced, degraded
 capability set. Terminal `fx ask` completes admitted MCP discovery before its
 first model request. JSON and other headless asks start required servers first
 and defer optional servers until the turn performs an MCP operation or delegates
-MCP capability to a child. `/mcp list` renders a bounded, secret-free health
-snapshot.
+MCP capability to a child. Server-filtered searches, selected tools, and feature
+operations activate only their target; a broad search activates the broader
+catalog. Each server owns its startup and recovery progress. Connection deadlines
+cover discovery, fallback, and restarts together. Interactive authentication and
+logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
+snapshot. The interactive menu refreshes that view while it is open.
+
+Search and explicit selection share bounded schema publication. Definitions are
+checked against their runtime, connection, catalog, and credential generations
+before execution. Tool argument JSON must be bounded and object-shaped; semantic
+schema assertions belong to the server. Image results use the shared tool-result,
+provider, and versioned history paths. Saved native images use managed result
+artifacts that `read_tool_result` can load without repeating the original tool.
+
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 
