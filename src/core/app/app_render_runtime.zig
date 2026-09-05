@@ -1619,7 +1619,9 @@ pub fn Runtime(comptime App: type) type {
             try build_checkpoint.poll(checkpoint);
             if (footer_frame.paint.reset_terminal) {
                 if (comptime @hasField(App, "terminal")) {
-                    app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    if (app.terminal.alternate_screen_owner == .none) {
+                        app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    }
                 }
             }
             var frame_shell = SurfaceFrameShell.init(

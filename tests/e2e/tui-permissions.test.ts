@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText as finalText,
   fakeGatewaySse,
@@ -351,6 +352,85 @@ async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
 }
 
 describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
+
+  test("resized file approval restores complete history once", async () => {
+    const paragraphs = Array.from({ length: 28 }, (_, index) => {
+      const row = String(index + 1).padStart(2, "0");
+      return `ROW${row} ALPHA${row}_abcdefghijklmnopqrstuvwxyz0123456789 ` +
+        `BRAVO${row}_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`;
+    });
+    const draft = "retained approval draft";
+    for (const decision of ["1", "3", "C-c"]) {
+      const root = createIsolatedRoot();
+      const target = join(root.workspace, "target.txt");
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(target, "original line\n");
+      let releaseEdit!: () => void;
+      const editReady = new Promise<void>((resolve) => { releaseEdit = resolve; });
+      const gateway = startFakeGateway([
+        finalText(paragraphs.join("\n\n")),
+        async () => {
+          await editReady;
+          return toolCall("approval-resize", "edit_file", {
+            path: "target.txt",
+            old_string: "original line\n",
+            new_string: "approved line\n",
+          });
+        },
+        finalText("The edit request has finished."),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway, {
+        width: 120,
+        height: 36,
+      }, {
+        FX_RECORD: join(root.root, "approval-resize.fxtape"),
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "agent,permission,frame_commit,scroll",
+      });
+      const expectCompleteHistory = async () => {
+        const text = (await session.captureFullScrollback()).replace(/\s+/g, "");
+        let previous = -1;
+        for (const paragraph of paragraphs) {
+          const needle = paragraph.replace(/\s+/g, "");
+          const index = text.indexOf(needle);
+          expect(index).toBeGreaterThan(previous);
+          expect(text.indexOf(needle, index + 1)).toBe(-1);
+          previous = index;
+        }
+      };
+      try {
+        await session.sendText("Show the prepared paragraphs.");
+        await session.waitForText("ROW28", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        await expectCompleteHistory();
+        await session.sendText("Change the prepared file.");
+        await session.waitForPane(() => gateway.requests.length === 2, TIMEOUT);
+        await session.sendLiteralText(draft);
+        releaseEdit();
+        await waitForFileApproval(session);
+        expect(readFileSync(target, "utf8")).toBe("original line\n");
+        await session.resizeWindow(72, 18, 400);
+        await waitForFileApproval(session);
+        await session.sendKeys(decision);
+        await session.waitForPane((pane) => {
+          const finished = readFileSync(tracePath, "utf8").match(/event=prompt_finish /g)?.length ?? 0;
+          return finished === 2 && composerContains(pane, draft) && !pane.includes(APPLY_QUESTION);
+        }, TIMEOUT);
+        await expectCompleteHistory();
+        expect(readFileSync(target, "utf8")).toBe(
+          decision === "1" ? "approved line\n" : "original line\n",
+        );
+        expectCleanStderr(stderrPath);
+        await session.sendKeys("C-u");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        releaseEdit();
+        await session.kill();
+        activeSession = null;
+      }
+    }
+  }, 90_000);
 
   test(
     "decomposed prompt and file approval remain visible across resize",
