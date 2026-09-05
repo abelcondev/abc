@@ -4449,6 +4449,83 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("direct providers reconcile final text before saving or releasing tools", async () => {
+  const prefix = "COMMENTARY_ITEM\n", answer = "FINAL_ANSWER_ITEM";
+  for (const provider of ["codex", "grok"] as const) for (const mode of ["streamed", "final-only", "mixed", "terminal-only", "conflict"]) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-response-text-"));
+    const model = "fixture-model";
+    const gateway = startFakeGateway([]);
+    const events: object[] = [], items: object[] = [];
+    for (const [index, text] of [prefix, answer].entries()) {
+      const id = "msg_" + index;
+      const part = { type: "output_text", text, annotations: [] };
+      const item = { id, type: "message", role: "assistant", status: "completed", content: [part] };
+      items.push(item);
+      events.push({ type: "response.output_item.added", output_index: index, item: { ...item, status: "in_progress", content: [] } });
+      if (mode === "streamed" || (index === 0 && (mode === "mixed" || mode === "conflict"))) {
+        events.push({ type: "response.output_text.delta", output_index: index, content_index: 0, item_id: id, delta: text });
+      }
+      if (mode === "conflict" && index === 0) {
+        events.push({ type: "response.output_item.added", output_index: 2, item: { type: "function_call", id: "fc_write", call_id: "write", name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "not admitted" }) } });
+        events.push({ type: "response.output_text.done", output_index: 0, content_index: 0, item_id: id, text: "CONFLICTING_FINAL" });
+        break;
+      }
+      if (mode !== "terminal-only") events.push(
+        { type: "response.output_text.done", output_index: index, content_index: 0, item_id: id, text },
+        { type: "response.content_part.done", output_index: index, content_index: 0, item_id: id, part },
+        { type: "response.output_item.done", output_index: index, item },
+      );
+    }
+    events.push({ type: "response.completed", response: { status: "completed", output: items } });
+    const responses = [fakeGatewaySse(events), fakeGatewaySse([
+      { type: "response.output_text.delta", delta: "RESUME_OK" },
+      { type: "response.completed", response: { status: "completed" } },
+    ])];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Report both response items."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const output = JSON.parse(first.stdout);
+      expect(first.signal).toBeNull();
+      expect(direct.bodies).toHaveLength(1);
+      expect(existsSync(join(profile, "must-not-exist.txt"))).toBe(false);
+      if (mode === "conflict") {
+        expect(first.code, first.stdout + first.stderr).toBe(1);
+        expect(output.error).toBe("ResponsesTextConflict");
+        expect(output.tool_calls).toEqual([]);
+      } else {
+        expect(first.code, first.stdout + first.stderr).toBe(0);
+        expect(first.stderr).toBe("");
+        expect(output.output).toBe(prefix + answer);
+        expect(output.final_output).toBe(prefix + answer);
+        const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(direct.bodies).toHaveLength(2);
+        const replay = JSON.parse(direct.bodies[1]).input.filter((entry: { role?: string }) => entry.role === "assistant");
+        expect(replay.some((entry: { content: Array<{ text?: string }> }) => entry.content.some(part => part.text === prefix + answer))).toBe(true);
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("direct providers keep images with their users through tools and resume", async () => {
   for (const provider of ["codex", "grok"] as const) {
     const profile = mkdtempSync(join(tmpdir(), "fx-native-image-history-"));
