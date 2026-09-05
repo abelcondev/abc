@@ -318,11 +318,33 @@ fn prepareResolvedCredential(
     return credential;
 }
 
-fn requestedSource(
+pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    return if (provider == .gateway) preferred else provider_catalog.find(provider).login_source;
+    if (provider != .gateway) return provider_catalog.find(provider).login_source;
+    return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
+}
+
+test "requested credential source follows provider authority" {
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        preferred: ?credentials.Source,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .gateway, .preferred = null, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.required, requestedSource(case.provider, case.preferred));
+    }
 }
 
 pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError {
@@ -1517,14 +1539,7 @@ pub fn loadStatusSnapshotForProvider(
         };
     }
     return .{
-        .required_source = if (provider == .codex)
-            .chatgpt_subscription
-        else if (provider == .grok)
-            .grok_subscription
-        else if (provider == .gateway and !model_provider.authorizesCredential(.gateway, preferred))
-            null
-        else
-            preferred,
+        .required_source = if (provider) |selected_provider| requestedSource(selected_provider, preferred) else preferred,
         .stored_key_status = resolution.stored_key_status,
         .fx_login_status = resolution.fx_login_status,
         .failure = if (resolution.failure) |failure| classifyCredentialFailure(failure.source, failure.err) else null,

@@ -1406,13 +1406,12 @@ fn missingCredentialResult(
     alloc: Allocator,
     options: RunOptions,
     provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else if (provider == .grok)
-        credentials.missing_grok_credential_message
-    else
-        credentials.missing_credential_message;
+    const status = auth_runtime.StatusSnapshot{
+        .required_source = auth_runtime.requestedSource(provider, preferred),
+    };
+    const message = status.missingHelp(.cli).?;
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1484,7 +1483,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (startup.credential_load_failure) |failure| {
             if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
         }
-        return missingCredentialResult(alloc, options, startup.provider);
+        return missingCredentialResult(alloc, options, startup.provider, startup.credential_source_preference);
     }
 
     var owned_resumed_model: ?[]u8 = null;
@@ -1595,15 +1594,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         const credential: *const credentials.Credential = if (startup_credential_is_final)
             &startup.credential.?
         else routed: {
+            const preferred_source = if (ctx.provider == .gateway) startup.credential_source_preference else null;
             routed_credential = try auth_runtime.prepareCredential(
                 alloc,
                 cfg.gateway_provider.oauth_transport,
                 cfg.secret_store,
                 ctx.provider,
-                if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                preferred_source,
             );
             if (routed_credential == null) {
-                return missingCredentialResult(alloc, options, ctx.provider);
+                return missingCredentialResult(alloc, options, ctx.provider, preferred_source);
             }
             break :routed &routed_credential.?;
         };
