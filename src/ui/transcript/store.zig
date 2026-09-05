@@ -2207,6 +2207,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_process_presentation = source.command_process_presentation,
         .outcome = source.outcome,
         .fallback_disposition = source.fallback_disposition,
+        .origin = source.origin,
         .lifecycle_id = lifecycle_id,
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,

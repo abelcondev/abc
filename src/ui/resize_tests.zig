@@ -7870,3 +7870,44 @@ test "orphan command output does not leak into current compact rows" {
 
     try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
 }
+
+test "recorded tool rows enter physical history when the viewport advances" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    const entry_id = try h.shell.appendRawTranscriptEntryClassified(alloc, "● Wrote receipt.txt\n", .tool_status);
+    try h.shell.attachHistoricalToolDetailWithLifecycle(
+        alloc,
+        entry_id,
+        .{ .id = "saved-write", .name = "write_file", .arguments_json = "{\"path\":\"receipt.txt\"}" },
+        .write,
+        .{
+            .tool_call_id = @constCast("saved-write"),
+            .tool_name = @constCast("write_file"),
+            .status = .success,
+            .output = @constCast("saved result"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+        },
+        .{ .turn_id = 2, .call_id = "saved-write" },
+    );
+    _ = try h.shell.appendRawTranscriptEntry(alloc, "Saved response\n");
+    try h.renderTranscriptFrame();
+    try h.flush();
+    try expectGridContains(&h, "Wrote receipt.txt");
+    try expectGridContains(&h, "Saved response");
+
+    var committed_rows: usize = 0;
+    for (0..16) |i| {
+        var buf: [48]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&buf, "Continuation row {d}\n", .{i}));
+        try h.renderTranscriptFrame();
+        try h.flush();
+        committed_rows += h.last_frame.committed_scroll_rows;
+        try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    }
+    try expectGridContains(&h, "Continuation row 15");
+    try std.testing.expect(committed_rows > 0);
+    const anchor = h.shell.transcript_commit_state.stable;
+    try std.testing.expectEqual(anchor.visual_offset, anchor.history_visual_offset);
+}

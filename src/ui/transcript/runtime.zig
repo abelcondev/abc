@@ -5483,6 +5483,7 @@ pub const TranscriptRuntime = struct {
         );
         if (self.toolDetailPtr(entry_id)) |detail| {
             detail.created_at_ms = result.created_at_ms;
+            detail.origin = .recorded;
         }
     }
 
@@ -5493,7 +5494,10 @@ pub const TranscriptRuntime = struct {
         call: types.ToolCall,
     ) !void {
         try self.upsertToolDetailStart(alloc, entry_id, null, call.name, null, call.arguments_json);
-        if (self.toolDetailPtr(entry_id)) |detail| detail.outcome = .failed;
+        if (self.toolDetailPtr(entry_id)) |detail| {
+            detail.outcome = .failed;
+            detail.origin = .recorded;
+        }
     }
 
     pub fn attachHistoricalCommandOutput(
@@ -5527,6 +5531,7 @@ pub const TranscriptRuntime = struct {
             command_artifact_handle,
             if (replayed_output) self.latestCommandOutputEntryId() else null,
         );
+        if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
     }
 
     fn upsertToolDetailStart(

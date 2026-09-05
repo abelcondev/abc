@@ -50,6 +50,8 @@ pub const ToolFallbackDisposition = enum {
 
 pub const ToolDetailRecord = struct {
     entry_id: u32,
+    // Recorded identities are archival and cannot pin live output.
+    origin: enum { live, recorded } = .live,
     created_at_ms: i64 = 0,
     tool_name: []u8,
     captured_command: bool = false,
