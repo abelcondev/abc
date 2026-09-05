@@ -704,13 +704,27 @@ const SessionPickerLoad = struct {
     const Task = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
         catalog: ?subagent_resume_admission.ActionableSessionCatalog = null,
         failure: ?anyerror = null,
 
+        fn requestStop(self: *Task) void {
+            if (!self.done.load(.acquire) and
+                !self.cancel_requested.swap(true, .acq_rel))
+            {
+                debug_trace.logf(
+                    "core",
+                    "session picker load cancellation requested generation={d}",
+                    .{self.request.generation},
+                );
+            }
+        }
+
         fn deinit(self: *Task) void {
+            self.requestStop();
             if (self.thread) |thread| thread.join();
             if (self.catalog) |*catalog| catalog.deinit(std.heap.c_allocator);
             self.request.deinit();
@@ -726,9 +740,22 @@ const SessionPickerLoad = struct {
     next_generation: u64 = 1,
 
     fn deinit(self: *SessionPickerLoad) void {
+        self.requestStop();
         if (self.task) |task| task.deinit();
-        if (self.pending) |*pending| pending.deinit();
         self.* = .{};
+    }
+
+    fn requestStop(self: *SessionPickerLoad) void {
+        if (self.task) |task| task.requestStop();
+        if (self.pending) |*pending| {
+            debug_trace.logf(
+                "core",
+                "session picker request dropped reason=shutdown generation={d}",
+                .{pending.generation},
+            );
+            pending.deinit();
+            self.pending = null;
+        }
     }
 
     fn allocateGeneration(self: *SessionPickerLoad) u64 {
@@ -766,6 +793,7 @@ const SessionPickerLoad = struct {
         if (self.task) |task| {
             if (task.request.generation == generation) {
                 self.abandoned_generation = generation;
+                task.requestStop();
                 debug_trace.logf(
                     "core",
                     "session picker request abandoned reason=cancelled generation={d}",
@@ -880,16 +908,17 @@ const SessionPickerLoad = struct {
     }
 
     fn threadMain(task: *Task) void {
+        defer task.done.store(true, .release);
         var read_only = session_store.Store.initReadOnlyFromHome(
             std.heap.c_allocator,
             task.home_dir,
             task.workspace_root,
         ) catch |err| {
             task.failure = err;
-            task.done.store(true, .release);
             return;
         };
         defer read_only.deinit(std.heap.c_allocator);
+        read_only.resume_cancel_flag = &task.cancel_requested;
 
         task.catalog = subagent_resume_admission.listActionableCatalog(
             read_only,
@@ -901,10 +930,8 @@ const SessionPickerLoad = struct {
             task.request.active_id,
         ) catch |err| {
             task.failure = err;
-            task.done.store(true, .release);
             return;
         };
-        task.done.store(true, .release);
     }
 };
 
@@ -2875,6 +2902,10 @@ pub fn Runtime(comptime App: type) type {
         pub fn deinitPersistence(app: *App) void {
             closeWritableSession(app);
             app.session_persistence.deinit(app.alloc);
+        }
+
+        pub fn requestPersistenceShutdown(app: *App) void {
+            app.session_persistence.session_picker_load.requestStop();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -9074,6 +9105,69 @@ test "session picker page requests own the active session ID" {
     try std.testing.expectEqualStrings("active-session", request.active_id.?);
 }
 
+test "persistence shutdown drops pending picker work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    app.session_persistence.session_picker_load.pending =
+        try SessionPickerLoad.PageRequest.init(
+            1,
+            .current_workspace,
+            null,
+            session_store.default_resume_page_limit,
+        );
+
+    Runtime(TestApp).requestPersistenceShutdown(&app);
+
+    try std.testing.expect(app.session_persistence.session_picker_load.pending == null);
+}
+
+test "persistence shutdown cancels an active picker task before joining" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const task = try createHeldSessionPickerTask(
+        1,
+        "active-session",
+        app.session_persistence.store.?,
+    );
+    task.thread = try std.Thread.spawn(.{}, waitForPickerCancellation, .{task});
+    app.session_persistence.session_picker_load.task = task;
+
+    const started_ms = io_mod.milliTimestamp();
+    Runtime(TestApp).requestPersistenceShutdown(&app);
+    app.session_persistence.session_picker_load.deinit();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 500);
+}
+
 fn createHeldSessionPickerTask(
     generation: u64,
     active_id: []const u8,
@@ -9099,6 +9193,13 @@ fn createHeldSessionPickerTask(
         .request = request,
     };
     return task;
+}
+
+fn waitForPickerCancellation(task: *SessionPickerLoad.Task) void {
+    while (!task.cancel_requested.load(.acquire)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    task.done.store(true, .release);
 }
 
 fn waitForSessionPickerLoad(app: *TestApp) !void {

@@ -492,6 +492,13 @@ pub const Store = struct {
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
+    resume_cancel_flag: ?*const std.atomic.Value(bool) = null,
+
+    pub fn checkResumeCancellation(self: Store) !void {
+        if (self.resume_cancel_flag) |flag| {
+            if (flag.load(.acquire)) return error.Cancelled;
+        }
+    }
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -2147,6 +2154,7 @@ pub const Store = struct {
         if (self.canonical_root.sessions == null) return scan;
         var iter = self.canonical_root.sessions.?.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try self.checkResumeCancellation();
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, retired_latest_sessions_dir)) {
                 continue;
@@ -2209,6 +2217,7 @@ pub const Store = struct {
             };
             candidate.summary = undefined;
         }
+        try self.checkResumeCancellation();
         sortSummariesNewestFirst(scan.summaries.items);
         if (mode == .global_read_only_last and scan.summaries.items.len > 0) {
             for (metadata.items) |candidate| {
