@@ -1877,23 +1877,9 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const raw_object = try requireObject(value);
-    const object = if (raw_object.get("provider") != null)
-        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
-    else
-        try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
-    errdefer alloc.free(model);
-    return .{
-        .provider = if (object.get("provider")) |provider_value| blk: {
-            if (provider_value != .string) return error.InvalidEventFrame;
-            break :blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
-        } else .gateway,
-        .model = model,
-        .effort = types.ReasoningEffort.parse(
-            try requireString(object, "effort"),
-        ) orelse return error.InvalidEventFrame,
-        .fast_mode = try requireBool(object, "fast_mode"),
+    return session_codec.parse_preferences(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEventFrame,
     };
 }
 

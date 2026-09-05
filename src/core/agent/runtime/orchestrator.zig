@@ -3119,6 +3119,7 @@ fn shouldRejectRecoveryAuthority(
     source: ?types.CredentialSource,
     account_id: ?[]const u8,
 ) bool {
+    if (checkpoint.disposition == .history_only) return true;
     const provider_may_have_received_request = checkpoint.outstanding_reservation or
         checkpoint.consumed_provider_attempts > 0;
     return provider_may_have_received_request and !recoveryCredentialAuthorityMatches(
@@ -3192,6 +3193,9 @@ test "potentially sent recovery rejects missing or changed credential authority"
         .chatgpt_subscription,
         "acct_1",
     ));
+    legacy.disposition = .history_only;
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
 }
 
 fn checkpointCause(
