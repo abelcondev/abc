@@ -1803,9 +1803,20 @@ tmuxTest(
         expect(response.error.message).toContain("Saved credential storage is unavailable");
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
         await session.waitForComposer(TIMEOUT);
+        await session.sendText("/status");
+        await session.waitForText("auth_help=", TIMEOUT);
+        expect(await session.captureFullScrollback()).toContain(
+          "auth_help=Saved credential storage is unavailable",
+        );
         await selectEnvKeyCredential(session);
         await session.sendText("Use the working Gateway account.");
         await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
+        await session.sendText("/status");
+        await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+        const scrollback = await session.captureFullScrollback();
+        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+        expect(recoveredStatus).toContain("auth=AI_GATEWAY_API_KEY");
+        expect(recoveredStatus).not.toContain("auth_help=");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.kill();
         session = null;

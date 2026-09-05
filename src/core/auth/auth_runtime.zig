@@ -1750,7 +1750,7 @@ pub const Runtime = struct {
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
         if (self.auth_mode == .host_managed) return .host_managed;
-        if (self.credential_failure) |failure| {
+        if (self.credentialFailure()) |failure| {
             return credentials.catalogAccessAfterRefreshFailure(failure.source);
         }
         return credentials.catalogAccessAt(self.selected_credential, io_mod.milliTimestamp());
@@ -1770,8 +1770,10 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Recovery and catalog access concern only the selected credential.
     pub fn credentialFailure(self: *const Self) ?CredentialFailure {
-        return self.credential_failure;
+        const failure = self.credential_failure orelse return null;
+        return if (self.credentialSource() == failure.source) failure else null;
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
@@ -1819,6 +1821,12 @@ pub const Runtime = struct {
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
             .required_source = requestedSource(provider, null),
+            .failure = if (self.credential_failure) |failure|
+                if (model_provider.authorizesCredential(provider, failure.source)) failure else null
+            else
+                null,
+            .stored_key_status = if (provider == .gateway) self.stored_key_status else .not_attempted,
+            .fx_login_status = if (provider == .gateway) self.fx_login_status else .not_attempted,
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
@@ -1853,11 +1861,18 @@ pub const Runtime = struct {
         self: *Self,
         stored_key_status: credentials.StoredKeyReadStatus,
         fx_login_status: credentials.FxLoginReadStatus,
+        load_failure: ?credentials.LoadFailure,
         onboarding_skipped: bool,
     ) void {
         self.stored_key_status = stored_key_status;
         self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
+        if (self.auth_mode == .local and self.selected_credential == null) {
+            self.credential_failure = if (load_failure) |failure|
+                classifyCredentialFailure(failure.source, failure.err)
+            else
+                null;
+        }
     }
 
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
@@ -1989,6 +2004,13 @@ pub const Runtime = struct {
         self.fx_login_session_available = inventory.available.contains(.fx_login);
         if (self.credentialSource()) |source| {
             if (source != .host_managed and !inventory.unavailable.contains(source)) self.source_inventory.insert(source);
+        } else if (self.credential_failure) |failure| {
+            if (!inventory.available.contains(failure.source) and !inventory.unavailable.contains(failure.source)) {
+                debug_trace.logf("auth", "credential load failure cleared source={t} reason=source_absent", .{failure.source});
+                self.credential_failure = null;
+                if (failure.source == .stored_key) self.stored_key_status = .not_found;
+                if (failure.source == .fx_login) self.fx_login_status = .absent;
+            }
         }
     }
 
@@ -3429,7 +3451,7 @@ test "auth runtime view preserves missing and loaded states" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    runtime.recordStartupStatus(.unavailable, .unavailable, true);
+    runtime.recordStartupStatus(.unavailable, .unavailable, null, true);
     const missing = runtime.view();
     try std.testing.expect(missing.active_source == null);
     try std.testing.expect(missing.selected_team == null);
@@ -3495,6 +3517,97 @@ test "provider status snapshot preserves loaded and host-managed authority" {
     try std.testing.expectEqual(credentials.Source.host_managed, hosted.active_source.?);
     try std.testing.expect(hosted.required_source == null);
     try std.testing.expect(hosted.missingHelp(.interactive) == null);
+}
+
+test "startup credential failures reach only the matching provider status" {
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        const help = if (source == .stored_key)
+            credentials.unreadable_store_message
+        else
+            preparationFailureNotice(error.CredentialStorageUnavailable).?;
+        var runtime: Runtime = .{};
+        defer runtime.deinit(std.testing.allocator);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+
+        try std.testing.expect(runtime.credentialSource() == null);
+        try std.testing.expect(runtime.credentialFailure() == null);
+        try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.modelCatalogAccess().publicOnlyReason().?);
+        for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+            const snapshot = runtime.statusSnapshotAt(100, provider);
+            if (model_provider.authorizesCredential(provider, source)) {
+                try std.testing.expectEqual(classifyCredentialFailure(source, error.CredentialStorageUnavailable), snapshot.failure.?);
+                try std.testing.expectEqualStrings(help, snapshot.missingHelp(.interactive).?);
+            } else {
+                try std.testing.expect(snapshot.failure == null);
+                try std.testing.expect(!std.mem.eql(u8, help, snapshot.missingHelp(.interactive).?));
+            }
+        }
+    }
+}
+
+test "startup credential failures clear after source removal or credential adoption" {
+    const alloc = std.testing.allocator;
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        var runtime: Runtime = .{};
+        defer runtime.deinit(alloc);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+        runtime.applySourceInventory(.{ .available = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{ .unavailable = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{});
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.stored_key_status != .unavailable);
+        try std.testing.expect(runtime.fx_login_status != .unavailable);
+
+        runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+            .source = source,
+            .err = error.CredentialStorageUnavailable,
+        }, true);
+        var credential = try makeTestCredential(alloc, "replacement-token", .ai_gateway_api_key, null, null);
+        defer credential.deinit(alloc);
+        _ = runtime.adoptCredential(alloc, &credential);
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.statusSnapshotAt(100, .gateway).missingHelp(.interactive) == null);
+    }
+}
+
+test "startup status and inventory preserve selected and host-managed failure semantics" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "selected-token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    const failure = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    _ = runtime.recordCredentialFailure(failure);
+    runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+        .source = .grok_subscription,
+        .err = error.InvalidGrokAuthSession,
+    }, true);
+    runtime.applySourceInventory(.{});
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, runtime.modelCatalogAccess().publicOnlyReason().?);
+
+    var hosted: Runtime = .{ .auth_mode = .host_managed };
+    defer hosted.deinit(alloc);
+    hosted.recordStartupStatus(.unavailable, .unavailable, .{
+        .source = .chatgpt_subscription,
+        .err = error.InvalidChatGptAuthSession,
+    }, true);
+    try std.testing.expect(hosted.credential_failure == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, hosted.modelCatalogAccess());
+    try std.testing.expect(hosted.statusSnapshotAt(100, .codex).missingHelp(.interactive) == null);
 }
 
 test "auth status snapshot labels every credential source without exposing tokens" {
