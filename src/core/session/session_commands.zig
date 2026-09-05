@@ -273,7 +273,16 @@ pub fn Commands(comptime App: type) type {
 
         pub fn showStatus(app: *App) !void {
             const provider = provider_runtime.provider(app);
-            const auth = app.auth.statusSnapshot(provider);
+            var preferred: ?types.CredentialSource = null;
+            if (provider == .gateway and app.auth.credentialSource() == null) {
+                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                    try writeSettingsLoadError(app, err);
+                    return;
+                };
+                defer settings.deinit(app.alloc);
+                preferred = settings.credential_source;
+            }
+            const auth = app.auth.statusSnapshot(provider, preferred);
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
                 .provider = provider,
@@ -1917,6 +1926,12 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
 
 test "session_commands showStatus writes session status snapshot" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+    const env = try SessionCommandTestHome.install(alloc, home_root);
+    defer env.deinit();
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/test-model");
     defer app.deinit();
     app.permission_engine.mode = .auto;
