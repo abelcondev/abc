@@ -1012,7 +1012,7 @@ pub fn finishExecutedToolStatus(
                 arena,
                 call,
                 display_target,
-                "Failed",
+                try tooling_presentation.subagentFailureLabel(arena, call, result.model_output),
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
