@@ -217,7 +217,7 @@ function createLegacySession(fixture: ReturnType<typeof createFixture>, version:
     schema_version: 1, title: LEGACY_TITLE, preview: null, origin_workspace_root: fixture.workspace,
   });
   writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({
-    model: "anthropic/claude-sonnet-4.6", effort: "low", fast_mode: false, auto_upgrade: false,
+    model: "workspace/default", effort: "low", fast_mode: false, auto_upgrade: false,
   }), { mode: 0o600 });
   return { id, source, watermarkPath };
 }
