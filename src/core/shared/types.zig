@@ -1112,6 +1112,12 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
+/// Provider-returned phase for stateless assistant-message replay.
+pub const AssistantMessagePhase = enum {
+    commentary,
+    final_answer,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1122,6 +1128,8 @@ pub const ChatMessage = struct {
     /// Provider-owned opaque response items needed only for stateless within-turn continuation.
     /// The value is a validated JSON array and is never sent across provider routes.
     provider_state_json: ?[]const u8 = null,
+    /// Borrowed phase metadata for the same current-turn continuation.
+    assistant_phase: ?AssistantMessagePhase = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
@@ -1215,6 +1223,7 @@ pub const ProviderFailureCause = enum {
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    assistant_phase: ?AssistantMessagePhase = null,
     generation_id: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.

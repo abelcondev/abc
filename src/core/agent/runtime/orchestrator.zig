@@ -2576,6 +2576,7 @@ fn materializeConfirmedProviderTools(
         within_turn_suffix,
         null,
         novel_calls,
+        completion.assistant_phase,
         completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
@@ -7990,6 +7991,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             if (terminal_provider_completion) null else completion.content,
             effective_tool_calls,
+            completion.assistant_phase,
             completion.provider_state_json,
         );
 
