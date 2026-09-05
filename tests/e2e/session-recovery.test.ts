@@ -237,6 +237,55 @@ describe("session recovery", () => {
     }, TIMEOUT);
   }
 
+  for (const tail of ["", "invalid tail\n"]) {
+    test(`current recovery excludes checkpoint splitting a call/result pair with tail=${tail.length > 0}`, async () => {
+      const fixture = createFixture("fx-session-current-cut-");
+      const responses = [fakeShellRun("cut-call", "printf 'CUT_RESULT_619\\n'"), fakeGatewayFinalText("CUT_SAVED")];
+      const gateway = startFakeGateway(responses);
+      try {
+        const created = await runFx(["ask", "--json", "--full-access", "Save one result."], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(created.code).toBe(0);
+        const id = JSON.parse(created.stdout).session_id;
+        const source = join(fixture.home, ".fx", "sessions", id);
+        const eventPath = join(source, "events.jsonl");
+        const prefix = readFileSync(eventPath, "utf8");
+        const records = prefix.trimEnd().split("\n").map(JSON.parse);
+        const callSeq = records.find((record) => record.event.tool_call).seq;
+        appendFileSync(eventPath, JSON.stringify({ schema_version: 1, seq: records.at(-1).seq + 1, timestamp_ms: Date.now(), event: {
+          context_checkpoint: { covers_through_seq: callSeq, summary: "INVALID_SPLIT_CHECKPOINT" },
+        } }) + "\n" + tail);
+        const before = savedFileHashes(source);
+        const recovered = await runFx(["session", "recover", id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(recovered.code).toBe(0);
+        expect(recovered.stderr).toBe("");
+        const result = JSON.parse(recovered.stdout);
+        expect(result.status).toBe("recovered");
+        const target = join(fixture.home, ".fx", "sessions", result.recovered_id);
+        expect(readFileSync(join(target, "events.jsonl"), "utf8")).toBe(prefix);
+        expect(savedFileHashes(source)).toEqual(before);
+        const inspected = await runFx(["session", "--id", result.recovered_id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(inspected.code).toBe(0);
+        expect(inspected.stderr).toBe("");
+        expect(inspected.stdout).toContain("CUT_SAVED");
+        responses.push(fakeGatewayFinalText("CUT_CONTINUED"));
+        const continued = await continueSession(fixture, gateway, result.recovered_id);
+        expect(continued.code).toBe(0);
+        expect(JSON.parse(continued.stdout).output).toBe("CUT_CONTINUED");
+        expect(gateway.requests).toHaveLength(3);
+        expect(savedFileHashes(source)).toEqual(before);
+      } finally {
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
+
   for (const damage of ["metadata", "private-child", "private-marker", "first-record", "missing-result", "changed-result"] as const) {
     test(`current conversation recovery refuses ${damage} without publishing a copy`, async () => {
       const fixture = createFixture("fx-session-current-refusal-");

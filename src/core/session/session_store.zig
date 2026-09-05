@@ -3665,10 +3665,10 @@ fn copyRecoveredCommandReplay(
                 alloc,
                 target,
                 descriptor,
-            ) catch return error.SessionRecoveryBoundaryInvalid;
+            ) catch |err| return recoveryArtifactReadError(err);
             defer reader.deinit();
-            while (reader.nextByte() catch
-                return error.SessionRecoveryBoundaryInvalid) |_|
+            while (reader.nextByte() catch |err|
+                return recoveryArtifactReadError(err)) |_|
             {}
             return !authenticated;
         },
@@ -3752,7 +3752,7 @@ fn copyRecoveredManagedChild(
         const read_len = source_file.readRangeInto(
             offset,
             buffer[0..chunk_len],
-        ) catch return error.SessionRecoveryBoundaryInvalid;
+        ) catch |err| return recoveryArtifactReadError(err);
         if (read_len == 0) return error.SessionRecoveryBoundaryInvalid;
         source_hasher.update(buffer[0..read_len]);
         try target_file.writeAll(buffer[0..read_len]);
@@ -3796,7 +3796,7 @@ fn managedFileDigest(
         const read_len = file.readRangeInto(
             offset,
             buffer[0..chunk_len],
-        ) catch return error.SessionRecoveryBoundaryInvalid;
+        ) catch |err| return recoveryArtifactReadError(err);
         if (read_len == 0) return error.SessionRecoveryBoundaryInvalid;
         hasher.update(buffer[0..read_len]);
         offset = std.math.add(u64, offset, read_len) catch
@@ -3805,6 +3805,34 @@ fn managedFileDigest(
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn recoveryArtifactReadError(err: anyerror) anyerror {
+    return switch (err) {
+        error.FileNotFound,
+        error.InvalidReplayHeader,
+        error.ReplaySizeMismatch,
+        error.ReplayTooLarge,
+        error.ReplayOffsetTooLarge,
+        error.UnexpectedEndOfReplay,
+        error.EndOfStream,
+        error.TruncatedReplayFrame,
+        error.InvalidReplayStream,
+        error.EmptyReplayFrame,
+        error.ReplayFrameTooLarge,
+        error.Overflow,
+        => error.SessionRecoveryBoundaryInvalid,
+        else => err,
+    };
+}
+
+test "recovery artifact errors distinguish damaged bytes from operational failures" {
+    for ([_]anyerror{ error.FileNotFound, error.InvalidReplayHeader, error.ReplaySizeMismatch, error.ReplayTooLarge, error.ReplayOffsetTooLarge, error.UnexpectedEndOfReplay, error.EndOfStream, error.TruncatedReplayFrame, error.InvalidReplayStream, error.EmptyReplayFrame, error.ReplayFrameTooLarge, error.Overflow }) |err| {
+        try std.testing.expectEqual(error.SessionRecoveryBoundaryInvalid, recoveryArtifactReadError(err));
+    }
+    for ([_]anyerror{ error.OutOfMemory, error.ReadFailed, error.AccessDenied, error.Canceled, error.Unseekable, error.Unexpected, error.SystemResources }) |err| {
+        try std.testing.expectEqual(err, recoveryArtifactReadError(err));
+    }
 }
 
 fn validateRecoveredManagedChildDigest(
@@ -5794,6 +5822,39 @@ test "doctor ignores legacy task records" {
         }
     }
     try std.testing.expect(!found);
+}
+
+test "recovery command replay allocation failures propagate without changing source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source");
+    defer alloc.free(source_path);
+    const target_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target");
+    defer alloc.free(target_path);
+    var source = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, source_path, .command_artifacts, .writable);
+    defer source.deinit();
+    var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .command_artifacts, .writable);
+    defer target.deinit();
+    const capture = try command_replay_store.Capture.create(alloc, 1024, &source);
+    defer alloc.destroy(capture);
+    defer capture.discard(alloc);
+    capture.appendAccepted(alloc, .stdout, "retained command bytes");
+    const replay = capture.retain(alloc) orelse return error.TestExpectedReplay;
+    try std.testing.expect(replay == .available);
+    var source_file = try source.openFileReadOnly(alloc, .command_artifacts, replay.available.handle);
+    defer source_file.deinit();
+    const before = try managedFileDigest(&source_file, replay.available.framed_bytes);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(test_alloc: Allocator, input: *session_child_store.SessionChildCapability, output: *session_child_store.SessionChildCapability, value: core_types.CommandOutputReplay) !void {
+            // Each failure run starts from the same absent-target state.
+            defer output.delete(.command_artifacts, value.available.handle) catch {};
+            try std.testing.expect(!try copyRecoveredCommandReplay(test_alloc, input, output, value));
+        }
+    }.check, .{ &source, &target, replay });
+    try std.testing.expectEqual(before, try managedFileDigest(&source_file, replay.available.framed_bytes));
 }
 
 test "recovery authenticates content-addressed command artifacts" {

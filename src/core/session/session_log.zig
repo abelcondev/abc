@@ -898,6 +898,9 @@ pub fn find_conversation_recovery_boundary(
     }
     var boundary: ConversationRecoveryBoundary = .{};
     var offset: u64 = 0;
+    var coverage_offset: u64 = 0;
+    var coverage_seq: u64 = 0;
+    var coverage_progress: ConversationProgress = .{};
     scan: while (offset < length) {
         const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
             error.TruncatedEventFrame, error.EventFrameTooLarge => break,
@@ -914,6 +917,21 @@ pub fn find_conversation_recovery_boundary(
             .latest_checkpoint_coverage = state.latest_checkpoint_coverage,
             .pending_tool_calls = state.pending_tool_calls.items,
         }, decoded.value) catch break;
+        if (decoded.value.event == .context_checkpoint) {
+            const coverage = decoded.value.event.context_checkpoint.covers_through_seq;
+            // Coverage is monotone, so historical cuts need only one extra scan.
+            while (coverage_seq < coverage) {
+                const covered = (try session_replay.readLineAt(alloc, file, coverage_offset, offset)) orelse
+                    return error.SessionRecoveryBoundaryInvalid;
+                defer alloc.free(covered.bytes);
+                var frame = try session_event.decodeConversationFrame(alloc, covered.bytes);
+                defer frame.deinit();
+                try coverage_progress.observe(frame.value.seq, frame.value.event, null);
+                coverage_seq = frame.value.seq;
+                coverage_offset = covered.next_offset;
+            }
+            if (coverage_progress.pending != 0) break :scan;
+        }
         state.applyReplayedEvent(decoded.value.seq, decoded.value.event) catch |err| switch (err) {
             error.InvalidConversationFrame => break :scan,
             else => return err,
@@ -1037,6 +1055,37 @@ test "conversation recovery boundary validates prefix and never edits source" {
     try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, find_conversation_recovery_boundary(alloc, &dir));
 }
 
+test "conversation recovery rejects checkpoint cuts inside tool batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"request\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"one.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"two.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |coverage| {
+        for ([_][]const u8{ "", "invalid\n" }) |tail| {
+            const bytes = try std.fmt.allocPrint(alloc, "{s}{{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{{\"context_checkpoint\":{{\"covers_through_seq\":{d},\"summary\":\"checkpoint\"}}}}}}\n{s}", .{ prefix, coverage, tail });
+            defer alloc.free(bytes);
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+            if (coverage >= 2 and coverage <= 4) {
+                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+                try std.testing.expectEqual(prefix.len, boundary.bytes);
+                try std.testing.expectEqual(@as(u64, 6), boundary.seq);
+            } else if (tail.len == 0) {
+                try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
+            } else {
+                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+                try std.testing.expectEqual(bytes.len - tail.len, boundary.bytes);
+            }
+        }
+    }
+}
+
 test "conversation recovery allocation failures do not become corruption" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1044,12 +1093,13 @@ test "conversation recovery allocation failures do not become corruption" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n" ++
-        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"retained fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
             const boundary = try find_conversation_recovery_boundary(alloc, source);
-            try std.testing.expectEqual(@as(u64, 3), boundary.seq);
+            try std.testing.expectEqual(@as(u64, 4), boundary.seq);
         }
     }.check, .{&dir});
 }
