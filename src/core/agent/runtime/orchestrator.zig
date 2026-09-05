@@ -2652,6 +2652,7 @@ fn finishPendingParallelCancelled(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
+            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -4728,7 +4729,7 @@ const CompactionContinuation = struct {
         const body = (try provider.buildRequest(alloc, candidate)) orelse
             return error.ContextCompactionUnavailable;
         defer alloc.free(body);
-        return runtime_prompt_context.measureProviderRequest(body);
+        return runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, body, candidate);
     }
 };
 
@@ -4891,7 +4892,7 @@ test "manual compaction fixed context measures prepared skills and host instruct
     try std.testing.expect(std.mem.find(u8, body, "compaction-workflow") != null);
     try std.testing.expect(std.mem.find(u8, body, "HOST_COMPACTION_INSTRUCTIONS") != null);
     const measured = try small.measure(arena, deps.agent_stream_provider, "");
-    try std.testing.expectEqual(runtime_prompt_context.measureProviderRequest(body), measured);
+    try std.testing.expectEqual(try runtime_prompt_context.measureProviderRequest(arena, body, small.request), measured);
     const large = try prepareManualCompactionContinuation(arena, &deps, config, "fixture/model", .{ .context_window = 1_000_000 });
     const large_cost = try large.measure(arena, deps.agent_stream_provider, "");
     try std.testing.expect(large_cost.estimated_input_tokens > measured.estimated_input_tokens);
@@ -5048,7 +5049,7 @@ fn processQueuedPromptLoop(
     config: Config,
     job: QueuedPrompt,
     skills: PreparedSkills,
-    request_capabilities: model_capabilities.Capabilities,
+    initial_request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
     base_nested_subagent_advertised: bool,
     base_nested_read_tool_result_advertised: bool,
@@ -5068,6 +5069,8 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    var request_capabilities = initial_request_capabilities;
+    var tool_image_capabilities_resolved = false;
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
     const history_messages = history_messages_ptr.*;
@@ -5144,12 +5147,9 @@ fn processQueuedPromptLoop(
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
-    var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
-    try selected_dynamic_tool_names.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
-        selected_dynamic_tool_names.appendAssumeCapacity(tool.name);
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
     const current_user_effective = current_user_message;
@@ -5352,7 +5352,9 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tool_names = selected_dynamic_tool_names.items;
+        const advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        const advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
+        for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
         var gateway_model: []const u8 = job.model;
@@ -5591,11 +5593,22 @@ fn processQueuedPromptLoop(
                 subagent_request_eligible,
                 terminal_request_messages,
             );
-            const request_messages = try project_read_tool_result_request_messages(
+            const result_request_messages = try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             );
+            if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
+                for (result_request_messages) |message| {
+                    const memory = message.tool_result_memory orelse continue;
+                    if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
+                    request_capabilities = try deps.resolve_model_capabilities(deps.ctx, overlay_arena, gateway_model);
+                    tool_image_capabilities_resolved = true;
+                    break;
+                }
+            }
+            const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
+            const request_messages = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support == .native, config.max_tool_result_bytes);
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = true;
@@ -5608,19 +5621,6 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
-            if (job.provider != .gateway and job.images.len > 0 and
-                vision_policy.route == .native)
-            {
-                try verified_images.ensureTotalCapacity(overlay_arena, job.images.len);
-                for (job.images) |attachment| {
-                    verified_images.appendAssumeCapacity(try image_attachments.loadVerifiedSnapshot(
-                        overlay_arena,
-                        attachment,
-                        .{ .cancel_flag = config.cancel_flag },
-                    ));
-                }
-            }
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
@@ -5629,17 +5629,13 @@ fn processQueuedPromptLoop(
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
                     .advertised_functions = config.advertised_functions,
-                    .selected_dynamic = selected_dynamic_tools.items,
+                    .selected_dynamic = advertised_dynamic_tools,
                 },
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
                 .max_output_tokens = request_max_output_tokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
-                .verified_images = if (verified_images.items.len > 0)
-                    verified_images.items
-                else
-                    null,
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
@@ -5648,15 +5644,16 @@ fn processQueuedPromptLoop(
                 request_data,
             )) |request_body| {
                 prepared_request_body = request_body;
-                const measured_request_cost = runtime_prompt_context.measureProviderRequest(request_body);
-                const request_cost = if (request_token_calibration) |calibration|
-                    if (std.mem.eql(u8, calibration.model, gateway_model))
-                        runtime_prompt_context.calibrateProviderRequest(
-                            measured_request_cost,
-                            calibration.cost,
-                        )
+                const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
+                const applicable_calibration = if (request_token_calibration) |calibration|
+                    if (std.mem.eql(u8, calibration.model, gateway_model) and calibration.cost.applies(measured_request_cost))
+                        calibration.cost
                     else
-                        measured_request_cost
+                        null
+                else
+                    null;
+                const request_cost = if (applicable_calibration) |calibration|
+                    runtime_prompt_context.calibrateProviderRequest(measured_request_cost, calibration)
                 else
                     measured_request_cost;
                 request_cost_for_attempt = request_cost;
@@ -5676,11 +5673,15 @@ fn processQueuedPromptLoop(
                     "context_compaction",
                     "decision",
                     step_ctx,
-                    "decision={s} request_bytes={d} estimated_tokens={d} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
+                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
                         request_cost.serialized_bytes,
                         request_cost.estimated_input_tokens,
+                        request_cost.text_tokens,
+                        request_cost.image_identity != null,
+                        request_cost.image_identity != null and applicable_calibration != null,
+                        if (applicable_calibration) |calibration| calibration.exact_input_tokens else null,
                         projection_plan.usable_input_tokens,
                         projection_plan.high_water_tokens,
                         projection_plan.session_target_tokens,
@@ -5913,7 +5914,6 @@ fn processQueuedPromptLoop(
                 .provider_options = request_data.provider_options,
                 .max_output_tokens = request_data.max_output_tokens,
                 .budget = request_data.budget,
-                .verified_images = request_data.verified_images,
                 .prepared_request_body = prepared_request_body,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
@@ -7106,7 +7106,7 @@ fn processQueuedPromptLoop(
                 request_token_calibration = .{
                     .model = successful_gateway_model,
                     .cost = .{
-                        .serialized_bytes = request_cost.serialized_bytes,
+                        .request = request_cost,
                         .exact_input_tokens = @intCast(@min(
                             exact_input_tokens,
                             std.math.maxInt(usize),
@@ -8116,15 +8116,6 @@ fn processQueuedPromptLoop(
                         finish_trace.finish("interrupted");
                         return;
                     }
-                    if (try runtime_tool_admission.repeatedDynamicMcpFailure(
-                        arena,
-                        within_turn_suffix.items,
-                        parallel_call,
-                        advertised_dynamic_tool_names,
-                    )) |failure| {
-                        precomputed_results[group_index] = failure;
-                        continue;
-                    }
                     if (preparation_batch.preparations[tool_call_index + group_index]) |preparation| {
                         switch (preparation) {
                             .candidate => |candidate| {
@@ -8249,7 +8240,7 @@ fn processQueuedPromptLoop(
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
                         outcome
                     else
-                        runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
+                        runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, advertised_dynamic_tools, config.workspace_root, step_ctx) catch |err| blk: {
                             if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
                             break :blk null;
                         };
@@ -8854,54 +8845,6 @@ fn processQueuedPromptLoop(
                     },
                 }
             }
-            if (try runtime_tool_admission.repeatedDynamicMcpFailure(
-                arena,
-                within_turn_suffix.items,
-                tool_call,
-                advertised_dynamic_tool_names,
-            )) |execution| {
-                const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
-                const safe_tool_output = prepared.model_output;
-                _ = try stream_ctx.provisional_statuses.finishExecutedCall(
-                    deps,
-                    stream_ctx.alloc,
-                    arena,
-                    turn_id,
-                    tool_call,
-                    false,
-                    tool_display_target,
-                    execution,
-                    safe_tool_output,
-                    prepared.memory,
-                    null,
-                    advertised_dynamic_tool_names,
-                );
-                try runtime_tool_admission.recordRejectedToolCall(
-                    deps,
-                    arena,
-                    tool_call,
-                    safe_tool_output,
-                    null,
-                );
-                debug_trace.eventf(
-                    "tool",
-                    "execution_result",
-                    step_ctx,
-                    "call_id={s} name={s} result_kind=repeated_mcp_failure model_output_bytes={d}",
-                    .{ tool_call.id, tool_call.name, safe_tool_output.len },
-                );
-                try runtime_tool_batch.appendToolResultContent(
-                    arena,
-                    &within_turn_suffix,
-                    &completed_tool_names,
-                    &step_batch,
-                    tool_call,
-                    safe_tool_output,
-                    prepared.memory,
-                    .{ .increment_error = true },
-                );
-                continue;
-            }
             const requires_legacy_classification = if (preparation_batch.preparations[tool_call_index]) |preparation|
                 switch (preparation) {
                     .candidate => |candidate| !preparedCandidateClassificationComplete(candidate),
@@ -9304,6 +9247,7 @@ fn processQueuedPromptLoop(
                         if (live_authority) |resolved| resolved.authority else null,
                         null,
                         advertised_dynamic_tool_names,
+                        advertised_dynamic_tools,
                         config.workspace_root,
                         step_ctx,
                     )) catch |err| blk: {
@@ -9395,6 +9339,7 @@ fn processQueuedPromptLoop(
                         .human_approval = exact_human_approval,
                     } },
                     advertised_dynamic_tool_names,
+                    advertised_dynamic_tools,
                     config.workspace_root,
                     step_ctx,
                 ) catch |err| blk: {
@@ -9770,6 +9715,9 @@ fn processQueuedPromptLoop(
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
                 .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
+                .expected_mcp_binding = for (advertised_dynamic_tools) |tool| {
+                    if (std.mem.eql(u8, tool.name, execution_call.name)) break tool.mcp_binding;
+                } else null,
                 .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
                     switch (preparation) {
                         .candidate => |candidate| preparedCandidateClassificationComplete(candidate),
@@ -9980,6 +9928,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
+            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,
@@ -10112,7 +10061,7 @@ fn processQueuedPromptLoop(
                 debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
                 debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             }
-            try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tools, execution);
+            try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,
                 arena,

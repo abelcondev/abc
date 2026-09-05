@@ -3036,7 +3036,12 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
     try expectBodyContains(&gateway, 0, "\"tools\":[]");
     try expectBodyContains(&gateway, 1, "context_handoff");
-    try std.testing.expect(prompt_context.measureProviderRequest(gateway.request_bodies.items[1]).estimated_input_tokens <= 4_500);
+    try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[1], .{
+        .model = model,
+        .messages = &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
+    })).estimated_input_tokens <= 4_500);
     try expectBodyContains(&gateway, 1, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
     try expectBodyContains(&gateway, 1, "auto-compaction-workflow");
     try expectBodyContains(&gateway, 1, "available_skills");
@@ -3195,6 +3200,65 @@ test "processQueuedPrompt stops after one context overflow recovery" {
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
+test "image context overflow keeps one recovery and preserves the current image" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(path);
+    const image = try testCapturedImage(alloc, &tmp, path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const overflow = FakeCompletion{
+        .status = .bad_request,
+        .err_body = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"maximum context length exceeded\"}}",
+    };
+    for ([_]bool{ false, true }) |repeated| {
+        const completions = [_]FakeCompletion{
+            overflow,
+            .{ .content = "Retain the previous answer." },
+            if (repeated) overflow else .{ .content = "IMAGE_OVERFLOW_RECOVERED" },
+            .{ .content = "MUST_NOT_RUN" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.available_capability_overrides = &.{.{ .model = "fixture/image", .capabilities = .{
+            .context_window = 128_000,
+            .max_output_tokens = 16_384,
+            .image_input_support = .native,
+            .supports_vision = true,
+            .supports_file_input = true,
+        } }};
+        hooks.capability_overrides = hooks.available_capability_overrides;
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("fixture/image");
+        job.images = &images;
+        job.authorized_image_catalog = &images;
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior request") },
+            .assistant = @constCast("prior answer"),
+        } }};
+        job.history = &history;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(@as(usize, 3), gateway.index);
+        try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 2, "\"type\":\"file\"");
+        try expectBodyContains(&gateway, 2, "context_handoff");
+        if (repeated) {
+            try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        } else {
+            try std.testing.expectEqualStrings("IMAGE_OVERFLOW_RECOVERED", hooks.finish_assistant_text.?);
+            try std.testing.expect(hooks.http_status == null);
+        }
+    }
+}
+
 test "cancelled automatic compaction is retried by the next prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3317,8 +3381,9 @@ test "retained context automatic compaction continues with the exact recent para
     job.history = @constCast(&history);
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try std.testing.expect(prompt_context.measureProviderRequest(gateway.request_bodies.items[0]).estimated_input_tokens < context_window * 4 / 5);
-    const continued_tokens = prompt_context.measureProviderRequest(gateway.request_bodies.items[2]).estimated_input_tokens;
+    const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
+    try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
+    const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
     try std.testing.expect(continued_tokens > context_window / 4);
     try std.testing.expect(continued_tokens < context_window);
     try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
@@ -7057,6 +7122,7 @@ test "processQueuedPrompt preserves provider state during silent-tool continuati
                 &.{previous},
                 null,
                 .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 },
+                .{},
             );
             try std.testing.expectEqualStrings(state[1 .. state.len - 1], wire.written());
         }

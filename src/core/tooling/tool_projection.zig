@@ -1,6 +1,5 @@
 const std = @import("std");
 const model_tool_schema = @import("model_tool_schema.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set_contract = @import("tool_set.zig");
@@ -11,7 +10,6 @@ const Allocator = std.mem.Allocator;
 pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
-    mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
 };
 
@@ -641,36 +639,6 @@ fn indexOfName(names: []const []const u8, expected: []const u8) !usize {
     return error.TestExpectedEqual;
 }
 
-fn appendTestMcpTool(runtime: *mcp_runtime.McpRuntime, server_index: usize, name: []const u8) !void {
-    const alloc = runtime.alloc;
-    const description = try alloc.dupe(u8, "test MCP tool");
-    errdefer alloc.free(description);
-    const input_schema = try alloc.dupe(u8, "{\"type\":\"object\"}");
-    errdefer alloc.free(input_schema);
-    const tags = try alloc.alloc([]u8, 1);
-    errdefer alloc.free(tags);
-    tags[0] = try alloc.dupe(u8, "test");
-    errdefer alloc.free(tags[0]);
-    try runtime.servers.items[server_index].tool_catalog.tools.append(alloc, .{
-        .original_name = try alloc.dupe(u8, name),
-        .prefixed_name = try alloc.dupe(u8, name),
-        .description = description,
-        .input_schema_json = input_schema,
-        .tags = tags,
-    });
-}
-
-fn appendTestMcpServer(runtime: *mcp_runtime.McpRuntime, name: []const u8) !usize {
-    const config = mcp_runtime.McpServerConfig{
-        .name = try runtime.alloc.dupe(u8, name),
-        .enabled = true,
-    };
-    try runtime.addServer(config);
-    const index = runtime.servers.items.len - 1;
-    runtime.servers.items[index].state = .ready;
-    return index;
-}
-
 test "provider-executed search follows settled advertisement permission" {
     const cases = [_]struct {
         action: ?types.PermissionAction,
@@ -804,31 +772,12 @@ test "effective tool projection cleans up every partial allocation failure" {
     );
 }
 
-test "MCP tools stay deferred and base selection is stable across catalog churn" {
+test "base tool projection includes MCP discovery and explicit selection" {
     const alloc = std.testing.allocator;
-    var first_runtime = mcp_runtime.McpRuntime.init(alloc);
-    defer first_runtime.deinit();
-    const first_server = try appendTestMcpServer(&first_runtime, "first");
-    try appendTestMcpTool(&first_runtime, first_server, "mcp_first_a");
-
-    var second_runtime = mcp_runtime.McpRuntime.init(alloc);
-    defer second_runtime.deinit();
-    const second_server = try appendTestMcpServer(&second_runtime, "second");
-    try appendTestMcpTool(&second_runtime, second_server, "mcp_second_a");
-    try appendTestMcpTool(&second_runtime, second_server, "mcp_second_b");
-
-    var first = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &first_runtime });
-    defer first.deinit(alloc);
-    var second = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
-    defer second.deinit(alloc);
-
-    try expectContainsName(first.advertised_names, "capability_search");
-    try expectContainsName(first.advertised_names, "mcp_select_tool");
-    try expectNotContainsName(first.advertised_names, "mcp_first_a");
-    try std.testing.expectEqual(first.advertised_names.len, second.advertised_names.len);
-    for (first.advertised_names, second.advertised_names) |left, right| {
-        try std.testing.expectEqualStrings(left, right);
-    }
+    var projection = try buildTestModelToolProjection(alloc, .{});
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "capability_search");
+    try expectContainsName(projection.advertised_names, "mcp_select_tool");
 }
 
 test "subagent and shell selection follow host capability" {

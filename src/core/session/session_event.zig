@@ -53,6 +53,7 @@ pub const ConversationToolResult = struct {
     tool_name: []const u8,
     status: types.PersistedToolStatus,
     artifact_ref: []const u8,
+    tool_image_handle: ?[]const u8 = null,
     output_bytes: ?u64 = null,
     stored_bytes: u64,
     completeness: ArtifactCompleteness,
@@ -229,6 +230,9 @@ fn validateConversationEventShape(event: ConversationEvent) ConversationTransiti
                 {
                     return error.InvalidConversationEvent;
                 }
+            }
+            if (result.tool_image_handle) |handle| {
+                try validateConversationIdentity(handle);
             }
             if (result.created_at_ms < 0) return error.InvalidConversationEvent;
             for (result.permission_feedback) |feedback| {
@@ -483,11 +487,15 @@ fn appendExecutionConversationEvents(
         for (step.tool_results) |result| {
             const artifact_ref = resultArtifactRef(result) orelse
                 return error.ConversationArtifactRequired;
+            if (result.tool_images.len > 0 and result.tool_image_handle == null) {
+                return error.ConversationArtifactRequired;
+            }
             try events.append(alloc, .{ .tool_result = .{
                 .call_id = result.tool_call_id,
                 .tool_name = result.tool_name,
                 .status = result.status,
                 .artifact_ref = artifact_ref,
+                .tool_image_handle = result.tool_image_handle,
                 .output_bytes = std.math.cast(u64, result.output_bytes) orelse
                     return error.InvalidConversationEvent,
                 .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
@@ -3214,6 +3222,7 @@ fn fuzzConversationFrame(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "history turn projects to flat conversation events with artifact references" {
+    var images = [_]types.ToolImage{.{ .data = @constCast("image bytes"), .mime_type = @constCast("image/png") }};
     var calls = [_]types.ToolCall{.{
         .id = "call-shell",
         .name = "shell",
@@ -3225,6 +3234,8 @@ test "history turn projects to flat conversation events with artifact references
         .status = .success,
         .output = @constCast("done"),
         .output_handle = @constCast("result-shell.txt"),
+        .tool_image_handle = @constCast("image-result-shell.txt"),
+        .tool_images = &images,
         .output_bytes = 4,
         .stored_output_bytes = 4,
     }};
@@ -3248,6 +3259,19 @@ test "history turn projects to flat conversation events with artifact references
     try std.testing.expectEqualStrings("I will run it.", events.items[1].assistant.text);
     try std.testing.expectEqualStrings("call-shell", events.items[2].tool_call.call_id);
     try std.testing.expectEqualStrings("result-shell.txt", events.items[3].tool_result.artifact_ref);
+    try std.testing.expectEqualStrings("image-result-shell.txt", events.items[3].tool_result.tool_image_handle.?);
+    const encoded = try encodeConversationFrame(std.testing.allocator, .{
+        .seq = 4,
+        .timestamp_ms = 1,
+        .event = events.items[3],
+    });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "image bytes") == null);
+    var decoded = try decodeConversationFrame(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("image-result-shell.txt", decoded.value.event.tool_result.tool_image_handle.?);
     try std.testing.expectEqualStrings("It completed.", events.items[4].assistant.text);
     try std.testing.expect(events.items[5] == .turn_completed);
+    results[0].tool_image_handle = null;
+    try std.testing.expectError(error.ConversationArtifactRequired, appendHistoryTurnConversationEvents(std.testing.allocator, &events, turn));
 }

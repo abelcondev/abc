@@ -349,6 +349,7 @@ function createRuntime(options) {
   const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
+  const httpRequests = new Set();
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -583,20 +584,40 @@ function createRuntime(options) {
   }
 
   function httpRequest(methodPtr, methodLen, urlPtr, urlLen, headersPtr, headersLen, bodyPtr, bodyLen, statusOut, responsePtr, responseCap) {
-    return options.fetch(text(urlPtr, urlLen), {
-      method: text(methodPtr, methodLen),
-      headers: headersFromJson(headersPtr, headersLen),
-      body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
-    }).then(async (response) => {
+    const controller = new AbortController();
+    httpRequests.add(controller);
+    let onAbort;
+    const cancelled = new Promise((resolve) => {
+      onAbort = () => resolve(-1);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const request = (async () => {
+      const response = await options.fetch(text(urlPtr, urlLen), {
+        method: text(methodPtr, methodLen),
+        headers: headersFromJson(headersPtr, headersLen),
+        body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        void cancelResponseBody(response);
+        return -1;
+      }
       const body = new Uint8Array(await response.arrayBuffer());
+      if (controller.signal.aborted) return -1;
       new DataView(memory().buffer).setUint16(statusOut, response.status, true);
       if (body.length > responseCap) return -2;
       bytes(responsePtr, body.length).set(body);
       return body.length;
-    }).catch(() => -1);
+    })().catch(() => -1);
+    return Promise.race([request, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", onAbort);
+      httpRequests.delete(controller);
+    });
   }
 
+  let pendingHostToolResult = null;
   function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+    pendingHostToolResult = null;
     if (typeof options.hostToolExecutor !== "function") return -1;
     if (options.traceWasi) console.error("fx host tool call start");
     let input;
@@ -605,9 +626,13 @@ function createRuntime(options) {
       if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
       if (result.cancelled) return -2;
       const output = encoder.encode(result.content);
-      if (output.length > outputCap) return -3;
+      bytes(statusPtr, 1)[0] = (result.isError ? 1 : 0) + (result.rich ? 2 : 0);
+      if (output.length > outputCap) {
+        if (!result.rich || output.length > 8 * 1024 * 1024) return -3;
+        pendingHostToolResult = output;
+        return output.length;
+      }
       bytes(outputPtr, output.length).set(output);
-      bytes(statusPtr, 1)[0] = result.isError ? 1 : 0;
       return output.length;
     }).catch(() => -1);
   }
@@ -871,7 +896,9 @@ function createRuntime(options) {
   }
 
   function abortHostEffects() {
+    pendingHostToolResult = null;
     streams.forEach((state) => state.controller.abort(abortReason));
+    httpRequests.forEach((controller) => controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -932,6 +959,13 @@ function createRuntime(options) {
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
+    fx_host_tool_result_read(offset, ptr, cap) {
+      if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
+      const chunk = pendingHostToolResult.subarray(offset, offset + cap);
+      bytes(ptr, chunk.length).set(chunk);
+      return chunk.length;
+    },
+    fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -1138,10 +1172,27 @@ function normalizeInstructions(value) {
 }
 
 function hostToolContent(value) {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "null";
+  if (value?.type === "libfx.tool-result") {
+    if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
+      throw new TypeError("invalid typed tool result");
+    }
+    let imageBytes = 0;
+    const images = value.images.map((image) => {
+      if (image?.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string" || image.mimeType.length > 128 || image.data.length > 5 * 1024 * 1024) {
+        throw new TypeError("invalid tool image");
+      }
+      imageBytes += image.data.length;
+      if (imageBytes > 8 * 1024 * 1024) throw new RangeError("tool images exceed the result limit");
+      return { type: "image", data: image.data, mimeType: image.mimeType };
+    });
+    const content = JSON.stringify({ text: value.text, images });
+    if (new TextEncoder().encode(content).length > 8 * 1024 * 1024) throw new RangeError("typed tool result exceeds the result limit");
+    return { content, rich: true, isError: value.isError === true };
+  }
+  if (typeof value === "string") return { content: value, rich: false };
+  if (value === undefined) return { content: "null", rich: false };
   const encoded = JSON.stringify(value);
-  return encoded === undefined ? "null" : encoded;
+  return { content: encoded === undefined ? "null" : encoded, rich: false };
 }
 
 function checkpointBytes(value) {
@@ -1242,6 +1293,7 @@ export async function createFxAgent(options = {}) {
     const aborted = new Promise((resolve) => { onAbort = () => resolve(); });
     controller.signal.addEventListener("abort", onAbort, { once: true });
     let content = "";
+    let rich = false;
     let isError = false;
     try {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
@@ -1250,15 +1302,30 @@ export async function createFxAgent(options = {}) {
         return execute(input, { signal: controller.signal });
       });
       const value = await Promise.race([execution, aborted]);
-      if (!controller.signal.aborted) content = hostToolContent(value);
+      if (!controller.signal.aborted) {
+        const normalized = hostToolContent(value);
+        content = normalized.content;
+        rich = normalized.rich;
+        isError = normalized.isError === true;
+      }
     } catch (error) {
       isError = true;
-      content = error instanceof Error ? error.message : String(error);
+      if (error?.toolResult?.type === "libfx.tool-result") {
+        try {
+          const normalized = hostToolContent(error.toolResult);
+          content = normalized.content;
+          rich = normalized.rich;
+        } catch {
+          content = error instanceof Error ? error.message : String(error);
+        }
+      } else {
+        content = error instanceof Error ? error.message : String(error);
+      }
     } finally {
       controller.signal.removeEventListener("abort", onAbort);
       turn.toolControllers.delete(controller);
     }
-    return { content, isError, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
+    return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
   };
   emit("runtime.start");
   const runtimeOptions = {
@@ -1312,13 +1379,17 @@ export async function createFxAgent(options = {}) {
       return;
     }
     if (message.method === "libfx/tool_call") {
-      const { content, isError, cancelled } = await executeHostTool(
+      const { content, isError, rich, cancelled } = await executeHostTool(
         message.params?.name,
         message.params?.input,
         message.params?.sessionId,
       );
       if (cancelled || closing) return;
-      send({ jsonrpc: "2.0", id: message.id, result: { content, isError } });
+      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
+        response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
+      }
+      send(response);
       return;
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);

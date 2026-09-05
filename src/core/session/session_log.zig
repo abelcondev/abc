@@ -1498,6 +1498,8 @@ fn dupeConversationToolResult(
     errdefer alloc.free(output);
     const handle = try alloc.dupe(u8, value.artifact_ref);
     errdefer alloc.free(handle);
+    const image_handle = if (value.tool_image_handle) |image_ref| try alloc.dupe(u8, image_ref) else null;
+    errdefer if (image_handle) |image_ref| alloc.free(image_ref);
     const preview = if (value.preview) |text| try alloc.dupe(u8, text) else null;
     errdefer if (preview) |text| alloc.free(text);
     var permission_feedback: [][]u8 = if (value.permission_feedback.len > 0)
@@ -1548,6 +1550,7 @@ fn dupeConversationToolResult(
         .status = value.status,
         .output = output,
         .output_handle = handle,
+        .tool_image_handle = image_handle,
         .preview = preview,
         .output_bytes = output_bytes,
         .stored_output_bytes = stored_bytes,
@@ -1570,6 +1573,8 @@ fn freeConversationToolResult(
     alloc.free(result.tool_name);
     alloc.free(result.output);
     if (result.output_handle) |handle| alloc.free(handle);
+    types.freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     for (result.permission_feedback) |feedback| alloc.free(feedback);
     if (result.permission_feedback.len > 0) alloc.free(result.permission_feedback);
@@ -1743,6 +1748,15 @@ fn externalizeExecutionResults(
 ) !void {
     for (execution.tool_steps) |*step| {
         for (step.tool_results) |*result| {
+            if (result.tool_images.len > 0 and result.tool_image_handle == null) {
+                result.tool_image_handle = try result_store.storeToolImages(
+                    alloc,
+                    capability orelse return error.SessionChildCapabilityUnavailable,
+                    result.tool_call_id,
+                    result.tool_name,
+                    result.tool_images,
+                );
+            }
             if (result.output_handle == null) {
                 result.output_handle = try result_store.storeLargeResultManaged(
                     alloc,
@@ -1890,6 +1904,7 @@ pub const CommitPosition = session_replay.CommitPosition;
 
 test {
     _ = session_replay;
+    _ = session_permission_state;
 }
 
 pub const CleanupReport = struct {
@@ -2351,6 +2366,37 @@ pub fn importLegacySnapshotState(
     );
 }
 
+fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
+    var discarded: usize = 0;
+    for (history) |*turn| {
+        const execution = switch (turn.*) {
+            .assistant => |*entry| &entry.execution,
+            .interrupted => |*entry| &entry.execution,
+            .compacted_summary => continue,
+        };
+        const files = execution.files;
+        var retained_count: usize = 0;
+        for (files) |file| if (file.path.len > 0) {
+            retained_count += 1;
+        };
+        if (retained_count == files.len) continue;
+        const retained = try alloc.alloc(types.FileEvidence, retained_count);
+        var index: usize = 0;
+        for (files) |file| {
+            if (file.path.len == 0) {
+                types.freeFileEvidence(alloc, file);
+            } else {
+                retained[index] = file;
+                index += 1;
+            }
+        }
+        discarded += files.len - retained_count;
+        alloc.free(files);
+        execution.files = retained;
+    }
+    return discarded;
+}
+
 fn importLegacySnapshotStateWithOps(
     alloc: Allocator,
     writable: *WritableSessionDir,
@@ -2361,8 +2407,17 @@ fn importLegacySnapshotStateWithOps(
     metadata_ops: io_mod.DurableOps,
 ) !LoadedWritableSession {
     try recoverInterruptedLegacyImport(alloc, writable);
-    var converted = try state.dupe(alloc);
+    var migrated_permissions = if (state.permission_state.version != session_permission_state.schema_version)
+        try session_permission_state.migrateV1ToV2(alloc, state.permission_state)
+    else
+        null;
+    defer if (migrated_permissions) |*permissions| permissions.deinit(alloc);
+    var import_state = state;
+    if (migrated_permissions) |permissions| import_state.permission_state = permissions;
+    var converted = try import_state.dupe(alloc);
     errdefer converted.deinit(alloc);
+    const discarded = try discardEmptyLegacyFileEvidence(alloc, converted.history);
+    if (discarded > 0) debug_trace.logf("session", "legacy import discarded file evidence count={d} reason=empty_path", .{discarded});
     try projectConversationSnapshotLocators(alloc, converted.history);
 
     const display_path = try io_mod.dirRealpathAlloc(
@@ -3567,16 +3622,138 @@ test "legacy import recovery restores old authority or keeps published current d
     }
 }
 
+test "legacy import migrates permissions before publishing controls" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-permission-import", 20);
+    defer initial.deinit(alloc);
+    initial.permission_state.version = 1;
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("existing question") },
+        .assistant = @constCast("existing answer"),
+    } }};
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqual(@as(u8, 2), migrated.state.permission_state.version);
+        try std.testing.expectEqual(@as(u8, 1), initial.permission_state.version);
+        try std.testing.expectEqualStrings("existing answer", migrated.state.history[0].assistant.assistant);
+    }
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), reopened.state.permission_state.version);
+    try std.testing.expectEqualStrings("existing question", reopened.state.history[0].assistant.user.text);
+}
+
+test "legacy import omits empty file paths without losing execution history" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-empty-file-import", 20);
+    defer initial.deinit(alloc);
+    var calls = [_]types.ToolCall{.{ .id = "recorded-read", .name = "read_file", .arguments_json = "{\"path\":\"source.txt\"}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recorded-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("recorded output"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]types.FileEvidence{
+        .{ .path = @constCast("source.txt"), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+        .{ .path = @constCast(""), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+        .{ .path = @constCast("before.txt"), .new_path = @constCast("after.txt"), .tool_call_id = @constCast("recorded-read"), .tool_name = @constCast("read_file") },
+    };
+    const history = [_]session.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("read existing file") }, .assistant = @constCast("read finished"), .execution = .{ .tool_steps = &steps, .files = &files } } },
+        .{ .interrupted = .{ .user = .{ .text = @constCast("cancelled follow-up") }, .execution = .{ .files = files[1..2] } } },
+    };
+    try std.testing.expectError(error.InvalidConversationEvent, session_event.encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 20,
+        .event = .{ .turn_completed = .{ .files = &files } },
+    }));
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), initial.history[0].assistant.execution.files.len);
+        try std.testing.expectEqualStrings("", initial.history[0].assistant.execution.files[1].path);
+    }
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    const execution = reopened.state.history[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), reopened.state.history.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings("recorded-read", execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("recorded output", execution.tool_steps[0].tool_results[0].preview.?);
+    try std.testing.expectEqual(@as(usize, 2), execution.files.len);
+    try std.testing.expectEqualStrings("source.txt", execution.files[0].path);
+    try std.testing.expectEqualStrings("before.txt", execution.files[1].path);
+    try std.testing.expectEqualStrings("after.txt", execution.files[1].new_path.?);
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.history[1].interrupted.execution.files.len);
+    try std.testing.expectEqualStrings("cancelled follow-up", reopened.state.history[1].interrupted.user.text);
+}
+
+test "legacy import file projection cleans up allocation failures" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            const files = [_]types.FileEvidence{
+                .{ .path = @constCast(""), .new_path = @constCast("unusable.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
+                .{ .path = @constCast("retained.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
+            };
+            var history = [_]session.HistoryTurn{.{ .assistant = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast("response"),
+                .execution = .{ .files = try types.dupeFileEvidenceSlice(alloc, &files) },
+            } }};
+            defer types.freeFileEvidenceSlice(alloc, history[0].assistant.execution.files);
+            try std.testing.expectEqual(@as(usize, 1), try discardEmptyLegacyFileEvidence(alloc, &history));
+            try std.testing.expectEqualStrings("retained.txt", history[0].assistant.execution.files[0].path);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "legacy import preserves the active retained tail and complete archive" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-retained-tail", 10);
     defer initial.deinit(alloc);
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    var images = [_]types.ToolImage{.{ .data = @constCast(png), .mime_type = @constCast("image/png") }};
+    var calls = [_]types.ToolCall{.{ .id = "image-call", .name = "mcp_browser", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("image-call"),
+        .tool_name = @constCast("mcp_browser"),
+        .status = .success,
+        .output = @constCast(""),
+        .output_bytes = 0,
+        .stored_output_bytes = 0,
+        .tool_images = &images,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{ .user = .{ .text = @constCast("removed request") }, .assistant = @constCast("removed answer") } },
         .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>earlier summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 1 } },
-        .{ .assistant = .{ .user = .{ .text = @constCast("retained request") }, .assistant = @constCast("retained answer") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("retained request") }, .assistant = @constCast("retained answer"), .execution = .{ .tool_steps = &steps } } },
         .{ .compacted_summary = .{ .summary = @constCast("<context_handoff>active summary</context_handoff>"), .removed_turn_count = 1, .compaction_count = 2 } },
         .{ .assistant = .{ .user = .{ .text = @constCast("later request") }, .assistant = @constCast("later answer") } },
     };
@@ -3607,6 +3784,17 @@ test "legacy import preserves the active retained tail and complete archive" {
     try std.testing.expectEqualStrings(history[3].compacted_summary.summary, resumed.state.history[0].compacted_summary.summary);
     try std.testing.expectEqualStrings("retained answer", resumed.state.history[1].assistant.assistant);
     try std.testing.expectEqualStrings("later answer", resumed.state.history[2].assistant.assistant);
+    const result = resumed.state.history[1].assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(@as(usize, 0), result.tool_images.len);
+    try std.testing.expect(result.tool_image_handle != null);
+    const resumed_path = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
+    defer alloc.free(resumed_path);
+    var capability = try session_child_store.SessionChildCapability.init(alloc, resumed.log.dir.dir, resumed_path, .read_only);
+    defer capability.deinit();
+    const stored_images = try result_store.loadToolImages(alloc, &capability, result.tool_image_handle.?);
+    defer types.freeToolImages(alloc, stored_images);
+    try std.testing.expectEqual(@as(usize, 1), stored_images.len);
+    try std.testing.expectEqualStrings(png, stored_images[0].data);
 }
 
 test "legacy import preserves published events and active recovery after metadata sync failure" {

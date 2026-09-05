@@ -1576,6 +1576,41 @@ test "ACP load recognizes the retained active session exactly" {
     ));
 }
 
+test "ACP history excludes typed summaries without filtering original user text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .compacted_summary = .{
+        .summary = @constCast("internal summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } });
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+
+    const original = "Explain <context_handoff> without hiding my question.";
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+        .user = .{ .text = @constCast(original) },
+        .assistant = @constCast("original reply"),
+    } });
+    var file = try tmp.dir.openFile(io_mod.getIo(), "history.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, original) != null);
+    try std.testing.expect(std.mem.find(u8, captured, "original reply") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
+}
+
 test "ACP interrupted history replay hides model-only abort context" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

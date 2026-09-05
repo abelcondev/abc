@@ -15,13 +15,15 @@ const hash = (value) => createHash("sha256").update(value).digest("hex");
 const delta = (text) => `data: ${JSON.stringify({ type: "text-delta", delta: text })}\n\n`;
 const finish = 'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n';
 const pause = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+const catalogResponse = () => Response.json({ object: "list", data: [{ id: "fixture/output", type: "language" }] });
 const deadline = setTimeout(() => { throw new Error("bounded output did not settle"); }, 25_000);
 let agent;
 
 async function start(fetch, onEvent, options = {}) {
   agent = await createFxAgent({
     backend, nativeAddon, wasm, apiKey: "output-pressure-fixture", model: "fixture/output",
-    fetch, onEvent, ...options,
+    fetch: (url, init) => init.method === "GET" ? catalogResponse() : fetch(url, init),
+    onEvent, ...options,
   });
   return agent;
 }
@@ -116,7 +118,7 @@ try {
   while (!pressure) await pause(5);
   const independent = await createFxAgent({
     backend, nativeAddon, wasm, apiKey: "independent-fixture", model: "fixture/output",
-    fetch: async () => new Response(delta("independent") + finish),
+    fetch: async (_url, init) => init.method === "GET" ? catalogResponse() : new Response(delta("independent") + finish),
   });
   try {
     assert.deepEqual(await collect(independent.prompt("separate owner")), {

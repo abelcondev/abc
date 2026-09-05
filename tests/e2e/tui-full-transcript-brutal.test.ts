@@ -27,6 +27,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { stdoutFrames } from "./render-lab/tape";
 
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
@@ -38,6 +39,8 @@ const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";
 const DRAFT = "CTRL_O_BRUTAL_UNSENT_DRAFT";
 const RESUME_DRAFT = "CTRL_O_BRUTAL_RESUME_DRAFT";
 const TAIL_SENTINEL = "CTRL_O_TAIL_SENTINEL";
+const VIEWPORT_ALLOWANCE_BYTES = 64 * 1024;
+const RESIZE_SIZES = [[48, 18], [132, 42], [80, 24], [104, 30]] as const;
 const CTRL_O = ["0f"] as const;
 const PAGE_UP = ["1b", "5b", "35", "7e"] as const;
 const PAGE_DOWN = ["1b", "5b", "36", "7e"] as const;
@@ -452,6 +455,55 @@ async function waitForTraceAfter(
   );
 }
 
+async function waitForCommittedFrameAfter(
+  tracePath: string,
+  startByte: number,
+  markers: string[],
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  let appended = "";
+  while (Date.now() < deadline) {
+    appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
+    let offset = 0;
+    const committed = [...markers, "attempt_end outcome=committed"].every((marker) => {
+      const index = appended.indexOf(marker, offset);
+      if (index < 0) return false;
+      offset = index + marker.length;
+      return true;
+    });
+    if (committed) return;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for committed ${markers.join(", ")}.\n${appended}`);
+}
+
+async function terminalOutputBytes(tapePath: string): Promise<number> {
+  const deadline = Date.now() + TIMEOUT;
+  while (true) {
+    try {
+      return stdoutFrames(tapePath).reduce((bytes, frame) => bytes + frame.payload.length, 0);
+    } catch (error) {
+      if (!(error instanceof Error) ||
+        !error.message.startsWith("truncated tape frame") || Date.now() >= deadline) throw error;
+      await sleep(25);
+    }
+  }
+}
+
+async function measurePrimaryResize(
+  session: TmuxSession,
+  tracePath: string,
+  tapePath: string,
+  cols: number,
+  rows: number,
+): Promise<number> {
+  const before = await terminalOutputBytes(tapePath);
+  const start = traceSize(tracePath);
+  await session.resizeWindow(cols, rows, 0);
+  await waitForCommittedFrameAfter(tracePath, start, ["settled_reset_committed"]);
+  return await terminalOutputBytes(tapePath) - before;
+}
+
 async function waitForAnyTraceAfter(
   tracePath: string,
   startByte: number,
@@ -575,13 +627,13 @@ async function timeTransition(
   visible: () => Promise<unknown>,
   tapePath?: string,
 ): Promise<void> {
-  const bytesBefore = tapePath === undefined ? undefined : statSync(tapePath).size;
+  const bytesBefore = tapePath === undefined ? undefined : await terminalOutputBytes(tapePath);
   const started = performance.now();
   await action();
   await visible();
   metrics.transitions[kind].push(performance.now() - started);
   if (bytesBefore !== undefined) {
-    metrics.terminalBytes[kind].push(statSync(tapePath!).size - bytesBefore);
+    metrics.terminalBytes[kind].push(await terminalOutputBytes(tapePath!) - bytesBefore);
   }
 }
 
@@ -713,13 +765,7 @@ async function thrashViewer(
       );
     }
 
-    const sizes = [
-      [48, 18],
-      [132, 42],
-      [80, 24],
-      [104, 30],
-    ] as const;
-    const [cols, rows] = sizes[cycle % sizes.length]!;
+    const [cols, rows] = RESIZE_SIZES[cycle % RESIZE_SIZES.length]!;
     const resizeTraceStart = traceSize(tracePath);
     await timeTransition(
       metrics,
@@ -741,12 +787,19 @@ async function thrashViewer(
       tapePath,
     );
 
+    const closeTraceStart = traceSize(tracePath);
     const closeKey = cycle % 3 === 0 ? "C-o" : cycle % 3 === 1 ? "Escape" : "C-c";
     await timeTransition(
       metrics,
       "close",
       () => closeKey === "C-o" ? session.sendHexBytes(CTRL_O) : session.sendKeys(closeKey),
-      () => waitForMode(session, "main", draft),
+      async () => {
+        await waitForCommittedFrameAfter(tracePath, closeTraceStart, [
+          "close_full_transcript restore=resized",
+          "transcript_transition_commit state=stable",
+        ]);
+        await waitForMode(session, "main", draft);
+      },
       tapePath,
     );
     expect(session.paneStatus().dead).toBe(false);
@@ -897,7 +950,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         FX_RECORD_INPUT: "1",
         FX_TRACE_LOG: paths.tracePath,
         FX_TRACE_SCOPES:
-          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan",
+          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan,resize",
       },
       stderrPath: paths.stderrPath,
       width: 104,
@@ -1025,6 +1078,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       paths.tracePath,
       paths.tapePath,
     );
+    const primaryResizeBytes: number[] = [];
     const writeMetrics = () => {
       const summary = {
         config,
@@ -1060,6 +1114,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         resumedMemory: resumedRssKib.length > 0
           ? summarizeMemory(resumedRssKib)
           : null,
+        primaryResizeBytes,
         raw: metrics,
         rawSettled: settledMetrics,
         rawMemory: { primaryRssKib, resumedRssKib },
@@ -1083,6 +1138,13 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         paths.tracePath,
         paths.tapePath,
       );
+    }
+    // Settled history bounds the streaming prefix measured above at every geometry.
+    await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 120, 36);
+    for (const [cols, rows] of RESIZE_SIZES) {
+      primaryResizeBytes.push(await measurePrimaryResize(
+        session, paths.tracePath, paths.tapePath, cols, rows,
+      ));
     }
     await verifyOldestTranscriptEntrySurvives(session, DRAFT, config);
 
@@ -1121,7 +1183,9 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     }
     // Full-open cost must remain independent of total chat size.
     expect(summary.terminalBytes.full.maxBytes).toBeLessThan(128 * 1024);
-    expect(summary.terminalBytes.close.maxBytes).toBeLessThan(256 * 1024);
+    expect(summary.terminalBytes.close.maxBytes).toBeLessThan(
+      Math.max(...primaryResizeBytes) + VIEWPORT_ALLOWANCE_BYTES,
+    );
     expect(summary.memory.growthRssKib).toBeLessThan(256 * 1024);
 
     await session.sendKeys("C-u");
@@ -1140,7 +1204,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
           ...gatewayEnv(paths.home, resumedGateway),
           FX_TRACE_LOG: paths.resumedTracePath,
           FX_TRACE_SCOPES:
-            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_plan",
+            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan,resize",
         },
         stderrPath: paths.resumedStderrPath,
         width: 96,
@@ -1328,6 +1392,101 @@ test.skipIf(!tmuxAvailable())(
       await active?.kill();
       tallGateway.stop();
       rmSync(paths.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O resized close preserves long history within ordinary resize cost",
+  async () => {
+    const paths = makeRoot("resize-recovery-cost");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    const paragraphs = Array.from({ length: 4_000 }, (_, index) =>
+      `ROW${pad(index + 1)} ALPHA_abcdefghijklmnopqrstuvwxyz0123456789 ` +
+      "BRAVO_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    );
+    const gateway = startFakeGateway([fakeGatewayFinalText(paragraphs.join("\n\n"))]);
+    let session: TmuxSession | null = null;
+    let passed = false;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: paths.workspace,
+        env: {
+          ...gatewayEnv(paths.home, gateway),
+          FX_RECORD: paths.tapePath,
+          FX_TRACE_LOG: paths.tracePath,
+          FX_TRACE_SCOPES: "full_transcript,full_transcript_cache,scroll,frame_schedule,resize",
+        },
+        stderrPath: paths.stderrPath,
+        width: 120,
+        height: 36,
+        minimumHistoryLines: 50_000,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Return the prepared long response.");
+      await session.waitForText("ROW4000", TIMEOUT);
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendLiteralText(DRAFT);
+      await waitForMode(session, "main", DRAFT);
+      const completeHistory = async () => {
+        const text = (await session!.captureFullScrollback()).replace(/\s+/g, "");
+        let previous = -1;
+        for (const paragraph of paragraphs) {
+          const needle = paragraph.replace(/\s+/g, "");
+          const index = text.indexOf(needle);
+          expect(index).toBeGreaterThan(previous);
+          expect(text.indexOf(needle, index + 1)).toBe(-1);
+          previous = index;
+        }
+      };
+      await completeHistory();
+      const primaryBytes = await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 88, 24);
+      await completeHistory();
+      await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 120, 36);
+      await session.sendHexBytes(CTRL_O);
+      await waitForMode(session, "full", DRAFT);
+      const resizeStart = traceSize(paths.tracePath);
+      await session.resizeWindow(88, 24, 0);
+      await waitForCommittedFrameAfter(paths.tracePath, resizeStart, ["settled_reset_committed"]);
+      const closeStart = traceSize(paths.tracePath);
+      const beforeClose = await terminalOutputBytes(paths.tapePath);
+      const started = performance.now();
+      session.sendKeysImmediate(["Escape"]);
+      await waitForCommittedFrameAfter(paths.tracePath, closeStart, [
+        "close_full_transcript restore=resized",
+        "transcript_transition_commit state=stable",
+      ]);
+      await waitForMode(session, "main", DRAFT);
+      expect(performance.now() - started).toBeLessThan(2_500);
+      const closeBytes = await terminalOutputBytes(paths.tapePath) - beforeClose;
+      expect(closeBytes).toBeLessThan(primaryBytes + VIEWPORT_ALLOWANCE_BYTES);
+      await completeHistory();
+
+      await session.sendHexBytes(CTRL_O);
+      await waitForMode(session, "full", DRAFT);
+      const beforeOrdinaryClose = await terminalOutputBytes(paths.tapePath);
+      const ordinaryCloseStart = traceSize(paths.tracePath);
+      await session.sendKeys("Escape");
+      await waitForCommittedFrameAfter(paths.tracePath, ordinaryCloseStart, [
+        "close_full_transcript restore=exact",
+        "transcript_transition_commit state=stable",
+      ]);
+      await waitForMode(session, "main", DRAFT);
+      expect(await terminalOutputBytes(paths.tapePath) - beforeOrdinaryClose).toBeLessThan(256 * 1024);
+      await completeHistory();
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      passed = true;
+    } finally {
+      await session?.kill();
+      gateway.stop();
+      if (passed) rmSync(paths.root, { recursive: true, force: true });
+      else console.error(`retained recovery cost artifacts at ${paths.root}`);
     }
   },
   60_000,

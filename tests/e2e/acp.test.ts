@@ -204,6 +204,7 @@ function fakeGatewayEnv(
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
   };
 }
 
@@ -2909,7 +2910,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request(
@@ -2932,13 +2933,15 @@ describe("acp: model-independent", () => {
           "call_legacy_http",
           `${LEGACY_REMOTE_TOOL_RESULT}:new`,
         );
+        expect(newFixture.requests.find((entry) => entry.message)?.message?.method).toBe("initialize");
+        expect(newFixture.requests.some((entry) => entry.message?.method === "server/discover")).toBe(false);
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
         expect(newFixture.deleteCalls).toBe(1);
 
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 10);
         client.send({
@@ -2971,7 +2974,7 @@ describe("acp: model-independent", () => {
 
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 20);
         client.send({
@@ -8852,6 +8855,7 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const root = createIsolatedRoot("fx-acp-compacted-history-");
     const gateway = startFakeGateway([
+      fakeShellRun("saved-history-effect", "printf 'ACP_SAVED_TOOL_OUTPUT\\n' >> replay-effects.txt; printf 'ACP_SAVED_TOOL_OUTPUT\\n'"),
       finalText("ACP_EARLIER_VISIBLE_RESPONSE"),
       finalText("ACP_MIDDLE_VISIBLE_RESPONSE"),
       finalText("ACP_LATEST_VISIBLE_RESPONSE"),
@@ -8880,6 +8884,10 @@ test.skipIf(!tmuxAvailable())(
       const ids = readdirSync(join(root.home, ".fx", "sessions"), { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       expect(ids).toHaveLength(1);
+      const eventsPath = join(root.home, ".fx", "sessions", ids[0]!, "events.jsonl");
+      const savedEvents = readFileSync(eventsPath);
+      expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
+      expect(gateway.requests).toHaveLength(5);
       localClient = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
       await localClient.request("initialize", { protocolVersion: 1 }, 70);
       for (const requestId of [71, 72]) {
@@ -8901,7 +8909,14 @@ test.skipIf(!tmuxAvailable())(
         expect(visible).toContain("ACP_EARLIER_VISIBLE_RESPONSE");
         expect(visible).toContain("ACP_MIDDLE_VISIBLE_RESPONSE");
         expect(visible).toContain("ACP_LATEST_VISIBLE_RESPONSE");
+        expect(visible).toContain("ACP_SAVED_TOOL_OUTPUT");
         expect(visible).not.toContain("ACP_INTERNAL_HANDOFF");
+        expect(visible.indexOf("ACP_EARLIER_VISIBLE_RESPONSE")).toBeLessThan(visible.indexOf("ACP_MIDDLE_VISIBLE_RESPONSE"));
+        expect(visible.indexOf("ACP_MIDDLE_VISIBLE_RESPONSE")).toBeLessThan(visible.indexOf("ACP_LATEST_VISIBLE_RESPONSE"));
+        expect(readFileSync(eventsPath)).toEqual(savedEvents);
+        expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
+        expect(gateway.requests).toHaveLength(5);
+        expect(localClient.stderr).toBe("");
       }
     } finally {
       await tui?.kill();

@@ -24,6 +24,7 @@ const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
+const max_fetch_request_frame_bytes = std.base64.standard.Encoder.calcSize(max_fetch_request_bytes);
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
@@ -263,25 +264,40 @@ const FetchBridge = struct {
             .applied => {},
             else => unreachable,
         }
-        self.response_offset = 0;
-        self.response.clearRetainingCapacity();
+        if (body.len > max_fetch_request_bytes or method.len > max_fetch_request_bytes or
+            url.len > max_fetch_request_bytes or headers.len > max_fetch_request_bytes)
+            return error.HostStreamBackpressure;
+        var request: struct {
+            handle: fetch_state.Handle,
+            method: []const u8,
+            url: []const u8,
+            headers: []const u8,
+            body: []const u8,
+        } = .{
+            .handle = handle,
+            .method = method,
+            .url = url,
+            .headers = headers,
+            .body = "",
+        };
+        var metadata: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(request, .{}, &metadata.writer);
+        // Charge raw bytes and JSON metadata before the bridge's base64 expansion.
+        if (metadata.fullCount() > max_fetch_request_bytes - body.len) return error.HostStreamBackpressure;
         var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer writer.deinit();
         const encoded_body = std.base64.standard.Encoder.calcSize(body.len);
         const body_base64 = try std.heap.c_allocator.alloc(u8, encoded_body);
         defer std.heap.c_allocator.free(body_base64);
         _ = std.base64.standard.Encoder.encode(body_base64, body);
-        try std.json.Stringify.value(.{
-            .handle = handle,
-            .method = method,
-            .url = url,
-            .headers = headers,
-            .body = body_base64,
-        }, .{}, &writer.writer);
+        request.body = body_base64;
+        try std.json.Stringify.value(request, .{}, &writer.writer);
         const bytes = writer.writer.buffered();
-        if (bytes.len > max_fetch_request_bytes) return error.HostStreamBackpressure;
+        if (bytes.len > max_fetch_request_frame_bytes) return error.HostStreamBackpressure;
         self.request.clearRetainingCapacity();
         try self.request.appendSlice(std.heap.c_allocator, bytes);
+        self.response_offset = 0;
+        self.response.clearRetainingCapacity();
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
@@ -501,6 +517,7 @@ const Runtime = struct {
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         acp_server.runWithTransport(
             self.alloc,

@@ -64,7 +64,11 @@ async function exerciseCancellation(settlement, closeBeforeSettle) {
       backend,
       nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
       ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),
-      fetch,
+      fetch(input, init) {
+        const url = init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input;
+        assert.equal(new URL(url).origin, `http://127.0.0.1:${server.address().port}`);
+        return fetch(url, init);
+      },
       traceWasi: process.env.LIBFX_TRACE_WASM === "1",
       onEvent(event) {
         events.push(event);
