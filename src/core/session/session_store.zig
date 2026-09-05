@@ -24,6 +24,7 @@ const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -3192,9 +3193,8 @@ pub const Store = struct {
         };
     }
 
-    /// Creates a new conversation session from the exact validated manifest
-    /// boundary of a source whose commit watermark is corrupt. The source is
-    /// locked for the read and is never modified.
+    /// Copies a validated conversation prefix or legacy manifest boundary to a
+    /// new session. The source is locked for the read and is never modified.
     pub fn recoverSessionCopy(
         self: Store,
         alloc: Allocator,
@@ -3208,71 +3208,86 @@ pub const Store = struct {
             options.session_lock_deadline_ms,
         );
         defer source.deinit(alloc);
-        const authority = try classifyAuthority(
-            alloc,
-            &source.dir,
-            session_id,
-        );
-        if (authority != .schema_v3) {
-            return error.SessionRecoveryRequiresCurrentSchema;
-        }
-        var manifest_file = openSessionFile(
-            &source.dir,
-            "session.json",
-            .read_only,
-        ) catch return error.SessionRecoveryBoundaryInvalid;
-        defer manifest_file.close(io_mod.getIo());
-        const manifest_stat = try manifest_file.stat(io_mod.getIo());
-        if (manifest_stat.size > session_projection.manifest_max_bytes) {
-            return error.SessionRecoveryBoundaryInvalid;
-        }
-        const manifest_bytes = readExactLegacyFile(
-            alloc,
-            &manifest_file,
-            manifest_stat.size,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionRecoveryBoundaryInvalid,
+        var metadata = session_log.readConversationMetadata(alloc, &source.dir) catch |err| switch (err) {
+            error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
+            else => return err,
         };
-        defer alloc.free(manifest_bytes);
-        const manifest_schema = authority_module.manifestSchemaVersion(
-            alloc,
-            manifest_bytes,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionRecoveryBoundaryInvalid,
-        };
-        if (manifest_schema != 3) {
-            return error.SessionRecoveryUnsupportedSchema;
-        }
+        defer if (metadata) |*current| current.deinit();
+        var current_boundary: ?session_log.ConversationRecoveryBoundary = null;
+        var recovered = recovery_state: {
+            if (metadata) |current| {
+                if (!std.mem.eql(u8, current.value.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
+                if (current.value.subagent_child) return error.SessionNotFound;
+                current_boundary = try session_log.find_conversation_recovery_boundary(alloc, &source.dir);
+                break :recovery_state try session_log.load_conversation_recovery_state(alloc, &source.dir, session_id, current_boundary.?);
+            }
+            const authority = try classifyAuthority(
+                alloc,
+                &source.dir,
+                session_id,
+            );
+            if (authority != .schema_v3) {
+                return error.SessionRecoveryRequiresCurrentSchema;
+            }
+            var manifest_file = openSessionFile(
+                &source.dir,
+                "session.json",
+                .read_only,
+            ) catch return error.SessionRecoveryBoundaryInvalid;
+            defer manifest_file.close(io_mod.getIo());
+            const manifest_stat = try manifest_file.stat(io_mod.getIo());
+            if (manifest_stat.size > session_projection.manifest_max_bytes) {
+                return error.SessionRecoveryBoundaryInvalid;
+            }
+            const manifest_bytes = readExactLegacyFile(
+                alloc,
+                &manifest_file,
+                manifest_stat.size,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.SessionRecoveryBoundaryInvalid,
+            };
+            defer alloc.free(manifest_bytes);
+            const manifest_schema = authority_module.manifestSchemaVersion(
+                alloc,
+                manifest_bytes,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.SessionRecoveryBoundaryInvalid,
+            };
+            if (manifest_schema != 3) {
+                return error.SessionRecoveryUnsupportedSchema;
+            }
 
-        var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionRecoveryBoundaryInvalid,
+            var manifest = session_projection.decodeManifest(alloc, manifest_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.SessionRecoveryBoundaryInvalid,
+            };
+            defer manifest.deinit(alloc);
+            if (!std.mem.eql(u8, manifest.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
+            var events = openSessionFile(&source.dir, "events.jsonl", .read_only) catch
+                return error.SessionRecoveryBoundaryInvalid;
+            defer events.close(io_mod.getIo());
+            var imported = session_replay.replayCommittedPrefix(
+                alloc,
+                events,
+                manifest.log_generation,
+                manifest.last_event_seq,
+                manifest.event_log_bytes,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedSessionSchema => return error.SessionRecoveryUnsupportedSchema,
+                else => return error.SessionRecoveryBoundaryInvalid,
+            };
+            var imported_owned = true;
+            defer if (imported_owned) imported.deinit(alloc);
+            if (!session_projection.stateMatchesManifest(imported.state, manifest)) {
+                return error.SessionRecoveryBoundaryInvalid;
+            }
+            const recovered_state = imported.takeState();
+            imported_owned = false;
+            break :recovery_state recovered_state;
         };
-        defer manifest.deinit(alloc);
-        if (!std.mem.eql(u8, manifest.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
-        var events = openSessionFile(&source.dir, "events.jsonl", .read_only) catch
-            return error.SessionRecoveryBoundaryInvalid;
-        defer events.close(io_mod.getIo());
-        var imported = session_replay.replayCommittedPrefix(
-            alloc,
-            events,
-            manifest.log_generation,
-            manifest.last_event_seq,
-            manifest.event_log_bytes,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.UnsupportedSessionSchema => return error.SessionRecoveryUnsupportedSchema,
-            else => return error.SessionRecoveryBoundaryInvalid,
-        };
-        var imported_owned = true;
-        defer if (imported_owned) imported.deinit(alloc);
-        if (!session_projection.stateMatchesManifest(imported.state, manifest)) {
-            return error.SessionRecoveryBoundaryInvalid;
-        }
-        var recovered = imported.takeState();
-        imported_owned = false;
         defer recovered.deinit(alloc);
         try resolveSessionSnapshotLocators(
             alloc,
@@ -3293,6 +3308,9 @@ pub const Store = struct {
             .read_only,
         );
         defer source_children.deinit();
+        if (try subagent_child_state.capabilityHasManagedChildMarker(alloc, &source_children)) {
+            return error.SessionNotFound;
+        }
 
         const source_id = try alloc.dupe(u8, recovered.id);
         errdefer alloc.free(source_id);
@@ -3339,6 +3357,13 @@ pub const Store = struct {
             target_owned = false;
         };
 
+        if (recovered.usage == null) {
+            if (target.state.usage) |usage| {
+                // Keep the normal new-session default when optional usage is absent.
+                recovered.usage = try session_usage.dupeSnapshotOwned(alloc, usage);
+            }
+        }
+
         const staged_target_dir = try sessionDirPath(
             alloc,
             staging_root.display_root,
@@ -3379,6 +3404,10 @@ pub const Store = struct {
             target.child_capability orelse
                 return error.SessionChildStoreFailed,
         );
+        if (current_boundary) |boundary| {
+            try session_log.copy_conversation_recovery_prefix(alloc, &source.dir, &target.log.dir, boundary);
+            if (metadata.?.value.title) |title| _ = try target.renameConversation(alloc, title);
+        }
         if (!try session_log.durableStatesEqual(target.state, recovered)) {
             const disposition = discardRecoveryStagedSession(
                 &staging_root,
@@ -3420,13 +3449,7 @@ pub const Store = struct {
         target.deinit(alloc);
         target_owned = false;
 
-        var verified = self.resumeExactForWrite(
-            alloc,
-            recovered_id,
-            recovered.workspace_root,
-            false,
-            .{ .log = options },
-        ) catch |err| {
+        var verified = self.loadReadOnly(alloc, recovered_id) catch |err| {
             debug_trace.logf(
                 "session",
                 "event=session_recovery_target_indeterminate target={s} verify_err={s}",
@@ -3440,7 +3463,7 @@ pub const Store = struct {
             };
         };
         defer verified.deinit(alloc);
-        if (!try session_log.durableStatesEqual(verified.state, recovered)) {
+        if (!try session_log.durableStatesEqual(verified, recovered)) {
             return .{
                 .source_session_id = source_id,
                 .recovered_session_id = recovered_id,

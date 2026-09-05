@@ -545,7 +545,7 @@ pub fn hasManagedChildMarker(
     return capabilityHasManagedChildMarker(alloc, &capability);
 }
 
-fn capabilityHasManagedChildMarker(
+pub fn capabilityHasManagedChildMarker(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
 ) !bool {

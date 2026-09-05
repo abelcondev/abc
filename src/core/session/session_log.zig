@@ -741,6 +741,15 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null);
+}
+
+fn load_conversation_state_at_boundary(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    expected_session_id: []const u8,
+    recovery: ?ConversationRecoveryBoundary,
+) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
         dir,
@@ -753,7 +762,10 @@ fn loadConversationStateIfPresent(
     defer alloc.free(metadata_bytes);
     var probe = std.json.parseFromSlice(std.json.Value, alloc, metadata_bytes, .{
         .parse_numbers = false,
-    }) catch return null;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     defer probe.deinit();
     const object = if (probe.value == .object) probe.value.object else return null;
     const version_value = object.get("schema_version") orelse return null;
@@ -773,10 +785,15 @@ fn loadConversationStateIfPresent(
     var conversation_seq: u64 = 0;
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
-    const history = try replayConversationHistory(alloc, event_file, &conversation_seq, &open_work_id);
+    const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
+    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id);
     errdefer session.freeHistoryTurnSlice(alloc, history);
-    try restoreContextResultBodies(alloc, dir, history);
-    const last_work_id = if (latestConversationWorkId(history)) |work_id|
+    if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
+    const latest_work_id = if (recovery != null and recovery.?.turn_open and open_work_id != null)
+        open_work_id
+    else
+        latestConversationWorkId(history);
+    const last_work_id = if (latest_work_id) |work_id|
         try alloc.dupe(u8, work_id)
     else
         null;
@@ -789,7 +806,10 @@ fn loadConversationStateIfPresent(
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
     errdefer permission_state.deinit(alloc);
-    var recovery_checkpoint = try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq);
+    var recovery_checkpoint = if (recovery == null)
+        try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq)
+    else
+        null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (recovery_checkpoint) |*checkpoint| {
         if (checkpoint.user.work_id == null) {
@@ -852,6 +872,209 @@ pub fn hasConversationMetadata(
     const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return false;
     defer alloc.free(bytes);
     return isConversationMetadata(alloc, bytes);
+}
+
+pub const ConversationRecoveryBoundary = struct {
+    bytes: u64 = 0,
+    seq: u64 = 0,
+    timestamp_ms: i64 = 0,
+    turn_open: bool = false,
+};
+
+/// Reads only. The existing transition validator remains the record authority.
+pub fn find_conversation_recovery_boundary(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !ConversationRecoveryBoundary {
+    var reader = try ConversationHistoryReader.init(alloc, dir);
+    defer reader.deinit();
+    const file = reader.file;
+    const length = reader.length;
+    reader.length = 0;
+    var state = ConversationWriter{ .alloc = alloc, .file = file };
+    defer {
+        state.clearPendingToolCalls();
+        state.pending_tool_calls.deinit(alloc);
+    }
+    var boundary: ConversationRecoveryBoundary = .{};
+    var offset: u64 = 0;
+    scan: while (offset < length) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame, error.EventFrameTooLarge => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = session_event.decodeConversationFrame(alloc, line.bytes) catch |err| switch (err) {
+            error.InvalidConversationFrame => break,
+            else => return err,
+        };
+        defer decoded.deinit();
+        session_event.validateConversationTransition(.{
+            .last_seq = state.last_seq,
+            .latest_checkpoint_coverage = state.latest_checkpoint_coverage,
+            .pending_tool_calls = state.pending_tool_calls.items,
+        }, decoded.value) catch break;
+        state.applyReplayedEvent(decoded.value.seq, decoded.value.event) catch |err| switch (err) {
+            error.InvalidConversationFrame => break :scan,
+            else => return err,
+        };
+        // A valid frame must also be replayable before it can extend the copy.
+        reader.length = line.next_offset;
+        if (reader.next() catch |err| switch (err) {
+            error.InvalidConversationFrame, error.ConversationSizeOverflow => break :scan,
+            else => return err,
+        }) |turn| session.freeHistoryTurn(alloc, turn);
+        offset = line.next_offset;
+        if (!state.turn_open or
+            (decoded.value.event == .context_checkpoint and state.pending_tool_calls.items.len == 0))
+        {
+            boundary = .{
+                .bytes = offset,
+                .seq = state.last_seq,
+                .timestamp_ms = decoded.value.timestamp_ms,
+                .turn_open = state.turn_open,
+            };
+        }
+    }
+    if (offset == length and boundary.bytes == length) return error.SessionRecoveryNotNeeded;
+    if (boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
+    debug_trace.logf("session", "event=conversation_recovery_boundary source_bytes={d} retained_bytes={d} through_seq={d}", .{ length, boundary.bytes, boundary.seq });
+    return boundary;
+}
+
+/// Caller owns the returned complete archive, with a checkpointed open turn
+/// explicitly interrupted rather than scheduling its abandoned continuation.
+pub fn load_conversation_recovery_state(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    boundary: ConversationRecoveryBoundary,
+) !session_codec.DurableSessionState {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary) catch |err| switch (err) {
+        error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
+        else => return err,
+    };
+    var state = loaded orelse return error.SessionRecoveryBoundaryInvalid;
+    errdefer state.deinit(alloc);
+    const file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const archive = try load_conversation_archive_from_file(alloc, file, boundary.bytes, boundary.turn_open);
+    session.freeHistoryTurnSlice(alloc, state.history);
+    state.history = archive;
+    state.context_history_start = latestConversationCheckpointIndex(archive);
+    return state;
+}
+
+/// Installs exact validated records in an unpublished target; never edits source.
+pub fn copy_conversation_recovery_prefix(
+    alloc: Allocator,
+    source: *io_mod.VerifiedDir,
+    target: *io_mod.VerifiedDir,
+    boundary: ConversationRecoveryBoundary,
+) !void {
+    const input = try openManagedFile(source, events_file, .read_only);
+    defer input.close(io_mod.getIo());
+    const output = try openManagedFile(target, events_file, .read_write);
+    defer output.close(io_mod.getIo());
+    var buffer: [8192]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < boundary.bytes) {
+        const count: usize = @intCast(@min(buffer.len, boundary.bytes - offset));
+        if (try input.readPositionalAll(io_mod.getIo(), buffer[0..count], offset) != count)
+            return error.SessionRecoveryBoundaryInvalid;
+        try output.writePositionalAll(io_mod.getIo(), buffer[0..count], offset);
+        offset += count;
+    }
+    if (boundary.turn_open) {
+        const interrupted = try session_event.encodeConversationFrame(alloc, .{
+            .seq = try std.math.add(u64, boundary.seq, 1),
+            .timestamp_ms = boundary.timestamp_ms,
+            .event = .{ .interrupted = .{ .reason = .failed } },
+        });
+        defer alloc.free(interrupted);
+        try output.writePositionalAll(io_mod.getIo(), interrupted, offset);
+        offset = try std.math.add(u64, offset, interrupted.len);
+    }
+    try output.setLength(io_mod.getIo(), offset);
+    try output.sync(io_mod.getIo());
+    debug_trace.logf("session", "event=conversation_recovery_prefix bytes={d} through_seq={d} interrupted={}", .{ boundary.bytes, boundary.seq, boundary.turn_open });
+}
+
+test "conversation recovery boundary validates prefix and never edits source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    const suffixes = [_][]const u8{
+        "{",
+        "invalid\n",
+        "{\"schema_version\":1,\"seq\":99,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"wrong sequence\"}}}\n",
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":9,\"summary\":\"invalid coverage\"}}}\n",
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"unfinished batch\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"failed\"}}}\ninvalid\n",
+    };
+    for (suffixes) |suffix| {
+        const bytes = try std.mem.concat(alloc, u8, &.{ prefix, suffix });
+        defer alloc.free(bytes);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+        const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+        try std.testing.expectEqual(prefix.len, boundary.bytes);
+        try std.testing.expectEqual(@as(u64, 3), boundary.seq);
+        try std.testing.expect(!boundary.turn_open);
+        const actual = try readManagedFileAlloc(alloc, &dir, events_file, bytes.len);
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(bytes, actual);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = prefix, .flags = .{ .permissions = private_file_permissions } });
+    try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = "invalid\n", .flags = .{ .permissions = private_file_permissions } });
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, find_conversation_recovery_boundary(alloc, &dir));
+}
+
+test "conversation recovery allocation failures do not become corruption" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n" ++
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
+            const boundary = try find_conversation_recovery_boundary(alloc, source);
+            try std.testing.expectEqual(@as(u64, 3), boundary.seq);
+        }
+    }.check, .{&dir});
+}
+
+test "conversation recovery state preserves allocation errors and contains invalid metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":4,\"id\":\"recovery-source\",\"created_at_ms\":1,\"updated_at_ms\":1,\"origin_workspace_root\":\"/tmp\",\"workspace_root\":\"/tmp\",\"conversation_language\":\"en\",\"provider\":\"gateway\",\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false,\"title\":null,\"subagent_child\":false}" });
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = prefix ++ "invalid\n" });
+    const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, load_conversation_recovery_state(alloc, &dir, "wrong-id", boundary));
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, source: *io_mod.VerifiedDir, cut: ConversationRecoveryBoundary) !void {
+            var state = try load_conversation_recovery_state(a, source, "recovery-source", cut);
+            defer state.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), state.history.len);
+            try std.testing.expect(state.recovery_checkpoint == null);
+        }
+    }.check, .{ &dir, boundary });
 }
 
 /// Reads and validates current metadata once. The caller owns the decoded value.
@@ -946,10 +1169,10 @@ fn openConversationWritableSession(
 fn replayConversationHistory(
     alloc: Allocator,
     file: std.Io.File,
+    length: u64,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
 ) ![]session.HistoryTurn {
-    const length = try file.length(io_mod.getIo());
     const window = try findConversationReplayWindow(alloc, file, length);
     conversation_seq.* = window.last_complete_seq;
     var offset = window.offset;
@@ -1139,6 +1362,15 @@ pub fn loadConversationArchive(
     var file = try openManagedFile(dir, events_file, .read_only);
     defer file.close(io_mod.getIo());
     const length = try file.length(io_mod.getIo());
+    return load_conversation_archive_from_file(alloc, file, length, false);
+}
+
+fn load_conversation_archive_from_file(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+    close_open_turn: bool,
+) ![]session.HistoryTurn {
     var offset: u64 = 0;
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
@@ -1201,6 +1433,11 @@ pub fn loadConversationArchive(
             if (turn != .compacted_summary) raw_turn_count += 1;
         }
         offset = line.next_offset;
+    }
+    if (close_open_turn and builder.user != null) {
+        const completed = try builder.finishInterrupted(.{ .reason = .failed });
+        errdefer session.freeHistoryTurn(alloc, completed);
+        try turns.append(alloc, completed);
     }
     return turns.toOwnedSlice(alloc);
 }
