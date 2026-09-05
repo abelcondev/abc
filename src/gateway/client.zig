@@ -220,18 +220,7 @@ pub const StreamResult = struct {
     /// Frees all owned response buffers allocated for this stream result.
     pub fn deinit(self: *StreamResult, alloc: std.mem.Allocator) void {
         if (self.err_body) |body| alloc.free(body);
-        if (self.completion.content) |content| alloc.free(content);
-        if (self.completion.generation_id) |id| alloc.free(id);
-        if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
-        for (self.completion.tool_calls) |call| {
-            alloc.free(call.id);
-            alloc.free(call.name);
-            alloc.free(call.arguments_json);
-            if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
-            if (call.provider_result) |provider_result| alloc.free(provider_result);
-        }
-        if (self.completion.tool_calls.len > 0) alloc.free(self.completion.tool_calls);
-        if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+        deinitGatewayCompletion(alloc, &self.completion);
         const status = self.status;
         self.* = .{ .status = status };
     }
@@ -4506,16 +4495,41 @@ test "StreamResult.deinit frees owned completion fields" {
             .finish_reason = .stop,
             .tool_calls = calls,
             .provider_failure_detail = try alloc.dupe(u8, "provider detail"),
+            .provider_state_json = try alloc.dupe(u8, "[]"),
         },
         .err_body = try alloc.dupe(u8, "err"),
     };
 
     result.deinit(alloc);
+    result.deinit(alloc);
 
     try std.testing.expectEqual(std.http.Status.ok, result.status);
     try std.testing.expect(result.completion.content == null);
     try std.testing.expect(result.completion.tool_calls.len == 0);
+    try std.testing.expect(result.completion.provider_state_json == null);
     try std.testing.expect(result.err_body == null);
+}
+
+test "StreamResult.deinit releases parsed provider replay" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r\"}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r\",\"delta\":\"reasoning\"}\n\n" ++
+        "data: {\"type\":\"reasoning-end\",\"id\":\"r\"}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+    const Noop = struct {
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    var reader = std.Io.Reader.fixed(payload);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var result = StreamResult{
+        .status = .ok,
+        .completion = try consumeSseStream(alloc, &reader, undefined, Noop.discard, null, &cancelled),
+    };
+    defer result.deinit(alloc);
+    try std.testing.expect(result.completion.provider_state_json != null);
+    try std.testing.expectEqualStrings("answer", result.completion.content.?);
 }
 
 test "findResolvedModelHeader reads gateway model response header" {
@@ -6075,10 +6089,13 @@ const BoundedProbe = struct {
     }
 
     fn successResult(self: *@This()) !StreamResult {
+        const content = try self.alloc.dupe(u8, "ok");
+        errdefer self.alloc.free(content);
         return .{
             .status = .ok,
             .completion = .{
-                .content = try self.alloc.dupe(u8, "ok"),
+                .content = content,
+                .provider_state_json = try self.alloc.dupe(u8, "[]"),
                 .finish_reason = .stop,
             },
         };
