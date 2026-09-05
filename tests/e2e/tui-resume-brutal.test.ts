@@ -213,7 +213,8 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   let nextBatch = 0;
   let finalSent = false;
   const gateway = startDynamicFakeGateway((body) => {
-    if (body.includes("Summarize the conversation goals")) {
+    const request = JSON.parse(body);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
       return fakeGatewayFinalText(
         "The session is building a large, heterogeneous transcript and reading bounded ranges from resume-tool-payload.txt. Continue the same task without repeating completed reads.",
       );

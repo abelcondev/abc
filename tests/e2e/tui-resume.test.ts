@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -5255,6 +5256,7 @@ test.skipIf(!tmuxAvailable())(
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const freshStderrPath = join(root, "fresh-stderr.log");
+    const tracePath = join(root, "trace.log");
     const argvLogPath = join(root, "upgrade-argv.log");
     mkdirSync(home);
     mkdirSync(freshHome);
@@ -5276,6 +5278,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(stderrPath, "");
       writeFileSync(freshStderrPath, "");
+      writeFileSync(tracePath, "");
       active = await TmuxSession.create({
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
@@ -5283,6 +5286,8 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,session",
         },
         stderrPath,
         width: 110,
@@ -5299,6 +5304,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
+      const traceBeforeUpgrade = readFileSync(tracePath, "utf8");
 
       fresh = await TmuxSession.create({
         cmd: shellQuote(installedFx),
@@ -5323,6 +5329,11 @@ test.skipIf(!tmuxAvailable())(
 
       const updatedNotice = `● fx has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const postUpgradeTrace = readFileSync(tracePath, "utf8");
+      expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
+        "session picker completion",
+      );
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
@@ -6798,6 +6809,126 @@ test.skipIf(!tmuxAvailable())(
   120_000,
 );
 
+test.skipIf(!tmuxAvailable())(
+  "manual compaction keeps earlier small-session messages visible after resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-compacted-display-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("EARLIER_VISIBLE_RESPONSE"),
+      fakeGatewayFinalText("MIDDLE_VISIBLE_RESPONSE"),
+      fakeGatewayFinalText("LATEST_VISIBLE_RESPONSE"),
+      fakeGatewayFinalText("INTERNAL_COMPACTED_CONTEXT: continue the current task."),
+      fakeGatewayFinalText("AFTER_COMPACTED_RESUME_OK"),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        width: 100,
+        height: 60,
+      });
+      await active.waitForComposer(TIMEOUT);
+      for (const [prompt, response] of [
+        ["Earlier visible request", "EARLIER_VISIBLE_RESPONSE"],
+        ["Middle visible request", "MIDDLE_VISIBLE_RESPONSE"],
+        ["Latest visible request", "LATEST_VISIBLE_RESPONSE"],
+      ]) {
+        await active.sendText(prompt!);
+        await active.waitForText(response!, TIMEOUT);
+        await active.waitForComposer(TIMEOUT);
+      }
+      const sessionId = sessionIdFromHome(home);
+      await active.sendText("/compact");
+      await active.waitForText("Context compacted.", TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionId}`,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        width: 100,
+        height: 60,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["0f"]);
+      await active.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await active.sendKeys("Home");
+      const pane = await active.waitForText("EARLIER_VISIBLE_RESPONSE", 5_000);
+      expect(pane).toContain("Earlier visible request");
+      expect(pane).not.toContain("INTERNAL_COMPACTED_CONTEXT");
+      await active.sendHexBytes(["0f"]);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Continue after the compacted resume.");
+      await active.waitForText("AFTER_COMPACTED_RESUME_OK", TIMEOUT);
+      expect(gateway.requests.at(-1)!.body).toContain("INTERNAL_COMPACTED_CONTEXT");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O rebuilds its page when a saved tool result disappears",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-result-disappeared-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ max_tool_result_bytes: 2 * 1024 * 1024 }));
+    writeFileSync(join(workspace, "result.txt"), Array.from({ length: 400 }, (_, index) =>
+      `SAVED_OUTPUT_ROW_${String(index).padStart(4, "0")} ${"local-fixture-".repeat(7)}`
+    ).join("\n") + "\n");
+    const tail = "CONVERSATION_AFTER_SAVED_RESULT";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("read-saved-result", "read_file", { path: "result.txt", line_count: 400 }),
+      fakeGatewayFinalText(tail),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({ cwd: workspace, env: gatewayEnv(home, gateway), stderrPath, width: 100, height: 28 });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Read the prepared file, then report completion.");
+      await active.waitForText(tail, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["0f"]);
+      await active.waitForPane((pane) => pane.includes("Full detail · ctrl o close") && pane.includes(tail), TIMEOUT);
+      const resultsDir = join(home, ".fx", "sessions", sessionIdFromHome(home), "tool-results");
+      const files = readdirSync(resultsDir).filter((name) => name.endsWith(".txt"));
+      expect(files).toHaveLength(1);
+      renameSync(join(resultsDir, files[0]!), join(root, "withheld-result.txt"));
+      for (let page = 0; page < 3; page += 1) await active.sendKeys("PPage");
+      const recovered = await active.waitForPane((pane) =>
+        pane.includes("Full saved result unavailable.") && pane.includes(tail),
+      TIMEOUT);
+      expect(recovered).toContain("Full detail · ctrl o close");
+      expect(active.isPaneAlive()).toBe(true);
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendKeys("Escape");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
 for (const inspectDetails of [false, true]) {
   test.skipIf(!tmuxAvailable())(
     `resumed tool history survives continuation${inspectDetails ? " after full detail resize" : ""}`,

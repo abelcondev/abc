@@ -907,7 +907,11 @@ pub const WorkerRuntime = struct {
         }
         queued.agent_settings = self.agent_turn_settings;
         var interrupt_after_admission = false;
-        if (steer_if_active and self.worker_processing and self.active_turn_id != 0) {
+        const explicitly_cancelled = self.worker_cancel_requested.load(.seq_cst) and
+            self.steering_cancel_turn_id != self.active_turn_id;
+        if (steer_if_active and self.worker_processing and self.active_turn_id != 0 and
+            !explicitly_cancelled)
+        {
             queued.delivery = .{ .active_turn = self.active_turn_id };
             interrupt_after_admission = !self.hasActiveToolBoundaryLocked();
         }
@@ -4058,6 +4062,40 @@ test "explicit interrupt overrides immediate steering cancellation" {
     try std.testing.expect(boundary == .interrupt);
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "interactive prompt after explicit cancellation starts a new visible turn" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |already_presented| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        try std.testing.expect(runtime.beginDirectProcessing(41));
+        runtime.requestInteractiveCancel();
+
+        var prompt = try makePrompt(alloc, "ok", "model");
+        prompt.turn_id = 42;
+        prompt.user_prompt_already_presented = already_presented;
+        try runtime.admitInteractivePrompt(alloc, prompt);
+
+        try std.testing.expect(runtime.cancellationStopsTurn());
+        try std.testing.expect(runtime.queued_prompts.items[0].delivery == .ordinary);
+        try std.testing.expect(try runtime.takeSteeringBoundary(alloc, 41, .cancelled) == .interrupt);
+        try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+
+        runtime.finishProcessing();
+        const next = (try runtime.tryTakeNextPrompt(alloc)).?;
+        defer freeQueuedPrompt(alloc, next);
+        try std.testing.expectEqual(@as(u64, 42), next.turn_id);
+        try std.testing.expectEqualStrings("ok", next.prompt);
+        try std.testing.expect(!runtime.isCancelRequested());
+        try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+        if (already_presented) {
+            try std.testing.expectEqual(@as(u64, 42), runtime.worker_events.items[0].begin_presented_prompt);
+        } else {
+            try std.testing.expectEqualStrings("ok", runtime.worker_events.items[0].begin_prompt.text);
+        }
+        runtime.finishProcessing();
+    }
 }
 
 test "sequential tool lifecycle does not inspect compatible allocator context identities" {

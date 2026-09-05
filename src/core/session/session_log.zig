@@ -62,7 +62,9 @@ const ConversationProgress = struct {
         };
         switch (event) {
             .assistant => |value| {
-                self.pending_assistant = .{ .seq = seq, .has_replay = value.provider_replay != null };
+                if (value.text.len > 0 or value.provider_replay != null) {
+                    self.pending_assistant = .{ .seq = seq, .has_replay = value.provider_replay != null };
+                }
             },
             .tool_call => self.pending += 1,
             .tool_result => {
@@ -984,7 +986,7 @@ fn replayConversationHistory(
                 try history.append(alloc, completed);
             },
             .context_checkpoint => {
-                if (turn.pending_assistant != null) try turn.finishStep();
+                try turn.finishStandalone();
                 checkpoint_turn_open = turn.user != null;
             },
         }
@@ -1003,6 +1005,79 @@ fn replayConversationHistory(
     return completed;
 }
 
+/// Reads complete canonical turns while retaining only the turn being built.
+/// Each returned turn is owned by the caller.
+pub const ConversationHistoryReader = struct {
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+    offset: u64 = 0,
+    builder: ConversationTurnBuilder,
+
+    pub fn init(alloc: Allocator, dir: *io_mod.VerifiedDir) !ConversationHistoryReader {
+        var file = try openManagedFile(dir, events_file, .read_only);
+        errdefer file.close(io_mod.getIo());
+        return .{
+            .alloc = alloc,
+            .file = file,
+            .length = try file.length(io_mod.getIo()),
+            .builder = ConversationTurnBuilder.init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *ConversationHistoryReader) void {
+        self.builder.deinit();
+        self.file.close(io_mod.getIo());
+        self.* = undefined;
+    }
+
+    pub fn next(self: *ConversationHistoryReader) !?session.HistoryTurn {
+        while (self.offset < self.length) {
+            const line = session_replay.readLineAt(self.alloc, self.file, self.offset, self.length) catch |err| switch (err) {
+                error.TruncatedEventFrame => return null,
+                else => return err,
+            } orelse return null;
+            defer self.alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(self.alloc, line.bytes);
+            defer decoded.deinit();
+            const completed: ?session.HistoryTurn = switch (decoded.value.event) {
+                .user => |value| blk: {
+                    try self.builder.begin(value);
+                    break :blk null;
+                },
+                .assistant => |value| blk: {
+                    try self.builder.appendAssistant(value);
+                    break :blk null;
+                },
+                .tool_call => |value| blk: {
+                    try self.builder.appendToolCall(value);
+                    break :blk null;
+                },
+                .tool_result => |value| blk: {
+                    try self.builder.appendToolResult(value);
+                    break :blk null;
+                },
+                .steering => |value| blk: {
+                    try self.builder.appendSteering(value.text);
+                    break :blk null;
+                },
+                .turn_completed => |value| try self.builder.finishAssistant(value),
+                .interrupted => |value| try self.builder.finishInterrupted(value),
+                .context_checkpoint => blk: {
+                    if (self.builder.calls.items.len != 0 or self.builder.results.items.len != 0) {
+                        return error.InvalidConversationFrame;
+                    }
+                    try self.builder.finishStandalone();
+                    break :blk null;
+                },
+            };
+            self.offset = line.next_offset;
+            if (completed) |turn| return turn;
+        }
+        return null;
+    }
+};
+
 pub fn loadConversationHistoryRange(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
@@ -1010,67 +1085,22 @@ pub fn loadConversationHistoryRange(
     end: usize,
 ) ![]session.HistoryTurn {
     if (start > end) return error.InvalidHistoryPageCursor;
-    var file = try openManagedFile(dir, events_file, .read_only);
-    defer file.close(io_mod.getIo());
-    const length = try file.length(io_mod.getIo());
-    var offset: u64 = 0;
-    var turn_index: usize = 0;
+    var reader = try ConversationHistoryReader.init(alloc, dir);
+    defer reader.deinit();
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
         turns.deinit(alloc);
     }
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    while (offset < length and turn_index < end) {
-        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
-            error.TruncatedEventFrame => break,
-            else => return err,
-        } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const completed: ?session.HistoryTurn = switch (decoded.value.event) {
-            .user => |value| blk: {
-                try builder.begin(value);
-                break :blk null;
-            },
-            .assistant => |value| blk: {
-                try builder.appendAssistant(value);
-                break :blk null;
-            },
-            .tool_call => |value| blk: {
-                try builder.appendToolCall(value);
-                break :blk null;
-            },
-            .tool_result => |value| blk: {
-                try builder.appendToolResult(value);
-                break :blk null;
-            },
-            .steering => |value| blk: {
-                try builder.appendSteering(value.text);
-                break :blk null;
-            },
-            .turn_completed => |value| try builder.finishAssistant(value),
-            .interrupted => |value| try builder.finishInterrupted(value),
-            .context_checkpoint => blk: {
-                if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
-                    return error.InvalidConversationFrame;
-                }
-                if (builder.pending_assistant != null) try builder.finishStep();
-                break :blk null;
-            },
-        };
-        if (completed) |turn| {
-            if (turn_index >= start) {
-                errdefer session.freeHistoryTurn(alloc, turn);
-                try turns.append(alloc, turn);
-            } else {
-                session.freeHistoryTurn(alloc, turn);
-            }
-            turn_index += 1;
+    var turn_index: usize = 0;
+    while (turn_index < end) : (turn_index += 1) {
+        const turn = (try reader.next()) orelse break;
+        if (turn_index >= start) {
+            errdefer session.freeHistoryTurn(alloc, turn);
+            try turns.append(alloc, turn);
+        } else {
+            session.freeHistoryTurn(alloc, turn);
         }
-        offset = line.next_offset;
     }
     return turns.toOwnedSlice(alloc);
 }
@@ -1127,7 +1157,7 @@ pub fn loadConversationArchive(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
-                if (builder.pending_assistant != null) try builder.finishStep();
+                try builder.finishStandalone();
                 compaction_count += 1;
                 break :blk .{ .compacted_summary = .{
                     .summary = try alloc.dupe(u8, value.summary),
@@ -1302,7 +1332,7 @@ const ConversationTurnBuilder = struct {
     }
 
     fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
-        if (self.pending_assistant != null and self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStep();
+        if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
         }
@@ -1363,6 +1393,17 @@ const ConversationTurnBuilder = struct {
         errdefer freeConversationToolResult(self.alloc, result);
         try self.results.append(self.alloc, result);
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
+    }
+
+    fn finishStandalone(self: *ConversationTurnBuilder) !void {
+        if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
+        const text = self.pending_assistant orelse return;
+        if (text.len == 0 and self.pending_replay == null) {
+            self.alloc.free(text);
+            self.pending_assistant = null;
+            return;
+        }
+        try self.finishStep();
     }
 
     fn finishStep(self: *ConversationTurnBuilder) !void {
@@ -1431,7 +1472,7 @@ const ConversationTurnBuilder = struct {
         if (self.user == null or self.results.items.len != 0 or self.calls.items.len > 1) {
             return error.InvalidConversationFrame;
         }
-        if (self.pending_assistant != null and self.calls.items.len == 0) try self.finishStep();
+        if (self.calls.items.len == 0) try self.finishStandalone();
         const tool_call = if (self.calls.items.len == 1)
             self.calls.orderedRemove(0)
         else
@@ -4157,6 +4198,46 @@ test "conversation preserves standalone replies across completion and interrupti
             try std.testing.expectEqual(@as(usize, 0), execution.tool_steps[0].tool_calls.len);
         }
     }
+}
+
+test "standalone checkpoint boundaries do not create empty replies" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "standalone-checkpoint", 10);
+    defer initial.deinit(alloc);
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("older reply") },
+        .{ .assistant = @constCast("recent reply") },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("request") };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.commitContextCompaction(alloc, .{
+            .summary = @constCast("<context_handoff>Earlier context.</context_handoff>"),
+            .removed_turn_count = 0,
+            .compaction_count = 1,
+        }, .{ .user = user, .assistant = @constCast(""), .execution = .{ .tool_steps = &steps } }, .{ .tool_steps = 1 }, 20);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{ .user = user, .assistant = @constCast("final reply"), .execution = .{ .tool_steps = steps[1..] } } },
+        } }, 30);
+    }
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.state.history.len);
+    const active = resumed.state.history[1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), active.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("recent reply", active.execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqualStrings("final reply", active.assistant);
+    const archive = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+    defer session.freeHistoryTurnSlice(alloc, archive);
+    try std.testing.expectEqual(@as(usize, 2), archive[0].assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("older reply", archive[0].assistant.execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqualStrings("recent reply", archive[0].assistant.execution.tool_steps[1].assistant.?);
 }
 
 test "cache-free writable resume continues the conversation sequence" {

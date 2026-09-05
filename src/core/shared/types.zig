@@ -1136,6 +1136,11 @@ pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void 
     alloc.free(value.parts_json);
 }
 
+/// Provider-returned phase for stateless assistant-message replay.
+pub const AssistantMessagePhase = enum {
+    commentary,
+    final_answer,
+};
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1144,6 +1149,8 @@ pub const ChatMessage = struct {
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     provider_replay: ?ProviderReplay = null,
+    /// Borrowed phase metadata for the same current-turn continuation.
+    assistant_phase: ?AssistantMessagePhase = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
@@ -1163,6 +1170,7 @@ pub fn projectProviderReplay(
         if (replay.matches(source)) continue;
         if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
         projected.?[index].provider_replay = null;
+        projected.?[index].assistant_phase = null;
     }
     return projected;
 }
@@ -1283,6 +1291,7 @@ pub const ProviderFailureCause = enum {
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    assistant_phase: ?AssistantMessagePhase = null,
     generation_id: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.

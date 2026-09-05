@@ -675,7 +675,9 @@ const App = struct {
             }
         }
         if (comptime host_profile.durable_sessions) {
-            SessionAppRuntime.primeSessionPicker(&app);
+            if (launch.upgrade_relaunch == null) {
+                SessionAppRuntime.primeSessionPicker(&app);
+            }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
@@ -834,6 +836,7 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
         self.managed_executions.shutdown();
         self.upgrader.stop();
         self.file_index.requestStop();
@@ -4183,6 +4186,7 @@ test {
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
@@ -4311,6 +4315,7 @@ test {
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
+    _ = @import("ui/render_engine/terminal_diff.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");
