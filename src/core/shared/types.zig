@@ -1963,6 +1963,15 @@ pub const PermissionMode = enum {
     ask,
     auto,
     yolo,
+
+    pub fn parse(raw: []const u8) ?PermissionMode {
+        if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(raw, "full-access") or
+            std.ascii.eqlIgnoreCase(raw, "full access") or
+            std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
+        return null;
+    }
 };
 
 pub const RuleDecision = enum {
