@@ -1896,6 +1896,9 @@ pub fn Runtime(comptime App: type) type {
                         )) {
                             .inserted => {
                                 if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+                                }
                             },
                             .limit_exceeded => try input_limit_feedback.report(
                                 App,

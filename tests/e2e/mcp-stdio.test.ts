@@ -1009,6 +1009,54 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP preview insertion reveals pending project approval without losing inserted context",
+    async () => {
+      const root = createRoot("workspace-menu-insert", MODERN_FIXTURE, {
+        mode: "features",
+        recordLaunchAttempts: true,
+      });
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profileServer = JSON.parse(readFileSync(profilePath, "utf8")).mcp.fixture;
+      moveProfileFixtureToWorkspace(root);
+      writeFileSync(profilePath, JSON.stringify({ mcp: { library: profileServer } }));
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = { ...fixtureEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+      expect((await runFx(["mcp", "trust", "approve-all"], {
+        cwd: root.workspace,
+        env,
+      })).code).toBe(0);
+      tui = await TmuxSession.create({ isolated: true, remainOnExit: true, cwd: root.workspace, width: 120, height: 36, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp");
+      await tui.waitForPane((pane) => /^\s*library\s+Ready\b/m.test(pane) && /^\s*fixture\s+Ready\b/m.test(pane), 15_000);
+      await tui.sendLiteral("z");
+      await tui.waitForText("Reset all project MCP choices?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Pending trust", 10_000);
+      await tui.sendKeys("Tab");
+      await tui.sendKeys("Tab");
+      await tui.waitForText("custom://alpha", 10_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("MCP resource", 10_000);
+      await tui.sendLiteral("i");
+      const pane = await tui.waitForPane((text) => !/^MCP \d+\s/m.test(text) &&
+        text.includes("Project MCP server 'fixture' is defined in .mcp.json"), 10_000);
+      expect(pane).toContain("RESOURCE_TEXT");
+      await tui.sendLiteral("3");
+      await tui.waitForText("Rejecting project MCP server", 10_000);
+      expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
+        .workspaces[root.workspace].disabledMcpjsonServers).toContain("fixture");
+      expect(await tui.captureFullScrollback()).not.toContain("Project MCP approval prompts dismissed");
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    50_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
     "Escape suppresses project MCP prompts only for the current process",
     async () => {
       const root = createRoot("workspace-escape", MODERN_FIXTURE, {
