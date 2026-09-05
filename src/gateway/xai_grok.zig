@@ -1071,23 +1071,22 @@ fn buildToolArgumentsSse(alloc: Allocator, argument_bytes: usize) ![]u8 {
 
 fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     const item_count: usize = 8;
-    const event_prefix = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":";
-    const item_prefix = "{\"id\":\"rs\",\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const item_prefix = "{\"id\":\"rs";
+    const item_middle = "\",\"type\":\"reasoning\",\"encrypted_content\":\"";
     const item_suffix = "\"}";
     const event_suffix = "}\n\n";
     const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
-    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + item_suffix.len);
+    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + 1 + item_middle.len + item_suffix.len);
     const content_bytes = provider_state_bytes - framing_bytes;
     const bytes_per_item = content_bytes / item_count;
     var remainder = content_bytes % item_count;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    for (0..item_count) |_| {
+    for (0..item_count) |index| {
         const extra: usize = if (remainder > 0) 1 else 0;
         remainder -|= extra;
-        try out.writer.writeAll(event_prefix);
-        try out.writer.writeAll(item_prefix);
+        try out.writer.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{s}{d}{s}", .{ index, item_prefix, index, item_middle });
         try out.writer.splatByteAll('a', bytes_per_item + extra);
         try out.writer.writeAll(item_suffix);
         try out.writer.writeAll(event_suffix);

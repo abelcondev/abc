@@ -816,9 +816,15 @@ fn assistantMessagePhase(fields: std.json.ObjectMap) ?types.AssistantMessagePhas
 }
 
 pub const Reducer = struct {
+    const ReasoningItem = struct {
+        output_index: i64,
+        id_hash: ?[TextDigest.digest_length]u8,
+        json: ?[]u8,
+    };
+
     content: std.ArrayList(u8) = .empty,
-    provider_state: std.Io.Writer.Allocating,
-    provider_state_count: usize = 0,
+    reasoning_items: std.ArrayList(ReasoningItem) = .empty,
+    reasoning_bytes: usize = 0,
     tools: std.ArrayList(ToolAccumulator) = .empty,
     finish_reason: ?types.ProviderFinishReason = null,
     usage: types.Usage = .{},
@@ -831,14 +837,15 @@ pub const Reducer = struct {
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
-    pub fn init(alloc: std.mem.Allocator) Reducer {
-        return .{ .provider_state = .init(alloc) };
+    pub fn init(_: std.mem.Allocator) Reducer {
+        return .{};
     }
 
     pub fn deinit(self: *Reducer, alloc: std.mem.Allocator) void {
         self.content.deinit(alloc);
         self.text_parts.deinit(alloc);
-        self.provider_state.deinit();
+        for (self.reasoning_items.items) |item| if (item.json) |json| alloc.free(json);
+        self.reasoning_items.deinit(alloc);
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
         if (self.generation_id) |id| alloc.free(id);
@@ -897,6 +904,8 @@ pub const Reducer = struct {
                     const index = findTool(self.tools.items, output_index).?;
                     try self.tools.items[index].reconcileIdentity(alloc, item.object, "id", limits);
                 }
+            } else if (std.mem.eql(u8, item_type, "reasoning")) {
+                try self.reconcile_reasoning(alloc, output_index, item.object, .identity, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 self.assistant_phase.observe(assistantMessagePhase(item.object));
             }
@@ -953,13 +962,8 @@ pub const Reducer = struct {
             const item_type = stringField(item.object, "type") orelse return false;
             if (std.mem.eql(u8, item_type, "function_call")) {
                 try self.reconcileToolItem(alloc, output_index, item.object, callbacks, limits);
-            } else if (std.mem.eql(u8, item_type, "reasoning") and
-                stringField(item.object, "encrypted_content") != null)
-            {
-                var encoded: std.Io.Writer.Allocating = .init(alloc);
-                defer encoded.deinit();
-                try std.json.Stringify.value(item, .{}, &encoded.writer);
-                try self.appendReplayPart(encoded.written(), limits.provider_state_bytes);
+            } else if (std.mem.eql(u8, item_type, "reasoning")) {
+                try self.reconcile_reasoning(alloc, output_index, item.object, .completed, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 self.assistant_phase.observe(assistantMessagePhase(item.object));
                 try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
@@ -979,6 +983,8 @@ pub const Reducer = struct {
                     const index = std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded;
                     if (std.mem.eql(u8, item_type, "function_call")) {
                         try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
+                    } else if (std.mem.eql(u8, item_type, "reasoning")) {
+                        try self.reconcile_reasoning(alloc, index, item.object, .completed, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
                         self.assistant_phase.observe(assistantMessagePhase(item.object));
                         try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
@@ -1006,13 +1012,52 @@ pub const Reducer = struct {
         return false;
     }
 
-    fn appendReplayPart(self: *Reducer, bytes: []const u8, limit: usize) !void {
-        const overhead: usize = if (self.provider_state_count == 0) 2 else 1;
-        const size = try checkedAccumulatedSize(bytes.len, overhead, limit);
-        _ = try checkedAccumulatedSize(self.provider_state.written().len, size, limit);
-        self.provider_state.writer.writeByte(if (self.provider_state_count == 0) '[' else ',') catch return error.OutOfMemory;
-        self.provider_state.writer.writeAll(bytes) catch return error.OutOfMemory;
-        self.provider_state_count += 1;
+    fn reconcile_reasoning(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, fields: std.json.ObjectMap, evidence: enum { identity, completed }, limits: StreamLimits) !void {
+        const id_hash = try text_identity(fields, "id");
+        var low: usize = 0;
+        var high = self.reasoning_items.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.reasoning_items.items[middle].output_index < output_index) low = middle + 1 else high = middle;
+        }
+        const found = low < self.reasoning_items.items.len and self.reasoning_items.items[low].output_index == output_index;
+        if (id_hash) |id| for (self.reasoning_items.items) |prior| {
+            const prior_id = prior.id_hash orelse continue;
+            const same_id = std.mem.eql(u8, &prior_id, &id);
+            if (prior.output_index == output_index and !same_id) return error.ResponsesReasoningConflict;
+            if (prior.output_index != output_index and same_id) return error.ResponsesReasoningConflict;
+        };
+        const encrypted = fields.get("encrypted_content") orelse .null;
+        if (encrypted != .null and encrypted != .string) return error.InvalidEvent;
+        const json = if (evidence == .completed and encrypted == .string)
+            try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = fields }, .{})
+        else
+            null;
+        errdefer if (json) |bytes| alloc.free(bytes);
+        if (found) if (self.reasoning_items.items[low].json) |prior| {
+            if (json) |bytes| {
+                if (!try json_comparison.serializedEqual(alloc, prior, bytes)) return error.ResponsesReasoningConflict;
+                alloc.free(bytes);
+            }
+            if (id_hash != null) self.reasoning_items.items[low].id_hash = id_hash;
+            return;
+        };
+        var total = self.reasoning_bytes;
+        if (json) |bytes| {
+            const overhead: usize = if (total == 0) 2 else 1;
+            const size = try checkedAccumulatedSize(bytes.len, overhead, limits.provider_state_bytes);
+            total = try checkedAccumulatedSize(total, size, limits.provider_state_bytes);
+        }
+        if (found) {
+            const prior = &self.reasoning_items.items[low];
+            if (id_hash != null) prior.id_hash = id_hash;
+            prior.json = json;
+        } else {
+            if (id_hash == null and json == null) return;
+            if (self.reasoning_items.items.len >= limits.events) return error.ResourceLimitExceeded;
+            try self.reasoning_items.insert(alloc, low, .{ .output_index = output_index, .id_hash = id_hash, .json = json });
+        }
+        self.reasoning_bytes = total;
     }
 
     fn accept_text(
@@ -1130,18 +1175,34 @@ pub const Reducer = struct {
             null;
         if (owned_content != null) self.content = .empty;
         errdefer if (owned_content) |value| alloc.free(value);
-        if (self.assistant_phase.resolved()) |phase| {
-            try self.appendReplayPart(switch (phase) {
+        const phase_json: ?[]const u8 = if (self.assistant_phase.resolved()) |phase|
+            switch (phase) {
                 .commentary => "{\"type\":\"message\",\"phase\":\"commentary\"}",
                 .final_answer => "{\"type\":\"message\",\"phase\":\"final_answer\"}",
-            }, limits.provider_state_bytes);
-        }
-        const owned_provider_state = if (self.provider_state_count > 0) state: {
-            try self.provider_state.writer.writeByte(']');
-            if (self.provider_state.written().len > limits.provider_state_bytes) {
-                return error.ResourceLimitExceeded;
             }
-            break :state try self.provider_state.toOwnedSlice();
+        else
+            null;
+        const owned_provider_state = if (self.reasoning_bytes > 0 or phase_json != null) state: {
+            var size = self.reasoning_bytes;
+            if (phase_json) |phase| size = try checkedAccumulatedSize(size, phase.len + @as(usize, if (size == 0) 2 else 1), limits.provider_state_bytes);
+            _ = try checkedAccumulatedSize(0, size, limits.provider_state_bytes);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.ensureTotalCapacity(size);
+            try out.writer.writeByte('[');
+            var first = true;
+            for (self.reasoning_items.items) |item| {
+                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+                const json = item.json orelse continue;
+                try writeComma(&out.writer, &first);
+                try out.writer.writeAll(json);
+            }
+            if (phase_json) |phase| {
+                try writeComma(&out.writer, &first);
+                try out.writer.writeAll(phase);
+            }
+            try out.writer.writeByte(']');
+            break :state try out.toOwnedSlice();
         } else null;
         errdefer if (owned_provider_state) |value| alloc.free(value);
         const owned_tools: []types.ToolCall = if (self.tools.items.len > 0)
@@ -1219,6 +1280,160 @@ const ToolRecordTest = struct {
 
     fn ignore(_: *anyopaque, _: []const u8) void {}
 };
+
+test "Responses reasoning replay retains terminal-only context" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]", completion.provider_state_json orelse "");
+}
+
+test "Responses reasoning replay retains terminal enrichment without duplicates" {
+    for ([_][]const u8{ "", ",\"encrypted_content\":\"opaque\"" }) |encrypted| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const item = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]{s}}}}}", .{encrypted});
+        defer stream.alloc.free(item);
+        try stream.apply(item);
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]}}");
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings("[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]", completion.provider_state_json orelse "");
+    }
+}
+
+test "Responses reasoning replay orders sparse items and ignores equivalent duplicates" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":9223372036854775807,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"later\"}}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"first\"}}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"encrypted_content\":\"first\",\"type\":\"reasoning\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"encrypted_content\":\"first\"},{\"type\":\"reasoning\",\"encrypted_content\":\"later\"}]", completion.provider_state_json.?);
+}
+
+test "Responses reasoning replay binds supplied identity before ciphertext" {
+    for ([_][]const u8{ "response.output_item.added", "response.output_item.done" }) |kind| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"{s}\",\"output_index\":0,\"item\":{{\"type\":\"reasoning\",\"id\":\"rs_original\"}}}}", .{kind});
+        defer stream.alloc.free(event);
+        try stream.apply(event);
+        try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_replacement\",\"encrypted_content\":\"opaque\"}]}}"));
+    }
+}
+
+test "Responses reasoning replay rejects supplied identity at another position" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_same\",\"encrypted_content\":\"opaque\"}}");
+    try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_same\",\"encrypted_content\":\"opaque\"}]}}"));
+}
+
+test "Responses reasoning replay omits identity-only items and bounds their count" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_empty\"}}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_empty\",\"encrypted_content\":null},{\"type\":\"reasoning\",\"id\":\"rs_full\",\"encrypted_content\":\"opaque\"}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"id\":\"rs_full\",\"encrypted_content\":\"opaque\"}]", completion.provider_state_json.?);
+
+    var bounded = ToolRecordTest.init(std.testing.allocator);
+    defer bounded.deinit();
+    var limits = ToolRecordTest.limits;
+    limits.events = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, bounded.reducer.applyJson(bounded.alloc, "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"a\"},{\"type\":\"reasoning\",\"id\":\"b\"}]}}", .{ .context = &bounded.context, .on_content = ToolRecordTest.ignore }, &bounded.cancelled, null, limits));
+}
+
+test "Responses reasoning replay rejects conflicting final evidence and invalid supplied identity" {
+    for ([_][]const u8{
+        "{\"id\":\"different\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}",
+        "{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"different\"}",
+    }) |item| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}");
+        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
+        defer stream.alloc.free(event);
+        try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply(event));
+        try std.testing.expectError(error.StreamIncomplete, stream.finish());
+    }
+    for ([_][]const u8{
+        "{\"id\":42,\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}",
+        "{\"id\":\"\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}",
+        "{\"type\":\"reasoning\",\"encrypted_content\":42}",
+    }) |item| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        const event = try std.fmt.allocPrint(stream.alloc, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{s}]}}}}", .{item});
+        defer stream.alloc.free(event);
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+    }
+}
+
+test "Responses reasoning replay counts unique bytes and phase at the exact bound" {
+    const event = "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}";
+    const state = "[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]";
+    for ([_]usize{ state.len, state.len - 1 }) |limit| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        var bounds = ToolRecordTest.limits;
+        bounds.provider_state_bytes = limit;
+        const callbacks: StreamCallbacks = .{ .context = &stream.context, .on_content = ToolRecordTest.ignore };
+        if (limit < state.len) {
+            try std.testing.expectError(error.ResourceLimitExceeded, stream.reducer.applyJson(stream.alloc, event, callbacks, &stream.cancelled, null, bounds));
+            continue;
+        }
+        for (0..3) |_| _ = try stream.reducer.applyJson(stream.alloc, event, callbacks, &stream.cancelled, null, bounds);
+        try stream.apply(ToolRecordTest.terminal);
+        const completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, bounds);
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings(state, completion.provider_state_json.?);
+    }
+    const phase = "{\"type\":\"message\",\"phase\":\"commentary\"}";
+    for ([_]usize{ state.len + phase.len + 1, state.len + phase.len }) |limit| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(event);
+        try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}");
+        try stream.apply(ToolRecordTest.terminal);
+        var bounds = ToolRecordTest.limits;
+        bounds.provider_state_bytes = limit;
+        if (limit == state.len + phase.len) {
+            try std.testing.expectError(error.ResourceLimitExceeded, stream.reducer.finish(stream.alloc, &stream.cancelled, bounds));
+        } else {
+            const completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, bounds);
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqual(limit, completion.provider_state_json.?.len);
+        }
+    }
+}
+
+test "Responses reasoning replay frees duplicate comparison and final encoding allocations" {
+    const Scenario = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var stream = ToolRecordTest.init(alloc);
+            defer stream.deinit();
+            try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_pending\"}}");
+            try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}");
+            try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"encrypted_content\":\"opaque\",\"type\":\"reasoning\"},{\"id\":\"rs_2\",\"type\":\"reasoning\",\"encrypted_content\":\"second\"}]}}");
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expect(completion.provider_state_json != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]}}");
+    stream.cancelled.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, stream.finish());
+}
 
 test "Responses text finalization preserves mixed streamed and final-only items" {
     var stream = ToolRecordTest.init(std.testing.allocator);

@@ -4485,6 +4485,77 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("native reasoning snapshots survive tools and saved resume exactly once", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const shape of ["both", "terminal-only", "enriched", "conflict", "identity-conflict"] as const) {
+    const conflict = shape === "conflict" || shape === "identity-conflict";
+    const profile = mkdtempSync(join(tmpdir(), "fx-reasoning-snapshot-"));
+    const testGateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const signature = "REASONING_SNAPSHOT_CONTEXT";
+    const reasoning = { id: "rs_snapshot", type: "reasoning", summary: [], encrypted_content: signature };
+    const call = { id: "fc_snapshot", type: "function_call", call_id: "call_snapshot", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const events: object[] = [{ type: "response.output_item.added", output_index: 0, item: { id: reasoning.id, type: reasoning.type, summary: [] } }];
+    if (shape !== "terminal-only") events.push({ type: "response.output_item.done", output_index: 0, item: shape === "enriched" || shape === "identity-conflict" ? { id: reasoning.id, type: reasoning.type, summary: [] } : reasoning });
+    events.push(
+      { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: 1, item_id: call.id, arguments: call.arguments },
+      { type: "response.completed", response: { status: "completed", output: [{ ...reasoning, id: shape === "identity-conflict" ? "rs_replacement" : reasoning.id, encrypted_content: shape === "conflict" ? "CONFLICTING_CONTEXT" : signature }, call] } },
+    );
+    const answer = () => fakeGatewaySse([
+      { type: "response.output_text.delta", delta: "REASONING_SNAPSHOT_OK" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    const responses = [fakeGatewaySse(events), answer(), answer()];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "SETTLED_READ_RESULT\n");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and summarize it."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      if (conflict) {
+        expect(result.error).toBe("ResponsesReasoningConflict");
+        expect(result.tool_calls).toEqual([]);
+        expect(direct.bodies).toHaveLength(1);
+        continue;
+      }
+      expect(result.output).toBe("REASONING_SNAPSHOT_OK");
+      expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
+      expect(direct.bodies).toHaveLength(2);
+      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "events.jsonl"), "utf8");
+      expect(saved).toContain(signature);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input as Array<{ type: string; encrypted_content?: string; call_id?: string; output?: string }>;
+        expect(input.filter((item) => item.type === "reasoning").map((item) => item.encrypted_content)).toEqual([signature]);
+        const results = input.filter((item) => item.type === "function_call_output");
+        expect(results).toHaveLength(1);
+        expect(results[0].call_id).toBe(call.call_id);
+        expect(results[0].output).toContain("SETTLED_READ_RESULT");
+      }
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("provider SSE framing preserves saved and resumed answers", async () => {
   const prefix = "CONTROL_PREFIX\n", answer = "EXPECTED_FINAL";
   for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["no-space", "multiline", "invalid"]) {
