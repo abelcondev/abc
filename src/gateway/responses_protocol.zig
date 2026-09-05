@@ -98,11 +98,15 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                var assistant_phase = message.assistant_phase;
+                var legacy_phase: ?AssistantMessagePhase = null;
+                var span_end: ?usize = null;
+                const content = message.content orelse "";
                 if (message.provider_replay) |replay| {
                     const state_json = replay.parts_json;
-                    var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch
-                        return error.InvalidProviderState;
+                    var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.InvalidProviderState,
+                    };
                     defer state.deinit();
                     if (state.value != .array) return error.InvalidProviderState;
                     for (state.value.array.items) |item| {
@@ -110,9 +114,22 @@ pub fn writeInput(
                         const kind = item.object.get("type") orelse return error.InvalidProviderState;
                         if (kind != .string) return error.InvalidProviderState;
                         if (std.mem.eql(u8, kind.string, "message")) {
-                            const phase = assistantMessagePhase(item.object) orelse return error.InvalidProviderState;
-                            if (assistant_phase) |prior| if (prior != phase) return error.InvalidProviderState;
-                            assistant_phase = phase;
+                            const phase = assistantMessagePhase(item.object) catch return error.InvalidProviderState;
+                            if (item.object.contains("offset") or item.object.contains("length")) {
+                                if (legacy_phase != null) return error.InvalidProviderState;
+                                const offset = replay_index(item.object, "offset") orelse return error.InvalidProviderState;
+                                const length = replay_index(item.object, "length") orelse return error.InvalidProviderState;
+                                if (offset > content.len or length == 0 or length > content.len - offset) return error.InvalidProviderState;
+                                if (span_end) |end| {
+                                    if (offset < end or !std.mem.eql(u8, content[end..offset], "\n\n")) return error.InvalidProviderState;
+                                } else if (offset != 0) return error.InvalidProviderState;
+                                try write_assistant_text(writer, &first, content[offset..][0..length], phase);
+                                span_end = offset + length;
+                            } else {
+                                if (span_end != null or phase == null) return error.InvalidProviderState;
+                                if (legacy_phase) |prior| if (prior != phase.?) return error.InvalidProviderState;
+                                legacy_phase = phase;
+                            }
                             continue;
                         }
                         if (!std.mem.eql(u8, kind.string, "reasoning")) return error.InvalidProviderState;
@@ -120,17 +137,11 @@ pub fn writeInput(
                         try std.json.Stringify.value(item, .{}, writer);
                     }
                 }
-                if (message.content) |content| if (content.len > 0) {
-                    try writeComma(writer, &first);
-                    try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
-                    try writer.writeAll(",\"annotations\":[]}]");
-                    if (assistant_phase) |phase| {
-                        try writer.writeAll(",\"phase\":");
-                        try std.json.Stringify.value(@tagName(phase), .{}, writer);
-                    }
-                    try writer.writeByte('}');
-                };
+                if (span_end) |end| {
+                    // Capture can end inside the separator before the next message.
+                    const tail = content[end..];
+                    if (tail.len > 2 or !std.mem.startsWith(u8, "\n\n", tail)) return error.InvalidProviderState;
+                } else if (content.len > 0) try write_assistant_text(writer, &first, content, legacy_phase);
                 for (message.tool_calls) |call| {
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
@@ -176,6 +187,24 @@ pub fn writeInput(
             },
         }
     }
+}
+
+fn replay_index(fields: std.json.ObjectMap, name: []const u8) ?usize {
+    const value = fields.get(name) orelse return null;
+    if (value != .integer) return null;
+    return std.math.cast(usize, value.integer);
+}
+
+fn write_assistant_text(writer: *std.Io.Writer, first: *bool, content: []const u8, phase: ?AssistantMessagePhase) !void {
+    try writeComma(writer, first);
+    try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
+    try std.json.Stringify.value(content, .{}, writer);
+    try writer.writeAll(",\"annotations\":[]}]");
+    if (phase) |value| {
+        try writer.writeAll(",\"phase\":");
+        try std.json.Stringify.value(@tagName(value), .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 test "Responses request projects long call ids with matching outputs" {
@@ -285,7 +314,7 @@ test "Responses request preserves assistant commentary phase" {
             .role = .assistant,
             .content = "I will inspect the file first.",
             .tool_calls = &calls,
-            .assistant_phase = .commentary,
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = "[{\"type\":\"message\",\"phase\":\"commentary\"}]" },
         },
         .{
             .role = .tool,
@@ -755,7 +784,6 @@ const TextUpdate = struct {
 
 const TextPart = struct {
     kind: TextKind,
-    item_id_hash: ?[TextDigest.digest_length]u8 = null,
     received_bytes: usize = 0,
     digest: TextDigest = .init(.{}),
     finalized: bool = false,
@@ -788,34 +816,30 @@ fn text_identity(fields: std.json.ObjectMap, name: []const u8) !?[TextDigest.dig
     return digest;
 }
 
-const AssistantPhaseAccumulator = union(enum) {
-    empty,
-    value: types.AssistantMessagePhase,
-    conflicting,
+const AssistantMessagePhase = enum { commentary, final_answer };
 
-    fn observe(self: *AssistantPhaseAccumulator, candidate: ?types.AssistantMessagePhase) void {
-        const phase = candidate orelse return;
-        self.* = switch (self.*) {
-            .empty => .{ .value = phase },
-            .value => |current| if (current == phase) .{ .value = current } else .conflicting,
-            .conflicting => .conflicting,
-        };
-    }
-
-    fn resolved(self: AssistantPhaseAccumulator) ?types.AssistantMessagePhase {
-        return switch (self) {
-            .value => |phase| phase,
-            .empty, .conflicting => null,
-        };
-    }
-};
-
-fn assistantMessagePhase(fields: std.json.ObjectMap) ?types.AssistantMessagePhase {
-    const raw = stringField(fields, "phase") orelse return null;
-    return std.meta.stringToEnum(types.AssistantMessagePhase, raw);
+fn assistantMessagePhase(fields: std.json.ObjectMap) !?AssistantMessagePhase {
+    const raw = fields.get("phase") orelse return null;
+    if (raw == .null) return null;
+    if (raw != .string) return error.InvalidEvent;
+    return std.meta.stringToEnum(AssistantMessagePhase, raw.string);
 }
 
 pub const Reducer = struct {
+    const MessageItem = struct {
+        output_index: i64,
+        id_hash: ?[TextDigest.digest_length]u8,
+        phase: ?AssistantMessagePhase,
+        offset: usize = 0,
+        length: usize = 0,
+
+        fn replay_json(self: MessageItem, buffer: []u8) ![]const u8 {
+            var out: std.Io.Writer = .fixed(buffer);
+            try std.json.Stringify.value(.{ .type = "message", .offset = self.offset, .length = self.length, .phase = self.phase }, .{ .emit_null_optional_fields = false }, &out);
+            return out.buffered();
+        }
+    };
+
     const ReasoningItem = struct {
         output_index: i64,
         id_hash: ?[TextDigest.digest_length]u8,
@@ -823,6 +847,7 @@ pub const Reducer = struct {
     };
 
     content: std.ArrayList(u8) = .empty,
+    message_items: std.ArrayList(MessageItem) = .empty,
     reasoning_items: std.ArrayList(ReasoningItem) = .empty,
     reasoning_bytes: usize = 0,
     tools: std.ArrayList(ToolAccumulator) = .empty,
@@ -835,7 +860,6 @@ pub const Reducer = struct {
     text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
     last_text_key: ?TextKey = null,
     text_bytes: usize = 0,
-    assistant_phase: AssistantPhaseAccumulator = .empty,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
@@ -845,6 +869,7 @@ pub const Reducer = struct {
 
     pub fn deinit(self: *Reducer, alloc: std.mem.Allocator) void {
         self.content.deinit(alloc);
+        self.message_items.deinit(alloc);
         self.text_parts.deinit(alloc);
         for (self.reasoning_items.items) |item| if (item.json) |json| alloc.free(json);
         self.reasoning_items.deinit(alloc);
@@ -910,7 +935,7 @@ pub const Reducer = struct {
             } else if (std.mem.eql(u8, item_type, "reasoning")) {
                 try self.reconcile_reasoning(alloc, output_index, item.object, .identity, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
-                self.assistant_phase.observe(assistantMessagePhase(item.object));
+                _ = try self.reconcile_message(alloc, output_index, try text_identity(item.object, "id"), try assistantMessagePhase(item.object), limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
             std.mem.eql(u8, event_type, "response.refusal.delta"))
@@ -968,7 +993,6 @@ pub const Reducer = struct {
             } else if (std.mem.eql(u8, item_type, "reasoning")) {
                 try self.reconcile_reasoning(alloc, output_index, item.object, .completed, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
-                self.assistant_phase.observe(assistantMessagePhase(item.object));
                 try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
@@ -994,7 +1018,6 @@ pub const Reducer = struct {
                     } else if (std.mem.eql(u8, item_type, "reasoning")) {
                         try self.reconcile_reasoning(alloc, index, item.object, .completed, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
-                        self.assistant_phase.observe(assistantMessagePhase(item.object));
                         try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
                     }
                 }
@@ -1069,6 +1092,33 @@ pub const Reducer = struct {
         self.reasoning_bytes = total;
     }
 
+    fn reconcile_message(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, id_hash: ?[TextDigest.digest_length]u8, phase: ?AssistantMessagePhase, limits: StreamLimits) !*MessageItem {
+        var low: usize = 0;
+        var high = self.message_items.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.message_items.items[middle].output_index < output_index) low = middle + 1 else high = middle;
+        }
+        if (id_hash) |id| for (self.message_items.items) |prior| {
+            const prior_id = prior.id_hash orelse continue;
+            const same_id = std.mem.eql(u8, &prior_id, &id);
+            if (prior.output_index == output_index and !same_id) return error.ResponsesTextConflict;
+            if (prior.output_index != output_index and same_id) return error.ResponsesTextConflict;
+        };
+        if (low < self.message_items.items.len and self.message_items.items[low].output_index == output_index) {
+            const prior = &self.message_items.items[low];
+            if (phase) |value| {
+                if (prior.phase) |old| if (old != value) return error.ResponsesTextConflict;
+                prior.phase = value;
+            }
+            if (id_hash != null) prior.id_hash = id_hash;
+            return prior;
+        }
+        if (self.message_items.items.len >= limits.events) return error.ResourceLimitExceeded;
+        try self.message_items.insert(alloc, low, .{ .output_index = output_index, .id_hash = id_hash, .phase = phase });
+        return &self.message_items.items[low];
+    }
+
     fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
         const code = stringField(fields, "code") orelse "provider_error";
         const message = stringField(fields, "message") orelse "Provider response failed";
@@ -1094,16 +1144,12 @@ pub const Reducer = struct {
         capture_limit: ?usize,
         limits: StreamLimits,
     ) !void {
+        const message = try self.reconcile_message(alloc, update.key.output_index, update.item_id_hash, null, limits);
         if (self.text_parts.count() >= limits.events and !self.text_parts.contains(update.key)) return error.ResourceLimitExceeded;
         const entry = try self.text_parts.getOrPut(alloc, update.key);
         if (!entry.found_existing) entry.value_ptr.* = .{ .kind = update.kind };
         const part = entry.value_ptr;
         if (part.kind != update.kind) return error.ResponsesTextConflict;
-        if (update.item_id_hash) |id| {
-            if (part.item_id_hash) |prior| {
-                if (!std.mem.eql(u8, &id, &prior)) return error.ResponsesTextConflict;
-            } else part.item_id_hash = id;
-        }
         const suffix = switch (update.mode) {
             .final => try part.final_suffix(update.text),
             .delta => blk: {
@@ -1113,12 +1159,19 @@ pub const Reducer = struct {
         };
         if (suffix.len != 0) {
             if (self.last_text_key) |last| if (update.key.precedes(last)) return error.ResponsesTextConflict;
-            const total = try checkedAccumulatedSize(self.text_bytes, suffix.len, limits.aggregate_bytes);
+            const boundary = if (self.last_text_key) |last| last.output_index != update.key.output_index else false;
+            const with_boundary = try checkedAccumulatedSize(self.text_bytes, if (boundary) 2 else 0, limits.aggregate_bytes);
+            const total = try checkedAccumulatedSize(with_boundary, suffix.len, limits.aggregate_bytes);
+            if (boundary) try appendCaptured(alloc, &self.content, "\n\n", capture_limit);
+            const before = self.content.items.len;
             try appendCaptured(alloc, &self.content, suffix, capture_limit);
+            if (message.length == 0) message.offset = before;
+            message.length += self.content.items.len - before;
             part.digest.update(suffix);
             part.received_bytes += suffix.len; // Bounded by the aggregate total above.
             self.text_bytes = total;
             self.last_text_key = update.key;
+            if (boundary) callbacks.on_content(callbacks.context, "\n\n");
         }
         if (update.mode == .final) part.finalized = true;
         if (suffix.len != 0) callbacks.on_content(callbacks.context, suffix);
@@ -1156,6 +1209,7 @@ pub const Reducer = struct {
         capture_limit: ?usize,
         limits: StreamLimits,
     ) !void {
+        _ = try self.reconcile_message(alloc, output_index, try text_identity(fields, "id"), try assistantMessagePhase(fields), limits);
         const parts = fields.get("content") orelse return error.InvalidEvent;
         if (parts != .array) return error.InvalidEvent;
         const identity = try text_identity(fields, "id");
@@ -1201,35 +1255,28 @@ pub const Reducer = struct {
             null;
         if (owned_content != null) self.content = .empty;
         errdefer if (owned_content) |value| alloc.free(value);
-        const phase_json: ?[]const u8 = if (self.assistant_phase.resolved()) |phase|
-            switch (phase) {
-                .commentary => "{\"type\":\"message\",\"phase\":\"commentary\"}",
-                .final_answer => "{\"type\":\"message\",\"phase\":\"final_answer\"}",
-            }
-        else
-            null;
-        const owned_provider_state = if (self.reasoning_bytes > 0 or phase_json != null) state: {
-            var size = self.reasoning_bytes;
-            if (phase_json) |phase| size = try checkedAccumulatedSize(size, phase.len + @as(usize, if (size == 0) 2 else 1), limits.provider_state_bytes);
-            _ = try checkedAccumulatedSize(0, size, limits.provider_state_bytes);
+        const owned_provider_state = state: {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
-            try out.ensureTotalCapacity(size);
-            try out.writer.writeByte('[');
-            var first = true;
-            for (self.reasoning_items.items) |item| {
+            var reasoning_index: usize = 0;
+            for (self.message_items.items) |message| {
                 if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-                const json = item.json orelse continue;
-                try writeComma(&out.writer, &first);
-                try out.writer.writeAll(json);
+                while (reasoning_index < self.reasoning_items.items.len and self.reasoning_items.items[reasoning_index].output_index <= message.output_index) : (reasoning_index += 1) {
+                    if (self.reasoning_items.items[reasoning_index].json) |json| try append_replay_item(&out, json, limits.provider_state_bytes);
+                }
+                if (message.length == 0) continue;
+                if (self.message_items.items.len == 1 and message.phase == null) continue;
+                var buffer: [160]u8 = undefined;
+                try append_replay_item(&out, try message.replay_json(&buffer), limits.provider_state_bytes);
             }
-            if (phase_json) |phase| {
-                try writeComma(&out.writer, &first);
-                try out.writer.writeAll(phase);
+            for (self.reasoning_items.items[reasoning_index..]) |item| {
+                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+                if (item.json) |json| try append_replay_item(&out, json, limits.provider_state_bytes);
             }
+            if (out.written().len == 0) break :state null;
             try out.writer.writeByte(']');
             break :state try out.toOwnedSlice();
-        } else null;
+        };
         errdefer if (owned_provider_state) |value| alloc.free(value);
         const owned_tools: []types.ToolCall = if (self.tools.items.len > 0)
             try alloc.alloc(types.ToolCall, self.tools.items.len)
@@ -1264,7 +1311,6 @@ pub const Reducer = struct {
         return .{
             .content = owned_content,
             .tool_calls = owned_tools,
-            .assistant_phase = self.assistant_phase.resolved(),
             .generation_id = generation_id,
             .provider_failure_detail = provider_failure_detail,
             .provider_failure_cause = self.provider_failure_cause,
@@ -1274,6 +1320,14 @@ pub const Reducer = struct {
         };
     }
 };
+
+fn append_replay_item(out: *std.Io.Writer.Allocating, json: []const u8, maximum: usize) !void {
+    const item_size = try checkedAccumulatedSize(json.len, 2, maximum);
+    _ = try checkedAccumulatedSize(out.written().len, item_size, maximum);
+    try out.ensureUnusedCapacity(item_size);
+    try out.writer.writeByte(if (out.written().len == 0) '[' else ',');
+    try out.writer.writeAll(json);
+}
 
 const ToolRecordTest = struct {
     alloc: std.mem.Allocator,
@@ -1312,6 +1366,35 @@ const ToolRecordTest = struct {
     fn ignore(_: *anyopaque, _: []const u8) void {}
 };
 
+test "Responses message replay preserves separate commentary and final text" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        \\{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_progress","phase":"commentary","content":[{"type":"output_text","text":"Checking."}]},{"type":"message","id":"msg_final","phase":"final_answer","content":[{"type":"output_text","text":"42"}]}]}}
+    );
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("Checking.\n\n42", completion.content.?);
+    var out: std.Io.Writer.Allocating = .init(stream.alloc);
+    defer out.deinit();
+    const messages = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .content = completion.content,
+        .provider_replay = .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = completion.provider_state_json orelse "[]" },
+    }};
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, stream.alloc, &messages, null, .{ .tool_calls = 4, .tool_identity_bytes = 1024, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+    try out.writer.writeByte(']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, stream.alloc, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("commentary", items[0].object.get("phase").?.string);
+    try std.testing.expectEqualStrings("Checking.", items[0].object.get("content").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("final_answer", items[1].object.get("phase").?.string);
+    try std.testing.expectEqualStrings("42", items[1].object.get("content").?.array.items[0].object.get("text").?.string);
+}
+
 test "Responses reasoning replay retains terminal-only context" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
@@ -1319,6 +1402,123 @@ test "Responses reasoning replay retains terminal-only context" {
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
     try std.testing.expectEqualStrings("[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]", completion.provider_state_json orelse "");
+}
+
+test "Responses message replay rejects ambiguous or invalid spans" {
+    const cases = [_][]const u8{
+        \\[{"type":"message","offset":-1,"length":1}]
+        ,
+        \\[{"type":"message","offset":0,"length":6}]
+        ,
+        \\[{"type":"message","offset":6,"length":1}]
+        ,
+        \\[{"type":"message","offset":0,"length":0}]
+        ,
+        \\[{"type":"message","offset":0}]
+        ,
+        \\[{"type":"message","length":1}]
+        ,
+        \\[{"type":"message","offset":"0","length":1}]
+        ,
+        \\[{"type":"message","offset":0,"length":1,"phase":42}]
+        ,
+        \\[{"type":"message","offset":1,"length":4}]
+        ,
+        \\[{"type":"message","offset":0,"length":4},{"type":"message","offset":3,"length":2}]
+        ,
+        \\[{"type":"message","offset":0,"length":1},{"type":"message","offset":4,"length":1}]
+        ,
+        \\[{"type":"message","offset":0,"length":1}]
+        ,
+        \\[{"type":"message","phase":"commentary"},{"type":"message","offset":0,"length":5}]
+        ,
+        \\[{"type":"message","offset":0,"length":5},{"type":"message","phase":"commentary"}]
+        ,
+    };
+    for (cases) |parts_json| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        const messages = [_]types.ChatMessage{.{ .role = .assistant, .content = "a\n\nbc", .provider_replay = .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = parts_json } }};
+        try std.testing.expectError(error.InvalidProviderState, ImageInputTest.write(std.testing.allocator, &out.writer, &messages, null));
+    }
+}
+
+test "Responses message replay excludes separators and uncaptured bytes" {
+    for (0..6) |capture_limit| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.capture_limit = capture_limit;
+        try stream.delta(0, 0, "a");
+        try stream.apply(
+            \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"first","phase":"commentary","content":[{"type":"output_text","text":"a"}]}}
+        );
+        try stream.apply(
+            \\{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"first","phase":"commentary","content":[{"type":"output_text","text":"a"}]},{"type":"message","content":[]},{"type":"message","id":"last","phase":"final_answer","content":[{"type":"output_text","text":"bc"}]}]}}
+        );
+        try stream.expect_emitted("a\n\nbc");
+        var result = stream_provider.Result{ .completed = .{ .completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits), .ownership = .owned } };
+        defer result.deinit(stream.alloc);
+        const completion = result.completed.completion;
+        try std.testing.expectEqualStrings("a\n\nbc"[0..capture_limit], completion.content orelse "");
+        const messages = [_]types.ChatMessage{.{ .role = .assistant, .content = completion.content, .provider_replay = if (completion.provider_state_json) |parts| .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = parts } else null }};
+        var out: std.Io.Writer.Allocating = .init(stream.alloc);
+        defer out.deinit();
+        try ImageInputTest.write(stream.alloc, &out.writer, &messages, null);
+        const parsed = try std.json.parseFromSlice(std.json.Value, stream.alloc, out.written(), .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, if (capture_limit == 0) 0 else if (capture_limit <= 3) 1 else 2), items.len);
+        if (items.len > 0) {
+            try std.testing.expectEqualStrings("a", items[0].object.get("content").?.array.items[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("commentary", items[0].object.get("phase").?.string);
+        }
+        if (items.len > 1) {
+            try std.testing.expectEqualStrings("bc"[0 .. capture_limit - 3], items[1].object.get("content").?.array.items[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("final_answer", items[1].object.get("phase").?.string);
+        }
+    }
+}
+
+test "Responses message replay binds item identity before text and across content parts" {
+    for ([_][]const u8{
+        \\{"type":"response.output_text.delta","output_index":0,"item_id":"changed","delta":"bad"}
+        ,
+        \\{"type":"response.output_text.delta","output_index":1,"item_id":"original","delta":"bad"}
+        ,
+        \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"changed","content":[]}}
+        ,
+    }) |event| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(
+            \\{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"original","phase":"commentary"}}
+        );
+        try std.testing.expectError(error.ResponsesTextConflict, stream.apply(event));
+        try stream.expect_emitted("");
+    }
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        \\{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"original","delta":"a"}
+    );
+    try std.testing.expectError(error.ResponsesTextConflict, stream.apply(
+        \\{"type":"response.output_text.delta","output_index":0,"content_index":1,"item_id":"changed","delta":"b"}
+    ));
+    try stream.expect_emitted("a");
+}
+
+test "Responses message replay releases request scratch on allocation failure" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const messages = [_]types.ChatMessage{.{ .role = .assistant, .content = "a\n\nb", .provider_replay = .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = "[{\"type\":\"message\",\"offset\":0,\"length\":1},{\"type\":\"message\",\"offset\":3,\"length\":1}]" } }};
+            // Output storage is separate from the scratch allocator under test.
+            var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer wire.deinit();
+            try ImageInputTest.write(alloc, &wire.writer, &messages, null);
+            try std.testing.expect(std.mem.find(u8, wire.written(), "phase") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "Responses reasoning replay retains terminal enrichment without duplicates" {
@@ -1426,12 +1626,13 @@ test "Responses reasoning replay counts unique bytes and phase at the exact boun
         defer stream.freeCompletion(completion);
         try std.testing.expectEqualStrings(state, completion.provider_state_json.?);
     }
-    const phase = "{\"type\":\"message\",\"phase\":\"commentary\"}";
+    const phase = "{\"type\":\"message\",\"offset\":0,\"length\":1,\"phase\":\"commentary\"}";
     for ([_]usize{ state.len + phase.len + 1, state.len + phase.len }) |limit| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
         try stream.apply(event);
         try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}");
+        try stream.apply("{\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"x\"}");
         try stream.apply(ToolRecordTest.terminal);
         var bounds = ToolRecordTest.limits;
         bounds.provider_state_bytes = limit;
@@ -1474,7 +1675,7 @@ test "Responses text finalization preserves mixed streamed and final-only items"
     try stream.apply(ToolRecordTest.terminal);
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
-    try std.testing.expectEqualStrings("COMMENTARY_ITEM\nFINAL_ANSWER_ITEM", completion.content.?);
+    try std.testing.expectEqualStrings("COMMENTARY_ITEM\n\n\nFINAL_ANSWER_ITEM", completion.content.?);
 }
 
 test "Responses terminal failures retain provider diagnostics as outcomes" {
@@ -1673,7 +1874,7 @@ test "Responses text finalization reads terminal-only messages and streamed refu
     defer stream.deinit();
     try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"No\"}");
     try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" Alternative.\"}]}]}}");
-    try stream.finish("No. Alternative.");
+    try stream.finish("No.\n\n Alternative.");
 }
 
 test "Responses text finalization retains item text when the terminal envelope is empty" {
@@ -1732,7 +1933,7 @@ test "Responses text finalization preserves append order and bounded sparse inde
     try stream.final(99_999_999, 99_999_999, "b");
     try stream.final(0, 0, "a");
     try std.testing.expectError(error.ResponsesTextConflict, stream.final(1, 0, "late"));
-    try stream.expect_emitted("ab");
+    try stream.expect_emitted("a\n\nb");
 
     var bounded = TextRecordTest.init(std.testing.allocator);
     defer bounded.deinit();
@@ -1775,7 +1976,7 @@ test "Responses text finalization releases state on allocation failure" {
             try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"a\"}");
             try stream.apply("{\"type\":\"response.output_text.done\",\"text\":\"ab\"}");
             try stream.apply("{\"type\":\"response.output_text.done\",\"output_index\":1,\"text\":\"cd\"}");
-            try stream.finish("abcd");
+            try stream.finish("ab\n\ncd");
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
@@ -1784,11 +1985,13 @@ test "Responses text finalization releases state on allocation failure" {
 test "Responses text finalization fuzzes chunking and capture boundaries" {
     const Probe = struct {
         fn run(_: void, smith: *std.testing.Smith) !void {
-            var buffer: [260]u8 = undefined;
+            var buffer: [262]u8 = undefined;
             const len: usize = @intCast(smith.slice(buffer[0..256]));
             for (buffer[0..len]) |*byte| byte.* = 32 + byte.* % 95;
             const split = if (len == 0) 0 else buffer[0] % (len + 1);
-            @memcpy(buffer[len..][0..4], "tail");
+            const separator: []const u8 = if (len == 0) "" else "\n\n";
+            @memcpy(buffer[len..][0..separator.len], separator);
+            @memcpy(buffer[len + separator.len ..][0..4], "tail");
             var stream = TextRecordTest.init(std.testing.allocator);
             defer stream.deinit();
             stream.capture_limit = if (len == 0) 0 else buffer[0] % 17;
@@ -1796,7 +1999,7 @@ test "Responses text finalization fuzzes chunking and capture boundaries" {
             try stream.final(0, 0, buffer[0..len]);
             try stream.final(0, 0, buffer[0..len]);
             try stream.final(1, 0, "tail");
-            try stream.finish(buffer[0 .. len + 4]);
+            try stream.finish(buffer[0 .. len + separator.len + 4]);
         }
     };
     try std.testing.fuzz({}, Probe.run, .{ .corpus = &.{ "", "a", "two chunks", "capture limit is not receipt progress" } });
@@ -1815,11 +2018,9 @@ test "Responses captures assistant commentary phase" {
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
 
-    try std.testing.expectEqual(
-        types.AssistantMessagePhase.commentary,
-        completion.assistant_phase.?,
-    );
-    try std.testing.expectEqualStrings("[{\"type\":\"message\",\"phase\":\"commentary\"}]", completion.provider_state_json.?);
+    const replay = try std.json.parseFromSlice(std.json.Value, stream.alloc, completion.provider_state_json.?, .{});
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("commentary", replay.value.array.items[0].object.get("phase").?.string);
 }
 
 test "Responses captures assistant phase from terminal output" {
@@ -1831,13 +2032,12 @@ test "Responses captures assistant phase from terminal output" {
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
 
-    try std.testing.expectEqual(
-        types.AssistantMessagePhase.final_answer,
-        completion.assistant_phase.?,
-    );
+    const replay = try std.json.parseFromSlice(std.json.Value, stream.alloc, completion.provider_state_json.?, .{});
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("final_answer", replay.value.array.items[0].object.get("phase").?.string);
 }
 
-test "Responses ignores unknown and conflicting assistant phases" {
+test "Responses omits unknown phases and rejects contradictory phases within one message" {
     var unknown = ToolRecordTest.init(std.testing.allocator);
     defer unknown.deinit();
     try unknown.apply(
@@ -1846,20 +2046,16 @@ test "Responses ignores unknown and conflicting assistant phases" {
     try unknown.apply(ToolRecordTest.terminal);
     const unknown_completion = try unknown.finish();
     defer unknown.freeCompletion(unknown_completion);
-    try std.testing.expect(unknown_completion.assistant_phase == null);
+    try std.testing.expect(unknown_completion.provider_state_json == null);
 
     var conflicting = ToolRecordTest.init(std.testing.allocator);
     defer conflicting.deinit();
     try conflicting.apply(
         "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}",
     );
-    try conflicting.apply(
+    try std.testing.expectError(error.ResponsesTextConflict, conflicting.apply(
         "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[]}}",
-    );
-    try conflicting.apply(ToolRecordTest.terminal);
-    const conflicting_completion = try conflicting.finish();
-    defer conflicting.freeCompletion(conflicting_completion);
-    try std.testing.expect(conflicting_completion.assistant_phase == null);
+    ));
 }
 
 test "Responses rejects conflicting completed tool records" {
