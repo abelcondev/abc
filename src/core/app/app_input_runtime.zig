@@ -1533,7 +1533,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn handleSemanticCtrlC(app: *App) !void {
-            if (interrupt_rt.hasActiveOperation(app) and draftHasState(app)) {
+            if (app.stream.active and draftHasState(app)) {
                 clearDraftState(app, "ctrl_c");
                 app.shell.render_requests.request(.footer);
                 return;
