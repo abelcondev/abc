@@ -782,6 +782,8 @@ describe("gateway stream lifecycle", () => {
       expect(first).toContain("2 requested skills loaded");
       expect(first).toContain("Loaded skill status-first");
       expect(first).toContain("Loaded skill status-second");
+      expect(first).toMatch(/^├ Loaded skill status-first$/m);
+      expect(first).toMatch(/^└ Loaded skill status-second$/m);
       expect(first.indexOf("2 requested skills loaded")).toBeLessThan(first.indexOf("STATUS_FIRST_COMPLETE"));
       expect(first).not.toContain("tool call");
       await tui.resizeWindow(48, 36);
@@ -791,10 +793,16 @@ describe("gateway stream lifecycle", () => {
       expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
       expect(mixed).toContain("Could not load status-duplicate");
       expect(mixed).toContain("ambiguous");
+      expect(mixed).toMatch(/^└ Could not load status-duplicate/m);
+      expect(mixed.replace(/\s+/g, " ")).toContain("ctrl o");
+      expect(mixed).not.toContain("duplicate-a");
+      expect(mixed).not.toContain("duplicate-b");
       expect(mixed).not.toContain("Loaded skill status-duplicate");
       expect(mixed).not.toContain("tool call");
       await tui.sendKeys("C-o");
       await tui.waitForText("Could not load status-duplicate", 5_000);
+      const details = await tui.waitForText("duplicate-a", 5_000);
+      expect(details).toContain("duplicate-b");
       await tui.sendKeys("C-o");
       await tui.waitForComposer(5_000);
       expect(gateway.requests).toHaveLength(2);

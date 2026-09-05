@@ -188,12 +188,14 @@ pub const ExplicitPromptSection = struct {
     notice: ?[]u8 = null,
     diagnostic_notice: ?[]u8 = null,
     load_notice: ?types.SemanticNotice = null,
+    load_details: ?[]u8 = null,
 
     pub fn deinit(self: *ExplicitPromptSection, alloc: Allocator) void {
         alloc.free(self.text);
         if (self.notice) |notice| alloc.free(notice);
         if (self.diagnostic_notice) |notice| alloc.free(notice);
         if (self.load_notice) |notice| types.freeSemanticNotice(alloc, notice);
+        if (self.load_details) |details| alloc.free(details);
         self.* = .{ .text = &.{} };
     }
 };
@@ -222,6 +224,8 @@ pub fn buildExplicitPromptSection(
     defer diagnostic_notices.deinit();
     var load_rows: std.Io.Writer.Allocating = .init(alloc);
     defer load_rows.deinit();
+    var load_details: std.Io.Writer.Allocating = .init(alloc);
+    defer load_details.deinit();
     var loaded: usize = 0;
 
     try out.writer.writeAll(
@@ -239,6 +243,7 @@ pub fn buildExplicitPromptSection(
                 &notices.writer,
                 &diagnostic_notices,
                 &load_rows.writer,
+                &load_details.writer,
                 catalog,
                 binding.name,
                 binding.path,
@@ -253,7 +258,9 @@ pub fn buildExplicitPromptSection(
                 defer alloc.free(failure);
                 try out.writer.writeAll(failure);
                 try out.writer.writeByte('\n');
-                try appendExplicitLoadRow(alloc, &load_rows.writer, name, failure);
+                try appendExplicitLoadRow(alloc, &load_rows.writer, name, "ambiguous name");
+                try appendExplicitLoadRow(alloc, &load_details.writer, name, failure);
+                try load_details.writer.writeByte('\n');
             },
         }
     }
@@ -262,8 +269,10 @@ pub fn buildExplicitPromptSection(
     const summary = if (failed == 0)
         try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed{s}", .{ loaded, failed, load_rows.written() });
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl o for details){s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
+    const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
+    errdefer if (details) |value| alloc.free(value);
 
     const text = try out.toOwnedSlice();
     errdefer alloc.free(text);
@@ -275,12 +284,16 @@ pub fn buildExplicitPromptSection(
         .notice = notice,
         .diagnostic_notice = diagnostic_notice,
         .load_notice = .{ .topic = "", .tone = if (failed == 0) .neutral else .warning, .body = summary },
+        .load_details = details,
     };
 }
 
 fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8, failure: ?[]const u8) !void {
     const row = if (failure) |detail|
-        try std.fmt.allocPrint(alloc, "Could not load {s}: {s}", .{ name, detail })
+        if (detail.len > 0)
+            try std.fmt.allocPrint(alloc, "Could not load {s}: {s}", .{ name, detail })
+        else
+            try std.fmt.allocPrint(alloc, "Could not load {s}", .{name})
     else
         try std.fmt.allocPrint(alloc, "Loaded skill {s}", .{name});
     defer alloc.free(row);
@@ -304,6 +317,13 @@ test "explicit skill requests report ambiguous names without selecting a source"
     try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
     try expectContains(section.load_notice.?.body, "Could not load review:");
     try expectNotContains(section.load_notice.?.body, "Loaded skill review");
+    try expectContains(section.load_notice.?.body, "ambiguous name");
+    try expectNotContains(section.load_notice.?.body, "/workspace/review");
+    try expectNotContains(section.load_notice.?.body, "/global/review");
+    try expectContains(section.load_notice.?.body, "ctrl o");
+    try expectContains(section.load_details.?, "/workspace/review");
+    try expectContains(section.load_details.?, "/global/review");
+    try std.testing.expect(section.notice == null);
 }
 
 test "explicit skills include complete instructions beyond the default chunk" {
@@ -322,6 +342,7 @@ test "explicit skills include complete instructions beyond the default chunk" {
     try std.testing.expect(std.mem.find(u8, section.text, "BEGIN INSTRUCTIONS") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
     try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill workflow", section.load_notice.?.body);
+    try std.testing.expect(section.load_details == null);
     const bindings = [_]ExplicitBinding{ .{ .name = "workflow", .path = path }, .{ .name = "workflow", .path = path } };
     var repeated = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow $workflow", &bindings, .{}, null);
     defer repeated.deinit(alloc);
@@ -348,8 +369,9 @@ test "explicit load summary reports a missing bound skill without success" {
     var section = try buildExplicitPromptSection(alloc, .{ .skills = &.{} }, "Use the selected workflow", &.{.{ .name = "missing-workflow", .path = "/unavailable/workflow" }}, .{}, null);
     defer section.deinit(alloc);
     try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
-    try expectContains(section.load_notice.?.body, "Could not load missing-workflow:");
-    try expectContains(section.load_notice.?.body, "not found at advertised location");
+    try expectContains(section.load_notice.?.body, "Could not load missing-workflow");
+    try expectNotContains(section.load_notice.?.body, "/unavailable/workflow");
+    try expectContains(section.load_details.?, "not found at advertised location");
     try expectNotContains(section.text, "<skill_content");
 }
 
@@ -555,6 +577,7 @@ fn appendExplicitSkill(
     notices: *std.Io.Writer,
     diagnostic_notices: *std.Io.Writer.Allocating,
     load_rows: *std.Io.Writer,
+    load_details: *std.Io.Writer,
     catalog: Catalog,
     name: []const u8,
     location: []const u8,
@@ -581,7 +604,11 @@ fn appendExplicitSkill(
         .loaded => |output| if (output.complete) null else "Complete instructions were not loaded.",
         .failure => |output| output.model_output,
     };
-    try appendExplicitLoadRow(alloc, load_rows, name, failure);
+    if (failure) |detail| {
+        try appendExplicitLoadRow(alloc, load_details, name, detail);
+        try load_details.writeByte('\n');
+    }
+    try appendExplicitLoadRow(alloc, load_rows, name, if (failure != null) "" else null);
     return failure == null;
 }
 
@@ -2037,7 +2064,8 @@ test "explicit invocation reports user byte ceilings without partial success" {
     try expectNotContains(explicit.text, "TAIL MUST WAIT");
     try std.testing.expect(explicit.notice != null);
     try expectContains(explicit.load_notice.?.body, "0 loaded · 1 failed");
-    try expectContains(explicit.load_notice.?.body, "Could not load workflow:");
+    try expectContains(explicit.load_notice.?.body, "Could not load workflow");
+    try expectContains(explicit.load_details.?, "skill_chunk_bytes");
     try expectNotContains(explicit.load_notice.?.body, "Loaded skill workflow");
 
     var fuzzy = try buildExplicitPromptSection(alloc, catalog, "please improve this workflow", &.{}, limits, null);
