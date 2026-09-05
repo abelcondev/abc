@@ -1,4 +1,5 @@
 const std = @import("std");
+const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -252,6 +253,51 @@ fn storeLargeResultAtHandle(
         handle,
         text,
     );
+}
+
+pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, call_id: []const u8, tool_name: []const u8, images: []const types.ToolImage) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    for (images, 0..) |image, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+        try std.json.Stringify.value(image.mime_type, .{}, &out.writer);
+        try out.writer.writeAll(",\"data\":");
+        try std.json.Stringify.value(image.data, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeByte(']');
+    if (out.written().len > image_data.max_result_frame_bytes) return error.ResultTooLarge;
+    const base = try makeHandle(alloc, call_id, tool_name, out.written());
+    defer alloc.free(base);
+    const handle = try std.fmt.allocPrint(alloc, "image-{s}", .{base});
+    errdefer alloc.free(handle);
+    try storeLargeResultAtHandleManaged(alloc, capability, handle, out.written());
+    return handle;
+}
+
+pub fn isImageHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "image-result-");
+}
+
+pub fn loadToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, handle: []const u8) ![]types.ToolImage {
+    if (!isImageHandle(handle)) return error.InvalidResultHandle;
+    var reader = try openReaderManaged(alloc, capability, handle);
+    defer reader.deinit();
+    if (reader.size > image_data.max_result_frame_bytes) return error.ResultTooLarge;
+    const bytes = try reader.readPage(alloc, 0, image_data.max_result_frame_bytes);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    if (!handleMatchesContentDigest(handle, digest)) return error.ImageArtifactChanged;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidImageArtifact;
+    const images = try image_data.parseToolImages(alloc, parsed.value.array.items);
+    errdefer types.freeToolImages(alloc, images);
+    if (images.len != parsed.value.array.items.len) return error.InvalidImageArtifact;
+    return images;
 }
 
 pub fn storeLargeResultManaged(
@@ -511,6 +557,7 @@ fn readStoredTextManaged(
 }
 
 fn validateHandle(handle: []const u8) !void {
+    if (isImageHandle(handle)) return validateHandle(handle[6..]);
     if (handle.len == 0 or handle.len > 160) return error.InvalidHandle;
     if (std.mem.find(u8, handle, "..") != null) return error.InvalidHandle;
     for (handle) |byte| {
@@ -1070,4 +1117,27 @@ test "managed result handles authenticate stored content" {
         "result-run_command-legacy.txt",
         digest,
     ));
+}
+
+test "stored tool images round trip and reject changed artifacts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "images");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "images");
+    defer alloc.free(path);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, path, .tool_results, .writable);
+    defer capability.deinit();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const handle = try storeToolImages(alloc, &capability, "screenshot", "browser", &.{.{ .data = @constCast(png), .mime_type = @constCast("image/png") }});
+    defer alloc.free(handle);
+    const loaded = try loadToolImages(alloc, &capability, handle);
+    defer types.freeToolImages(alloc, loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings(png, loaded[0].data);
+    try std.testing.expectEqualStrings("image/png", loaded[0].mime_type);
+    var entry = try capability.atomicReplace(alloc, .tool_results, handle, "[]");
+    entry.deinit(alloc);
+    try std.testing.expectError(error.ImageArtifactChanged, loadToolImages(alloc, &capability, handle));
+    try std.testing.expectError(error.InvalidHandle, loadToolImages(alloc, &capability, "image-result-../../elsewhere"));
 }

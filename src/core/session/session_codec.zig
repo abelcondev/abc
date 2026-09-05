@@ -1,4 +1,5 @@
 const std = @import("std");
+const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -1283,7 +1284,13 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":7,\"tool_steps\":[");
+    const has_tool_images = images: {
+        for (execution.tool_steps) |step| {
+            for (step.tool_results) |result| if (result.tool_images.len > 0 or result.tool_image_handle != null) break :images true;
+        }
+        break :images false;
+    };
+    try writer.print("{{\"schema_version\":{d},\"tool_steps\":[", .{@as(u8, if (has_tool_images) 8 else 7)});
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1401,6 +1408,21 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
         writer,
         result.terminal_action_presentation,
     );
+    if (result.tool_image_handle) |handle| {
+        try writer.writeAll(",\"tool_image_handle\":");
+        try writeDurableBytes(writer, handle);
+    } else if (result.tool_images.len > 0) {
+        try writer.writeAll(",\"tool_images\":[");
+        for (result.tool_images, 0..) |image, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
     try writer.writeByte('}');
 }
 
@@ -1670,7 +1692,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
-        7 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7, 8 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -1901,6 +1923,8 @@ fn parseToolResults(
         alloc.free(result.tool_call_id);
         alloc.free(result.tool_name);
         alloc.free(result.output);
+        types.freeToolImages(alloc, result.tool_images);
+        if (result.tool_image_handle) |handle| alloc.free(handle);
         if (result.output_handle) |handle| alloc.free(handle);
         if (result.preview) |preview| alloc.free(preview);
         types.freePermissionFeedback(alloc, result.permission_feedback);
@@ -1982,7 +2006,7 @@ fn parseToolResult(
         "command_output_replay",
         "command_process_presentation",
     };
-    const v4_keys = &.{
+    const v4_keys = &[_][]const u8{
         "tool_call_id",
         "tool_name",
         "status",
@@ -2005,6 +2029,12 @@ fn parseToolResult(
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
         4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        8 => .{ .object = if (value == .object and value.object.contains("tool_images"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
+        else if (value == .object and value.object.contains("tool_image_handle"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
+        else
+            try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2012,7 +2042,7 @@ fn parseToolResult(
     errdefer alloc.free(tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
     errdefer alloc.free(tool_name);
-    const output = try parseRequiredDurableBytes(alloc, object, "output");
+    var output = try parseRequiredDurableBytes(alloc, object, "output");
     errdefer alloc.free(output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
@@ -2064,7 +2094,30 @@ fn parseToolResult(
         )
     else
         null;
+    const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = if (object.get("tool_images")) |images| images: {
+        if (images != .array) return error.InvalidSessionFormat;
+        const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        };
+        if (parsed_images.len != images.array.items.len) {
+            types.freeToolImages(alloc, parsed_images);
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        }
+        break :images parsed_images;
+    } else try alloc.alloc(types.ToolImage, 0);
+    errdefer types.freeToolImages(alloc, tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = std.meta.stringToEnum(

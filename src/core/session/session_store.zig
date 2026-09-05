@@ -492,6 +492,13 @@ pub const Store = struct {
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
+    resume_cancel_flag: ?*const std.atomic.Value(bool) = null,
+
+    pub fn checkResumeCancellation(self: Store) !void {
+        if (self.resume_cancel_flag) |flag| {
+            if (flag.load(.acquire)) return error.Cancelled;
+        }
+    }
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -2147,6 +2154,7 @@ pub const Store = struct {
         if (self.canonical_root.sessions == null) return scan;
         var iter = self.canonical_root.sessions.?.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
+            try self.checkResumeCancellation();
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, retired_latest_sessions_dir)) {
                 continue;
@@ -2209,6 +2217,7 @@ pub const Store = struct {
             };
             candidate.summary = undefined;
         }
+        try self.checkResumeCancellation();
         sortSummariesNewestFirst(scan.summaries.items);
         if (mode == .global_read_only_last and scan.summaries.items.len > 0) {
             for (metadata.items) |candidate| {
@@ -3486,6 +3495,16 @@ fn copyRecoveredManagedChildren(
         };
         for (execution.tool_steps) |*step| {
             for (step.tool_results) |*result| {
+                if (result.tool_image_handle) |handle| {
+                    try copyRecoveredManagedChild(
+                        alloc,
+                        source,
+                        target,
+                        .tool_results,
+                        handle,
+                        null,
+                    );
+                }
                 if (result.output_handle) |handle| {
                     try copyRecoveredManagedChild(
                         alloc,
@@ -5728,6 +5747,53 @@ test "recovery authenticates content-addressed command artifacts" {
             digest,
         ),
     );
+}
+
+test "recovery copies tool image artifacts and rejects changed content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source");
+    defer alloc.free(source_path);
+    const target_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target");
+    defer alloc.free(target_path);
+    var source = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, source_path, .tool_results, .writable);
+    defer source.deinit();
+    var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .tool_results, .writable);
+    defer target.deinit();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const handle = try result_store.storeToolImages(alloc, &source, "screenshot", "mcp_browser", &.{.{
+        .data = @constCast(png),
+        .mime_type = @constCast("image/png"),
+    }});
+    defer alloc.free(handle);
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("screenshot"),
+        .tool_name = @constCast("mcp_browser"),
+        .status = .success,
+        .output = @constCast(""),
+        .output_bytes = 0,
+        .stored_output_bytes = 0,
+        .tool_image_handle = handle,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &results }};
+    var history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Take a screenshot.") },
+        .assistant = @constCast("Captured."),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    const copied = try result_store.loadToolImages(alloc, &target, handle);
+    defer core_types.freeToolImages(alloc, copied);
+    try std.testing.expectEqual(@as(usize, 1), copied.len);
+    try std.testing.expectEqualStrings(png, copied[0].data);
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    try target.delete(.tool_results, handle);
+    var changed = try source.atomicReplace(alloc, .tool_results, handle, "[]");
+    changed.deinit(alloc);
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, copyRecoveredManagedChildren(alloc, &history, &source, &target));
 }
 
 test "session store schema v3 facade accepts dotted session IDs" {

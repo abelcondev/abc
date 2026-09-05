@@ -63,7 +63,7 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 
 The shared Agent checks its current turn's cancellation state before invoking host fetch. A request published after cancellation is aborted through the existing runtime boundary, so an earlier idle abort cannot leave the cancelled turn waiting for a response.
 
-The native kernel installs only the host-stream provider and static model metadata. It does not inherit CLI billing reconciliation, model discovery, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
+The native kernel installs host-stream and host model-catalog providers. It does not inherit CLI billing reconciliation, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
 
 ## Native module ABI
 
@@ -140,7 +140,7 @@ The native core is intentionally more restricted than the native `fx` CLI. Its A
 
 As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
 
-The native core also performs no model-catalog lookup while creating or prompting an Agent. It uses the local fallback capability policy for the host-selected model. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Agent creation does not fetch the model catalog. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -173,14 +173,19 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request record | 8 MiB |
+| Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
+| Fetch request record | 11,184,812 bytes including body base64 encoding |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
 | Active runtimes | 64 per process |
-| ACP tool result | 64 KiB |
+| ACP tool result | 64 KiB text; 8 MiB tagged rich result |
 | ACP history | 100 turns |
 | Agent steps | 64 |
+
+The fetch request budget covers the full model request, including retained history and metadata. Its base64 transfer frame has a separate derived bound; accepting one tool result does not reserve space for later requests.
+
+Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
 
 Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output queue pressure blocks the writer until space is available; a single message does not need to fit the queue. Allocation failure or an oversized output message permanently fails the output transport, notifies JavaScript, closes input, and shuts down host fetch. Later writes cannot publish a successful response after that failure.
 

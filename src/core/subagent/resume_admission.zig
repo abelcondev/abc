@@ -57,9 +57,11 @@ pub fn listActionableCatalog(
         .all_workspaces => try store.list(alloc),
     };
     errdefer session_summary_codec.freeSummaries(alloc, &summaries);
+    try store.checkResumeCancellation();
     const keep = try alloc.alloc(bool, summaries.items.len);
     defer alloc.free(keep);
     for (summaries.items, keep) |summary, *retain| {
+        try store.checkResumeCancellation();
         retain.* = summary.hasResumableContent();
         if (retain.*) {
             if (active_id) |id| {

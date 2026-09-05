@@ -485,11 +485,60 @@ pub fn prepareCapturedToolModelOutput(
     };
 }
 
+pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
+    const memory = &prepared.memory;
+    if (memory.tool_images.len == 0 or memory.tool_image_handle != null) return;
+    const capability = config.session_child_capability orelse return;
+    const handle = result_store.storeToolImages(arena, capability, call.id, call.name, memory.tool_images) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("session", "tool images remain inline because artifact storage failed call_id={s} err={s}", .{ call.id, @errorName(err) });
+        return;
+    };
+    memory.tool_image_handle = handle;
+    const notice = try std.fmt.allocPrint(arena, "Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
+    const limit = config.max_tool_result_bytes -| notice.len;
+    const keep = @import("../../config/context_limits.zig").utf8PrefixLength(prepared.model_output, limit);
+    if (keep < prepared.model_output.len) memory.truncated = true;
+    prepared.model_output = try std.mem.concat(arena, u8, &.{ notice, prepared.model_output[0..keep] });
+}
+
+pub fn materializeToolImages(arena: Allocator, config: Config, messages: []const ChatMessage) ![]const ChatMessage {
+    const needed = for (messages) |message| {
+        if (message.tool_result_memory) |memory| if (memory.tool_images.len == 0 and memory.tool_image_handle != null) break true;
+    } else false;
+    if (!needed) return messages;
+    const materialized = try arena.dupe(ChatMessage, messages);
+    for (materialized) |*message| {
+        if (message.tool_result_memory) |*memory| {
+            if (memory.tool_images.len > 0) continue;
+            const handle = memory.tool_image_handle orelse continue;
+            if (config.session_child_capability) |capability| {
+                memory.tool_images = result_store.loadToolImages(arena, capability, handle) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const notice = try std.fmt.allocPrint(arena, "[Stored tool image unavailable: {s}]\n", .{@errorName(err)});
+                    message.content = try prependImageNotice(arena, notice, message.content orelse "", config.max_tool_result_bytes);
+                    continue;
+                };
+            } else {
+                message.content = try prependImageNotice(arena, "[Stored tool image is unavailable in this session.]\n", message.content orelse "", config.max_tool_result_bytes);
+            }
+        }
+    }
+    return materialized;
+}
+
+fn prependImageNotice(alloc: Allocator, notice: []const u8, content: []const u8, limit: usize) Allocator.Error![]u8 {
+    const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, limit -| notice.len);
+    return std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, limit)], content[0..keep] });
+}
+
 pub fn applyToolResultMemory(
     prepared: *types.ToolResultMemory,
     source: ?types.ToolResultMemory,
 ) void {
     const source_memory = source orelse return;
+    prepared.tool_images = source_memory.tool_images;
+    prepared.tool_image_handle = source_memory.tool_image_handle;
     prepared.command_output_replay = source_memory.command_output_replay;
     prepared.command_process_presentation = source_memory.command_process_presentation;
     prepared.terminal_action_presentation = source_memory.terminal_action_presentation;

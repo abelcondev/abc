@@ -348,7 +348,7 @@ fn buildGatewayRequestBodyValidated(
         if (i > 0) try out.writer.writeByte(',');
         if (message.role == .tool) {
             const results = tool_result_prefix(messages[i..]);
-            try write_tool_result_group(&out.writer, results, budget, &ids);
+            try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
             i += results.len;
             if (budget) |active| try active.check();
             continue;
@@ -628,6 +628,7 @@ fn tool_result_prefix(messages: []const ChatMessage) []const ChatMessage {
 }
 
 fn write_tool_result_group(
+    alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     results: []const ChatMessage,
     budget: ?BuildBudget,
@@ -637,12 +638,12 @@ fn write_tool_result_group(
     for (results, 0..) |result, index| {
         if (budget) |active| try active.check();
         if (index > 0) try writer.writeByte(',');
-        try write_tool_result_part(writer, result, ids);
+        try write_tool_result_part(alloc, writer, result, ids);
     }
     try writer.writeAll("]}");
 }
 
-fn write_tool_result_part(writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
+fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
     try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
     try writer.writeAll(",\"toolName\":");
@@ -653,6 +654,27 @@ fn write_tool_result_part(writer: *std.Io.Writer, message: ChatMessage, ids: *co
     else
         false;
     const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
+    const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+    if (tool_images.len > 0 and !denied) {
+        try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
+        const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+        defer if (failed) scratch_alloc.free(text);
+        if (text.len > 0) {
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(text, .{}, writer);
+            try writer.writeByte('}');
+        }
+        for (tool_images, 0..) |image, index| {
+            if (index > 0 or text.len > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"type\":\"image-data\",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeAll(",\"mediaType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}}");
+        return;
+    }
     if (denied) {
         try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
     } else if (failed) {
@@ -755,7 +777,7 @@ fn writeChatMessageJsonInner(
         },
         .tool => {
             try writer.writeAll(",\"content\":[");
-            try write_tool_result_part(writer, message, ids);
+            try write_tool_result_part(scratch_alloc, writer, message, ids);
             try writer.writeByte(']');
         },
     }
@@ -1604,6 +1626,49 @@ test "gateway request serialization keeps each tool result group together" {
     try std.testing.expectEqualStrings(body, repeated);
     try std.testing.expectEqualStrings("A\n\"quoted\"", messages[2].content.?);
     try std.testing.expectEqualStrings(denial, messages[4].content.?);
+}
+
+test "grouped tool results retain images and individual error status" {
+    const alloc = std.testing.allocator;
+    const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    const source_id = "functions.capture:0";
+    const calls = [_]ToolCall{
+        .{ .id = source_id, .name = "capture", .arguments_json = "{}" },
+        .{ .id = "labels", .name = "read_labels", .arguments_json = "{}" },
+    };
+    for ([_]types.PersistedToolStatus{ .success, .failure }) |status| {
+        const messages = [_]ChatMessage{
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = source_id, .tool_name = "capture", .content = "capture", .tool_result_status = status, .tool_result_memory = .{ .tool_images = &images } },
+            .{ .role = .tool, .tool_call_id = "labels", .tool_name = "read_labels", .content = "labels", .tool_result_status = .success },
+        };
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), prompt.len);
+        const results = prompt[1].object.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+        const projected_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
+        try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+        try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+        try std.testing.expect(!std.mem.eql(u8, source_id, projected_id));
+        try std.testing.expectEqualStrings(projected_id, results[0].object.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings(source_id, messages[1].tool_call_id.?);
+        const media = results[0].object.get("output").?.object;
+        try std.testing.expectEqualStrings("content", media.get("type").?.string);
+        const parts = media.get("value").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), parts.len);
+        try std.testing.expectEqualStrings(if (status == .failure) "Tool error: capture" else "capture", parts[0].object.get("text").?.string);
+        try std.testing.expectEqualStrings("image-data", parts[1].object.get("type").?.string);
+        try std.testing.expectEqualStrings(images[0].data, parts[1].object.get("data").?.string);
+        try std.testing.expectEqualStrings("image/png", parts[1].object.get("mediaType").?.string);
+        try std.testing.expectEqualStrings("labels", results[1].object.get("toolCallId").?.string);
+        const plain = results[1].object.get("output").?.object;
+        try std.testing.expectEqualStrings("text", plain.get("type").?.string);
+        try std.testing.expectEqualStrings("labels", plain.get("value").?.string);
+    }
 }
 
 test "grouped tool results preserve request budgets with automatic caching" {

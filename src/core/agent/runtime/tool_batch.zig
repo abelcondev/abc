@@ -169,6 +169,7 @@ pub fn assembleParallelToolResults(
             &prepared.memory,
             execution.tool_result_memory,
         );
+        try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
         if (precomputed == null) {
             runtime_parallel_execution.reportInnerToolUsage(hooks, original_call.name, execution);

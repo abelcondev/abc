@@ -3156,6 +3156,7 @@ test.skipIf(!tmuxAvailable())(
             stderrPath,
             width,
             height: width === 88 ? 24 : 36,
+            remainOnExit: true,
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Show the prepared paragraphs.");
@@ -3183,10 +3184,17 @@ test.skipIf(!tmuxAvailable())(
           );
           const historyAfter = await active.captureFullScrollback();
           expect(historyAfter).toContain(`┃ ${draft}`);
-          if (width === 120) {
-            const historyMarker = "ROW14 ALPHA14_abcdefghijklmnopqrstuvwxyz0123456789";
-            expect(historyBefore).toContain(historyMarker);
-            expect(historyAfter).toContain(historyMarker);
+          const beforeText = historyBefore.replace(/\s+/g, "");
+          const afterText = historyAfter.replace(/\s+/g, "");
+          let previousEnd = 0;
+          for (const paragraph of response.split("\n\n")) {
+            const text = paragraph.replace(/\s+/g, "");
+            expect(beforeText).toContain(text);
+            expect(afterText).toContain(text);
+            expect(afterText.split(text)).toHaveLength(2);
+            const start = afterText.indexOf(text, previousEnd);
+            expect(start).toBeGreaterThanOrEqual(previousEnd);
+            previousEnd = start + text.length;
           }
           const events = readFileSync(
             join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
@@ -5247,6 +5255,7 @@ test.skipIf(!tmuxAvailable())(
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const freshStderrPath = join(root, "fresh-stderr.log");
+    const tracePath = join(root, "trace.log");
     const argvLogPath = join(root, "upgrade-argv.log");
     mkdirSync(home);
     mkdirSync(freshHome);
@@ -5268,6 +5277,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(stderrPath, "");
       writeFileSync(freshStderrPath, "");
+      writeFileSync(tracePath, "");
       active = await TmuxSession.create({
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
@@ -5275,6 +5285,8 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,session",
         },
         stderrPath,
         width: 110,
@@ -5291,6 +5303,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
+      const traceBeforeUpgrade = readFileSync(tracePath, "utf8");
 
       fresh = await TmuxSession.create({
         cmd: shellQuote(installedFx),
@@ -5315,6 +5328,11 @@ test.skipIf(!tmuxAvailable())(
 
       const updatedNotice = `● fx has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const postUpgradeTrace = readFileSync(tracePath, "utf8");
+      expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
+        "session picker completion",
+      );
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
@@ -6789,3 +6807,101 @@ test.skipIf(!tmuxAvailable())(
   },
   120_000,
 );
+
+for (const inspectDetails of [false, true]) {
+  test.skipIf(!tmuxAvailable())(
+    `resumed tool history survives continuation${inspectDetails ? " after full detail resize" : ""}`,
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resumed-tool-history-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        sound: false, permission_mode: "auto", sandbox: "none",
+      }));
+      const ledger = Array.from({ length: 420 }, (_, i) => `ROW_${i + 1} café 東京`).join("\n") + "\n";
+      writeFileSync(join(workspace, "ledger.txt"), ledger);
+      const savedReply = "Created receipt.txt with:\n\nRECEIVED\n\nledger.txt was not changed.";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("read-ledger", "read_file", { path: "ledger.txt", line_count: 420 }),
+        fakeGatewayFinalText("ledger.txt contains 420 rows."),
+        fakeGatewayToolCall("write-receipt", "write_file", { path: "receipt.txt", content: "RECEIVED\n" }),
+        fakeGatewayFinalText(savedReply),
+        fakeGatewayToolCall("read-missing", "read_file", { path: "missing.txt" }),
+        fakeGatewayFinalText("missing.txt does not exist."),
+        fakeGatewayFinalText("I created receipt.txt and left ledger.txt unchanged."),
+        fakeGatewayToolCall("write-second", "write_file", { path: "second.txt", content: "AFTER\n" }),
+        fakeGatewayFinalText("Created second.txt once."),
+      ]);
+      let active: TmuxSession | null = null;
+      const prompt = async (text: string) => {
+        const offset = existsSync(tracePath) ? readFileSync(tracePath, "utf8").length : 0;
+        await active!.sendText(text);
+        await waitForCondition(
+          () => existsSync(tracePath) && readFileSync(tracePath, "utf8").slice(offset).includes("event=prompt_finish"),
+          "completed prompt", TIMEOUT,
+        );
+        await active!.waitForComposer(TIMEOUT);
+      };
+      const markers = ["Wrote receipt.txt", "Created receipt.txt with:", "RECEIVED", "ledger.txt was not changed.", "missing.txt does not exist."];
+      const assertHistory = async () => {
+        const plain = stripAnsi(await active!.captureFullScrollbackEscapes());
+        for (const marker of markers) expect(plain).toContain(marker);
+      };
+      try {
+        const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,worker" };
+        active = await TmuxSession.create({ cmd: FX_BIN, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 160, height: 48 });
+        await active.waitForComposer(TIMEOUT);
+        await prompt("Read every line of ledger.txt without changing it.");
+        await prompt("Create receipt.txt containing RECEIVED and a newline. Keep ledger.txt unchanged.");
+        await prompt("Read missing.txt once without retrying.");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        const sessionId = sessionIdFromHome(home);
+        const eventsPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
+        await active.kill();
+        active = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
+        await active.waitForComposer(TIMEOUT);
+        await assertHistory();
+        if (inspectDetails) {
+          await active.sendKeys("C-o");
+          await active.waitForText("Full detail", TIMEOUT);
+          await active.sendKeys("PPage");
+          await active.resizeWindow(60, 18);
+          await Bun.sleep(350);
+          await active.sendKeys("NPage");
+          await active.resizeWindow(88, 24);
+          await Bun.sleep(350);
+          await active.sendKeys("Escape");
+          await active.waitForPane(pane => !pane.includes("Full detail"), TIMEOUT);
+          await Bun.sleep(150);
+        }
+        await prompt("In one sentence, confirm which file you created. Do not use tools.");
+        await assertHistory();
+        await prompt("Create second.txt containing AFTER and a newline. Leave the other files unchanged.");
+        await assertHistory();
+        expect(readFileSync(join(workspace, "receipt.txt"), "utf8")).toBe("RECEIVED\n");
+        expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("AFTER\n");
+        expect(readFileSync(join(workspace, "ledger.txt"), "utf8")).toBe(ledger);
+        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
+        expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
+        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+          .toEqual({ turn_id: 2, call_id: "write-receipt" });
+        expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
+        expect(gateway.requests).toHaveLength(9);
+        expect(active.isPaneAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await active.sendText("/quit");
+        await waitForCondition(() => active!.paneStatus().dead, "session exit", TIMEOUT);
+        expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
+      } finally {
+        if (active) await active.kill();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+}

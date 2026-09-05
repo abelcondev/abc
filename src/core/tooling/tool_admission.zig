@@ -74,6 +74,7 @@ pub const Input = struct {
     session_permission_state_provider: ?SessionPermissionStateProvider = null,
     tool_registry: tool_dispatch.Registry,
     worker: *WorkerRuntime,
+    mcp_review_schema_json: ?[]const u8 = null,
     permission_prompter: ?permission_prompter.Prompter = null,
     advertised_dynamic_tool_names: []const []const u8,
     mcp_runtime: tool_mcp_runtime.RuntimeCapabilities,
@@ -716,29 +717,6 @@ fn fileMutationPermissionTargets(
     return targets;
 }
 
-fn schemaForReview(
-    input: Input,
-    arena: Allocator,
-    call: ToolCall,
-    is_dynamic_tool: bool,
-) !?[]const u8 {
-    if (!is_dynamic_tool) return null;
-    const context = input.mcp_runtime.context orelse return null;
-    const tool_schema = input.mcp_runtime.tool_schema orelse return null;
-    const result = (try tool_schema(
-        context,
-        arena,
-        call.name,
-        input.permission_rules,
-        input.context_limits,
-        input.mcp_runtime.access,
-    )) orelse return null;
-    return switch (result) {
-        .selected => |payload| payload.model_output,
-        .rejected => null,
-    };
-}
-
 fn reviewRequestForCall(
     input: Input,
     arena: Allocator,
@@ -774,12 +752,7 @@ fn reviewRequestForCall(
             break :blk .{ .tool = .{
                 .tool_name = call.name,
                 .arguments_json = call.arguments_json,
-                .schema_json = try schemaForReview(
-                    input,
-                    arena,
-                    call,
-                    is_dynamic_tool,
-                ),
+                .schema_json = if (is_dynamic_tool) input.mcp_review_schema_json else null,
                 .schema_required = is_dynamic_tool,
             } };
         };
@@ -5642,21 +5615,6 @@ test "selected dynamic MCP review receives exact arguments and advertised schema
         fn hasTool(_: *anyopaque, name: []const u8, _: tool_mcp_runtime.Access) bool {
             return std.mem.eql(u8, name, "mcp_example_write");
         }
-
-        fn schema(
-            _: *anyopaque,
-            alloc: Allocator,
-            name: []const u8,
-            _: types.PermissionRuleSet,
-            _: context_limits.Values,
-            _: tool_mcp_runtime.Access,
-        ) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-            if (!std.mem.eql(u8, name, "mcp_example_write")) return null;
-            return .{ .selected = .{ .model_output = try alloc.dupe(
-                u8,
-                "{\"name\":\"mcp_example_write\",\"inputSchema\":{\"type\":\"object\"}}",
-            ) } };
-        }
     };
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5674,10 +5632,10 @@ test "selected dynamic MCP review receives exact arguments and advertised schema
         ),
     );
     input.advertised_dynamic_tool_names = &advertised;
+    input.mcp_review_schema_json = "{\"name\":\"mcp_example_write\",\"inputSchema\":{\"type\":\"object\"}}";
     input.mcp_runtime = .{
         .context = @ptrCast(&marker),
         .has_tool = Mcp.hasTool,
-        .tool_schema = Mcp.schema,
     };
 
     const arguments = "{\"path\":\"outside.txt\",\"value\":\"exact\"}";

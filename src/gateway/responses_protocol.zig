@@ -101,7 +101,31 @@ pub fn writeInput(
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
                 try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
                 try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                if (tool_images.len == 0) {
+                    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                } else {
+                    const failed = message.tool_result_status == .failure;
+                    const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
+                    defer if (failed) scratch_alloc.free(text);
+                    try writer.writeByte('[');
+                    if (text.len > 0) {
+                        try writer.writeAll("{\"type\":\"input_text\",\"text\":");
+                        try std.json.Stringify.value(text, .{}, writer);
+                        try writer.writeByte('}');
+                    }
+                    for (tool_images, 0..) |image, index| {
+                        try budget.check();
+                        const url = try std.fmt.allocPrint(scratch_alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                        defer scratch_alloc.free(url);
+                        if (index > 0 or text.len > 0) try writer.writeByte(',');
+                        try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
+                        try std.json.Stringify.value(url, .{}, writer);
+                        try writer.writeByte('}');
+                        try budget.check();
+                    }
+                    try writer.writeByte(']');
+                }
                 try writer.writeByte('}');
             },
         }
@@ -111,23 +135,34 @@ pub fn writeInput(
 test "Responses request projects long call ids with matching outputs" {
     const source_id = "c" ** 65;
     const calls = [_]types.ToolCall{.{ .id = source_id, .name = "read_file", .arguments_json = "{}" }};
-    const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result" },
-    };
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try out.writer.writeByte('[');
-    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
-    try out.writer.writeByte(']');
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
-    defer parsed.deinit();
-    const items = parsed.value.array.items;
-    const call_id = items[0].object.get("call_id").?.string;
-    try std.testing.expect(call_id.len <= 64);
-    try std.testing.expectEqualStrings(call_id, items[1].object.get("call_id").?.string);
-    try std.testing.expectEqualStrings(source_id, calls[0].id);
-    try std.testing.expectEqualStrings("result", items[1].object.get("output").?.string);
+    const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    for ([_]bool{ false, true }) |with_images| {
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result", .tool_result_memory = if (with_images) .{ .tool_images = &images } else null },
+        };
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try out.writer.writeByte('[');
+        try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+        try out.writer.writeByte(']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        const call_id = items[0].object.get("call_id").?.string;
+        try std.testing.expect(call_id.len <= 64);
+        try std.testing.expectEqualStrings(call_id, items[1].object.get("call_id").?.string);
+        try std.testing.expectEqualStrings(source_id, calls[0].id);
+        if (with_images) {
+            const output = items[1].object.get("output").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), output.len);
+            try std.testing.expectEqualStrings("result", output[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("input_image", output[1].object.get("type").?.string);
+            try std.testing.expectEqualStrings("data:image/png;base64,cG5n", output[1].object.get("image_url").?.string);
+        } else {
+            try std.testing.expectEqualStrings("result", items[1].object.get("output").?.string);
+        }
+    }
 }
 
 test "Responses request preserves opaque tool-call identity" {
@@ -232,10 +267,11 @@ test "Responses images remain on their owning users across tools and later promp
     const second = try ImageInputTest.capture(alloc, &tmp, "second.png", "\x89PNG\r\n\x1a\nB", 2);
     defer types.freeImageAttachment(alloc, second);
     const calls = [_]types.ToolCall{.{ .id = "read_1", .name = "read_file", .arguments_json = "{}" }};
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "first", .images = &.{first} },
         .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .tool_call_id = "read_1", .tool_name = "read_file", .content = "read result" },
+        .{ .role = .tool, .tool_call_id = "read_1", .tool_name = "read_file", .content = "read result", .tool_result_memory = .{ .tool_images = &tool_images } },
         .{ .role = .user, .content = "second", .images = &.{ second, first } },
         .{ .role = .assistant, .content = "response" },
         .{ .role = .user, .content = "continue" },
@@ -254,6 +290,10 @@ test "Responses images remain on their owning users across tools and later promp
     try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", first_parts[1].object.get("image_url").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpC", second_parts[1].object.get("image_url").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", second_parts[2].object.get("image_url").?.string);
+    const tool_parts = items[2].object.get("output").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tool_parts.len);
+    try std.testing.expectEqualStrings("read result", tool_parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,cG5n", tool_parts[1].object.get("image_url").?.string);
     try std.testing.expectEqual(@as(usize, 1), items[5].object.get("content").?.array.items.len);
 }
 
@@ -365,6 +405,27 @@ test "Responses image encoding observes cancellation after partial output" {
     try std.testing.expectError(error.Cancelled, writeInputImage(&out.writer, .{ .bytes = &bytes, .media_type = "image/png" }, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
     try std.testing.expect(out.written().len > 1024);
     try std.testing.expect(out.written().len < bytes.len);
+}
+
+test "Responses tool images observe cancellation after bounded image output" {
+    const Cancel = struct {
+        fn check(raw: *anyopaque) !void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(raw));
+            if (out.written().len > 1024) return error.Cancelled;
+        }
+    };
+    var data: [32 * 1024]u8 = undefined;
+    @memset(&data, 'A');
+    const images = [_]types.ToolImage{.{ .data = &data, .mime_type = @constCast("image/png") }};
+    const calls = [_]types.ToolCall{.{ .id = "capture_1", .name = "capture", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "capture_1", .tool_name = "capture", .content = "capture", .tool_result_memory = .{ .tool_images = &images } },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.Cancelled, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expect(out.written().len > data.len);
 }
 
 fn writeInputImage(
