@@ -6654,6 +6654,92 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  test.each([
+    ["before output", 401, false],
+    ["after effects", 403, true],
+  ] as const)("subagent HTTP failures retain terminal outcome %s", async (_, status, withEffect) => {
+    const root = createFixtureRoot("subagent-http-outcome");
+    const marker = join(root.workspace, "effect.txt");
+    const task = "SUBAGENT_HTTP_OUTCOME: perform the prepared task once.";
+    const followupTask = "SUBAGENT_HTTP_RECOVERY: reply CHILD_RECOVERED without tools.";
+    type Child = { id: string; phase: string; active: unknown; last_outcome: string; last_failure: string | null };
+    let failed: { ok: boolean; result: string | null; error_code: string | null } | undefined;
+    let recovered: typeof failed;
+    let failedChild: Child | undefined;
+    let childRequests = 0;
+    let markerAtFailure: string | null = null;
+    let registryPath = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "http_followup")) {
+        recovered = JSON.parse(toolResultOutput(body, "http_followup"));
+        return fakeGatewayFinalText("SUBAGENT_HTTP_OBSERVED");
+      }
+      if (hasCurrentToolResult(body, "http_delegate")) {
+        failed = JSON.parse(toolResultOutput(body, "http_delegate"));
+        const sessions = join(root.home, ".fx", "sessions");
+        const parentId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "children.json")))!;
+        registryPath = join(sessions, parentId, "subagent", "children.json");
+        failedChild = JSON.parse(readFileSync(registryPath, "utf8")).children[0];
+        return withEffect
+          ? fakeGatewayToolCall("http_followup", "subagent", { request: { action: "message", agent: "reporter", message: followupTask } })
+          : fakeGatewayFinalText("SUBAGENT_HTTP_OBSERVED");
+      }
+      if (body.includes(followupTask)) {
+        childRequests++;
+        return fakeGatewayFinalText("CHILD_RECOVERED");
+      }
+      if (body.includes(task)) {
+        childRequests++;
+        if (withEffect && childRequests === 1) return fakeShellRun("http_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
+        markerAtFailure = existsSync(marker) ? readFileSync(marker, "utf8") : null;
+        return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
+          status, headers: { "content-type": "application/json" },
+        });
+      }
+      return fakeGatewayToolCall("http_delegate", "subagent", {
+        request: withEffect ? { action: "message", agent: "reporter", message: task } : { action: "run", task },
+      });
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--auto", "Observe the delegated task's outcome."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, ""), FX_TRACE_LOG: undefined, FX_TRACE: undefined, FX_TRACE_SCOPES: undefined },
+        timeoutMs: 15_000,
+      });
+      expect(run.code).toBe(0);
+      expect(run.timedOut).toBe(false);
+      expect(failed).toMatchObject({ ok: false, error_code: "child_failed" });
+      expect(failed?.result).toContain(`provider_http_error: API access denied · HTTP ${status}`);
+      expect(failed?.result).toContain("Earlier tool calls may have completed");
+      expect(failedChild).toMatchObject({ phase: withEffect ? "idle" : "finished", active: null, last_outcome: "failed" });
+      expect(failedChild?.last_failure).toContain(`HTTP ${status}`);
+      const saved = JSON.parse(readFileSync(registryPath, "utf8"));
+      expect(saved.children).toHaveLength(1);
+      expect(saved.children[0].id).toBe(failedChild?.id);
+      expect(childRequests).toBe(withEffect ? 3 : 1);
+      expect(gateway.requestCount()).toBe(withEffect ? 6 : 3);
+      if (withEffect) {
+        expect(markerAtFailure).toBe("EFFECT_ONCE\n");
+        expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
+        expect(recovered).toEqual({ ok: true, result: "CHILD_RECOVERED", error_code: null });
+        expect(saved.children[0]).toMatchObject({ active: null, last_outcome: "completed", last_failure: null });
+      } else {
+        expect(markerAtFailure).toBeNull();
+        expect(existsSync(marker)).toBe(false);
+        expect(saved.children[0].last_failure).toBe(failedChild?.last_failure);
+      }
+      const json = parseAskJson(run.stdout);
+      expect(json.output).toContain("SUBAGENT_HTTP_OBSERVED");
+      expect(json.tool_calls).toEqual(withEffect
+        ? [{ name: "subagent", status: "error" }, { name: "subagent", status: "success" }]
+        : [{ name: "subagent", status: "error" }]);
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("subagent replay returns saved success and failure without another worker", async () => {
     const root = createFixtureRoot("subagent-completed-replay");
     const task = "Reply REPLAY_CHILD_DONE without tools.";

@@ -310,7 +310,31 @@ pub fn run(
         debug_trace.eventf("subagent", "child_execution_failed", trace_context, "child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
         return mapped;
     };
-    return if (context.turn_outcome == .paused) .paused else .completed;
+    return finalRunOutcome(context.turn_outcome);
+}
+
+fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed}!execution.RunOutcome {
+    return switch (outcome orelse return error.ProviderFailed) {
+        .completed => .completed,
+        .failed => error.ProviderFailed,
+        .interrupted, .paused => .paused,
+    };
+}
+
+test "subagent finalization preserves every outcome and fails closed on absence" {
+    const cases = [_]struct {
+        outcome: ?types.TurnPresentationOutcome,
+        expected: error{ProviderFailed}!execution.RunOutcome,
+    }{
+        .{ .outcome = .completed, .expected = .completed },
+        .{ .outcome = .failed, .expected = error.ProviderFailed },
+        .{ .outcome = .interrupted, .expected = .paused },
+        .{ .outcome = .paused, .expected = .paused },
+        .{ .outcome = null, .expected = error.ProviderFailed },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, finalRunOutcome(case.outcome));
+    }
 }
 
 fn withoutSubagentNames(
