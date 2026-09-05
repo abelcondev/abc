@@ -593,10 +593,67 @@ fn checkOptionalIdentity(fields: std.json.ObjectMap, key: []const u8, expected: 
     }
 }
 
-fn optionalOutputIndex(fields: std.json.ObjectMap) error{InvalidEvent}!?i64 {
-    const value = fields.get("output_index") orelse return null;
+fn optional_index(fields: std.json.ObjectMap, name: []const u8) error{InvalidEvent}!?i64 {
+    const value = fields.get(name) orelse return null;
     if (value != .integer or value.integer < 0) return error.InvalidEvent;
     return value.integer;
+}
+
+const TextKey = struct {
+    output_index: i64,
+    content_index: i64,
+
+    fn precedes(self: TextKey, other: TextKey) bool {
+        return self.output_index < other.output_index or
+            (self.output_index == other.output_index and self.content_index < other.content_index);
+    }
+};
+
+const TextKind = enum { text, refusal };
+const TextMode = enum { delta, final };
+const TextDigest = std.crypto.hash.sha2.Sha256;
+
+const TextUpdate = struct {
+    key: TextKey,
+    kind: TextKind,
+    item_id_hash: ?[TextDigest.digest_length]u8,
+    text: []const u8,
+    mode: TextMode,
+};
+
+const TextPart = struct {
+    kind: TextKind,
+    item_id_hash: ?[TextDigest.digest_length]u8 = null,
+    received_bytes: usize = 0,
+    digest: TextDigest = .init(.{}),
+    finalized: bool = false,
+
+    // Receipt is independent of capture: capped text cannot validate a final prefix.
+    fn final_suffix(self: *const TextPart, text: []const u8) ![]const u8 {
+        if (text.len < self.received_bytes or
+            (self.finalized and text.len != self.received_bytes)) return error.ResponsesTextConflict;
+        var actual: [TextDigest.digest_length]u8 = undefined;
+        TextDigest.hash(text[0..self.received_bytes], &actual, .{});
+        var prior = self.digest;
+        const expected = prior.finalResult();
+        if (!std.mem.eql(u8, &actual, &expected)) return error.ResponsesTextConflict;
+        return text[self.received_bytes..];
+    }
+};
+
+fn text_key(fields: std.json.ObjectMap) !TextKey {
+    return .{
+        .output_index = try optional_index(fields, "output_index") orelse 0,
+        .content_index = try optional_index(fields, "content_index") orelse 0,
+    };
+}
+
+fn text_identity(fields: std.json.ObjectMap, name: []const u8) !?[TextDigest.digest_length]u8 {
+    const value = fields.get(name) orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidEvent;
+    var digest: [TextDigest.digest_length]u8 = undefined;
+    TextDigest.hash(value.string, &digest, .{});
+    return digest;
 }
 
 pub const Reducer = struct {
@@ -608,7 +665,9 @@ pub const Reducer = struct {
     usage: types.Usage = .{},
     generation_id: ?[]u8 = null,
     terminal_seen: bool = false,
-    saw_content_delta: bool = false,
+    text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
+    last_text_key: ?TextKey = null,
+    text_bytes: usize = 0,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
@@ -618,6 +677,7 @@ pub const Reducer = struct {
 
     pub fn deinit(self: *Reducer, alloc: std.mem.Allocator) void {
         self.content.deinit(alloc);
+        self.text_parts.deinit(alloc);
         self.provider_state.deinit();
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
@@ -655,7 +715,7 @@ pub const Reducer = struct {
         const event_type = stringField(parsed.value.object, "type") orelse return false;
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -681,10 +741,28 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
             std.mem.eql(u8, event_type, "response.refusal.delta"))
         {
-            const delta = stringField(parsed.value.object, "delta") orelse return false;
-            self.saw_content_delta = true;
-            callbacks.on_content(callbacks.context, delta);
-            try appendCaptured(alloc, &self.content, delta, content_capture_limit);
+            try self.accept_text(alloc, .{
+                .key = try text_key(parsed.value.object),
+                .kind = if (std.mem.eql(u8, event_type, "response.refusal.delta")) .refusal else .text,
+                .item_id_hash = try text_identity(parsed.value.object, "item_id"),
+                .text = stringField(parsed.value.object, "delta") orelse return error.InvalidEvent,
+                .mode = .delta,
+            }, callbacks, content_capture_limit, limits);
+        } else if (std.mem.eql(u8, event_type, "response.output_text.done") or
+            std.mem.eql(u8, event_type, "response.refusal.done"))
+        {
+            const refusal = std.mem.eql(u8, event_type, "response.refusal.done");
+            try self.accept_text(alloc, .{
+                .key = try text_key(parsed.value.object),
+                .kind = if (refusal) .refusal else .text,
+                .item_id_hash = try text_identity(parsed.value.object, "item_id"),
+                .text = stringField(parsed.value.object, if (refusal) "refusal" else "text") orelse return error.InvalidEvent,
+                .mode = .final,
+            }, callbacks, content_capture_limit, limits);
+        } else if (std.mem.eql(u8, event_type, "response.content_part.done")) {
+            const part = parsed.value.object.get("part") orelse return error.InvalidEvent;
+            if (part != .object) return error.InvalidEvent;
+            try self.finalize_text_part(alloc, try text_key(parsed.value.object), try text_identity(parsed.value.object, "item_id"), part.object, callbacks, content_capture_limit, limits);
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
             std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
         {
@@ -693,7 +771,7 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, "\n\n");
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             const index = findTool(self.tools.items, output_index) orelse return false;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
@@ -701,13 +779,13 @@ pub const Reducer = struct {
             try appendToolArguments(alloc, &self.tools.items[index].arguments, delta, limits.tool_arguments_bytes);
             if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
             const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
             try self.tools.items[index].finalizeArguments(alloc, arguments, callbacks, limits);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const output_index = try optionalOutputIndex(parsed.value.object) orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -737,16 +815,8 @@ pub const Reducer = struct {
                 }
                 try self.provider_state.writer.writeAll(encoded.written());
                 self.provider_state_count += 1;
-            } else if (std.mem.eql(u8, item_type, "message") and !self.saw_content_delta) {
-                if (item.object.get("content")) |parts| if (parts == .array) {
-                    for (parts.array.items) |part| {
-                        if (part != .object) continue;
-                        const text = stringField(part.object, "text") orelse
-                            stringField(part.object, "refusal") orelse continue;
-                        callbacks.on_content(callbacks.context, text);
-                        try appendCaptured(alloc, &self.content, text, content_capture_limit);
-                    }
-                };
+            } else if (std.mem.eql(u8, item_type, "message")) {
+                try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -757,12 +827,18 @@ pub const Reducer = struct {
             if (response_value.object.get("output")) |output| {
                 if (output != .array) return error.InvalidEvent;
                 for (output.array.items, 0..) |item, output_index| {
+                    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (item != .object) continue;
                     const item_type = stringField(item.object, "type") orelse continue;
-                    if (!std.mem.eql(u8, item_type, "function_call")) continue;
-                    try self.reconcileToolItem(alloc, std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded, item.object, callbacks, limits);
+                    const index = std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded;
+                    if (std.mem.eql(u8, item_type, "function_call")) {
+                        try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
+                    } else if (std.mem.eql(u8, item_type, "message")) {
+                        try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                    }
                 }
             }
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             self.terminal_seen = true;
             self.finish_reason = finishReason(
                 stringField(response_value.object, "status"),
@@ -781,6 +857,89 @@ pub const Reducer = struct {
             return error.ResponseFailed;
         }
         return false;
+    }
+
+    fn accept_text(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        update: TextUpdate,
+        callbacks: StreamCallbacks,
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        if (self.text_parts.count() >= limits.events and !self.text_parts.contains(update.key)) return error.ResourceLimitExceeded;
+        const entry = try self.text_parts.getOrPut(alloc, update.key);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .kind = update.kind };
+        const part = entry.value_ptr;
+        if (part.kind != update.kind) return error.ResponsesTextConflict;
+        if (update.item_id_hash) |id| {
+            if (part.item_id_hash) |prior| {
+                if (!std.mem.eql(u8, &id, &prior)) return error.ResponsesTextConflict;
+            } else part.item_id_hash = id;
+        }
+        const suffix = switch (update.mode) {
+            .final => try part.final_suffix(update.text),
+            .delta => blk: {
+                if (part.finalized and update.text.len != 0) return error.ResponsesTextConflict;
+                break :blk update.text;
+            },
+        };
+        if (suffix.len != 0) {
+            if (self.last_text_key) |last| if (update.key.precedes(last)) return error.ResponsesTextConflict;
+            const total = try checkedAccumulatedSize(self.text_bytes, suffix.len, limits.aggregate_bytes);
+            try appendCaptured(alloc, &self.content, suffix, capture_limit);
+            part.digest.update(suffix);
+            part.received_bytes += suffix.len; // Bounded by the aggregate total above.
+            self.text_bytes = total;
+            self.last_text_key = update.key;
+        }
+        if (update.mode == .final) part.finalized = true;
+        if (suffix.len != 0) callbacks.on_content(callbacks.context, suffix);
+    }
+
+    fn finalize_text_part(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        key: TextKey,
+        item_id_hash: ?[TextDigest.digest_length]u8,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        const kind = stringField(fields, "type") orelse return error.InvalidEvent;
+        const refusal = std.mem.eql(u8, kind, "refusal");
+        if (!refusal and !std.mem.eql(u8, kind, "output_text")) return;
+        try self.accept_text(alloc, .{
+            .key = key,
+            .kind = if (refusal) .refusal else .text,
+            .item_id_hash = item_id_hash,
+            .text = stringField(fields, if (refusal) "refusal" else "text") orelse return error.InvalidEvent,
+            .mode = .final,
+        }, callbacks, capture_limit, limits);
+    }
+
+    fn finalize_text_message(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        output_index: i64,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        cancel_flag: *std.atomic.Value(bool),
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        const parts = fields.get("content") orelse return error.InvalidEvent;
+        if (parts != .array) return error.InvalidEvent;
+        const identity = try text_identity(fields, "id");
+        for (parts.array.items, 0..) |part, content_index| {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            if (part != .object) return error.InvalidEvent;
+            try self.finalize_text_part(alloc, .{
+                .output_index = output_index,
+                .content_index = std.math.cast(i64, content_index) orelse return error.ResourceLimitExceeded,
+            }, identity, part.object, callbacks, capture_limit, limits);
+        }
     }
 
     fn reconcileToolItem(
@@ -897,6 +1056,231 @@ const ToolRecordTest = struct {
 
     fn ignore(_: *anyopaque, _: []const u8) void {}
 };
+
+test "Responses text finalization preserves mixed streamed and final-only items" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_0\",\"delta\":\"COMMENTARY_ITEM\\n\"}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"FINAL_ANSWER_ITEM\"}]}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("COMMENTARY_ITEM\nFINAL_ANSWER_ITEM", completion.content.?);
+}
+
+const TextRecordTest = struct {
+    alloc: std.mem.Allocator,
+    reducer: Reducer,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    capture_limit: ?usize = null,
+    emitted_bytes: usize = 0,
+    emitted_digest: TextDigest = .init(.{}),
+    cancel_on_content: bool = false,
+    limits: StreamLimits = ToolRecordTest.limits,
+
+    fn init(alloc: std.mem.Allocator) TextRecordTest {
+        return .{ .alloc = alloc, .reducer = .init(alloc) };
+    }
+
+    fn deinit(self: *TextRecordTest) void {
+        self.reducer.deinit(self.alloc);
+    }
+
+    fn content(raw: *anyopaque, bytes: []const u8) void {
+        const self: *TextRecordTest = @ptrCast(@alignCast(raw));
+        self.emitted_bytes += bytes.len;
+        self.emitted_digest.update(bytes);
+        if (self.cancel_on_content) self.cancelled.store(true, .seq_cst);
+    }
+
+    fn apply(self: *TextRecordTest, event: []const u8) !void {
+        _ = try self.reducer.applyJson(self.alloc, event, .{ .context = self, .on_content = content }, &self.cancelled, self.capture_limit, self.limits);
+    }
+
+    fn json(self: *TextRecordTest, event: anytype) !void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(event, .{}, &out.writer);
+        try self.apply(out.written());
+    }
+
+    fn delta(self: *TextRecordTest, item: i64, part: i64, text: []const u8) !void {
+        try self.json(.{ .type = "response.output_text.delta", .output_index = item, .content_index = part, .delta = text });
+    }
+
+    fn final(self: *TextRecordTest, item: i64, part: i64, text: []const u8) !void {
+        try self.json(.{ .type = "response.output_text.done", .output_index = item, .content_index = part, .text = text });
+    }
+
+    fn expect_emitted(self: *const TextRecordTest, expected: []const u8) !void {
+        try std.testing.expectEqual(expected.len, self.emitted_bytes);
+        var actual = self.emitted_digest;
+        var expected_hash: [TextDigest.digest_length]u8 = undefined;
+        TextDigest.hash(expected, &expected_hash, .{});
+        try std.testing.expectEqual(expected_hash, actual.finalResult());
+    }
+
+    fn finish(self: *TextRecordTest, expected: []const u8) !void {
+        try self.apply(ToolRecordTest.terminal);
+        var result = stream_provider.Result{ .completed = .{
+            .completion = try self.reducer.finish(self.alloc, &self.cancelled, self.limits),
+            .ownership = .owned,
+        } };
+        defer result.deinit(self.alloc);
+        const limit = self.capture_limit orelse expected.len;
+        try std.testing.expectEqualStrings(expected[0..@min(expected.len, limit)], result.completed.completion.content orelse "");
+        try self.expect_emitted(expected);
+    }
+};
+
+test "Responses text finalization converges across every final record layer" {
+    for ([_]?usize{ null, 0, 2 }) |capture_limit| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.capture_limit = capture_limit;
+        try stream.delta(0, 0, "Hel");
+        try stream.final(0, 0, "Hello");
+        try stream.apply("{\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg\",\"part\":{\"type\":\"output_text\",\"text\":\"Hello\"}}");
+        try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\"!\"}]}}");
+        try stream.apply("{\"type\":\"response.refusal.done\",\"output_index\":0,\"content_index\":1,\"item_id\":\"msg\",\"refusal\":\"!\"}");
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\"!\"}]}]}}");
+        try stream.finish("Hello!");
+    }
+}
+
+test "Responses text finalization reads terminal-only messages and streamed refusals" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"No\"}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" Alternative.\"}]}]}}");
+    try stream.finish("No. Alternative.");
+}
+
+test "Responses text finalization retains item text when the terminal envelope is empty" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.delta(0, 0, "accepted");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"message\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"accepted final\"}]}}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}");
+    try stream.finish("accepted final");
+}
+
+test "Responses text finalization rejects contradictory content identity and finality" {
+    for ([_][]const u8{
+        "{\"type\":\"response.output_text.done\",\"text\":\"changed\",\"item_id\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":\"he\",\"item_id\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":\"hello\",\"item_id\":\"b\"}",
+        "{\"type\":\"response.refusal.done\",\"refusal\":\"hello\",\"item_id\":\"a\"}",
+    }) |final_record| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.capture_limit = 1;
+        try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"item_id\":\"a\"}");
+        try std.testing.expectError(error.ResponsesTextConflict, stream.apply(final_record));
+        try stream.expect_emitted("hello");
+    }
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.final(0, 0, "done");
+    try std.testing.expectError(error.ResponsesTextConflict, stream.final(0, 0, "done later"));
+    try std.testing.expectError(error.ResponsesTextConflict, stream.delta(0, 0, "later"));
+    try stream.delta(0, 0, "");
+    try stream.finish("done");
+}
+
+test "Responses text finalization rejects malformed supplied correlation" {
+    for ([_][]const u8{
+        "{\"type\":\"response.output_text.delta\",\"output_index\":-1,\"delta\":\"a\"}",
+        "{\"type\":\"response.output_text.delta\",\"content_index\":\"0\",\"delta\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"content_index\":null,\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"item_id\":7,\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"item_id\":\"\",\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":7}",
+        "{\"type\":\"response.content_part.done\",\"part\":null}",
+    }) |event| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+        try stream.expect_emitted("");
+    }
+}
+
+test "Responses text finalization preserves append order and bounded sparse indexes" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.delta(0, 0, "a");
+    try stream.final(99_999_999, 99_999_999, "b");
+    try stream.final(0, 0, "a");
+    try std.testing.expectError(error.ResponsesTextConflict, stream.final(1, 0, "late"));
+    try stream.expect_emitted("ab");
+
+    var bounded = TextRecordTest.init(std.testing.allocator);
+    defer bounded.deinit();
+    bounded.limits.events = 2;
+    try std.testing.expectError(error.ResourceLimitExceeded, bounded.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"a\"},{\"type\":\"output_text\",\"text\":\"b\"},{\"type\":\"output_text\",\"text\":\"c\"}]}]}}"));
+    try bounded.expect_emitted("ab");
+}
+
+test "Responses text finalization stops on cancellation within a terminal snapshot" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    stream.cancel_on_content = true;
+    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"never\"}]}]}}"));
+    try stream.expect_emitted("first");
+    try std.testing.expectError(error.Cancelled, stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits));
+}
+
+test "Responses text finalization does not retain uncaptured text" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 32 * 1024);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    var tracked = std.testing.FailingAllocator.init(alloc, .{});
+    var stream = TextRecordTest.init(tracked.allocator());
+    defer stream.deinit();
+    stream.capture_limit = 1;
+    stream.limits.aggregate_bytes = 256 * 1024;
+    try stream.delta(0, 0, text);
+    try std.testing.expect(tracked.allocated_bytes - tracked.freed_bytes < 4096);
+    try stream.final(0, 0, text);
+    try std.testing.expect(tracked.allocated_bytes - tracked.freed_bytes < 4096);
+    try stream.finish(text);
+}
+
+test "Responses text finalization releases state on allocation failure" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var stream = TextRecordTest.init(alloc);
+            defer stream.deinit();
+            try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"a\"}");
+            try stream.apply("{\"type\":\"response.output_text.done\",\"text\":\"ab\"}");
+            try stream.apply("{\"type\":\"response.output_text.done\",\"output_index\":1,\"text\":\"cd\"}");
+            try stream.finish("abcd");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "Responses text finalization fuzzes chunking and capture boundaries" {
+    const Probe = struct {
+        fn run(_: void, smith: *std.testing.Smith) !void {
+            var buffer: [260]u8 = undefined;
+            const len: usize = @intCast(smith.slice(buffer[0..256]));
+            for (buffer[0..len]) |*byte| byte.* = 32 + byte.* % 95;
+            const split = if (len == 0) 0 else buffer[0] % (len + 1);
+            @memcpy(buffer[len..][0..4], "tail");
+            var stream = TextRecordTest.init(std.testing.allocator);
+            defer stream.deinit();
+            stream.capture_limit = if (len == 0) 0 else buffer[0] % 17;
+            try stream.delta(0, 0, buffer[0..split]);
+            try stream.final(0, 0, buffer[0..len]);
+            try stream.final(0, 0, buffer[0..len]);
+            try stream.final(1, 0, "tail");
+            try stream.finish(buffer[0 .. len + 4]);
+        }
+    };
+    try std.testing.fuzz({}, Probe.run, .{ .corpus = &.{ "", "a", "two chunks", "capture limit is not receipt progress" } });
+}
 
 test "Responses rejects conflicting completed tool records" {
     const records = [_][]const u8{
