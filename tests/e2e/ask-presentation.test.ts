@@ -436,6 +436,9 @@ describe("fx ask presentation", () => {
       final_output: string;
       tool_calls: Array<{ name: string; status: string }>;
     };
+    expect(output.output).toContain(initial);
+    expect(output.output).toContain(recovery);
+    expect(output.output).toContain(final);
     expect(output.output.indexOf(initial)).toBeLessThan(
       output.output.indexOf(recovery),
     );
