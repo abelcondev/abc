@@ -1438,7 +1438,7 @@ test "common Stop cancellation excludes active call and keeps typed failed peer"
 
 test "common Stop interruption keeps only completed calls from a partially attempted step" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
