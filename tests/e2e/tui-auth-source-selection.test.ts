@@ -1398,6 +1398,40 @@ for (const gatewayState of ["absent", "rejected"] as const) {
   }, 60_000);
 }
 
+for (const otherProvider of ["codex", "grok"] as const) {
+  tmuxTest(`default logout preserves ${otherProvider} when active fx login becomes unreadable`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-logout-active-unreadable-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth("unused-token");
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+    if (otherProvider === "codex") writeSeededChatGptLogin(home);
+    else writeSeededGrokLogin(home, "other-grok-token");
+    const otherPath = join(home, ".fx", otherProvider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+    const otherCredential = readFileSync(otherPath, "utf8");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "gateway", credential_source: "fx_login" }));
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=fx login", TIMEOUT);
+    const authPath = join(home, ".fx", "auth.json");
+    linkSync(authPath, join(home, "login.alias"));
+    await session.sendText("/logout");
+    const result = await session.waitForPane(
+      (pane) => pane.includes("Signed out of fx.") || pane.includes(`Signed out of ${otherProvider === "codex" ? "Codex" : "Grok"}.`),
+      TIMEOUT,
+    );
+    expect(result).toContain("Signed out of fx.");
+    expect(readFileSync(otherPath, "utf8")).toBe(otherCredential);
+    expect(existsSync(authPath)).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
+
 tmuxTest("provider recovery stays signed out when no replacement is connected", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-logout-no-provider-"));
   stderrPath = join(home, "stderr.log");
