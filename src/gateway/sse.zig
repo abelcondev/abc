@@ -14,13 +14,14 @@ fn classify(line: []const u8) Line {
 }
 
 fn line_end(bytes: []const u8) usize {
-    const width = std.simd.suggestVectorLength(u8) orelse 1;
-    const Vector = @Vector(width, u8);
     var offset: usize = 0;
-    while (bytes.len - offset >= width) : (offset += width) {
-        const chunk: Vector = bytes[offset..][0..width].*;
-        const matches = @select(bool, chunk == @as(Vector, @splat('\r')), @as(@Vector(width, bool), @splat(true)), chunk == @as(Vector, @splat('\n')));
-        if (std.simd.firstTrue(matches)) |index| return offset + index;
+    if (std.simd.suggestVectorLength(u8)) |width| {
+        const Vector = @Vector(width, u8);
+        while (bytes.len - offset >= width) : (offset += width) {
+            const chunk: Vector = bytes[offset..][0..width].*;
+            const matches = @select(bool, chunk == @as(Vector, @splat('\r')), @as(@Vector(width, bool), @splat(true)), chunk == @as(Vector, @splat('\n')));
+            if (std.simd.firstTrue(matches)) |index| return offset + index;
+        }
     }
     for (bytes[offset..], offset..) |byte, index| {
         if (byte == '\r' or byte == '\n') return index;
