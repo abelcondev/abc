@@ -165,7 +165,7 @@ test "subagent failure labels trust structured terminal codes only" {
     const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{}" };
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
-    for ([_][]const u8{ "child_interrupted", "{", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
+    for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
         try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
     }
 }
