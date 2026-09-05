@@ -1384,6 +1384,31 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
+  test("file edits keep earlier instruction bytes stable", async () => {
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-stable-verification-",
+      [
+        fakeGatewayToolCall("write_first", "write_file", { path: "first.txt", content: "first\n" }),
+        fakeGatewayToolCall("write_second", "write_file", { path: "second.txt", content: "second\n" }),
+        fakeGatewayFinalText("STABLE_VERIFICATION_DONE"),
+      ],
+    );
+    await session!.sendText("Create first.txt and second.txt with their respective contents.");
+    await session!.waitForText("STABLE_VERIFICATION_DONE", TIMEOUT);
+    await session!.waitForComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    const instructions = queuedGateway.requests.map((request) =>
+      JSON.parse(request.body).prompt.filter((message: { role: string }) => message.role === "system")
+    );
+    expect(instructions[0].length).toBeGreaterThan(0);
+    expect(instructions[1]).toEqual(instructions[0]);
+    expect(instructions[2]).toEqual(instructions[0]);
+    expect(readFileSync(join(root!, "workspace", "first.txt"), "utf8")).toBe("first\n");
+    expect(readFileSync(join(root!, "workspace", "second.txt"), "utf8")).toBe("second\n");
+    expect(await session!.captureFullScrollback()).toContain("STABLE_VERIFICATION_DONE");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+
   test(
     "clear response language mismatch never reaches TUI scrollback",
     async () => {
