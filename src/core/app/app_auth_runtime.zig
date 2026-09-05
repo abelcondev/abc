@@ -262,7 +262,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .gateway;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
-                try app.auth.refreshSourceInventoryForLogout(app.alloc);
+                try app.auth.refreshSourceInventory(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
             const logout_provider = auth_transition.decideLogoutProvider(.{
@@ -2472,10 +2472,6 @@ const TestAuth = struct {
 
     fn openOnboardingPicker(self: *TestAuth, _: std.mem.Allocator) void {
         self.picker_opened = true;
-    }
-
-    fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
-        self.source_inventory_refresh_count += 1;
     }
 
     fn beginSourceInventoryRefresh(
