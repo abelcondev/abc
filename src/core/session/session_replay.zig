@@ -30,12 +30,38 @@ pub fn readLineAt(
     offset: u64,
     max_end: u64,
 ) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, null);
+}
+
+pub fn readLineAtCancellable(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: *const std.atomic.Value(bool),
+) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, cancelled);
+}
+
+fn readLineAtWithCancellation(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?LineRead {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
     if (offset >= max_end) return null;
     var line: std.ArrayList(u8) = .empty;
     errdefer line.deinit(alloc);
     var cursor = offset;
     var chunk: [8192]u8 = undefined;
     while (cursor < max_end) {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
         const count = try file.readPositionalAll(
             io_mod.getIo(),
@@ -70,6 +96,23 @@ pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
     var envelope = try readSessionStarted(alloc, file);
     defer envelope.deinit(alloc);
     return envelope.log_generation;
+}
+
+test "cancelled event reads release work before reading another frame" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    defer file.close(std.testing.io);
+    const bytes = "{\"event\":1}\n";
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled));
+    cancelled.store(false, .release);
+    const line = (try readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled)).?;
+    defer alloc.free(line.bytes);
+    try std.testing.expectEqualStrings(bytes, line.bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), line.next_offset);
 }
 
 pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {

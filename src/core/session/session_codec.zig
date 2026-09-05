@@ -217,7 +217,7 @@ pub const DurableSessionState = struct {
 
 pub const session_metadata_schema_version: u8 = 4;
 pub const max_session_metadata_bytes: usize = 64 * 1024;
-const max_session_title_bytes: usize = 240;
+pub const max_session_title_bytes: usize = 240;
 
 pub const SessionMetadata = struct {
     schema_version: u8 = session_metadata_schema_version,

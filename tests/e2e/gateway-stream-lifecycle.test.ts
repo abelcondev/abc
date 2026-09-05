@@ -2210,7 +2210,8 @@ describe("gateway stream lifecycle", () => {
       tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       const sessionsDirectory = join(root.home, ".fx", "sessions");
-      const sessionIds = readdirSync(sessionsDirectory);
+      const sessionIds = readdirSync(sessionsDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
       const resultsDirectory = join(sessionsDirectory, sessionIds[0]!, "tool-results");
       const mainArtifacts = readdirSync(resultsDirectory).filter((name) =>

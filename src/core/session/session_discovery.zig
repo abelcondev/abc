@@ -59,6 +59,7 @@ pub const ReadOnlyCandidate = struct {
     summary: SessionSummary,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+    subagent_child: ?bool = null,
 
     pub fn deinit(self: *ReadOnlyCandidate, alloc: Allocator) void {
         self.summary.deinit(alloc);
@@ -263,30 +264,55 @@ pub fn classifyReadOnlyCandidate(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !ReadOnlyCandidate {
-    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
-        return classifyConversationCandidate(alloc, session_dir, session_id);
+    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, null);
+}
+
+pub fn classifyReadOnlyCandidateCancellable(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: *const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, cancelled);
+}
+
+fn classifyReadOnlyCandidateWithCancellation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
     }
-    return switch (try classifyAuthority(alloc, session_dir, session_id)) {
+    if (try session_log.readConversationMetadata(alloc, session_dir)) |value| {
+        var metadata = value;
+        defer metadata.deinit();
+        return classifyConversationCandidate(alloc, session_dir, session_id, metadata.value, cancelled);
+    }
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const candidate = switch (try classifyAuthority(alloc, session_dir, session_id)) {
         .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
-        .legacy => classifyLegacyCandidate(alloc, session_dir, session_id),
+        .legacy => classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, cancelled),
     };
+    var owned = try candidate;
+    errdefer owned.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    return owned;
 }
 
 fn classifyConversationCandidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    metadata: session_codec.SessionMetadata,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !ReadOnlyCandidate {
-    const metadata_bytes = (try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_codec.max_session_metadata_bytes,
-    )) orelse return error.SessionNotFound;
-    defer alloc.free(metadata_bytes);
-    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
-    defer metadata.deinit();
-    if (!std.mem.eql(u8, metadata.value.id, session_id)) {
+    if (!std.mem.eql(u8, metadata.id, session_id)) {
         return error.InvalidSessionFormat;
     }
 
@@ -305,12 +331,19 @@ fn classifyConversationCandidate(
         defer event_file.close(io_mod.getIo());
         var offset: u64 = 0;
         while (offset < event_stat.size) {
-            const line = session_replay.readLineAt(
+            const read = if (cancelled) |stop| session_replay.readLineAtCancellable(
                 alloc,
                 event_file,
                 offset,
                 event_stat.size,
-            ) catch |err| switch (err) {
+                stop,
+            ) else session_replay.readLineAt(
+                alloc,
+                event_file,
+                offset,
+                event_stat.size,
+            );
+            const line = read catch |err| switch (err) {
                 error.TruncatedEventFrame => break,
                 else => return err,
             } orelse break;
@@ -330,38 +363,39 @@ fn classifyConversationCandidate(
         }
     }
 
-    const id = try alloc.dupe(u8, metadata.value.id);
+    const id = try alloc.dupe(u8, metadata.id);
     errdefer alloc.free(id);
-    const origin = try alloc.dupe(u8, metadata.value.origin_workspace_root);
+    const origin = try alloc.dupe(u8, metadata.origin_workspace_root);
     errdefer alloc.free(origin);
-    const workspace = try alloc.dupe(u8, metadata.value.workspace_root);
+    const workspace = try alloc.dupe(u8, metadata.workspace_root);
     errdefer alloc.free(workspace);
-    const title = if (metadata.value.title) |value| try alloc.dupe(u8, value) else null;
+    const title = if (metadata.title) |value| try alloc.dupe(u8, value) else null;
     return .{
         .summary = .{
             .id = id,
             .workspace_root = workspace,
             .origin_workspace_root = origin,
             .title = title,
-            .created_at_ms = metadata.value.created_at_ms,
+            .created_at_ms = metadata.created_at_ms,
             .updated_at_ms = if (history_len == 0 and !has_checkpoint)
-                metadata.value.updated_at_ms
+                metadata.updated_at_ms
             else
                 @max(
-                    metadata.value.updated_at_ms,
+                    metadata.updated_at_ms,
                     std.math.cast(
                         i64,
                         @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
                     ) orelse std.math.maxInt(i64),
                 ),
             .conversation_language = session.ConversationLanguage.fromSlice(
-                metadata.value.conversation_language,
+                metadata.conversation_language,
             ) catch return error.InvalidSessionFormat,
             .history_len = history_len,
             .has_checkpoint = has_checkpoint,
         },
         .storage = .conversation,
         .projection_state = .current,
+        .subagent_child = metadata.subagent_child,
     };
 }
 
@@ -452,6 +486,15 @@ pub fn classifyLegacyCandidate(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !ReadOnlyCandidate {
+    return classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, null);
+}
+
+fn classifyLegacyCandidateWithCancellation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
@@ -462,14 +505,7 @@ pub fn classifyLegacyCandidate(
     if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
     var buffer: [16 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io_mod.getIo(), &buffer);
-    var legacy = session_json.parseLegacySummaryStreaming(
-        LegacyCandidateSummary,
-        alloc,
-        &reader.interface,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return err,
-    };
+    var legacy = try readLegacySummary(alloc, &reader.interface, cancelled);
     errdefer legacy.deinit(alloc);
     if (!std.mem.eql(u8, legacy.id, session_id)) {
         return error.InvalidSessionFormat;
@@ -481,6 +517,76 @@ pub fn classifyLegacyCandidate(
         .storage = storage,
         .projection_state = .current,
     };
+}
+
+const CancellableReader = struct {
+    source: *std.Io.Reader,
+    cancelled: ?*const std.atomic.Value(bool),
+    interface: std.Io.Reader,
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *CancellableReader = @fieldParentPtr("interface", reader);
+        if (self.cancelled) |stop| {
+            if (stop.load(.acquire)) return error.ReadFailed;
+        }
+        return self.source.stream(writer, limit.min(.limited(8192)));
+    }
+};
+
+fn readLegacySummary(
+    alloc: Allocator,
+    source: *std.Io.Reader,
+    cancelled: ?*const std.atomic.Value(bool),
+) !LegacyCandidateSummary {
+    var buffer: [8192]u8 = undefined;
+    var reader = CancellableReader{
+        .source = source,
+        .cancelled = cancelled,
+        .interface = .{ .vtable = &.{ .stream = CancellableReader.stream }, .buffer = &buffer, .seek = 0, .end = 0 },
+    };
+    var result = session_json.parseLegacySummaryStreaming(LegacyCandidateSummary, alloc, &reader.interface) catch |err| {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
+        return err;
+    };
+    errdefer result.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    return result;
+}
+
+test "legacy summary cancellation stops after streaming starts" {
+    const alloc = std.testing.allocator;
+    const bytes = "{\"schema_version\":2,\"history\":[{\"user\":\"request\",\"assistant\":\"response\"}]," ++
+        "\"id\":\"legacy\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":null," ++
+        "\"conversation_language\":\"en\",\"history_len\":1}";
+    const Source = struct {
+        input: std.Io.Reader,
+        stopped: *std.atomic.Value(bool),
+        reads: usize = 0,
+        interface: std.Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+
+        fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("interface", reader);
+            self.reads += 1;
+            const count = try self.input.stream(writer, limit.min(.limited(32)));
+            self.stopped.store(true, .release);
+            return count;
+        }
+    };
+    var stopped = std.atomic.Value(bool).init(false);
+    var source = Source{ .input = .fixed(bytes), .stopped = &stopped };
+    try std.testing.expectError(error.Cancelled, readLegacySummary(alloc, &source.interface, &stopped));
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    try std.testing.expect(source.input.seek > 0 and source.input.seek < bytes.len);
+    stopped.store(false, .release);
+    var complete = std.Io.Reader.fixed(bytes);
+    var summary = try readLegacySummary(alloc, &complete, &stopped);
+    defer summary.deinit(alloc);
+    try std.testing.expectEqualStrings("legacy", summary.id);
+    try std.testing.expectEqual(@as(usize, 1), summary.history_len);
 }
 
 /// Projects a durable session state into the lightweight `SessionSummary`
