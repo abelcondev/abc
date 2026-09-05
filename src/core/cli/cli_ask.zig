@@ -2150,7 +2150,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
-        .tracker = null,
     }, arena, messages);
 }
 
@@ -2932,10 +2931,13 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
-                .assistant => |turn| try ctx.final_output.appendSlice(
-                    ctx.alloc,
-                    turn.assistant,
-                ),
+                .assistant => |turn| {
+                    const presentation = @import("../agent/runtime/assistant_stream.zig");
+                    const text = finished.presentation_text orelse turn.assistant;
+                    const normalized = try presentation.normalizeAssistantTextForDisplay(ctx.alloc, text);
+                    defer ctx.alloc.free(normalized);
+                    try ctx.final_output.appendSlice(ctx.alloc, presentation.textForCompletedPresentation(text, normalized));
+                },
                 .compacted_summary, .interrupted => {},
             };
         },
