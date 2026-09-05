@@ -159,6 +159,7 @@ pub fn finishAssistantTerminalWithExecution(
     disposition: ?types.ProviderCompletionDisposition,
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
+    replay: ?types.ProviderReplay,
 ) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
@@ -167,6 +168,7 @@ pub fn finishAssistantTerminalWithExecution(
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
+        .provider_replay = replay,
         .execution = context_execution,
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
@@ -216,6 +218,7 @@ pub fn finishExecutionOnlyFailureIfNeeded(
         null,
         finish_trace,
         trace_outcome,
+        null,
     );
     return true;
 }
@@ -253,5 +256,6 @@ pub fn finalizeRetainedCandidateFailure(
         null,
         finish_trace,
         "error",
+        null,
     );
 }

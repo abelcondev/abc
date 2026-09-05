@@ -39,12 +39,30 @@ const ConversationProgress = struct {
     pending: usize = 0,
     coverage: u64 = 0,
     reached: bool = false,
+    pending_assistant_seq: ?u64 = null,
 
     fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
+        if (self.pending_assistant_seq) |assistant_seq| {
+            const standalone = switch (event) {
+                .assistant, .steering, .context_checkpoint, .interrupted => true,
+                else => false,
+            };
+            if (standalone) {
+                self.point.tool_steps += 1;
+                if (cut) |target| if (!self.reached and std.meta.eql(self.point, target)) {
+                    self.coverage = assistant_seq;
+                    self.reached = true;
+                };
+            }
+            self.pending_assistant_seq = null;
+        }
         if (cut) |target| if (std.meta.eql(self.point, target) and self.pending == 0) {
             self.reached = true;
         };
         switch (event) {
+            .assistant => |value| if (value.provider_replay != null) {
+                self.pending_assistant_seq = seq;
+            },
             .tool_call => self.pending += 1,
             .tool_result => {
                 if (self.pending == 0) return error.InvalidConversationFrame;
@@ -930,7 +948,7 @@ fn replayConversationHistory(
         defer decoded.deinit();
         switch (decoded.value.event) {
             .user => |value| try turn.begin(value),
-            .assistant => |value| try turn.appendAssistant(value.text),
+            .assistant => |value| try turn.appendAssistant(value),
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
@@ -946,7 +964,10 @@ fn replayConversationHistory(
                 errdefer session.freeHistoryTurn(alloc, completed);
                 try history.append(alloc, completed);
             },
-            .context_checkpoint => checkpoint_turn_open = turn.user != null,
+            .context_checkpoint => {
+                if (turn.pending_replay != null) try turn.finishStep();
+                checkpoint_turn_open = turn.user != null;
+            },
         }
         offset = line.next_offset;
     }
@@ -996,7 +1017,7 @@ pub fn loadConversationHistoryRange(
                 break :blk null;
             },
             .assistant => |value| blk: {
-                try builder.appendAssistant(value.text);
+                try builder.appendAssistant(value);
                 break :blk null;
             },
             .tool_call => |value| blk: {
@@ -1017,6 +1038,7 @@ pub fn loadConversationHistoryRange(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
+                if (builder.pending_replay != null) try builder.finishStep();
                 break :blk null;
             },
         };
@@ -1065,7 +1087,7 @@ pub fn loadConversationArchive(
                 break :blk null;
             },
             .assistant => |value| blk: {
-                try builder.appendAssistant(value.text);
+                try builder.appendAssistant(value);
                 break :blk null;
             },
             .tool_call => |value| blk: {
@@ -1086,6 +1108,7 @@ pub fn loadConversationArchive(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
+                if (builder.pending_replay != null) try builder.finishStep();
                 compaction_count += 1;
                 break :blk .{ .compacted_summary = .{
                     .summary = try alloc.dupe(u8, value.summary),
@@ -1205,6 +1228,7 @@ const ConversationTurnBuilder = struct {
     alloc: Allocator,
     user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
+    pending_replay: ?types.ProviderReplay = null,
     calls: std.ArrayList(types.ToolCall) = .empty,
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
@@ -1217,12 +1241,14 @@ const ConversationTurnBuilder = struct {
     fn deinit(self: *ConversationTurnBuilder) void {
         if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
+        if (self.pending_replay) |replay| types.freeProviderReplay(self.alloc, replay);
         for (self.calls.items) |call| types.freeToolCall(self.alloc, call);
         self.calls.deinit(self.alloc);
         for (self.results.items) |result| freeConversationToolResult(self.alloc, result);
         self.results.deinit(self.alloc);
         for (self.steps.items) |step| {
             if (step.assistant) |text| self.alloc.free(text);
+            if (step.provider_replay) |replay| types.freeProviderReplay(self.alloc, replay);
             types.freeToolCallSlice(self.alloc, step.tool_calls);
             types.freePersistedToolResults(self.alloc, step.tool_results);
         }
@@ -1256,11 +1282,15 @@ const ConversationTurnBuilder = struct {
         });
     }
 
-    fn appendAssistant(self: *ConversationTurnBuilder, text: []const u8) !void {
+    fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
+        if (self.pending_replay != null and self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStep();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
         }
-        self.pending_assistant = try self.alloc.dupe(u8, text);
+        const text = try self.alloc.dupe(u8, value.text);
+        errdefer self.alloc.free(text);
+        self.pending_replay = if (value.provider_replay) |replay| try types.dupeProviderReplay(self.alloc, replay) else null;
+        self.pending_assistant = text;
     }
 
     fn appendToolCall(
@@ -1324,16 +1354,19 @@ const ConversationTurnBuilder = struct {
         errdefer types.freePersistedToolResults(self.alloc, results);
         self.steps.appendAssumeCapacity(.{
             .assistant = self.pending_assistant,
+            .provider_replay = self.pending_replay,
             .tool_calls = calls,
             .tool_results = results,
         });
         self.pending_assistant = null;
+        self.pending_replay = null;
     }
 
     fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
         if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
             return error.InvalidConversationFrame;
         }
+        if (self.pending_replay != null) try self.finishStep();
         const owned = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(owned);
         try self.steering.append(self.alloc, .{
@@ -1362,10 +1395,13 @@ const ConversationTurnBuilder = struct {
         const user = self.user.?;
         self.user = null;
         self.pending_assistant = null;
+        const replay = self.pending_replay;
+        self.pending_replay = null;
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .provider_replay = replay,
         } };
     }
 
@@ -1376,6 +1412,7 @@ const ConversationTurnBuilder = struct {
         if (self.user == null or self.results.items.len != 0 or self.calls.items.len > 1) {
             return error.InvalidConversationFrame;
         }
+        if (self.pending_replay != null and self.calls.items.len == 0) try self.finishStep();
         const tool_call = if (self.calls.items.len == 1)
             self.calls.orderedRemove(0)
         else
@@ -1384,6 +1421,11 @@ const ConversationTurnBuilder = struct {
         if (self.pending_assistant) |text| {
             self.alloc.free(text);
             self.pending_assistant = null;
+        }
+        if (self.pending_replay) |replay| {
+            debug_trace.logf("session", "provider replay omitted reason=interrupted_association", .{});
+            types.freeProviderReplay(self.alloc, replay);
+            self.pending_replay = null;
         }
         const assistant = if (value.partial_text) |text|
             try self.alloc.dupe(u8, text)
@@ -1457,6 +1499,86 @@ const ConversationTurnBuilder = struct {
         };
     }
 };
+
+test "conversation replay keeps reasoning-only assistant units before the final reply" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    try builder.begin(.{ .text = "question" });
+    try builder.appendAssistant(.{ .text = "", .provider_replay = replay });
+    try builder.appendAssistant(.{ .text = "answer" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "reasoning-only checkpoint coverage and replay count the same completed unit" {
+    const alloc = std.testing.allocator;
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    const events = [_]session_event.ConversationEvent{
+        .{ .user = .{ .text = "question" } },
+        .{ .assistant = .{ .text = "", .provider_replay = replay } },
+        .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "prior facts" } },
+    };
+    var progress: ConversationProgress = .{};
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    for (events, 1..) |event, seq| {
+        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
+        switch (event) {
+            .user => |value| try builder.begin(value),
+            .assistant => |value| try builder.appendAssistant(value),
+            .context_checkpoint => try builder.finishStep(),
+            else => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.tool_steps);
+    try std.testing.expectEqual(progress.point.tool_steps, builder.steps.items.len);
+    try builder.appendAssistant(.{ .text = "final", .provider_replay = replay });
+    try progress.observe(4, .{ .assistant = .{ .text = "final", .provider_replay = replay } }, null);
+    try progress.observe(5, .{ .turn_completed = .{} }, null);
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.turns);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.provider_replay.?.parts_json);
+}
+
+test "reasoning-only history keeps an empty final response as a distinct boundary" {
+    const alloc = std.testing.allocator;
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    var steps = [_]types.ToolExecutionStep{.{ .provider_replay = replay }};
+    var events: std.ArrayList(session_event.ConversationEvent) = .empty;
+    defer events.deinit(alloc);
+    try session_event.appendHistoryTurnConversationEvents(alloc, &events, .{ .assistant = .{
+        .user = .{ .text = @constCast("question") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } });
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    var progress: ConversationProgress = .{};
+    for (events.items, 1..) |event, seq| {
+        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
+        switch (event) {
+            .user => |value| try builder.begin(value),
+            .assistant => |value| try builder.appendAssistant(value),
+            .turn_completed => |value| {
+                const turn = try builder.finishAssistant(value);
+                defer types.freeHistoryTurn(alloc, turn);
+                try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+                try std.testing.expectEqualStrings("", turn.assistant.assistant);
+                try std.testing.expect(turn.assistant.provider_replay == null);
+            },
+            else => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+}
 
 fn dupeConversationToolResult(
     alloc: Allocator,
@@ -4452,6 +4574,7 @@ test "cache-free permission state resumes from its domain file" {
 
 test "cache-free resume rebuilds tool calls and external result references" {
     const alloc = std.testing.allocator;
+    const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "conversation-tool-resume", 10);
@@ -4500,6 +4623,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
     }};
     var steps = [_]types.ToolExecutionStep{.{
         .assistant = @constCast("Running it."),
+        .provider_replay = provider_state,
         .tool_calls = &calls,
         .tool_results = &results,
     }};
@@ -4519,6 +4643,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
             .total_output_tokens = 1,
             .turn = .{ .assistant = .{
                 .user = .{ .text = @constCast("Run it.") },
+                .provider_replay = provider_state,
                 .assistant = @constCast("Done."),
                 .execution = .{
                     .tool_steps = &steps,
@@ -4537,6 +4662,8 @@ test "cache-free resume rebuilds tool calls and external result references" {
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     const execution = resumed.history[0].assistant.execution;
+    try std.testing.expectEqualStrings(provider_state.parts_json, resumed.history[0].assistant.provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings(provider_state.parts_json, execution.tool_steps[0].provider_replay.?.parts_json);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("call-shell", execution.tool_steps[0].tool_calls[0].id);
     try std.testing.expectEqual(

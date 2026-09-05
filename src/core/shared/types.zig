@@ -1025,6 +1025,7 @@ pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const PersistedSteering = struct {
@@ -1112,6 +1113,29 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
+/// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
+pub const ProviderReplay = struct {
+    pub const max_bytes: usize = 4 * 1024 * 1024;
+    source: @import("../config/model_provider.zig").ProviderSelection,
+    parts_json: []const u8,
+
+    pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
+        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+    }
+};
+
+pub fn dupeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) !ProviderReplay {
+    const model = try alloc.dupe(u8, value.source.model);
+    errdefer alloc.free(model);
+    const parts = try alloc.dupe(u8, value.parts_json);
+    return .{ .source = .{ .provider = value.source.provider, .model = model }, .parts_json = parts };
+}
+
+pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void {
+    alloc.free(value.source.model);
+    alloc.free(value.parts_json);
+}
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: ?[]const u8 = null,
@@ -1119,13 +1143,56 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
-    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
-    /// The value is a validated JSON array and is never sent across provider routes.
-    provider_state_json: ?[]const u8 = null,
+    provider_replay: ?ProviderReplay = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
 };
+
+/// Returns a caller-owned shallow projection only when incompatible replay exists.
+pub fn projectProviderReplay(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    source: @import("../config/model_provider.zig").ProviderSelection,
+) !?[]ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |owned| alloc.free(owned);
+    for (messages, 0..) |message, index| {
+        const replay = message.provider_replay orelse continue;
+        if (replay.matches(source)) continue;
+        if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
+        projected.?[index].provider_replay = null;
+    }
+    return projected;
+}
+
+test "provider replay projection preserves matching origin and excludes other routes" {
+    const alloc = std.testing.allocator;
+    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
+    for ([_]@import("../config/model_provider.zig").ProviderSelection{
+        .{ .provider = .codex, .model = "model" },
+        .{ .provider = .grok, .model = "model" },
+        .{ .provider = .gateway, .model = "different" },
+    }) |other| {
+        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
+        defer alloc.free(projected);
+        try std.testing.expect(projected[0].provider_replay == null);
+        try std.testing.expectEqualStrings("answer", projected[0].content.?);
+        try std.testing.expect(messages[0].provider_replay != null);
+        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator) !void {
+            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
+            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
+            defer a.free(projected);
+            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
+            defer freeProviderReplay(a, copy);
+        }
+    }.check, .{});
+}
 
 pub const Usage = struct {
     input_tokens: ?u64 = null,
@@ -1787,6 +1854,7 @@ pub const AssistantHistoryTurn = struct {
     user: UserTurn,
     assistant: []u8,
     execution: ExecutionMemory = .{},
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const InterruptedTerminalReason = enum {
@@ -2100,6 +2168,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
             alloc.free(entry.assistant);
+            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
         },
         .interrupted => |entry| {
@@ -2159,10 +2228,13 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer alloc.free(assistant);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
+                .provider_replay = replay,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2354,9 +2426,11 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
     errdefer freeToolCallSlice(alloc, tool_calls);
     const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
     errdefer freePersistedToolResults(alloc, tool_results);
+    const replay = if (step.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
 
     return .{
         .assistant = assistant,
+        .provider_replay = replay,
         .tool_calls = tool_calls,
         .tool_results = tool_results,
     };
@@ -2364,6 +2438,7 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
 
 fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| freeProviderReplay(alloc, replay);
     freeToolCallSlice(alloc, step.tool_calls);
     freePersistedToolResults(alloc, step.tool_results);
 }

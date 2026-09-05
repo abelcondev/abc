@@ -5,7 +5,13 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
-const json_comparison = @import("json_comparison.zig");
+const json_comparison = @import("../core/shared/json_comparison.zig");
+
+pub fn selectReplayParts(_: std.mem.Allocator, replay: ?types.ProviderReplay, _: []const types.ToolCall, _: bool, reasoning: bool) !?types.ProviderReplay {
+    const source = replay orelse return null;
+    if (source.source.provider == .gateway) return error.InvalidProviderState;
+    return if (reasoning) source else null;
+}
 
 pub const ReplayLimits = struct {
     tool_calls: usize,
@@ -68,13 +74,16 @@ pub fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                if (message.provider_state_json) |state_json| {
+                if (message.provider_replay) |replay| {
+                    const state_json = replay.parts_json;
                     var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
                     defer state.deinit();
                     if (state.value != .array) return error.InvalidProviderState;
                     for (state.value.array.items) |item| {
                         if (item != .object) return error.InvalidProviderState;
+                        const kind = item.object.get("type") orelse return error.InvalidProviderState;
+                        if (kind != .string or !std.mem.eql(u8, kind.string, "reasoning")) return error.InvalidProviderState;
                         try writeComma(writer, &first);
                         try std.json.Stringify.value(item, .{}, writer);
                     }
@@ -169,7 +178,7 @@ test "Responses request preserves opaque tool-call identity" {
     const state = "[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
     const calls = [_]types.ToolCall{.{ .id = "signed:0", .name = "read_file", .arguments_json = "{}" }};
     const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls, .provider_state_json = state },
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = .{ .source = .{ .provider = .codex, .model = "test" }, .parts_json = state } },
         .{ .role = .tool, .tool_call_id = "signed:0", .tool_name = "read_file", .content = "result" },
     };
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -183,7 +192,7 @@ test "Responses request preserves opaque tool-call identity" {
     try std.testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
     try std.testing.expectEqualStrings("signed:0", items[1].object.get("call_id").?.string);
     try std.testing.expectEqualStrings("signed:0", items[2].object.get("call_id").?.string);
-    try std.testing.expectEqualStrings(state, messages[0].provider_state_json.?);
+    try std.testing.expectEqualStrings(state, messages[0].provider_replay.?.parts_json);
 }
 
 test "non-object provider-owned arguments retain their Responses representation" {
@@ -211,7 +220,8 @@ test "non-object function arguments cannot enter a Responses request" {
 }
 
 fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
-    if (message.provider_state_json) |state_json| {
+    if (message.provider_replay) |replay| {
+        const state_json = replay.parts_json;
         if (state_json.len > limits.provider_state_bytes) return error.ProviderStateTooLarge;
     }
     if (message.tool_calls.len > limits.tool_calls) return error.ToolCallLimitExceeded;

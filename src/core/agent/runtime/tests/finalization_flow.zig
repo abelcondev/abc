@@ -70,7 +70,7 @@ const PostTurnEndFinalizationCapture = struct {
     }
 };
 
-test "processQueuedPrompt normal final completion propagates normalized history before finish event" {
+test "processQueuedPrompt preserves original final history before finish event" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{" **Hello** "};
     const completions = [_]FakeCompletion{.{
@@ -85,8 +85,8 @@ test "processQueuedPrompt normal final completion propagates normalized history 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqualStrings("Hello", hooks.history_assistant_text.?);
-    try std.testing.expectEqualStrings("Hello", hooks.finish_assistant_text.?);
+    try std.testing.expectEqualStrings(" **Hello** ", hooks.history_assistant_text.?);
+    try std.testing.expectEqualStrings(" **Hello** ", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(?types.TurnPresentationOutcome, .completed), hooks.finish_terminal_outcome);
     const newline_idx = logIndex(&hooks, "text:newline").?;
     const finish_idx = logIndex(&hooks, "event:finish_prompt").?;
@@ -1682,6 +1682,7 @@ test "common Stop terminal payload construction failure leaves guard open for on
             null,
             &finish_trace,
             "error",
+            null,
         ),
     );
 

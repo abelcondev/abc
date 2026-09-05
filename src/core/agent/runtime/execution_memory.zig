@@ -133,7 +133,8 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
 
 fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
     const assistant = messages[assistant_index];
-    if (assistant.role != .assistant or assistant.tool_calls.len == 0) return false;
+    if (assistant.role != .assistant) return false;
+    if (assistant.tool_calls.len == 0) return assistant.provider_replay != null;
     var result_index = assistant_index + 1;
     while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
         const result_call_id = messages[result_index].tool_call_id orelse continue;
