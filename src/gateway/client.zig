@@ -2301,7 +2301,8 @@ const GatewayReplayBuilder = struct {
             !std.mem.eql(u8, event, "reasoning-delta") and !std.mem.eql(u8, event, "reasoning-end")) return;
         const id_value = root.object.get(if (std.mem.eql(u8, event, "tool-call")) "toolCallId" else "id");
         const id: []const u8 = if (id_value) |value| if (value == .string) value.string else "" else "";
-        if (kind == .tool_call and id.len == 0) return;
+        // Canonical admission owns rejection of malformed tool identities.
+        if (kind == .tool_call and types.ConversationIdentity.invalidReason(id) != null) return;
         if (id.len > types.ConversationIdentity.max_bytes) return error.ProviderStateTooLarge;
         var index: ?usize = null;
         for (self.parts.items, 0..) |part, i| {

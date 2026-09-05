@@ -422,6 +422,11 @@ pub fn appendHistoryTurnConversationEvents(
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
+                if (entry.execution.tool_steps.len > 0 and
+                    entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0)
+                {
+                    try events.append(alloc, .{ .assistant = .{ .text = "" } });
+                }
                 try events.append(alloc, .{ .tool_call = .{
                     .call_id = call.id,
                     .tool_name = call.name,

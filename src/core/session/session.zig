@@ -3103,12 +3103,13 @@ pub fn appendExecutionMemoryChatMessages(
             }
             steering_index += 1;
         }
-        if (step.tool_calls.len == 0 and step.provider_replay == null) continue;
+        if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
         try messages.append(alloc, .{
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
             .provider_replay = step.provider_replay,
+            .standalone_response = step.tool_calls.len == 0,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{

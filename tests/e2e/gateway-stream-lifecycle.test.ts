@@ -768,7 +768,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests).toHaveLength(2);
       const first = advertisedSkillLocations(gateway.requests[0]!.body, "cancel-workflow")[0]!;
       const second = advertisedSkillLocations(gateway.requests[1]!.body, "cancel-workflow")[0]!;
-      expect(first).not.toBe(second);
+      expect(first).toBe(second);
       expect(advertisedSkillPath(gateway.requests[0]!.body, first)).toBe(directory);
       expect(advertisedSkillPath(gateway.requests[1]!.body, second)).toBe(directory);
       expect(await tui.captureFullScrollback()).toContain("SKILL_RECOVERY_COMPLETE");
@@ -3112,6 +3112,91 @@ describe("gateway stream lifecycle", () => {
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("saved ask replays standalone assistant replies without joining their metadata", async () => {
+    for (const withReplay of [false, true]) {
+      const root = createFixtureRoot(`standalone-replies-${withReplay}`);
+      const replies = [fakeGatewayFinalText("Seed reply."), fakeGatewayFinalText("Resumed reply.")];
+      const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
+      try {
+        const seeded = await runFx(["ask", "--json", "--auto", "Seed a conversation."], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "seed.log")),
+          timeoutMs: 15_000,
+        });
+        expect(seeded.code).toBe(0);
+        expect(seeded.stderr).toBe("");
+        const seed = parseAskJson(seeded.stdout);
+        const path = join(root.home, ".fx", "sessions", seed.session_id, "events.jsonl");
+        const events = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const user = events.find((event) => event.event.user);
+        const completed = events.find((event) => event.event.turn_completed);
+        expect(user).toBeDefined();
+        expect(completed).toBeDefined();
+        const first = "Earlier original reply.";
+        const last = "Final original reply.";
+        const replay = (text: string, signature: string) => ({
+          source: { provider: "gateway", model: MODEL },
+          parts_json: JSON.stringify([
+            { type: "reasoning", text: "", providerOptions: { openai: { reasoningEncryptedContent: signature } } },
+            { type: "text", offset: 0, length: text.length },
+          ]),
+        });
+        const frames = [
+          { ...user, seq: 1 },
+          { ...user, seq: 2, event: { assistant: { text: first, provider_replay: withReplay ? replay(first, "FIRST_REPLAY_SIGNATURE") : null } } },
+          { ...user, seq: 3, event: { assistant: { text: last, provider_replay: withReplay ? replay(last, "FINAL_REPLAY_SIGNATURE") : null } } },
+          { ...completed, seq: 4 },
+        ];
+        writeFileSync(path, frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", seed.session_id, "Continue without tools."], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
+          timeoutMs: 15_000,
+        });
+        expect(resumed.code).toBe(0);
+        expect(resumed.stderr).toBe("");
+        const result = parseAskJson(resumed.stdout);
+        expect(result.session_id).toBe(seed.session_id);
+        expect(result.final_output).toBe("Resumed reply.");
+        expect(result.tool_calls).toEqual([]);
+        expect(gateway.requests).toHaveLength(2);
+        const prompt = JSON.parse(gateway.requests[1].body).prompt as PromptMessage[];
+        const assistants = prompt.filter((message) => message.role === "assistant");
+        expect(assistants.map((message) => contentText(message.content))).toEqual([first, last]);
+        if (withReplay) {
+          expect(JSON.stringify(assistants[0])).toContain("FIRST_REPLAY_SIGNATURE");
+          expect(JSON.stringify(assistants[1])).toContain("FINAL_REPLAY_SIGNATURE");
+        }
+        expect(resumed.stdout).not.toContain("REPLAY_SIGNATURE");
+        if (tmuxAvailable()) {
+          const stderrPath = join(root.root, "tui-stderr.log");
+          const tui = await TmuxSession.create({
+            cmd: `${FX_BIN} --resume-last`,
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, join(root.root, "tui-trace.log")),
+            stderrPath,
+            isolated: true,
+          });
+          try {
+            await tui.waitForText(last, 10_000);
+            const pane = await tui.capturePane();
+            expect(pane.split(first).length - 1).toBe(1);
+            expect(pane.split(last).length - 1).toBe(1);
+            expect(pane).not.toContain("REPLAY_SIGNATURE");
+            expect(hasEmptyComposer(pane)).toBe(true);
+            expect(readFileSync(stderrPath, "utf8")).toBe("");
+            expect(gateway.requests).toHaveLength(2);
+          } finally {
+            await tui.kill();
+          }
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
     }
   });
 

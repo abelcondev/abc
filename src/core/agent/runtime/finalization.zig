@@ -148,6 +148,25 @@ pub const TurnFinalizationGuard = struct {
     }
 };
 
+pub const TerminalText = struct {
+    history: []const u8,
+    presentation: ?[]const u8 = null,
+};
+
+/// The candidate is already retained as an original response. History borrows
+/// only current text; the caller owns the joined presentation.
+pub fn stopTerminalText(
+    alloc: std.mem.Allocator,
+    candidate: ?[]const u8,
+    current: ?[]const u8,
+) Allocator.Error!TerminalText {
+    const presentation = try hooks.prompt.joinVisibleSegments(alloc, candidate, current);
+    return .{
+        .history = current orelse "",
+        .presentation = presentation,
+    };
+}
+
 pub fn finishAssistantTerminalWithExecution(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
@@ -160,6 +179,7 @@ pub fn finishAssistantTerminalWithExecution(
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
     replay: ?types.ProviderReplay,
+    presentation_text: ?[]const u8,
 ) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
@@ -177,6 +197,7 @@ pub fn finishAssistantTerminalWithExecution(
         .{
             .turn = turn,
             .summary = completed_summary,
+            .presentation_text = presentation_text,
         },
     );
 
@@ -219,6 +240,7 @@ pub fn finishExecutionOnlyFailureIfNeeded(
         finish_trace,
         trace_outcome,
         null,
+        null,
     );
     return true;
 }
@@ -236,7 +258,7 @@ pub fn finalizeRetainedCandidateFailure(
     terminal_materializing: *bool,
 ) !void {
     terminal_materializing.* = true;
-    const assistant_text = try hooks.prompt.joinVisibleSegments(
+    const assistant_text = try stopTerminalText(
         arena,
         retained_candidate,
         latest_partial,
@@ -251,11 +273,12 @@ pub fn finalizeRetainedCandidateFailure(
         job,
         execution,
         summary,
-        assistant_text,
+        assistant_text.history,
         .failed,
         null,
         finish_trace,
         "error",
         null,
+        assistant_text.presentation,
     );
 }

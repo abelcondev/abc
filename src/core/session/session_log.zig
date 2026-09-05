@@ -39,29 +39,30 @@ const ConversationProgress = struct {
     pending: usize = 0,
     coverage: u64 = 0,
     reached: bool = false,
-    pending_assistant_seq: ?u64 = null,
+    pending_assistant: ?struct { seq: u64, has_replay: bool } = null,
 
     fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
-        if (self.pending_assistant_seq) |assistant_seq| {
+        if (self.pending_assistant) |assistant| {
             const standalone = switch (event) {
-                .assistant, .steering, .context_checkpoint, .interrupted => true,
+                .assistant, .context_checkpoint, .interrupted => true,
+                .steering => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
                 self.point.tool_steps += 1;
                 if (cut) |target| if (!self.reached and std.meta.eql(self.point, target)) {
-                    self.coverage = assistant_seq;
+                    self.coverage = assistant.seq;
                     self.reached = true;
                 };
             }
-            self.pending_assistant_seq = null;
+            self.pending_assistant = null;
         }
         if (cut) |target| if (std.meta.eql(self.point, target) and self.pending == 0) {
             self.reached = true;
         };
         switch (event) {
-            .assistant => |value| if (value.provider_replay != null) {
-                self.pending_assistant_seq = seq;
+            .assistant => |value| {
+                self.pending_assistant = .{ .seq = seq, .has_replay = value.provider_replay != null };
             },
             .tool_call => self.pending += 1,
             .tool_result => {
@@ -86,6 +87,24 @@ const ConversationProgress = struct {
         }
     }
 };
+
+test "conversation cut counts standalone text without changing steering prefixes" {
+    var progress: ConversationProgress = .{};
+    const cut: types.ContextHistoryCut = .{ .tool_steps = 1 };
+    try progress.observe(1, .{ .user = .{ .text = "request" } }, cut);
+    try progress.observe(2, .{ .assistant = .{ .text = "CANDIDATE_741" } }, cut);
+    try progress.observe(3, .{ .assistant = .{ .text = "FINAL_852" } }, cut);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.tool_steps);
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+    try std.testing.expect(progress.reached);
+
+    var steering: ConversationProgress = .{};
+    try steering.observe(1, .{ .user = .{ .text = "request" } }, null);
+    try steering.observe(2, .{ .assistant = .{ .text = "prefix" } }, null);
+    try steering.observe(3, .{ .steering = .{ .text = "human update" } }, null);
+    try std.testing.expectEqual(@as(usize, 0), steering.point.tool_steps);
+    try std.testing.expectEqual(@as(usize, 1), steering.point.steering);
+}
 
 pub const ConversationWriter = struct {
     alloc: Allocator,
@@ -965,7 +984,7 @@ fn replayConversationHistory(
                 try history.append(alloc, completed);
             },
             .context_checkpoint => {
-                if (turn.pending_replay != null) try turn.finishStep();
+                if (turn.pending_assistant != null) try turn.finishStep();
                 checkpoint_turn_open = turn.user != null;
             },
         }
@@ -1038,7 +1057,7 @@ pub fn loadConversationHistoryRange(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
-                if (builder.pending_replay != null) try builder.finishStep();
+                if (builder.pending_assistant != null) try builder.finishStep();
                 break :blk null;
             },
         };
@@ -1108,7 +1127,7 @@ pub fn loadConversationArchive(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
-                if (builder.pending_replay != null) try builder.finishStep();
+                if (builder.pending_assistant != null) try builder.finishStep();
                 compaction_count += 1;
                 break :blk .{ .compacted_summary = .{
                     .summary = try alloc.dupe(u8, value.summary),
@@ -1283,7 +1302,7 @@ const ConversationTurnBuilder = struct {
     }
 
     fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
-        if (self.pending_replay != null and self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStep();
+        if (self.pending_assistant != null and self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStep();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
         }
@@ -1412,7 +1431,7 @@ const ConversationTurnBuilder = struct {
         if (self.user == null or self.results.items.len != 0 or self.calls.items.len > 1) {
             return error.InvalidConversationFrame;
         }
-        if (self.pending_replay != null and self.calls.items.len == 0) try self.finishStep();
+        if (self.pending_assistant != null and self.calls.items.len == 0) try self.finishStep();
         const tool_call = if (self.calls.items.len == 1)
             self.calls.orderedRemove(0)
         else
@@ -4073,6 +4092,71 @@ test "cache-free conversation session resumes from metadata and JSONL" {
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     try std.testing.expectEqualStrings("question", resumed.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("answer", resumed.history[0].assistant.assistant);
+}
+
+test "conversation preserves standalone replies across completion and interruption" {
+    const alloc = std.testing.allocator;
+    const Outcome = enum { completed, cancelled, failed, active_call };
+    for ([_]bool{ false, true }) |with_replay| {
+        for (std.enums.values(Outcome)) |outcome| {
+            var temp = try TempRoot.init(alloc);
+            defer temp.deinit(alloc);
+            var initial = try testState(alloc, "standalone-replies", 10);
+            defer initial.deinit(alloc);
+            const replay: types.ProviderReplay = .{
+                .source = .{ .provider = .gateway, .model = "test-model" },
+                .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private state\"}]",
+            };
+            var steps = [_]types.ToolExecutionStep{.{
+                .assistant = @constCast("earlier reply"),
+                .provider_replay = if (with_replay) replay else null,
+            }};
+            const user: types.UserTurn = .{ .text = @constCast("request") };
+            const turn: types.HistoryTurn = if (outcome == .completed) .{ .assistant = .{
+                .user = user,
+                .assistant = @constCast("current reply"),
+                .execution = .{ .tool_steps = &steps },
+            } } else .{ .interrupted = .{
+                .user = user,
+                .assistant = @constCast("partial reply"),
+                .execution = .{ .tool_steps = &steps },
+                .terminal_reason = if (outcome == .failed) .failed else .cancelled,
+                .tool_call = if (outcome == .active_call) .{ .id = "pending", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" } else null,
+            } };
+            {
+                var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+                defer loaded.deinit(alloc);
+                _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                    .conversation_language = .literal("en"),
+                    .total_input_tokens = 1,
+                    .total_output_tokens = 1,
+                    .turn = turn,
+                } }, 20);
+            }
+            var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
+            const execution = switch (resumed.history[0]) {
+                .assistant => |entry| blk: {
+                    try std.testing.expectEqual(Outcome.completed, outcome);
+                    try std.testing.expectEqualStrings("current reply", entry.assistant);
+                    break :blk entry.execution;
+                },
+                .interrupted => |entry| blk: {
+                    try std.testing.expectEqualStrings("partial reply", entry.assistant.?);
+                    try std.testing.expectEqual(outcome == .active_call, entry.tool_call != null);
+                    try std.testing.expectEqual(if (outcome == .failed) types.InterruptedTerminalReason.failed else .cancelled, entry.terminal_reason);
+                    break :blk entry.execution;
+                },
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+            try std.testing.expectEqualStrings("earlier reply", execution.tool_steps[0].assistant.?);
+            try std.testing.expectEqual(with_replay, execution.tool_steps[0].provider_replay != null);
+            if (execution.tool_steps[0].provider_replay) |saved| try std.testing.expectEqualStrings(replay.parts_json, saved.parts_json);
+            try std.testing.expectEqual(@as(usize, 0), execution.tool_steps[0].tool_calls.len);
+        }
+    }
 }
 
 test "cache-free writable resume continues the conversation sequence" {

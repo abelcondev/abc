@@ -245,6 +245,9 @@ pub fn findToolCallById(calls: []const ToolCall, id: []const u8) ?ToolCall {
 }
 
 const ChatMessageAdapter = struct {
+    fn standalone(value: Message) bool {
+        return value.standalone_response or value.provider_replay != null;
+    }
     pub const Message = types.ChatMessage;
 
     fn providerReplay(value: Message) ?types.ProviderReplay {
@@ -293,6 +296,9 @@ const ChatMessageAdapter = struct {
 };
 
 const MessageAdapter = struct {
+    fn standalone(_: Message) bool {
+        return false;
+    }
     pub const Message = message.Message;
 
     fn providerReplay(_: Message) ?types.ProviderReplay {
@@ -369,10 +375,10 @@ fn buildNormalExecutionMemory(
             continue;
         }
         if (tool_calls.len == 0) {
-            if (Adapter.providerReplay(msg)) |source| {
+            if (Adapter.standalone(msg)) {
                 const assistant = if (Adapter.content(msg)) |content| try alloc.dupe(u8, content) else null;
                 errdefer if (assistant) |text| alloc.free(text);
-                const replay = try dupeUnchangedProviderReplay(alloc, source, Adapter.content(msg), assistant, &.{}, &.{});
+                const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, &.{}, &.{});
                 errdefer if (replay) |value| types.freeProviderReplay(alloc, value);
                 try tool_steps.append(alloc, .{ .assistant = assistant, .provider_replay = replay });
             }
