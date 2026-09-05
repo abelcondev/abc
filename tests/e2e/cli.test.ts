@@ -749,9 +749,7 @@ describe("cli: status", () => {
           const ask = await runFx(["ask", "--json", "--no-save", "Say hello."], options);
           expect(ask.code).toBe(1);
           expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
-          expect(ask.stderr).toContain(
-            scenario.provider === "gateway" ? MISSING_AUTH_MESSAGE : scenario.help,
-          );
+          expect(ask.stderr).toContain(scenario.help);
           expect(readFileSync(settingsPath, "utf8")).toBe(settings);
         } finally {
           rmSync(root, { recursive: true, force: true });
@@ -760,6 +758,71 @@ describe("cli: status", () => {
       TIMEOUT,
     );
   }
+
+  test("fresh and resumed asks retain an unavailable exact login with an environment key", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-ask-exact-source-"));
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("SESSION_SEEDED"),
+      fakeGatewayFinalText("AUTOMATIC_KEY_WORKS"),
+    ]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settings = { provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } };
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const options = {
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "exact-source-control-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        },
+      };
+      const seeded = await runFx(["ask", "--json", "Create a short greeting."], options);
+      expect(seeded.code).toBe(0);
+      const sessionId = JSON.parse(seeded.stdout).session_id;
+      expect(sessionId.length).toBeGreaterThan(0);
+      expect(gateway.requests).toHaveLength(1);
+
+      const pinned = JSON.stringify({ ...settings, credential_source: "fx_login" });
+      writeFileSync(settingsPath, pinned);
+      const status = await runFx(["status", "--json"], options);
+      const help = JSON.parse(status.stdout).auth_help;
+      expect(help).toContain("fx login is selected but unavailable");
+      for (const resumed of [false, true]) {
+        for (const json of [false, true]) {
+          const result = await runFx([
+            "ask", ...(json ? ["--json"] : []),
+            ...(resumed ? ["--resume-id", sessionId] : ["--no-save"]),
+            "Continue with a greeting.",
+          ], options);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(help);
+          expect(result.stderr).not.toContain("set AI_GATEWAY_API_KEY");
+          if (json) expect(JSON.parse(result.stdout).error).toBe("MissingCredentials");
+          expect(readFileSync(settingsPath, "utf8")).toBe(pinned);
+          expect(gateway.requests).toHaveLength(1);
+        }
+      }
+
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const automatic = await runFx(["ask", "--json", "--no-save", "Give a greeting."], options);
+      expect(automatic.code).toBe(0);
+      expect(JSON.parse(automatic.stdout).output).toContain("AUTOMATIC_KEY_WORKS");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 
   test(
     "status and doctor share fx login source, team, and refreshability",
