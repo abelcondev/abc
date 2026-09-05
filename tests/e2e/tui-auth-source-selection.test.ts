@@ -1265,6 +1265,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
   }, TIMEOUT);
 }
 
+
 for (const provider of ["codex", "grok"] as const) {
   tmuxTest(`provider recovery switches from ${provider} after logout and preserves the fallback on restart`, async () => {
     home = mkdtempSync(join(tmpdir(), `fx-logout-fallback-${provider}-`));
@@ -2903,6 +2904,52 @@ for (const [provider, help] of [
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT);
 }
+
+tmuxTest("/status preserves a missing selected login through explicit key recovery", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-status-selected-login-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  mkdirSync(join(home, ".fx"));
+  const settingsPath = join(home, ".fx", "settings.json");
+  const settings = JSON.stringify({
+    provider: "gateway",
+    models: { gateway: FAKE_GATEWAY_MODEL },
+    credential_source: "fx_login",
+  });
+  writeFileSync(settingsPath, settings);
+  gateway = startFakeGateway([fakeGatewayFinalText("SELECTED_KEY_RECOVERED")]);
+  session = await startFx(home, stderrPath, gateway);
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/status");
+  await session.waitForText("auth_help=", TIMEOUT);
+  const missing = await session.captureFullScrollback();
+  expect(missing).toContain("auth_help=fx login is selected but unavailable.");
+  expect(missing).toContain("Run /login to reconnect");
+  expect(missing).not.toContain("or set AI_GATEWAY_API_KEY");
+  expect(await session.captureFullScrollbackEscapes()).toContain("fx login is selected but unavailable.");
+  expect(gateway.requests).toHaveLength(0);
+  expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+
+  writeFileSync(settingsPath, "{broken");
+  await session.sendText("/status");
+  await session.waitForText("Failed to load settings:", TIMEOUT);
+  expect(gateway.requests).toHaveLength(0);
+  writeFileSync(settingsPath, settings);
+
+  await selectEnvKeyCredential(session);
+  await session.sendText("Verify the selected account with a greeting.");
+  await session.waitForText("SELECTED_KEY_RECOVERED", TIMEOUT);
+  expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
+  writeFileSync(settingsPath, "{broken");
+  await session.sendText("/status");
+  await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+  const scrollback = await session.captureFullScrollback();
+  const recovered = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+  expect(recovered).not.toContain("auth_help=");
+  expect(readFileSync(settingsPath, "utf8")).toBe("{broken");
+  expect(gateway.requests).toHaveLength(1);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
 
 for (const provider of ["codex", "grok"] as const) {
   tmuxTest(`/status retains ${provider} storage failure after unrelated logout`, async () => {

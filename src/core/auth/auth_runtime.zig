@@ -1411,10 +1411,16 @@ pub const StatusSnapshot = struct {
             if (preparationError(failure)) |err| return preparationFailureNotice(err);
         }
         if (self.required_source == .fx_login) {
-            return if (self.fx_login_status == .unavailable)
-                "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
-            else
-                "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.";
+            return switch (surface) {
+                .cli => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                .interactive => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+            };
         }
         if (self.required_source == .chatgpt_subscription) {
             return switch (surface) {
@@ -1812,11 +1818,11 @@ pub const Runtime = struct {
         return credential.needsRefreshAt(now_ms);
     }
 
-    pub fn statusSnapshot(self: *const Self, provider: model_provider.ProviderId) StatusSnapshot {
-        return self.statusSnapshotAt(io_mod.milliTimestamp(), provider);
+    pub fn statusSnapshot(self: *const Self, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
+        return self.statusSnapshotAt(io_mod.milliTimestamp(), provider, preferred);
     }
 
-    fn statusSnapshotAt(self: *const Self, now_ms: i64, provider: model_provider.ProviderId) StatusSnapshot {
+    fn statusSnapshotAt(self: *const Self, now_ms: i64, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
         if (self.auth_mode == .host_managed) return .{
             .active_source = .host_managed,
             .gateway_connected = true,
@@ -1830,7 +1836,7 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
-            .required_source = requestedSource(provider, null),
+            .required_source = requestedSource(provider, preferred),
             .failure = if (self.credential_failure) |failure|
                 if (model_provider.authorizesCredential(provider, failure.source)) failure else null
             else
@@ -2930,7 +2936,7 @@ test "host-managed runtime exposes authority without local credential state" {
     try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
     try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
-    const status = runtime.statusSnapshot(.gateway);
+    const status = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
     try std.testing.expect(status.gateway_connected);
     try std.testing.expect(status.chatgpt_connected);
@@ -3421,12 +3427,12 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
-    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway).active_source.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
 
     // The source is still reported; only its freshness changes across the boundary.
-    try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway).refreshable());
+    try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).refreshable());
 
     var refreshed = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer refreshed.deinit(alloc);
@@ -3471,14 +3477,23 @@ test "provider status snapshot retains required sources without selecting a cred
     runtime.source_inventory.insert(.grok_subscription);
     const cases = [_]struct {
         provider: model_provider.ProviderId,
+        preferred: ?credentials.Source = null,
         required: ?credentials.Source,
     }{
         .{ .provider = .codex, .required = .chatgpt_subscription },
         .{ .provider = .grok, .required = .grok_subscription },
         .{ .provider = .gateway, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
     };
     for (cases) |case| {
-        const snapshot = runtime.statusSnapshotAt(100, case.provider);
+        const snapshot = runtime.statusSnapshotAt(100, case.provider, case.preferred);
         try std.testing.expectEqual(case.required, snapshot.required_source);
         try std.testing.expect(snapshot.active_source == null);
         try std.testing.expect(snapshot.grok_connected);
@@ -3495,7 +3510,7 @@ test "provider status snapshot preserves loaded and host-managed authority" {
     defer credential.deinit(alloc);
     credential.refresh_after_ms = 100;
     _ = runtime.adoptCredential(alloc, &credential);
-    const loaded = runtime.statusSnapshotAt(100, .gateway);
+    const loaded = runtime.statusSnapshotAt(100, .gateway, .ai_gateway_api_key);
     try std.testing.expectEqual(credentials.Source.fx_login, loaded.active_source.?);
     try std.testing.expectEqualStrings("team", loaded.team.?);
     try std.testing.expect(loaded.expired);
@@ -3503,7 +3518,7 @@ test "provider status snapshot preserves loaded and host-managed authority" {
     try std.testing.expect(loaded.missingHelp(.interactive) == null);
 
     runtime.auth_mode = .host_managed;
-    const hosted = runtime.statusSnapshotAt(100, .codex);
+    const hosted = runtime.statusSnapshotAt(100, .codex, .fx_login);
     try std.testing.expectEqual(credentials.Source.host_managed, hosted.active_source.?);
     try std.testing.expect(hosted.required_source == null);
     try std.testing.expect(hosted.missingHelp(.interactive) == null);
@@ -3528,7 +3543,7 @@ test "startup credential failures reach only the matching provider status" {
         try std.testing.expect(runtime.credentialFailure() == null);
         try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.modelCatalogAccess().publicOnlyReason().?);
         for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
-            const snapshot = runtime.statusSnapshotAt(100, provider);
+            const snapshot = runtime.statusSnapshotAt(100, provider, null);
             if (model_provider.authorizesCredential(provider, source)) {
                 try std.testing.expectEqual(classifyCredentialFailure(source, error.CredentialStorageUnavailable), snapshot.failure.?);
                 try std.testing.expectEqualStrings(help, snapshot.missingHelp(.interactive).?);
@@ -3568,7 +3583,7 @@ test "startup credential failures clear after source removal or credential adopt
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
         try std.testing.expect(runtime.credential_failure == null);
-        try std.testing.expect(runtime.statusSnapshotAt(100, .gateway).missingHelp(.interactive) == null);
+        try std.testing.expect(runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive) == null);
     }
 }
 
@@ -3597,7 +3612,7 @@ test "startup status and inventory preserve selected and host-managed failure se
     }, true);
     try std.testing.expect(hosted.credential_failure == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, hosted.modelCatalogAccess());
-    try std.testing.expect(hosted.statusSnapshotAt(100, .codex).missingHelp(.interactive) == null);
+    try std.testing.expect(hosted.statusSnapshotAt(100, .codex, null).missingHelp(.interactive) == null);
 }
 
 test "credential inventory retains startup failure while storage is unavailable" {
@@ -3634,7 +3649,7 @@ test "confirmed source removal clears stale store status after adoption and logo
     var fixture: LogoutFixture = .{ .existing = .empty };
     _ = try runtime.reconcileAfterFxLoginLogoutWithDeps(alloc, &fixture, LogoutFixture.probe, LogoutFixture.load);
 
-    try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, runtime.statusSnapshotAt(100, .gateway).missingHelp(.interactive).?);
+    try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive).?);
 }
 
 test "auth status snapshot labels every credential source without exposing tokens" {
@@ -3653,7 +3668,7 @@ test "auth status snapshot labels every credential source without exposing token
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
 
-        const snapshot = runtime.statusSnapshot(.gateway);
+        const snapshot = runtime.statusSnapshot(.gateway, null);
         try std.testing.expectEqualStrings(credentials.sourceLabel(source), snapshot.activeSourceLabel());
         try std.testing.expectEqual(credentials.sourceRefreshable(source), snapshot.refreshable());
         const detail = try snapshot.formatDoctorDetail(alloc);
@@ -3668,7 +3683,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    const missing = runtime.statusSnapshot(.gateway);
+    const missing = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings(credentials.missing_credential_message, missing.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, missing.missingHelp(.interactive).?);
 
@@ -3676,7 +3691,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     defer credential.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &credential);
 
-    const selected = runtime.statusSnapshot(.gateway);
+    const selected = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
 }
@@ -3703,13 +3718,18 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
 }
 
 test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
-    const status = StatusSnapshot{
-        .required_source = .fx_login,
-        .fx_login_status = .unavailable,
-    };
-    const help = status.missingHelp(.cli).?;
-    try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
-    try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+    for ([_]credentials.FxLoginReadStatus{ .absent, .unavailable }) |read_status| {
+        const status = StatusSnapshot{
+            .required_source = .fx_login,
+            .fx_login_status = read_status,
+        };
+        const help = status.missingHelp(.cli).?;
+        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+        const interactive = status.missingHelp(.interactive).?;
+        try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
+        try std.testing.expect(std.mem.find(u8, interactive, "no other credential was selected") != null);
+    }
 }
 
 test "auth status snapshot reports an expired session without claiming it is unrefreshable" {
