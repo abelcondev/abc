@@ -3729,7 +3729,7 @@ pub fn Runtime(comptime App: type) type {
                 action_arena.allocator(),
                 call,
                 null,
-                "Failed",
+                try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                 &.{},
             );
             const formatted_action = if (outcome_decision) |decision|

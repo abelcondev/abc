@@ -4971,6 +4971,119 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "subagent rows show task previews and named replies through resume",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-rows-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(workspace, "fixture.txt"), "ROW_FILE_CONTENT");
+      const tasks = ["Check one-off cleanup", "Check provider replay", "Check replay again"];
+      const rootPrompt = "SUBAGENT_ROW_FIXTURE";
+      const finalText = "SUBAGENT_ROWS_FINISHED";
+      let parentStep = 0;
+      const releases: Array<() => void> = [];
+      const childGates = tasks.map(() => new Promise<void>((resolve) => releases.push(resolve)));
+      const rowGateway = startDynamicFakeGateway(async (body) => {
+        const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+        const userText = contentText(request.prompt?.findLast((message) => message.role === "user")?.content);
+        const child = tasks.findIndex((task) => userText.includes(task));
+        if (child >= 0 && !userText.includes(rootPrompt)) {
+          await childGates[child];
+          return fakeGatewayFinalText(`CHILD_ROW_REPLY_${child}`);
+        }
+        if (parentStep < tasks.length) {
+          const step = parentStep++;
+          return fakeGatewayToolCall(`row_child_${step}`, "subagent", {
+            request: step === 0
+              ? { action: "run", task: tasks[step] }
+              : { action: "message", agent: "reviewer", message: tasks[step] },
+          });
+        }
+        if (parentStep === tasks.length) {
+          parentStep += 1;
+          return fakeGatewayToolCall("row_invalid", "subagent", {
+            request: { action: "message", agent: "Invalid Agent", message: "Check failure visibility" },
+          });
+        }
+        if (parentStep++ === tasks.length + 1) {
+          return fakeGatewayToolCall("row_read", "read_file", { path: "fixture.txt" });
+        }
+        return fakeGatewayFinalText(finalText);
+      });
+      gateway = rowGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-subagent-row-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(rootPrompt);
+        for (let index = 0; index < tasks.length; index += 1) {
+          await session.waitForText(`${index === 0 ? "Subagent" : "reviewer"} working`, TIMEOUT);
+          const active = await session.captureFullScrollback();
+          expect(active).toContain(tasks[index]);
+          releases[index]();
+          await session.waitForText(`${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`, TIMEOUT);
+        }
+        await session.waitForText(finalText, TIMEOUT);
+        const compact = await session.captureFullScrollback();
+        expect(compact).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(compact).toContain("Invalid Agent failed · Check failure visibility");
+        expect(compact).not.toContain("Invalid Agent replied");
+        for (let index = 0; index < tasks.length; index += 1) {
+          expect(countOccurrences(compact, `${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`)).toBe(1);
+        }
+        expect(compact).not.toContain("Managed subagent");
+        await session.resizeWindow(45, 30);
+        await session.waitForText(finalText, TIMEOUT);
+        const narrow = await session.capturePane();
+        expect(narrow).toContain("reviewer replied · Check replay again");
+        await session.resizeWindow(110, 35);
+        await session.sendKeys("C-o");
+        await session.waitForText("Full detail", TIMEOUT);
+        let details = await session.capturePane();
+        for (let page = 0; page < 8 && !details.includes("CHILD_ROW_REPLY_0"); page += 1) {
+          await session.sendKeys("PPage");
+          details += await session.capturePane();
+        }
+        expect(details).toContain("CHILD_ROW_REPLY_0");
+        expect(details).toContain("Check one-off cleanup");
+        await session.sendKeys("C-o");
+        const requestCount = rowGateway.requests.length;
+        expect(requestCount).toBe(9);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await session.kill();
+        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
+        await session.waitForText(finalText, TIMEOUT);
+        const resumed = await session.captureFullScrollback();
+        expect(resumed).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
+        expect(resumed).toContain("Subagent finished · Check one-off cleanup");
+        expect(resumed).toContain("reviewer replied · Check replay again");
+        expect(rowGateway.requests.length).toBe(requestCount);
+        expect(readFileSync(join(root, "resumed-stderr.log"), "utf8")).toBe("");
+      } finally {
+        for (const release of releases) release();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "current compact command summaries hide no-op cwd prefixes and abbreviate the active workspace path",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-command-summary-")));
