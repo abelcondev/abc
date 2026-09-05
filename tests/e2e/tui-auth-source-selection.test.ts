@@ -2823,6 +2823,42 @@ tmuxTest(
   60_000,
 );
 
+for (const [provider, help] of [
+  ["gateway", "fx needs access to Vercel AI Gateway."],
+  ["codex", "Codex needs a subscription login."],
+  ["grok", "Grok needs a subscription login."],
+] as const) {
+  tmuxTest(`/status keeps ${provider} authentication requirements without credentials`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-status-provider-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    mkdirSync(join(home, ".fx"));
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.stringify({ provider, models: { [provider]: "test-model" } });
+    writeFileSync(settingsPath, settings);
+    gateway = startFakeGateway([]);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth_help=", TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain(`auth_help=${help}`);
+    if (provider !== "gateway") {
+      expect(scrollback).toContain(`model_source=${provider === "codex" ? "Codex" : "Grok"} subscription`);
+      expect(scrollback).not.toContain("auth_help=fx needs access to Vercel AI Gateway");
+    }
+    expect(scrollback).toContain("auth=missing");
+    expect(scrollback).toContain("auth_refreshable=false");
+    expect(await session.captureFullScrollbackEscapes()).toContain(help);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
+
 async function startFxWithoutAuth(
   testHome: string,
   testStderrPath: string,

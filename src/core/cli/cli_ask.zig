@@ -2470,6 +2470,7 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
 
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -2481,6 +2482,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
 
 fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| return line;
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -3597,7 +3599,7 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--auto")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .auto;
-        } else if (std.mem.eql(u8, arg, "--yolo")) {
+        } else if (std.mem.eql(u8, arg, "--full-access") or std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
@@ -3682,7 +3684,7 @@ fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
             var message: std.Io.Writer.Allocating = .init(alloc);
             defer message.deinit();
             try message.writer.print(
-                "fx ask: failed to save YOLO acknowledgment: {s}\n",
+                "fx ask: failed to save full access acknowledgment: {s}\n",
                 .{@errorName(failure.err)},
             );
             try options.deps.write_stderr(options.deps.stderr_ctx, message.written());
@@ -4097,7 +4099,7 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
+        .command_usage = "ask [--auto|--full-access] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,
@@ -5153,23 +5155,48 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expectEqualStrings("hello world", options.prompt);
 }
 
-test "parse options accepts yolo and rejects permission flag conflicts" {
-    var yolo = try parseOptionsWithStdin(
-        std.testing.allocator,
-        &.{ "--yolo", "hello" },
-        .tty,
-    );
-    defer yolo.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?PermissionMode, .yolo), yolo.permission_override);
+test "parse options accepts full access aliases and rejects permission flag conflicts" {
+    const alloc = std.testing.allocator;
+    const aliases = [_][:0]const u8{ "--full-access", "--yolo" };
+    for (aliases) |alias| {
+        var options = try parseOptionsWithStdin(alloc, &.{ alias, "hello" }, .tty);
+        defer options.deinit(alloc);
+        try std.testing.expectEqual(@as(?PermissionMode, .yolo), options.permission_override);
+        try std.testing.expectEqualStrings("hello", options.prompt);
+    }
 
-    try std.testing.expectError(
-        error.InvalidAskArgs,
-        parseOptionsWithStdin(
-            std.testing.allocator,
-            &.{ "--auto", "--yolo", "hello" },
-            .tty,
-        ),
-    );
+    const permission_flags = [_][:0]const u8{ "--auto", "--full-access", "--yolo" };
+    for (permission_flags) |first| {
+        for (permission_flags) |second| {
+            try std.testing.expectError(
+                error.InvalidAskArgs,
+                parseOptionsWithStdin(alloc, &.{ first, second, "hello" }, .tty),
+            );
+        }
+    }
+}
+
+test "parse options preserves full access aliases after the delimiter as prompt text" {
+    const alloc = std.testing.allocator;
+    var literal = try parseOptionsWithStdin(alloc, &.{ "--", "--full-access", "--yolo", "--auto" }, .tty);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(@as(?PermissionMode, null), literal.permission_override);
+    try std.testing.expectEqualStrings("--full-access --yolo --auto", literal.prompt);
+
+    const cases = [_]struct {
+        flag: [:0]const u8,
+        mode: PermissionMode,
+    }{
+        .{ .flag = "--auto", .mode = .auto },
+        .{ .flag = "--full-access", .mode = .yolo },
+        .{ .flag = "--yolo", .mode = .yolo },
+    };
+    for (cases) |case| {
+        var options = try parseOptionsWithStdin(alloc, &.{ case.flag, "--", "--full-access", "--yolo", "--auto" }, .tty);
+        defer options.deinit(alloc);
+        try std.testing.expectEqual(@as(?PermissionMode, case.mode), options.permission_override);
+        try std.testing.expectEqualStrings("--full-access --yolo --auto", options.prompt);
+    }
 }
 
 test "headless yolo warning reaches stderr before acknowledgment persistence" {

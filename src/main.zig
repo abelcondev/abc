@@ -843,6 +843,9 @@ const App = struct {
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
+            debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
+        };
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
