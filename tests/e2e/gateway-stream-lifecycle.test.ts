@@ -4082,6 +4082,7 @@ describe("gateway stream lifecycle", () => {
     const pidPath = join(root.workspace, "escaped-timeout.pids");
     const effectPath = join(root.workspace, "post-timeout-effect.txt");
     const scriptPath = join(root.workspace, "spawn-descendants.sh");
+    const readyCallId = "terminal_timeout_env_bash_ready";
     const timeoutCallId = "terminal_timeout_reaps_env_bash_1";
     const trailingMarker = "POST_TIMEOUT_BASH_STATEMENT_MUST_NOT_RUN";
     const descendantCount = 8;
@@ -4112,19 +4113,12 @@ describe("gateway stream lifecycle", () => {
       "  os._exit(0)",
       "while True: time.sleep(1)",
     ].join("\n");
-    writeFileSync(
-      scriptPath,
-      `#!/bin/bash
-/usr/bin/python3 - ${JSON.stringify(pidPath)} <<'PY'
-${python}
-PY
-printf '%s\\n' ${JSON.stringify(trailingMarker)}
-printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
-`,
-    );
-    chmodSync(scriptPath, 0o700);
     const command =
       `/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash ${JSON.stringify(scriptPath)}`;
+    const readyMarker = "TIMEOUT_FIXTURE_PYTHON_READY:";
+    // Resolve Apple's developer-tool launcher before starting the cleanup deadline.
+    // The response is a readiness handshake, not a guessed startup sleep.
+    const readyCommand = `/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,sys,time; print("${readyMarker}" + os.path.realpath(sys.executable), flush=True)'`;
     let step = 0;
     let escapedPids: number[] = [];
     let timeoutOutput = "";
@@ -4134,12 +4128,37 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
+          return fakeShellRun(readyCallId, readyCommand, { profile: "clean" });
+        case 1: {
+          try {
+            const ready = shellResult(body, readyCallId);
+            expect(ready).toMatchObject({ state: "completed", exit_code: 0, error: null });
+            expect(ready.output_delta.startsWith(readyMarker)).toBe(true);
+            const pythonPath = ready.output_delta.slice(readyMarker.length).trim();
+            expect(pythonPath.startsWith("/")).toBe(true);
+            expect(existsSync(pythonPath)).toBe(true);
+            writeFileSync(
+              scriptPath,
+              `#!/bin/bash
+${JSON.stringify(pythonPath)} - ${JSON.stringify(pidPath)} <<'PY'
+${python}
+PY
+printf '%s\\n' ${JSON.stringify(trailingMarker)}
+printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
+`,
+            );
+            chmodSync(scriptPath, 0o700);
+          } catch (error) {
+            gatewayObservationError = error;
+            return fakeGatewayFinalText("Timeout fixture readiness failed.");
+          }
           return fakeShellRun(timeoutCallId, command, {
             profile: "clean",
             yield_time_ms: 30_000,
             timeout_ms: 2_000,
           });
-        case 1: {
+        }
+        case 2: {
           try {
             timeoutOutput = toolResultOutput(body, timeoutCallId);
             escapedPids = readEscapedPids();
@@ -4174,9 +4193,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       const json = parseAskJson(result.stdout);
 
-      expect(json.output).toContain("Combined timeout cleanup complete.");
-      expect(gateway.requestCount()).toBe(2);
       if (gatewayObservationError) throw gatewayObservationError;
+      expect(json.output).toContain("Combined timeout cleanup complete.");
+      expect(gateway.requestCount()).toBe(3);
       expect(JSON.parse(timeoutOutput)).toMatchObject({
         state: "stopped",
         error: "TimeoutExpired",
@@ -7546,8 +7565,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("unstorable tool identities reject the batch and preserve earlier saved work", async () => {
-    for (const kind of ["empty-name", "missing-name", "null-name", "long-name", "long-id", "long-provisional"]) {
+  test.each(["empty-name", "missing-name", "null-name", "long-name", "long-id", "long-provisional"])(
+    "unstorable tool identities reject the batch and preserve earlier saved work (%s)",
+    async (kind) => {
       const root = createFixtureRoot(`identity-${kind}`);
       const tracePath = join(root.root, "trace.log");
       const invalid: Record<string, unknown> = {
@@ -7609,8 +7629,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
-    }
-  });
+    },
+  );
 
   test("blank current tool id is rejected before file execution", async () => {
     const root = createFixtureRoot("blank-call-id");

@@ -2693,7 +2693,10 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
 }
 
 fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (tool_presentation.isProviderSearchAlias(call.name) or std.mem.eql(u8, call.name, "subagent")) {
+    if (registry.lookup(call.name) != null) {
+        if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
+    }
+    if (tool_presentation.isProviderSearchAlias(call.name)) {
         return tool_presentation.formatPlainAction(arena, .{
             .tool_registry = registry,
             .call = call,
@@ -2710,7 +2713,7 @@ test "ACP subagent titles and terminal descriptions share request projection" {
     const call: ToolCall = .{ .id = "review", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}" };
     const title = try describeToolTitle(builtin_tools.registry, alloc, call);
     defer alloc.free(title);
-    try std.testing.expectEqualStrings("reviewer working · Check replay", title);
+    try std.testing.expectEqualStrings("reviewer · Check replay", title);
     const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
     defer alloc.free(completed);
     try std.testing.expectEqualStrings("reviewer replied · Check replay", completed);

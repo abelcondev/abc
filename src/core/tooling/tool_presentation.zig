@@ -31,6 +31,7 @@ pub const ToolActionInput = struct {
 };
 
 pub const SubagentActionState = union(enum) {
+    identity,
     active,
     completed,
     stopped: []const u8,
@@ -72,6 +73,7 @@ pub fn subagentAction(
     const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
     const preview = try subagentPreview(scratch, raw_preview);
     const label = switch (state) {
+        .identity => try alloc.dupe(u8, name.bytes),
         .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
         .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
         .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
