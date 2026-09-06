@@ -655,7 +655,7 @@ test "catalog ranking cache tolerates thousands of obsolete watermarks and binds
     }
     const generation: Generation = @splat(0x11);
     const stamp = (try rankingFingerprint(tmp.dir, "legacy", generation)).?;
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) } };
+    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
     defer writer.deinit();
     const ranking = Entry{ .fingerprint = stamp, .value = .{ .legacy_ranking = .{ .id = @constCast("legacy"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = generation } } };
     var stop = std.atomic.Value(bool).init(false);
@@ -680,7 +680,7 @@ test "catalog ranking invalid rows versions cancellation and bounds are misses" 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) } };
+    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
     defer writer.deinit();
     var stop = std.atomic.Value(bool).init(false);
     const invalid = [_]Entry{
@@ -722,7 +722,7 @@ test "catalog ranking missing or malformed generation requires rebuilding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) };
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
     const prefix = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ "1" ** 64 ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20";
     for ([_][]const u8{ prefix ++ "}}}]", prefix ++ ",\"generation\":[1]}}}]", prefix ++ ",\"generation\":null}}}]" }) |payload| {
@@ -745,7 +745,7 @@ test "catalog ranking allocation failures clean owned rows and merged publicatio
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try rankingTestSource(tmp.dir, "legacy");
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) } };
+    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
     defer writer.deinit();
     const stamp = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
     const ranking = Entry{ .fingerprint = stamp, .value = .{ .legacy_ranking = .{ .id = @constCast("legacy"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = @splat(0x11) } } };
