@@ -167,7 +167,7 @@ Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills),
 
 The `subagent` tool has two operations: `run` delegates one temporary task, and `message` creates or continues a named persistent agent. Each call waits for the child's result. A first message creates the named child immediately; optional instructions set or replace that child's system overlay while preserving fx's trusted base prompt. Child sessions remain private to their saved parent session. Each call appears in the main chat with its agent name or one-off status and a short task preview; full requests and replies remain in the tool details.
 
-Failed calls include the captured failure reason and any partial result; earlier tool effects are not rolled back or automatically retried. Existing child records remain readable, but records saved by this version cannot be reopened by older binaries that only support child registry schema 1.
+Failed calls include the captured failure reason and any partial result, including HTTP failures before an answer or after earlier tool calls. Earlier tool effects are not rolled back or automatically retried. Existing child records remain readable, but records saved by this version cannot be reopened by older binaries that only support child registry schema 1.
 
 Run `fx mcp` to see the available commands. Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive profile management. `fx mcp trust approve|reject NAME`, `fx mcp trust approve-all`, and `fx mcp trust reset` manage workspace-scoped project trust. `fx mcp auth NAME` and `fx mcp logout NAME` run the existing remote credential lifecycle without opening the TUI or contacting the Gateway.
 
