@@ -2277,6 +2277,18 @@ const GatewayReplayBuilder = struct {
         self.retained_bytes += bytes;
     }
 
+    fn findPart(parts: []const Part, kind: Kind, id: []const u8, starts_segment: bool) ?usize {
+        for (0..parts.len) |offset| {
+            const index = if (kind == .tool_call) offset else parts.len - 1 - offset;
+            const part = parts[index];
+            if (part.kind != kind or !std.mem.eql(u8, part.id, id)) continue;
+            // Provider continuations can restart a text or reasoning ID within one response.
+            if (kind != .tool_call and starts_segment and part.ended) return null;
+            return index;
+        }
+        return null;
+    }
+
     fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize) !void {
         const event = root.object.get("type").?.string;
         const kind: Kind = if (std.mem.startsWith(u8, event, "reasoning-"))
@@ -2294,13 +2306,8 @@ const GatewayReplayBuilder = struct {
         // Canonical admission owns rejection of malformed tool identities.
         if (kind == .tool_call and types.ConversationIdentity.invalidReason(id) != null) return;
         if (id.len > types.ConversationIdentity.max_bytes) return error.ProviderStateTooLarge;
-        var index: ?usize = null;
-        for (self.parts.items, 0..) |part, i| {
-            if (part.kind == kind and std.mem.eql(u8, part.id, id)) {
-                index = i;
-                break;
-            }
-        }
+        var index = findPart(self.parts.items, kind, id, std.mem.eql(u8, event, "text-start") or
+            std.mem.eql(u8, event, "reasoning-start"));
         if (index == null) {
             try self.reserve(@sizeOf(Part) + id.len);
             const owned_id = try self.alloc.dupe(u8, id);
@@ -4280,6 +4287,89 @@ test "Gateway completion retains ordered continuation parts and final metadata" 
     try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
 }
 
+test "Gateway replay preserves restarted reasoning and text segments" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        fn event(writer: *std.Io.Writer, value: anytype) !void {
+            try writer.writeAll("data: ");
+            try std.json.Stringify.value(value, .{}, writer);
+            try writer.writeAll("\n\n");
+        }
+
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    var distinct_id_replay: ?[]u8 = null;
+    defer if (distinct_id_replay) |replay| alloc.free(replay);
+
+    for ([_]bool{ false, true }) |reuse_ids| {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        const labels = [_][]const u8{ "A", "B", "C" };
+        for (labels) |label| {
+            const id = if (reuse_ids) "0" else label;
+            try Fixture.event(&payload.writer, .{ .type = "reasoning-start", .id = id });
+            try Fixture.event(&payload.writer, .{ .type = "reasoning-delta", .id = id, .delta = "" });
+            try Fixture.event(&payload.writer, .{ .type = "reasoning-delta", .id = id, .delta = label });
+            try Fixture.event(&payload.writer, .{ .type = "reasoning-end", .id = id, .providerMetadata = .{ .anthropic = .{ .signature = label } } });
+            try Fixture.event(&payload.writer, .{ .type = "text-start", .id = id });
+            try Fixture.event(&payload.writer, .{ .type = "text-delta", .id = id, .delta = label });
+            try Fixture.event(&payload.writer, .{ .type = "text-end", .id = id });
+            try Fixture.event(&payload.writer, .{ .type = "tool-call", .toolCallId = label, .toolName = "exa_search", .input = .{ .query = label }, .providerExecuted = true });
+            try Fixture.event(&payload.writer, .{ .type = "tool-result", .toolCallId = label, .result = .{ .results = .{} } });
+        }
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        var completion = try consumeSseStream(alloc, &reader, undefined, Fixture.discard, null, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expectEqualStrings("ABC", completion.content.?);
+        try std.testing.expectEqual(@as(usize, 3), completion.tool_calls.len);
+        const replay = completion.provider_state_json orelse return error.TestExpectedProviderReplay;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, replay, .{});
+        defer parsed.deinit();
+        const parts = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 9), parts.len);
+        for (labels, 0..) |label, i| {
+            const reasoning = parts[i * 3].object;
+            try std.testing.expectEqualStrings("reasoning", reasoning.get("type").?.string);
+            try std.testing.expectEqualStrings(label, reasoning.get("text").?.string);
+            try std.testing.expectEqualStrings(label, reasoning.get("providerOptions").?.object.get("anthropic").?.object.get("signature").?.string);
+            const text = parts[i * 3 + 1].object;
+            try std.testing.expectEqualStrings("text", text.get("type").?.string);
+            try std.testing.expectEqual(@as(i64, @intCast(i)), text.get("offset").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), text.get("length").?.integer);
+            try std.testing.expectEqualStrings(label, parts[i * 3 + 2].object.get("toolCallId").?.string);
+            try std.testing.expectEqualStrings(label, completion.tool_calls[i].id);
+            try std.testing.expectEqual(types.ToolExecutionProvenance.provider_executed, completion.tool_calls[i].provenance);
+        }
+        if (distinct_id_replay) |expected| {
+            try std.testing.expectEqualStrings(expected, replay);
+        } else {
+            distinct_id_replay = try alloc.dupe(u8, replay);
+        }
+    }
+}
+
+test "Gateway replay rejects late deltas without a segment restart" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "reasoning", "text" }) |kind| {
+        const payload = try std.fmt.allocPrint(
+            alloc,
+            "data: {{\"type\":\"{s}-start\",\"id\":\"0\"}}\n\n" ++
+                "data: {{\"type\":\"{s}-end\",\"id\":\"0\"}}\n\n" ++
+                "data: {{\"type\":\"{s}-delta\",\"id\":\"0\",\"delta\":\"\"}}\n\n",
+            .{ kind, kind, kind },
+        );
+        defer alloc.free(payload);
+        var reader = std.Io.Reader.fixed(payload);
+        var cancelled = std.atomic.Value(bool).init(false);
+        const Noop = struct {
+            fn discard(_: *anyopaque, _: []const u8) void {}
+        };
+        try std.testing.expectError(error.InvalidProviderState, consumeSseStream(alloc, &reader, undefined, Noop.discard, null, &cancelled));
+    }
+}
+
 test "Gateway replay assembly is allocation-safe and rejects incomplete metadata" {
     const Check = struct {
         fn run(alloc: std.mem.Allocator) !void {
@@ -4288,6 +4378,9 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
             for ([_][]const u8{
                 "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"redactedData\":\"opaque\"}}}",
                 "{\"type\":\"reasoning-delta\",\"id\":\"r\",\"delta\":\"\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"signed\"}}}",
+                "{\"type\":\"reasoning-end\",\"id\":\"r\"}",
+                "{\"type\":\"reasoning-start\",\"id\":\"r\"}",
+                "{\"type\":\"reasoning-delta\",\"id\":\"r\",\"delta\":\"\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"second\"}}}",
                 "{\"type\":\"reasoning-end\",\"id\":\"r\"}",
             }) |event| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, alloc, event, .{});
@@ -4301,6 +4394,7 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
             defer alloc.free(output);
             try std.testing.expect(std.mem.find(u8, output, "opaque") != null);
             try std.testing.expect(std.mem.find(u8, output, "signed") != null);
+            try std.testing.expect(std.mem.find(u8, output, "second") != null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
