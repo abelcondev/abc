@@ -3089,6 +3089,139 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "multiline steering survives retained history recovery after tool completion",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-retained-history-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const startPath = join(workspace, "started");
+      const releasePath = join(workspace, "release");
+      const effectPath = join(workspace, "effect");
+      const finalText = "RETAINED_HISTORY_COMPLETE";
+      const lines = [
+        "RETAINED_FIRST adjust the header",
+        "RETAINED_MIDDLE remove the footer",
+        "RETAINED_LAST keep the labels concise",
+      ];
+      const steering = lines.join("\n");
+      const finalHold: HoldState = { started: false, cancelled: false };
+      const requestHold: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(
+        join(workspace, "check.sh"),
+        "printf started > started\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf once >> effect\n",
+      );
+      let requestCount = 0;
+      const recoveryGateway = startDynamicFakeGateway((body) => {
+        requestCount++;
+        if (body.includes("RETAINED_FIRST")) {
+          return heldGatewayResponse(finalHold, [], [
+            { type: "text-delta", id: "recovery_done", delta: finalText },
+            { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+          ]);
+        }
+        if (requestCount === 1) {
+          return fakeGatewaySse([
+            {
+              type: "text-delta",
+              id: "recovery_history",
+              delta: Array.from(
+                { length: 6_000 },
+                (_, index) => "History row " + index + ": previous implementation work.",
+              ).join("\n"),
+            },
+            {
+              type: "tool-call",
+              toolCallId: "retained_command",
+              toolName: "shell",
+              input: { request: { action: "run", command: "sh check.sh", profile: "clean", yield_time_ms: 1_000 } },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        return heldGatewayResponse(requestHold);
+      });
+      gateway = recoveryGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 103,
+        height: 26,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-retained-history-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: recoveryGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,scroll,frame_schedule",
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run the prepared check.");
+        await waitForPath(startPath);
+        for (let index = 0; index < lines.length; index++) {
+          if (index > 0) await session.sendKeys("M-Enter");
+          for (const character of lines[index]!) {
+            session.sendLiteralImmediate(character);
+            await Bun.sleep(3);
+          }
+        }
+        await waitForCondition(
+          () => readFileSync(tracePath, "utf8").includes("reason=lifecycle_status_replacement"),
+          "completed tool status replacement",
+        );
+        session.sendKeysImmediate(["Enter"]);
+        await waitForCondition(() => finalHold.started, "accepted steering response");
+        await waitForCondition(
+          () => {
+            const trace = readFileSync(tracePath, "utf8");
+            const consumed = trace.indexOf("event=prompt_steering_consumed");
+            return consumed >= 0 && trace.slice(consumed).includes("body_disposition=retain_committed");
+          },
+          "retained frame after steering adoption",
+        );
+        writeFileSync(releasePath, "go");
+        await waitForPath(effectPath);
+        finalHold.release?.();
+        await session.waitForText(finalText, TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+        const scrollback = await session.captureFullScrollback();
+        for (const line of lines) expect(countOccurrences(scrollback, line)).toBe(1);
+        expect(scrollback).toContain("History row 5999");
+        expect(readFileSync(effectPath, "utf8")).toBe("once");
+        const continued = recoveryGateway.requests.filter((request) => request.body.includes("RETAINED_FIRST"));
+        expect(continued).toHaveLength(1);
+        const prompt = contentText(parseGatewayRequest(continued[0]!.body).prompt);
+        expect(prompt).toContain(steering);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(execFileSync(FX_BIN, ["replay", tapePath, "--frames"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).toContain(finalText);
+        expect(session.isPaneAlive()).toBe(true);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        writeFileSync(releasePath, "go");
+        finalHold.release?.();
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "cancelled buffered assistant tail stays before steering and the next answer",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-late-tail-")));
