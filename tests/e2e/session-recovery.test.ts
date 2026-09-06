@@ -642,6 +642,7 @@ describe("session recovery", () => {
           await tui.waitForText(LEGACY_TITLE, TIMEOUT);
           await tui.waitForPane(() => readFileSync(trace, "utf8").includes("session catalog cache reused="), TIMEOUT);
           await tui.sendKeys("Escape");
+          await tui.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
           await tui.waitForComposer(TIMEOUT);
         }
         await tui.sendText("/quit");
