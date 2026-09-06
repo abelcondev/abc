@@ -11905,14 +11905,19 @@ test "history recovery preserves retained geometry and stages painted frames" {
             .gap_above_activity = 0,
             .footer_gap_after_activity = 1,
         } };
-        const candidate = render_engine.frame_layout.solve(.{
+        const frame_input = render_engine.frame_layout.SolveInput{
             .terminal = layout,
             .owned_top = 1,
             .footer = .{ .natural_rows = 3, .min_rows = 3, .max_rows = 3 },
             .transcript = source.preview,
             .activity = activity,
-        });
-        const committed = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate);
+        };
+        const candidate = render_engine.frame_layout.solve(frame_input);
+        var prior_input = frame_input;
+        if (repaint) prior_input.footer = .{ .natural_rows = 5, .min_rows = 5, .max_rows = 5 };
+        const committed = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(
+            render_engine.frame_layout.solve(prior_input),
+        );
         runtime.committed_frame_layout = committed;
         const committed_selection = ViewportSelection{
             .top_row = 1,
@@ -11937,29 +11942,33 @@ test "history recovery preserves retained geometry and stages painted frames" {
             .layout_id = committed.layout_id,
             .normal_buffer_recovery_pending = true,
         } };
-        const area = render_engine.frame_layout.FrameRect{ .top = 1, .bottom = 18 };
+        const area = render_engine.frame_layout.FrameRect{ .top = 1, .bottom = if (repaint) 16 else 18 };
         var metrics: Metrics = .{};
         var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForFrame(
             alloc,
             &metrics,
             &source,
             area,
-            false,
+            repaint,
         );
         defer prepared.deinit(alloc);
         const facts = try runtime.prepareTranscriptScrollFactsForFrame(
             alloc,
             &source,
             &prepared,
-            false,
+            repaint,
             false,
         );
         const scroll = render_engine.frame_scroll_plan.merge(layout.rows, 1, 0, facts.planned_rows);
+        if (repaint) {
+            try std.testing.expectEqual(@as(u32, 64), facts.target_visual_offset);
+            try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+        }
         const resolved = try runtime.resolveTranscriptTransitionTargetForFrameInArea(
             alloc,
             &source,
             &prepared,
-            committed,
+            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
             area,
             scroll,
             facts,
@@ -11968,9 +11977,10 @@ test "history recovery preserves retained geometry and stages painted frames" {
         );
         if (repaint) {
             try std.testing.expect(resolved.bodyDisposition() == .paint);
-            try std.testing.expectEqual(@as(u16, 18), resolved.cursorRow());
-            try std.testing.expectEqual(@as(u16, 4), resolved.cursorCol());
-            try std.testing.expectEqual(@as(u16, 18), resolved.selection().last_visible_row);
+            try std.testing.expectEqual(@as(usize, 62), resolved.selection().start_line);
+            try std.testing.expectEqual(@as(u16, 17), resolved.cursorRow());
+            try std.testing.expectEqual(@as(u16, 1), resolved.cursorCol());
+            try std.testing.expectEqual(@as(u16, 16), resolved.selection().last_visible_row);
         } else {
             try std.testing.expect(resolved.bodyDisposition() == .retain_committed);
             try std.testing.expectEqualDeep(committed_selection, resolved.selection());
