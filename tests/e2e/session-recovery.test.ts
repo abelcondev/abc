@@ -617,6 +617,56 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
+  test.skipIf(!tmuxAvailable())("continue reuses legacy ranking after opening the resume picker", async () => {
+    const fixture = createFixture("fx-continue-ranking-cache-");
+    const legacy = createLegacySession(fixture, 3);
+    const gateway = startFakeGateway([fakeGatewayFinalText("LATEST_CACHE_HISTORY")]);
+    let tui: TmuxSession | null = null;
+    try {
+      const id = await createSavedSession(fixture, gateway);
+      const before = savedFileHashes(legacy.source);
+      for (const iteration of [0, 1]) {
+        const trace = join(fixture.root, `ranking-${iteration}.trace`);
+        const stderrPath = join(fixture.root, `ranking-${iteration}.stderr`);
+        tui = await TmuxSession.create({
+          cmd: `${JSON.stringify(FX_BIN)} -c`, cwd: fixture.workspace, stderrPath,
+          env: { ...gatewayEnv(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "session,core" },
+        });
+        await tui.waitForComposer(TIMEOUT);
+        await tui.waitForText("LATEST_CACHE_HISTORY", TIMEOUT);
+        expect(readFileSync(trace, "utf8")).toContain(iteration === 0
+          ? "legacy ranking cache reused=0 refreshed=1"
+          : "legacy ranking cache reused=1 refreshed=0");
+        if (iteration === 0) {
+          await tui.sendText("/resume");
+          await tui.waitForText(LEGACY_TITLE, TIMEOUT);
+          await tui.waitForPane(() => readFileSync(trace, "utf8").includes("session catalog cache reused="), TIMEOUT);
+          await tui.sendKeys("Escape");
+          await tui.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+          await tui.waitForComposer(TIMEOUT);
+        }
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(savedFileHashes(legacy.source)).toEqual(before);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        await tui.kill();
+        tui = null;
+      }
+      const resumed = await runFx(["session", "--id", id, "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(resumed.stdout).toContain("LATEST_CACHE_HISTORY");
+    } finally {
+      await tui?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
   for (const { version, entry } of [
     { version: 2, entry: "-r" },
     { version: 3, entry: "/resume" },
