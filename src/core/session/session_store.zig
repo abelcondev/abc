@@ -7293,7 +7293,9 @@ test "writable last preserves conversation recency and allocation cleanup" {
         defer dir.close();
         var reference = try classifyReadOnlyCandidate(alloc, &dir, id);
         defer reference.deinit(alloc);
-        var candidate = (try ctx.store.resolveWritableCandidate(alloc, id, ctx.workspace, .{})).?;
+        var scan = Store.RankingScan{ .cache = .{} };
+        defer scan.deinit(alloc);
+        var candidate = (try ctx.store.resolveWritableCandidate(alloc, id, ctx.workspace, .{}, &scan)).?;
         defer candidate.deinit(alloc);
         try std.testing.expectEqual(reference.summary.updated_at_ms, candidate.updated_at_ms);
         try std.testing.expectEqualStrings(reference.summary.workspace_root.?, candidate.workspace_root);
