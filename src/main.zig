@@ -1473,6 +1473,10 @@ const App = struct {
         };
     }
 
+    pub fn request_context_compaction(self: *App) !void {
+        try InputSubmitRuntime.request_context_compaction(self);
+    }
+
     pub fn enqueueContextCompaction(self: *App) !bool {
         if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
         const selection = self.provider_selection.selection();
@@ -4151,6 +4155,7 @@ test {
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
+    _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
     _ = @import("core/app/usage_dashboard_runtime.zig");
