@@ -6080,6 +6080,8 @@ fn processQueuedPromptLoop(
                         overlay_arena,
                         recovery_source_messages,
                         current_user_message_index,
+                        deps.agent_stream_provider,
+                        .{ .provider = job.provider, .model = gateway_model },
                     ),
                     .fallback => fallback: {
                         if (job.authorized_image_catalog.len == 0) {
@@ -6099,6 +6101,11 @@ fn processQueuedPromptLoop(
                     },
                 };
             };
+            if (vision_policy.route == .native and projected_request_messages.len < recovery_source_messages.len) {
+                debug_trace.logf("history", "native_vision_history_projected removed_messages={d} reason=native_image_input", .{
+                    recovery_source_messages.len - projected_request_messages.len,
+                });
+            }
             const terminal_request_eligible = terminal_request_normalization_eligible(
                 base_nested_terminal_advertised,
                 vision_mode,
