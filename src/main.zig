@@ -1405,10 +1405,15 @@ const App = struct {
             null;
         errdefer if (account_id_copy) |account_id| std.heap.c_allocator.free(account_id);
 
-        const authorized_image_catalog = try self.session.snapshotImageCatalog(
-            std.heap.c_allocator,
-            source_images,
-        );
+        const authorized_image_catalog = if (recovery_checkpoint) |checkpoint| blk: {
+            const history_catalog = try self.session.snapshotImageCatalog(std.heap.c_allocator, &.{});
+            defer types.freeImageAttachmentSlice(std.heap.c_allocator, history_catalog);
+            break :blk try session_runtime.merge_image_catalog_history_turn(
+                std.heap.c_allocator,
+                history_catalog,
+                checkpoint.interruptedTurn(),
+            );
+        } else try self.session.snapshotImageCatalog(std.heap.c_allocator, source_images);
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
         const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);

@@ -1641,10 +1641,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (current_images.len > 0) {
+    if (recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1656,7 +1656,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
     }
 
-    const authorized_image_catalog = try ctx.session.snapshotImageCatalog(alloc, current_images);
+    const authorized_image_catalog = if (recovery_checkpoint) |checkpoint|
+        try session_runtime.merge_image_catalog_history_turn(alloc, restored_image_catalog, checkpoint.interruptedTurn())
+    else
+        try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
@@ -2890,6 +2893,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        ctx.prompt_snapshot_committed = true;
+    };
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
@@ -2899,6 +2905,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    ctx.prompt_snapshot_committed = true;
 }
 
 fn flushAskSessionUsage(
@@ -8620,15 +8627,18 @@ test "json run with missing API key prints diagnostic then final object" {
     );
 }
 
-test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+test "resumed ask preserves user and image identity after a retained mid-turn checkpoint" {
     const Process = struct {
         fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
             if (job.recovery_checkpoint) |checkpoint| {
                 try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
                 try std.testing.expectEqualStrings("original request", job.prompt);
+                try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
+                try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
+                try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
             }
             try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
-                .user = .{ .text = job.prompt },
+                .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast("new answer"),
             } });
             try testPushAssistantText(deps, "new answer");
@@ -8652,7 +8662,17 @@ test "ordinary resumed ask preserves its user after a retained mid-turn checkpoi
         defer store.deinit(alloc);
         var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
         defer state.deinit(alloc);
-        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        var images = [_]ImageAttachment{.{
+            .id = 7,
+            .path = @constCast("/missing/original.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
+            .snapshot_sha256 = @constCast("a" ** 64),
+        }};
+        const old_user = types.UserTurn{
+            .text = @constCast("original request"),
+            .images = if (case.continue_recovery) &images else &.{},
+        };
         {
             var writable = try store.startWritableSession(alloc, state);
             defer writable.deinit(alloc);

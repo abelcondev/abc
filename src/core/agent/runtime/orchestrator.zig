@@ -4685,6 +4685,17 @@ fn processQueuedPromptInner(
     var within_turn_suffix: std.ArrayList(ChatMessage) = .empty;
     defer within_turn_suffix.deinit(arena);
     if (job.recovery_checkpoint) |checkpoint| {
+        for (checkpoint.user.images) |attachment| {
+            var verified = image_attachments.loadVerifiedSnapshot(
+                std.heap.c_allocator,
+                attachment,
+                .{ .cancel_flag = config.cancel_flag },
+            ) catch |err| {
+                debug_trace.logf("images", "recovery_snapshot_unavailable image_id={d} reason={s}", .{ attachment.id, @errorName(err) });
+                return if (err == error.FileNotFound) error.MissingImageSnapshot else err;
+            };
+            verified.deinit(std.heap.c_allocator);
+        }
         try session_runtime.appendExecutionMemoryChatMessages(
             arena,
             &within_turn_suffix,

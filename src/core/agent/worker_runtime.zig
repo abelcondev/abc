@@ -1946,6 +1946,12 @@ pub const WorkerRuntime = struct {
         ownership.deinit();
     }
 
+    pub fn preservePromptSnapshots(self: *WorkerRuntime, turn_id: u64, images: []const types.ImageAttachment) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        _ = self.preservePromptSnapshotsLocked(turn_id, images);
+    }
+
     fn preservePromptSnapshotsLocked(
         self: *WorkerRuntime,
         turn_id: u64,
@@ -2617,7 +2623,9 @@ fn discardQueuedPrompt(
     prompt: QueuedPrompt,
     retained_images: []const types.ImageAttachment,
 ) void {
-    image_attachments.deleteUnreferencedImageSnapshots(prompt.images, retained_images);
+    if (prompt.recovery_checkpoint == null) {
+        image_attachments.deleteUnreferencedImageSnapshots(prompt.images, retained_images);
+    }
     freeQueuedPrompt(alloc, prompt);
 }
 
@@ -2659,62 +2667,68 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
     }
 }
 
-test "session transfer preserves active and finished prompt snapshots" {
+test "session and checkpoint transfer preserve active and finished prompt snapshots" {
     const alloc = std.testing.allocator;
     const phases = [_]enum { take_before_begin, active, finished }{
         .take_before_begin,
         .active,
         .finished,
     };
-    for (phases) |phase| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const name = switch (phase) {
-            .take_before_begin => "take-before-begin.bin",
-            .active => "active.bin",
-            .finished => "finished.bin",
-        };
-        {
-            var file = try tmp.dir.createFile(std.testing.io, name, .{});
-            defer file.close(std.testing.io);
-            try file.writeStreamingAll(std.testing.io, "snapshot");
-        }
-        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-        defer alloc.free(path);
-        const images = [_]types.ImageAttachment{.{
-            .id = 1,
-            .path = @constCast("/tmp/source.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = path,
-            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        }};
+    for ([_]bool{ false, true }) |checkpoint_accepted| {
+        for (phases) |phase| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const name = switch (phase) {
+                .take_before_begin => "take-before-begin.bin",
+                .active => "active.bin",
+                .finished => "finished.bin",
+            };
+            {
+                var file = try tmp.dir.createFile(std.testing.io, name, .{});
+                defer file.close(std.testing.io);
+                try file.writeStreamingAll(std.testing.io, "snapshot");
+            }
+            const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+            defer alloc.free(path);
+            const images = [_]types.ImageAttachment{.{
+                .id = 1,
+                .path = @constCast("/tmp/source.png"),
+                .media_type = @constCast("image/png"),
+                .snapshot_path = path,
+                .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            }};
 
-        var runtime = WorkerRuntime{};
-        defer runtime.deinit(alloc);
-        runtime.active_turn_id = 41;
-        var active = ActivePromptSnapshotOwnership.init(&images);
-        if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-        if (phase == .finished) {
-            const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
-                return error.TestExpectedSnapshotOwnership;
-            try runtime.pushEvent(alloc, .{ .finish_prompt = .{
-                .turn = .{ .assistant = .{
-                    .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
-                    .assistant = @constCast("done"),
-                } },
-                .snapshot_file_ownership = ownership,
-            } });
-            ownership.release();
-            runtime.endActivePromptSnapshots(&active);
-            runtime.active_turn_id = 0;
-        }
+            var runtime = WorkerRuntime{};
+            defer runtime.deinit(alloc);
+            runtime.active_turn_id = 41;
+            var active = ActivePromptSnapshotOwnership.init(&images);
+            if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+            if (phase == .finished) {
+                const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
+                    return error.TestExpectedSnapshotOwnership;
+                try runtime.pushEvent(alloc, .{ .finish_prompt = .{
+                    .turn = .{ .assistant = .{
+                        .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
+                        .assistant = @constCast("done"),
+                    } },
+                    .snapshot_file_ownership = ownership,
+                } });
+                ownership.release();
+                runtime.endActivePromptSnapshots(&active);
+                runtime.active_turn_id = 0;
+            }
 
-        runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
-        if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-        if (phase != .finished) runtime.endActivePromptSnapshots(&active);
-        runtime.discardEvents(alloc);
-        try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
-        try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
+            if (checkpoint_accepted) {
+                runtime.preservePromptSnapshots(41, &images);
+            } else {
+                runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
+            }
+            if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+            if (phase != .finished) runtime.endActivePromptSnapshots(&active);
+            runtime.discardEvents(alloc);
+            try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+            try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
+        }
     }
 }
 
@@ -6449,4 +6463,43 @@ test "question request rolls back pending state when its boundary event cannot b
     try std.testing.expect(runtime.pending_question_shared == null);
     try std.testing.expect(runtime.pending_question_response == .pending);
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+}
+
+test "discarding queued recovery releases metadata without deleting saved images" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "saved.bin", .data = "snapshot" });
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved.bin");
+    defer alloc.free(path);
+    const images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/missing/source.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = path,
+        .snapshot_sha256 = @constCast("a" ** 64),
+    }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var prompt = try makePrompt(alloc, "recover", "test/model");
+    var owned = true;
+    defer if (owned) freeQueuedPrompt(alloc, prompt);
+    prompt.images = try types.dupeImageAttachmentSlice(alloc, &images);
+    prompt.recovery_checkpoint = try (session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("recover"), .images = @constCast(&images) },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    }).dupe(alloc);
+    try runtime.enqueuePrompt(alloc, prompt);
+    owned = false;
+    runtime.clearQueuedPrompts(alloc, &.{});
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
 }

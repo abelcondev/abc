@@ -661,8 +661,15 @@ pub fn handlePrompt(
         },
     };
 
-    const prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
+    var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+    if (session.writable) |writable| {
+        if (writable.state.recovery_checkpoint) |checkpoint| {
+            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, checkpoint.interruptedTurn());
+            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
+            prior_image_catalog = merged;
+        }
+    }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
     var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
         return promptInputFailure(err);
@@ -777,8 +784,11 @@ pub fn handlePrompt(
     defer alloc.free(root_user_intent_context);
 
     const current_images = if (recovery_checkpoint) |checkpoint| checkpoint.user.images else prompt_input.images;
-    const authorized_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, current_images);
-    defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
+    const authorized_image_catalog = if (recovery_checkpoint != null)
+        prior_image_catalog
+    else
+        try session.session_rt.snapshotImageCatalog(alloc, current_images);
+    defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
@@ -2039,6 +2049,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+    };
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2049,6 +2062,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
 /// Stores grants on the active ACP session without persisting them.
