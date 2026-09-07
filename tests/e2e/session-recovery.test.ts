@@ -454,18 +454,31 @@ describe("session recovery", () => {
       expect(savedFileHashes(source)).toEqual(before);
       expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
       expect(gateway.requests).toHaveLength(1);
-      writeFileSync(join(source, "permissions.json"), "{broken", { mode: 0o600 });
-      const damaged = savedFileHashes(source);
-      const refused = await runFx(["session", "recover", id, "--json"], {
-        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
-      });
-      expect(refused.code).toBe(1);
-      expect(refused.stderr).toBe("");
-      expect(JSON.parse(refused.stdout).code).toBe("InvalidPermissionState");
-      expect(refused.stdout).not.toContain("resume it normally");
-      expect(savedFileHashes(source)).toEqual(damaged);
-      expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
-      expect(gateway.requests).toHaveLength(1);
+      async function expectRefused(code: string) {
+        const damaged = savedFileHashes(source);
+        const refused = await runFx(["session", "recover", id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(refused.code).toBe(1);
+        expect(refused.stderr).toBe("");
+        expect(JSON.parse(refused.stdout).code).toBe(code);
+        expect(refused.stdout).not.toContain("resume it normally");
+        expect(savedFileHashes(source)).toEqual(damaged);
+        expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
+        expect(gateway.requests).toHaveLength(1);
+      }
+      const permissionPath = join(source, "permissions.json");
+      const permissions = readFileSync(permissionPath);
+      writeFileSync(permissionPath, "{broken", { mode: 0o600 });
+      await expectRefused("InvalidPermissionState");
+      writeFileSync(permissionPath, "", { mode: 0o600 });
+      await expectRefused("PermissionStateTooLarge");
+      writeFileSync(permissionPath, permissions, { mode: 0o600 });
+      const usagePath = join(source, "usage-v2.json");
+      rmSync(usagePath);
+      mkdirSync(usagePath, { mode: 0o700 });
+      await expectRefused("InvalidUsageSidecar");
+      expect(readdirSync(usagePath)).toEqual([]);
     } finally {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
