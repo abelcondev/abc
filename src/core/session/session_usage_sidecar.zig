@@ -133,6 +133,13 @@ pub fn has_recoverable_corruption(alloc: Allocator, session_dir: *io_mod.Verifie
             if (envelope.value.object.get("schema_version")) |version| {
                 if (version == .integer and version.integer != 1) return error.UnsupportedUsageSidecar;
             }
+            if (envelope.value.object.get("snapshot")) |value| {
+                if (value == .object) {
+                    if (value.object.get("schema_version")) |version| {
+                        if (version == .integer and (version.integer < 0 or !session_usage.supports_snapshot_schema(@intCast(version.integer)))) return error.UnsupportedUsageSidecar;
+                    }
+                }
+            }
         }
         return true;
     };
@@ -451,6 +458,16 @@ test "recovery copy classifies accounting without changing normal resume" {
     try std.testing.expectEqualStrings("{broken", retained.encoded);
     try write(alloc, &dir, "foreign", snapshot);
     try std.testing.expectError(error.UsageSidecarSessionMismatch, has_recoverable_corruption(alloc, &dir, "session"));
+    const valid_bytes = try encode(alloc, "session", snapshot);
+    defer alloc.free(valid_bytes);
+    var future = try std.json.parseFromSlice(std.json.Value, alloc, valid_bytes, .{});
+    defer future.deinit();
+    future.value.object.getPtr("snapshot").?.object.getPtr("schema_version").?.* = .{ .integer = 4 };
+    var future_bytes: std.Io.Writer.Allocating = .init(alloc);
+    defer future_bytes.deinit();
+    try std.json.Stringify.value(future.value, .{}, &future_bytes.writer);
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, future_bytes.written());
+    try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
     try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{\"schema_version\":2,\"session_id\":\"session\",\"snapshot\":{}}");
     try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
     const file = try dir.dir.openFile(std.testing.io, sidecar_file, .{ .mode = .read_write });

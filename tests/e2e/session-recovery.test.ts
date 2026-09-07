@@ -355,6 +355,32 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
 }
 
 describe("session recovery", () => {
+  test("unsupported accounting snapshot versions refuse recovery without changing the source", async () => {
+    const fixture = createFixture("fx-session-future-usage-");
+    const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_ACCOUNTING_VERSION")]);
+    try {
+      const id = await createSavedSession(fixture, gateway);
+      const sessions = join(fixture.home, ".fx", "sessions");
+      const source = join(sessions, id);
+      const usagePath = join(source, "usage-v2.json");
+      const usage = JSON.parse(readFileSync(usagePath, "utf8"));
+      usage.snapshot.schema_version = 4;
+      writeFileSync(usagePath, JSON.stringify(usage), { mode: 0o600 });
+      const before = savedFileHashes(source);
+      const sessionNames = readdirSync(sessions).sort();
+      const result = await runFx(["session", "recover", id, "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain("UnsupportedUsageSidecar");
+      expect(savedFileHashes(source)).toEqual(before);
+      expect(readdirSync(sessions).sort()).toEqual(sessionNames);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   for (const damagedTail of [false, true]) {
     test(`corrupt accounting recovers a source-preserving copy, damaged tail=${damagedTail}`, async () => {
       const fixture = createFixture("fx-session-usage-copy-");
