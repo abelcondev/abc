@@ -18,7 +18,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewaySse, hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -1191,13 +1191,22 @@ describe("Vision route fake Gateway", () => {
     TIMEOUT,
   );
 
-  test(
-    "saved unadvertised native Vision rejection recovers and is filtered after resume",
-    async () => {
+  test.each(["plain", "prose-replay", "mixed-replay"] as const)(
+    "saved unadvertised native Vision rejection recovers and is filtered after resume (%s)",
+    async (shape) => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
+      if (shape === "mixed-replay") writeFileSync(join(root.workspace, "notes.txt"), "VISION_READ_SENTINEL\n");
       const gateway = startImageGateway([
-        sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision"),
+        shape === "plain" ? sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision") : fakeGatewaySse([
+          { type: "reasoning-start", id: "reasoning" },
+          { type: "reasoning-delta", id: "reasoning", delta: "Inspect the available evidence." },
+          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: "retained-reasoning-signature" } } },
+          ...(shape === "prose-replay" ? [{ type: "text-delta", id: "intro", delta: "I will inspect the image." }] : []),
+          { type: "tool-call", toolCallId: "native_vision", toolName: "vision", input: { image_ids: [1], focus: "inspect" }, providerMetadata: { vertex: { thoughtSignature: "removed-vision-signature" } } },
+          ...(shape === "mixed-replay" ? [{ type: "tool-call", toolCallId: "retained_read", toolName: "read_file", input: { path: "notes.txt" }, providerMetadata: { vertex: { thoughtSignature: "retained-read-signature" } } }] : []),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
         sseText("Gemini recovered after rejected Vision"),
         sseText("Gemini continued without historical Vision evidence"),
       ]);
@@ -1254,6 +1263,9 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
+        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const originalEvents = readFileSync(eventsPath, "utf8");
+        if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
 
         const resumed = await runFx(
           [
@@ -1286,6 +1298,17 @@ describe("Vision route fake Gateway", () => {
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
         expect(resumedRequest.body).not.toContain("Vision is unavailable for this request.");
+        expect(resumedRequest.body).not.toContain("removed-vision-signature");
+        if (shape !== "plain") expect(resumedRequest.body).toContain("retained-reasoning-signature");
+        if (shape === "prose-replay") expect(resumedRequest.body).toContain("I will inspect the image.");
+        if (shape === "mixed-replay") {
+          expect(resumedRequest.body).toContain("retained-read-signature");
+          expect(resumedRequest.body).toContain("VISION_READ_SENTINEL");
+          const parts = promptParts(resumedRequest.body);
+          expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(1);
+          expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(1);
+        }
+        expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
         for (const request of gateway.chatRequests) {
           expect(request.headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
           expect(request.body).not.toContain(fixture.imagePath);
