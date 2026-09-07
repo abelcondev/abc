@@ -2852,7 +2852,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         return;
     };
     try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
@@ -2861,7 +2861,10 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
+    };
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
@@ -2879,7 +2882,10 @@ fn commitContextCompaction(
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (ctx.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
         if (active_prefix != null) ctx.prompt_snapshot_committed = true;
     }
     ctx.session.commitCompactedHistory(ctx.alloc, prepared);
@@ -2890,6 +2896,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        ctx.prompt_snapshot_committed = true;
+    };
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;

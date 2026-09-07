@@ -642,6 +642,11 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        if (session.writable) |*loaded| try loaded.requireWritable();
+    }
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
@@ -1962,7 +1967,7 @@ fn persistAcpHistoryTurn(
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         alloc,
         .{ .history_turn_committed = .{
             .conversation_language = session.session_rt.languageSnapshot(),
@@ -1971,7 +1976,12 @@ fn persistAcpHistoryTurn(
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) {
+            if (current_prompt_input) |input| input.retainImageSnapshots();
+        }
+        return err;
+    };
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
@@ -1991,7 +2001,12 @@ fn commitContextCompaction(
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (session.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+            return err;
+        };
         if (active_prefix != null) {
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
         }
@@ -2039,6 +2054,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+    };
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());

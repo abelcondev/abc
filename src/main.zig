@@ -813,7 +813,7 @@ const App = struct {
     }
 
     /// Returns an owned handoff only after all interactive state is torn down.
-    pub fn deinitWithResumeHandoff(self: *App) ?app_session_runtime.ResumeHandoff {
+    pub fn deinitWithResumeHandoff(self: *App) app_session_runtime.ShutdownOutcome {
         return self.deinitImpl(true);
     }
 
@@ -829,7 +829,7 @@ const App = struct {
         return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
-    fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
+    fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
@@ -844,7 +844,7 @@ const App = struct {
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
-            debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
+            SessionAppRuntime.recordShutdownFailure(self, err);
         };
         self.terminal_client.deinit();
         self.managed_executions.deinit();
@@ -857,6 +857,7 @@ const App = struct {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
         };
+        const shutdown_failure = self.session_persistence.shutdown_failure;
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
@@ -892,7 +893,7 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
-        return resume_handoff;
+        return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
     pub fn releaseTerminal(self: *App) void {
@@ -2591,17 +2592,15 @@ const App = struct {
         return SessionAppRuntime.fastModeModelBound(self);
     }
 
-    pub fn appendFinishedPrompt(self: *App, finished: types.FinishedPrompt) !void {
-        try SessionAppRuntime.appendFinishedPrompt(self, finished);
-        if (finished.summary) |summary| {
-            _ = try self.shell.appendTurnSummaryEntry(self.alloc, summary);
-        }
+    pub fn finishPromptPresentation(self: *App, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
+        return app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
     }
 
-    pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!void {
+    pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
-        try self.appendFinishedPrompt(finished);
-        self.notificationPresentationFinished();
+        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        if (result == .committed) self.notificationPresentationFinished();
+        return result;
     }
 
     pub fn pacerCallbacks(self: *App) assistant_pacer.TickCallbacks {

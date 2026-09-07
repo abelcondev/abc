@@ -506,7 +506,7 @@ pub const WorkerEvent = union(enum) {
 
 pub const WorkerEventBatch = struct {
     events: std.ArrayList(WorkerEvent),
-    cancel_requested: bool,
+    cancelled_turn_id: ?u64,
 };
 
 pub const WorkerRuntime = struct {
@@ -797,7 +797,7 @@ pub const WorkerRuntime = struct {
         self.worker_events = .empty;
         return .{
             .events = events,
-            .cancel_requested = self.worker_cancel_requested.load(.seq_cst),
+            .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and self.active_turn_id != 0) self.active_turn_id else null,
         };
     }
 
@@ -1806,6 +1806,11 @@ pub const WorkerRuntime = struct {
         max_history_turns: usize,
         publication: ?HistoryPublication,
     ) !void {
+        errdefer |err| if (err == error.SessionPersistenceUncertain) {
+            if (self.active_prompt_snapshot_ownership) |ownership| {
+                _ = ownership.preserve();
+            }
+        };
         if (self.queued_prompts.items.len == 0) {
             if (publication) |value| try value.commit();
             return;
@@ -1944,6 +1949,12 @@ pub const WorkerRuntime = struct {
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
+    }
+
+    pub fn preservePromptSnapshots(self: *WorkerRuntime, turn_id: u64, images: []const types.ImageAttachment) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        _ = self.preservePromptSnapshotsLocked(turn_id, images);
     }
 
     fn preservePromptSnapshotsLocked(
@@ -4515,6 +4526,7 @@ test "takeEventBatch snapshots cancellation with detached events" {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
+    runtime.active_turn_id = 7;
     runtime.worker_cancel_requested.store(true, .seq_cst);
     runtime.worker_recovery_pause_requested.store(true, .seq_cst);
     try runtime.pushEvent(alloc, .{ .assistant_presentation = .{
@@ -4523,7 +4535,9 @@ test "takeEventBatch snapshots cancellation with detached events" {
 
     var batch = runtime.takeEventBatch();
     defer freeEventList(alloc, &batch.events);
-    try std.testing.expect(batch.cancel_requested);
+    runtime.active_turn_id = 8;
+    runtime.worker_cancel_requested.store(false, .seq_cst);
+    try std.testing.expectEqual(@as(?u64, 7), batch.cancelled_turn_id);
     try std.testing.expectEqual(@as(usize, 1), batch.events.items.len);
     try std.testing.expect(batch.events.items[0] == .assistant_presentation);
     try std.testing.expect(batch.events.items[0].assistant_presentation == .text);

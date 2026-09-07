@@ -3888,6 +3888,8 @@ fn pushTerminalProviderFailureStatus(
 fn finishRecoveryPaused(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
     finish_trace: *PromptFinishTrace,
     cause: model_response_recovery.FailureCause,
     consumed_attempts: usize,
@@ -3895,6 +3897,13 @@ fn finishRecoveryPaused(
     required_action: types.ModelRecoveryRequiredAction,
     diagnostic: ?types.ModelFailureDiagnostic,
 ) !void {
+    try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
+        deps,
+        stream_ctx.alloc,
+        arena,
+        finalization.turn_id,
+        &.{},
+    );
     try pushRouteRecoveryStatus(deps, .{
         .kind = .terminal_provider_error,
         .failed_attempt = consumed_attempts,
@@ -5474,7 +5483,7 @@ fn processQueuedPromptLoop(
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
-            if (recovery_has_unexecuted_tool_start) {
+            if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
                 const settlement = if (config.cancel_flag.load(.seq_cst))
                     stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
@@ -5530,6 +5539,8 @@ fn processQueuedPromptLoop(
                 try finishRecoveryPaused(
                     deps,
                     finalization,
+                    &stream_ctx,
+                    arena,
                     &finish_trace,
                     recovery_cause,
                     semantic_attempt,
@@ -5564,6 +5575,8 @@ fn processQueuedPromptLoop(
                 try finishRecoveryPaused(
                     deps,
                     finalization,
+                    &stream_ctx,
+                    arena,
                     &finish_trace,
                     recovery_cause,
                     semantic_attempt,
@@ -6076,6 +6089,8 @@ fn processQueuedPromptLoop(
                     try finishRecoveryPaused(
                         deps,
                         finalization,
+                        &stream_ctx,
+                        arena,
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
@@ -6209,6 +6224,8 @@ fn processQueuedPromptLoop(
                     try finishRecoveryPaused(
                         deps,
                         finalization,
+                        &stream_ctx,
+                        arena,
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
@@ -6291,6 +6308,8 @@ fn processQueuedPromptLoop(
                     try finishRecoveryPaused(
                         deps,
                         finalization,
+                        &stream_ctx,
+                        arena,
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
@@ -6470,6 +6489,8 @@ fn processQueuedPromptLoop(
                 try finishRecoveryPaused(
                     deps,
                     finalization,
+                    &stream_ctx,
+                    arena,
                     &finish_trace,
                     recovery_cause,
                     semantic_attempt + 1,
@@ -6657,6 +6678,8 @@ fn processQueuedPromptLoop(
                     try finishRecoveryPaused(
                         deps,
                         finalization,
+                        &stream_ctx,
+                        arena,
                         &finish_trace,
                         cause,
                         semantic_attempt + 1,
@@ -6991,6 +7014,8 @@ fn processQueuedPromptLoop(
                     try finishRecoveryPaused(
                         deps,
                         finalization,
+                        &stream_ctx,
+                        arena,
                         &finish_trace,
                         cause,
                         semantic_attempt + 1,

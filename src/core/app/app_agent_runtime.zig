@@ -945,6 +945,11 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !void {
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (app.session_persistence.writable) |*loaded| try loaded.requireWritable();
+            }
             var job = queued_job;
             var fresh_history: ?worker_runtime.FreshPromptHistory = null;
             defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);

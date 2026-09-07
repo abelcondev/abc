@@ -105,7 +105,7 @@ const CatalogWorker = struct {
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
             var cacheable = candidate.storage == .conversation;
-            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isListedManagedChildSession(self.read.store, self.alloc, &candidate) catch |err| switch (err) {
+            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     cacheable = false;

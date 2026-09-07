@@ -113,6 +113,82 @@ async function continueSession(
 }
 
 const LEGACY_TITLE = "Synthetic legacy recovery conversation";
+
+test("latest resume preserves an unrelated pending authority directory", async () => {
+  const fixture = createFixture("fx-latest-pending-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("SAVED_PARENT_CONTEXT"),
+    fakeGatewayFinalText("CONTINUED_PARENT_CONTEXT"),
+  ]);
+  try {
+    const id = await createSavedSession(fixture, gateway);
+    const orphan = join(fixture.home, ".fx", "sessions", "pending-authority");
+    mkdirSync(orphan, { mode: 0o700 });
+    writeFileSync(join(orphan, "authority.pending.json"), "pending", { mode: 0o600 });
+    writeFileSync(join(orphan, "events.jsonl"), "unidentified saved data\n", { mode: 0o600 });
+    const resumed = await continueSession(fixture, gateway, id, true);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    expect(JSON.parse(resumed.stdout).session_id).toBe(id);
+    expect(gateway.requests.at(-1)?.body).toContain("SAVED_PARENT_CONTEXT");
+    expect(readFileSync(join(orphan, "events.jsonl"), "utf8")).toBe("unidentified saved data\n");
+    expect(readFileSync(join(orphan, "authority.pending.json"), "utf8")).toBe("pending");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("resume keeps conversation history when accounting is damaged", async () => {
+  const fixture = createFixture("fx-accounting-resume-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("ACCOUNTING_HISTORY_RETAINED"),
+    fakeGatewayFinalText("ACCOUNTING_RESUME_COMPLETED"),
+  ]);
+  try {
+    const id = await createSavedSession(fixture, gateway);
+    const dir = join(fixture.home, ".fx", "sessions", id);
+    const events = join(dir, "events.jsonl");
+    const before = readFileSync(events);
+    writeFileSync(join(dir, "usage-v2.json"), "{broken accounting", { mode: 0o600 });
+    const resumed = await continueSession(fixture, gateway, id);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    expect(JSON.parse(resumed.stdout).session_id).toBe(id);
+    expect(gateway.requests.at(-1)?.body).toContain("ACCOUNTING_HISTORY_RETAINED");
+    expect(readFileSync(events).subarray(0, before.length).equals(before)).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("conversation language survives an ordinary saved turn and resume", async () => {
+  const fixture = createFixture("fx-language-resume-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("こんにちは。"),
+    fakeGatewayFinalText("完了しました。"),
+  ]);
+  try {
+    const seeded = await runFx(["ask", "--json", "こんにちは。日本語で返答してください。"], {
+      cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+    });
+    expect(seeded.code).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+    const metadata = join(fixture.home, ".fx", "sessions", id, "session.json");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+    const resumed = await runFx(["ask", "--json", "--resume-id", id, "👍"], {
+      cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+    });
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    expect(JSON.parse(readFileSync(metadata, "utf8")).conversation_language).toBe("ja");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
 const LEGACY_ANSWER = "LEGACY_COMMITTED_ANSWER";
 const LEGACY_PARTIAL = "LEGACY_PARTIAL_EVIDENCE";
 const LEGACY_TOOL_CALL_ID = "legacy-recorded-read";

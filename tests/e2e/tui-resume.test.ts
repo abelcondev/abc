@@ -289,6 +289,65 @@ async function waitForPersistedSessionMarker(
   }, `persisted session marker ${marker}`, timeout);
 }
 
+test.skipIf(!tmuxAvailable())("suspension preserves another writer's acknowledged turn after foreground", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-foreground-history-"));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  mkdirSync(home, { mode: 0o700 });
+  mkdirSync(workspace, { mode: 0o700 });
+  const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("FIRST_ACCEPTED_TURN"),
+    fakeGatewayFinalText("OTHER_WRITER_ACCEPTED_TURN"),
+    fakeGatewayFinalText("AFTER_FOREGROUND_TURN"),
+    fakeGatewayFinalText("COLD_REOPEN_TURN"),
+  ]);
+  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1" };
+  let tui: TmuxSession | undefined;
+  try {
+    const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(seeded.code).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+    const events = join(home, ".fx", "sessions", id, "events.jsonl");
+    tui = await TmuxSession.create({
+      cmd: "/bin/sh -i", cwd: workspace, isolated: true, remainOnExit: true, width: 110, height: 36,
+      env: { ...env, PS1: "HANDOFF_SHELL> ", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "session,worker" },
+    });
+    await tui.waitForText("HANDOFF_SHELL>", TIMEOUT);
+    await tui.sendText(`${shellQuote(FX_BIN)} --resume ${shellQuote(id)} 2>${shellQuote(stderr)}`);
+    await tui.waitForText("FIRST_ACCEPTED_TURN", TIMEOUT);
+    await tui.waitForStableComposer(TIMEOUT);
+    await tui.sendKeys("C-z");
+    await waitForCondition(() => existsSync(trace) && readFileSync(trace, "utf8").includes("parked writer lock for suspend"), "writer park");
+    await tui.waitForPane(pane => /stopped|suspended/i.test(pane), TIMEOUT);
+    const other = await runFx(["ask", "--json", "--resume-id", id, "Remember the second writer's turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(other.code).toBe(0);
+    const accepted = readFileSync(events);
+    expect(accepted.toString()).toContain("OTHER_WRITER_ACCEPTED_TURN");
+    await tui.sendText("fg");
+    await waitForCondition(() => readFileSync(trace, "utf8").includes("unparked writer lock after suspend"), "foreground reload");
+    await tui.waitForStableComposer(TIMEOUT);
+    await tui.sendText("Continue with the current conversation.");
+    await tui.waitForText("AFTER_FOREGROUND_TURN", TIMEOUT);
+    await tui.waitForStableComposer(TIMEOUT);
+    expect(gateway.requests.at(-1)?.body).toContain("OTHER_WRITER_ACCEPTED_TURN");
+    expect(readFileSync(events).subarray(0, accepted.length).equals(accepted)).toBe(true);
+    const scrollback = await tui.captureFullScrollback();
+    expect(scrollback).toContain("OTHER_WRITER_ACCEPTED_TURN");
+    expect(scrollback).not.toContain("InvalidTranscriptTransition");
+    await tui.sendText("/quit");
+    await tui.waitForPane(pane => pane.trimEnd().endsWith("HANDOFF_SHELL>"), TIMEOUT);
+    const cold = await runFx(["ask", "--json", "--resume-id", id, "Read the saved conversation."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(cold.code).toBe(0);
+    expect(gateway.requests.at(-1)?.body).toContain("OTHER_WRITER_ACCEPTED_TURN");
+    expect(gateway.requests.at(-1)?.body).toContain("AFTER_FOREGROUND_TURN");
+    expect(readFileSync(stderr, "utf8")).toBe("");
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
