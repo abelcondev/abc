@@ -4486,6 +4486,31 @@ test "permission state schema two round trips before activation" {
     try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
 }
 
+test "durable state usage remains strict and releases partial allocations" {
+    const alloc = std.testing.allocator;
+    const state_json =
+        \\{"id":"usage-state","origin_workspace_root":"/workspace","workspace_root":"/workspace","created_at_ms":1,"updated_at_ms":2,
+        \\"conversation_language":"en","preferences":{"model":"test/model","effort":"auto","fast_mode":false},"history":[],"total_input_tokens":0,"total_output_tokens":0,
+        \\"usage":{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]},
+        \\"last_subagent_work_id":"legacy-work"}
+    ;
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, bytes: []const u8) !void {
+            var source = std.Io.Reader.fixed(bytes);
+            var decoded = try decodeState(a, &source, .{});
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(u64, 10), decoded.usage.?.input_tokens);
+            try std.testing.expectEqualStrings("legacy-work", decoded.last_subagent_work_id.?);
+        }
+    }.check, .{state_json});
+    const incompatible = try std.mem.replaceOwned(u8, alloc, state_json, "\"cache_read_tokens\":2", "\"cache_read_tokens\":11");
+    defer alloc.free(incompatible);
+    var strict_source = std.Io.Reader.fixed(incompatible);
+    try std.testing.expectError(error.InvalidSessionFormat, decodeState(alloc, &strict_source, .{}));
+}
+
 test "durable session optional fields handle fuzzed ownership paths" {
     try std.testing.fuzz({}, fuzzDurableSessionOptionalFields, .{ .corpus = &.{
         "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
