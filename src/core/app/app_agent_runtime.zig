@@ -945,17 +945,17 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !void {
-            {
-                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (app.session_persistence.writable) |*loaded| try loaded.requireWritable();
-            }
             var job = queued_job;
             var fresh_history: ?worker_runtime.FreshPromptHistory = null;
             defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);
             var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
             app.worker.beginActivePromptSnapshots(&snapshot_ownership);
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (app.session_persistence.writable) |*loaded| try loaded.requireWritable();
+            }
             if (job.recovery_checkpoint == null) {
                 if (try app_session_runtime.Runtime(App).snapshotFreshPromptBoundary(app, std.heap.c_allocator)) |value| {
                     var checkpoint = value;
@@ -3190,40 +3190,76 @@ test "subagent tool context uses immutable admission authority" {
     );
 }
 
-test "app agent runtime discards queued snapshots when tool projection preflight fails" {
+test "app agent runtime settles queued snapshot ownership when prompt admission fails" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
+    const Admission = enum { projection_failure, invalid_writer, uncertain_checkpoint };
+    for ([_]Admission{ .projection_failure, .invalid_writer, .uncertain_checkpoint }) |admission| {
+        const invalid_writer = admission != .projection_failure;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
+        }
+        const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
+        defer alloc.free(snapshot_path);
+
+        var app = try FakeApp.init(alloc);
+        defer app.deinit();
+        app.snapshot_tools_error = error.TestExpectedEqual;
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        defer app.session_persistence.deinit(alloc);
+        if (invalid_writer) {
+            app.session_persistence.store = try @import("../session/session_store.zig").Store.initFromHome(alloc, root, root);
+            app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
+                .id = @constCast("rejected-images"),
+                .origin_workspace_root = @constCast(root),
+                .workspace_root = @constCast(root),
+                .created_at_ms = 1,
+                .updated_at_ms = 1,
+                .conversation_language = .literal("en"),
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+            });
+            app.session_persistence.writable.?.conversation_writer.failure = error.SessionCommitFailed;
+        }
+
+        var job = try makeQueuedPrompt(alloc);
+        defer worker_runtime.freeQueuedPrompt(alloc, job);
+        job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
+            .id = 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = snapshot_path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }});
+
+        if (admission == .uncertain_checkpoint) {
+            app.worker.active_turn_id = 41;
+            app.worker.preservePromptSnapshots(41, job.images);
+            app.session_persistence.writable.?.conversation_writer.failure = error.SessionPersistenceUncertain;
+        }
+        try std.testing.expectError(
+            switch (admission) {
+                .projection_failure => error.TestExpectedEqual,
+                .invalid_writer => error.SessionCommitFailed,
+                .uncertain_checkpoint => error.SessionPersistenceUncertain,
+            },
+            Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+        );
+        if (admission == .uncertain_checkpoint) {
+            try std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{});
+        } else {
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
+            );
+        }
     }
-    const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
-    defer alloc.free(snapshot_path);
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.snapshot_tools_error = error.TestExpectedEqual;
-
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
-        .id = 1,
-        .path = @constCast("/tmp/source.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    }});
-
-    try std.testing.expectError(
-        error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
-    );
 }
 
 test "app agent runtime discards every snapshot in a failed multi-image preflight" {
