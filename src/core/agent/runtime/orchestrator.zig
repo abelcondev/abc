@@ -385,13 +385,23 @@ fn projected_read_tool_result_arguments(
     return try out.toOwnedSlice();
 }
 
+fn free_projected_tool_replay(alloc: Allocator, source: ChatMessage, projected: ChatMessage) void {
+    if (source.role != .assistant) return;
+    const replay = projected.provider_replay orelse return;
+    if (source.provider_replay) |original| {
+        if (original.parts_json.ptr == replay.parts_json.ptr) return;
+    }
+    alloc.free(@constCast(replay.parts_json));
+}
+
 fn free_terminal_request_projection(
     alloc: Allocator,
     source: []const ChatMessage,
     projected: []const ChatMessage,
 ) void {
     if (source.ptr == projected.ptr) return;
-    for (projected) |message| {
+    for (projected, 0..) |message, index| {
+        free_projected_tool_replay(alloc, source[index], message);
         if (message.content) |content| alloc.free(@constCast(content));
         for (message.tool_calls) |call| {
             alloc.free(@constCast(call.arguments_json));
@@ -404,6 +414,7 @@ fn free_terminal_request_projection(
 }
 
 const LegacyTerminalCall = struct {
+    assistant_index: usize,
     id: []const u8,
     action: []const u8,
     mapped: bool,
@@ -459,7 +470,7 @@ fn projectLegacyTerminalExecArguments(
     const command = parsed.value.object.get("command") orelse return null;
     if (command != .string) return null;
     var request = std.json.Value{ .object = .empty };
-    errdefer request.object.deinit(alloc);
+    defer request.object.deinit(alloc);
     try request.object.put(alloc, "action", .{ .string = "run" });
     try request.object.put(alloc, "command", command);
     for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
@@ -474,12 +485,29 @@ fn projectLegacyTerminalExecArguments(
     return try out.toOwnedSlice();
 }
 
+test "legacy exec argument projection releases temporary allocations" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\"}") orelse return error.TestUnexpectedResult;
+            defer alloc.free(projected);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
+            defer parsed.deinit();
+            const request = parsed.value.object.get("request") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("run", request.object.get("action").?.string);
+            try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
 fn findLegacyCall(
     calls: []const LegacyTerminalCall,
+    assistant_index: ?usize,
     id: []const u8,
 ) ?LegacyTerminalCall {
+    const owner = assistant_index orelse return null;
     for (calls) |call| {
-        if (std.mem.eql(u8, call.id, id)) return call;
+        if (call.assistant_index == owner and std.mem.eql(u8, call.id, id)) return call;
     }
     return null;
 }
@@ -505,19 +533,79 @@ fn legacyToolSummary(
         );
 }
 
+fn complete_projected_tool_exchanges(
+    alloc: Allocator,
+    source: []const ChatMessage,
+    projected: []ChatMessage,
+    provider: agent_stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) !void {
+    for (source, 0..) |message, index| {
+        if (message.role != .assistant or message.tool_calls.len == 0) continue;
+        const target = &projected[index];
+        if (target.tool_calls.len == message.tool_calls.len) continue;
+
+        var end = index + 1;
+        while (end < source.len and source[end].role == .tool) : (end += 1) {}
+        if (end - index - 1 != message.tool_calls.len) return error.InvalidToolHistoryProjection;
+        const seen = try alloc.alloc(bool, message.tool_calls.len);
+        defer alloc.free(seen);
+        @memset(seen, false);
+        for (source[index + 1 .. end]) |result| {
+            const id = result.tool_call_id orelse return error.InvalidToolHistoryProjection;
+            const name = result.tool_name orelse return error.InvalidToolHistoryProjection;
+            if (result.content == null) return error.InvalidToolHistoryProjection;
+            var matched: ?usize = null;
+            for (message.tool_calls, 0..) |call, call_index| {
+                if (!std.mem.eql(u8, call.id, id)) continue;
+                if (matched != null or seen[call_index] or !std.mem.eql(u8, call.name, name)) return error.InvalidToolHistoryProjection;
+                matched = call_index;
+            }
+            seen[matched orelse return error.InvalidToolHistoryProjection] = true;
+        }
+
+        if (message.provider_replay) |replay| {
+            if (replay.matches(selection)) {
+                target.provider_replay = try provider.projectReplay(
+                    alloc,
+                    replay,
+                    target.tool_calls,
+                    if (message.content) |content| content.len > 0 else false,
+                    true,
+                );
+            }
+        }
+
+        // Only result rows move; assistant anchors retain their source indices.
+        const results = try alloc.dupe(ChatMessage, projected[index + 1 .. end]);
+        defer alloc.free(results);
+        var next = index + 1;
+        for ([_]bool{ true, false }) |keep_tool_result| {
+            for (results) |result| {
+                if ((result.role == .tool) != keep_tool_result) continue;
+                projected[next] = result;
+                next += 1;
+            }
+        }
+    }
+}
+
+/// Returns source unchanged or an owned projection released by free_terminal_request_projection.
 fn project_terminal_request_messages(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
     source: []const ChatMessage,
-) Allocator.Error![]const ChatMessage {
+    provider: agent_stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) ![]const ChatMessage {
     if (!attempt_eligible) return source;
     if (registry.lookup("shell") == null) return source;
 
     var legacy_calls: std.ArrayList(LegacyTerminalCall) = .empty;
     defer legacy_calls.deinit(alloc);
     var needs_projection = false;
-    for (source) |message| {
+    for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         var has_legacy_exec = false;
         var has_removed_legacy_action = false;
@@ -536,11 +624,16 @@ fn project_terminal_request_messages(
             if (call.argument_integrity != .valid) continue;
             if (std.mem.eql(u8, call.name, "terminal")) {
                 const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+                const mapped_arguments = if (std.mem.eql(u8, action, "exec") and !mixed_legacy_batch)
+                    try projectLegacyTerminalExecArguments(alloc, call.arguments_json)
+                else
+                    null;
+                defer if (mapped_arguments) |arguments| alloc.free(arguments);
                 try legacy_calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = action,
-                    .mapped = std.mem.eql(u8, action, "exec") and
-                        !mixed_legacy_batch,
+                    .mapped = mapped_arguments != null,
                 });
                 needs_projection = true;
                 continue;
@@ -558,7 +651,8 @@ fn project_terminal_request_messages(
     const projected = try alloc.alloc(ChatMessage, source.len);
     var initialized: usize = 0;
     errdefer {
-        for (projected[0..initialized]) |message| {
+        for (projected[0..initialized], 0..) |message, index| {
+            free_projected_tool_replay(alloc, source[index], message);
             if (message.content) |content| alloc.free(@constCast(content));
             for (message.tool_calls) |call| {
                 alloc.free(@constCast(call.arguments_json));
@@ -569,7 +663,9 @@ fn project_terminal_request_messages(
         }
         alloc.free(projected);
     }
-    for (source, projected) |message, *target| {
+    var assistant_index: ?usize = null;
+    for (source, projected, 0..) |message, *target, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         target.* = message;
         target.content = null;
         target.tool_calls = &.{};
@@ -580,7 +676,7 @@ fn project_terminal_request_messages(
             null;
 
         if (message.role == .tool and message.tool_call_id != null) {
-            if (findLegacyCall(legacy_calls.items, message.tool_call_id.?)) |legacy| {
+            if (findLegacyCall(legacy_calls.items, assistant_index, message.tool_call_id.?)) |legacy| {
                 if (legacy.mapped) {
                     target.tool_name = "shell";
                 } else {
@@ -610,7 +706,7 @@ fn project_terminal_request_messages(
                 if (call.argument_integrity == .valid and
                     std.mem.eql(u8, call.name, "terminal"))
                 {
-                    const legacy = findLegacyCall(legacy_calls.items, call.id) orelse continue;
+                    const legacy = findLegacyCall(legacy_calls.items, message_index, call.id) orelse continue;
                     if (!legacy.mapped) continue;
                     const arguments = try projectLegacyTerminalExecArguments(
                         alloc,
@@ -657,6 +753,7 @@ fn project_terminal_request_messages(
             );
         }
     }
+    try complete_projected_tool_exchanges(alloc, source, projected, provider, selection);
     return projected;
 }
 
@@ -666,6 +763,7 @@ const SubagentHistoryDisposition = enum {
 };
 
 const SubagentHistoryCall = struct {
+    assistant_index: usize,
     id: []const u8,
     action: []const u8,
     disposition: SubagentHistoryDisposition,
@@ -673,10 +771,12 @@ const SubagentHistoryCall = struct {
 
 fn find_subagent_history_call(
     calls: []const SubagentHistoryCall,
+    assistant_index: ?usize,
     id: []const u8,
 ) ?SubagentHistoryCall {
+    const owner = assistant_index orelse return null;
     for (calls) |call| {
-        if (std.mem.eql(u8, call.id, id)) return call;
+        if (call.assistant_index == owner and std.mem.eql(u8, call.id, id)) return call;
     }
     return null;
 }
@@ -751,23 +851,27 @@ fn subagent_history_summary(
         );
 }
 
+/// Returns source unchanged or an owned projection released by free_terminal_request_projection.
 fn project_subagent_request_messages(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     attempt_eligible: bool,
     source: []const ChatMessage,
-) Allocator.Error![]const ChatMessage {
+    provider: agent_stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) ![]const ChatMessage {
     if (!attempt_eligible or registry.lookup("subagent") == null) return source;
 
     var calls: std.ArrayList(SubagentHistoryCall) = .empty;
     defer calls.deinit(alloc);
     var needs_projection = false;
-    for (source) |message| {
+    for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
             if (!std.mem.eql(u8, call.name, "subagent")) continue;
             if (call.argument_integrity == .malformed_json) {
                 try calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = "malformed",
                     .disposition = .inert,
@@ -777,6 +881,7 @@ fn project_subagent_request_messages(
             }
             if (legacy_subagent_action(call.arguments_json)) |action| {
                 try calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = action,
                     .disposition = .inert,
@@ -785,6 +890,7 @@ fn project_subagent_request_messages(
                 continue;
             }
             try calls.append(alloc, .{
+                .assistant_index = message_index,
                 .id = call.id,
                 .action = "managed",
                 .disposition = .current,
@@ -798,9 +904,11 @@ fn project_subagent_request_messages(
             }
         }
     }
-    for (source) |message| {
+    var assistant_index: ?usize = null;
+    for (source, 0..) |message, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         if (message.role != .tool or message.tool_call_id == null) continue;
-        const call = find_subagent_history_call(calls.items, message.tool_call_id.?) orelse continue;
+        const call = find_subagent_history_call(calls.items, assistant_index, message.tool_call_id.?) orelse continue;
         if (call.disposition == .inert) {
             needs_projection = true;
             continue;
@@ -817,21 +925,24 @@ fn project_subagent_request_messages(
     const projected = try alloc.alloc(ChatMessage, source.len);
     var initialized: usize = 0;
     errdefer {
-        for (projected[0..initialized]) |message| {
+        for (projected[0..initialized], 0..) |message, index| {
+            free_projected_tool_replay(alloc, source[index], message);
             if (message.content) |content| alloc.free(@constCast(content));
             for (message.tool_calls) |call| alloc.free(@constCast(call.arguments_json));
             if (message.tool_calls.len != 0) alloc.free(@constCast(message.tool_calls));
         }
         alloc.free(projected);
     }
-    for (source, projected) |message, *target| {
+    assistant_index = null;
+    for (source, projected, 0..) |message, *target, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         target.* = message;
         target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
         target.tool_calls = &.{};
         initialized += 1;
 
         if (message.role == .tool and message.tool_call_id != null) {
-            if (find_subagent_history_call(calls.items, message.tool_call_id.?)) |call| {
+            if (find_subagent_history_call(calls.items, assistant_index, message.tool_call_id.?)) |call| {
                 if (call.disposition == .inert) {
                     if (target.content) |content| alloc.free(@constCast(content));
                     target.content = null;
@@ -860,7 +971,7 @@ fn project_subagent_request_messages(
             }
             for (message.tool_calls) |call| {
                 const history_call = if (std.mem.eql(u8, call.name, "subagent"))
-                    find_subagent_history_call(calls.items, call.id)
+                    find_subagent_history_call(calls.items, message_index, call.id)
                 else
                     null;
                 if (history_call) |known| {
@@ -895,6 +1006,7 @@ fn project_subagent_request_messages(
             );
         }
     }
+    try complete_projected_tool_exchanges(alloc, source, projected, provider, selection);
     return projected;
 }
 
@@ -922,7 +1034,14 @@ test "non-object subagent rejection keeps its call and result during projection"
         .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
     };
     for (0..2) |_| {
-        const projected = try project_subagent_request_messages(alloc, .{ .tools = &.{tool} }, true, &messages);
+        const projected = try project_subagent_request_messages(
+            alloc,
+            .{ .tools = &.{tool} },
+            true,
+            &messages,
+            agent_stream_provider.unavailable_provider,
+            .{ .provider = .gateway, .model = "test" },
+        );
         try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
         try std.testing.expectEqualStrings("rejected", projected[0].tool_calls[0].id);
         try std.testing.expectEqualStrings("{}", projected[0].tool_calls[0].arguments_json);
@@ -980,23 +1099,27 @@ test "subagent history makes every removed manager action inert" {
         registry,
         true,
         &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
     try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
-    try std.testing.expect(std.mem.find(
-        u8,
-        projected[1].content.?,
-        "Prior subagent create action completed",
-    ) != null);
+    try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+    try std.testing.expectEqualStrings("current-run", projected[1].tool_call_id.?);
+    try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
     try std.testing.expect(std.mem.find(
         u8,
         projected[2].content.?,
+        "Prior subagent create action completed",
+    ) != null);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[3].content.?,
         "Prior subagent configure action completed",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, projected[3].content.?, "operation_id") == null);
     try std.testing.expectEqualStrings(calls[0].arguments_json, messages[0].tool_calls[0].arguments_json);
 
     const idempotent = try project_subagent_request_messages(
@@ -1004,6 +1127,8 @@ test "subagent history makes every removed manager action inert" {
         registry,
         true,
         projected,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
     const ineligible = try project_subagent_request_messages(
@@ -1011,6 +1136,8 @@ test "subagent history makes every removed manager action inert" {
         registry,
         false,
         &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
@@ -1046,6 +1173,8 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
         registry,
         true,
         &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     if (projected.ptr == messages[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &messages, projected);
@@ -1490,7 +1619,14 @@ test "shell request projection wraps eligible flat objects without changing sour
         .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
     };
 
-    const projected = try project_terminal_request_messages(arena, registry, true, &messages);
+    const projected = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
     try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
@@ -1505,9 +1641,23 @@ test "shell request projection wraps eligible flat objects without changing sour
     try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 1].arguments_json);
     try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 2].arguments_json);
 
-    const idempotent = try project_terminal_request_messages(arena, registry, true, projected);
+    const idempotent = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        projected,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-    const ineligible = try project_terminal_request_messages(arena, registry, false, &messages);
+    const ineligible = try project_terminal_request_messages(
+        arena,
+        registry,
+        false,
+        &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
 
@@ -1552,6 +1702,276 @@ test "legacy read_tool_result history gains one nested request wrapper" {
         &messages,
     );
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+test "legacy request projection preserves complete surviving exchanges" {
+    const shell = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var subagent = shell;
+    subagent.name = "subagent";
+    subagent.executor_kind = .subagent;
+    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
+    const cases = [_]struct { name: []const u8, arguments: []const u8 }{
+        .{ .name = "terminal", .arguments = "{\"action\":\"read\",\"session_id\":\"missing\"}" },
+        .{ .name = "terminal", .arguments = "{\"action\":\"exec\"}" },
+        .{ .name = "terminal", .arguments = "{\"action\":\"exec\",\"command\":42}" },
+        .{ .name = "subagent", .arguments = "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}" },
+    };
+    for (cases) |case| {
+        const is_subagent = std.mem.eql(u8, case.name, "subagent");
+        for ([_]bool{ false, true }) |removed_first| {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const removed = ToolCall{
+                .id = "removed",
+                .name = case.name,
+                .arguments_json = case.arguments,
+            };
+            const retained = ToolCall{ .id = "retained", .name = "read_file", .arguments_json = "{}" };
+            const second = ToolCall{ .id = "second", .name = "read_file", .arguments_json = "{}" };
+            const calls = if (removed_first) [_]ToolCall{ removed, retained, second } else [_]ToolCall{ retained, second, removed };
+            const messages = [_]ChatMessage{
+                .{ .role = .assistant, .tool_calls = &calls },
+                .{ .role = .tool, .tool_call_id = calls[0].id, .tool_name = calls[0].name, .content = "first result" },
+                .{ .role = .tool, .tool_call_id = calls[1].id, .tool_name = calls[1].name, .content = "second result" },
+                .{ .role = .tool, .tool_call_id = calls[2].id, .tool_name = calls[2].name, .content = "third result" },
+                .{ .role = .user, .content = "next turn" },
+            };
+            const projected = if (is_subagent)
+                try project_subagent_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    &messages,
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                )
+            else
+                try project_terminal_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    &messages,
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                );
+            try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
+            try std.testing.expectEqualStrings("retained", projected[0].tool_calls[0].id);
+            try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+            try std.testing.expectEqualStrings("retained", projected[1].tool_call_id.?);
+            try std.testing.expectEqualStrings(if (removed_first) "second result" else "first result", projected[1].content.?);
+            try std.testing.expectEqual(types.ChatRole.tool, projected[2].role);
+            try std.testing.expectEqualStrings("second", projected[2].tool_call_id.?);
+            try std.testing.expectEqualStrings(if (removed_first) "third result" else "second result", projected[2].content.?);
+            try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
+            try std.testing.expect(std.mem.find(u8, projected[3].content.?, if (removed_first) "first result" else "third result") != null);
+            try std.testing.expectEqualStrings("next turn", projected[4].content.?);
+            try std.testing.expectEqual(@as(usize, 3), messages[0].tool_calls.len);
+            try std.testing.expectEqual(types.ChatRole.tool, messages[1].role);
+            var invalid = messages;
+            invalid[1].tool_call_id = "unmatched";
+            try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
+                project_subagent_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    &invalid,
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                )
+            else
+                project_terminal_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    &invalid,
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                ));
+            try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
+                project_subagent_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    messages[0..2],
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                )
+            else
+                project_terminal_request_messages(
+                    arena,
+                    registry,
+                    true,
+                    messages[0..2],
+                    agent_stream_provider.unavailable_provider,
+                    .{ .provider = .gateway, .model = "test" },
+                ));
+        }
+    }
+}
+
+test "legacy request projection scopes reused call identities to their exchange" {
+    const shell = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var subagent = shell;
+    subagent.name = "subagent";
+    subagent.executor_kind = .subagent;
+    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
+    for ([_]bool{ false, true }) |is_subagent| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const kept = ToolCall{
+            .id = "reused",
+            .name = if (is_subagent) "subagent" else "terminal",
+            .arguments_json = if (is_subagent)
+                "{\"request\":{\"action\":\"inspect\",\"id\":\"missing\"}}"
+            else
+                "{\"action\":\"exec\",\"command\":\":\"}",
+        };
+        var removed = kept;
+        removed.arguments_json = if (is_subagent)
+            "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}"
+        else
+            "{\"action\":\"exec\"}";
+        const messages = [_]ChatMessage{
+            .{ .role = .assistant, .tool_calls = &.{kept} },
+            .{ .role = .tool, .tool_call_id = "reused", .tool_name = kept.name, .content = "first result" },
+            .{ .role = .assistant, .tool_calls = &.{removed} },
+            .{ .role = .tool, .tool_call_id = "reused", .tool_name = removed.name, .content = "second result" },
+        };
+        const projected = if (is_subagent)
+            try project_subagent_request_messages(
+                arena,
+                registry,
+                true,
+                &messages,
+                agent_stream_provider.unavailable_provider,
+                .{ .provider = .gateway, .model = "test" },
+            )
+        else
+            try project_terminal_request_messages(
+                arena,
+                registry,
+                true,
+                &messages,
+                agent_stream_provider.unavailable_provider,
+                .{ .provider = .gateway, .model = "test" },
+            );
+        try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
+        try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+        try std.testing.expectEqualStrings(projected[0].tool_calls[0].name, projected[1].tool_name.?);
+        try std.testing.expectEqual(@as(usize, 0), projected[2].tool_calls.len);
+        try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
+        try std.testing.expect(std.mem.find(u8, projected[3].content.?, "second result") != null);
+        try std.testing.expectEqual(types.ChatRole.tool, messages[3].role);
+        try std.testing.expectEqual(@as(usize, 1), messages[2].tool_calls.len);
+    }
+}
+
+fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
+    const Probe = struct {
+        const selected = "[{\"type\":\"text\",\"offset\":0,\"length\":8},{\"type\":\"tool-call\",\"toolCallId\":\"retained\"}]";
+
+        fn project(arena: Allocator, replay: ?types.ProviderReplay, calls: []const ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+            const source = replay orelse return error.TestUnexpectedResult;
+            if (std.mem.eql(u8, source.parts_json, "invalid")) return error.InvalidProviderState;
+            try std.testing.expect(text and reasoning);
+            try std.testing.expectEqual(@as(usize, 1), calls.len);
+            try std.testing.expectEqualStrings("retained", calls[0].id);
+            return .{ .source = source.source, .parts_json = try arena.dupe(u8, selected) };
+        }
+    };
+    const provider = agent_stream_provider.Provider{
+        .stream_fn = agent_stream_provider.unavailable_provider.stream_fn,
+        .project_replay_fn = Probe.project,
+    };
+    const shell = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{shell} };
+    const selection = model_provider.ProviderSelection{ .provider = .gateway, .model = "test" };
+    const original = "[{\"type\":\"text\",\"offset\":0,\"length\":8},{\"type\":\"tool-call\",\"toolCallId\":\"removed\"},{\"type\":\"tool-call\",\"toolCallId\":\"retained\"}]";
+    const calls = [_]ToolCall{
+        .{ .id = "removed", .name = "terminal", .arguments_json = "{\"action\":\"read\"}" },
+        .{ .id = "retained", .name = "read_file", .arguments_json = "{}" },
+    };
+    var messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "original", .tool_calls = &calls, .provider_replay = .{ .source = selection, .parts_json = original } },
+        .{ .role = .tool, .tool_call_id = "removed", .tool_name = "terminal", .content = "unsupported" },
+        .{ .role = .tool, .tool_call_id = "retained", .tool_name = "read_file", .content = "read result" },
+    };
+    const projected = try project_terminal_request_messages(
+        alloc,
+        registry,
+        true,
+        &messages,
+        provider,
+        selection,
+    );
+    defer free_terminal_request_projection(alloc, &messages, projected);
+    try std.testing.expectEqualStrings(Probe.selected, projected[0].provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings("original", projected[0].content.?);
+    try std.testing.expectEqualStrings(original, messages[0].provider_replay.?.parts_json);
+
+    var invalid_tail = messages;
+    invalid_tail[0].provider_replay.?.parts_json = "invalid";
+    const combined = messages ++ invalid_tail;
+    if (project_terminal_request_messages(
+        alloc,
+        registry,
+        true,
+        &combined,
+        provider,
+        selection,
+    )) |unexpected| {
+        free_terminal_request_projection(alloc, &combined, unexpected);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.InvalidProviderState, err);
+    }
+    try std.testing.expectEqual(types.ChatRole.tool, messages[1].role);
+
+    messages[0].provider_replay.?.source.model = "other-model";
+    const foreign = try project_terminal_request_messages(
+        alloc,
+        registry,
+        true,
+        &messages,
+        agent_stream_provider.unavailable_provider,
+        selection,
+    );
+    defer free_terminal_request_projection(alloc, &messages, foreign);
+    try std.testing.expectEqual(messages[0].provider_replay.?.parts_json.ptr, foreign[0].provider_replay.?.parts_json.ptr);
+}
+
+test "legacy request projection preserves replay ownership and source binding on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_legacy_replay_projection_allocations, .{});
 }
 
 test "mixed legacy terminal batches become inert in every order" {
@@ -1602,6 +2022,8 @@ test "mixed legacy terminal batches become inert in every order" {
         registry,
         true,
         &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
@@ -1625,6 +2047,8 @@ test "mixed legacy terminal batches become inert in every order" {
         registry,
         true,
         projected,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
 
@@ -1649,6 +2073,8 @@ test "mixed legacy terminal batches become inert in every order" {
         registry,
         true,
         &reversed_messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 0), reversed[0].tool_calls.len);
     try std.testing.expectEqual(types.ChatRole.assistant, reversed[1].role);
@@ -1673,6 +2099,8 @@ test "mixed legacy terminal batches become inert in every order" {
         registry,
         true,
         &exec_only_messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 1), exec_only[0].tool_calls.len);
     try std.testing.expectEqualStrings("shell", exec_only[0].tool_calls[0].name);
@@ -1705,7 +2133,14 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
         .{ .role = .assistant, .tool_calls = &first_calls },
         .{ .role = .assistant, .tool_calls = &second_calls },
     };
-    const projected = try project_terminal_request_messages(alloc, registry, true, &source);
+    const projected = try project_terminal_request_messages(
+        alloc,
+        registry,
+        true,
+        &source,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &source, projected);
     try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
@@ -5682,13 +6117,24 @@ fn processQueuedPromptLoop(
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
+                deps.agent_stream_provider,
+                .{ .provider = job.provider, .model = gateway_model },
             );
             const subagent_request_messages = try project_subagent_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 subagent_request_eligible,
                 terminal_request_messages,
+                deps.agent_stream_provider,
+                .{ .provider = job.provider, .model = gateway_model },
             );
+            if (terminal_request_messages.ptr != projected_request_messages.ptr or subagent_request_messages.ptr != terminal_request_messages.ptr) {
+                debug_trace.logf("history", "legacy_tool_history_projected terminal={s} subagent={s} messages={d}", .{
+                    if (terminal_request_messages.ptr != projected_request_messages.ptr) "true" else "false",
+                    if (subagent_request_messages.ptr != terminal_request_messages.ptr) "true" else "false",
+                    subagent_request_messages.len,
+                });
+            }
             const result_request_messages = try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
