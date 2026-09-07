@@ -355,6 +355,71 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
 }
 
 describe("session recovery", () => {
+  test("unsupported accounting snapshot versions refuse recovery without changing the source", async () => {
+    const fixture = createFixture("fx-session-future-usage-");
+    const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_ACCOUNTING_VERSION")]);
+    try {
+      const id = await createSavedSession(fixture, gateway);
+      const sessions = join(fixture.home, ".fx", "sessions");
+      const source = join(sessions, id);
+      const usagePath = join(source, "usage-v2.json");
+      const usage = JSON.parse(readFileSync(usagePath, "utf8"));
+      usage.snapshot.schema_version = 4;
+      writeFileSync(usagePath, JSON.stringify(usage), { mode: 0o600 });
+      const before = savedFileHashes(source);
+      const sessionNames = readdirSync(sessions).sort();
+      const result = await runFx(["session", "recover", id, "--json"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain("UnsupportedUsageSidecar");
+      expect(savedFileHashes(source)).toEqual(before);
+      expect(readdirSync(sessions).sort()).toEqual(sessionNames);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  for (const damagedTail of [false, true]) {
+    test(`corrupt accounting recovers a source-preserving copy, damaged tail=${damagedTail}`, async () => {
+      const fixture = createFixture("fx-session-usage-copy-");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("ACCOUNTING_RECOVERY_SAVED"),
+        fakeGatewayFinalText("ACCOUNTING_RECOVERY_CONTINUED"),
+      ]);
+      try {
+        const id = await createSavedSession(fixture, gateway);
+        const source = join(fixture.home, ".fx", "sessions", id);
+        const committed = readFileSync(join(source, "events.jsonl"));
+        writeFileSync(join(source, "usage-v2.json"), "{broken usage", { mode: 0o600 });
+        if (damagedTail) appendFileSync(join(source, "events.jsonl"), "{broken tail");
+        const before = savedFileHashes(source);
+        const result = await runFx(["session", "recover", id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const recovered = JSON.parse(result.stdout);
+        expect(recovered).toMatchObject({ status: "recovered", usage_incomplete: true, source_id: id });
+        expect(recovered.recovered_id).not.toBe(id);
+        expect(savedFileHashes(source)).toEqual(before);
+        const copy = join(fixture.home, ".fx", "sessions", recovered.recovered_id);
+        expect(readFileSync(join(copy, "events.jsonl"))).toEqual(committed);
+        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+        const continued = await continueSession(fixture, gateway, recovered.recovered_id);
+        expect(continued.code).toBe(0);
+        expect(continued.stderr).toBe("");
+        expect(gateway.requests.at(-1)!.body).toContain("ACCOUNTING_RECOVERY_SAVED");
+        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+        expect(savedFileHashes(source)).toEqual(before);
+      } finally {
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
+
   test.skipIf(!tmuxAvailable())("legacy cache usage resumes through latest and exact session flows", async () => {
     const fixture = createFixture("fx-session-legacy-cache-");
     const gateway = startFakeGateway([
