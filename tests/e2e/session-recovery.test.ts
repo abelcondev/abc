@@ -476,7 +476,7 @@ describe("session recovery", () => {
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await tui.kill(); tui = undefined;
       }
-      await resume(["-c"], "HEALTHY_LATEST_USAGE", "latest");
+      await resume(["--resume-last"], "HEALTHY_LATEST_USAGE", "latest");
       expect(savedFileHashes(legacy.source)).toEqual(oldHashes);
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(join(fixture.home, ".fx", "sessions", healthyId))).toBe(true);
@@ -821,7 +821,7 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
-  test.skipIf(!tmuxAvailable())("continue ignores unrelated history and unfinished migration", async () => {
+  test.skipIf(!tmuxAvailable())("latest resume ignores unrelated history and unfinished migration", async () => {
     const fixture = createFixture("fx-continue-isolated-discovery-");
     const gateway = startFakeGateway([
       fakeGatewayFinalText("LOCAL_HISTORY_KEPT"),
@@ -853,7 +853,7 @@ describe("session recovery", () => {
       const fencedBefore = savedFileHashes(fenced);
       const stderrPath = join(fixture.root, "continue.stderr");
       tui = await TmuxSession.create({
-        cmd: `${JSON.stringify(FX_BIN)} -c`,
+        cmd: `${JSON.stringify(FX_BIN)} --resume-last`,
         cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), stderrPath,
       });
       await tui.waitForComposer(TIMEOUT);
@@ -876,7 +876,7 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
-  test.skipIf(!tmuxAvailable())("continue reuses legacy ranking after opening the resume picker", async () => {
+  test.skipIf(!tmuxAvailable())("latest resume reuses legacy ranking after opening the resume picker", async () => {
     const fixture = createFixture("fx-continue-ranking-cache-");
     const legacy = createLegacySession(fixture, 3);
     const gateway = startFakeGateway([fakeGatewayFinalText("LATEST_CACHE_HISTORY")]);
@@ -888,7 +888,7 @@ describe("session recovery", () => {
         const trace = join(fixture.root, `ranking-${iteration}.trace`);
         const stderrPath = join(fixture.root, `ranking-${iteration}.stderr`);
         tui = await TmuxSession.create({
-          cmd: `${JSON.stringify(FX_BIN)} -c`, cwd: fixture.workspace, stderrPath,
+          cmd: `${JSON.stringify(FX_BIN)} --resume-last`, cwd: fixture.workspace, stderrPath,
           env: { ...gatewayEnv(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "session,core" },
         });
         await tui.waitForComposer(TIMEOUT);
