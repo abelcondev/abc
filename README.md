@@ -105,7 +105,7 @@ fx session resume --id <id>
 
 `fx -c` (or `fx --continue`) resumes the remembered session for the current workspace directly by ID. Selecting a saved session or saving the first work in a new interactive session remembers it; opening an empty window, later background activity, and quitting do not change that selection. If no session is remembered, choose one with `fx -r` or `fx --resume <id>`. `fx --resume last` still selects the latest workspace session by activity. A busy or unreadable target produces an error rather than opening another conversation. The session picker loads its catalog when opened.
 
-Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
+Latest-session selection with `fx --resume last` reuses validated summaries of unchanged older sessions instead of replaying their histories. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
 
 Older sessions that saved Vercel connection settings can be selected through `-r`, `/resume`, or an exact ID, then continued with `-c`. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
 
