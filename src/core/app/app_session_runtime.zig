@@ -220,9 +220,10 @@ test "live session transition decision defers only active cooperative requests" 
     }
 }
 
-fn nextImageIdForResumedHistory(
+fn nextImageIdForResume(
     alloc: Allocator,
     history: []const types.HistoryTurn,
+    checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !usize {
     const restored_catalog = try session_runtime.collect_image_catalog(
         alloc,
@@ -230,8 +231,12 @@ fn nextImageIdForResumedHistory(
         &.{},
     );
     defer types.freeImageAttachmentSlice(alloc, restored_catalog);
-    const bounds = try image_attachments.calculate_next_image_id(restored_catalog);
-    return bounds.next_id;
+    if (checkpoint) |value| {
+        const merged = try session_runtime.merge_image_catalog_history_turn(alloc, restored_catalog, value.interruptedTurn());
+        defer types.freeImageAttachmentSlice(alloc, merged);
+        return (try image_attachments.calculate_next_image_id(merged)).next_id;
+    }
+    return (try image_attachments.calculate_next_image_id(restored_catalog)).next_id;
 }
 
 pub const SessionPickerScope = session_catalog.Scope;
@@ -1827,9 +1832,10 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
-                app.next_image_id = try nextImageIdForResumedHistory(
+                app.next_image_id = try nextImageIdForResume(
                     app.alloc,
                     state.history,
+                    state.recovery_checkpoint,
                 );
             }
             try app.session.restoreWithPermissionState(
@@ -2309,18 +2315,23 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) {
                 return error.SessionPersistenceUnavailable;
             }
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            const now_ms = io_mod.milliTimestamp();
-            _ = try loaded.appendEvent(
-                app.alloc,
-                .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-                now_ms,
-            );
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                const loaded = if (app.session_persistence.writable) |*value|
+                    value
+                else
+                    return error.SessionPersistenceUnavailable;
+                const now_ms = io_mod.milliTimestamp();
+                _ = try loaded.appendEvent(
+                    app.alloc,
+                    .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
+                    now_ms,
+                );
+            }
+            if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
+                app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
+            }
         }
 
         pub fn snapshotRecoveryCheckpoint(
@@ -5741,7 +5752,7 @@ test "cold resume image id rebase rejects overflow before admission" {
 
     try std.testing.expectError(
         error.ImageIdOverflow,
-        nextImageIdForResumedHistory(std.testing.allocator, &history),
+        nextImageIdForResume(std.testing.allocator, &history, null),
     );
 }
 

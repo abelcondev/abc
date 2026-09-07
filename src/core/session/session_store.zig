@@ -1206,7 +1206,7 @@ pub const Store = struct {
         while (try reader.next()) |turn| {
             var turns = [_]session.HistoryTurn{turn};
             defer session.freeHistoryTurn(alloc, turns[0]);
-            try resolveSessionSnapshotLocators(alloc, &turns, self.sessions_dir, session_id);
+            try resolveSessionSnapshotLocators(alloc, &turns, null, self.sessions_dir, session_id);
             try visitor.append(turns[0]);
         }
     }
@@ -1281,6 +1281,7 @@ pub const Store = struct {
             resolveSessionSnapshotLocators(
                 alloc,
                 turns,
+                null,
                 self.sessions_dir,
                 session_id,
             ) catch |err| return mapHistoryPageLoadError(err);
@@ -1686,6 +1687,7 @@ pub const Store = struct {
             try resolveSessionSnapshotLocators(
                 alloc,
                 state.history,
+                if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
                 self.sessions_dir,
                 session_id,
             );
@@ -1711,6 +1713,7 @@ pub const Store = struct {
                 try resolveSessionSnapshotLocators(
                     alloc,
                     state.history,
+                    if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
                     self.sessions_dir,
                     session_id,
                 );
@@ -2562,6 +2565,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             state.history,
+            if (state.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             session_id,
         );
@@ -2665,6 +2669,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             loaded.state.history,
+            if (loaded.state.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             loaded.active_id,
         );
@@ -3465,6 +3470,7 @@ pub const Store = struct {
         try resolveSessionSnapshotLocators(
             alloc,
             recovered.history,
+            if (recovered.recovery_checkpoint) |*checkpoint| checkpoint else null,
             self.sessions_dir,
             session_id,
         );
@@ -4077,6 +4083,7 @@ fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]
 fn resolveSessionSnapshotLocators(
     alloc: Allocator,
     history: []session.HistoryTurn,
+    checkpoint: ?*session_codec.RecoveryCheckpoint,
     sessions_dir: []const u8,
     session_id: []const u8,
 ) !void {
@@ -4091,13 +4098,22 @@ fn resolveSessionSnapshotLocators(
             .assistant => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
-        for (images) |*image| {
-            const stored = image.snapshot_path orelse continue;
-            const leaf = try canonicalSnapshotLeaf(image.*, stored);
-            const resolved = try std.fs.path.join(alloc, &.{ image_dir, leaf });
-            alloc.free(stored);
-            image.snapshot_path = resolved;
-        }
+        try resolveImageSnapshotLocators(alloc, images, image_dir);
+    }
+    if (checkpoint) |value| try resolveImageSnapshotLocators(alloc, value.user.images, image_dir);
+}
+
+fn resolveImageSnapshotLocators(
+    alloc: Allocator,
+    images: []session.ImageAttachment,
+    image_dir: []const u8,
+) !void {
+    for (images) |*image| {
+        const stored = image.snapshot_path orelse continue;
+        const leaf = try canonicalSnapshotLeaf(image.*, stored);
+        const resolved = try std.fs.path.join(alloc, &.{ image_dir, leaf });
+        alloc.free(stored);
+        image.snapshot_path = resolved;
     }
 }
 
@@ -4154,6 +4170,7 @@ test "session snapshot locators resolve through their owning store" {
     try resolveSessionSnapshotLocators(
         alloc,
         history,
+        null,
         "/new/fx-home/sessions",
         "id",
     );
@@ -4187,6 +4204,7 @@ test "current session snapshot locators reject absolute paths" {
         resolveSessionSnapshotLocators(
             alloc,
             history,
+            null,
             "/new/fx-home/sessions",
             "id",
         ),
@@ -4226,6 +4244,7 @@ test "session snapshot locator resolver rejects noncanonical tampering" {
             resolveSessionSnapshotLocators(
                 alloc,
                 history,
+                null,
                 "/new/fx-home/sessions",
                 "id",
             ),
@@ -4349,6 +4368,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
         try resolveSessionSnapshotLocators(
             alloc,
             history,
+            null,
             sessions_path,
             "session",
         );
@@ -8542,4 +8562,50 @@ test "history page allocation failure sweep frees replay and page ownership" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "recovery checkpoint images resolve on read-only and writable resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "checkpoint-images", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    var writable_owned = true;
+    defer if (writable_owned) writable.deinit(alloc);
+    var temp_dir: ?[]u8 = null;
+    const image_dir = try imageSnapshotStorageDir(alloc, ctx.store.sessions_dir, state.id, &temp_dir);
+    defer alloc.free(image_dir);
+    const image = try image_attachments.captureInlineImageBytes(alloc, 7, "image/png", "\x89PNG\r\n\x1a\ncheckpoint", image_dir);
+    defer core_types.freeImageAttachment(alloc, image);
+    var images = [_]session.ImageAttachment{image};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("recover"), .images = &images },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } }, 20);
+    writable.deinit(alloc);
+    writable_owned = false;
+    var detail = try ctx.store.loadReadOnlyDetail(alloc, state.id, .{});
+    defer detail.deinit(alloc);
+    const restored = detail.state.recovery_checkpoint.?.user.images[0];
+    try std.testing.expectEqual(@as(usize, 7), restored.id);
+    try std.testing.expectEqualStrings(image.snapshot_path.?, restored.snapshot_path.?);
+    var verified = try image_attachments.loadVerifiedSnapshot(alloc, restored, .{});
+    defer verified.deinit(alloc);
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .{ .id = state.id }, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(image.snapshot_path.?, resumed.state.recovery_checkpoint.?.user.images[0].snapshot_path.?);
+    _ = try resumed.appendEvent(alloc, .{ .recovery_checkpoint_cleared = .{} }, 30);
+    try std.Io.Dir.accessAbsolute(std.testing.io, image.snapshot_path.?, .{});
 }

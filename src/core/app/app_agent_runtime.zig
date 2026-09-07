@@ -950,6 +950,9 @@ pub fn Runtime(comptime App: type) type {
             defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);
             var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
             app.worker.beginActivePromptSnapshots(&snapshot_ownership);
+            if (job.recovery_checkpoint != null) {
+                app.worker.preservePromptSnapshots(job.turn_id, job.images);
+            }
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
             {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
