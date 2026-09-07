@@ -5236,7 +5236,6 @@ fn reconstructProjectContext(
     job: QueuedPrompt,
 ) !?context_contract.GatheredContextSnapshot {
     if (!deps.context_enabled) return null;
-    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
         job.history,
@@ -5247,6 +5246,7 @@ fn reconstructProjectContext(
     );
     defer retained.deinit(alloc);
     if (retained.items.len == 0) return null;
+    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
     var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
     defer targets.deinit(alloc);
     const prior = job.context_snapshot.evaluated_endpoints;
@@ -5291,7 +5291,12 @@ fn appendStablePromptContext(
     if (config.model_prompt_overlay) |overlay| {
         try messages.append(alloc, .{ .role = .system, .content = overlay });
     }
-    if (deps.append_static_context) |append| try append(deps.ctx, alloc, project_context, messages);
+    if (deps.append_static_context) |append| {
+        try append(deps.ctx, alloc, project_context, messages);
+    } else if (project_context) |content| {
+        const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
+        try registry.appendDefaultStatic(.{ .project_context = content }, alloc, messages);
+    }
 }
 
 const CompactionContinuation = struct {

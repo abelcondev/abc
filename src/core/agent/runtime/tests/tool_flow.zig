@@ -3171,6 +3171,20 @@ test "modern cancellation during later context selection stops before context or
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
+test "retained project context leaves empty history host context unchanged" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.static_context_text = "HOST_ONLY_CONTEXT";
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try expectBodyContains(&gateway, 0, "HOST_ONLY_CONTEXT");
+}
+
 test "retained project context refreshes queued rules before a repeated shell call" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3217,6 +3231,22 @@ test "retained project context refreshes queued rules before a repeated shell ca
     try std.testing.expectEqual(@as(usize, 1), second_hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), second_hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+
+    const bare_final = [_]FakeCompletion{.{ .content = "Core context delivered" }};
+    var bare_gateway = FakeGateway.init(alloc, &bare_final);
+    defer bare_gateway.deinit();
+    var bare_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer bare_hooks.deinit();
+    bare_hooks.context_enabled = true;
+    bare_hooks.context_registry = registry;
+    var bare_deps = bare_hooks.deps();
+    bare_deps.append_static_context = null;
+    bare_deps.agent_stream_provider = bare_gateway.provider();
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try agent.restoreHistory(alloc, job.history);
+    try runtime_orchestrator.processAgentPrompt(&agent, &bare_deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, workspace), fixture.config(), job);
+    try expectBodyContains(&bare_gateway, 0, "RETAINED_CURRENT_RULE");
 
     try tmp.dir.deleteFile(std.testing.io, "nested/AGENTS.md");
     const final = [_]FakeCompletion{.{ .content = "No stale rule" }};
