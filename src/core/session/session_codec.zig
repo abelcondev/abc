@@ -525,7 +525,17 @@ pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSu
 }
 
 pub fn decodeState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
-    return decodeStateImpl(alloc, source, limits) catch |err| switch (err) {
+    return decodeStateWithUsageContract(alloc, source, limits, false);
+}
+
+/// Reads an old persisted state without requiring modern cache-token totals.
+/// Caller owns the state; all non-usage validation remains unchanged.
+pub fn decodeLegacyState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+    return decodeStateWithUsageContract(alloc, source, limits, true);
+}
+
+fn decodeStateWithUsageContract(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
+    return decodeStateImpl(alloc, source, limits, legacy_usage) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDurableField => return error.InvalidDurableField,
         error.InvalidDurableBytes => return error.InvalidDurableBytes,
@@ -1047,7 +1057,7 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     });
 }
 
-fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
+fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
     var json_reader = std.json.Reader.init(alloc, source);
     defer json_reader.deinit();
 
@@ -1117,6 +1127,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     errdefer permission_state.deinit(alloc);
     var permission_state_seen = false;
     var usage: ?session_usage.Snapshot = null;
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
@@ -1162,7 +1173,10 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .allocate = .alloc_always,
                 .parse_numbers = false,
             });
-            usage = try session_usage.parseSnapshotValue(alloc, value);
+            usage = if (legacy_usage)
+                try session_usage.parseLegacySnapshotValue(alloc, value)
+            else
+                try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
             if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
@@ -1184,7 +1198,6 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
         } else return error.InvalidSessionFormat;
     }
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     try expectToken(try json_reader.next(), .object_end);
     try expectToken(try json_reader.next(), .end_of_document);
 

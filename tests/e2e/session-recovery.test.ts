@@ -279,6 +279,89 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
 }
 
 describe("session recovery", () => {
+  test.skipIf(!tmuxAvailable())("legacy cache usage resumes through latest and exact session flows", async () => {
+    const fixture = createFixture("fx-session-legacy-cache-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("HEALTHY_LATEST_USAGE"),
+      fakeGatewayFinalText("LEGACY_USAGE_CONTINUED"),
+    ], LEGACY_GATEWAY_OPTIONS);
+    let tui: TmuxSession | undefined;
+    try {
+      const legacy = createLegacySession(fixture, 4);
+      const eventPath = join(legacy.source, "events.jsonl");
+      const records = readFileSync(eventPath, "utf8").trimEnd().split("\n").map(JSON.parse);
+      records.push({
+        schema_version: 1, log_generation: records[0].log_generation,
+        seq: 4, event_id: "04".repeat(16), timestamp_ms: 40, kind: "usage_checkpointed",
+        payload: { usage: {
+          billing: "complete", api_duration_complete: true, wall_duration_complete: true,
+          code_complete: true, next_sequence: 2, settled_through_sequence: 1,
+          api_duration_ms: 10, wall_duration_ms: 20, total_cost: 1,
+          input_tokens: 1, output_tokens: 3, cache_read_tokens: 2, cache_write_tokens: 0,
+          billable_web_search_calls: 0, lines_added: 0, lines_removed: 0,
+          models: [{ model: "test/model", first_sequence: 1, total_cost: 1,
+            input_tokens: 1, output_tokens: 3, cache_read_tokens: 2, cache_write_tokens: 0,
+            billable_web_search_calls: 0 }], pending: [],
+        } },
+      });
+      const events = records.map(record => JSON.stringify(record) + "\n").join("");
+      writeFileSync(eventPath, events, { mode: 0o600 });
+      const metadataPath = join(legacy.source, "session.json");
+      const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+      writeFileSync(metadataPath, JSON.stringify({ ...metadata, updated_at_ms: 40,
+        last_event_seq: 4, event_log_bytes: Buffer.byteLength(events) }), { mode: 0o600 });
+      const watermark = JSON.parse(readFileSync(legacy.watermarkPath, "utf8"));
+      writeFileSync(legacy.watermarkPath, JSON.stringify({ ...watermark, through_seq: 4,
+        through_event_id: records.at(-1).event_id, through_event_log_bytes: Buffer.byteLength(events) }), { mode: 0o600 });
+      const oldHashes = savedFileHashes(legacy.source);
+      const healthyId = await createSavedSession(fixture, gateway);
+      const env = { ...legacyGatewayEnv(fixture, gateway), FX_SOUND: "0", FX_SKIP_ONBOARDING: "1" };
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      async function resume(args: string[], marker: string, label: string) {
+        const stderrPath = join(fixture.root, `${label}.stderr`);
+        tui = await TmuxSession.create({
+          cmd: [FX_BIN, ...args].map(quote).join(" "), cwd: fixture.workspace,
+          isolated: true, remainOnExit: true, width: 110, height: 40, stderrPath,
+          env: { ...env, FX_RECORD: join(fixture.root, `${label}.fxtape`) },
+        });
+        await tui.waitForPane(pane => tui!.paneStatus().dead || pane.includes(marker), TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(tui.paneStatus().dead).toBe(false);
+        await tui.waitForStableComposer(TIMEOUT);
+        expect(await tui.captureFullScrollback()).toContain(marker);
+        await tui.sendText("/quit");
+        await tui.waitForPane(() => tui!.paneStatus().dead, TIMEOUT);
+        expect(tui.paneStatus().status).toBe(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await tui.kill(); tui = undefined;
+      }
+      await resume(["-c"], "HEALTHY_LATEST_USAGE", "latest");
+      expect(savedFileHashes(legacy.source)).toEqual(oldHashes);
+      expect(gateway.requests).toHaveLength(1);
+      expect(existsSync(join(fixture.home, ".fx", "sessions", healthyId))).toBe(true);
+
+      await resume(["--resume", legacy.id], LEGACY_ANSWER, "legacy");
+      expectLegacyArchive(legacy.source);
+      const usage = JSON.parse(readFileSync(join(legacy.source, "usage-v2.json"), "utf8"));
+      expect(usage.session_id).toBe(legacy.id);
+      expect(usage.snapshot.billing).toBe("legacy");
+      expect(usage.snapshot.models).toEqual([]);
+      expect(gateway.requests).toHaveLength(1);
+      const continued = await continueSession(fixture, gateway, legacy.id);
+      expect(continued.code).toBe(0);
+      expect(continued.stderr).toBe("");
+      expect(JSON.parse(continued.stdout).session_id).toBe(legacy.id);
+      expect(continued.stdout).toContain("LEGACY_USAGE_CONTINUED");
+      expectLegacyArchive(legacy.source);
+      expect(gateway.requests).toHaveLength(2);
+      expectLegacyRequest(gateway.requests[1]!);
+    } finally {
+      await tui?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
+
   test("healthy current conversation needs no recovery or migration", async () => {
     const fixture = createFixture("fx-session-current-healthy-");
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_HEALTHY")]);

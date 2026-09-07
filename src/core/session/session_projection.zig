@@ -368,7 +368,7 @@ fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
         &state_json.writer,
     );
     var state_source = std.Io.Reader.fixed(state_json.written());
-    var state = session_codec.decodeState(alloc, &state_source, .{}) catch |err| switch (err) {
+    var state = session_codec.decodeLegacyState(alloc, &state_source, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidCheckpoint,
     };
@@ -709,6 +709,74 @@ test "event stat fingerprint detects same-size replacement and metadata-only cha
     var wrong_size = original;
     wrong_size.size += 1;
     try std.testing.expectError(error.InvalidEventFileStat, eventFileStatFingerprint(wrong_size, 4096));
+}
+
+test "legacy checkpoint usage stays unavailable without weakening current state reads" {
+    const usage = @import("session_usage.zig");
+    const alloc = std.testing.allocator;
+    var runtime = usage.Usage.initFresh();
+    defer runtime.deinit(alloc);
+    var empty = try runtime.snapshot(alloc);
+    defer empty.deinit(alloc);
+    var models = [_]usage.ModelAggregate{.{
+        .model = @constCast("test/model"),
+        .first_sequence = 1,
+        .input_tokens = 10,
+    }};
+    var accounting = empty;
+    accounting.models = &models;
+    accounting.next_sequence = 2;
+    accounting.settled_through_sequence = 1;
+    accounting.input_tokens = 10;
+    accounting.reasoning_tokens = null;
+    accounting.request_count = null;
+    const state = session_codec.DurableSessionState{
+        .id = @constCast("legacy-usage"),
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .usage = accounting,
+        .last_subagent_work_id = @constCast("legacy-work"),
+    };
+    var state_json: std.Io.Writer.Allocating = .init(alloc);
+    defer state_json.deinit();
+    _ = try session_codec.encodeState(state, &state_json.writer);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, bytes: []const u8) !void {
+            var source = std.Io.Reader.fixed(bytes);
+            var decoded = try session_codec.decodeState(a, &source, .{});
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(u64, 10), decoded.usage.?.input_tokens);
+        }
+    }.check, .{state_json.written()});
+    const old_state = try std.mem.replaceOwned(u8, alloc, state_json.written(), "\"cache_read_tokens\":0", "\"cache_read_tokens\":11");
+    defer alloc.free(old_state);
+    var strict_source = std.Io.Reader.fixed(old_state);
+    try std.testing.expectError(error.InvalidSessionFormat, session_codec.decodeState(alloc, &strict_source, .{}));
+
+    const encoded = try encodeCheckpoint(alloc, .{
+        .session_id = state.id,
+        .log_generation = testIdentifier(1),
+        .through_seq = 2,
+        .through_event_id = testIdentifier(2),
+        .through_event_log_bytes = 1024,
+        .state = state,
+    });
+    defer alloc.free(encoded);
+    const old_checkpoint = try std.mem.replaceOwned(u8, alloc, encoded, "\"cache_read_tokens\":0", "\"cache_read_tokens\":11");
+    defer alloc.free(old_checkpoint);
+    var decoded = try decodeCheckpoint(alloc, old_checkpoint);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(state.id, decoded.state.id);
+    try std.testing.expectEqual(@as(u64, 2), decoded.through_seq);
+    try std.testing.expectEqual(usage.Availability.legacy, decoded.state.usage.?.billing);
+    try usage.validateSnapshot(decoded.state.usage.?);
 }
 
 test "checkpoint validation rejects stale corrupt and non-semantic boundaries" {
