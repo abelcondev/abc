@@ -597,6 +597,11 @@ pub const Store = struct {
         var directory = (try self.openRememberedDirectory(false)) orelse return null;
         defer directory.close();
         const name = self.rememberedSessionFilename();
+        const path_stat = directory.dir.statFile(io_mod.getIo(), &name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (path_stat.kind != .file) return error.InvalidRememberedSession;
         var file = directory.dir.openFile(io_mod.getIo(), &name, .{
             .mode = .read_only,
             .allow_directory = false,

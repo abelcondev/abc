@@ -7252,6 +7252,14 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     for (const label of ["select-a", "select-b", "reselect-a", "empty-window", "continue-a"]) {
       expect(readFileSync(join(root, label + ".stderr"), "utf8")).toBe("");
     }
+    rmSync(bookmark);
+    const fifo = Bun.spawnSync(["mkfifo", bookmark]);
+    expect(fifo.exitCode).toBe(0);
+    active = await open(["-c"], "invalid-bookmark");
+    await active.waitForPane(() => active!.paneStatus().dead, 3000);
+    expect(active.paneStatus().status).toBe(1);
+    expect(readFileSync(join(root, "invalid-bookmark.stderr"), "utf8")).toContain("remembered session ID could not be read");
+    await active.kill(); active = null;
     passed = true;
   } finally {
     await active?.kill(); await other?.kill(); gateway.stop();
