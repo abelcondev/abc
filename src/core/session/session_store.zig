@@ -3396,7 +3396,13 @@ pub const Store = struct {
             if (metadata) |current| {
                 if (!std.mem.eql(u8, current.value.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
                 if (current.value.subagent_child) return error.SessionNotFound;
-                current_boundary = try session_log.find_conversation_recovery_boundary(alloc, &source.dir);
+                current_boundary = session_log.find_conversation_recovery_boundary(alloc, &source.dir) catch |err| {
+                    if (err == error.SessionRecoveryNotNeeded) {
+                        var healthy = try self.loadReadOnly(alloc, session_id);
+                        healthy.deinit(alloc);
+                    }
+                    return err;
+                };
                 break :recovery_state try session_log.load_conversation_recovery_state(alloc, &source.dir, session_id, current_boundary.?);
             }
             const authority = try classifyAuthority(
@@ -4527,6 +4533,29 @@ fn makeSessionDir(alloc: Allocator, store: Store, id: []const u8) !void {
     const dir = try sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(dir);
     try config_runtime.makeAbsolutePath(dir);
+}
+
+test "recovery no-op validates supporting state before advising normal resume" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "permissions.json", "recovery.json" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        var initial = try testDurableState(alloc, "recovery-supporting-state", ctx.workspace);
+        defer initial.deinit(alloc);
+        {
+            var writer = try ctx.store.startWritableSession(alloc, initial);
+            defer writer.deinit(alloc);
+            try io_mod.durableReplaceVerified(alloc, &writer.log.dir, name, "{broken");
+        }
+        const expected_error = if (std.mem.eql(u8, name, "permissions.json"))
+            error.InvalidPermissionState
+        else
+            error.InvalidRecoveryCheckpoint;
+        try std.testing.expectError(expected_error, ctx.store.loadReadOnly(alloc, initial.id));
+        try std.testing.expectError(expected_error, ctx.store.recoverSessionCopy(alloc, initial.id, .{}));
+    }
 }
 
 fn makeRawSessionsEntry(store: Store, name: []const u8) !void {
