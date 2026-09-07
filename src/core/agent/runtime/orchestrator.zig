@@ -470,7 +470,7 @@ fn projectLegacyTerminalExecArguments(
     const command = parsed.value.object.get("command") orelse return null;
     if (command != .string) return null;
     var request = std.json.Value{ .object = .empty };
-    errdefer request.object.deinit(alloc);
+    defer request.object.deinit(alloc);
     try request.object.put(alloc, "action", .{ .string = "run" });
     try request.object.put(alloc, "command", command);
     for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
@@ -483,6 +483,21 @@ fn projectLegacyTerminalExecArguments(
     std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+test "legacy exec argument projection releases temporary allocations" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\"}") orelse return error.TestUnexpectedResult;
+            defer alloc.free(projected);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
+            defer parsed.deinit();
+            const request = parsed.value.object.get("request") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("run", request.object.get("action").?.string);
+            try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 fn findLegacyCall(
