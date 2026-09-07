@@ -932,11 +932,7 @@ const ConversationRecovery = struct {
 pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !ConversationRecovery {
     const scan = try scan_conversation_recovery(alloc, dir);
     const usage_incomplete = try session_usage_sidecar.has_recoverable_corruption(alloc, dir, session_id);
-    if (scan.complete and !usage_incomplete) {
-        var state = (try loadConversationStateIfPresent(alloc, dir, session_id)) orelse return error.InvalidSessionMetadata;
-        defer state.deinit(alloc);
-        return error.SessionRecoveryNotNeeded;
-    }
+    if (scan.complete and !usage_incomplete) return error.SessionRecoveryNotNeeded;
     return .{ .boundary = scan.boundary, .usage_incomplete = usage_incomplete };
 }
 
