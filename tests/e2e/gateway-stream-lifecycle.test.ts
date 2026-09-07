@@ -3383,6 +3383,84 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("legacy tool projection preserves surviving calls and replay through saved resume", async () => {
+    for (const tool of ["terminal", "subagent"] as const) {
+      for (const removedFirst of [false, true]) {
+        for (const metadata of [false, true]) {
+          const root = createFixtureRoot("legacy-projection");
+          const tracePath = join(root.root, "projection.trace");
+          writeFileSync(join(root.workspace, "notes.txt"), "LEGACY_READ_RESULT\n");
+          const calls = [
+            {
+              type: "tool-call", toolCallId: "removed_call", toolName: tool,
+              input: tool === "terminal" ? { action: "read", session_id: "missing" } : { command: { inspect: { id: "missing" } } },
+              ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "removed-signature" } } } : {}),
+            },
+            {
+              type: "tool-call", toolCallId: "retained_call", toolName: "read_file", input: { path: "notes.txt" },
+              ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "retained-signature" } } } : {}),
+            },
+          ];
+          if (!removedFirst) calls.reverse();
+          const responses = [
+            fakeGatewaySse([
+              { type: "reasoning-start", id: "reasoning" },
+              { type: "reasoning-delta", id: "reasoning", delta: "Inspect the fixture." },
+              { type: "reasoning-end", id: "reasoning", ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "reasoning-signature" } } } : {}) },
+              { type: "text-delta", id: "intro", delta: "I will inspect the notes." },
+              ...calls,
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText("The notes were read."),
+            fakeGatewayFinalText("The saved result remains available."),
+          ];
+          const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+          try {
+            const first = await runFx(["ask", "--json", "--auto", "Please read notes.txt and explain the result."], {
+              cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+            });
+            const result = parseAskJson(first.stdout);
+            expect(first.code).toBe(0);
+            expect(first.stderr).toContain("Reading notes.txt");
+            expect(result.final_output).toBe("The notes were read.");
+            expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
+            expect(gateway.requestCount()).toBe(2);
+            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "events.jsonl");
+            const originalEvents = readFileSync(eventsPath, "utf8");
+            expect(originalEvents).toContain("removed_call");
+            if (metadata) expect(originalEvents).toContain("removed-signature");
+            const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
+              cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+            });
+            expect(resumed.code).toBe(0);
+            expect(resumed.stderr).toBe("");
+            expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+            expect(gateway.requestCount()).toBe(3);
+            expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+            for (const request of gateway.requests.slice(1)) {
+              const prompt = gatewayRequest(request.body).prompt;
+              const callIndex = prompt.findIndex((message) => Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === "retained_call"));
+              expect(callIndex).toBeGreaterThanOrEqual(0);
+              expect(prompt[callIndex + 1].role).toBe("tool");
+              expect(JSON.stringify(prompt[callIndex + 1].content)).toContain("retained_call");
+              expect(request.body).toContain("LEGACY_READ_RESULT");
+              expect(request.body).toContain("I will inspect the notes.");
+              expect(request.body).not.toContain('"toolCallId":"removed_call"');
+              expect(request.body).not.toContain("removed-signature");
+              if (metadata) {
+                expect(request.body).toContain("retained-signature");
+                expect(request.body).toContain("reasoning-signature");
+              }
+            }
+          } finally {
+            gateway.stop();
+            rmSync(root.root, { recursive: true, force: true });
+          }
+        }
+      }
+    }
+  }, 60_000);
+
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");
     const firstTracePath = join(root.root, "first-trace.log");
