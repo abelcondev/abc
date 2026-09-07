@@ -4581,6 +4581,9 @@ test "legacy import preserves published events and active recovery after metadat
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-metadata-sync-failure", 10);
     defer initial.deinit(alloc);
+    var legacy_usage = session_usage.Usage.initLegacy();
+    defer legacy_usage.deinit(alloc);
+    initial.usage = try legacy_usage.snapshot(alloc);
     const history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
     initial.history = history;
@@ -4625,6 +4628,7 @@ test "legacy import preserves published events and active recovery after metadat
     try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
     try std.testing.expectEqualStrings("saved answer", resumed.state.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
+    try std.testing.expectEqual(session_usage.Availability.legacy, resumed.state.usage.?.billing);
 }
 
 test "conversation storage creates only metadata and event log" {

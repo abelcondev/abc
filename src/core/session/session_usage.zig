@@ -2257,6 +2257,11 @@ const ReconciliationAuthority = struct {
 };
 
 pub fn validateSnapshot(snapshot: Snapshot) !void {
+    _ = try validateSnapshotContract(snapshot, false);
+}
+
+fn validateSnapshotContract(snapshot: Snapshot, allow_legacy_cache: bool) !bool {
+    var cache_totals_valid = true;
     if (snapshot.next_sequence == 0) return error.InvalidUsageSnapshot;
     if (snapshot.settled_through_sequence >= snapshot.next_sequence) {
         return error.InvalidUsageSnapshot;
@@ -2323,7 +2328,8 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         if (model.cache_read_tokens > model.input_tokens or
             model.cache_write_tokens > model.input_tokens)
         {
-            return error.InvalidUsageSnapshot;
+            if (!allow_legacy_cache) return error.InvalidUsageSnapshot;
+            cache_totals_valid = false;
         }
         if (model.reasoning_tokens) |reasoning| {
             if (reasoning > model.output_tokens) return error.InvalidUsageSnapshot;
@@ -2418,6 +2424,7 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         }
     }
     if (identifier_bytes > max_identifier_bytes) return error.UsageCapacityExceeded;
+    return cache_totals_valid;
 }
 
 pub fn appendIncidentOwned(
@@ -2751,10 +2758,51 @@ fn writePendingAuthority(writer: *std.Io.Writer, pending: PendingGeneration) !vo
 
 /// Parses either the rollback-readable or current usage snapshot schema.
 pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    try validateSnapshot(snapshot);
+    return snapshot;
+}
+
+/// Caller owns the result. Only historical separate-cache accounting may
+/// become unavailable; malformed or versioned snapshots remain errors.
+pub fn parseLegacySnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    if (try validateSnapshotContract(snapshot, isUnversionedSnapshot(value))) return snapshot;
+
+    snapshot.deinit(alloc);
+    return .{
+        .billing = .legacy,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+    };
+}
+
+fn isUnversionedSnapshot(value: std.json.Value) bool {
+    return value == .object and value.object.count() == 18;
+}
+
+fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     if (value != .object) {
         return error.InvalidUsageSnapshot;
     }
-    const legacy = value.object.count() == 18;
+    const legacy = isUnversionedSnapshot(value);
     const schema_version = if (legacy)
         @as(u64, 1)
     else
@@ -3026,7 +3074,6 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         .publication_backlog = publication_backlog,
         .incidents = incidents,
     };
-    try validateSnapshot(snapshot);
     return snapshot;
 }
 
@@ -4199,6 +4246,138 @@ test "fresh usage aggregates authoritative generations in invocation order" {
     snapshot.input_tokens -= 1;
     snapshot.total_cost += 1;
     try std.testing.expectError(error.InvalidUsageSnapshot, validateSnapshot(snapshot));
+}
+
+fn legacyUsageForTest(alloc: Allocator) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]}
+    , .{});
+}
+
+test "legacy usage compatibility preserves valid snapshots and strict parsing" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    var strict = try parseSnapshotValue(alloc, parsed.value);
+    defer strict.deinit(alloc);
+    var compatible = try parseLegacySnapshotValue(alloc, parsed.value);
+    defer compatible.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, compatible));
+
+    for ([_][]const u8{ "cache_read_tokens", "cache_write_tokens" }) |field| {
+        const global = parsed.value.object.getPtr(field).?;
+        const model = parsed.value.object.getPtr("models").?.array.items[0].object.getPtr(field).?;
+        const saved = global.*;
+        global.* = .{ .integer = 11 };
+        model.* = global.*;
+        var unavailable = try parseLegacySnapshotValue(alloc, parsed.value);
+        defer unavailable.deinit(alloc);
+        try validateSnapshot(unavailable);
+        try std.testing.expectEqual(Availability.legacy, unavailable.billing);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.models.len);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.pending.len);
+        try std.testing.expectError(error.InvalidUsageSnapshot, parseSnapshotValue(alloc, parsed.value));
+        global.* = saved;
+        model.* = saved;
+    }
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, strict);
+    var rich = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer rich.deinit();
+    var rich_copy = try parseLegacySnapshotValue(alloc, rich.value);
+    defer rich_copy.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, rich_copy));
+    rich.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    rich.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, rich.value));
+}
+
+test "legacy usage compatibility does not hide malformed accounting" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const model = &parsed.value.object.getPtr("models").?.array.items[0];
+    model.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+
+    const cases = [_]struct {
+        field: []const u8,
+        value: std.json.Value,
+        want: error{ InvalidGenerationRecord, InvalidUsageSnapshot },
+    }{
+        .{ .field = "total_cost", .value = .{ .float = -1 }, .want = error.InvalidGenerationRecord },
+        .{ .field = "total_cost", .value = .{ .float = std.math.inf(f64) }, .want = error.InvalidGenerationRecord },
+        .{ .field = "input_tokens", .value = .{ .integer = 9 }, .want = error.InvalidUsageSnapshot },
+        .{ .field = "next_sequence", .value = .{ .integer = 0 }, .want = error.InvalidUsageSnapshot },
+    };
+    for (cases) |case| {
+        const field = parsed.value.object.getPtr(case.field).?;
+        const saved = field.*;
+        field.* = case.value;
+        try std.testing.expectError(case.want, parseLegacySnapshotValue(alloc, parsed.value));
+        try std.testing.expectError(case.want, parseSnapshotValue(alloc, parsed.value));
+        field.* = saved;
+    }
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 0 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 1 };
+    const models = parsed.value.object.getPtr("models").?;
+    try models.array.append(models.array.items[0]);
+    const totals = [_]struct { field: []const u8, original: i64, doubled: i64 }{
+        .{ .field = "total_cost", .original = 1, .doubled = 2 },
+        .{ .field = "input_tokens", .original = 10, .doubled = 20 },
+        .{ .field = "output_tokens", .original = 3, .doubled = 6 },
+        .{ .field = "cache_read_tokens", .original = 11, .doubled = 22 },
+    };
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.doubled };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    models.array.items.len = 1;
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.original };
+
+    var pending = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"id\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":0,\"origin\":\"https://ai-gateway.vercel.sh\",\"team\":null}]", .{});
+    defer pending.deinit();
+    const pending_field = parsed.value.object.getPtr("pending").?;
+    const old_pending = pending_field.*;
+    pending_field.* = pending.value;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "pending" };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    pending_field.* = old_pending;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "complete" };
+    try parsed.value.object.put(parsed.arena.allocator(), "unknown", .null);
+    try std.testing.expectError(error.InvalidGenerationRecord, parseLegacySnapshotValue(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, .null));
+}
+
+test "legacy usage compatibility releases rejected and unavailable allocations" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    parsed.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const Check = struct {
+        fn run(a: Allocator, value: std.json.Value, reject: bool) !void {
+            if (reject) {
+                if (parseLegacySnapshotValue(a, value)) |result| {
+                    var owned = result;
+                    owned.deinit(a);
+                    return error.ExpectedInvalidUsage;
+                } else |err| switch (err) {
+                    error.InvalidUsageSnapshot => return,
+                    else => return err,
+                }
+            }
+            var snapshot = try parseLegacySnapshotValue(a, value);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(Availability.legacy, snapshot.billing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, false });
+    parsed.value.object.getPtr("input_tokens").?.* = .{ .integer = 9 };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, true });
 }
 
 test "usage deduplicates terminal and generation callbacks" {
