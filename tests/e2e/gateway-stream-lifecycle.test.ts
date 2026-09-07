@@ -3384,7 +3384,11 @@ describe("gateway stream lifecycle", () => {
   });
 
   test("legacy tool projection preserves surviving calls and replay through saved resume", async () => {
-    for (const tool of ["terminal", "subagent"] as const) {
+    for (const { tool, input } of [
+      { tool: "terminal", input: { action: "read", session_id: "missing" } },
+      { tool: "terminal", input: { action: "exec" } },
+      { tool: "subagent", input: { command: { inspect: { id: "missing" } } } },
+    ] as const) {
       for (const removedFirst of [false, true]) {
         for (const metadata of [false, true]) {
           const root = createFixtureRoot("legacy-projection");
@@ -3393,7 +3397,7 @@ describe("gateway stream lifecycle", () => {
           const calls = [
             {
               type: "tool-call", toolCallId: "removed_call", toolName: tool,
-              input: tool === "terminal" ? { action: "read", session_id: "missing" } : { command: { inspect: { id: "missing" } } },
+              input,
               ...(metadata ? { providerMetadata: { vertex: { thoughtSignature: "removed-signature" } } } : {}),
             },
             {
@@ -3460,6 +3464,63 @@ describe("gateway stream lifecycle", () => {
       }
     }
   }, 60_000);
+
+  test("legacy tool projection keeps reused identities scoped across saved turns", async () => {
+    const root = createFixtureRoot("legacy-reused-id");
+    const tracePath = join(root.root, "reused.trace");
+    const callResponse = (valid: boolean) => fakeGatewaySse([
+      {
+        type: "tool-call", toolCallId: "reused", toolName: "terminal",
+        input: valid ? { action: "exec", command: ":" } : { action: "exec" },
+        providerMetadata: { vertex: { thoughtSignature: valid ? "first-call-signature" : "second-call-signature" } },
+      },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+    const responses = [
+      callResponse(true), fakeGatewayFinalText("First turn stored."),
+      callResponse(false), fakeGatewayFinalText("Second turn stored."),
+      fakeGatewayFinalText("Both stored results remain available."),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Exercise the first fixture."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "events.jsonl");
+      const originalEvents = readFileSync(eventsPath, "utf8");
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(second.code).toBe(0);
+      expect(parseAskJson(second.stdout).final_output).toBe("Second turn stored.");
+      expect(gateway.requestCount()).toBe(4);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Confirm the stored results without running tools."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(5);
+      expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+      for (const request of gateway.requests.slice(3)) {
+        const parts = gatewayRequest(request.body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+        const calls = parts.filter((part) => part.type === "tool-call" && part.toolCallId === "reused");
+        const results = parts.filter((part) => part.type === "tool-result" && part.toolCallId === "reused");
+        expect(calls).toHaveLength(1);
+        expect(calls[0].toolName).toBe("shell");
+        expect(results).toHaveLength(1);
+        expect(results[0].toolName).toBe("shell");
+        expect(request.body).toContain("first-call-signature");
+        expect(request.body).not.toContain("second-call-signature");
+        expect(request.body).toContain("Unsupported tool: terminal");
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
 
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");

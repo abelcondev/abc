@@ -414,6 +414,7 @@ fn free_terminal_request_projection(
 }
 
 const LegacyTerminalCall = struct {
+    assistant_index: usize,
     id: []const u8,
     action: []const u8,
     mapped: bool,
@@ -486,10 +487,12 @@ fn projectLegacyTerminalExecArguments(
 
 fn findLegacyCall(
     calls: []const LegacyTerminalCall,
+    assistant_index: ?usize,
     id: []const u8,
 ) ?LegacyTerminalCall {
+    const owner = assistant_index orelse return null;
     for (calls) |call| {
-        if (std.mem.eql(u8, call.id, id)) return call;
+        if (call.assistant_index == owner and std.mem.eql(u8, call.id, id)) return call;
     }
     return null;
 }
@@ -587,7 +590,7 @@ fn project_terminal_request_messages(
     var legacy_calls: std.ArrayList(LegacyTerminalCall) = .empty;
     defer legacy_calls.deinit(alloc);
     var needs_projection = false;
-    for (source) |message| {
+    for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         var has_legacy_exec = false;
         var has_removed_legacy_action = false;
@@ -606,11 +609,16 @@ fn project_terminal_request_messages(
             if (call.argument_integrity != .valid) continue;
             if (std.mem.eql(u8, call.name, "terminal")) {
                 const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+                const mapped_arguments = if (std.mem.eql(u8, action, "exec") and !mixed_legacy_batch)
+                    try projectLegacyTerminalExecArguments(alloc, call.arguments_json)
+                else
+                    null;
+                defer if (mapped_arguments) |arguments| alloc.free(arguments);
                 try legacy_calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = action,
-                    .mapped = std.mem.eql(u8, action, "exec") and
-                        !mixed_legacy_batch,
+                    .mapped = mapped_arguments != null,
                 });
                 needs_projection = true;
                 continue;
@@ -640,7 +648,9 @@ fn project_terminal_request_messages(
         }
         alloc.free(projected);
     }
-    for (source, projected) |message, *target| {
+    var assistant_index: ?usize = null;
+    for (source, projected, 0..) |message, *target, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         target.* = message;
         target.content = null;
         target.tool_calls = &.{};
@@ -651,7 +661,7 @@ fn project_terminal_request_messages(
             null;
 
         if (message.role == .tool and message.tool_call_id != null) {
-            if (findLegacyCall(legacy_calls.items, message.tool_call_id.?)) |legacy| {
+            if (findLegacyCall(legacy_calls.items, assistant_index, message.tool_call_id.?)) |legacy| {
                 if (legacy.mapped) {
                     target.tool_name = "shell";
                 } else {
@@ -681,7 +691,7 @@ fn project_terminal_request_messages(
                 if (call.argument_integrity == .valid and
                     std.mem.eql(u8, call.name, "terminal"))
                 {
-                    const legacy = findLegacyCall(legacy_calls.items, call.id) orelse continue;
+                    const legacy = findLegacyCall(legacy_calls.items, message_index, call.id) orelse continue;
                     if (!legacy.mapped) continue;
                     const arguments = try projectLegacyTerminalExecArguments(
                         alloc,
@@ -738,6 +748,7 @@ const SubagentHistoryDisposition = enum {
 };
 
 const SubagentHistoryCall = struct {
+    assistant_index: usize,
     id: []const u8,
     action: []const u8,
     disposition: SubagentHistoryDisposition,
@@ -745,10 +756,12 @@ const SubagentHistoryCall = struct {
 
 fn find_subagent_history_call(
     calls: []const SubagentHistoryCall,
+    assistant_index: ?usize,
     id: []const u8,
 ) ?SubagentHistoryCall {
+    const owner = assistant_index orelse return null;
     for (calls) |call| {
-        if (std.mem.eql(u8, call.id, id)) return call;
+        if (call.assistant_index == owner and std.mem.eql(u8, call.id, id)) return call;
     }
     return null;
 }
@@ -837,12 +850,13 @@ fn project_subagent_request_messages(
     var calls: std.ArrayList(SubagentHistoryCall) = .empty;
     defer calls.deinit(alloc);
     var needs_projection = false;
-    for (source) |message| {
+    for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
             if (!std.mem.eql(u8, call.name, "subagent")) continue;
             if (call.argument_integrity == .malformed_json) {
                 try calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = "malformed",
                     .disposition = .inert,
@@ -852,6 +866,7 @@ fn project_subagent_request_messages(
             }
             if (legacy_subagent_action(call.arguments_json)) |action| {
                 try calls.append(alloc, .{
+                    .assistant_index = message_index,
                     .id = call.id,
                     .action = action,
                     .disposition = .inert,
@@ -860,6 +875,7 @@ fn project_subagent_request_messages(
                 continue;
             }
             try calls.append(alloc, .{
+                .assistant_index = message_index,
                 .id = call.id,
                 .action = "managed",
                 .disposition = .current,
@@ -873,9 +889,11 @@ fn project_subagent_request_messages(
             }
         }
     }
-    for (source) |message| {
+    var assistant_index: ?usize = null;
+    for (source, 0..) |message, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         if (message.role != .tool or message.tool_call_id == null) continue;
-        const call = find_subagent_history_call(calls.items, message.tool_call_id.?) orelse continue;
+        const call = find_subagent_history_call(calls.items, assistant_index, message.tool_call_id.?) orelse continue;
         if (call.disposition == .inert) {
             needs_projection = true;
             continue;
@@ -900,14 +918,16 @@ fn project_subagent_request_messages(
         }
         alloc.free(projected);
     }
-    for (source, projected) |message, *target| {
+    assistant_index = null;
+    for (source, projected, 0..) |message, *target, message_index| {
+        if (message.role != .tool) assistant_index = if (message.role == .assistant) message_index else null;
         target.* = message;
         target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
         target.tool_calls = &.{};
         initialized += 1;
 
         if (message.role == .tool and message.tool_call_id != null) {
-            if (find_subagent_history_call(calls.items, message.tool_call_id.?)) |call| {
+            if (find_subagent_history_call(calls.items, assistant_index, message.tool_call_id.?)) |call| {
                 if (call.disposition == .inert) {
                     if (target.content) |content| alloc.free(@constCast(content));
                     target.content = null;
@@ -936,7 +956,7 @@ fn project_subagent_request_messages(
             }
             for (message.tool_calls) |call| {
                 const history_call = if (std.mem.eql(u8, call.name, "subagent"))
-                    find_subagent_history_call(calls.items, call.id)
+                    find_subagent_history_call(calls.items, message_index, call.id)
                 else
                     null;
                 if (history_call) |known| {
@@ -1684,18 +1704,22 @@ test "legacy request projection preserves complete surviving exchanges" {
     subagent.name = "subagent";
     subagent.executor_kind = .subagent;
     const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
-    for ([_]bool{ false, true }) |is_subagent| {
+    const cases = [_]struct { name: []const u8, arguments: []const u8 }{
+        .{ .name = "terminal", .arguments = "{\"action\":\"read\",\"session_id\":\"missing\"}" },
+        .{ .name = "terminal", .arguments = "{\"action\":\"exec\"}" },
+        .{ .name = "terminal", .arguments = "{\"action\":\"exec\",\"command\":42}" },
+        .{ .name = "subagent", .arguments = "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}" },
+    };
+    for (cases) |case| {
+        const is_subagent = std.mem.eql(u8, case.name, "subagent");
         for ([_]bool{ false, true }) |removed_first| {
             var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             const removed = ToolCall{
                 .id = "removed",
-                .name = if (is_subagent) "subagent" else "terminal",
-                .arguments_json = if (is_subagent)
-                    "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}"
-                else
-                    "{\"action\":\"read\",\"session_id\":\"missing\"}",
+                .name = case.name,
+                .arguments_json = case.arguments,
             };
             const retained = ToolCall{ .id = "retained", .name = "read_file", .arguments_json = "{}" };
             const second = ToolCall{ .id = "second", .name = "read_file", .arguments_json = "{}" };
@@ -1777,6 +1801,73 @@ test "legacy request projection preserves complete surviving exchanges" {
                     .{ .provider = .gateway, .model = "test" },
                 ));
         }
+    }
+}
+
+test "legacy request projection scopes reused call identities to their exchange" {
+    const shell = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var subagent = shell;
+    subagent.name = "subagent";
+    subagent.executor_kind = .subagent;
+    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
+    for ([_]bool{ false, true }) |is_subagent| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const kept = ToolCall{
+            .id = "reused",
+            .name = if (is_subagent) "subagent" else "terminal",
+            .arguments_json = if (is_subagent)
+                "{\"request\":{\"action\":\"inspect\",\"id\":\"missing\"}}"
+            else
+                "{\"action\":\"exec\",\"command\":\":\"}",
+        };
+        var removed = kept;
+        removed.arguments_json = if (is_subagent)
+            "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}"
+        else
+            "{\"action\":\"exec\"}";
+        const messages = [_]ChatMessage{
+            .{ .role = .assistant, .tool_calls = &.{kept} },
+            .{ .role = .tool, .tool_call_id = "reused", .tool_name = kept.name, .content = "first result" },
+            .{ .role = .assistant, .tool_calls = &.{removed} },
+            .{ .role = .tool, .tool_call_id = "reused", .tool_name = removed.name, .content = "second result" },
+        };
+        const projected = if (is_subagent)
+            try project_subagent_request_messages(
+                arena,
+                registry,
+                true,
+                &messages,
+                agent_stream_provider.unavailable_provider,
+                .{ .provider = .gateway, .model = "test" },
+            )
+        else
+            try project_terminal_request_messages(
+                arena,
+                registry,
+                true,
+                &messages,
+                agent_stream_provider.unavailable_provider,
+                .{ .provider = .gateway, .model = "test" },
+            );
+        try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
+        try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+        try std.testing.expectEqualStrings(projected[0].tool_calls[0].name, projected[1].tool_name.?);
+        try std.testing.expectEqual(@as(usize, 0), projected[2].tool_calls.len);
+        try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
+        try std.testing.expect(std.mem.find(u8, projected[3].content.?, "second result") != null);
+        try std.testing.expectEqual(types.ChatRole.tool, messages[3].role);
+        try std.testing.expectEqual(@as(usize, 1), messages[2].tool_calls.len);
     }
 }
 
