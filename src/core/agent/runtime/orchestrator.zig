@@ -6407,7 +6407,7 @@ fn processQueuedPromptLoop(
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
-                                    if (retention_target == 0) return error.ContextCapacityExceeded;
+                                    if (retention_target == 0 or request_cost.estimated_input_tokens <= (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
