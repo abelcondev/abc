@@ -6881,6 +6881,35 @@ test "processQueuedPrompt pauses a local tool after assistant source when budget
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt settles retry tool starts before pausing" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("interrupted-read", "read_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .stream_error_after_chunks = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 2;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    const paused = logIndex(&hooks, "event:turn_finished").?;
+    var settled: usize = 0;
+    for (hooks.log.items, 0..) |entry, index| {
+        if (std.mem.startsWith(u8, entry, "status:finished:")) {
+            try std.testing.expect(index < paused);
+            settled += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), settled);
+}
+
 test "processQueuedPrompt cancellation absorbs ReadFailed after published source" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"partial cancelled"};
@@ -8142,4 +8171,44 @@ test "processQueuedPrompt trace emits one canonical result for tool execution er
     );
     try std.testing.expect(std.mem.find(u8, trace, "err=SystemResources") != null);
     try std.testing.expect(std.mem.find(u8, trace, "model_output_bytes=") != null);
+}
+
+test "processQueuedPrompt keeps provider uncertainty without tool terminals after pause" {
+    const alloc = std.testing.allocator;
+    const local = [_]ToolCall{toolCall("local-read", "read_file", "{}")};
+    const provider = [_]ToolCall{toolCall("provider-search", "web_search", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &local, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .streamed_tool_starts = &provider, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .pause_before_output = true },
+    };
+    var pause_flag = std.atomic.Value(bool).init(false);
+    var gateway = FakeGateway.init(alloc, &completions);
+    gateway.recovery_pause_flag = &pause_flag;
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.recovery_pause_flag = &pause_flag;
+    config.gateway_retry_count = 3;
+    config.max_provider_attempts = 4;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.paused, checkpoint.action);
+    try std.testing.expectEqual(.uncertain, checkpoint.tool_state);
+    const paused = logIndex(&hooks, "event:turn_finished").?;
+    var settled: usize = 0;
+    for (hooks.log.items, 0..) |entry, index| {
+        if (std.mem.startsWith(u8, entry, "status:finished:")) {
+            try std.testing.expect(index < paused);
+            settled += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), settled);
+    try expectFailedLifecycleContains(hooks.lifecycle_events.items, "local-read", "before tool call ran");
 }

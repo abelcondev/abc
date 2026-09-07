@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -118,6 +119,8 @@ pub const ConversationWriter = struct {
     latest_checkpoint_coverage: u64 = 0,
     turn_open: bool = false,
     pending_tool_calls: std.ArrayList(session_event.PendingToolCall) = .empty,
+    failure: ?error{ SessionWriterChanged, SessionPersistenceUncertain, SessionCommitFailed } = null,
+    test_sync_ops: if (builtin.is_test) io_mod.DurableOps else void = if (builtin.is_test) .{} else {},
 
     /// Takes ownership of `file` only on success.
     pub fn init(alloc: Allocator, file: std.Io.File) !ConversationWriter {
@@ -216,6 +219,7 @@ pub const ConversationWriter = struct {
         timestamp_ms: i64,
         event: session_event.ConversationEvent,
     ) !u64 {
+        if (self.failure) |err| return err;
         const seq = std.math.add(u64, self.last_seq, 1) catch
             return error.ConversationSequenceOverflow;
         const envelope = session_event.ConversationEnvelope{
@@ -254,14 +258,7 @@ pub const ConversationWriter = struct {
 
         const frame = try session_event.encodeConversationFrame(alloc, envelope);
         defer alloc.free(frame);
-        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
-            try self.file.setLength(io_mod.getIo(), self.committed_bytes);
-            try self.file.sync(io_mod.getIo());
-        }
-        try self.file.writePositionalAll(io_mod.getIo(), frame, self.committed_bytes);
-        try self.file.sync(io_mod.getIo());
-        self.committed_bytes = std.math.add(u64, self.committed_bytes, frame.len) catch
-            return error.ConversationSizeOverflow;
+        try self.writePrepared(frame);
         self.last_seq = seq;
         self.turn_open = turn_open;
 
@@ -444,6 +441,7 @@ pub const ConversationWriter = struct {
         timestamp_ms: i64,
         events: []const session_event.ConversationEvent,
     ) !void {
+        if (self.failure) |err| return err;
         if (events.len == 0) return;
         if (self.pending_tool_calls.items.len != 0) return error.UnresolvedToolCall;
 
@@ -492,24 +490,48 @@ pub const ConversationWriter = struct {
             try out.writer.writeAll(frame);
         }
         if (pending.items.len != 0) return error.UnresolvedToolCall;
-        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
-            try self.file.setLength(io_mod.getIo(), self.committed_bytes);
-            try self.file.sync(io_mod.getIo());
-        }
-        try self.file.writePositionalAll(
-            io_mod.getIo(),
-            out.written(),
-            self.committed_bytes,
-        );
-        try self.file.sync(io_mod.getIo());
-        self.committed_bytes = std.math.add(
-            u64,
-            self.committed_bytes,
-            out.written().len,
-        ) catch return error.ConversationSizeOverflow;
+        try self.writePrepared(out.written());
         self.last_seq = seq;
         self.latest_checkpoint_coverage = checkpoint_coverage;
         self.turn_open = turn_open;
+    }
+
+    fn writePrepared(self: *ConversationWriter, bytes: []const u8) !void {
+        if (self.failure) |err| return err;
+        const next_bytes = std.math.add(u64, self.committed_bytes, bytes.len) catch
+            return error.ConversationSizeOverflow;
+        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
+            self.failure = error.SessionWriterChanged;
+            debug_trace.logf("session", "conversation writer changed outside ownership offset={d}", .{self.committed_bytes});
+            return error.SessionWriterChanged;
+        }
+        self.file.writePositionalAll(io_mod.getIo(), bytes, self.committed_bytes) catch |err| {
+            return self.rollbackAppend(err);
+        };
+        self.syncAppend() catch |err| return self.rollbackAppend(err);
+        self.committed_bytes = next_bytes;
+    }
+
+    fn syncAppend(self: *ConversationWriter) !void {
+        if (comptime builtin.is_test) {
+            return self.test_sync_ops.sync_file(self.test_sync_ops.ctx, self.file);
+        }
+        try self.file.sync(io_mod.getIo());
+    }
+
+    fn rollbackAppend(self: *ConversationWriter, original: anyerror) anyerror {
+        self.failure = error.SessionPersistenceUncertain;
+        self.file.setLength(io_mod.getIo(), self.committed_bytes) catch |err| {
+            debug_trace.logf("session", "conversation append rollback failed offset={d} append_err={s} rollback_err={s}", .{ self.committed_bytes, @errorName(original), @errorName(err) });
+            return error.SessionPersistenceUncertain;
+        };
+        self.syncAppend() catch |err| {
+            debug_trace.logf("session", "conversation append rollback sync failed offset={d} append_err={s} rollback_err={s}", .{ self.committed_bytes, @errorName(original), @errorName(err) });
+            return error.SessionPersistenceUncertain;
+        };
+        self.failure = null;
+        debug_trace.logf("session", "conversation append rolled back offset={d} err={s}", .{ self.committed_bytes, @errorName(original) });
+        return original;
     }
 
     fn clearPendingToolCalls(self: *ConversationWriter) void {
@@ -812,10 +834,11 @@ fn load_conversation_state_at_boundary(
     else
         null;
     errdefer if (last_work_id) |work_id| alloc.free(work_id);
-    var usage = try session_usage_sidecar.load(
+    var usage: ?session_usage.Snapshot = try session_usage_sidecar.loadConversation(
         alloc,
         dir,
         expected_session_id,
+        metadata.value.updated_at_ms,
     );
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
@@ -2430,21 +2453,12 @@ pub const WritableSessionDir = struct {
         return self.writer_lock == null;
     }
 
-    /// Release `session.lock` while keeping the session directory open for a
-    /// later `unpark` in the same process (idle job-control suspend).
+    /// Release `session.lock`. The loaded session must be retired before
+    /// acquiring another writer, since its state may no longer match storage.
     pub fn park(self: *WritableSessionDir) void {
         const lock = &(self.writer_lock orelse return);
         lock.release();
         self.writer_lock = null;
-    }
-
-    /// Reacquire `session.lock` after `park`. Fails with `SessionBusy` when
-    /// another process already owns the writer lock.
-    pub fn unpark(self: *WritableSessionDir) !void {
-        if (self.writer_lock != null) return;
-        self.writer_lock = acquireLock(&self.dir, session_lock_file, true) catch |err| {
-            return mapSessionLockError(err);
-        };
     }
 
     pub fn eventLogLengthForTest(self: *WritableSessionDir) !u64 {
@@ -2478,6 +2492,19 @@ pub const LoadedWritableSession = struct {
     external_prompt_origin: ExternalPromptOrigin = .root,
     external_root_user_messages: [][]u8 = &.{},
     external_root_user_evidence_complete: bool = false,
+
+    pub fn requireWritable(self: *const LoadedWritableSession) !void {
+        if (self.log.isParked()) return error.SessionWriterParked;
+        if (self.conversation_writer.failure) |err| return err;
+    }
+
+    fn recordWriteFailure(self: *LoadedWritableSession, err: anyerror) anyerror {
+        if (err == error.DurableReplacePostRenameFailed) {
+            self.conversation_writer.failure = error.SessionPersistenceUncertain;
+            return error.SessionPersistenceUncertain;
+        }
+        return err;
+    }
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
         self.conversation_writer.deinit();
@@ -2521,6 +2548,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         turn: *session.HistoryTurn,
     ) !void {
+        try self.requireWritable();
         try externalizeConversationTurnResults(
             alloc,
             turn,
@@ -2533,6 +2561,7 @@ pub const LoadedWritableSession = struct {
         alloc: Allocator,
         title: []const u8,
     ) !bool {
+        try self.requireWritable();
         const bytes = try readManagedFileAlloc(
             alloc,
             &self.log.dir,
@@ -2557,12 +2586,12 @@ pub const LoadedWritableSession = struct {
             .subagent_child = metadata.value.subagent_child,
         });
         defer alloc.free(encoded);
-        try io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerified(
             alloc,
             &self.log.dir,
             manifest_file,
             encoded,
-        );
+        ) catch |err| return self.recordWriteFailure(err);
         return true;
     }
 
@@ -2591,7 +2620,8 @@ pub const LoadedWritableSession = struct {
         event: SessionUpdate,
         timestamp_ms: i64,
     ) !CommitPosition {
-        return switch (event) {
+        try self.requireWritable();
+        const result = switch (event) {
             .history_turn_committed => self.appendConversationHistoryEvent(
                 alloc,
                 event,
@@ -2613,6 +2643,7 @@ pub const LoadedWritableSession = struct {
                 timestamp_ms,
             ),
         };
+        return result catch |err| self.recordWriteFailure(err);
     }
 
     pub fn commitContextCompaction(
@@ -2623,6 +2654,7 @@ pub const LoadedWritableSession = struct {
         retained_from: ?types.ContextHistoryCut,
         timestamp_ms: i64,
     ) !CommitPosition {
+        try self.requireWritable();
         var prepared: ?session.HistoryTurn = if (active_prefix) |prefix|
             try session.dupeHistoryTurn(alloc, .{ .assistant = prefix })
         else
@@ -2637,6 +2669,7 @@ pub const LoadedWritableSession = struct {
             retained_from,
         );
         if (prepared) |turn| self.writeFirstConversationTitle(alloc, turn);
+        if (self.conversation_writer.failure) |err| return err;
         return self.finishConversationCommit(alloc, timestamp_ms);
     }
 
@@ -2650,7 +2683,7 @@ pub const LoadedWritableSession = struct {
             .history_turn_committed => |value| value,
             else => return error.InvalidConversationEvent,
         };
-        const work_id = if (payload.work_id) |value|
+        var work_id = if (payload.work_id) |value|
             try alloc.dupe(u8, value)
         else
             null;
@@ -2661,14 +2694,26 @@ pub const LoadedWritableSession = struct {
             payload.turn,
         );
         self.writeFirstConversationTitle(alloc, payload.turn);
+        if (self.conversation_writer.failure) |err| return err;
         if (work_id) |value| {
             if (self.state.last_subagent_work_id) |old| alloc.free(old);
             self.state.last_subagent_work_id = value;
+            work_id = null;
         }
+        const language_changed = !std.mem.eql(u8, self.state.conversation_language.view(), payload.conversation_language.view());
         self.state.conversation_language = payload.conversation_language;
         self.state.total_input_tokens = payload.total_input_tokens;
         self.state.total_output_tokens = payload.total_output_tokens;
-        return self.finishConversationCommit(alloc, timestamp_ms);
+        const position = self.finishConversationCommit(alloc, timestamp_ms);
+        if (language_changed) {
+            writeConversationMetadata(alloc, &self.log.dir, self.state) catch |err| {
+                self.conversation_writer.failure = error.SessionPersistenceUncertain;
+                debug_trace.logf("session", "history committed but language metadata failed session={s} err={s}", .{ self.active_id, @errorName(err) });
+                return error.SessionPersistenceUncertain;
+            };
+        }
+        if (self.conversation_writer.failure) |err| return err;
+        return position;
     }
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
@@ -2827,16 +2872,17 @@ pub const LoadedWritableSession = struct {
         permission_state: session_permission_state.State,
         timestamp_ms: i64,
     ) !void {
+        try self.requireWritable();
         var next = try session_permission_state.dupe(alloc, permission_state);
         errdefer next.deinit(alloc);
         const bytes = try session_codec.encodePermissionState(alloc, next);
         defer alloc.free(bytes);
-        try io_mod.durableReplaceVerified(
+        io_mod.durableReplaceVerified(
             alloc,
             &self.log.dir,
             permission_state_file,
             bytes,
-        );
+        ) catch |err| return self.recordWriteFailure(err);
         self.state.permission_state.deinit(alloc);
         self.state.permission_state = next;
         self.state.updated_at_ms = timestamp_ms;
@@ -3305,14 +3351,11 @@ pub const Root = struct {
             session_id,
             options.session_lock_deadline_ms,
         );
+        errdefer writable.deinit(alloc);
         if (!try hasConversationMetadata(alloc, &writable.dir)) {
-            writable.deinit(alloc);
             return error.SessionMigrationRequired;
         }
-        return openConversationWritableSession(alloc, &writable) catch |err| {
-            writable.deinit(alloc);
-            return err;
-        };
+        return openConversationWritableSession(alloc, &writable);
     }
 
     pub fn loadReadOnly(
@@ -3851,6 +3894,187 @@ test "conversation writer appends one durable line per event" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\n"));
     try std.testing.expect(std.mem.find(u8, bytes, "commit.pending") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "state_replacement") == null);
+}
+
+test "conversation writer preserves a suffix written outside its ownership" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+        var writer = try ConversationWriter.init(alloc, file);
+        defer writer.deinit();
+        try writer.appendHistoryTurn(alloc, 1, .{ .assistant = .{
+            .user = .{ .text = @constCast("accepted request") },
+            .assistant = @constCast("accepted answer"),
+        } });
+        const external = try session_event.encodeConversationFrame(alloc, .{
+            .seq = writer.last_seq + 1,
+            .timestamp_ms = 2,
+            .event = .{ .context_checkpoint = .{
+                .covers_through_seq = writer.last_seq,
+                .summary = "another writer's accepted context",
+            } },
+        });
+        defer alloc.free(external);
+        try file.writePositionalAll(std.testing.io, external, writer.committed_bytes);
+        try file.sync(std.testing.io);
+        const before = try alloc.alloc(u8, @intCast(try file.length(std.testing.io)));
+        defer alloc.free(before);
+        try std.testing.expectEqual(before.len, try file.readPositionalAll(std.testing.io, before, 0));
+        const turn: types.HistoryTurn = if (checkpoint)
+            .{ .compacted_summary = .{ .summary = @constCast("stale checkpoint"), .removed_turn_count = 1, .compaction_count = 1 } }
+        else
+            .{ .assistant = .{ .user = .{ .text = @constCast("stale request") }, .assistant = @constCast("stale answer") } };
+        try std.testing.expectError(error.SessionWriterChanged, writer.appendHistoryTurn(alloc, 3, turn));
+        try std.testing.expectEqual(before.len, try file.length(std.testing.io));
+        const after = try alloc.alloc(u8, before.len);
+        defer alloc.free(after);
+        try std.testing.expectEqual(after.len, try file.readPositionalAll(std.testing.io, after, 0));
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+}
+
+test "conversation writer rolls back failed sync and refuses uncertain continuation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint| {
+        for ([_]bool{ false, true }) |fail_rollback| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+            var writer = try ConversationWriter.init(alloc, file);
+            defer writer.deinit();
+            try writer.appendHistoryTurn(alloc, 10, .{ .assistant = .{
+                .user = .{ .text = @constCast("accepted request") },
+                .assistant = @constCast("accepted answer"),
+            } });
+            const prior = try writer.readAllForTest(alloc);
+            defer alloc.free(prior);
+            const SyncFault = struct {
+                calls: usize = 0,
+                fail_rollback: bool,
+
+                fn sync(ctx: ?*anyopaque, target: std.Io.File) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.calls += 1;
+                    if (self.calls == 1 or (self.fail_rollback and self.calls == 2)) return error.InjectedSyncFailure;
+                    try target.sync(std.testing.io);
+                }
+            };
+            var fault = SyncFault{ .fail_rollback = fail_rollback };
+            writer.test_sync_ops = .{ .ctx = &fault, .sync_file = SyncFault.sync };
+            const turn: types.HistoryTurn = if (checkpoint)
+                .{ .compacted_summary = .{ .summary = @constCast("failed summary"), .removed_turn_count = 1, .compaction_count = 1 } }
+            else
+                .{ .assistant = .{ .user = .{ .text = @constCast("failed request") }, .assistant = @constCast("failed answer") } };
+            try std.testing.expectError(
+                if (fail_rollback) error.SessionPersistenceUncertain else error.InjectedSyncFailure,
+                writer.appendHistoryTurn(alloc, 11, turn),
+            );
+            try std.testing.expectEqual(@as(usize, 2), fault.calls);
+            try std.testing.expectEqual(prior.len, try file.length(std.testing.io));
+            try std.testing.expectEqual(@as(u64, 3), writer.last_seq);
+            const after = try writer.readAllForTest(alloc);
+            defer alloc.free(after);
+            try std.testing.expectEqualSlices(u8, prior, after);
+            if (fail_rollback) {
+                try std.testing.expectError(error.SessionPersistenceUncertain, writer.appendHistoryTurn(alloc, 12, turn));
+                try std.testing.expectEqual(@as(usize, 2), fault.calls);
+            } else {
+                try writer.appendHistoryTurn(alloc, 12, turn);
+                try std.testing.expect(writer.committed_bytes > prior.len);
+            }
+        }
+    }
+}
+
+test "parked session refuses history and control mutations" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "parked-writes", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.log.park();
+    try std.testing.expectError(error.SessionWriterParked, loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = initial.conversation_language,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .turn = .{ .assistant = .{ .user = .{ .text = @constCast("request") }, .assistant = @constCast("answer") } },
+    } }, 2));
+    try std.testing.expectError(error.SessionWriterParked, loaded.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, 2));
+    try std.testing.expectError(error.SessionWriterParked, loaded.commitContextCompaction(alloc, .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 }, null, null, 2));
+}
+
+test "writable resume releases ownership when metadata allocation fails" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "resume-allocation", 10);
+    defer initial.deinit(alloc);
+    var started = try temp.root.startConversationSession(alloc, initial, .{});
+    started.deinit(alloc);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, temp.root.resumeForWrite(failing.allocator(), initial.id, .{ .session_lock_deadline_ms = 0 }));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, resumed.active_id);
+}
+
+test "committed conversation language survives reopening" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "language-roundtrip", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("fr"),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{ .user = .{ .text = @constCast("Bonjour") }, .assistant = @constCast("Salut") } },
+        } }, 20);
+    }
+    var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("fr", restored.conversation_language.view());
+    try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "conversation load retains history and qualifies missing or corrupt accounting" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |missing| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "accounting-recovery", 10);
+        defer initial.deinit(alloc);
+        initial.history = try alloc.alloc(session.HistoryTurn, 1);
+        initial.history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        loaded.deinit(alloc);
+        var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+        defer dir.close();
+        if (missing) {
+            try dir.dir.deleteFile(std.testing.io, session_usage_sidecar.sidecar_file);
+        } else {
+            try io_mod.durableReplaceVerified(alloc, &dir, session_usage_sidecar.sidecar_file, "{broken accounting");
+        }
+        var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
+        defer restored.deinit(alloc);
+        try std.testing.expectEqualStrings("saved answer", restored.history[0].assistant.assistant);
+        try std.testing.expect(restored.usage != null);
+        try std.testing.expectEqual(session_usage.Availability.incomplete, restored.usage.?.billing);
+        try std.testing.expectEqual(@as(usize, 1), restored.usage.?.incidents.len);
+        if (!missing) {
+            const retained = try readManagedFileAlloc(alloc, &dir, session_usage_sidecar.sidecar_file, 1024);
+            defer alloc.free(retained);
+            try std.testing.expectEqualStrings("{broken accounting", retained);
+        }
+    }
 }
 
 test "conversation writer repairs only a partial final record and continues" {
@@ -5673,4 +5897,26 @@ test "cache-free resume loads only the latest checkpoint and suffix" {
     const bytes = try io_mod.readFileToEnd(alloc, &event_file, 1024 * 1024);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "old question") != null);
+}
+
+test "language metadata failure retains ownership of the committed work identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "language-work-failure", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.freshly_started = false;
+    try loaded.log.dir.dir.deleteFile(std.testing.io, "session.json");
+    try loaded.log.dir.dir.createDir(std.testing.io, "session.json", private_dir_permissions);
+    try std.testing.expectError(error.SessionPersistenceUncertain, loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .work_id = @constCast("committed-work"),
+        .conversation_language = .literal("fr"),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .turn = .{ .assistant = .{ .user = .{ .text = @constCast("Bonjour") }, .assistant = @constCast("Salut") } },
+    } }, 20));
+    try std.testing.expectEqualStrings("committed-work", loaded.state.last_subagent_work_id.?);
+    try std.testing.expectError(error.SessionPersistenceUncertain, loaded.requireWritable());
 }

@@ -88,13 +88,7 @@ pub fn writeEncoded(
     );
 }
 
-pub fn load(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !?session_usage.Snapshot {
-    var captured = try capture(alloc, session_dir);
-    defer captured.deinit(alloc);
+fn loadCaptured(alloc: Allocator, captured: Captured, session_id: []const u8) !?session_usage.Snapshot {
     const bytes = switch (captured) {
         .missing => return null,
         .invalid => return error.InvalidUsageSidecar,
@@ -109,6 +103,57 @@ pub fn load(
     const snapshot = decoded.snapshot;
     alloc.free(decoded.session_id);
     decoded_owned = false;
+    return snapshot;
+}
+
+/// A conversation remains usable when its accounting snapshot is damaged.
+/// File access and private-path failures still prevent admission.
+pub fn loadConversation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    continuity_at_ms: i64,
+) !session_usage.Snapshot {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    if (captured == .invalid) {
+        const reason = captured.invalid;
+        if (!std.mem.eql(u8, reason, "empty") and !std.mem.eql(u8, reason, "oversized")) {
+            return error.InvalidUsageSidecar;
+        }
+    }
+    const loaded = loadCaptured(alloc, captured, session_id) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        traceInvalid(err);
+        break :blk null;
+    };
+    if (loaded) |snapshot| return snapshot;
+    debug_trace.logf("session", "conversation accounting unavailable session={s} completeness=incomplete", .{session_id});
+    var snapshot = session_usage.Snapshot{
+        .billing = .incomplete,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+    };
+    errdefer snapshot.deinit(alloc);
+    try session_usage.appendIncidentOwned(alloc, &snapshot, .{
+        .occurred_at_ms = @max(continuity_at_ms, 0),
+        .completeness = .incomplete,
+    });
     return snapshot;
 }
 
@@ -347,6 +392,21 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
             .{ .iterate = true, .follow_symlinks = false },
         ),
     };
+}
+
+test "conversation accounting recovery refuses unsafe storage" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = try openTestVerifiedDir(temp.dir);
+    defer verified.close();
+    try temp.dir.createDir(std.testing.io, sidecar_file, .fromMode(0o700));
+    try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
+    try temp.dir.deleteDir(std.testing.io, sidecar_file);
+    var file = try temp.dir.createFile(std.testing.io, sidecar_file, .{ .permissions = .fromMode(0o644) });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "{corrupt but not private");
+    try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
 }
 
 test "usage sidecar restores rich fields only for its bound session and projection" {

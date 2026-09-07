@@ -526,8 +526,9 @@ pub const Usage = struct {
         outcome: DeliveryOutcome,
     ) !void {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         self.finishInvocation(sequence, duration_ms, outcome);
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         self.flushProfilePublications();
     }
@@ -543,6 +544,7 @@ pub const Usage = struct {
         team: ?[]const u8,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishObservedInvocationAccepted(
             alloc,
             sequence,
@@ -553,7 +555,7 @@ pub const Usage = struct {
             team,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
@@ -563,7 +565,7 @@ pub const Usage = struct {
             self.flushProfilePublications();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -577,6 +579,7 @@ pub const Usage = struct {
         reference: stream_provider.DeferredUsageReference,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishDeferredInvocationAccepted(
             alloc,
             sequence,
@@ -585,7 +588,7 @@ pub const Usage = struct {
             reference,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
@@ -595,7 +598,7 @@ pub const Usage = struct {
             self.flushProfilePublications();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -661,6 +664,7 @@ pub const Usage = struct {
         };
 
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const durable_bridge = self.checkpoint_sink != null;
         const accepted = self.finishExactInvocationAccepted(
             alloc,
@@ -673,7 +677,7 @@ pub const Usage = struct {
             durable_bridge,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             debug_trace.logf(
                 "session",
@@ -683,11 +687,11 @@ pub const Usage = struct {
             return false;
         };
         if (!accepted) {
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
-        if (durable_bridge and !self.persistCheckpointBestEffortLocked()) {
+        if (durable_bridge and !(try self.persistCheckpointForContinuationLocked())) {
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
@@ -741,6 +745,10 @@ pub const Usage = struct {
     }
 
     fn persistCheckpointBestEffortLocked(self: *Usage) bool {
+        return self.persistCheckpointForContinuationLocked() catch false;
+    }
+
+    fn persistCheckpointForContinuationLocked(self: *Usage) error{ SessionPersistenceUncertain, SessionWriterChanged, SessionWriterParked, SessionCommitFailed }!bool {
         const sink = self.checkpoint_sink orelse return true;
         var persisted = self.snapshotCurrent(sink.allocator) catch |err| {
             self.markBillingIncomplete();
@@ -759,6 +767,14 @@ pub const Usage = struct {
                 "usage checkpoint unavailable; billing marked incomplete reason={s}",
                 .{@errorName(err)},
             );
+            switch (err) {
+                error.SessionPersistenceUncertain,
+                error.SessionWriterChanged,
+                error.SessionWriterParked,
+                error.SessionCommitFailed,
+                => return @errorCast(err),
+                else => {},
+            }
             return false;
         };
         self.markClean(persisted);
@@ -5881,4 +5897,34 @@ test "host-managed reconciliation records authority without credential bytes" {
         credential_authority.derive(.host_managed, null).?,
     ));
     try std.testing.expect(!usage.reconciliation_credential_blocked);
+}
+
+test "terminal checkpoint writer failure stops invocation completion and releases its lock" {
+    const Reject = struct {
+        calls: usize = 0,
+        fn persist(raw: *anyopaque, _: Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.SessionPersistenceUncertain;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |deferred| {
+        var reject = Reject{};
+        var usage = Usage.initFresh();
+        defer usage.deinit(alloc);
+        usage.configureCheckpointSink(.{ .context = &reject, .allocator = alloc, .persist = Reject.persist });
+        const observation = try InvocationObservation.begin(&usage);
+        try std.testing.expectError(error.SessionPersistenceUncertain, observation.complete(
+            alloc,
+            .{ .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+            if (deferred) testGatewayUsageOutcome("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", false) else .{ .unavailable = .unbilled },
+        ));
+        try std.testing.expectEqual(@as(usize, 2), reject.calls);
+        try std.testing.expect(usage.checkpoint_mutex.tryLock());
+        usage.checkpoint_mutex.unlock(io_mod.getIo());
+        var snapshot = try usage.snapshot(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    }
 }

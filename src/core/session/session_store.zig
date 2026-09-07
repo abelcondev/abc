@@ -1397,6 +1397,20 @@ pub const Store = struct {
     }
 
     /// Opens verified read-only storage restricted to subagent control files.
+    /// The caller has already classified the session; no history is replayed.
+    pub fn openListedSubagentControlReadOnly(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !?session_child_store.SessionChildCapability {
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        const display = try sessionDirPath(alloc, self.sessions_dir, session_id);
+        defer alloc.free(display);
+        return session_child_store.SessionChildCapability.initLegacySubagentControl(alloc, session_dir.dir, display);
+    }
+
+    /// Opens verified read-only storage restricted to subagent control files.
     pub fn openSubagentControlCapabilityReadOnly(
         self: Store,
         alloc: Allocator,
@@ -1786,6 +1800,7 @@ pub const Store = struct {
         writable: *const LoadedWritableSession,
         snapshot: session_usage.Snapshot,
     ) !UsageRecoveryCheckpoint {
+        try writable.requireWritable();
         const now_ms = @max(io_mod.milliTimestamp(), 0);
         const timestamp_ms = if (now_ms > writable.state.updated_at_ms)
             now_ms
@@ -2750,6 +2765,7 @@ pub const Store = struct {
         var scan = RankingScan{ .cache = try catalog_cache.Loaded.load(alloc, sessions, null) };
         defer scan.deinit(alloc);
         var selected: ?WritableCandidate = null;
+        var candidate_error: ?anyerror = null;
         defer if (selected) |*candidate| candidate.deinit(alloc);
         var dir = try sessions.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false });
         defer dir.close(io_mod.getIo());
@@ -2774,7 +2790,9 @@ pub const Store = struct {
                     null,
                     err,
                 );
-                return err;
+                if (err == error.OutOfMemory or err == error.Cancelled) return err;
+                candidate_error = err;
+                continue;
             } orelse continue;
             if (!std.mem.eql(u8, candidate.workspace_root, workspace_root)) {
                 logDiscovery(
@@ -2786,6 +2804,27 @@ pub const Store = struct {
                     .skipped,
                     null,
                 );
+                candidate.deinit(alloc);
+                continue;
+            }
+            const child_identity = candidate.subagent_child orelse switch (candidate.storage) {
+                .legacy_v1, .legacy_v2 => false,
+                .schema_v3, .conversation => null,
+            };
+            const internal = subagent_child_state.isDiscoveredManagedChildSession(
+                self,
+                alloc,
+                candidate.id,
+                child_identity,
+            ) catch |err| {
+                logDiscoveryError(.workspace_writable_last, candidate.id, candidate.storage, candidate.projection_state, err);
+                candidate.deinit(alloc);
+                if (err == error.OutOfMemory or err == error.Cancelled) return err;
+                candidate_error = err;
+                continue;
+            };
+            if (internal) {
+                debug_trace.logf("session", "latest selection excluded internal child id={s}", .{candidate.id});
                 candidate.deinit(alloc);
                 continue;
             }
@@ -2805,8 +2844,7 @@ pub const Store = struct {
                 candidate.deinit(alloc);
             }
         }
-        // No cache publication is reachable from an incomplete or failed scan.
-        scan.publish(self, alloc);
+        if (candidate_error == null) scan.publish(self, alloc);
         if (selected) |candidate| {
             logDiscovery(
                 .workspace_writable_last,
@@ -2819,6 +2857,7 @@ pub const Store = struct {
             );
             return try alloc.dupe(u8, candidate.id);
         }
+        if (candidate_error) |err| return err;
         return null;
     }
 
@@ -2873,6 +2912,10 @@ pub const Store = struct {
         if (try session_log.readConversationMetadata(alloc, &session_dir)) |value| {
             var metadata = value;
             defer metadata.deinit();
+            if (metadata.value.subagent_child and std.mem.eql(u8, metadata.value.id, session_id)) {
+                debug_trace.logf("session", "latest selection excluded internal child id={s}", .{session_id});
+                return null;
+            }
             if (std.mem.eql(u8, metadata.value.id, session_id) and
                 try only_unpublished_creation(&session_dir, true))
             {
@@ -7156,7 +7199,7 @@ test "classifies conversation and legacy candidates" {
     );
 }
 
-test "writable last skips only unpublished lock directories" {
+test "writable last preserves unidentified data without blocking a healthy session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7172,13 +7215,15 @@ test "writable last skips only unpublished lock directories" {
         try std.testing.expectEqualStrings("local", resumed.active_id);
     }
     try writeFixtureEntry(alloc, ctx.store, "lock-only", "events.jsonl", "unidentified saved data\n");
-    try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("local", resumed.active_id);
     const retained = try readFixtureFile(alloc, ctx.store, "lock-only", "events.jsonl", 1024);
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("unidentified saved data\n", retained);
 }
 
-test "writable last skips retained incomplete creation without weakening saved-data checks" {
+test "writable last preserves incomplete creation and exact resume diagnostics" {
     const alloc = std.testing.allocator;
     for ([_]struct { metadata: bool, temporary: bool }{
         .{ .metadata = false, .temporary = true },
@@ -7226,10 +7271,63 @@ test "writable last skips retained incomplete creation without weakening saved-d
             return error.IncompleteSessionWasResumed;
         } else |err| try std.testing.expect(err == error.FileNotFound or err == error.SessionNotFound);
         try writeFixtureEntry(alloc, ctx.store, "failed-start", "permissions.json", "{}");
-        try std.testing.expectError(error.FileNotFound, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("healthy", resumed.active_id);
         const controls = try readFixtureFile(alloc, ctx.store, "failed-start", "permissions.json", 1024);
         defer alloc.free(controls);
         try std.testing.expectEqualStrings("{}", controls);
+    }
+}
+
+test "writable last retains a pending authority directory without a manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "healthy", ctx.workspace, 1, "saved");
+    try ctx.store.canonical_root.sessions.?.dir.createDir(std.testing.io, "pending", .fromMode(0o700));
+    try writeFixtureEntry(alloc, ctx.store, "pending", "authority.pending.json", "pending authority");
+    try writeFixtureEntry(alloc, ctx.store, "pending", "events.jsonl", "retained event data\n");
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("healthy", resumed.active_id);
+    const retained = try readFixtureFile(alloc, ctx.store, "pending", "events.jsonl", 1024);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained event data\n", retained);
+}
+
+test "writable last excludes newer child metadata and legacy owner markers" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |legacy_marker| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
+        if (legacy_marker) {
+            try writeLegacyFixture(alloc, ctx.store, "child", ctx.workspace, std.math.maxInt(i64) - 1);
+            var dir = try ctx.store.openSessionDir("child");
+            defer dir.close();
+            try dir.dir.createDir(std.testing.io, "subagent", .fromMode(0o700));
+            try dir.dir.writeFile(std.testing.io, .{ .sub_path = "subagent/owner.json", .data = "{}", .flags = .{ .permissions = .fromMode(0o600) } });
+        } else {
+            try createHistoryPageFixture(alloc, ctx.store, "child", ctx.workspace, 1, "child");
+            var dir = try ctx.store.openSessionDir("child");
+            defer dir.close();
+            var decoded = (try session_log.readConversationMetadata(alloc, &dir)).?;
+            defer decoded.deinit();
+            var metadata = decoded.value;
+            metadata.subagent_child = true;
+            metadata.updated_at_ms = std.math.maxInt(i64) - 1;
+            const bytes = try session_codec.encodeSessionMetadata(alloc, metadata);
+            defer alloc.free(bytes);
+            try writeFixtureEntry(alloc, ctx.store, "child", "session.json", bytes);
+        }
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("parent", resumed.active_id);
     }
 }
 

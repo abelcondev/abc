@@ -73,6 +73,7 @@ pub const WritableCandidate = struct {
     updated_at_ms: i64,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+    subagent_child: ?bool = null,
 
     pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
         alloc.free(self.id);
@@ -430,7 +431,9 @@ pub fn writable_conversation_candidate(
             offset = line.next_offset;
         }
     }
-    return dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
+    var candidate = try dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
+    candidate.subagent_child = metadata.subagent_child;
+    return candidate;
 }
 
 /// Identifies a fenced candidate without recovering it. Caller owns the candidate.
@@ -440,7 +443,12 @@ pub fn fenced_legacy_writable_candidate(
     session_id: []const u8,
     fallback_workspace: []const u8,
 ) !WritableCandidate {
-    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json")) "session.legacy.json" else "session.json";
+    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json"))
+        "session.legacy.json"
+    else if (try entryExistsRelative(session_dir, "session.json"))
+        "session.json"
+    else
+        return error.SessionAuthorityBoundaryUnavailable;
     const path_stat = try session_dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false });
     if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
     var file = try openSessionFile(session_dir, name, .read_only);
