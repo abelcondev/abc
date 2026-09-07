@@ -4882,6 +4882,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const instruction = "NESTED_INSTRUCTION_REFRESH_SENTINEL";
       const command = "cat AGENTS.md && printf 'executed\\n' >> executions.log";
       const finalText = "INSTRUCTION_REFRESH_FINAL";
+      const nextFinalText = "INSTRUCTION_REFRESH_NEXT_TURN_FINAL";
+      const currentInstruction = "NESTED_CURRENT_INSTRUCTION_SENTINEL";
       const refreshLabel = "Reading project instructions before continuing:";
       const header = "● 2 tool calls · 2 commands";
       mkdirSync(join(home, ".fx"), { recursive: true });
@@ -4903,6 +4905,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             : undefined;
           return fakeGatewayFinalText(finalText);
         },
+        fakeShellRun("retained_scope_next_turn", command, { cwd: nested }),
+        fakeGatewayFinalText(nextFinalText),
       ]);
       gateway = refreshGateway;
       session = await TmuxSession.create({
@@ -4947,6 +4951,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       for (const output of [compact, escapes]) {
         expect(output).not.toMatch(/command not run|project instructions changed|\bfailed\b/i);
       }
+
+      writeFileSync(join(nested, "AGENTS.md"), `${currentInstruction}\n`);
+      await session.sendText("Run that same command once more.");
+      await session.waitForText(nextFinalText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(refreshGateway.requests).toHaveLength(5);
+      const nextInstructions = (parseGatewayRequest(refreshGateway.requests[3]!.body).prompt ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => contentText(message.content)).join("\n");
+      expect(nextInstructions).toContain(currentInstruction);
+      expect(nextInstructions).not.toContain(instruction);
+      expect(readFileSync(markerPath, "utf8")).toBe("executed\nexecuted\n");
+      expect(countOccurrences(await session.captureFullScrollback(), refreshLabel))
+        .toBe(countOccurrences(compact, refreshLabel));
+      expect(hasEmptyComposer(await session.capturePane())).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
       await session.sendText("/quit");

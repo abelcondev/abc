@@ -4815,7 +4815,11 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    var reconstructed_context = try reconstructProjectContext(arena, deps, config, job);
+    defer if (reconstructed_context) |*snapshot| snapshot.deinit(arena);
+    var prepared_job = job;
+    if (reconstructed_context) |snapshot| prepared_job.context_snapshot = snapshot;
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, if (reconstructed_context) |snapshot| snapshot.modelVisibleBytes() else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -4871,7 +4875,7 @@ fn processQueuedPromptInner(
         semantic_presentation,
         lifecycle,
         config,
-        job,
+        prepared_job,
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
         base_nested_terminal_advertised,
@@ -5225,11 +5229,55 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
+fn reconstructProjectContext(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    job: QueuedPrompt,
+) !?context_contract.GatheredContextSnapshot {
+    if (!deps.context_enabled) return null;
+    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
+    var retained = try tool_preparation.retainedContextTargets(
+        alloc,
+        job.history,
+        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
+        config.workspace_root,
+        deps.tool_registry,
+        config.cancel_flag,
+    );
+    defer retained.deinit(alloc);
+    if (retained.items.len == 0) return null;
+    var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
+    defer targets.deinit(alloc);
+    const prior = job.context_snapshot.evaluated_endpoints;
+    for (prior[0..@min(prior.len, 128)]) |endpoint| {
+        try targets.append(alloc, .{ .path = endpoint, .kind = .directory });
+    }
+    const image_targets = try context_contract.applicableTargetsForImages(alloc, job.images);
+    defer if (image_targets.len > 0) alloc.free(image_targets);
+    try targets.appendSlice(alloc, image_targets[0..@min(image_targets.len, 32)]);
+    try targets.appendSlice(alloc, retained.items);
+    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{
+        .workspace_root = config.workspace_root,
+        .access_scope = config.access_scope,
+        .targets = targets.items,
+        .bounded_reconstruction = true,
+        .context_limits = config.context_limits,
+    });
+    errdefer snapshot.deinit(alloc);
+    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    for (snapshot.notices) |notice| try deps.pushContextNotice(notice);
+    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len });
+    return snapshot;
+}
+
 fn appendStablePromptContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     skill_catalog_text: ?[]const u8,
+    project_context: ?[]const u8,
     messages: *std.ArrayList(ChatMessage),
 ) !void {
     for ([_][]const u8{
@@ -5243,7 +5291,7 @@ fn appendStablePromptContext(
     if (config.model_prompt_overlay) |overlay| {
         try messages.append(alloc, .{ .role = .system, .content = overlay });
     }
-    if (deps.append_static_context) |append| try append(deps.ctx, alloc, messages);
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, project_context, messages);
 }
 
 const CompactionContinuation = struct {
@@ -5366,7 +5414,7 @@ pub fn prepareManualCompactionContinuation(
 ) !CompactionContinuation {
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     const skill_section = try prepareSkillCatalog(arena, deps, config, capabilities.context_window);
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, null, &stable_prefix);
     var overlay: std.ArrayList(ChatMessage) = .empty;
     try deps.append_runtime_context(deps.ctx, arena, &overlay);
     const projection = try build_provider_prompt_with_response_language_control(
