@@ -4634,7 +4634,7 @@ const TestContextRegistryFixture = struct {
         defer messages.deinit(arena);
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-        try append_static(deps.ctx, arena, &messages);
+        try append_static(deps.ctx, arena, null, &messages);
         try deps.append_runtime_context(deps.ctx, arena, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
@@ -4965,7 +4965,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
