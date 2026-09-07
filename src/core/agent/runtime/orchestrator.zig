@@ -4815,7 +4815,30 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
-    var reconstructed_context = try reconstructProjectContext(arena, deps, config, job);
+    var reconstructed_context = reconstruct: while (true) {
+        const snapshot = reconstructProjectContext(arena, deps, config, job) catch |err| {
+            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+            if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) continue :reconstruct;
+            runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
+            var terminal_materializing = false;
+            try runtime_interruption.persistInterruptedTurnOnce(
+                deps,
+                finalization,
+                job,
+                null,
+                null,
+                completed_tool_names.items,
+                &interrupted_persisted,
+                finish_trace.ctx,
+                within_turn_suffix.items,
+                null,
+                &terminal_materializing,
+            );
+            finish_trace.finish("interrupted");
+            return;
+        };
+        break :reconstruct snapshot;
+    };
     defer if (reconstructed_context) |*snapshot| snapshot.deinit(arena);
     var prepared_job = job;
     if (reconstructed_context) |snapshot| prepared_job.context_snapshot = snapshot;

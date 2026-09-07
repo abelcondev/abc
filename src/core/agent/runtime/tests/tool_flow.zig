@@ -262,6 +262,7 @@ const ApplicableContextDelta = struct {
         _: std.mem.Allocator,
         _: context_contract.InitialContextInput,
     ) context_contract.ProviderError!context_contract.ProviderContext {
+        if (cancel_flag) |flag| flag.store(true, .seq_cst);
         return .{};
     }
 
@@ -3169,6 +3170,39 @@ test "modern cancellation during later context selection stops before context or
     try std.testing.expectEqualStrings("candidate_read", interrupted.tool_call.?.id);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
+test "retained project context cancellation preserves an interrupted turn" {
+    const alloc = std.testing.allocator;
+    defer ApplicableContextDelta.reset("", null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior") },
+        .assistant = @constCast("prior result"),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    } }};
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = ApplicableContextDelta.registry;
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.history = @constCast(&history);
+    ApplicableContextDelta.reset("", &fixture.cancel_flag);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
 }
 
 test "retained project context leaves empty history host context unchanged" {
