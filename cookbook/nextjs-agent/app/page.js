@@ -1,12 +1,14 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { readReply } from '../../shared/read-reply.mjs'
 
 export default function Page() {
   const [reply, setReply] = useState('')
   const [status, setStatus] = useState('')
   const [busy, setBusy] = useState(false)
+  const [ready, setReady] = useState(false)
+  useEffect(() => setReady(true), [])
 
   async function send(event) {
     event.preventDefault()
@@ -35,7 +37,7 @@ export default function Page() {
     <form onSubmit={send}>
       <label htmlFor="prompt">Prompt</label><br />
       <textarea id="prompt" name="prompt" rows={3} cols={30} required maxLength={2000} defaultValue="Explain server components in two sentences." /><br />
-      <button disabled={busy}>Send</button>
+      <button disabled={!ready || busy}>Send</button>
     </form>
     <p role="status">{status}</p>
     <label htmlFor="reply">Reply</label><br />

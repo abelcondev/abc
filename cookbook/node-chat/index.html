@@ -9,7 +9,7 @@
   <form>
     <label for="prompt">Prompt</label><br>
     <textarea id="prompt" name="prompt" rows="3" cols="30" required maxlength="2000">Explain closures in two sentences.</textarea><br>
-    <button>Send</button>
+    <button disabled>Send</button>
   </form>
   <p role="status" id="status"></p>
   <label for="reply">Reply</label><br>
@@ -42,5 +42,6 @@
       button.disabled = false
     }
   })
+  button.disabled = false
 </script>
 </html>

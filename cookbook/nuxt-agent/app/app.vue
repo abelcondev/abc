@@ -5,6 +5,8 @@ const prompt = ref('Explain Vue reactivity in two sentences.')
 const reply = ref('')
 const status = ref('')
 const busy = ref(false)
+const ready = ref(false)
+onMounted(() => { ready.value = true })
 useHead({ title: 'Nuxt agent · fx cookbook', htmlAttrs: { lang: 'en' } })
 
 async function send() {
@@ -34,7 +36,7 @@ async function send() {
     <form @submit.prevent="send">
       <label for="prompt">Prompt</label><br>
       <textarea id="prompt" v-model="prompt" name="prompt" rows="3" cols="30" required maxlength="2000" /><br>
-      <button :disabled="busy">Send</button>
+      <button :disabled="!ready || busy">Send</button>
     </form>
     <p role="status">{{ status }}</p>
     <label for="reply">Reply</label><br>
