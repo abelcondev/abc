@@ -6847,6 +6847,64 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("ask continues and persists a healthy parent when child recovery is unavailable", async () => {
+    const root = createFixtureRoot("subagent-recovery-unavailable");
+    const tracePath = join(root.root, "trace.log");
+    const replies = ["PARENT_SEED_SENTINEL", "PARENT_CONTINUATION_SAVED", "PARENT_REOPENED"];
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (requestIndex > 0) expect(body).toContain(replies[0]);
+      if (requestIndex === 2) expect(body).toContain(replies[1]);
+      return fakeGatewayFinalText(replies[requestIndex++] ?? "UNEXPECTED_REQUEST");
+    });
+    const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "subagent,session" };
+    try {
+      const seeded = await runFx(["ask", "--json", "Start a saved conversation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(seeded.code).toBe(0);
+      const id = parseAskJson(seeded.stdout).session_id;
+      expect(id).not.toBe("");
+      const directory = join(root.home, ".fx", "sessions", id);
+      const eventsPath = join(directory, "events.jsonl");
+      const originalEvents = readFileSync(eventsPath, "utf8");
+      const childDirectory = join(directory, "subagent");
+      mkdirSync(childDirectory, { recursive: true, mode: 0o700 });
+      const registryPath = join(childDirectory, "children.json");
+      writeFileSync(registryPath, "[]", { mode: 0o600 });
+
+      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      const result = parseAskJson(resumed.stdout);
+      expect(result.session_id).toBe(id);
+      expect(result.final_output).toBe(replies[1]);
+      expect(result.tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(2);
+      const continuedEvents = readFileSync(eventsPath, "utf8");
+      expect(continuedEvents.startsWith(originalEvents)).toBe(true);
+      expect(continuedEvents).toContain(replies[1]);
+      expect(continuedEvents.trim().split("\n").map(line => JSON.parse(line)).filter(frame => frame.event.turn_completed)).toHaveLength(2);
+      expect(readFileSync(registryPath, "utf8")).toBe("[]");
+      expect(readFileSync(tracePath, "utf8")).toContain("ask subagent host unavailable");
+
+      const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
+        cwd: root.workspace, env, timeoutMs: 15_000,
+      });
+      expect(reopened.code).toBe(0);
+      expect(reopened.stderr).toBe("");
+      expect(parseAskJson(reopened.stdout).session_id).toBe(id);
+      expect(parseAskJson(reopened.stdout).final_output).toBe(replies[2]);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(registryPath, "utf8")).toBe("[]");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");
     const tracePath = join(root.root, "trace.log");

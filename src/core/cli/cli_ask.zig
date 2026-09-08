@@ -906,13 +906,21 @@ const AskContext = struct {
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
         }
-        self.subagent_host = try subagent_tool_host.Runtime.create(
+        self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
             &self.store.?,
             self.writable.?.active_id,
             .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
             .{ .context = self, .run_fn = runAskChild },
-        );
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf(
+                "subagent",
+                "ask subagent host unavailable root_id={s} err={s}",
+                .{ self.writable.?.active_id, @errorName(err) },
+            );
+            break :blk null;
+        };
         const capability = try self.writable.?.childCapability();
         if (legacy_background_migration.migrate(
             self.alloc,
