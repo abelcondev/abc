@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "nuxt dev",
+    "dev": "nuxt dev --dotenv .env.local",
     "build": "nuxt build",
     "start": "node .output/server/index.mjs"
   },
