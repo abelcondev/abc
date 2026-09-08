@@ -145,7 +145,8 @@ pub const MarkdownProcessor = struct {
     code_buf: std.ArrayList(u8) = .empty,
     code_language: std.ArrayList(u8) = .empty,
     in_code_block: bool = false,
-    code_fence_marker: ?u8 = null,
+    /// Set for fenced blocks; null while inside an indented code block.
+    code_fence: ?bp.CodeFence = null,
     in_pipe_block: bool = false,
     pipe_last_line_has_lf: bool = false,
     active_blockquote: ?bp.BlockquotePrefix = null,
@@ -172,7 +173,7 @@ pub const MarkdownProcessor = struct {
         self.code_language.clearAndFree(alloc);
         self.deinitFootnotes(alloc);
         self.in_code_block = false;
-        self.code_fence_marker = null;
+        self.code_fence = null;
         self.in_pipe_block = false;
         self.pipe_last_line_has_lf = false;
         self.active_blockquote = null;
@@ -252,7 +253,7 @@ pub const MarkdownProcessor = struct {
         if (self.in_code_block) {
             try self.finalizeCodeBlock(alloc, out, completions.code);
             self.in_code_block = false;
-            self.code_fence_marker = null;
+            self.code_fence = null;
         }
         try self.flushFootnotes(alloc, out);
     }
@@ -270,11 +271,11 @@ pub const MarkdownProcessor = struct {
 
         if (self.in_code_block) {
             self.active_definition = false;
-            if (self.code_fence_marker) |marker| {
-                if (bp.codeFenceMarker(tu.leftTrim(line)) == marker) {
+            if (self.code_fence) |fence| {
+                if (bp.closesCodeFence(line, fence)) {
                     try self.finalizeCodeBlock(alloc, out, completions.code);
                     self.in_code_block = false;
-                    self.code_fence_marker = null;
+                    self.code_fence = null;
                     return;
                 }
             } else if (!tu.isBlankMarkdownLine(line) and !bp.hasIndentedCodePrefix(line)) {
@@ -283,7 +284,9 @@ pub const MarkdownProcessor = struct {
                 try self.handleLine(alloc, line, line_has_lf, out, completions);
                 return;
             }
-            const code_line = if (self.code_fence_marker == null and !tu.isBlankMarkdownLine(line))
+            const code_line = if (self.code_fence) |fence|
+                bp.stripFenceIndent(line, fence.indent)
+            else if (!tu.isBlankMarkdownLine(line))
                 bp.deindentCodeLine(line)
             else
                 line;
@@ -359,7 +362,7 @@ pub const MarkdownProcessor = struct {
         if (self.previous_line_was_blank and bp.hasIndentedCodePrefix(line)) {
             self.active_definition = false;
             self.in_code_block = true;
-            self.code_fence_marker = null;
+            self.code_fence = null;
             self.code_language.clearRetainingCapacity();
             try self.appendCodeLine(alloc, bp.deindentCodeLine(line), line_has_lf, out, completions.code);
             return;
@@ -374,10 +377,14 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.codeFenceMarker(tu.leftTrim(line))) |marker| {
+        if (bp.parseCodeFence(tu.leftTrim(line))) |fence| {
             self.active_definition = false;
             self.in_code_block = true;
-            self.code_fence_marker = marker;
+            self.code_fence = .{
+                .marker = fence.marker,
+                .run = fence.run,
+                .indent = line.len - tu.leftTrim(line).len,
+            };
             self.code_language.clearRetainingCapacity();
             try self.code_language.appendSlice(alloc, bp.codeFenceLanguage(tu.leftTrim(line)));
             return;
@@ -465,30 +472,7 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.parseUnorderedList(line)) |parsed| {
-            try out.appendSlice(alloc, parsed.indent);
-            if (bp.parseTaskListItem(parsed.content)) |task| {
-                try block_render.writeTaskListMarker(alloc, out, task);
-                try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, &fs, &link_id_counter);
-                return;
-            }
-            try ansi.writeDim(alloc, out, ansi.bullet_marker);
-            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, &fs, &link_id_counter);
-            return;
-        }
-
-        if (bp.parseOrderedList(line)) |parsed| {
-            try out.appendSlice(alloc, parsed.indent);
-            try ansi.writeDim(alloc, out, parsed.marker);
-            try out.append(alloc, ' ');
-            if (bp.parseTaskListItem(parsed.content)) |task| {
-                try block_render.writeTaskListMarker(alloc, out, task);
-                try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, &fs, &link_id_counter);
-                return;
-            }
-            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, &fs, &link_id_counter);
-            return;
-        }
+        if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) return;
 
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
     }
@@ -2225,6 +2209,124 @@ test "unordered list literal bullet gets dim marker" {
     try std.testing.expectEqualStrings(
         "\x1b[2m\xe2\x80\xa2 \x1b[22mthird item\n" ++
             "  \x1b[2m\xe2\x80\xa2 \x1b[22mnested\n",
+        out.items,
+    );
+}
+
+test "unordered list plus marker and tab separator get bullet" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "+ plus item\n-\ttabbed item\n+not a list\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x80\xa2 \x1b[22mplus item\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22mtabbed item\n" ++
+            "+not a list\n",
+        out.items,
+    );
+}
+
+test "ordered list accepts paren markers and rejects long numbers" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1) first\n12) twelfth\n1234567890. too long\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1)\x1b[22m first\n" ++
+            "\x1b[2m12)\x1b[22m twelfth\n" ++
+            "1234567890. too long\n",
+        out.items,
+    );
+}
+
+test "atx heading strips closing hashes and allows small indent" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## Title ##\n   ## Indented\n## Keep#\n## Trail ##   \n    ## code\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mTitle\x1b[22m\n" ++
+            "\x1b[1mIndented\x1b[22m\n" ++
+            "\x1b[1mKeep#\x1b[22m\n" ++
+            "\x1b[1mTrail\x1b[22m\n" ++
+            "    ## code\n",
+        out.items,
+    );
+}
+
+test "longer code fence contains shorter fences" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "````md\n```zig\ninner\n```\n````\nafter\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m```zig\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22minner\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m```\n" ++
+            "after\n",
+        out.items,
+    );
+    try std.testing.expectEqual(@as(?bp.CodeFence, null), processor.code_fence);
+}
+
+test "code fence language skips the whole marker run" {
+    try std.testing.expectEqualStrings("md", bp.codeFenceLanguage("````md"));
+    try std.testing.expectEqualStrings("zig", bp.codeFenceLanguage("```   zig extra"));
+    try std.testing.expectEqualStrings("", bp.codeFenceLanguage("~~~"));
+}
+
+test "closing fence needs matching marker length and nothing after it" {
+    const open = bp.CodeFence{ .marker = '`', .run = 4, .indent = 0 };
+    try std.testing.expect(bp.closesCodeFence("````", open));
+    try std.testing.expect(bp.closesCodeFence("`````  ", open));
+    try std.testing.expect(!bp.closesCodeFence("```", open));
+    try std.testing.expect(!bp.closesCodeFence("~~~~", open));
+    try std.testing.expect(!bp.closesCodeFence("```` trailing", open));
+}
+
+test "fenced code inside a list item drops the item indentation" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. step\n   ```sh\n   ls -la\n     nested\n   ```\n- next\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1.\x1b[22m step\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mls -la\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m  nested\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22mnext\n",
+        out.items,
+    );
+}
+
+test "blockquote renders headings and list items inside the quote" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "> ## Note\n> - one\n> 2. two\n> - [x] done\n> plain\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mNote\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x80\xa2 \x1b[22mone\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m2.\x1b[22m two\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mplain\n",
         out.items,
     );
 }

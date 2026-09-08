@@ -982,7 +982,7 @@ fn listContinuationIndentWidth(text: []const u8, line_start: usize) ?usize {
         marker_width += 1;
         i = skipPacerDimReassertions(text, i);
     }
-    if (marker_width == 0 or i >= text.len or text[i] != '.') return null;
+    if (marker_width == 0 or i >= text.len or (text[i] != '.' and text[i] != ')')) return null;
     i += 1;
     marker_width += 1;
     i = skipPacerDimReassertions(text, i);
@@ -1286,6 +1286,13 @@ test "wrapAssistantText recognizes paced list markers" {
     );
     defer alloc.free(blockquote);
     try std.testing.expectEqualStrings("\x1b[2m\xe2\x94\x82\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcde\n\x1b[2m\xe2\x94\x82 \x1b[22mfghij", blockquote);
+}
+
+test "wrapAssistantText indents paren-style ordered list continuations" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "\x1b[2m12)\x1b[22m abcdefghij", 10);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("\x1b[2m12)\x1b[22m abcdef\n    ghij", out);
 }
 
 test "wrapAssistantText indents ordered and nested list continuations" {
