@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser agent · fx cookbook</title>
+<main>
+  <h1>Browser agent</h1>
+  <p>libfx runs in this browser through WebAssembly. Reload to start a new conversation.</p>
+  <form>
+    <label for="prompt">Prompt</label><br>
+    <textarea id="prompt" name="prompt" rows="3" cols="30" required maxlength="2000">Explain WebAssembly in two sentences.</textarea><br>
+    <button>Send</button>
+  </form>
+  <p role="status" id="status"></p>
+  <label for="reply">Reply</label><br>
+  <textarea id="reply" rows="12" cols="30" readonly></textarea>
+  <p><a href="https://fx.sh/docs/lib/examples#browser-agent">Code and setup</a></p>
+</main>
+<script type="module" src="/main.js"></script>
+</html>

@@ -1,0 +1,37 @@
+name: Cookbook
+
+on:
+  pull_request:
+    paths:
+      - 'cookbook/**'
+      - '.github/workflows/cookbook.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'cookbook/**'
+      - '.github/workflows/cookbook.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  examples:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        example: [node-chat, browser-agent, nextjs-agent, nuxt-agent]
+    defaults:
+      run:
+        working-directory: cookbook/${{ matrix.example }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cookbook/${{ matrix.example }}/package-lock.json
+      - run: npm ci
+      - if: matrix.example == 'node-chat'
+        run: node --test ../shared/gateway.test.mjs
+      - if: matrix.example != 'node-chat'
+        run: npm run build
