@@ -80,8 +80,8 @@ fn writeQuotedBlockContent(
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
 ) !void {
-    if (bp.parseHeader(content)) |header| {
-        try writeHeading(alloc, header.level, tu.withoutTerminalHardBreakMarker(header.content, line_has_lf), out, footnotes, link_id);
+    if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(content, line_has_lf))) |header| {
+        try writeHeading(alloc, header.level, header.content, out, footnotes, link_id);
         return;
     }
     if (try writeListLine(alloc, content, line_has_lf, out, footnotes, link_id)) return;

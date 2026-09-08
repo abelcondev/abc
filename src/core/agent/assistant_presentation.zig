@@ -2360,10 +2360,12 @@ test "heading keeps a backslash exposed by removing closing hashes" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    try processor.push(alloc, "## C:\\ ###\n## trailing\\\n", &out);
+    try processor.push(alloc, "## C:\\ ###\n## trailing\\\n> ## C:\\ ###\n> ## quoted\\\n", &out);
     try std.testing.expectEqualStrings(
         "\x1b[1mC:\\\x1b[22m\n" ++
-            "\x1b[1mtrailing\x1b[22m\n",
+            "\x1b[1mtrailing\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mC:\\\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mquoted\x1b[22m\n",
         out.items,
     );
 }
