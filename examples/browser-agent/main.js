@@ -42,7 +42,9 @@ form.addEventListener('submit', async (event) => {
     const { stopReason } = await turn.result
     status.textContent = stopReason === 'refused' ? 'Request failed. See the reply for details.' : 'Reply complete.'
   } catch (error) {
-    status.textContent = error.message
+    status.textContent = error.message === 'HostStreamFailed'
+      ? 'Unable to connect to AI Gateway. Check your key and connection.'
+      : error.message
   } finally {
     button.disabled = false
     keyInput.disabled = false

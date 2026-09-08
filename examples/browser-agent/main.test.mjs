@@ -25,7 +25,7 @@ async function page({ key = '', fail = false, stopReason = 'stop', duringFetch }
     fetch: async (url, init) => {
       calls.push({ url, init })
       duringFetch?.(elements)
-      if (fail) throw new Error('Invalid key')
+      if (fail) throw new Error(typeof fail === 'string' ? fail : 'Invalid key')
       return 'hello'
     },
   })
@@ -118,4 +118,10 @@ test('a refused request is not reported as a successful reply', async () => {
   const app = await page({ key: 'test-user-key', stopReason: 'refused' })
   await app.submit()
   assert.equal(app.elements['#status'].textContent, 'Request failed. See the reply for details.')
+})
+
+test('a browser transport failure explains what the visitor can try', async () => {
+  const app = await page({ key: 'test-user-key', fail: 'HostStreamFailed' })
+  await app.submit()
+  assert.equal(app.elements['#status'].textContent, 'Unable to connect to AI Gateway. Check your key and connection.')
 })
