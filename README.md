@@ -105,11 +105,11 @@ fx session resume last
 fx session resume --id <id>
 ```
 
-`fx -c` also resumes the latest session for the current workspace. It skips unrelated current-format conversation histories during selection and attempts safe recovery of the selected session after an interrupted migration. A busy or unrecoverable selected session produces an error rather than opening an older conversation.
+`fx -c` (or `fx --continue`) resumes the remembered session for the current workspace directly by ID. Selecting a saved session or saving the first work in a new interactive session remembers it; opening an empty window, later background activity, and quitting do not change that selection. If no session is remembered, choose one with `fx -r` or `fx --resume <id>`. `fx --resume last` still selects the latest workspace session by activity. A busy or unreadable target produces an error rather than opening another conversation. The session picker loads its catalog when opened.
 
-Repeated continuation reuses validated summaries of unchanged older sessions instead of replaying their histories during selection. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
+Latest-session selection with `fx --resume last` reuses validated summaries of unchanged older sessions instead of replaying their histories. The first scan, or a scan after those session files change, can take longer. Opening the resume picker preserves these cached summaries.
 
-Older sessions that saved Vercel connection settings can be opened through `-r`, `/resume`, `-c`, or an exact ID. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
+Older sessions that saved Vercel connection settings can be selected through `-r`, `/resume`, or an exact ID, then continued with `-c`. Migration preserves their model settings and keeps unfinished responses as interrupted history, without replaying old requests or restoring saved credential references.
 
 If a saved conversation is damaged, run `fx session recover <id>` to copy its validated prefix into a new session. Recovery preserves checkpoint boundaries and referenced result files, leaves the original unchanged, and prints the new session ID. Records after the damaged boundary are not included, and recovery does not rerun commands. If only accounting is corrupt, recovery keeps the conversation and marks historical usage as incomplete in the copy; the original accounting file remains unchanged. Healthy conversations can be resumed without recovery. Paused requests retain their captured images across errors and restarts. Continuing uses those saved images even if the original files move or change; missing or corrupted saved images produce a recovery error.
 
@@ -117,7 +117,7 @@ A saved session has one writer until it closes. Suspending it with Ctrl+Z keeps 
 
 Recovery only reports that no repair is needed after confirming the saved session can be loaded. If a final session save fails during interactive shutdown, fx reports the failure and exits with a nonzero status after cleanup, without a successful resume hint or automatic upgrade relaunch.
 
-New sessions appear in resume selection only after their initial files are ready. Incomplete creation folders left by older builds do not block healthy conversations from resuming with `-c`; those folders remain available for diagnosis and are not deleted.
+New sessions appear in discovery only after their initial files are ready. Incomplete creation folders left by older builds remain available for diagnosis and are not deleted. Remembered continuation does not scan these folders.
 
 Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
