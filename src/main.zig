@@ -4209,6 +4209,7 @@ test {
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("core/workspace/path_completion.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/github/git_context.zig");
