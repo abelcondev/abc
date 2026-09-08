@@ -13,7 +13,7 @@ pub const CodeFence = struct {
 /// allowing any leading spaces so fences inside list items are recognized.
 pub fn parseCodeFence(line: []const u8) ?CodeFence {
     var i: usize = 0;
-    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     const indent = i;
     if (i >= line.len) return null;
     const marker = line[i];
@@ -48,11 +48,11 @@ pub fn codeFenceLanguage(line: []const u8) []const u8 {
     return info[0..end];
 }
 
-/// Strips up to `indent` leading spaces so code inside an indented list item
-/// renders flush with the fence.
+/// Strips up to `indent` leading spaces or tabs so code inside an indented
+/// list item renders flush with the fence.
 pub fn stripFenceIndent(line: []const u8, indent: usize) []const u8 {
     var i: usize = 0;
-    while (i < line.len and i < indent and line[i] == ' ') : (i += 1) {}
+    while (i < line.len and i < indent and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     return line[i..];
 }
 

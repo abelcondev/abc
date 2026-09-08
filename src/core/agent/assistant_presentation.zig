@@ -352,7 +352,12 @@ pub const MarkdownProcessor = struct {
             self.active_blockquote = null;
         }
 
-        if (bp.hasIndentedCodePrefix(line) and (bp.parseUnorderedList(line) != null or bp.parseOrderedList(line) != null)) {
+        // An indented list marker continues a list, except that a plus sign in
+        // indented-code position stays code so diff-style lines are preserved.
+        const indented_list_item = bp.hasIndentedCodePrefix(line) and
+            (bp.parseUnorderedList(line) != null or bp.parseOrderedList(line) != null);
+        const plus_in_code_position = indented_list_item and self.previous_line_was_blank and tu.leftTrim(line)[0] == '+';
+        if (indented_list_item and !plus_in_code_position) {
             self.active_definition = false;
             try self.processLine(alloc, line, line_has_lf, out);
             try out.append(alloc, '\n');
@@ -457,8 +462,8 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.parseHeader(line)) |header| {
-            try block_render.writeHeading(alloc, header.level, tu.withoutTerminalHardBreakMarker(header.content, line_has_lf), out, &fs, &link_id_counter);
+        if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(line, line_has_lf))) |header| {
+            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, &link_id_counter);
             return;
         }
 
@@ -2309,6 +2314,56 @@ test "fenced code inside a list item drops the item indentation" {
             "\x1b[2m\xe2\x94\x82 \x1b[22mls -la\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22m  nested\n" ++
             "\x1b[2m\xe2\x80\xa2 \x1b[22mnext\n",
+        out.items,
+    );
+}
+
+test "tab indented fence inside a list item closes on a tab indented fence" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. item\n\t```\n\tcode\n\t```\n\tprose after\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1.\x1b[22m item\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mcode\n" ++
+            "\tprose after\n",
+        out.items,
+    );
+}
+
+test "indented plus line after a blank stays indented code" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "    + value\n    second\ntext\n- a\n    + nested\n", &out);
+    try processor.flush(alloc, &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m+ value\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22msecond\n" ++
+            "text\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22ma\n" ++
+            "    \x1b[2m\xe2\x80\xa2 \x1b[22mnested\n",
+        out.items,
+    );
+}
+
+test "heading keeps a backslash exposed by removing closing hashes" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## C:\\ ###\n## trailing\\\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mC:\\\x1b[22m\n" ++
+            "\x1b[1mtrailing\x1b[22m\n",
         out.items,
     );
 }

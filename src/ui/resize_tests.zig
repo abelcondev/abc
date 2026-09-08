@@ -1784,6 +1784,32 @@ test "streamed longer code fence keeps inner fences inside the block" {
     try expectGridNotContains(&h, "````");
 }
 
+test "streamed tab indented fence closes and releases the following prose" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "1. item\n\t```sh\n\tls\n\t```\n\tprose after\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const code_row = try findRowContaining(&h, "ls");
+    try expectRowPrefix(&h, code_row, "  │ ls");
+    const prose_row = try findRowContaining(&h, "prose after");
+    try std.testing.expect(prose_row > code_row);
+    const prose_cell = h.vt.cellAt(prose_row, 2) orelse return error.TestMissingCell;
+    try std.testing.expect(prose_cell.style.fg.eql(.default));
+    try expectGridNotContains(&h, "│ ```");
+    try expectGridNotContains(&h, "│ prose");
+}
+
 test "streamed plus and paren list markers wrap under their text" {
     var h = try Harness.init(std.testing.allocator, 20, 40, 4);
     defer h.deinit();
