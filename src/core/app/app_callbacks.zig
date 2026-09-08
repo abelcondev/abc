@@ -34,6 +34,7 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const ui_render = @import("../../ui/render.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -318,6 +319,11 @@ pub fn Bindings(comptime App: type) type {
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
                 .propagate_history_turn = agentPropagateHistoryTurn,
                 .commit_context_compaction = .{ .commit = agentCommitContextCompaction },
+                .compaction_activity = if (comptime @hasDecl(@TypeOf(app.worker), "beginCompactionActivity")) .{
+                    .begin = beginCompactionActivity,
+                    .running = runCompactionActivity,
+                    .settle = settleCompactionActivity,
+                } else null,
                 .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.writable != null)
                         .{
@@ -913,6 +919,21 @@ pub fn Bindings(comptime App: type) type {
         fn agentPropagateHistoryTurn(ctx: *anyopaque, turn: HistoryTurn) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).propagateHistoryTurn(app, turn, app.session.max_history_turns);
+        }
+
+        fn beginCompactionActivity(ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.worker.beginCompactionActivity(origin, turn_id);
+        }
+
+        fn runCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            app.worker.runCompactionActivity(id, stage);
+        }
+
+        fn settleCompactionActivity(ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            app.worker.settleCompactionActivity(id, feedback);
         }
 
         fn agentCommitContextCompaction(

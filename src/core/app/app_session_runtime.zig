@@ -1441,10 +1441,19 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn retireLiveSessionCompaction(app: *App) void {
+            // Called after the worker is idle, before installing the next session.
+            const observed = app.worker.compactionActivitySnapshot();
+            if (observed.operation) |op| {
+                _ = app.worker.dismissCompactionActivity(op.id, observed.revision);
+            }
+        }
+
         fn applyIdleLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) void {
+            retireLiveSessionCompaction(app);
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
 
@@ -4757,6 +4766,98 @@ const TestResumeTarget = union(enum) {
         self.* = .last;
     }
 };
+
+test "session transition retires queued and running compaction only after worker idle" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        worker: worker_runtime.WorkerRuntime = .{},
+        pacer: struct {
+            fn clear(_: *@This(), _: Allocator) void {}
+        } = .{},
+    };
+    for ([_]bool{ false, true }) |running| {
+        var app: App = .{};
+        defer app.worker.deinit(app.alloc);
+        try app.worker.enqueueContextCompaction(.{
+            .turn_id = 41,
+            .model = try app.alloc.dupe(u8, "provider/model"),
+            .api_key = try app.alloc.dupe(u8, "key"),
+            .history = try app.alloc.alloc(types.HistoryTurn, 0),
+        });
+        const work = if (running) (try app.worker.tryTakeNextWork(app.alloc)).? else null;
+        defer if (work) |item| worker_runtime.freeWorkItem(app.alloc, item);
+        const old = app.worker.compactionActivitySnapshot();
+        Runtime(App).beginLiveSessionCancellation(&app);
+        try std.testing.expect(app.worker.isCancelRequested());
+        if (running) {
+            try std.testing.expect(app.worker.isProcessing());
+            try std.testing.expect(app.worker.compactionActivitySnapshot().operation.?.phase == .stopping);
+            Runtime(App).retireLiveSessionCompaction(&app);
+            try std.testing.expect(!app.worker.compactionActivitySnapshot().operation.?.dismissed);
+            app.worker.finishProcessing();
+        }
+        app.worker.waitUntilIdle();
+        const terminal = app.worker.compactionActivitySnapshot();
+        try std.testing.expect(!terminal.operation.?.active());
+        try std.testing.expectEqual(@import("../output/compaction_activity.zig").Outcome.cancelled, terminal.operation.?.phase.terminal.outcome);
+        Runtime(App).retireLiveSessionCompaction(&app);
+        const retired = app.worker.compactionActivitySnapshot();
+        try std.testing.expectEqual(old.operation.?.id, retired.operation.?.id);
+        try std.testing.expect(retired.operation.?.dismissed);
+        try std.testing.expect(!retired.operation.?.visible(io_mod.milliTimestamp()));
+        try std.testing.expect(retired.revision > terminal.revision);
+        try std.testing.expect(app.worker.isCancelRequested());
+        Runtime(App).retireLiveSessionCompaction(&app);
+        try std.testing.expectEqualDeep(retired, app.worker.compactionActivitySnapshot());
+
+        try app.worker.enqueueContextCompaction(.{
+            .turn_id = 42,
+            .model = try app.alloc.dupe(u8, "provider/model"),
+            .api_key = try app.alloc.dupe(u8, "key"),
+            .history = try app.alloc.alloc(types.HistoryTurn, 0),
+        });
+        const next = app.worker.compactionActivitySnapshot();
+        try std.testing.expect(@intFromEnum(next.operation.?.id) > @intFromEnum(old.operation.?.id));
+        try std.testing.expect(next.revision > retired.revision);
+        app.worker.settleCompactionActivity(old.operation.?.id, .{ .outcome = .failed });
+        try std.testing.expect(!app.worker.dismissCompactionActivity(old.operation.?.id, terminal.revision));
+        try std.testing.expectEqualDeep(next, app.worker.compactionActivitySnapshot());
+        const next_work = (try app.worker.tryTakeNextWork(app.alloc)).?;
+        defer worker_runtime.freeWorkItem(app.alloc, next_work);
+        try std.testing.expect(!app.worker.isCancelRequested());
+        app.worker.finishProcessing();
+    }
+}
+
+test "session transition retirement preserves a newer compaction snapshot race" {
+    const compaction_activity = @import("../output/compaction_activity.zig");
+    const App = struct {
+        worker: struct {
+            runtime: worker_runtime.WorkerRuntime = .{},
+
+            pub fn compactionActivitySnapshot(self: *@This()) compaction_activity.Snapshot {
+                const observed = self.runtime.compactionActivitySnapshot();
+                const next = self.runtime.beginCompactionActivity(.manual, null);
+                self.runtime.settleCompactionActivity(next, .{ .outcome = .failed });
+                return observed;
+            }
+
+            pub fn dismissCompactionActivity(self: *@This(), id: compaction_activity.OperationId, revision: u64) bool {
+                return self.runtime.dismissCompactionActivity(id, revision);
+            }
+        } = .{},
+    };
+    var app: App = .{};
+    defer app.worker.runtime.deinit(std.testing.allocator);
+    const old = app.worker.runtime.beginCompactionActivity(.manual, null);
+    app.worker.runtime.settleCompactionActivity(old, .{ .outcome = .cancelled });
+    Runtime(App).retireLiveSessionCompaction(&app);
+    const current = app.worker.runtime.compactionActivitySnapshot();
+    try std.testing.expect(current.operation.?.id != old);
+    try std.testing.expect(!current.operation.?.dismissed);
+    try std.testing.expect(current.operation.?.visible(io_mod.milliTimestamp()));
+    try std.testing.expectEqual(compaction_activity.Outcome.failed, current.operation.?.phase.terminal.outcome);
+}
 
 const FakeWorker = struct {
     model: std.ArrayList(u8) = .empty,

@@ -1861,8 +1861,8 @@ pub fn Runtime(comptime App: type) type {
             else
                 true;
             const for_compaction = if (comptime @hasField(App, "submission")) app.submission.compaction_pending else false;
-            if (!first_observation and !for_compaction) return false;
-            const recovery = try credentialRecoveryText(app.alloc, failure, for_compaction);
+            if (for_compaction or !first_observation) return false;
+            const recovery = try credentialRecoveryText(app.alloc, failure);
             defer app.alloc.free(recovery);
             try app.writeDomainNotice(.{
                 .topic = "auth",
@@ -1876,20 +1876,8 @@ pub fn Runtime(comptime App: type) type {
         fn credentialRecoveryText(
             alloc: std.mem.Allocator,
             failure: auth_runtime.CredentialFailure,
-            for_compaction: bool,
         ) ![]u8 {
             const source_label = credentials.sourceLabel(failure.source);
-            if (for_compaction) {
-                const reason = if (auth_runtime.preparationError(failure)) |err|
-                    auth_runtime.preparationFailureNotice(err).?
-                else
-                    "Sign-in expired.";
-                return std.fmt.allocPrint(
-                    alloc,
-                    "{s}: {s} Your conversation is unchanged. Check /status and repair authentication with /provider, then run /compact again.",
-                    .{ source_label, reason },
-                );
-            }
             return switch (failure.reason) {
                 .invalid_credential => std.fmt.allocPrint(
                     alloc,
@@ -2617,6 +2605,7 @@ const TestUrlOpener = struct {
 
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
+    submission: @import("input_submit_runtime.zig").State = .{},
     selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
     input_runtime: @import("../input/runtime.zig").Runtime = .{},
@@ -3369,18 +3358,15 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.auth.picker_opened);
 }
 
-test "manual compaction credential failure guidance does not promise a saved prompt" {
-    const alloc = std.testing.allocator;
-    const failure = auth_runtime.classifyCredentialFailure(.fx_login, error.CredentialRefreshUnavailable);
-    const manual = try Runtime(TestApp).credentialRecoveryText(alloc, failure, true);
-    defer alloc.free(manual);
-    try std.testing.expect(std.mem.find(u8, manual, "Your conversation is unchanged.") != null);
-    try std.testing.expect(std.mem.find(u8, manual, "/compact again") != null);
-    try std.testing.expect(std.mem.find(u8, manual, "Your prompt is saved.") == null);
-    const prompt = try Runtime(TestApp).credentialRecoveryText(alloc, failure, false);
-    defer alloc.free(prompt);
-    try std.testing.expect(std.mem.find(u8, prompt, "Your prompt is saved.") != null);
-    try std.testing.expect(std.mem.find(u8, prompt, "/compact") == null);
+test "manual compaction credential failure leaves feedback to its lifecycle owner" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.submission.compaction_pending = true;
+    app.auth.active_source = .fx_login;
+    try std.testing.expect(!try Runtime(TestApp).recoverCredentialFailure(&app, .fx_login, error.CredentialRefreshUnavailable));
+    try std.testing.expect(app.auth.credential_failure != null);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
 test "prompt credential refresh falls back when its task cannot start" {

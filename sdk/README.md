@@ -329,6 +329,11 @@ The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
 `abort`. Terminal session, config, OAuth, prompt-history, URL, and workspace
 stores remain terminal-only host integrations.
 
+During `/compact` and automatic compaction, the terminal shows a live
+`Compacting` activity row with elapsed time. Input and cancellation remain
+responsive while the summary request is pending. Compaction progress and
+outcomes do not add transcript entries.
+
 ## Security
 
 Treat `nativeAddon` and `gatewayChatUrl` as trusted host

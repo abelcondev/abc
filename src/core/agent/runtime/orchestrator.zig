@@ -44,6 +44,7 @@ const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const runtime_context_compaction = @import("context_compaction.zig");
+const compaction_activity = @import("../../output/compaction_activity.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
@@ -4479,6 +4480,7 @@ pub fn processAgentPrompt(
     config: Config,
     job: QueuedPrompt,
 ) !void {
+    if (deps.compaction_failure) |out| out.* = null;
     var effective_job = job;
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
@@ -4504,7 +4506,10 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
-            finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
+            finalization.finish(.failed, null, null) catch |finalization_err| {
+                if (deps.compaction_failure) |out| out.* = null;
+                return finalization_err;
+            };
         }
         return err;
     };
@@ -4955,7 +4960,10 @@ fn processQueuedPromptInner(
                 stop_state.retained_candidate,
                 stop_state.latest_partial,
                 &stop_state.terminal_materializing,
-            ) catch |secondary_err| return secondary_err;
+            ) catch |secondary_err| {
+                if (deps.compaction_failure) |out| out.* = null;
+                return secondary_err;
+            };
         } else if (!stop_state.terminal_materializing and
             finalization.state == .open)
         {
@@ -4969,7 +4977,10 @@ fn processQueuedPromptInner(
                 &finish_trace,
                 &stop_state.terminal_materializing,
                 "error",
-            ) catch |secondary_err| return secondary_err;
+            ) catch |secondary_err| {
+                if (deps.compaction_failure) |out| out.* = null;
+                return secondary_err;
+            };
         }
         return err;
     };
@@ -5577,6 +5588,9 @@ test "manual compaction fixed context measures prepared skills and host instruct
 
 pub const ContextCompactionTransactionRequest = struct {
     trigger: runtime_prompt_context.CompactionTrigger,
+    operation_id: ?compaction_activity.OperationId = null,
+    activity_origin: ?compaction_activity.Origin = null,
+    failure_provenance: ?*?compaction_activity.ErrorProvenance = null,
     provider: model_provider.ProviderId,
     working_capabilities: model_capabilities.Capabilities,
     request_tokens: usize,
@@ -5615,6 +5629,19 @@ pub fn compactContextTransaction(
     deps: *const AgentRuntimeDeps,
     request: ContextCompactionTransactionRequest,
 ) !?ContextCompactionTransactionResult {
+    if (request.failure_provenance) |out| out.* = null;
+    const operation_id = if (deps.compaction_activity) |effect|
+        request.operation_id orelse effect.begin(deps.ctx, request.activity_origin orelse if (request.trigger == .manual) .manual else .automatic, request.trace_ctx.turn_id)
+    else
+        null;
+    var stage: compaction_activity.Stage = .preparation;
+    if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
+    errdefer |err| {
+        if (operation_id) |id| {
+            deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
+            if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = request.trace_ctx.turn_id, .err = err };
+        }
+    }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     var plan_input = runtime_prompt_context.CompactionPlanInput{
         .trigger = request.trigger,
@@ -5623,7 +5650,10 @@ pub fn compactContextTransaction(
         .source_tokens = request.source_tokens,
         .newest_exchange_tokens = request.newest_exchange_tokens,
     };
-    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) return null;
+    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) {
+        if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
+        return null;
+    }
     const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
     plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
     const plan = runtime_prompt_context.planCompaction(plan_input);
@@ -5651,18 +5681,14 @@ pub fn compactContextTransaction(
         request.uncertain_source_message_count,
     );
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (deps.push_interactive_notice) |push_notice| {
-        try push_notice(deps.ctx, .{
-            .topic = "context",
-            .tone = .neutral,
-            .body = "Compacting context…",
-        });
-    }
+    stage = .summary;
+    if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     var compacted = try runtime_context_compaction.compact(
         alloc,
         request.source_messages,
         .{
             .stream_provider = deps.agent_stream_provider,
+            .cooperative_transport_pulse = deps.cooperative_transport_pulse,
             .model = compaction_model,
             .api_key = request.api_key,
             .credential_source = request.credential_source,
@@ -5688,28 +5714,233 @@ pub fn compactContextTransaction(
         },
     );
     errdefer compacted.deinit(alloc);
+    stage = .validation;
+    if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
         return error.ContextCapacityExceeded;
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    stage = .publication;
+    if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     try commitContextCompaction(deps, .{
         .summary = compacted.handoff,
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
     }, request.active_prefix, request.retained_from);
-    if (deps.push_interactive_notice) |push_notice| {
-        push_notice(deps.ctx, .{
-            .topic = "context",
-            .tone = .neutral,
-            .body = "Context compacted.",
-        }) catch |err| debug_trace.logf("context_compaction", "completed notice unavailable err={s}", .{@errorName(err)});
-    }
+    // A successful acknowledgement wins even if cancellation arrived during publication.
+    if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{
+        .outcome = .succeeded,
+        .stage = .publication,
+        .publication = .committed,
+    });
     return .{
         .compacted = compacted,
         .accepted_tokens = accepted_tokens,
     };
+}
+
+test "compaction activity automatic error provenance excludes secondary finalization errors" {
+    const support = @import("tests/support.zig");
+    const Host = struct {
+        fake: support.FakeAgentRuntimeDeps,
+        activity: compaction_activity.State = .{},
+        fn from(raw: *anyopaque) *@This() {
+            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("fake", fake);
+        }
+        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+            return from(raw).activity.begin(origin, turn_id, 0);
+        }
+        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+            from(raw).activity.running(id, stage);
+        }
+        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+            from(raw).activity.settle(id, feedback, 1);
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |bound| {
+        for ([_]bool{ false, true }) |secondary_failure| {
+            var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
+            defer host.fake.deinit();
+            const model = "provider/compaction-provenance";
+            host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 45_000 } }};
+            if (secondary_failure) host.fake.finalization_error = error.ContextCapacityExceeded;
+            var gateway = support.FakeGateway.init(alloc, &.{.{ .content = "\"" ** 10_000 }});
+            defer gateway.deinit();
+            var fixture: support.PromptFixture = .{};
+            var job = fixture.job();
+            job.turn_id = 31;
+            job.model = @constCast(model);
+            var history = [_]HistoryTurn{.{ .assistant = .{
+                .user = .{ .text = @constCast("earlier request") },
+                .assistant = @constCast("history " ** 19_000),
+            } }};
+            job.history = &history;
+            var deps = host.fake.deps();
+            deps.agent_stream_provider = gateway.provider();
+            if (bound) deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+            var provenance: ?compaction_activity.ErrorProvenance = null;
+            deps.compaction_failure = &provenance;
+            var agent: runtime_agent.Agent = .{};
+            defer agent.deinit(alloc);
+            try agent.restoreHistory(alloc, job.history);
+            try std.testing.expectError(error.ContextCapacityExceeded, processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job));
+            try std.testing.expectEqual(@as(usize, 1), gateway.index);
+            if (bound) {
+                const op = host.activity.snapshot.operation.?;
+                try std.testing.expectEqual(compaction_activity.Origin.automatic, op.origin);
+                try std.testing.expectEqual(error.ContextCapacityExceeded, op.phase.terminal.err.?);
+                if (!secondary_failure) {
+                    try std.testing.expectEqual(op.id, provenance.?.operation_id);
+                    try std.testing.expectEqual(@as(?u64, 31), provenance.?.turn_id);
+                }
+            }
+            if (!bound or secondary_failure) try std.testing.expect(provenance == null);
+        }
+    }
+}
+
+test "compaction activity transaction settles only after publication and preserves failures" {
+    const support = @import("tests/support.zig");
+    const Host = struct {
+        fake: support.FakeAgentRuntimeDeps,
+        worker: worker_runtime.WorkerRuntime = .{},
+        cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        commit_error: ?anyerror = null,
+        provider_error: ?anyerror = null,
+        cancel_at_commit: bool = false,
+        provider_returned: bool = false,
+        acknowledged: bool = false,
+
+        fn from(raw: *anyopaque) *@This() {
+            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("fake", fake);
+        }
+        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+            return from(raw).worker.beginCompactionActivity(origin, turn_id);
+        }
+        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+            from(raw).worker.runCompactionActivity(id, stage);
+        }
+        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+            const self = from(raw);
+            if (feedback.outcome == .succeeded) std.debug.assert(self.acknowledged);
+            self.worker.settleCompactionActivity(id, feedback);
+        }
+        fn commit(raw: *anyopaque, _: types.CompactedSummaryHistoryTurn, _: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
+            const self = from(raw);
+            try std.testing.expect(self.provider_returned);
+            try std.testing.expectEqual(compaction_activity.Stage.publication, self.worker.compactionActivitySnapshot().operation.?.phase.running);
+            if (self.cancel_at_commit) self.cancel.store(true, .seq_cst);
+            if (self.commit_error) |err| return err;
+            self.acknowledged = true;
+        }
+        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
+            if (self.provider_error) |err| return err;
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            self.provider_returned = true;
+            return .{ .completed = .{ .completion = .{ .content = "The user requested the recorded change.", .finish_reason = .stop } } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (0..7) |case| {
+        var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
+        defer host.fake.deinit();
+        defer host.worker.deinit(alloc);
+        switch (case) {
+            0 => {},
+            1 => host.cancel_at_commit = true,
+            2 => host.commit_error = error.SessionPersistenceUncertain,
+            3 => {
+                host.commit_error = error.Aborted;
+                host.cancel_at_commit = true;
+            },
+            4 => host.commit_error = error.TestPersistenceFailure,
+            5 => host.provider_error = error.Timeout,
+            6 => host.cancel.store(true, .seq_cst),
+            else => unreachable,
+        }
+        var deps = host.fake.deps();
+        var gateway = support.FakeGateway.init(alloc, &.{});
+        defer gateway.deinit();
+        deps.agent_stream_provider = gateway.provider();
+        deps.agent_stream_provider.context = &host;
+        deps.agent_stream_provider.stream_fn = Host.stream;
+        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+        deps.commit_context_compaction = .{ .commit = Host.commit };
+        deps.push_interactive_notice = null;
+        var source = [_]ChatMessage{.{ .role = .user, .content = "recorded source " ** 100 }};
+        var provenance: ?compaction_activity.ErrorProvenance = null;
+        const request: ContextCompactionTransactionRequest = .{
+            .trigger = .manual,
+            .activity_origin = .manual,
+            .provider = .gateway,
+            .working_capabilities = .{ .context_window = 100_000, .max_output_tokens = 4096 },
+            .request_tokens = 10_000,
+            .source_tokens = 10_000,
+            .continuation = .{
+                .request = .{ .model = "fixture/model", .messages = &.{.{ .role = .user, .content = "" }}, .tool_choice = .none, .provider_options = .{} },
+                .handoff_message_index = 0,
+            },
+            .source_messages = &source,
+            .result_storage = .unavailable,
+            .api_key = "fixture-key",
+            .credential_source = .ai_gateway_api_key,
+            .retry_count = 1,
+            .cancel_flag = &host.cancel,
+            .trace_ctx = .{ .turn_id = 19 },
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+            .failure_provenance = &provenance,
+        };
+        const result = compactContextTransaction(alloc, &deps, request);
+        if (case < 2) {
+            var transaction = (try result).?;
+            defer transaction.deinit(alloc);
+            try std.testing.expect(provenance == null);
+            try std.testing.expectEqual(compaction_activity.Publication.committed, host.worker.compactionActivitySnapshot().operation.?.phase.terminal.publication);
+        } else {
+            const expected: anyerror = switch (case) {
+                2 => error.SessionPersistenceUncertain,
+                3 => error.Aborted,
+                4 => error.TestPersistenceFailure,
+                5 => error.Timeout,
+                6 => error.Cancelled,
+                else => unreachable,
+            };
+            try std.testing.expectError(expected, result);
+            const op = host.worker.compactionActivitySnapshot().operation.?;
+            try std.testing.expectEqual(op.id, provenance.?.operation_id);
+            try std.testing.expectEqual(@as(?u64, 19), provenance.?.turn_id);
+            try std.testing.expectEqual(expected, provenance.?.err);
+            try std.testing.expectEqual(expected, op.phase.terminal.err.?);
+            try std.testing.expectEqual(if (case == 3 or case == 6) compaction_activity.Outcome.cancelled else .failed, op.phase.terminal.outcome);
+            if (case == 2) try std.testing.expectEqual(compaction_activity.Publication.uncertain, op.phase.terminal.publication);
+        }
+        const terminal = host.worker.compactionActivitySnapshot();
+        host.worker.finishProcessing();
+        try std.testing.expectEqualDeep(terminal, host.worker.compactionActivitySnapshot());
+
+        host.cancel.store(false, .seq_cst);
+        var no_op = request;
+        no_op.source_tokens = 0;
+        try std.testing.expect((try compactContextTransaction(alloc, &deps, no_op)) == null);
+        try std.testing.expect(provenance == null);
+        try std.testing.expectEqual(compaction_activity.Outcome.no_op, host.worker.compactionActivitySnapshot().operation.?.phase.terminal.outcome);
+
+        // Unbound callers keep the same original cancellation result and no presentation output.
+        deps.compaction_activity = null;
+        provenance = null;
+        host.cancel.store(true, .seq_cst);
+        try std.testing.expectError(error.Cancelled, compactContextTransaction(alloc, &deps, request));
+        try std.testing.expect(provenance == null);
+    }
 }
 
 fn processQueuedPromptLoop(
@@ -6469,8 +6700,11 @@ fn processQueuedPromptLoop(
                             const next_compaction_history_tail = window.retained_messages;
                             const next_compaction_count = compaction_count + 1;
                             const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
+                            var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                             const transaction_result = compactContextTransaction(arena, deps, .{
                                 .trigger = compaction_trigger,
+                                .activity_origin = if (context_overflow_recovery == .pending) .provider_overflow else .automatic,
+                                .failure_provenance = &compaction_failure,
                                 .provider = job.provider,
                                 .working_capabilities = request_capabilities,
                                 .request_tokens = request_cost.estimated_input_tokens,
@@ -6511,6 +6745,7 @@ fn processQueuedPromptLoop(
                                     finish_trace.finish("interrupted");
                                     return;
                                 }
+                                if (deps.compaction_failure) |out| out.* = compaction_failure;
                                 return err;
                             };
                             const transaction = transaction_result orelse

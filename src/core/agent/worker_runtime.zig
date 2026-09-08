@@ -18,6 +18,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
@@ -123,6 +124,7 @@ pub const QueuedPrompt = struct {
 
 pub const ContextCompactionTask = struct {
     turn_id: u64 = 0,
+    operation_id: ?compaction_activity.OperationId = null,
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     api_key: []u8,
@@ -559,6 +561,76 @@ pub const WorkerRuntime = struct {
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
 
+    /// Presentation metadata only; all access is protected by worker_mutex.
+    compaction_presentation: compaction_activity.State = .{},
+
+    pub fn beginCompactionActivity(self: *WorkerRuntime, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.compaction_presentation.begin(origin, turn_id, io_mod.milliTimestamp());
+    }
+
+    /// A rejected intent must not hide an already-running compaction.
+    pub fn rejectCompactionActivity(self: *WorkerRuntime, outcome: compaction_activity.Outcome) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.compaction_presentation.snapshot.operation) |op| if (op.active()) return;
+        const now = io_mod.milliTimestamp();
+        const id = self.compaction_presentation.begin(.manual, null, now);
+        self.compaction_presentation.settle(id, .{ .outcome = outcome }, now);
+    }
+
+    pub fn runCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.running(id, stage);
+    }
+
+    pub fn settleCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.compaction_presentation.settle(id, feedback, io_mod.milliTimestamp());
+    }
+
+    /// Cheap by-value read; does not clone permissions or allocate.
+    pub fn compactionActivitySnapshot(self: *WorkerRuntime) compaction_activity.Snapshot {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.compaction_presentation.snapshot;
+    }
+
+    pub fn dismissCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, revision: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.compaction_presentation.dismiss(id, revision);
+    }
+
+    pub fn expireCompactionActivity(self: *WorkerRuntime, id: compaction_activity.OperationId, revision: u64, now_ms: i64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.compaction_presentation.expire(id, revision, now_ms);
+    }
+
+    fn stopCompactionActivityLocked(self: *WorkerRuntime) void {
+        const op = self.compaction_presentation.snapshot.operation orelse return;
+        if (op.turn_id != self.active_turn_id or !self.worker_processing) return;
+        self.compaction_presentation.stopping(op.id);
+    }
+
+    fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
+        const op = self.compaction_presentation.snapshot.operation orelse return;
+        if (op.turn_id != turn_id or !op.active()) return;
+        debug_trace.logf("context_compaction", "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        var feedback = compaction_activity.failure(
+            if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
+            op.stage(),
+            self.isCancelRequested(),
+        );
+        // No transaction acknowledgement survived this fallback; do not promise rollback.
+        if (op.stage() == .publication) feedback.publication = .uncertain;
+        self.compaction_presentation.settle(op.id, feedback, io_mod.milliTimestamp());
+    }
+
     fn queuedWorkCountLocked(self: *const WorkerRuntime) usize {
         return self.queued_prompts.items.len +
             @intFromBool(self.queued_context_compaction != null);
@@ -591,6 +663,10 @@ pub const WorkerRuntime = struct {
     pub fn requestStop(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         self.worker_stop_requested = true;
+        if (self.queued_context_compaction) |task| {
+            if (task.operation_id) |id| self.compaction_presentation.settle(id, .{ .outcome = .cancelled }, io_mod.milliTimestamp());
+        }
+        self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
     }
@@ -620,6 +696,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -643,6 +720,7 @@ pub const WorkerRuntime = struct {
         });
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -652,6 +730,7 @@ pub const WorkerRuntime = struct {
 
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.stopCompactionActivityLocked();
         _ = self.resolvePendingPermissionLocked(
             permission_request.OwnedPermissionResponse.init(
                 std.heap.c_allocator,
@@ -776,6 +855,7 @@ pub const WorkerRuntime = struct {
         self.worker_stop_requested = true;
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
+        self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -829,6 +909,8 @@ pub const WorkerRuntime = struct {
         {
             return error.WorkerBusy;
         }
+        if (queued.operation_id == null) queued.operation_id = self.compaction_presentation.begin(.manual, queued.turn_id, io_mod.milliTimestamp());
+        self.compaction_presentation.queued(queued.operation_id.?, queued.turn_id, io_mod.milliTimestamp());
         self.queued_context_compaction = queued;
         debug_trace.eventf(
             "worker",
@@ -855,6 +937,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
+            if (task.operation_id) |id| self.compaction_presentation.settle(id, .{ .outcome = .cancelled }, io_mod.milliTimestamp());
             self.worker_cond.broadcast(io_mod.getIo());
             self.worker_mutex.unlock(io_mod.getIo());
             freeContextCompactionTask(alloc, task);
@@ -869,6 +952,7 @@ pub const WorkerRuntime = struct {
         }
         if (self.active_context_compaction) {
             self.worker_cancel_requested.store(true, .seq_cst);
+            self.stopCompactionActivityLocked();
             self.worker_cond.broadcast(io_mod.getIo());
             self.worker_mutex.unlock(io_mod.getIo());
             debug_trace.eventf(
@@ -1174,6 +1258,7 @@ pub const WorkerRuntime = struct {
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
             self.active_context_compaction = true;
+            if (task.operation_id) |id| self.compaction_presentation.running(id, .preparation);
             debug_trace.eventf(
                 "worker",
                 "context_compaction_begin",
@@ -1267,6 +1352,7 @@ pub const WorkerRuntime = struct {
         // Close steering admission without moving entries, preserving the exact
         // order in which steering and ordinary prompts were submitted.
         const finished_turn_id = self.active_turn_id;
+        self.finishCompactionActivityLocked(finished_turn_id);
         for (self.queued_prompts.items) |*prompt| {
             if (prompt.delivery.activeTurnId() == finished_turn_id) {
                 prompt.delivery = .continuation;
@@ -1545,6 +1631,7 @@ pub const WorkerRuntime = struct {
         types.freeHistoryTurnSlice(alloc, self.queued_history);
         self.queued_history = &.{};
         if (self.queued_context_compaction) |task| {
+            if (task.operation_id) |id| self.compaction_presentation.settle(id, .{ .outcome = .cancelled }, io_mod.milliTimestamp());
             freeContextCompactionTask(alloc, task);
             self.queued_context_compaction = null;
         }
@@ -2737,6 +2824,34 @@ test "session and checkpoint transfer preserve active and finished prompt snapsh
     }
 }
 
+test "compaction activity survives worker finish without allocating a permission snapshot" {
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    try std.testing.expect(runtime.beginDirectProcessing(17));
+    const first = runtime.beginCompactionActivity(.automatic, 17);
+    runtime.runCompactionActivity(first, .publication);
+    runtime.requestInteractiveCancel();
+    try std.testing.expect(runtime.compactionActivitySnapshot().operation.?.phase == .stopping);
+    runtime.settleCompactionActivity(first, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed });
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+    const terminal = runtime.compactionActivitySnapshot();
+    try std.testing.expectEqual(first, terminal.operation.?.id);
+    try std.testing.expectEqual(compaction_activity.Outcome.succeeded, terminal.operation.?.phase.terminal.outcome);
+    runtime.settleCompactionActivity(first, .{ .outcome = .cancelled });
+    try std.testing.expectEqualDeep(terminal, runtime.compactionActivitySnapshot());
+
+    const next = runtime.beginCompactionActivity(.manual, null);
+    const started = runtime.compactionActivitySnapshot();
+    runtime.rejectCompactionActivity(.busy);
+    try std.testing.expectEqualDeep(started, runtime.compactionActivitySnapshot());
+    try std.testing.expect(!runtime.dismissCompactionActivity(first, terminal.revision));
+    runtime.settleCompactionActivity(first, compaction_activity.failure(error.Aborted, .publication, true));
+    try std.testing.expectEqual(next, runtime.compactionActivitySnapshot().operation.?.id);
+    runtime.settleCompactionActivity(next, compaction_activity.failure(error.OutOfMemory, .preparation, false));
+    try std.testing.expectEqual(error.OutOfMemory, runtime.compactionActivitySnapshot().operation.?.phase.terminal.err.?);
+}
+
 test "manual compaction is a typed worker item and not a prompt" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -2753,6 +2868,52 @@ test "manual compaction is a typed worker item and not a prompt" {
         return error.TestExpectedQueuedWork;
     defer freeWorkItem(alloc, taken);
     try std.testing.expect(taken == .compact_context);
+    const snapshot = runtime.compactionActivitySnapshot();
+    try std.testing.expectEqual(taken.compact_context.operation_id.?, snapshot.operation.?.id);
+    try std.testing.expectEqual(taken.compact_context.turn_id, snapshot.operation.?.turn_id.?);
+    try std.testing.expect(snapshot.operation.?.phase == .running);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(error.CompactionInterrupted, runtime.compactionActivitySnapshot().operation.?.phase.terminal.err.?);
+}
+
+test "session transition queue clearing settles only the dropped compaction identity" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |retain_snapshots| {
+        for ([_]bool{ false, true }) |newer_activity| {
+            var runtime: WorkerRuntime = .{};
+            defer runtime.deinit(alloc);
+            try runtime.enqueueContextCompaction(.{
+                .turn_id = 41,
+                .model = try alloc.dupe(u8, "provider/model"),
+                .api_key = try alloc.dupe(u8, "key"),
+                .history = try alloc.alloc(types.HistoryTurn, 0),
+            });
+            const queued = runtime.compactionActivitySnapshot();
+            if (newer_activity) _ = runtime.beginCompactionActivity(.manual, null);
+            const observed = runtime.compactionActivitySnapshot();
+
+            if (retain_snapshots) {
+                runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &.{});
+            } else {
+                runtime.clearQueuedPrompts(alloc, &.{});
+            }
+            try std.testing.expectEqual(ContextCompactionStatus.idle, runtime.contextCompactionStatus());
+            try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+            try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+            try std.testing.expect(!runtime.isCancelRequested());
+            const settled = runtime.compactionActivitySnapshot();
+            if (newer_activity) {
+                try std.testing.expectEqualDeep(observed, settled);
+            } else {
+                try std.testing.expectEqual(queued.operation.?.id, settled.operation.?.id);
+                try std.testing.expectEqual(compaction_activity.Outcome.cancelled, settled.operation.?.phase.terminal.outcome);
+                try std.testing.expect(!settled.operation.?.active());
+                try std.testing.expect(settled.revision > queued.revision);
+            }
+            runtime.clearQueuedPrompts(alloc, &.{});
+            try std.testing.expectEqualDeep(settled, runtime.compactionActivitySnapshot());
+        }
+    }
 }
 
 test "queued manual compaction can be cancelled before worker execution" {
@@ -2772,6 +2933,7 @@ test "queued manual compaction can be cancelled before worker execution" {
     try std.testing.expectEqual(ContextCompactionStatus.idle, runtime.contextCompactionStatus());
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    try std.testing.expectEqual(compaction_activity.Outcome.cancelled, runtime.compactionActivitySnapshot().operation.?.phase.terminal.outcome);
 }
 
 test "running manual compaction cancellation uses the worker cancel flag" {
@@ -2792,7 +2954,10 @@ test "running manual compaction cancellation uses the worker cancel flag" {
     try std.testing.expectEqual(ContextCompactionStatus.running, runtime.contextCompactionStatus());
     try std.testing.expect(runtime.cancelContextCompaction(alloc));
     try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(runtime.compactionActivitySnapshot().operation.?.phase == .stopping);
     runtime.finishProcessing();
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+    try std.testing.expectEqual(compaction_activity.Outcome.cancelled, runtime.compactionActivitySnapshot().operation.?.phase.terminal.outcome);
     try std.testing.expectEqual(ContextCompactionStatus.idle, runtime.contextCompactionStatus());
 }
 
