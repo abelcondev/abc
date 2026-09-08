@@ -169,6 +169,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
+For runnable Node.js, browser, Next.js, and Nuxt applications, see the [libfx examples](examples/README.md).
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
