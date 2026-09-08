@@ -5,7 +5,12 @@ import { pipeline } from 'node:stream/promises'
 import { POST } from './handler.mjs'
 
 const html = await readFile(new URL('./index.html', import.meta.url))
+const replyReader = await readFile(new URL('../shared/read-reply.mjs', import.meta.url))
 createServer(async (incoming, outgoing) => {
+  if (incoming.method === 'GET' && incoming.url === '/read-reply.mjs') {
+    outgoing.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' }).end(replyReader)
+    return
+  }
   if (incoming.method === 'GET' && incoming.url === '/') {
     outgoing.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(html)
     return

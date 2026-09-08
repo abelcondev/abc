@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { readReply } from '../../shared/read-reply.mjs'
 
 export default function Page() {
   const [reply, setReply] = useState('')
@@ -19,7 +20,7 @@ export default function Page() {
         body: JSON.stringify({ prompt }),
       })
       if (!response.ok) throw new Error(response.status === 429 ? 'Request limit reached. Try again later.' : await response.text())
-      for await (const text of response.body.pipeThrough(new TextDecoderStream())) setReply((previous) => previous + text)
+      for await (const text of readReply(response)) setReply((previous) => previous + text)
       setStatus('Reply complete.')
     } catch (error) {
       setStatus(error.message)

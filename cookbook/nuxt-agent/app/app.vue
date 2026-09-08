@@ -1,4 +1,6 @@
 <script setup>
+import { readReply } from '../../shared/read-reply.mjs'
+
 const prompt = ref('Explain Vue reactivity in two sentences.')
 const reply = ref('')
 const status = ref('')
@@ -15,7 +17,7 @@ async function send() {
       body: JSON.stringify({ prompt: prompt.value }),
     })
     if (!response.ok) throw new Error(response.status === 429 ? 'Request limit reached. Try again later.' : await response.text())
-    for await (const text of response.body.pipeThrough(new TextDecoderStream())) reply.value += text
+    for await (const text of readReply(response)) reply.value += text
     status.value = 'Reply complete.'
   } catch (error) {
     status.value = error.message

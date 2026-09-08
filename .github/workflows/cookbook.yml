@@ -32,6 +32,6 @@ jobs:
           cache-dependency-path: cookbook/${{ matrix.example }}/package-lock.json
       - run: npm ci
       - if: matrix.example == 'node-chat'
-        run: node --test ../shared/gateway.test.mjs
+        run: node --test ../shared/*.test.mjs
       - if: matrix.example != 'node-chat'
         run: npm run build

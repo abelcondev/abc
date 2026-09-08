@@ -63,7 +63,7 @@ and usage policy when adapting the examples.
 From the repository root:
 
 ```sh
-node --test cookbook/shared/gateway.test.mjs
+node --test cookbook/shared/*.test.mjs
 ```
 
 Build the browser, Next.js, and Nuxt examples with `npm run build` in their
