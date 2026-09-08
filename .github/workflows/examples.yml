@@ -33,5 +33,7 @@ jobs:
       - run: npm ci
       - if: matrix.example == 'node-chat'
         run: node --test ../shared/*.test.mjs
+      - if: matrix.example == 'browser-agent'
+        run: node --experimental-vm-modules --test main.test.mjs
       - if: matrix.example != 'node-chat'
         run: npm run build

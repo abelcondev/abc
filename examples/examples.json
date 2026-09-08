@@ -11,9 +11,9 @@
   {
     "id": "browser-agent",
     "title": "Browser agent",
-    "prompt": "Build a browser agent with libfx running through WebAssembly. Use a plain HTML form without CSS, keep the conversation in the browser, and route model requests through a server that holds the API key. Use the files below as a starting point.",
+    "prompt": "Build a browser agent with libfx and WebAssembly using plain HTML without CSS. Use the free-token proxy by default. Let visitors enter an AI Gateway API key to connect directly, without sending their key to the proxy or saving it. Start a new conversation when the key changes. Use the files below as a starting point.",
     "entry": "main.js",
-    "command": "npx vercel dev",
+    "command": "npm run dev",
     "files": ["package.json", "index.html", "main.js", "api/gateway.js"],
     "demo": "https://fx-demo-browser-agent.vercel.app"
   },

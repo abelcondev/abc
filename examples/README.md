@@ -21,7 +21,7 @@ cd fx/examples/node-chat
 npm install
 ```
 
-Create `.env.local` in that directory:
+For the server-backed examples, create `.env.local` in that directory:
 
 ```sh
 AI_GATEWAY_API_KEY=your-key
@@ -32,9 +32,14 @@ Run `npm run dev` for its browser demo, Next.js, or Nuxt. Those web handlers sta
 a new agent per request; the readline and browser WebAssembly examples keep one
 conversation open.
 
-For the browser example, run `npx vercel dev` from `browser-agent/`. This runs Vite
-and the local `/api/gateway` function together. `npm run dev` by itself serves only
-the frontend. WebAssembly needs a browser with [JSPI support](https://fx.sh/docs/lib/webassembly#check-runtime-support).
+For the browser example, run `npm run dev` from `browser-agent/` and enter your
+AI Gateway API key in the page. Requests go directly to AI Gateway; no server key
+is needed. The key stays in memory, and changing it starts a new conversation.
+
+The hosted browser demo works without a key through a proxy with some free tokens.
+Entering a key bypasses that proxy and uses your Gateway balance. To run the proxy
+locally, set `AI_GATEWAY_API_KEY` in `.env.local` and run `npx vercel dev` instead.
+WebAssembly needs a browser with [JSPI support](https://fx.sh/docs/lib/webassembly#check-runtime-support).
 
 Keep the sibling `shared/` directory when copying a web example. It contains the
 public-demo model and transport policy, not another agent framework.
@@ -45,9 +50,10 @@ Create a Vercel project for each example, with its directory as the project root
 Enable **Include source files outside of the Root Directory in the Build Step**
 so the project can load `examples/shared/`. Use Node.js 24.
 
-Set `AI_GATEWAY_API_KEY` as a server-only environment variable. Use a dedicated
-Gateway key with a daily budget. Never place a provider credential in a browser
-bundle or a `NEXT_PUBLIC_` variable.
+Set the shared demo key as a server-only `AI_GATEWAY_API_KEY` environment variable.
+Use a dedicated Gateway key with a daily budget. Do not build that shared key into
+the browser bundle. The browser example accepts each visitor’s own key at runtime
+for direct requests; it does not save or send that key to the proxy.
 
 Before making the demo public, configure a Vercel Firewall rule that rate-limits
 `POST /api/*` by IP. The hosted examples use 10 requests per minute per project.
@@ -64,6 +70,7 @@ From the repository root:
 
 ```sh
 node --test examples/shared/*.test.mjs
+node --experimental-vm-modules --test examples/browser-agent/main.test.mjs
 ```
 
 Build the browser, Next.js, and Nuxt examples with `npm run build` in their
