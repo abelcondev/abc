@@ -96,7 +96,7 @@ async function runScenario(name) {
   const { Terminal } = xtermHeadless;
   const wasm = await readFile(wasmPath);
   const head = "HOST_HISTORY_HEAD_73b4", tail = "HOST_HISTORY_TAIL_b149";
-  const handoff = `HOST_INTERNAL_HANDOFF_268a: preserve ${head}; follow the latest request.`;
+  let handoff;
   // Several ordinary exchanges leave older history outside the retained suffix,
   // without pushing a cancelled attempt's followup over the automatic threshold.
   const seedTurns = 3;
@@ -129,12 +129,16 @@ async function runScenario(name) {
   };
   const fetch = async (_url, init = {}) => {
     if ((init.method ?? "GET") === "GET") {
-      return Response.json({ data: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+      return Response.json({ data: [{ id: "fixture/test-model", type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
     }
     const body = JSON.parse(typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body));
     requests.push(body);
     if (body.toolChoice?.type === "none" && body.tools?.length === 0) {
       summaries++;
+      // Retained windows vary by model; summarize only markers actually supplied.
+      const source = JSON.stringify(body);
+      const markers = [head, tail].filter((marker) => source.includes(marker));
+      handoff = `HOST_INTERNAL_HANDOFF_268a: preserve ${markers.join(" and ")}; follow the latest request.`;
       if (summaries === 1) {
         hold = heldSummary(init.signal);
         return hold.response;
@@ -169,11 +173,11 @@ async function runScenario(name) {
         write(bytes) { state.writes++; adapter.write(bytes); },
       },
       env: {
-        AI_GATEWAY_API_KEY: "synthetic-host-compaction-key", FX_MODEL: "openai/gpt-5",
+        AI_GATEWAY_API_KEY: "synthetic-host-compaction-key", FX_MODEL: "fixture/test-model",
         FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1",
       },
       fetch, sessionStore,
-      configStore: { get(id) { return id === "model" ? "openai/gpt-5" : null; }, set() {} },
+      configStore: { get(id) { return id === "model" ? "fixture/test-model" : null; }, set() {} },
       stderr(bytes) { state.stderr += new TextDecoder().decode(bytes); },
       onEvent(event) { state.events.push(event); },
     });
@@ -263,7 +267,11 @@ async function runScenario(name) {
     assert.equal(ordinary, seedTurns + 1);
     assert.equal(summaries, 1, "followup must not trigger automatic compaction");
     const followup = JSON.stringify(requests.at(-1));
-    assert(followup.includes(head) && followup.includes(tail));
+    assert(followup.includes(head) && followup.includes(tail), JSON.stringify(requests.map((request) => ({
+      summary: request.toolChoice?.type === "none" && request.tools?.length === 0,
+      head: JSON.stringify(request).includes(head), tail: JSON.stringify(request).includes(tail),
+      handoff: JSON.stringify(request).includes("HOST_INTERNAL_HANDOFF_268a"),
+    }))));
     assert.equal(followup.includes("HOST_INTERNAL_HANDOFF_268a"), name === "success");
     await silentTranscript();
     await stop();
