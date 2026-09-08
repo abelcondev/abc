@@ -7,7 +7,7 @@ const status = ref('')
 const busy = ref(false)
 const ready = ref(false)
 onMounted(() => { ready.value = true })
-useHead({ title: 'Nuxt agent · fx cookbook', htmlAttrs: { lang: 'en' } })
+useHead({ title: 'Nuxt agent · fx examples', htmlAttrs: { lang: 'en' } })
 
 async function send() {
   busy.value = true

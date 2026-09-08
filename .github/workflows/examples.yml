@@ -1,15 +1,15 @@
-name: Cookbook
+name: Examples
 
 on:
   pull_request:
     paths:
-      - 'cookbook/**'
-      - '.github/workflows/cookbook.yml'
+      - 'examples/**'
+      - '.github/workflows/examples.yml'
   push:
     branches: [main]
     paths:
-      - 'cookbook/**'
-      - '.github/workflows/cookbook.yml'
+      - 'examples/**'
+      - '.github/workflows/examples.yml'
 
 permissions:
   contents: read
@@ -22,14 +22,14 @@ jobs:
         example: [node-chat, browser-agent, nextjs-agent, nuxt-agent]
     defaults:
       run:
-        working-directory: cookbook/${{ matrix.example }}
+        working-directory: examples/${{ matrix.example }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: cookbook/${{ matrix.example }}/package-lock.json
+          cache-dependency-path: examples/${{ matrix.example }}/package-lock.json
       - run: npm ci
       - if: matrix.example == 'node-chat'
         run: node --test ../shared/*.test.mjs

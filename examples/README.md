@@ -1,4 +1,4 @@
-# libfx cookbook
+# libfx examples
 
 Small applications built with [libfx](https://fx.sh/docs/lib). Each example keeps
 the agent calls in its entry point. Start with the one that matches your runtime.
@@ -17,7 +17,7 @@ Clone this repository, then open the example directory:
 
 ```sh
 git clone https://github.com/vercel-labs/fx.git
-cd fx/cookbook/node-chat
+cd fx/examples/node-chat
 npm install
 ```
 
@@ -43,7 +43,7 @@ public-demo model and transport policy, not another agent framework.
 
 Create a Vercel project for each example, with its directory as the project root.
 Enable **Include source files outside of the Root Directory in the Build Step**
-so the project can load `cookbook/shared/`. Use Node.js 24.
+so the project can load `examples/shared/`. Use Node.js 24.
 
 Set `AI_GATEWAY_API_KEY` as a server-only environment variable. Use a dedicated
 Gateway key with a daily budget. Never place a provider credential in a browser
@@ -63,7 +63,7 @@ and usage policy when adapting the examples.
 From the repository root:
 
 ```sh
-node --test cookbook/shared/*.test.mjs
+node --test examples/shared/*.test.mjs
 ```
 
 Build the browser, Next.js, and Nuxt examples with `npm run build` in their
