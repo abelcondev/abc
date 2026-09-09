@@ -408,6 +408,7 @@ const max_static_status_activity_rows: u16 = 3;
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
     // Pacer emitting visible text, including the post-finish tail drain.
@@ -699,7 +700,8 @@ pub fn frameOwnedActivityProjection(
     approval: ?approval_prompt.Projection,
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
-    if (!ctx.stream.active and ctx.pending_prompt_activity) {
+    const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.stream, ctx.now_ms);
+    if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
         return .{ .turn_thinking = .{ .label = "• Thinking" } };
     }
     switch (ctx.activity) {
@@ -709,7 +711,17 @@ pub fn frameOwnedActivityProjection(
         },
         .none => {},
     }
+    if (compaction != .none) return compaction;
     return turnActivityProjection(buf, shell, ctx);
+}
+
+pub fn frameActivityBlink(ctx: RenderContext) ?bool {
+    if (ctx.compaction.operation) |op| {
+        if (op.active() and op.visible(ctx.now_ms)) {
+            return activity_status.activityBlinkVisible(activity_status.compactionClock(ctx.stream, op), ctx.now_ms);
+        }
+    }
+    return activity_status.activityBlinkVisible(ctx.stream, ctx.now_ms);
 }
 
 fn turnActivityProjection(
@@ -930,6 +942,42 @@ test "frame-owned thinking activity projects the thinking label" {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "frame compaction overrides idle and tool activity but not blocking feedback or questions" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    var state: @import("../../core/output/compaction_activity.zig").State = .{};
+    const id = state.begin(.manual, null, 1_000);
+    state.running(id, .summary);
+    var ctx: RenderContext = .{
+        .stream = .{},
+        .compaction = state.snapshot,
+        .now_ms = 2_500,
+        .has_api_key = true,
+        .model = "test",
+        .input = &input,
+    };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
+    try std.testing.expect(!ctx.stream.active);
+    ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
+    try std.testing.expectEqualStrings("• Compacting (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
+    try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
+    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
+    ctx.question = null;
+    state.settle(id, .{ .outcome = .cancelled }, 2_500);
+    ctx.compaction = state.snapshot;
+    ctx.activity = .none;
+    try std.testing.expectEqual(ActivityProjection.Tone.neutral, frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.tone);
+    try std.testing.expect(state.dismiss(id, state.snapshot.revision));
+    ctx.compaction = state.snapshot;
+    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
 }
 
 test "pending prompt projects thinking before the worker stream starts" {

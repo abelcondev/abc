@@ -584,6 +584,9 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte(']');
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
+            if (entry.cancellation_origin == .compaction) {
+                try writer.writeAll(",\"cancellation_origin\":\"compaction\"");
+            }
             if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemory(writer, entry.execution);
@@ -733,11 +736,13 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const has_execution = source.get("execution") != null;
         const has_presentation = source.get("cancelled_command") != null;
         const has_terminal_reason = source.get("terminal_reason") != null;
+        const has_cancellation_origin = source.get("cancellation_origin") != null;
         const object = try exactInterruptedHistoryObject(
             value,
             has_execution,
             has_presentation,
             has_terminal_reason,
+            has_cancellation_origin,
         );
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
@@ -754,6 +759,11 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             try parseInterruptedTerminalReason(object, "terminal_reason")
         else
             types.InterruptedTerminalReason.cancelled;
+        const cancellation_origin: types.CancellationOrigin = if (has_cancellation_origin)
+            std.meta.stringToEnum(types.CancellationOrigin, try requireString(object, "cancellation_origin")) orelse
+                return error.InvalidSessionFormat
+        else
+            .turn;
         const execution = if (has_execution)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
@@ -784,6 +794,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             .execution = execution,
             .cancelled_command = cancelled_command,
             .terminal_reason = terminal_reason,
+            .cancellation_origin = cancellation_origin,
         } };
     }
     return error.InvalidSessionFormat;
@@ -2828,8 +2839,9 @@ fn exactInterruptedHistoryObject(
     has_execution: bool,
     has_presentation: bool,
     has_terminal_reason: bool,
+    has_cancellation_origin: bool,
 ) !std.json.ObjectMap {
-    var keys: [8][]const u8 = undefined;
+    var keys: [9][]const u8 = undefined;
     keys[0] = "kind";
     keys[1] = "user";
     keys[2] = "assistant";
@@ -2846,6 +2858,10 @@ fn exactInterruptedHistoryObject(
     }
     if (has_terminal_reason) {
         keys[len] = "terminal_reason";
+        len += 1;
+    }
+    if (has_cancellation_origin) {
+        keys[len] = "cancellation_origin";
         len += 1;
     }
     return exactObject(value, keys[0..len]);
@@ -3723,6 +3739,78 @@ test "terminal action presentation codec preserves return and failure causes" {
             case,
             (try parseOptionalTerminalActionPresentation(parsed.value)).?,
         );
+    }
+}
+
+test "durable cancellation provenance defaults old records and preserves ordinary bytes" {
+    const alloc = std.testing.allocator;
+    const old = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[]}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, old, .{});
+    defer parsed.deinit();
+    const turn = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqual(types.CancellationOrigin.turn, turn.interrupted.cancellation_origin);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, turn.interrupted.terminal_reason);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeHistoryTurn(&out.writer, turn);
+    try std.testing.expectEqualStrings(old[0 .. old.len - 1] ++ ",\"terminal_reason\":\"cancelled\"}", out.written());
+}
+
+test "durable cancellation provenance roundtrips and cleans allocation failures" {
+    const Case = struct {
+        fn run(alloc: Allocator, origin: types.CancellationOrigin, reason: types.InterruptedTerminalReason) !void {
+            const turn: session.HistoryTurn = .{ .interrupted = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast("partial"),
+                .terminal_reason = reason,
+                .cancellation_origin = origin,
+            } };
+            const copy = try session.dupeHistoryTurn(alloc, turn);
+            defer session.freeHistoryTurn(alloc, copy);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            // This in-memory writer reports injected allocation failure as WriteFailed.
+            writeHistoryTurn(&out.writer, copy) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            try std.testing.expectEqual(origin == .compaction, std.mem.find(u8, out.written(), "\"cancellation_origin\"") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer parsed.deinit();
+            const decoded = try parseHistoryTurn(alloc, parsed.value);
+            defer session.freeHistoryTurn(alloc, decoded);
+            try std.testing.expectEqual(origin, decoded.interrupted.cancellation_origin);
+            try std.testing.expectEqual(reason, decoded.interrupted.terminal_reason);
+            try std.testing.expectEqualStrings("request", decoded.interrupted.user.text);
+            try std.testing.expectEqualStrings("partial", decoded.interrupted.assistant.?);
+            var again: std.Io.Writer.Allocating = .init(alloc);
+            defer again.deinit();
+            writeHistoryTurn(&again.writer, decoded) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            try std.testing.expectEqualStrings(out.written(), again.written());
+        }
+    };
+    for (std.enums.values(types.CancellationOrigin)) |origin| {
+        for (std.enums.values(types.InterruptedTerminalReason)) |reason| {
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ origin, reason });
+        }
+    }
+}
+
+test "durable cancellation provenance accepts explicit turn and rejects invalid or unknown fields" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":";
+    for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "0", "true", "{}", "[]", "\"compaction\",\"unknown_field\":true" }, 0..) |value, i| {
+        const bytes = try std.fmt.allocPrint(alloc, "{s}{s}}}", .{ prefix, value });
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        if (i < 2) {
+            const turn = try parseHistoryTurn(alloc, parsed.value);
+            defer session.freeHistoryTurn(alloc, turn);
+            try std.testing.expectEqual(if (i == 0) types.CancellationOrigin.turn else .compaction, turn.interrupted.cancellation_origin);
+        } else {
+            try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
+        }
     }
 }
 

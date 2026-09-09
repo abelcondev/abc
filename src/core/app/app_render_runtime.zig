@@ -688,6 +688,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
+                .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),

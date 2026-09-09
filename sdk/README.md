@@ -338,6 +338,13 @@ workspace stores remain terminal-only host integrations. Clipboard copy writes
 through the host `clipboard.writeText(text)` adapter and defaults to
 `navigator.clipboard`.
 
+During `/compact` and automatic compaction, the terminal shows a live
+`Compacting` activity row with elapsed time. Input and cancellation remain
+responsive while the summary request is pending. Compaction progress and
+outcomes do not add transcript entries, including cancellation after resume.
+Stored snapshots retain cancellation-origin metadata; keep them opaque and
+resume with the same or a newer SDK build. Older snapshots remain readable.
+
 ## Security
 
 Treat `nativeAddon` and `gatewayChatUrl` as trusted host
