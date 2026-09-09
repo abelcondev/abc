@@ -306,6 +306,17 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
+        const defaults = effectiveDefaults(options.defaults, request.override());
+        debug_trace.logf(
+            "subagent",
+            "admission requested operation={s} action={s} agent={s} override={s}",
+            .{
+                operation_id,
+                @tagName(request.action()),
+                request.agentName() orelse "none",
+                if (request.override().present()) "yes" else "no",
+            },
+        );
         var lock = try self.managed.state_store.acquireLock(alloc);
         defer lock.release();
         var registry = try self.managed.state_store.load(alloc);
@@ -320,6 +331,11 @@ pub const Runtime = struct {
                 "operation_conflict",
             );
             if (!std.mem.eql(u8, &observed, &fingerprint)) {
+                debug_trace.logf(
+                    "subagent",
+                    "admission rejected operation={s} child_id={s} code=operation_conflict",
+                    .{ operation_id, existing.id },
+                );
                 return managedAdmissionRejected(
                     alloc,
                     existing.id,
@@ -330,7 +346,7 @@ pub const Runtime = struct {
                 alloc,
                 existing.id,
                 operation_id,
-                options.defaults,
+                defaults,
             );
             if (existing.last_work_id) |work_id| {
                 if (std.mem.eql(u8, work_id, operation_id)) return .{ .completed = .{
@@ -363,7 +379,7 @@ pub const Runtime = struct {
                     alloc,
                     child_id,
                     active.id,
-                    options.defaults,
+                    defaults,
                 );
                 return managedAdmissionReady(
                     alloc,
@@ -372,6 +388,18 @@ pub const Runtime = struct {
             },
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
+                    if (request.override().present()) {
+                        debug_trace.logf(
+                            "subagent",
+                            "admission rejected operation={s} child_id={s} agent={s} code=override_after_create",
+                            .{ operation_id, child.id, message.agent },
+                        );
+                        return managedAdmissionRejected(
+                            alloc,
+                            child.id,
+                            "override_after_create",
+                        );
+                    }
                     switch (child.phase) {
                         .running, .awaiting_approval => return managedAdmissionRejected(
                             alloc,
@@ -408,7 +436,7 @@ pub const Runtime = struct {
                     alloc,
                     child_id,
                     active.id,
-                    options.defaults,
+                    defaults,
                 );
                 return managedAdmissionReady(
                     alloc,
@@ -437,6 +465,18 @@ pub const Runtime = struct {
             var writable = writable_value;
             writable.log.park();
             writable.deinit(alloc);
+            debug_trace.logf(
+                "subagent",
+                "child session created child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={}",
+                .{
+                    child_id,
+                    work_id,
+                    @tagName(state.preferences.provider),
+                    state.preferences.model,
+                    state.preferences.effort.label(),
+                    state.preferences.fast_mode,
+                },
+            );
         } else |err| switch (err) {
             error.SessionAlreadyExists => {},
             else => return err,
@@ -543,6 +583,29 @@ test "internal operation identity is deterministic and invocation-bound" {
     try std.testing.expectEqualStrings(first, replay);
     try std.testing.expect(!std.mem.eql(u8, first, changed));
     try std.testing.expect(std.mem.startsWith(u8, first, "fxop:2:m:41:"));
+}
+
+test "creation defaults keep parent values unless the request overrides them" {
+    const parent = Defaults{
+        .provider = .gateway,
+        .model = "parent-model",
+        .effort = .auto,
+        .conversation_language = session.ConversationLanguage.default(),
+    };
+    const inherited = effectiveDefaults(parent, .{});
+    try std.testing.expectEqualStrings("parent-model", inherited.model);
+    try std.testing.expect(inherited.effort.isDefault());
+    const overridden = effectiveDefaults(parent, .{
+        .model = "gpt-5.6-sol-fast",
+        .effort = types.ReasoningEffort.parse("medium"),
+    });
+    try std.testing.expectEqualStrings("gpt-5.6-sol-fast", overridden.model);
+    try std.testing.expectEqualStrings("medium", overridden.effort.label());
+    try std.testing.expectEqual(parent.provider, overridden.provider);
+    // Model-only and effort-only overrides leave the other value inherited.
+    const model_only = effectiveDefaults(parent, .{ .model = "other-model" });
+    try std.testing.expectEqualStrings("other-model", model_only.model);
+    try std.testing.expect(model_only.effort.isDefault());
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
@@ -703,6 +766,19 @@ fn assistantTextForWork(
         };
     }
     return null;
+}
+
+/// Resolves the defaults used to seed a new child session. The returned value
+/// borrows `override.model` from the request; both the request and the
+/// original defaults must outlive the result.
+fn effectiveDefaults(
+    defaults: Defaults,
+    override: model_contract.Override,
+) Defaults {
+    var resolved = defaults;
+    if (override.model) |model| resolved.model = model;
+    if (override.effort) |effort| resolved.effort = effort;
+    return resolved;
 }
 
 fn freshChildState(
