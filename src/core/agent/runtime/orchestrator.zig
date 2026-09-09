@@ -2367,6 +2367,11 @@ test "terminal request normalization cleans every partial allocation failure" {
     );
 }
 
+const LiveToolAuthorityResolution = union(enum) {
+    resolved: runtime_deps.ResolvedLiveToolAuthority,
+    tool_failure: []const u8,
+};
+
 fn resolveLiveToolAuthority(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2374,15 +2379,19 @@ fn resolveLiveToolAuthority(
     workspace_root: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
     target_override: ?[]const u8,
-) !runtime_deps.ResolvedLiveToolAuthority {
+) !LiveToolAuthorityResolution {
     const provider = deps.live_tool_authority orelse unreachable;
     const target = target_override orelse
-        try deps.permission_target_for_call(
+        deps.permission_target_for_call(
             deps.ctx,
             arena,
             call,
             advertised_dynamic_tool_names,
-        );
+        ) catch |err| {
+        const failure = (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call.name, err)) orelse return err;
+        debug_trace.logf("permission", "event=live_authority_target_failure call_id={s} tool_name={s} err={s}", .{ call.id, call.name, @errorName(err) });
+        return .{ .tool_failure = failure };
+    };
     const command_call = try tooling_tool_admission.callUsesCommandAuthority(
         deps.tool_registry,
         arena,
@@ -2394,13 +2403,13 @@ fn resolveLiveToolAuthority(
         tool.permission_target_kind
     else
         .none;
-    return provider.resolve(
+    return .{ .resolved = try provider.resolve(
         arena,
         call,
         workspace_root,
         target,
         target_kind,
-    );
+    ) };
 }
 
 fn liveAuthorityRejectsExecution(
@@ -10210,15 +10219,22 @@ fn processQueuedPromptLoop(
                 try arena.dupe(u8, prepared.targetPath())
             else
                 null;
+            var live_target_failure: ?[]const u8 = null;
             var live_authority = if (deps.live_tool_authority != null) live: {
-                const resolved = try resolveLiveToolAuthority(
+                const resolved = switch (try resolveLiveToolAuthority(
                     deps,
                     arena,
                     tool_call,
                     config.workspace_root,
                     advertised_dynamic_tool_names,
                     live_authority_target,
-                );
+                )) {
+                    .resolved => |value| value,
+                    .tool_failure => |failure| {
+                        live_target_failure = failure;
+                        break :live null;
+                    },
+                };
                 if (liveAuthorityRejectsExecution(resolved)) {
                     const outcome: []const u8 = if (resolved.decision == .deny)
                         "denied"
@@ -10340,7 +10356,9 @@ fn processQueuedPromptLoop(
                     .{ tool_call.id, tool_call.name },
                 );
             }
-            const maybe_permission: ?command_admission.PermissionOutcome = if (effective_preserved_denial) |outcome|
+            const maybe_permission: ?command_admission.PermissionOutcome = if (live_target_failure) |failure|
+                .{ .tool_failure = failure }
+            else if (effective_preserved_denial) |outcome|
                 outcome
             else
                 (if (prepared_file_mutation) |*prepared|
@@ -10421,14 +10439,20 @@ fn processQueuedPromptLoop(
                 !permission_result.decision.isDenied() and
                 deps.live_tool_authority != null)
             {
-                const refreshed = try resolveLiveToolAuthority(
+                const refreshed = switch (try resolveLiveToolAuthority(
                     deps,
                     arena,
                     tool_call,
                     config.workspace_root,
                     advertised_dynamic_tool_names,
                     live_authority_target,
-                );
+                )) {
+                    .resolved => |value| value,
+                    .tool_failure => |failure| {
+                        permission_result = .{ .tool_failure = failure };
+                        break;
+                    },
+                };
                 live_authority = refreshed;
                 if (refreshed.authority.generation == validated_permission_generation) {
                     if (liveAuthorityUnavailable(refreshed)) {

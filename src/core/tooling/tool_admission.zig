@@ -2358,6 +2358,13 @@ pub fn permissionTargetResolutionFailureMessage(
     return switch (err) {
         error.PathOutsideWorkspace,
         error.FileNotFound,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NameTooLong,
+        error.BadPathName,
+        error.InputOutput,
         error.HomeNotSet,
         error.InvalidPath,
         error.WorkspaceUnavailable,
@@ -2504,6 +2511,17 @@ test "permission target resolution reports a missing home" {
     )).?;
     defer std.testing.allocator.free(failure);
     try std.testing.expect(std.mem.find(u8, failure, "HomeNotSet") != null);
+}
+
+test "permission target failures preserve filesystem causes without hiding runtime errors" {
+    for ([_]anyerror{ error.FileNotFound, error.NotDir, error.SymLinkLoop, error.AccessDenied, error.PermissionDenied, error.NameTooLong }) |err| {
+        const failure = (try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err)) orelse return error.TestExpectedToolFailure;
+        defer std.testing.allocator.free(failure);
+        try std.testing.expect(std.mem.find(u8, failure, @errorName(err)) != null);
+    }
+    for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.HostAuthorityUnavailable }) |err| {
+        try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err));
+    }
 }
 
 test "interactive terminal exec approval permits command amendments" {
