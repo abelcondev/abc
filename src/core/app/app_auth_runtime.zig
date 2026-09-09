@@ -1863,12 +1863,13 @@ pub fn Runtime(comptime App: type) type {
                 "credential failure source={t} reason={t} retryable={s}",
                 .{ failure.source, failure.reason, if (failure.retryable()) "true" else "false" },
             );
-            const first_observation = if (app.auth.credentialSource() == source and
+            const notify = !compactionOwnsCredentialFeedback(app);
+            const should_notify = if (app.auth.credentialSource() == source and
                 comptime @hasDecl(@TypeOf(app.auth), "recordCredentialFailure"))
-                app.auth.recordCredentialFailure(failure)
+                app.auth.recordCredentialFailure(failure, .{ .notify = notify })
             else
-                true;
-            if (compactionOwnsCredentialFeedback(app) or !first_observation) return false;
+                notify;
+            if (!should_notify) return false;
             const recovery = try credentialRecoveryText(app.alloc, failure);
             defer app.alloc.free(recovery);
             try app.writeDomainNotice(.{
@@ -2283,6 +2284,7 @@ const TestAuth = struct {
     logout_reconcile_count: usize = 0,
     source_inventory_refresh_count: usize = 0,
     credential_failure: ?auth_runtime.CredentialFailure = null,
+    credential_notice_claimed: bool = false,
     picker_opened: bool = false,
     picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
@@ -2507,15 +2509,18 @@ const TestAuth = struct {
     fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
+        options: struct { notify: bool = true },
     ) bool {
-        if (self.credential_failure) |current| {
-            if (current.source == failure.source and
-                current.reason == failure.reason)
-            {
-                return false;
-            }
+        const same_failure = if (self.credential_failure) |current|
+            current.source == failure.source and current.reason == failure.reason
+        else
+            false;
+        if (!same_failure) {
+            self.credential_failure = failure;
+            self.credential_notice_claimed = false;
         }
-        self.credential_failure = failure;
+        if (!options.notify or self.credential_notice_claimed) return false;
+        self.credential_notice_claimed = true;
         return true;
     }
 
@@ -3404,6 +3409,71 @@ test "manual compaction credential failure leaves feedback to its lifecycle owne
     try std.testing.expect(app.auth.credential_failure != null);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "compaction credential failure preserves the first ordinary recovery notice" {
+    const AuthApp = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        auth: auth_runtime.Runtime = .{},
+        submission: @import("input_submit_runtime.zig").State = .{},
+        shell: struct { render_requests: TestRenderRequests = .{} } = .{},
+        notice_write_count: usize = 0,
+        transcript: std.ArrayList(u8) = .empty,
+
+        fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            try std.testing.expectEqualStrings("auth", notice.topic);
+            try self.transcript.appendSlice(self.alloc, notice.body);
+            self.notice_write_count += 1;
+        }
+    };
+    var app: AuthApp = .{};
+    defer app.auth.deinit(app.alloc);
+    defer app.transcript.deinit(app.alloc);
+    var credential: credentials.Credential = .{
+        .token = try app.alloc.dupe(u8, "login-token"),
+        .source = .fx_login,
+    };
+    defer credential.deinit(app.alloc);
+    _ = app.auth.adoptCredential(app.alloc, &credential);
+    const runtime = Runtime(AuthApp);
+    const failure = auth_runtime.classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+
+    app.submission.compaction_pending = true;
+    try std.testing.expect(!try runtime.recoverCredentialFailure(&app, .fx_login, error.OAuthRequestFailed));
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expectEqual(failure, app.auth.credentialFailure().?);
+    try std.testing.expectEqual(
+        credentials.CatalogPublicOnlyReason.credential_refresh_failed,
+        app.auth.modelCatalogAccess().publicOnlyReason().?,
+    );
+
+    app.submission.compaction_pending = false;
+    app.auth.cancelPromptCredentialRefresh();
+    app.submission.pending = .{
+        .draft = .{
+            .turn_id = 1,
+            .prompt = try app.alloc.dupe(u8, "keep this ordinary prompt"),
+            .images = &.{},
+            .skill_display_spans = &.{},
+        },
+        .phase = .awaiting_auth,
+    };
+    defer app.submission.pending.?.deinit(app.alloc);
+    try std.testing.expect(!try runtime.recoverCredentialFailure(&app, .fx_login, error.OAuthRequestFailed));
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expectEqualStrings(
+        "fx login credential refresh failed.\nPress Enter to retry. Your prompt is saved.",
+        app.transcript.items,
+    );
+    try std.testing.expectEqualStrings("keep this ordinary prompt", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(@as(u64, 1), app.submission.pending.?.draft.turn_id);
+    try std.testing.expectEqual(.awaiting_auth, app.submission.pending.?.phase);
+    try std.testing.expectEqual(failure, app.auth.credentialFailure().?);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+
+    try std.testing.expect(!try runtime.recoverCredentialFailure(&app, .fx_login, error.OAuthRequestFailed));
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
 
 test "prompt credential refresh falls back when its task cannot start" {

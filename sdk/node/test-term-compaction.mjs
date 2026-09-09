@@ -13,13 +13,14 @@ if (!supportsJspi()) {
   console.error("JSPI is required: node --experimental-wasm-jspi sdk/node/test-term-compaction.mjs");
   process.exit(2);
 }
+const scenarios = ["success", "cancel-headers", "cancel-body", "auto-cancel-headers"];
 const scenario = process.argv[3];
 if (scenario) {
-  assert(["success", "cancel-headers", "cancel-body"].includes(scenario));
+  assert(scenarios.includes(scenario));
   await runScenario(scenario);
 } else {
   // A blocked cooperative loop must fail the test, not hang the entire SDK lane.
-  for (const name of ["success", "cancel-headers", "cancel-body"]) {
+  for (const name of scenarios) {
     const child = spawn(process.execPath, ["--experimental-wasm-jspi", script, wasmPath, name], {
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", FX_SOUND: "0", FX_E2E_DISABLE_DOTENV: "1" },
       stdio: ["ignore", "pipe", "pipe"],
@@ -99,8 +100,9 @@ async function runScenario(name) {
   let handoff;
   // Several ordinary exchanges leave older history outside the retained suffix,
   // without pushing a cancelled attempt's followup over the automatic threshold.
-  const seedTurns = 3;
-  const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(400)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
+  const automatic = name === "auto-cancel-headers";
+  const seedTurns = automatic ? 1 : 3;
+  const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 400)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
   const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
   const forbidden = /Compacting|compaction|Context compacted|No context to compact|Your existing context was kept|HOST_INTERNAL_HANDOFF_268a/i;
   const emptyComposer = (text) => text.split("\n").some((line) => /^[ \t]*(?:┃|❯|>)[ \t]*$/.test(line));
@@ -231,16 +233,23 @@ async function runScenario(name) {
     await stop();
     phase = "attempt";
     await start(["--resume", sessionId]);
+    if (automatic) {
+      active.runtime.write("/model\r");
+      await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("Tab Provider"), "model capabilities loaded");
+      active.runtime.write("\x1b");
+      await waitFor(() => !grid(active.terminal).includes("Tab Provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
+    }
     const beforeCommits = commits;
     const beforeBytes = [...records.values()][0].bytes.slice();
-    active.runtime.write("/compact\r");
+    const cancelledPrompt = "Cancel this automatic summary before headers.";
+    active.runtime.write(automatic ? `${cancelledPrompt}\r` : "/compact\r");
     await waitFor(() => summaries === 1 && hold, "summary held before headers");
     await ticking("held headers");
     assert.equal(commits, beforeCommits, "checkpoint before headers released");
     assert.deepEqual([...records.values()][0].bytes, beforeBytes);
     assert.equal(ordinary, seedTurns, "manual compaction created an ordinary prompt");
-    assert(JSON.stringify(requests.at(-1)).includes(head), "summary must receive real older history");
-    if (name !== "cancel-headers") {
+    assert(JSON.stringify(requests.at(-1)).includes(automatic ? "Seed ordinary historical turn 1." : head), `summary must receive real older history: ${JSON.stringify(requests.at(-1)).slice(-4000)}`);
+    if (name !== "cancel-headers" && !automatic) {
       hold.releaseHeaders();
       await waitFor(() => hold.bodyRead, "summary body read reached");
       await ticking("held body");
@@ -255,12 +264,38 @@ async function runScenario(name) {
       active.runtime.write("\x03");
       await waitFor(() => hold.aborted, "Ctrl+C reaches summary AbortSignal");
       await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("Compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
-      assert.equal(commits, beforeCommits, "cancelled summary committed a checkpoint");
-      assert.deepEqual(records.get(sessionId).bytes, beforeBytes, "cancelled summary changed saved history");
+      if (automatic) {
+        await waitFor(() => commits === beforeCommits + 1, "automatic interruption persisted");
+        const saved = new TextDecoder().decode(records.get(sessionId).bytes);
+        assert.equal(saved.match(/"cancellation_origin"\s*:\s*"compaction"/g)?.length, 1, "save one compaction-origin interruption");
+        assert(saved.includes(cancelledPrompt), "save the interrupted prompt");
+        assert(!saved.includes("HOST_INTERNAL_HANDOFF_268a"), "unacknowledged summary must not enter history");
+        assert.equal(ordinary, seedTurns, "cancelled automatic turn must not request an ordinary reply");
+      } else {
+        assert.equal(commits, beforeCommits, "cancelled summary committed a checkpoint");
+        assert.deepEqual(records.get(sessionId).bytes, beforeBytes, "cancelled summary changed saved history");
+      }
       active.runtime.write("\x1b");
       await waitFor(() => !/compact/i.test(grid(active.terminal)), "feedback dismissal");
     }
     await silentTranscript();
+    if (automatic) {
+      await stop();
+      phase = "reopen";
+      await start(["--resume", sessionId]);
+      active.runtime.write("\x0f");
+      await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("Full detail"), "reopened full transcript");
+      active.runtime.write("\x1b[F");
+      await waitFor(() => grid(active.terminal).includes(cancelledPrompt), "replayed interrupted prompt");
+      assert(!/cancelled|compaction|HOST_INTERNAL_HANDOFF_268a/i.test(grid(active.terminal)), "compaction cancellation must replay silently");
+      active.runtime.write("\x0f");
+      await waitFor(() => active.terminal.buffer.active.type === "normal" && emptyComposer(grid(active.terminal)), "reopened inline restoration");
+      await stop();
+      assert.equal(summaries, 1);
+      assert.equal(ordinary, seedTurns);
+      console.log(`term compaction ${name} passed`);
+      return;
+    }
     phase = "followup";
     active.runtime.write("Follow the latest request.\r");
     await waitFor(() => grid(active.terminal).includes("HOST_FOLLOWUP_OK_781c") && emptyComposer(grid(active.terminal)), "followup");

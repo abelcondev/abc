@@ -6467,21 +6467,30 @@ tmuxTest(
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
     await session.sendText("/status");
     await session.waitForText("auth_expired=true", TIMEOUT);
+    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    expect(sessionIds).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const before = readFileSync(historyPath, "utf8");
     await session.sendText("/compact");
     await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
     expect(gateway.requests).toHaveLength(2);
     await session.sendText("/compact");
     await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
     await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
-    await session.waitForText("Context compacted.", TIMEOUT);
-    expect(await session.captureFullScrollback()).toContain("PRESERVE_COMPACTION_DRAFT");
+    // Success is silent; wait for durable publication and the activity row to clear.
+    await session.waitForPane((pane) =>
+      pane.includes("PRESERVE_COMPACTION_DRAFT") &&
+      !/Preparing compaction|Compacting|Stopping compaction/.test(pane) &&
+      readFileSync(historyPath, "utf8").includes('"context_checkpoint"'),
+    TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("PRESERVE_COMPACTION_DRAFT");
+    expect(scrollback).not.toContain("Context compacted.");
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
-    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
-    expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    expect(readFileSync(historyPath, "utf8").startsWith(before)).toBe(true);
     const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
     await session.sendKeys("C-u");
@@ -6536,9 +6545,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("DRAFT_DURING_AUTH_BOUNDARY", 1_000);
     if (outcome === "cancel") {
       await session.sendKeys("C-c");
-      await session.waitForText("Context compaction cancelled.", 3_000);
+      await session.waitForText("Compaction cancelled. Try /compact again when ready.", 3_000);
     } else {
-      await session.waitForText("Your conversation is unchanged.", TIMEOUT);
+      await session.waitForText("Compaction was not started. Check authentication and try /compact again.", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("/compact again");
       expect(scrollback).not.toContain("Your prompt is saved.");

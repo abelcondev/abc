@@ -5803,6 +5803,158 @@ test "compaction activity automatic error provenance excludes secondary finaliza
     }
 }
 
+test "automatic compaction interruption persists transport cancellation and preserves publication authority" {
+    const support = @import("tests/support.zig");
+    const Host = struct {
+        fake: support.FakeAgentRuntimeDeps,
+        activity: compaction_activity.State = .{},
+        cancel: *std.atomic.Value(bool),
+        summary_error: ?anyerror = null,
+        publication_error: ?anyerror = null,
+        cancel_at_publication: bool = false,
+        summary_calls: usize = 0,
+        publication_calls: usize = 0,
+
+        fn from(raw: *anyopaque) *@This() {
+            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("fake", fake);
+        }
+        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+            return from(raw).activity.begin(origin, turn_id, 0);
+        }
+        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
+            from(raw).activity.running(id, stage);
+        }
+        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+            from(raw).activity.settle(id, feedback, 1);
+        }
+        fn commit(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, prefix: ?types.AssistantHistoryTurn, cut: ?types.ContextHistoryCut) !void {
+            const self = from(raw);
+            self.publication_calls += 1;
+            try std.testing.expectEqual(compaction_activity.Stage.publication, self.activity.snapshot.operation.?.phase.running);
+            if (self.cancel_at_publication) self.cancel.store(true, .seq_cst);
+            if (self.publication_error) |err| return err;
+            const deps = self.fake.deps();
+            try deps.commit_context_compaction.?.commit(raw, summary, prefix, cut);
+        }
+        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.summary_calls += 1;
+            try std.testing.expectEqual(compaction_activity.Stage.summary, self.activity.snapshot.operation.?.phase.running);
+            try std.testing.expect(!request.cancel_flag.load(.seq_cst));
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            if (self.summary_error) |err| return err;
+            return .{ .completed = .{ .completion = .{ .content = "Preserve the earlier request and follow the latest request.", .finish_reason = .stop } } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        summary_error: ?anyerror = null,
+        publication_error: ?anyerror = null,
+        cancel_at_publication: bool = false,
+        expected_error: ?anyerror = null,
+        committed: bool = false,
+    }{
+        .{ .publication_error = error.Aborted, .cancel_at_publication = true },
+        .{ .summary_error = error.Cancelled },
+        .{ .publication_error = error.Aborted, .expected_error = error.Aborted },
+        .{ .publication_error = error.SessionPersistenceUncertain, .cancel_at_publication = true, .expected_error = error.SessionPersistenceUncertain },
+        .{ .publication_error = error.TestPersistenceFailure, .cancel_at_publication = true, .expected_error = error.TestPersistenceFailure },
+        .{ .cancel_at_publication = true, .committed = true },
+    };
+    for (cases) |case| {
+        var fixture: support.PromptFixture = .{};
+        var host: Host = .{
+            .fake = support.FakeAgentRuntimeDeps.init(alloc),
+            .cancel = &fixture.cancel_flag,
+            .summary_error = case.summary_error,
+            .publication_error = case.publication_error,
+            .cancel_at_publication = case.cancel_at_publication,
+        };
+        defer host.fake.deinit();
+        const model = "provider/compaction-interruption";
+        host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 45_000 } }};
+        var gateway = support.FakeGateway.init(alloc, &.{});
+        defer gateway.deinit();
+        var deps = host.fake.deps();
+        deps.agent_stream_provider = gateway.provider();
+        deps.agent_stream_provider.context = &host;
+        deps.agent_stream_provider.stream_fn = Host.stream;
+        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+        deps.commit_context_compaction = .{ .commit = Host.commit };
+        var provenance: ?compaction_activity.ErrorProvenance = null;
+        deps.compaction_failure = &provenance;
+        var job = fixture.job();
+        job.turn_id = 37;
+        job.model = @constCast(model);
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("earlier request") },
+            .assistant = @constCast("history " ** 19_000),
+        } }};
+        job.history = &history;
+        var agent: runtime_agent.Agent = .{};
+        defer agent.deinit(alloc);
+        try agent.restoreHistory(alloc, job.history);
+        const result = processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
+        if (case.committed) {
+            // The next request build observes cancellation outside the committed transaction.
+            try std.testing.expectError(error.Cancelled, result);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, host.fake.finalized_outcome.?);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_history_count);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_event_count);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.finish_event_count);
+            try std.testing.expectEqual(@as(usize, 1), host.fake.history_turns.items.len);
+            try std.testing.expect(host.fake.history_turns.items[0] == .compacted_summary);
+            try std.testing.expect(provenance == null);
+        } else if (case.expected_error) |err| {
+            try std.testing.expectError(err, result);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, host.fake.finalized_outcome.?);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_history_count);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_event_count);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.finish_event_count);
+            try std.testing.expectEqual(@as(usize, 0), host.fake.history_turns.items.len);
+            try std.testing.expectEqual(err, provenance.?.err);
+        } else {
+            try result;
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, host.fake.finalized_outcome.?);
+            try std.testing.expectEqual(@as(usize, 1), host.fake.interrupted_history_count);
+            try std.testing.expectEqual(@as(usize, 1), host.fake.interrupted_event_count);
+            try std.testing.expectEqual(@as(usize, 1), host.fake.finish_event_count);
+            try std.testing.expectEqual(@as(usize, 1), host.fake.history_turns.items.len);
+            const interrupted = host.fake.history_turns.items[0].interrupted;
+            try std.testing.expectEqualStrings(job.prompt, interrupted.user.text);
+            try std.testing.expectEqual(types.CancellationOrigin.compaction, interrupted.cancellation_origin);
+            try std.testing.expect(provenance == null);
+        }
+        try std.testing.expectEqual(case.cancel_at_publication, fixture.cancel_flag.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 1), host.summary_calls);
+        try std.testing.expectEqual(@as(usize, if (case.summary_error == null) 1 else 0), host.publication_calls);
+        try std.testing.expectEqual(@as(usize, 1), host.fake.finalization_count);
+        const op = host.activity.snapshot.operation.?;
+        try std.testing.expectEqual(compaction_activity.Origin.automatic, op.origin);
+        try std.testing.expectEqual(@as(?u64, 37), op.turn_id);
+        const expected_outcome: compaction_activity.Outcome = if (case.committed) .succeeded else if (case.expected_error != null) .failed else .cancelled;
+        const expected_publication: compaction_activity.Publication = if (case.committed)
+            .committed
+        else if (case.publication_error) |err|
+            if (err == error.SessionPersistenceUncertain) .uncertain else .not_published
+        else
+            .not_published;
+        try std.testing.expectEqual(expected_outcome, op.phase.terminal.outcome);
+        try std.testing.expectEqual(expected_publication, op.phase.terminal.publication);
+        const expected_stage: compaction_activity.Stage = if (case.summary_error != null) .summary else .publication;
+        try std.testing.expectEqual(expected_stage, op.phase.terminal.stage);
+        if (case.summary_error) |err| {
+            try std.testing.expectEqual(err, op.phase.terminal.err.?);
+        } else if (case.publication_error) |err| {
+            try std.testing.expectEqual(err, op.phase.terminal.err.?);
+        } else {
+            try std.testing.expect(op.phase.terminal.err == null);
+        }
+    }
+}
+
 test "compaction activity transaction settles only after publication and preserves failures" {
     const support = @import("tests/support.zig");
     const Host = struct {
@@ -6727,7 +6879,7 @@ fn processQueuedPromptLoop(
                                 .removed_turn_count = window.cut.turns,
                                 .compaction_count = next_compaction_count,
                             }) catch |err| {
-                                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                                if (compaction_activity.failure(err, .preparation, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                                     try runtime_interruption.persistCompactionInterruptedTurnOnce(
                                         deps,

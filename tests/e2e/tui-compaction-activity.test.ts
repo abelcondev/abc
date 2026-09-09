@@ -361,14 +361,28 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.sendKeys("Escape");
         if (trigger === "auto") {
           await terminal.waitForText("Compaction cancelled.", 10_000);
-          await terminal.sendKeys("Escape");
+          // An empty composer already exists while feedback is visible. Wait
+          // for Escape's visible acknowledgement, not a fixed sendKeys delay,
+          // so the slash in /quit cannot become part of a Meta key sequence.
+          terminal.sendKeysImmediate(["Escape"]);
         } else {
           await terminal.waitForText("Cancelled", 10_000);
         }
-        await terminal.waitForComposer(5000);
+        await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
+          !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
+        const interruptions = () => f.savedEvents().trim().split("\n")
+          .map((line) => JSON.parse(line)).filter((frame) => frame.event?.interrupted);
+        await until(() => interruptions().length === 1, "durable cancellation", 5000);
+        expect(interruptions()[0].event.interrupted.reason).toBe("cancelled");
+        expect(interruptions()[0].event.interrupted.cancellation_origin === "compaction").toBe(trigger === "auto");
+        const cancelledCounts = { summaries: trigger === "auto" ? 1 : 0,
+          ordinary: f.seedTurns + (trigger === "ordinary" ? 1 : 0), overflowSent: false };
+        expect(f.counts()).toEqual(cancelledCounts);
         expect(f.durable()).toBe(0);
+        const cancelledEvents = f.savedEvents();
         await f.close();
-        expect(f.savedEvents().includes('"cancellation_origin":"compaction"')).toBe(trigger === "auto");
+        expect(f.counts()).toEqual(cancelledCounts);
+        expect(f.savedEvents()).toBe(cancelledEvents);
 
         const reopened = await f.launch();
         await reopened.sendKeys("C-o");
@@ -377,9 +391,19 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
         expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
+        expect(full).not.toMatch(COMPACTION_OUTPUT);
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
+        expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
         await f.close();
+        expect(f.counts()).toEqual(cancelledCounts);
+        expect(f.savedEvents()).toBe(cancelledEvents);
+        expect(f.durable()).toBe(0);
+        for (const tape of f.tapes) {
+          const replay = await f.cli(["replay", tape, "--json"]);
+          expect(replay.frame_count).toBeGreaterThan(0);
+          expect(replay.stdout_bytes).toBeGreaterThan(0);
+        }
         passed = true;
       } finally { await f.cleanup(passed); }
     }, 60_000);
