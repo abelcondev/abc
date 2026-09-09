@@ -1484,7 +1484,7 @@ const App = struct {
         try InputSubmitRuntime.request_context_compaction(self);
     }
 
-    pub fn enqueueContextCompaction(self: *App) !bool {
+    pub fn enqueueContextCompaction(self: *App, operation_id: @import("core/output/compaction_activity.zig").OperationId) !bool {
         if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
         const selection = self.provider_selection.selection();
         const model = try std.heap.c_allocator.dupe(u8, selection.model);
@@ -1509,6 +1509,7 @@ const App = struct {
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
 
         try self.worker.enqueueContextCompaction(.{
+            .operation_id = operation_id,
             .model = model,
             .provider = selection.provider,
             .api_key = api_key,
@@ -2212,18 +2213,20 @@ const App = struct {
         }
     }
 
-    pub fn processQueuedWork(self: *App, work: WorkItem) !void {
+    pub fn processQueuedWork(self: *App, work: WorkItem, failure_provenance: *?@import("core/output/compaction_activity.zig").ErrorProvenance) !void {
         const result = switch (work) {
             .prompt => |job| AgentAppRuntime.processQueuedPrompt(
                 self,
                 job,
                 builtin_gateway.retry_count,
                 builtin_gateway.defaultChatUrl(),
+                failure_provenance,
             ),
             .compact_context => |task| AgentAppRuntime.processContextCompaction(
                 self,
                 task,
                 builtin_gateway.retry_count,
+                failure_provenance,
             ),
         };
         result catch |err| {
@@ -4166,6 +4169,10 @@ test {
     _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");
+    _ = @import("core/app/input_interrupt_runtime.zig");
+    _ = @import("ui/footer/render_input.zig");
+    _ = @import("ui/footer/surface_frame.zig");
+    _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");

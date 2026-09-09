@@ -30,6 +30,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText as finalText,
   heldFakeGatewayFinalText,
+  hasEmptyComposer,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
@@ -8921,16 +8922,31 @@ test.skipIf(!tmuxAvailable())(
         await tui.waitForText(answer!, TIMEOUT);
         await tui.waitForComposer(TIMEOUT);
       }
-      await tui.sendText("/compact");
-      await tui.waitForText("Context compacted.", TIMEOUT);
-      await tui.sendText("/quit");
-      expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
-      await tui.kill();
-      tui = null;
       const ids = readdirSync(join(root.home, ".fx", "sessions"), { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       expect(ids).toHaveLength(1);
       const eventsPath = join(root.home, ".fx", "sessions", ids[0]!, "events.jsonl");
+      const checkpointFrames = () => readFileSync(eventsPath, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).filter((frame) => frame.event?.context_checkpoint);
+      const beforeCompaction = readFileSync(eventsPath);
+      expect(checkpointFrames()).toHaveLength(0);
+      await tui.sendText("/compact");
+      // Success is silent: the committed checkpoint, not a transcript notice,
+      // establishes that compaction finished before testing ACP replay.
+      await waitForCondition("persisted compaction checkpoint", () => checkpointFrames().length === 1, TIMEOUT);
+      await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Thinking|Preparing compaction/.test(pane), TIMEOUT);
+      expect(checkpointFrames()).toHaveLength(1);
+      expect(JSON.stringify(checkpointFrames())).toContain("ACP_INTERNAL_HANDOFF");
+      expect(readFileSync(eventsPath).subarray(0, beforeCompaction.length)).toEqual(beforeCompaction);
+      const inline = await tui.captureFullScrollbackEscapes();
+      expect(inline).toContain("ACP_EARLIER_VISIBLE_RESPONSE");
+      expect(inline).toContain("ACP_MIDDLE_VISIBLE_RESPONSE");
+      expect(inline).toContain("ACP_LATEST_VISIBLE_RESPONSE");
+      expect(inline).not.toMatch(/Context compacted|Compacting|ACP_INTERNAL_HANDOFF/);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await tui.kill();
+      tui = null;
       const savedEvents = readFileSync(eventsPath);
       expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
       expect(gateway.requests).toHaveLength(5);

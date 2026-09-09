@@ -1865,6 +1865,11 @@ pub const InterruptedTerminalReason = enum {
     failed,
 };
 
+pub const CancellationOrigin = enum {
+    turn,
+    compaction,
+};
+
 pub const InterruptedHistoryTurn = struct {
     user: UserTurn,
     assistant: ?[]u8 = null,
@@ -1873,6 +1878,7 @@ pub const InterruptedHistoryTurn = struct {
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
+    cancellation_origin: CancellationOrigin = .turn,
 };
 
 pub const context_handoff_open = "<context_handoff>";
@@ -2283,6 +2289,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .execution = execution,
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
+                .cancellation_origin = entry.cancellation_origin,
             } };
         },
     };

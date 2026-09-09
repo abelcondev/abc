@@ -788,16 +788,12 @@ pub fn Runtime(comptime App: type) type {
             if (app.shell.worker_status_state().expire_transient(now_ms)) {
                 app.shell.render_requests.request(.footer);
             }
-            if (!app.approval_prompt.isActive() and
-                !app.question_prompt.isActive())
-            {
-                _ = advanceVisibleAnimation(
-                    app,
-                    event_handlers.tool_lifecycle,
-                    now_ms,
-                    std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-                );
-            }
+            _ = advanceVisibleAnimation(
+                app,
+                event_handlers.tool_lifecycle,
+                now_ms,
+                std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+            );
         }
 
         fn advanceVisibleAnimation(
@@ -806,9 +802,17 @@ pub fn Runtime(comptime App: type) type {
             now_ms: i64,
             now_awake: std.Io.Clock.Timestamp,
         ) bool {
+            const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{};
+            app.shell.render_requests.observeCompactionRevision(compaction.revision);
+            if (comptime @hasDecl(@TypeOf(app.worker), "expireCompactionActivity")) {
+                if (compaction.operation) |op| {
+                    if (app.worker.expireCompactionActivity(op.id, compaction.revision, now_ms)) app.shell.render_requests.request(.footer);
+                }
+            }
+            const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
             const status_changed = app.shell.worker_status_state().refresh_route_recovery(now_awake);
             if (status_changed) app.shell.render_requests.request(.footer);
-            if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
+            if (!compaction_active and !app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return status_changed;
             }
             if (app.approval_prompt.isActive() or
@@ -819,7 +823,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var label_buf: [256]u8 = undefined;
-            _ = activityShimmerLabel(app, presenter, &label_buf) orelse return status_changed;
+            _ = activityShimmerLabel(app, presenter, compaction, now_ms, &label_buf) orelse return status_changed;
             const previous_deadline = app.shell.render_requests.animation_next_deadline_ms;
             if (!app.shell.render_requests.requestAnimationDue(now_ms)) return status_changed;
             debug_trace.logf(
@@ -833,8 +837,18 @@ pub fn Runtime(comptime App: type) type {
         fn activityShimmerLabel(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
+            compaction: @import("../output/compaction_activity.zig").Snapshot,
+            now_ms: i64,
             buf: []u8,
         ) ?[]const u8 {
+            switch (app.shell.activityProjection()) {
+                .turn_thinking => |thinking| if (thinking.tone != .thinking) return null,
+                .none, .tool_slot => {},
+            }
+            switch (activity_status.compactionProjection(buf, compaction, app.stream, now_ms)) {
+                .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
+                .none, .tool_slot => {},
+            }
             // Existence guard only: pass no clock so the label skips the counter.
             if (!app.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
                 return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
@@ -1396,6 +1410,9 @@ const FakeQuestionSnapshot = struct {
 };
 
 const FakeWorker = struct {
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+    compaction_reads: usize = 0,
+
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     events: std.ArrayList(WorkerEvent) = .empty,
     queued_count: usize = 0,
@@ -1410,6 +1427,15 @@ const FakeWorker = struct {
     propagated_grants: usize = 0,
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
+
+    fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
+        self.compaction_reads += 1;
+        return self.compaction.snapshot;
+    }
+
+    fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
+        return self.compaction.expire(id, revision, now_ms);
+    }
 
     fn resolveFreshPrompt(_: *FakeWorker, alloc: std.mem.Allocator, value: worker_runtime.FreshPromptPreparation, ctx: *anyopaque, handler: worker_runtime.FreshPromptHandler) void {
         var result = handler(ctx, value) catch return;
@@ -2411,6 +2437,30 @@ test "core.app_worker_runtime next admitted model step returns running to thinki
 
     try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
     try std.testing.expectEqual(@as(u64, 13), app.stream.phase_step_id);
+}
+
+test "manual compaction schedules initial repaint animation and terminal expiry without a stream" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const id = app.worker.compaction.begin(.manual, null, 1_000);
+    app.worker.compaction.running(id, .summary);
+    const presenter = NoopBridge.lifecyclePresenter(&app);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_000, test_awake_timestamp(1_000)));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 1), app.worker.compaction_reads);
+    try std.testing.expect(!app.stream.active);
+    app.shell.shimmer_active = true;
+    app.shell.render_requests.animation_visible = true;
+    app.shell.render_requests.animation_next_deadline_ms = 1_050;
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_050, test_awake_timestamp(1_050)));
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
+    app.shell.render_requests.clearReason(.animation);
+    app.worker.compaction.settle(id, .{ .outcome = .no_op }, 1_100);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_599, test_awake_timestamp(2_599)));
+    try std.testing.expect(!app.worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_600, test_awake_timestamp(2_600)));
+    try std.testing.expect(app.worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!app.stream.active);
 }
 
 test "core.app_worker_runtime advances visible animation exactly at its deadline" {

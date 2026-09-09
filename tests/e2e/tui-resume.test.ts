@@ -6964,8 +6964,18 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
       }
       const sessionId = sessionIdFromHome(home);
+      const historyPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
+      const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      await active.waitForText("Context compacted.", TIMEOUT);
+      // Success is silent; publication, not a transcript notice, gates resume.
+      await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"context_checkpoint"'), "durable context checkpoint");
+      await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+      const compacted = readFileSync(historyPath, "utf8");
+      expect(compacted.startsWith(before)).toBe(true);
+      const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
+      expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+      expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
+      expect(gateway.requests).toHaveLength(4);
       const summaryRequest = JSON.parse(gateway.requests[3]!.body);
       expect(summaryRequest.prompt).toHaveLength(2);
       expect(summaryRequest.prompt[0].role).toBe("system");

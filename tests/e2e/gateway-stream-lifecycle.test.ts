@@ -178,6 +178,44 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
   }, 60000);
 }
 
+const COMPACTION_ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+
+function compactionIdle(pane: string): boolean {
+  return hasEmptyComposer(pane) && !COMPACTION_ACTIVITY.test(pane);
+}
+
+function compactionEventsPath(root: FixtureRoot): string {
+  const sessionsRoot = join(root.home, ".fx", "sessions");
+  const parents = readdirSync(sessionsRoot).filter((id) => {
+    const path = join(sessionsRoot, id, "session.json");
+    return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
+  });
+  expect(parents).toHaveLength(1);
+  return join(sessionsRoot, parents[0]!, "events.jsonl");
+}
+
+function checkpointCount(events: string): number {
+  return events.split("\n").slice(0, -1)
+    .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
+}
+
+async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: number) {
+  const eventsPath = compactionEventsPath(root);
+  const before = readFileSync(eventsPath, "utf8");
+  const checkpoints = checkpointCount(before);
+  await tui.sendText("/compact");
+  const pane = await tui.waitForPane(
+    (text) => compactionIdle(text) &&
+      checkpointCount(readFileSync(eventsPath, "utf8")) === checkpoints + 1,
+    timeoutMs,
+  );
+  const after = readFileSync(eventsPath, "utf8");
+  expect(after.startsWith(before)).toBe(true);
+  expect(checkpointCount(after)).toBe(checkpoints + 1);
+  expect(pane).not.toContain("request failed:");
+  expect(pane).not.toContain("Compaction failed.");
+}
+
 function writeContextLimitFixture(root: FixtureRoot) {
   const skillDirectory = join(
     root.workspace,
@@ -5644,8 +5682,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.sendText("Remember the result and acknowledge this short follow-up.");
       await tui.waitForText("RECENT_TURN_DONE", 15_000);
       await tui.waitForComposer(15_000);
-      await tui.sendText("/compact");
-      await tui.waitForPane((text) => hasEmptyComposer(text) && summaries === 2 && (text.includes("Context compacted.") || text.includes("request failed:")), 20_000);
+      await compactAndWait(tui, root, 20_000);
+      expect(summaries).toBe(2);
       expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(15_000)).toBe(true);
@@ -5748,10 +5786,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
           if (trigger === "manual") {
-            await tui.sendText("/compact");
-            const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
-            expect(compacted).not.toContain("request failed:");
-            expect(compacted).toContain("Context compacted.");
+            await compactAndWait(tui, root, 20000);
           }
           expect(compactions).toBe(2);
           const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
@@ -5862,8 +5897,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           stderrPath: compactionStderrPath,
         });
         await tui.waitForComposer(15_000);
-        await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
+        await compactAndWait(tui, root, 15_000);
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -5998,8 +6032,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(resumedTranscript).toContain("compaction restart complete");
         expect(resumedTranscript).not.toContain("context_handoff");
         expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
-        await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
+        await compactAndWait(tui, root, 15_000);
         expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
@@ -6115,10 +6148,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
-            await tui.sendText("/compact");
-            const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
-            expect(compacted).not.toContain("request failed:");
-            expect(compacted).toContain("Context compacted.");
+            await compactAndWait(tui, root, 20000);
           }
           expect(compactions).toBe(1);
           expect(gateway.requests).toHaveLength(5);
@@ -6197,6 +6227,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           15_000,
         );
 
+        const eventsPath = compactionEventsPath(root);
+        const originalHistory = readFileSync(eventsPath, "utf8");
+        expect(checkpointCount(originalHistory)).toBe(0);
         await tui.sendText("/compact");
         const requestDeadline = Date.now() + 15_000;
         while (gateway.requests.length < 3) {
@@ -6209,11 +6242,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           if (Date.now() >= requestDeadline) throw new Error("compactor provider did not start");
           await Bun.sleep(10);
         }
+        await tui.waitForText(COMPACTION_ACTIVITY, Math.max(1, requestDeadline - Date.now()));
+        expect(gateway.requests).toHaveLength(3);
+        expect(JSON.parse(gateway.requests[2]!.body).tools).toEqual([]);
+        expect(JSON.parse(gateway.requests[2]!.body).toolChoice).toEqual({ type: "none" });
+        expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
         tui.sendKeysImmediate(["Escape"]);
         await tui.waitForPane(
-          (pane) => pane.includes("Context compaction cancelled.") && hasEmptyComposer(pane),
+          (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),
           5_000,
         );
+        expect(gateway.requests).toHaveLength(3);
+        expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
 
         const latest = await runFx(["session", "last", "--json"], {
           cwd: root.workspace,
@@ -6239,17 +6279,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           15_000,
         );
         expect(gateway.requests).toHaveLength(4);
+        const followUpRequest = gateway.requests[3]!.body;
+        expect(followUpRequest).toContain("MANUAL_CANCEL_FIRST_READY");
+        expect(followUpRequest).toContain("MANUAL_CANCEL_SECOND_READY");
+        expect(followUpRequest).not.toContain("context_handoff");
+        const beforeFailure = readFileSync(eventsPath, "utf8");
+        expect(beforeFailure.startsWith(originalHistory)).toBe(true);
+        expect(checkpointCount(beforeFailure)).toBe(0);
         expect(readFileSync(tracePath, "utf8")).not.toContain(
           "[context_compaction] event=installed",
         );
         responses.push(fakeGatewayFinalText(""), fakeGatewayFinalText(""));
         await tui.sendText("/compact");
-        const failedSummary = await tui.waitForPane(
-          (pane) => pane.includes("context was kept") && hasEmptyComposer(pane),
+        await tui.waitForPane(
+          (pane) => pane.includes("Compaction failed. Try /compact again.") && compactionIdle(pane),
           15_000,
         );
-        expect(failedSummary.replace(/\s+/g, " ")).toContain("Try /compact again or send a follow-up");
         expect(gateway.requests).toHaveLength(6);
+        expect(gateway.requests[5]!.body).toBe(gateway.requests[4]!.body);
+        expect(readFileSync(eventsPath, "utf8")).toBe(beforeFailure);
         const afterFailure = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace, env: { HOME: root.home },
         });
@@ -6330,8 +6378,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             hasEmptyComposer(pane),
           20_000,
         );
-        await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
+        await compactAndWait(tui, root, 15_000);
         await tui.sendText("Read the explicit skill after compaction.");
         await tui.waitForPane(
           (pane) =>

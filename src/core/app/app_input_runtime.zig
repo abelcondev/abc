@@ -2930,6 +2930,10 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                     return;
                 }
+                if (interrupt_rt.dismissCompactionFeedback(app)) {
+                    _ = disarmEscapeClear(app);
+                    return;
+                }
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
                     try interrupt_rt.cancelActiveOperation(app);
                 }
@@ -2954,6 +2958,10 @@ pub fn Runtime(comptime App: type) type {
             if (completion_rt.dismissVisibleInlinePicker(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (interrupt_rt.dismissCompactionFeedback(app)) {
+                _ = disarmEscapeClear(app);
                 return;
             }
             if (!draftHasState(app)) {
@@ -3343,6 +3351,8 @@ const RoutingUpgradeStatus = struct {
 };
 
 const RoutingWorker = struct {
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+
     submitted_permission: ?ToolPermissionDecision = null,
     submitted_permission_feedback: [64]u8 = undefined,
     submitted_permission_feedback_len: usize = 0,
@@ -3362,6 +3372,14 @@ const RoutingWorker = struct {
     queued_count: usize = 0,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
+
+    pub fn compactionActivitySnapshot(self: *RoutingWorker) @import("../output/compaction_activity.zig").Snapshot {
+        return self.compaction.snapshot;
+    }
+
+    pub fn dismissCompactionActivity(self: *RoutingWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64) bool {
+        return self.compaction.dismiss(id, revision);
+    }
 
     pub fn queuedPromptCount(self: *const RoutingWorker) usize {
         return self.queued_count;
@@ -8151,6 +8169,21 @@ test "app_input_runtime ctrl+c clears an image-only draft" {
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
+test "Escape dismisses idle compaction feedback without clearing the draft or cancelling a turn" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    const id = app.worker.compaction.begin(.manual, null, 1);
+    app.worker.compaction.settle(id, .{ .outcome = .failed }, 2);
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 3);
+    try std.testing.expect(app.worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
 test "app_input_runtime double escape clears an image-only draft" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -10368,6 +10401,24 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmedAt() != null);
     try std.testing.expect(!app.should_exit);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "automatic compaction cancellation is silent only while compaction is active" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |settled| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.stream.active = true;
+        const id = app.worker.compaction.begin(.automatic, 1, 1);
+        app.worker.compaction.running(id, .summary);
+        if (settled) app.worker.compaction.settle(id, .{ .outcome = .succeeded }, 2);
+        try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+        try std.testing.expect(app.worker.cancel_requested);
+        var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+        defer rendered.deinit(alloc);
+        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+        try std.testing.expectEqualStrings("", app.notice_body.items);
+    }
 }
 
 test "app_input_runtime active tool Escape presents final cancellation immediately" {

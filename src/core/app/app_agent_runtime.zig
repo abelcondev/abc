@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
 const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -945,7 +946,9 @@ pub fn Runtime(comptime App: type) type {
             queued_job: worker_runtime.QueuedPrompt,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
+            failure_provenance: ?*?compaction_activity.ErrorProvenance,
         ) !void {
+            if (failure_provenance) |out| out.* = null;
             var job = queued_job;
             var fresh_history: ?worker_runtime.FreshPromptHistory = null;
             defer if (fresh_history) |*snapshot| snapshot.deinit(std.heap.c_allocator);
@@ -1034,7 +1037,8 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
 
-            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
                 app,
@@ -1054,7 +1058,19 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             job: worker_runtime.ContextCompactionTask,
             gateway_retry_count: usize,
-        ) !void {
+            failure_provenance: ?*?compaction_activity.ErrorProvenance,
+        ) anyerror!void {
+            if (failure_provenance) |out| out.* = null;
+            const operation_id = job.operation_id orelse app.worker.beginCompactionActivity(.manual, job.turn_id);
+            app.worker.runCompactionActivity(operation_id, .preparation);
+            // Covers early cancellation before the transaction; acknowledged settlement wins.
+            defer if (app.worker.isCancelRequested()) {
+                app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
+            };
+            errdefer |err| {
+                app.worker.settleCompactionActivity(operation_id, compaction_activity.failure(err, .preparation, app.worker.isCancelRequested()));
+                if (failure_provenance) |out| out.* = .{ .operation_id = operation_id, .turn_id = job.turn_id, .err = err };
+            }
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -1115,7 +1131,7 @@ pub fn Runtime(comptime App: type) type {
                 continuation.request.messages = continuation_messages;
                 const refine = window.refine_budget(arena, deps.agent_stream_provider, continuation, capabilities, source_tokens, &retention_target) catch |err| {
                     if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
-                    return err;
+                    return @as(anyerror!void, err);
                 };
                 if (refine) continue;
                 var compaction_count: usize = 0;
@@ -1130,6 +1146,8 @@ pub fn Runtime(comptime App: type) type {
                 };
                 const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
                     .trigger = .manual,
+                    .operation_id = operation_id,
+                    .activity_origin = .manual,
                     .provider = job.provider,
                     .working_capabilities = capabilities,
                     .request_tokens = source_tokens,
@@ -1156,16 +1174,9 @@ pub fn Runtime(comptime App: type) type {
                     {
                         return;
                     }
-                    return err;
+                    return @as(anyerror!void, err);
                 };
-                _ = transaction orelse {
-                    try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                        .topic = "context",
-                        .tone = .neutral,
-                        .body = "No context to compact.",
-                    });
-                    return;
-                };
+                _ = transaction;
                 return;
             }
         }
@@ -2630,7 +2641,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         cancel_after_prepare: bool = false,
 
         fn run(self: *@This(), job: worker_runtime.QueuedPrompt) void {
-            Runtime(FakeApp).processQueuedPrompt(self.app, job, 1, test_gateway_chat_url) catch |err| {
+            Runtime(FakeApp).processQueuedPrompt(self.app, job, 1, test_gateway_chat_url, null) catch |err| {
                 self.failure = err;
             };
             self.returned.store(true, .release);
@@ -2858,7 +2869,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
         failure: ?anyerror = null,
 
         fn run(self: *@This(), target: *FakeApp, task: worker_runtime.ContextCompactionTask) void {
-            Runtime(FakeApp).processContextCompaction(target, task, 1) catch |err| {
+            Runtime(FakeApp).processContextCompaction(target, task, 1, null) catch |err| {
                 self.failure = err;
             };
             self.returned.store(true, .release);
@@ -2880,17 +2891,19 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     defer events.deinit(std.heap.c_allocator);
     defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     const deadline = io_mod.milliTimestamp() + 5_000;
-    while (events.items.len < 2) {
+    while (events.items.len == 0) {
         var batch = app.worker.takeEvents();
         defer batch.deinit(std.heap.c_allocator);
         try events.appendSlice(std.heap.c_allocator, batch.items);
         if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
-        if (events.items.len < 2) io_mod.sleep(std.time.ns_per_ms);
+        if (events.items.len == 0) io_mod.sleep(std.time.ns_per_ms);
     }
-    try std.testing.expect(events.items[1] == .context_compaction);
+    try std.testing.expect(events.items[0] == .context_compaction);
     try std.testing.expect(!worker.returned.load(.acquire));
+    const pending_activity = app.worker.compactionActivitySnapshot();
+    try std.testing.expectEqual(compaction_activity.Stage.publication, pending_activity.operation.?.phase.running);
     try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    app.worker.resolveContextCompaction(std.heap.c_allocator, events.items[1].context_compaction, &app, Worker.commit);
+    app.worker.resolveContextCompaction(std.heap.c_allocator, events.items[0].context_compaction, &app, Worker.commit);
     thread.join();
     joined = true;
     if (worker.failure) |err| return err;
@@ -2902,16 +2915,25 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
     try std.testing.expect(gateway.saw_no_tools);
     try std.testing.expectEqualStrings("test-model", gateway.observed_model.?);
-    try std.testing.expectEqual(@as(usize, 3), events.items.len);
-    try std.testing.expect(events.items[0] == .semantic_notice);
-    try std.testing.expectEqualStrings("Compacting context…", events.items[0].semantic_notice.body);
-    try std.testing.expect(events.items[1] == .context_compaction);
-    try std.testing.expect(events.items[1].context_compaction.active_prefix == null);
-    try std.testing.expect(events.items[2] == .semantic_notice);
-    try std.testing.expectEqualStrings("Context compacted.", events.items[2].semantic_notice.body);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0] == .context_compaction);
+    try std.testing.expect(events.items[0].context_compaction.active_prefix == null);
+
+    const completed_activity = app.worker.compactionActivitySnapshot();
+    try std.testing.expectEqual(pending_activity.operation.?.id, completed_activity.operation.?.id);
+    try std.testing.expectEqual(compaction_activity.Outcome.succeeded, completed_activity.operation.?.phase.terminal.outcome);
+    try std.testing.expect(completed_activity.revision > pending_activity.revision);
+    app.worker.finishProcessing();
+    try std.testing.expectEqualDeep(completed_activity, app.worker.compactionActivitySnapshot());
 
     app.snapshot_custom_guidance = "fixed tool guidance " ** 20_000;
-    try std.testing.expectError(error.ContextCapacityExceeded, Runtime(FakeApp).processContextCompaction(&app, job, 1));
+    var provenance: ?compaction_activity.ErrorProvenance = null;
+    try std.testing.expectError(error.ContextCapacityExceeded, Runtime(FakeApp).processContextCompaction(&app, job, 1, &provenance));
+    const failed_activity = app.worker.compactionActivitySnapshot();
+    try std.testing.expectEqual(failed_activity.operation.?.id, provenance.?.operation_id);
+    try std.testing.expectEqual(error.ContextCapacityExceeded, provenance.?.err);
+    try std.testing.expectEqual(error.ContextCapacityExceeded, failed_activity.operation.?.phase.terminal.err.?);
+    try std.testing.expect(failed_activity.operation.?.id != completed_activity.operation.?.id);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
     try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
 }
@@ -2926,7 +2948,7 @@ test "app agent runtime processes a cancelled queued prompt" {
     const job = try makeQueuedPrompt(alloc);
     defer worker_runtime.freeQueuedPrompt(alloc, job);
 
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null);
 
     try std.testing.expectEqual(@as(usize, 0), app.append_context_count);
     try std.testing.expectEqual(@as(usize, 1), app.snapshot_tools_count);
@@ -2975,7 +2997,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
 
     app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
 
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null);
 
     var events = app.worker.takeEvents();
     defer events.deinit(std.heap.c_allocator);
@@ -3043,7 +3065,7 @@ test "app agent runtime clears active turn settings when queued prompt setup fai
     };
     job.permission_mode = .yolo;
 
-    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url));
+    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null));
     try std.testing.expectEqual(
         @as(?PermissionMode, .yolo),
         app.snapshot_permission_mode,
@@ -3267,7 +3289,7 @@ test "app agent runtime settles queued snapshot ownership when prompt admission 
                 .invalid_writer => error.SessionCommitFailed,
                 .uncertain_checkpoint => error.SessionPersistenceUncertain,
             },
-            Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+            Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null),
         );
         if (admission == .uncertain_checkpoint) {
             try std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{});
@@ -3323,7 +3345,7 @@ test "app agent runtime discards every snapshot in a failed multi-image prefligh
 
     try std.testing.expectError(
         error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null),
     );
     try std.testing.expectError(
         error.FileNotFound,

@@ -14,6 +14,7 @@ const tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_contracts = @import("tool_contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
+const compaction_activity = @import("../../output/compaction_activity.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -33,6 +34,13 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+};
+
+/// Presentation only. Called outside history publication's worker critical section.
+pub const CompactionActivityEffect = struct {
+    begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
+    running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
+    settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -221,6 +229,9 @@ pub const AgentRuntimeDeps = struct {
     publish_deferred_tool_completion: ?*const fn (ctx: *anyopaque, completion: DeferredToolCompletion) TransportPublicationOutcome = null,
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
     commit_context_compaction: ?ContextCompactionCommitEffect = null,
+    compaction_activity: ?CompactionActivityEffect = null,
+    /// Call-scoped output for the exact error returned through compaction, never retained.
+    compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,

@@ -1949,6 +1949,7 @@ const ConversationTurnBuilder = struct {
             .execution = execution,
             .cancelled_command = cancelled_command,
             .terminal_reason = value.reason,
+            .cancellation_origin = value.cancellation_origin,
         } };
     }
 
@@ -4900,6 +4901,64 @@ test "cache-free conversation session resumes from metadata and JSONL" {
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     try std.testing.expectEqualStrings("question", resumed.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("answer", resumed.history[0].assistant.assistant);
+}
+
+test "conversation cancellation provenance survives checkpoint resume range and archive replay" {
+    const alloc = std.testing.allocator;
+    for (std.enums.values(types.CancellationOrigin)) |origin| {
+        for ([_]bool{ false, true }) |checkpoint| {
+            var temp = try TempRoot.init(alloc);
+            defer temp.deinit(alloc);
+            var initial = try testState(alloc, "cancellation-provenance", 10);
+            defer initial.deinit(alloc);
+            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("earlier reply") }};
+            const user: types.UserTurn = .{ .text = @constCast("request") };
+            {
+                var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+                defer loaded.deinit(alloc);
+                if (checkpoint) {
+                    _ = try loaded.commitContextCompaction(alloc, .{
+                        .summary = @constCast("Earlier context."),
+                        .removed_turn_count = 0,
+                        .compaction_count = 1,
+                    }, .{
+                        .user = user,
+                        .assistant = @constCast(""),
+                        .execution = .{ .tool_steps = &steps },
+                    }, .{ .tool_steps = 1 }, 20);
+                }
+                _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                    .conversation_language = .literal("en"),
+                    .total_input_tokens = 1,
+                    .total_output_tokens = 1,
+                    .turn = .{ .interrupted = .{
+                        .user = user,
+                        .assistant = @constCast("partial reply"),
+                        .execution = .{ .tool_steps = if (checkpoint) &.{} else &steps },
+                        .cancellation_origin = origin,
+                    } },
+                } }, 30);
+            }
+            var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, if (checkpoint) 2 else 1), resumed.state.history.len);
+            const active = resumed.state.history[if (checkpoint) 1 else 0].interrupted;
+            try std.testing.expectEqual(origin, active.cancellation_origin);
+            try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, active.terminal_reason);
+            try std.testing.expectEqualStrings("partial reply", active.assistant.?);
+            const range = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+            defer session.freeHistoryTurnSlice(alloc, range);
+            try std.testing.expectEqual(@as(usize, 1), range.len);
+            try std.testing.expectEqual(origin, range[0].interrupted.cancellation_origin);
+            try std.testing.expectEqualStrings("earlier reply", range[0].interrupted.execution.tool_steps[0].assistant.?);
+            const archive = try loadConversationArchive(alloc, &resumed.log.dir);
+            defer session.freeHistoryTurnSlice(alloc, archive);
+            try std.testing.expectEqual(origin, archive[archive.len - 1].interrupted.cancellation_origin);
+            var readonly = try temp.root.loadReadOnly(alloc, initial.id, .{});
+            defer readonly.deinit(alloc);
+            try std.testing.expectEqual(origin, readonly.history[readonly.history.len - 1].interrupted.cancellation_origin);
+        }
+    }
 }
 
 test "conversation preserves standalone replies across completion and interruption" {
