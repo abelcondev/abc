@@ -82,6 +82,60 @@ pub const ConversationInterruption = struct {
     command_artifact_ref: ?[]const u8 = null,
     files: []const types.FileEvidence = &.{},
     turn_summary: ?types.TurnSummary = null,
+    cancellation_origin: types.CancellationOrigin = .turn,
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ConversationInterruption {
+        const Wire = struct {
+            reason: session.InterruptedTerminalReason,
+            partial_text: ?[]const u8 = null,
+            command_replay_ref: ?[]const u8 = null,
+            command_replay_bytes: ?u64 = null,
+            command_artifact_ref: ?[]const u8 = null,
+            files: []const types.FileEvidence = &.{},
+            turn_summary: ?types.TurnSummary = null,
+            cancellation_origin: std.json.Value = .{ .string = "turn" },
+        };
+        const wire = try std.json.innerParse(Wire, alloc, source, options);
+        // The default enum decoder also accepts numeric tags, not just names.
+        if (wire.cancellation_origin != .string) return error.UnexpectedToken;
+        const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse
+            return error.InvalidEnumTag;
+        return .{
+            .reason = wire.reason,
+            .partial_text = wire.partial_text,
+            .command_replay_ref = wire.command_replay_ref,
+            .command_replay_bytes = wire.command_replay_bytes,
+            .command_artifact_ref = wire.command_artifact_ref,
+            .files = wire.files,
+            .turn_summary = wire.turn_summary,
+            .cancellation_origin = origin,
+        };
+    }
+
+    // Keep ordinary record bytes unchanged. Older strict readers reject the
+    // optional compaction origin; they cannot safely replay those records.
+    pub fn jsonStringify(self: ConversationInterruption, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("reason");
+        try writer.write(self.reason);
+        try writer.objectField("partial_text");
+        try writer.write(self.partial_text);
+        try writer.objectField("command_replay_ref");
+        try writer.write(self.command_replay_ref);
+        try writer.objectField("command_replay_bytes");
+        try writer.write(self.command_replay_bytes);
+        try writer.objectField("command_artifact_ref");
+        try writer.write(self.command_artifact_ref);
+        try writer.objectField("files");
+        try writer.write(self.files);
+        try writer.objectField("turn_summary");
+        try writer.write(self.turn_summary);
+        if (self.cancellation_origin == .compaction) {
+            try writer.objectField("cancellation_origin");
+            try writer.write(self.cancellation_origin);
+        }
+        try writer.endObject();
+    }
 };
 
 pub const ConversationTurnCompleted = struct {
@@ -441,6 +495,7 @@ pub fn appendHistoryTurnConversationEvents(
             }
             try events.append(alloc, .{ .interrupted = .{
                 .reason = entry.terminal_reason,
+                .cancellation_origin = entry.cancellation_origin,
                 .partial_text = entry.assistant,
                 .command_replay_ref = interruptedCommandReplayRef(entry),
                 .command_replay_bytes = interruptedCommandReplayBytes(entry),
@@ -3268,6 +3323,146 @@ test "conversation transition validates sequence tool identity and checkpoint sa
         .timestamp_ms = 10,
         .event = .{ .assistant = .{ .text = "skipped sequence" } },
     }));
+}
+
+test "conversation cancellation provenance preserves ordinary frame bytes" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .interrupted = .{ .reason = .cancelled } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}}}\n",
+        encoded,
+    );
+    for ([_]u8{ 1, 2 }) |version| {
+        for (std.enums.values(session.InterruptedTerminalReason)) |reason| {
+            const old = try std.fmt.allocPrint(alloc, "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"{s}\"}}}}}}\n", .{ version, @tagName(reason) });
+            defer alloc.free(old);
+            var decoded = try decodeConversationFrame(alloc, old);
+            defer decoded.deinit();
+            try std.testing.expectEqual(types.CancellationOrigin.turn, decoded.value.event.interrupted.cancellation_origin);
+            try std.testing.expectEqual(reason, decoded.value.event.interrupted.reason);
+            try validateConversationTransition(.{}, decoded.value);
+        }
+    }
+}
+
+test "conversation cancellation provenance roundtrips history projection with owned strings" {
+    const Case = struct {
+        fn run(alloc: Allocator, origin: types.CancellationOrigin) !void {
+            const turn: types.HistoryTurn = .{ .interrupted = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast("partial"),
+                .cancellation_origin = origin,
+            } };
+            const copy = try session.dupeHistoryTurn(alloc, turn);
+            defer session.freeHistoryTurn(alloc, copy);
+            var events: std.ArrayList(ConversationEvent) = .empty;
+            defer events.deinit(alloc);
+            try appendHistoryTurnConversationEvents(alloc, &events, copy);
+            try std.testing.expectEqual(@as(usize, 2), events.items.len);
+            try std.testing.expectEqual(origin, events.items[1].interrupted.cancellation_origin);
+            // This in-memory writer reports injected allocation failure as WriteFailed.
+            const encoded = encodeConversationFrame(alloc, .{ .seq = 2, .timestamp_ms = 1, .event = events.items[1] }) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            defer alloc.free(encoded);
+            try std.testing.expectEqual(origin == .compaction, std.mem.find(u8, encoded, "\"cancellation_origin\"") != null);
+            var decoded = try decodeConversationFrame(alloc, encoded);
+            defer decoded.deinit();
+            try std.testing.expectEqual(origin, decoded.value.event.interrupted.cancellation_origin);
+            try std.testing.expectEqual(session.InterruptedTerminalReason.cancelled, decoded.value.event.interrupted.reason);
+            try std.testing.expectEqualStrings("partial", decoded.value.event.interrupted.partial_text.?);
+            try validateConversationTransition(.{ .last_seq = 1 }, decoded.value);
+            const again = encodeConversationFrame(alloc, decoded.value) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            defer alloc.free(again);
+            try std.testing.expectEqualStrings(encoded, again);
+        }
+    };
+    for (std.enums.values(types.CancellationOrigin)) |origin| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{origin});
+    }
+}
+
+test "conversation cancellation provenance rejects invalid values and retains strict unknown fields" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "1", "true", "[]", "{}", "\"compaction\",\"future_field\":true" }, 0..) |origin, i| {
+        const bytes = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"cancelled\",\"partial_text\":\"partial\",\"cancellation_origin\":{s}}}}}}}\n", .{origin});
+        defer alloc.free(bytes);
+        if (i < 2) {
+            var decoded = try decodeConversationFrame(alloc, bytes);
+            defer decoded.deinit();
+            try std.testing.expectEqual(if (i == 0) types.CancellationOrigin.turn else .compaction, decoded.value.event.interrupted.cancellation_origin);
+        } else {
+            try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, bytes));
+        }
+    }
+}
+
+test "journal cancellation provenance survives reduction and durable checkpoint reload" {
+    const projection = @import("session_projection.zig");
+    const alloc = std.testing.allocator;
+    for (std.enums.values(types.CancellationOrigin)) |origin| {
+        var jsonl: std.Io.Writer.Allocating = .init(alloc);
+        defer jsonl.deinit();
+        const started = try encodeLegacyFixtureFrame(alloc, .{
+            .log_generation = identifier(1),
+            .seq = 1,
+            .event_id = identifier(2),
+            .timestamp_ms = 1,
+            .event = .{ .session_started = .{
+                .id = @constCast("provenance"),
+                .created_at_ms = 1,
+                .origin_workspace_root = @constCast("/tmp/workspace"),
+                .workspace_root = @constCast("/tmp/workspace"),
+                .conversation_language = .literal("en"),
+                .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+            } },
+        });
+        defer alloc.free(started);
+        const committed = try encodeLegacyFixtureFrame(alloc, .{
+            .log_generation = identifier(1),
+            .seq = 2,
+            .event_id = identifier(3),
+            .timestamp_ms = 2,
+            .event = .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .turn = .{ .interrupted = .{
+                    .user = .{ .text = @constCast("request") },
+                    .assistant = @constCast("partial"),
+                    .cancellation_origin = origin,
+                } },
+            } },
+        });
+        defer alloc.free(committed);
+        try jsonl.writer.writeAll(started);
+        try jsonl.writer.writeAll(committed);
+        var source = std.Io.Reader.fixed(jsonl.written());
+        var reduced = try reduceJsonl(alloc, &source, null);
+        defer reduced.deinit(alloc);
+        try std.testing.expectEqual(origin, reduced.state.history[0].interrupted.cancellation_origin);
+        var duplicate = try reduced.state.dupe(alloc);
+        defer duplicate.deinit(alloc);
+        const checkpoint = try projection.encodeCheckpoint(alloc, .{
+            .session_id = duplicate.id,
+            .log_generation = identifier(1),
+            .through_seq = 2,
+            .through_event_id = identifier(3),
+            .through_event_log_bytes = jsonl.written().len,
+            .state = duplicate,
+        });
+        defer alloc.free(checkpoint);
+        var restored = try projection.decodeCheckpoint(alloc, checkpoint);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(origin, restored.state.history[0].interrupted.cancellation_origin);
+        try std.testing.expectEqual(session.InterruptedTerminalReason.cancelled, restored.state.history[0].interrupted.terminal_reason);
+        try std.testing.expectEqualStrings("partial", restored.state.history[0].interrupted.assistant.?);
+    }
 }
 
 test "conversation frame round trips an external tool result reference" {

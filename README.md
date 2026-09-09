@@ -131,7 +131,9 @@ Context estimates adjust to observed provider usage, including when a local esti
 
 While compaction runs, the activity row shows `Compacting` with elapsed time instead of the ordinary turn label and token counts. Manual `/compact` returns to an idle composer without sending a prompt; automatic compaction continues the current turn. Cancellation and failure feedback stays in the status area, not the transcript.
 
-Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries, compaction notices, or operation ledgers.
+Compaction handoffs remain internal context for the model. Resuming a session and opening its full transcript show the conversation and tool activity, not internal summaries, compaction notices, or operation ledgers. Cancelling automatic compaction records its origin so reopening does not add a cancellation marker; ordinary turn cancellations still appear.
+
+Existing sessions load without migration. Sessions saved after cancelling automatic compaction contain new cancellation metadata; reopen them with the same or a newer fx build, since older builds may reject that metadata.
 
 Saved conversations preserve original assistant replies and compatible provider continuation data. Display formatting does not rewrite saved text, and hook-driven continuation keeps earlier replies separate from the final response.
 

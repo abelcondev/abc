@@ -3477,7 +3477,7 @@ pub fn Runtime(comptime App: type) type {
                             try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
                         }
                         switch (entry.terminal_reason) {
-                            .cancelled => if (entry.cancelled_command == null) {
+                            .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
                             },
                             .failed => try sink.appendNotice(

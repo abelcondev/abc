@@ -94,6 +94,10 @@ pub const PendingPromptCredentialReadiness = enum {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn compactionOwnsCredentialFeedback(app: *const App) bool {
+            return if (comptime @hasField(App, "submission")) app.submission.compaction_pending else false;
+        }
+
         fn ensurePromptCredential(app: *App) !bool {
             if (try rejectPendingPreparation(app)) return false;
             if (comptime provider_runtime.supported(App) and
@@ -104,6 +108,7 @@ pub fn Runtime(comptime App: type) type {
                     const selection = selectProviderCredential(app, provider) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         debug_trace.logf("auth", "prompt credential preference load failed err={s}", .{@errorName(err)});
+                        if (compactionOwnsCredentialFeedback(app)) return false;
                         try writeAuthNotice(app, .{
                             .topic = "auth",
                             .tone = .@"error",
@@ -184,6 +189,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn missingPromptCredential(app: *App, provider: model_provider.ProviderId) !bool {
             if (provider != .gateway) {
+                if (compactionOwnsCredentialFeedback(app)) return false;
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
@@ -198,6 +204,7 @@ pub fn Runtime(comptime App: type) type {
 
             const auth_view = app.auth.view();
             if (auth_view.onboarding_skipped) {
+                if (compactionOwnsCredentialFeedback(app)) return false;
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
@@ -1692,6 +1699,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn admitPromptCredential(app: *App) !bool {
             if (comptime !oauthAuthEnabled(App)) {
                 if (app.auth.apiKey() != null) return true;
+                if (compactionOwnsCredentialFeedback(app)) return false;
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
@@ -1860,8 +1868,7 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.recordCredentialFailure(failure)
             else
                 true;
-            const for_compaction = if (comptime @hasField(App, "submission")) app.submission.compaction_pending else false;
-            if (for_compaction or !first_observation) return false;
+            if (compactionOwnsCredentialFeedback(app) or !first_observation) return false;
             const recovery = try credentialRecoveryText(app.alloc, failure);
             defer app.alloc.free(recovery);
             try app.writeDomainNotice(.{
@@ -2271,6 +2278,7 @@ const TestAuth = struct {
     refresh_error: ?anyerror = null,
     selected_source: ?credentials.Source = null,
     active_source: ?credentials.Source = .ai_gateway_api_key,
+    onboarding_skipped: bool = false,
     refresh_count: usize = 0,
     logout_reconcile_count: usize = 0,
     source_inventory_refresh_count: usize = 0,
@@ -2311,7 +2319,7 @@ const TestAuth = struct {
                 false,
             .stored_key_status = .not_attempted,
             .fx_login_status = .not_attempted,
-            .onboarding_skipped = false,
+            .onboarding_skipped = self.onboarding_skipped,
         };
     }
 
@@ -3356,6 +3364,35 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+}
+
+test "manual compaction missing credentials leave transcript feedback to its owner" {
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        for ([_]bool{ false, true }) |for_compaction| {
+            var app: TestApp = .{};
+            defer app.deinit();
+            app.auth.active_source = null;
+            app.auth.onboarding_skipped = true;
+            app.submission.compaction_pending = for_compaction;
+
+            try std.testing.expect(!try Runtime(TestApp).missingPromptCredential(&app, provider));
+            try std.testing.expectEqual(@as(usize, if (for_compaction) 0 else 1), app.notice_write_count);
+            try std.testing.expectEqual(for_compaction, app.transcript.items.len == 0);
+            try std.testing.expect(!app.auth.picker_opened);
+        }
+    }
+}
+
+test "manual compaction missing credentials preserves onboarding when it is enabled" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = null;
+    app.submission.compaction_pending = true;
+
+    try std.testing.expect(!try Runtime(TestApp).missingPromptCredential(&app, .gateway));
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
 }
 
 test "manual compaction credential failure leaves feedback to its lifecycle owner" {

@@ -119,15 +119,16 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       return JSON.parse(stdout);
     } finally { clearTimeout(timer); }
   }
-  async function launch() {
+  async function launch(withoutCredential = false) {
     const tape = join(root, `terminal-${++launchIndex}.fxtape`);
     const stderr = join(root, `terminal-${launchIndex}.stderr`);
     tapes.push(tape);
     stderrPaths.push(stderr);
-    const terminalEnv = { ...env, FX_RECORD: tape, FX_DEBUG_RECORD_SILENT_BANNER: "1",
+    const terminalEnv: Record<string, string> = { ...env, FX_RECORD: tape, FX_DEBUG_RECORD_SILENT_BANNER: "1",
       FX_TRACE_LOG: join(root, `terminal-${launchIndex}.trace`),
       FX_TRACE_SCOPES: "input,worker,session,scroll,agent,gateway,compaction",
     };
+    if (withoutCredential) delete terminalEnv.AI_GATEWAY_API_KEY;
     // Do not inherit provider overrides, credentials, shell startup or dotenv state.
     const command = `/usr/bin/env -i ${Object.entries(terminalEnv).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
     terminal = await TmuxSession.create({
@@ -193,6 +194,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     phase = "attempt";
     return {
       launch, close, cleanup, durable, cli, tapes, root, seedTurns, summaryHold, ordinaryHold,
+      savedEvents: () => readFileSync(eventsPath, "utf8"),
       counts: () => ({ summaries, ordinary, overflowSent }),
       phase: (value: typeof phase) => { phase = value; },
       lastRequest: () => gateway.requests.at(-1)!.body,
@@ -346,6 +348,77 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       } finally { await f.cleanup(passed); }
     }, 90_000);
   }
+
+  for (const trigger of ["auto", "ordinary"] as const) {
+    test(`${trigger}: cancellation provenance preserves the correct transcript after reopen`, async () => {
+      const f = await fixture(trigger);
+      let passed = false;
+      try {
+        const terminal = await f.launch();
+        await terminal.sendText("Cancel this held response.");
+        await until(() => trigger === "auto" ? f.counts().summaries === 1 : f.counts().ordinary === 2, "held cancellation boundary");
+        await terminal.waitForText(trigger === "auto" ? ACTIVITY : /Thinking \(/, 10_000);
+        await terminal.sendKeys("Escape");
+        if (trigger === "auto") {
+          await terminal.waitForText("Compaction cancelled.", 10_000);
+          await terminal.sendKeys("Escape");
+        } else {
+          await terminal.waitForText("Cancelled", 10_000);
+        }
+        await terminal.waitForComposer(5000);
+        expect(f.durable()).toBe(0);
+        await f.close();
+        expect(f.savedEvents().includes('"cancellation_origin":"compaction"')).toBe(trigger === "auto");
+
+        const reopened = await f.launch();
+        await reopened.sendKeys("C-o");
+        await reopened.waitForText("Full detail", 5000);
+        await reopened.sendKeys("End");
+        const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
+        writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
+        expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
+        await reopened.sendKeys("C-o");
+        await reopened.waitForComposer(5000);
+        await f.close();
+        passed = true;
+      } finally { await f.cleanup(passed); }
+    }, 60_000);
+  }
+
+  test("missing credentials keep compaction feedback local without hiding ordinary auth errors", async () => {
+    const f = await fixture("manual");
+    let passed = false;
+    try {
+      const terminal = await f.launch(true);
+      const authMessage = "fx needs access to Vercel AI Gateway";
+      async function authNotices(label: string) {
+        await terminal.sendKeys("C-o");
+        await terminal.waitForText("Full detail", 5000);
+        await terminal.sendKeys("End");
+        const pane = await terminal.waitForPane((text) => text.includes("Full detail") && text.includes(authMessage), 5000);
+        writeFileSync(join(f.root, `${label}.txt`), pane);
+        await terminal.sendKeys("C-o");
+        await terminal.waitForComposer(5000);
+        return pane.split(authMessage).length - 1;
+      }
+      const initialNotices = await authNotices("auth-before");
+      expect(initialNotices).toBeGreaterThan(0);
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Compaction was not started.", 5000);
+      expect(f.counts().summaries).toBe(0);
+      expect(f.counts().ordinary).toBe(f.seedTurns);
+      expect(f.durable()).toBe(0);
+      await terminal.sendKeys("Escape");
+      expect(await authNotices("auth-after-compaction")).toBe(initialNotices);
+
+      await terminal.sendText("Ordinary request without a credential.");
+      await terminal.waitForText(authMessage, 5000);
+      expect(await authNotices("auth-after-ordinary")).toBe(initialNotices + 1);
+      expect(f.counts().ordinary).toBe(f.seedTurns);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 60_000);
 
   test("ordinary held request remains Thinking without compaction or extra requests", async () => {
     const f = await fixture("ordinary");

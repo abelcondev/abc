@@ -6729,12 +6729,10 @@ fn processQueuedPromptLoop(
                             }) catch |err| {
                                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
                                     runtime_telemetry.traceCancelObserved(step_ctx, false);
-                                    try runtime_interruption.persistInterruptedTurnOnce(
+                                    try runtime_interruption.persistCompactionInterruptedTurnOnce(
                                         deps,
                                         finalization,
                                         job,
-                                        null,
-                                        null,
                                         completed_tool_names.items,
                                         &interrupted_persisted,
                                         step_ctx,
