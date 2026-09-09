@@ -80,6 +80,7 @@ const FrameAttemptResult = struct {
     animation_visible: bool,
     yolo_warning_visible: bool = false,
     pending_prompt_presented: bool = false,
+    file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
 
     fn is_committed(self: FrameAttemptResult) bool {
         return self.shadow_state.is_committed();
@@ -521,9 +522,6 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [2][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
-        var file_completions_buf: [input_completion_runtime.file_picker_completion_cap]file_index.SearchResult = undefined;
-        var file_match_spans_buf: [input_completion_runtime.file_picker_completion_cap * file_index.max_path_len]file_index.MatchSpan = undefined;
-        var file_path_storage_buf: [input_completion_runtime.file_picker_path_storage_cap]u8 = undefined;
         noinline fn footerContext(
             app: *App,
             upgrade_status_buf: *[64]u8,
@@ -608,22 +606,22 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const file_query = if (model_query == null and provider_query == null)
+            const completion_rt = input_completion_runtime.CompletionRuntime(App);
+            const file_query = if (model_query == null and provider_query == null and completion_rt.hasFileQuery(app))
                 app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
             else
                 null;
-            var file_items: []const file_index.SearchResult = &.{};
-            var file_anchor: usize = 0;
-            var file_selection_index: usize = 0;
-            if (file_query) |fq| {
-                file_anchor = fq.at_offset;
-                const count = app.fileCompletions(fq.query, &file_completions_buf, &file_match_spans_buf, &file_path_storage_buf) catch |err| failed: {
-                    debug_trace.logf("render", "file picker render search failed err={s}", .{@errorName(err)});
-                    break :failed 0;
-                };
-                file_items = file_completions_buf[0..count];
-                file_selection_index = app.input_runtime.picker.file_completion_index;
-            }
+            const file_view = completion_rt.filePickerView(app);
+            const file_anchor = if (file_query) |fq| fq.at_offset else 0;
+            const file_selection = if (file_view.receipt) |receipt| receipt.selected else null;
+            const file_status: ?[]const u8 = switch (file_view.status) {
+                .unavailable => if (app.input_runtime.picker.file_completion.indexed)
+                    "Files unavailable. Tab to retry; Esc to dismiss."
+                else
+                    "Directory unavailable. Tab to retry; Esc to dismiss.",
+                .stale => "Selection unavailable. Navigate to choose; Tab to retry.",
+                .loading, .ready, .empty => null,
+            };
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
@@ -723,18 +721,14 @@ pub fn Runtime(comptime App: type) type {
                 .provider_picker_completion_window_start = provider_picker_window_start,
                 .provider_picker_completion_anchor = provider_picker_anchor,
                 .file_query_active = file_query != null,
-                .file_completions = file_items,
-                .file_completion_index = file_selection_index,
+                .file_completions = file_view.items,
+                .file_completion_index = file_selection orelse 0,
+                .file_completion_has_selection = file_selection != null,
+                .file_completion_status = file_status,
                 .file_completion_window_start = app.input_runtime.picker.file_completion_window_start,
                 .file_completion_anchor = file_anchor,
-                .file_completions_loading = if (file_query) |fq|
-                    fileCompletionsDependOnIndex(app, fq.query) and app.isFileIndexLoading()
-                else
-                    false,
-                .file_completions_failed = if (file_query) |fq|
-                    fileCompletionsDependOnIndex(app, fq.query) and app.isFileIndexFailed()
-                else
-                    false,
+                .file_completions_loading = file_view.status == .loading,
+                .file_completions_failed = file_view.status == .unavailable,
                 .inline_completion_suffix = if (inline_completion) |completion|
                     completion.suffix()
                 else
@@ -883,13 +877,6 @@ pub fn Runtime(comptime App: type) type {
             return fast_index % picker_state.model_picker_fast_options.len == 1;
         }
 
-        fn fileCompletionsDependOnIndex(app: *App, query: []const u8) bool {
-            if (comptime @hasDecl(App, "fileCompletionsDependOnIndex")) {
-                return app.fileCompletionsDependOnIndex(query);
-            }
-            return true;
-        }
-
         pub fn flushRequestedFrame(app: *App) !void {
             if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) return;
             const has_resize_lifecycle =
@@ -964,6 +951,7 @@ pub fn Runtime(comptime App: type) type {
             };
 
             if (!result.is_committed()) {
+                input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
                 render_requests.resetInputPendingAbortStreak();
                 attempt.restore();
                 debug_trace.logf(
@@ -982,6 +970,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            if (result.file_picker_receipt) |receipt| {
+                input_completion_runtime.CompletionRuntime(App).acknowledgeFilePicker(app, receipt);
+            } else {
+                input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
+            }
             const committed_at_ms = io_mod.milliTimestamp();
             attempt.commit(
                 committed_at_ms,
@@ -1203,6 +1196,7 @@ pub fn Runtime(comptime App: type) type {
                 shimmer_pos,
                 &steering,
             );
+            const file_picker_receipt = input_completion_runtime.CompletionRuntime(App).filePickerView(app).receipt;
             var footer_ctx = main_footer_ctx;
             const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
@@ -1795,6 +1789,12 @@ pub fn Runtime(comptime App: type) type {
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
                 .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
+                .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
+                    footer_measurement != null and footer_measurement.?.show_picker and
+                    footer_measurement.?.picker_kind == .file and footer_measurement.?.picker_rows > 0)
+                    file_picker_receipt
+                else
+                    null,
             };
         }
 
@@ -2892,6 +2892,8 @@ test "transcript checkpoint sees input retained above an empty terminal" {
 }
 
 const CoordinatorFaultTestApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
     shell: struct {
         terminal_dimensions_invalid: bool = false,
         terminal_reset_pending: bool = false,
@@ -2909,6 +2911,7 @@ const CoordinatorFaultTestApp = struct {
     inject_animation_reset: bool = false,
     animation_visible: bool = false,
     notification_flushes: usize = 0,
+    file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
     last_snapshot: ?render_request.AttemptSnapshot = null,
 
     fn flushNotifications(self: *CoordinatorFaultTestApp) void {
@@ -2934,6 +2937,7 @@ const CoordinatorFaultTestApp = struct {
                 break :blk .{
                     .shadow_state = .committed,
                     .animation_visible = self.animation_visible,
+                    .file_picker_receipt = self.file_picker_receipt,
                 };
             },
             .preparation_error => error.TestPreparationFailure,
@@ -2949,6 +2953,37 @@ const CoordinatorFaultTestApp = struct {
         };
     }
 };
+
+test "file picker receipt aborts preserve authority and uncertain writes revoke it" {
+    const state_mod = @import("../input/file_completion_state.zig");
+    const alloc = std.testing.allocator;
+    for ([_]CoordinatorFault{ .preparation_error, .input_pending, .terminal_partial_write, .shadow_feed_failed }) |fault| {
+        var app: CoordinatorFaultTestApp = .{};
+        defer app.input_runtime.deinit(alloc);
+        try app.input_runtime.textReplacementState().replace(alloc, "@file");
+        const picker = &app.input_runtime.picker;
+        _ = picker.file_completion.reconcile(picker.activeFilePickerQuery(&app.input_runtime.edit_state), 0, true);
+        const values = [_]file_index.SearchResult{.{ .path = "file.txt", .kind = .file, .matched_spans = &.{} }};
+        picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
+        app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.selected(0) != null);
+        picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
+        app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
+        app.fault = fault;
+        app.shell.render_requests.request(.footer);
+        if (fault == .preparation_error) {
+            try std.testing.expectError(error.TestPreparationFailure, Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app));
+        } else try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.prepared != null);
+        try std.testing.expectEqual(fault == .preparation_error or fault == .input_pending, picker.file_completion.selected(0) != null);
+        app.fault = .committed;
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try std.testing.expect(picker.file_completion.prepared == null);
+        try std.testing.expectEqualStrings("file.txt", picker.file_completion.selected(0).?.path);
+    }
+}
 
 test "core.app_render_runtime requested-frame flush skips absent and blocked work" {
     var app = CoordinatorFaultTestApp{};
@@ -3416,6 +3451,8 @@ const CoordinatorTestApp = struct {
     permission_state: app_permission_runtime.State = .{},
     upgrader: CoordinatorTestUpgrader = .{},
     terminal_client: CoordinatorTestTerminalClient = .{},
+    file_completion_values: []const file_index.SearchResult = &.{},
+    file_completion_calls: usize = 0,
 
     pub fn slashRegistry(_: *const CoordinatorTestApp) command_specs.SlashRegistry {
         return coordinator_test_slash_registry;
@@ -3433,18 +3470,32 @@ const CoordinatorTestApp = struct {
         self.model_cache.deinit();
     }
 
+    pub fn prepareDirectoryCompletion(self: *CoordinatorTestApp) void {
+        const completion = @import("../input/file_completion_state.zig");
+        const state = &self.input_runtime.picker.file_completion;
+        const rows = completion.Rows.copy(self.alloc, self.file_completion_values) catch {
+            state.stage(self.alloc, .{ .state = .ready }, .unavailable, null);
+            return;
+        };
+        self.file_completion_calls += 1;
+        state.stage(self.alloc, .{ .state = .ready }, if (rows.results.len == 0) .empty else .ready, rows);
+    }
+
     pub fn modelCompletions(_: *CoordinatorTestApp, _: []const u8, _: [][]const u8) usize {
         return 0;
     }
 
     pub fn fileCompletions(
-        _: *CoordinatorTestApp,
+        self: *CoordinatorTestApp,
         _: []const u8,
-        _: []file_index.SearchResult,
+        out: []file_index.SearchResult,
         _: []file_index.MatchSpan,
         _: []u8,
     ) file_index.SearchError!usize {
-        return 0;
+        self.file_completion_calls += 1;
+        const count = @min(out.len, self.file_completion_values.len);
+        @memcpy(out[0..count], self.file_completion_values[0..count]);
+        return count;
     }
 
     pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
@@ -3513,6 +3564,54 @@ fn initCoordinatorProjectionTestApp(
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     return app;
+}
+
+test "file picker real frame receipt promotes only visible rows and preserves prepared identity" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(std.testing.io);
+    var app = try initCoordinatorProjectionTestApp(alloc, sink);
+    defer app.deinit();
+    app.terminal_client.source_running = false;
+    const completion = input_completion_runtime.CompletionRuntime(CoordinatorTestApp);
+    const first = [_]file_index.SearchResult{
+        .{ .path = "b.txt", .kind = .file, .matched_spans = &.{} },
+        .{ .path = "c.txt", .kind = .file, .matched_spans = &.{} },
+    };
+    app.file_completion_values = &first;
+    try app.input_runtime.textReplacementState().replace(alloc, "@txt");
+    completion.prepareFilePicker(&app);
+    try std.testing.expect(app.input_runtime.picker.file_completion.selected(0) == null);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqualStrings("b.txt", app.input_runtime.picker.file_completion.selected(0).?.path);
+    var grid: std.ArrayList(u8) = .empty;
+    defer grid.deinit(alloc);
+    try app.shell.shadow_vt.?.snapshot(&grid);
+    try std.testing.expect(std.mem.find(u8, grid.items, "c.txt") != null);
+    const picker = &app.input_runtime.picker;
+    picker.file_completion.navigate(&picker.file_completion_index, &picker.file_completion_window_start, 1);
+    const next = [_]file_index.SearchResult{.{ .path = "a.txt", .kind = .file, .matched_spans = &.{} }} ++ first;
+    app.file_completion_values = &next;
+    picker.file_completion.retry();
+    completion.prepareFilePicker(&app);
+    try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
+    // A catalog owns the frame while the completion stays staged.
+    app.input_runtime.help_menu.active = true;
+    completion.reconcileFilePicker(&app);
+    const prepared_revision = completion.filePickerView(&app).receipt.?.revision;
+    app.shell.render_requests.request(.footer);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(picker.file_completion.prepared != null);
+    try std.testing.expect(picker.file_completion.selected(picker.file_completion_index) == null);
+    app.input_runtime.help_menu.active = false;
+    app.shell.render_requests.request(.footer);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqual(prepared_revision, completion.filePickerView(&app).receipt.?.revision);
+    try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
+    try std.testing.expectEqual(@as(usize, 2), app.file_completion_calls);
 }
 
 test "core.app_render_runtime keeps final token progress during paced response tail" {
