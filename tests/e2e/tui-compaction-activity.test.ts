@@ -146,6 +146,16 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     await terminal.waitForComposer(5000);
     return terminal;
   }
+  async function waitForResumeHandoff() {
+    if (lines < 18_000) return;
+    const tracePath = join(root, `terminal-${launchIndex}.trace`);
+    // Wait only after submission: the composer accepts input during restoration,
+    // but replies need the immutable history source to hand off to the live one.
+    // 18k rows / 64 per frame needs about 282 frames. Debug observations reached
+    // 77 ms median / 134 ms max per frame; 60s bounds the drain, not the reply.
+    await until(() => readFileSync(tracePath, "utf8").includes("resume historical flow committed"),
+      `resume history-source handoff in ${tracePath}`, 60_000);
+  }
   function durable() {
     const bytes = readFileSync(eventsPath);
     expect(bytes.subarray(0, initial.length).equals(initial)).toBe(true);
@@ -193,7 +203,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     expect(ordinary).toBe(seedTurns);
     phase = "attempt";
     return {
-      launch, close, cleanup, durable, cli, tapes, root, seedTurns, summaryHold, ordinaryHold,
+      launch, close, cleanup, durable, cli, tapes, root, seedTurns, summaryHold, ordinaryHold, waitForResumeHandoff,
       savedEvents: () => readFileSync(eventsPath, "utf8"),
       counts: () => ({ summaries, ordinary, overflowSent }),
       phase: (value: typeof phase) => { phase = value; },
@@ -267,6 +277,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           expect(pane).not.toMatch(ACTIVITY);
           expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
+          await f.waitForResumeHandoff();
           await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane), 10_000);
         }
         expect(f.counts().overflowSent).toBe(trigger === "overflow");
@@ -282,6 +293,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.phase("reopen");
         const reopened = await f.launch();
         await reopened.sendText("Continue after reopening.");
+        await f.waitForResumeHandoff();
         await reopened.waitForPane((pane) => pane.includes(REOPEN) && hasEmptyComposer(pane), 10_000);
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 2 });
         expect(f.durable()).toBe(1);
