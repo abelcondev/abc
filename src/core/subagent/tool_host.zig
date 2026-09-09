@@ -242,7 +242,13 @@ pub const Runtime = struct {
                     },
                     .ready => |ready| {
                         if (options.steering_worker != null) try self.retainYielded(ready.child_id, operation_id, options.max_result_bytes);
-                        _ = try self.managed.start(ready.child_id);
+                        _ = self.managed.start(ready.child_id) catch |err| {
+                            if (options.steering_worker != null) {
+                                debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ ready.child_id, operation_id, @errorName(err) });
+                                self.removeYielded(ready.child_id, operation_id);
+                            }
+                            return err;
+                        };
                         const result = try self.observeManagedState(
                             alloc,
                             ready.child_id,
@@ -719,6 +725,99 @@ test "parallel subagent wait bookkeeping stays serialized" {
     try std.testing.expect(first.failure == null);
     try std.testing.expect(second.failure == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
+}
+
+fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
+    const Fixture = struct {
+        runs: std.atomic.Value(usize) = .init(0),
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            _ = self.runs.fetchAdd(1, .seq_cst);
+            return error.ProviderFailed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    const state = session_codec.DurableSessionState{
+        .id = @constCast("failed-start-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var parent = try sessions.startWritableSession(alloc, state);
+    defer parent.deinit(alloc);
+    var fixture = Fixture{};
+    const runtime = try Runtime.create(alloc, &sessions, state.id, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    defer runtime.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    runtime.managed.closed = true;
+    try runtime.retainYielded("other-child", "other-work", 2048);
+
+    var request = try model_contract.validateRequest(alloc, switch (action) {
+        .run => .{ .run = .{ .task = "review this" } },
+        .message => .{ .message = .{ .agent = "reviewer", .message = "review this" } },
+    });
+    defer request.deinit(alloc);
+    const options = ExecuteOptions{
+        .caller_id = state.id,
+        .invocation_id = "failed-start",
+        .identity_epoch = 1,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = state.conversation_language },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .steering_worker = &worker,
+    };
+    try std.testing.expectError(error.OwnerClosed, runtime.executeManaged(alloc, &request, options));
+    try std.testing.expectEqual(@as(usize, 0), runtime.managed.slots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.runs.load(.seq_cst));
+
+    const work_id = try operationIdAlloc(alloc, options.invocation_id, options.identity_epoch);
+    defer alloc.free(work_id);
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+    const child = registry.findByOperation(work_id).?;
+    try std.testing.expectEqual(child_state.Phase.running, child.phase);
+    var saved = try sessions.loadReadOnly(alloc, child.id);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.subagent_child);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
+    try std.testing.expect(!runtime.hasYieldedChild(child.id));
+    const retained = runtime.yielded.items[0];
+    try std.testing.expectEqualStrings("other-child", retained.child_id);
+    try std.testing.expectEqualStrings("other-work", retained.work_id);
+    try std.testing.expectEqual(@as(usize, 2048), retained.max_result_bytes);
+    try std.testing.expect(!retained.delivered);
+    runtime.removeYielded("other-child", "other-work");
+    // Keep the regression bounded even when failed starts leave pending work.
+    try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
+    try std.testing.expect(!try runtime.waitYielded(&worker));
+}
+
+test "subagent failed start removes only its pending tuple for run" {
+    try checkFailedStartBookkeeping(.run);
+}
+
+test "subagent failed start removes only its pending tuple for message" {
+    try checkFailedStartBookkeeping(.message);
 }
 
 test "internal operation identity is deterministic and invocation-bound" {
