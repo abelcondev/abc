@@ -322,6 +322,17 @@ fn runOne(slot: *Slot) OneOutcome {
         .work_id = work_id,
         .outcome = .cancelled,
     } else failedOutcome(work_id, "admission", err);
+    @import("../shared/debug_trace.zig").logf(
+        "subagent",
+        "child turn admitted child_id={s} work_id={s} provider={s} model={s} effort={s}",
+        .{
+            slot.child_id,
+            work_id,
+            @tagName(admission.provider),
+            admission.model,
+            admission.effort.label(),
+        },
+    );
     var owned_admission = admission;
     defer owned_admission.deinit(owner.alloc);
     const result = owner.services.run(
