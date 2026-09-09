@@ -6488,6 +6488,95 @@ test "child live authority refresh denies the next tool action before execution"
     try std.testing.expectEqual(runtime_deps.ToolActivityPhase.denied, activity.phases[2]);
 }
 
+test "child target failures settle the batch before and after permission without effects" {
+    const Probe = struct {
+        hooks: FakeAgentRuntimeDeps,
+        after_permission: bool,
+        provider_error: ?anyerror = null,
+        target_error: anyerror = error.NotDir,
+
+        fn target(raw: *anyopaque, arena: std.mem.Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
+            const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("hooks", hooks);
+            if (std.mem.eql(u8, call.id, "bad-target") and self.provider_error == null and
+                (!self.after_permission or hooks.permission_index > 0))
+                return self.target_error;
+            return arena.dupe(u8, "/tmp/workspace/file.txt");
+        }
+
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ToolCall, _: []const u8, _: []const u8, _: tool_dispatch.PermissionTargetKind) !runtime_deps.ResolvedLiveToolAuthority {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.provider_error) |err| return err;
+            return .{
+                .authority = .{
+                    .generation = 1,
+                    .root_id = "root",
+                    .tools = &.{"read_file"},
+                    .integrations = &.{},
+                    .rules = .{ .rules = &.{} },
+                    .grants = &.{},
+                    .permission_mode = .auto,
+                },
+                .decision = .allow,
+            };
+        }
+    };
+    const cases = [_]struct { after_permission: bool = false, target_error: anyerror = error.NotDir, provider_error: ?anyerror = null, fatal: ?anyerror = null }{
+        .{},
+        .{ .after_permission = true },
+        .{ .target_error = error.OutOfMemory, .fatal = error.OutOfMemory },
+        .{ .target_error = error.Cancelled, .fatal = error.Cancelled },
+        .{ .provider_error = error.FileNotFound, .fatal = error.FileNotFound },
+        .{ .provider_error = error.HostAuthorityUnavailable, .fatal = error.HostAuthorityUnavailable },
+    };
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+        const calls = [_]ToolCall{
+            toolCall("bad-target", "read_file", "{\"path\":\"bad\"}"),
+            toolCall("good-neighbor", "read_file", "{\"path\":\"good\"}"),
+        };
+        const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "recovered" } };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var probe = Probe{
+            .hooks = FakeAgentRuntimeDeps.init(alloc),
+            .after_permission = case.after_permission,
+            .target_error = case.target_error,
+            .provider_error = case.provider_error,
+        };
+        defer probe.hooks.deinit();
+        probe.hooks.permission_decisions = &.{ .once, .once };
+        probe.hooks.exec_plans = &.{.{ .result = .{ .model_output = "good result" } }};
+        var deps = probe.hooks.deps();
+        deps.agent_stream_provider = gateway.provider();
+        deps.permission_target_for_call = Probe.target;
+        deps.live_tool_authority = .{ .context = &probe, .resolve_fn = Probe.resolve };
+        var agent: @import("../agent.zig").Agent = .{};
+        defer agent.deinit(alloc);
+        var fixture = PromptFixture{};
+        const config = fixture.config();
+        const result = runtime_orchestrator.processAgentPrompt(
+            &agent,
+            &deps,
+            null,
+            test_support.testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, config.workspace_root),
+            config,
+            fixture.job(),
+        );
+        if (case.fatal) |err| {
+            try std.testing.expectError(err, result);
+            try std.testing.expectEqual(@as(usize, 0), probe.hooks.executed_names.items.len);
+            continue;
+        }
+        try result;
+        try std.testing.expectEqual(@as(usize, 1), probe.hooks.executed_call_ids.items.len);
+        try std.testing.expectEqualStrings("good-neighbor", probe.hooks.executed_call_ids.items[0]);
+        try std.testing.expectEqual(@as(usize, if (case.after_permission) 2 else 1), probe.hooks.permission_names.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), probe.hooks.rejected_names.items.len);
+    }
+}
+
 test "child live authority revalidates after permission before effect" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(

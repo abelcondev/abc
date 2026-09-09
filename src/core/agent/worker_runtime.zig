@@ -1003,6 +1003,9 @@ pub const WorkerRuntime = struct {
             interrupt_after_admission = !self.hasActiveToolBoundaryLocked();
         }
         try self.enqueuePromptLocked(alloc, queued);
+        if (steer_if_active and self.worker_processing) {
+            debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), interrupt_after_admission });
+        }
         if (interrupt_after_admission) {
             if (sameTurnSteeringEligible(queued)) {
                 self.steering_cancel_turn_id = self.active_turn_id;
@@ -1042,6 +1045,19 @@ pub const WorkerRuntime = struct {
             .{ queued.prompt.len, self.queuedWorkCountLocked(), if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
         );
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    pub fn hasPendingPlainSteering(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or self.active_turn_id == 0 or self.worker_stop_requested) return false;
+        var pending = false;
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.delivery.activeTurnId() != self.active_turn_id) continue;
+            if (!sameTurnSteeringEligible(prompt)) return false;
+            pending = true;
+        }
+        return pending;
     }
 
     /// Classifies and drains steering at one observed agent boundary. Returned
@@ -1455,6 +1471,7 @@ pub const WorkerRuntime = struct {
             .turn_phase_update => |update| if (update.turn_id == self.active_turn_id) {
                 switch (update.phase) {
                     .running => self.tool_phase_step_id = update.step_id,
+                    .waiting_for_subagent => {},
                     .thinking, .generating => if (self.tool_phase_step_id != update.step_id) {
                         self.tool_phase_step_id = null;
                     },
@@ -4174,6 +4191,34 @@ fn expectContinuedSteering(result: SteeringBoundaryResult) ![]const []const u8 {
     };
 }
 
+test "subagent steering peek preserves the existing queue consumer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(!runtime.hasPendingPlainSteering());
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try std.testing.expect(runtime.hasPendingPlainSteering());
+    try std.testing.expect(runtime.hasPendingPlainSteering());
+    {
+        var images: [1]types.ImageAttachment = undefined;
+        runtime.queued_prompts.items[1].images = &images;
+        defer runtime.queued_prompts.items[1].images = &.{};
+        try std.testing.expect(!runtime.hasPendingPlainSteering());
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqualStrings("first", guidance[0]);
+    try std.testing.expectEqualStrings("second", guidance[1]);
+    try std.testing.expect(!runtime.hasPendingPlainSteering());
+}
+
 test "interactive prompt admission derives steering from active worker state" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -4371,6 +4416,43 @@ test "tool lifecycle decides whether interactive steering interrupts immediately
     } } });
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
     try std.testing.expect(runtime.isCancelRequested());
+}
+
+test "subagent wait phase preserves steering control and existing tool boundaries" {
+    const alloc = std.testing.allocator;
+    for ([_]?u64{ null, 7 }) |tool_step| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        runtime.active_turn_id = 41;
+        runtime.tool_phase_step_id = tool_step;
+        for ([_][]const u8{ "first steering", "second steering" }) |text| {
+            try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+                .turn_id = 41,
+                .step_id = 8,
+                .phase = .waiting_for_subagent,
+            } });
+            try std.testing.expectEqual(tool_step, runtime.tool_phase_step_id);
+            try std.testing.expectEqual(@as(usize, 0), runtime.active_tool_calls.count());
+            try std.testing.expect(!runtime.isCancelRequested());
+            try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, text, "model"));
+            try std.testing.expectEqual(tool_step == null, runtime.isCancelRequested());
+            const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(
+                alloc,
+                41,
+                if (tool_step == null) .cancelled else .model,
+            ));
+            defer {
+                for (guidance) |item| alloc.free(item);
+                alloc.free(guidance);
+            }
+            try std.testing.expectEqual(@as(usize, 1), guidance.len);
+            try std.testing.expectEqualStrings(text, guidance[0]);
+            try std.testing.expect(!runtime.isCancelRequested());
+        }
+        runtime.requestCancel();
+        try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .cancelled)) == .interrupt);
+    }
 }
 
 test "tool handoff phase holds steering only through its model step" {

@@ -71,6 +71,134 @@ function createFixtureRoot(label: string): FixtureRoot {
   return { root, home, workspace: realpathSync(workspace) };
 }
 
+for (const action of ["run", "message"] as const) for (const stop of [false, true]) {
+  test(`subagent steering responds before ${action} finishes, stop=${stop}`, async () => {
+    const root = createFixtureRoot("subagent-steering");
+    const held = heldFakeGatewayFinalText();
+    const parentReply = heldFakeGatewayFinalText();
+    const activity = (pane: string) => pane.match(/^[• ] (?:Thinking|Generating|Running) \([^\n]+$/gm)?.at(-1)?.slice(2) ?? "";
+    const requests: string[] = [];
+    let childRequests = 0;
+    let delegated = false;
+    let afterChildTool = false;
+    writeFileSync(join(root.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      if (latest.includes("STEERING_CHILD")) {
+        childRequests++;
+        return held.response;
+      }
+      requests.push(raw);
+      if (!delegated) {
+        delegated = true;
+        return fakeGatewayToolCall("steering-delegation", "subagent", { request: action === "run"
+          ? { action, task: "STEERING_CHILD" }
+          : { action, agent: "worker", message: "STEERING_CHILD" } });
+      }
+      if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
+      if (raw.includes("HELD_CHILD_RESULT")) {
+        expect(JSON.stringify(body.prompt.filter((item: any) => item.role === "user"))).not.toContain("HELD_CHILD_RESULT");
+        if (!afterChildTool) {
+          afterChildTool = true;
+          return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
+        }
+        expect(raw).toContain("AFTER_CHILD_TOOL_OK");
+        return fakeGatewayFinalText("CHILD_COMPLETE");
+      }
+      expect(afterChildTool).toBe(false);
+      if (latest.includes("STEERING_SECOND")) return fakeGatewayFinalText("SECOND_ACCEPTED");
+      return new Response(parentReply.response.body!.pipeThrough(new TransformStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"type":"text-start","id":"answer_1"}\n\n' +
+              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: "FIRST_STREAMING\n\nStill composing the first reply. " })}\n\n`,
+          ));
+        },
+      })), { headers: parentReply.response.headers });
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const registry = () => {
+      const sessions = join(root.home, ".fx/sessions");
+      for (const id of readdirSync(sessions)) {
+        const path = join(sessions, id, "subagent/children.json");
+        if (existsSync(path)) {
+          const value = JSON.parse(readFileSync(path, "utf8"));
+          if (value.children.length) return { id, value };
+        }
+      }
+      throw new Error("child registry unavailable");
+    };
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true,
+        stderrPath: join(root.root, "stderr.log"),
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "synthetic-steering", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_LOG: join(root.root, "trace.log"), FX_TRACE_SCOPES: "subagent,worker,agent,tool",
+        },
+      });
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("STEERING_START");
+      await tui.waitForPane(() => childRequests === 1, 10000);
+      const original = registry().value.children[0];
+      await tui.sendText("STEERING_FIRST");
+      const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
+      expect(activity(streaming)).toMatch(/^Generating \(/);
+      // Keep the parent stream open without more text after the visible prefix drains.
+      await Bun.sleep(300);
+      expect(activity(await tui.capturePane())).toMatch(/^Generating \(/);
+      expect(registry().value.children[0].phase).toBe("running");
+      expect(registry().value.children[0].last_outcome).toBeNull();
+      parentReply.release("FIRST_ACCEPTED");
+      await tui.waitForText("FIRST_ACCEPTED", 10000);
+      await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
+      await tui.sendText("STEERING_SECOND");
+      await tui.waitForText("SECOND_ACCEPTED", 10000);
+      await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
+      expect(childRequests).toBe(1);
+      const pending = registry().value.children[0];
+      expect(pending.id).toBe(original.id);
+      expect(pending.active.id).toBe(original.active.id);
+      expect(requests.some(raw => raw.includes(original.id) && raw.includes(original.active.id))).toBe(true);
+      expect(pending.phase).toBe("running");
+      expect(pending.last_outcome).toBeNull();
+      expect(await tui.captureFullScrollback()).toContain("still running");
+      if (stop) {
+        await tui.sendKeys("Escape");
+        await tui.waitForPane(() => registry().value.children[0].last_outcome === "cancelled", 10000);
+      } else {
+        held.release("HELD_CHILD_RESULT");
+        await tui.waitForText("CHILD_COMPLETE", 10000);
+        expect(requests.filter(raw => raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
+      }
+      await tui.waitForStableComposer(10000);
+      await tui.sendText("STEERING_LATER");
+      await tui.waitForText("LATER_OK", 10000);
+      expect(childRequests).toBe(1);
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
+      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
+      const trace = readFileSync(join(root.root, "trace.log"), "utf8");
+      expect(trace).toContain("event=steering_wait_yielded ");
+      expect(trace.split("\n").filter(line => line.includes("event=steering_result_delivered "))).toHaveLength(stop ? 0 : 1);
+    } finally {
+      parentReply.dispose();
+      held.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60000);
+}
+
 const COMPACTION_ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
 
 function compactionIdle(pane: string): boolean {
@@ -7134,6 +7262,127 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  test.each(["run", "message"] as const)("subagent %s recovers from search path failures and completes its batch", async (action) => {
+    const root = createFixtureRoot("subagent-search-recovery");
+    const trace = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "RECOVERY_READ\n");
+    writeFileSync(join(root.workspace, "not-dir"), "UNCHANGED\n");
+    symlinkSync("loop", join(root.workspace, "loop"));
+    const badCalls = [
+      { id: "missing-search", name: "glob_files", input: { path: "missing", pattern: "*" }, error: "FileNotFound" },
+      { id: "not-dir-search", name: "grep_files", input: { path: "not-dir/child", pattern: "test" }, error: "NotDir" },
+      { id: "loop-search", name: "glob_files", input: { path: "loop/child", pattern: "*" }, error: "SymLinkLoop" },
+    ];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "recover-child")) {
+        expect(JSON.parse(toolResultOutput(body, "recover-child"))).toEqual({ ok: true, result: "CHILD_RECOVERED", error_code: null });
+        return fakeGatewayFinalText("SEARCH_RECOVERY_COMPLETE");
+      }
+      if (!body.includes('"name":"subagent"')) {
+        childRequests++;
+        if (hasCurrentToolResult(body, "recovery-read")) {
+          for (const call of badCalls) {
+            expect(toolResultOutput(body, call.id)).toContain(`Permission target resolution failed for ${call.name}: ${call.error}`);
+          }
+          expect(toolResultOutput(body, "recovery-read")).toContain("RECOVERY_READ");
+          return fakeGatewayFinalText("CHILD_RECOVERED");
+        }
+        return fakeGatewaySse([
+          ...badCalls.map(call => ({ type: "tool-call", toolCallId: call.id, toolName: call.name, input: call.input })),
+          { type: "tool-call", toolCallId: "recovery-read", toolName: "read_file", input: { path: "notes.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+      }
+      return fakeGatewayToolCall("recover-child", "subagent", { request: action === "run"
+        ? { action, task: "Inspect the prepared fixture and report." }
+        : { action, agent: "reader", message: "Inspect the prepared fixture and report." } });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Delegate the fixture inspection."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, trace), FX_TRACE_SCOPES: "agent,tool,permission,subagent" },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("SEARCH_RECOVERY_COMPLETE");
+      expect(childRequests).toBe(2);
+      expect(gateway.requests).toHaveLength(4);
+      expect(existsSync(join(root.workspace, "missing"))).toBe(false);
+      expect(readFileSync(join(root.workspace, "not-dir"), "utf8")).toBe("UNCHANGED\n");
+      const lines = readFileSync(trace, "utf8").split("\n");
+      for (const call of badCalls) {
+        expect(lines.filter(line => line.includes(`call_id=${call.id} `) && line.includes("event=execution_start"))).toHaveLength(0);
+        expect(lines.filter(line => line.includes(`call_id=${call.id} `) && line.includes("event=permission_requested"))).toHaveLength(0);
+      }
+      expect(lines.filter(line => line.includes("call_id=recovery-read ") && line.includes("event=execution_start"))).toHaveLength(1);
+      expect(lines.some(line => line.includes("event=child_execution_failed"))).toBe(false);
+      expect(result.stderr).not.toContain("panic");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("subagent search recovers when its target disappears during approval", async () => {
+    const root = createFixtureRoot("subagent-search-recheck");
+    const trace = join(root.root, "trace.log"), stderr = join(root.root, "stderr.log");
+    const target = join(root.workspace, "search-target");
+    mkdirSync(target);
+    writeFileSync(join(target, "match.txt"), "APPROVAL_SEARCH\n");
+    writeFileSync(join(root.workspace, "notes.txt"), "AFTER_APPROVAL\n");
+    writeFileSync(join(root.home, ".fx/settings.json"), JSON.stringify({ permission: { grep_files: "ask" } }));
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "approval-child")) {
+        expect(JSON.parse(toolResultOutput(body, "approval-child")).ok).toBe(true);
+        return fakeGatewayFinalText("APPROVAL_RECOVERY_COMPLETE");
+      }
+      if (!body.includes('"name":"subagent"')) {
+        childRequests++;
+        if (hasCurrentToolResult(body, "after-approval")) {
+          expect(toolResultOutput(body, "after-approval")).toContain("AFTER_APPROVAL");
+          return fakeGatewayFinalText("CHILD_RECOVERED");
+        }
+        if (hasCurrentToolResult(body, "approval-search")) {
+          expect(toolResultOutput(body, "approval-search")).toContain("FileNotFound");
+          return fakeGatewayToolCall("after-approval", "read_file", { path: "notes.txt" });
+        }
+        return fakeGatewayToolCall("approval-search", "grep_files", { pattern: "APPROVAL_SEARCH", path: "search-target" });
+      }
+      return fakeGatewayToolCall("approval-child", "subagent", { request: { action: "run", task: "Search the fixture, then read notes.txt." } });
+    }, { classifierDecision: "clear" });
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: root.workspace, isolated: true, remainOnExit: true, width: 120, height: 38, stderrPath: stderr,
+        env: { ...fixtureEnv(root, gateway, trace), FX_PERMISSION_MODE: "auto", FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+          FX_TRACE_SCOPES: "agent,tool,permission,subagent" },
+      });
+      await session.waitForStableComposer(15_000);
+      await session.sendText("Delegate the prepared search.");
+      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("Esc Cancel"), 15_000);
+      expect(existsSync(join(target, "match.txt"))).toBe(true);
+      renameSync(target, join(root.workspace, "moved-target"));
+      await session.sendKeys("Enter");
+      await session.waitForText("APPROVAL_RECOVERY_COMPLETE", 15_000);
+      await session.waitForStableComposer(15_000);
+      expect(childRequests).toBe(3);
+      const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
+      expect(lines.some(line => line.includes("event=permission_decision") && line.includes("decision=once"))).toBe(true);
+      expect(lines.some(line => line.includes("event=execution_start"))).toBe(false);
+      expect(readFileSync(join(root.workspace, "moved-target/match.txt"), "utf8")).toBe("APPROVAL_SEARCH\n");
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus().status).toBe(0);
+      expect(readFileSync(stderr, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");
