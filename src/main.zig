@@ -841,6 +841,7 @@ const App = struct {
         self.managed_executions.shutdown();
         self.upgrader.stop();
         self.file_index.requestStop();
+        WorkspaceAppRuntime.requestStop(self);
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
@@ -2147,6 +2148,37 @@ const App = struct {
         return WorkspaceAppRuntime.fileCompletions(self, query, out, match_spans, path_storage);
     }
 
+    pub fn fileCompletionsAtRevision(
+        self: *App,
+        revision: file_index_mod.ReadableRevision,
+        query: []const u8,
+        out: []file_index_mod.SearchResult,
+        match_spans: []file_index_mod.MatchSpan,
+        path_storage: []u8,
+    ) app_workspace_runtime.FileCompletionError!usize {
+        return WorkspaceAppRuntime.fileCompletionsAtRevision(self, revision, query, out, match_spans, path_storage);
+    }
+
+    pub fn reconcileDirectoryCompletion(self: *App, eligible: bool) void {
+        WorkspaceAppRuntime.reconcileDirectoryCompletion(self, eligible);
+    }
+
+    pub fn prepareDirectoryCompletion(self: *App) void {
+        WorkspaceAppRuntime.prepareDirectoryCompletion(self);
+    }
+
+    pub fn harvestDirectoryCompletion(self: *App, eligible: bool) void {
+        WorkspaceAppRuntime.harvestDirectoryCompletion(self, eligible);
+    }
+
+    pub fn fileCompletionRevision(self: *const App) file_index_mod.ReadableRevision {
+        return WorkspaceAppRuntime.fileCompletionRevision(self);
+    }
+
+    pub fn fileCompletionScopeEpoch(self: *const App) u64 {
+        return WorkspaceAppRuntime.fileCompletionScopeEpoch(self);
+    }
+
     pub fn fileCompletionsDependOnIndex(self: *const App, query: []const u8) bool {
         return WorkspaceAppRuntime.fileCompletionsDependOnIndex(self, query);
     }
@@ -2872,6 +2904,7 @@ const App = struct {
             try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
         }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
+        InputAppRuntime.collectFilePickerFacts(self);
 
         try self.collectThemeFacts();
 
@@ -3004,6 +3037,7 @@ const App = struct {
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
+        InputAppRuntime.prepareFilePicker(self);
         try self.flushRequestedFrame();
     }
 
@@ -4218,6 +4252,8 @@ test {
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
+    _ = @import("core/workspace/directory_completion_job.zig");
+    _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/github/git_context.zig");

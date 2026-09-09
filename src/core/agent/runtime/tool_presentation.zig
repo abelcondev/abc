@@ -47,6 +47,9 @@ fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
 ) []const u8 {
+    // Provider-executed search backends are never registered locally; their
+    // stream names (exa_search, ...) are internal identifiers, not display copy.
+    if (tooling_presentation.isProviderSearchAlias(tool_name)) return "web search";
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
         "shell"
     else
@@ -1571,6 +1574,15 @@ test "formatToolStatusWithStats accents the +/- counts and falls back to neutral
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m-1") != null);
 }
 
+test "fallback tool display never exposes provider search backend names" {
+    for ([_][]const u8{ "exa_search", "perplexity_search", "parallel_search" }) |name| {
+        try std.testing.expectEqualStrings("web search", fallbackToolDisplay(test_tool_registry, name));
+    }
+    try std.testing.expectEqualStrings("tool call", fallbackToolDisplay(test_tool_registry, "read_file"));
+    try std.testing.expectEqualStrings("tool call", fallbackToolDisplay(test_tool_registry, "run_command"));
+    try std.testing.expectEqualStrings("mcp_custom", fallbackToolDisplay(test_tool_registry, "mcp_custom"));
+}
+
 test "provisional lifecycle preflight distinguishes unknown eligible and ineligible tools" {
     try std.testing.expect(ProvisionalToolStatuses.preflight(test_tool_registry, "unknown_tool") == null);
 
@@ -1883,6 +1895,9 @@ test "tracked provisional cancellation retains labels without exposing registere
     try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig", null);
     try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
     try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_1", "exa_search", .read, "Searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_2", "perplexity_search", .read, "Searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_3", "exa_search", .read, "Searching", "cmux theme docs", null);
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
 
     var terminal_count: usize = 0;
@@ -1896,11 +1911,17 @@ test "tracked provisional cancellation retains labels without exposing registere
             try std.testing.expectEqualStrings("Cancelled tool call", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "mcp_1")) {
             try std.testing.expectEqualStrings("Cancelled mcp_custom", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_1")) {
+            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_2")) {
+            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_3")) {
+            try std.testing.expectEqualStrings("Cancelled cmux theme docs", event.terminal.outcome.summary);
         } else {
             return error.TestUnexpectedToolCallId;
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), terminal_count);
+    try std.testing.expectEqual(@as(usize, 6), terminal_count);
     try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
 
     const event_count = capture.events.items.len;
@@ -2091,12 +2112,23 @@ test "provisional lifecycle terminal matching prefers final id then provisional 
         .arguments_json = "{",
     });
 
-    try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
+    _ = try statuses.record(alloc, "provider_search_invalid");
+    try statuses.finishMalformedProviderToolArguments(&hooks, arena, 1, &.{.{
+        .id = "provider_search_invalid",
+        .name = "exa_search",
+        .arguments_json = "{",
+        .argument_integrity = .malformed_json,
+        .provenance = .provider_executed,
+    }});
+
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     for (capture.events.items) |event| {
         switch (event) {
             .terminal => |terminal| {
                 if (std.mem.eql(u8, terminal.id.call_id, "mcp_invalid")) {
                     try std.testing.expectEqualStrings("mcp_lookup failed: invalid JSON arguments", terminal.outcome.summary);
+                } else if (std.mem.eql(u8, terminal.id.call_id, "provider_search_invalid")) {
+                    try std.testing.expectEqualStrings("web search failed: invalid JSON arguments", terminal.outcome.summary);
                 } else {
                     try std.testing.expectEqualStrings("provisional_read", terminal.id.call_id);
                     try std.testing.expectEqualStrings("tool call failed: invalid JSON arguments", terminal.outcome.summary);

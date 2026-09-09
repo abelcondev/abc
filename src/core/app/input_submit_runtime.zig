@@ -761,14 +761,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                 return;
             }
 
-            const first_image_id = try firstAvailableImageId(app.pending_images.items);
+            const first_image_id = if (comptime @hasDecl(App, "peekNextImageId"))
+                app.peekNextImageId()
+            else
+                try firstAvailableImageId(app.pending_images.items);
             var extracted = image_attachments.extractInlineImageAttachments(
                 app.alloc,
                 app.workspace_root,
-                trimmed,
+                expanded.text,
                 first_image_id,
             ) catch |err| {
                 const message = switch (err) {
+                    error.InvalidImageId, error.ImageIdOverflow => return err,
                     error.UnsupportedImageType => try app.alloc.dupe(u8, "unsupported image type"),
                     error.FileNotFound => try app.alloc.dupe(u8, "image file not found"),
                     error.ImageTooLarge => try app.alloc.dupe(u8, image_attachments.image_too_large_notice),
@@ -788,14 +792,16 @@ pub fn SubmitRuntime(comptime App: type) type {
                 extracted.discard(app.alloc)
             else
                 extracted.deinit(app.alloc);
-            try assignStableExtractedImageIds(app, &extracted);
+            for (extracted.images) |image| {
+                if (image_attachments.findImageIndexById(app.pending_images.items, image.id) != null) return error.DuplicateImageId;
+            }
             if (try captureExtractedImages(app, extracted.images) == .rejected) {
                 app.shell.render_requests.request(.footer);
                 return;
             }
 
             const has_inline_images = extracted.images.len > 0;
-            const effective_text = if (has_inline_images) extracted.text else expanded.text;
+            const effective_text = extracted.text;
 
             var staged_images = if (app.pending_images.items.len > 0 or extracted.images.len > 0)
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
@@ -807,14 +813,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
-                trimmed,
                 effective_text,
                 app.input_runtime.entities.pasted_blocks.items,
                 app.input_runtime.entities.image_tokens.items,
                 app.pending_images.items,
-                extracted.image_spans,
+                extracted.edits,
                 extracted.images,
-                has_inline_images,
             );
             defer image_occurrences.deinit(app.alloc);
 
@@ -834,12 +838,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
-                trimmed,
                 effective_text,
                 visual_text.text,
                 app.input_runtime.entities.pasted_blocks.items,
                 app.input_runtime.entities.skill_tokens.items,
-                has_inline_images,
+                extracted.edits,
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
@@ -1196,95 +1199,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             return std.math.add(usize, highest_id, 1);
         }
 
-        fn assignStableExtractedImageIds(
-            app: *App,
-            extracted: *image_attachments.ExtractedInlineImages,
-        ) !void {
-            if (extracted.images.len == 0) return;
-            if (comptime !@hasDecl(App, "peekNextImageId")) return;
-
-            const stable_ids = try app.alloc.alloc(usize, extracted.images.len);
-            defer app.alloc.free(stable_ids);
-            const first_stable_id = app.peekNextImageId();
-            _ = std.math.add(
-                usize,
-                first_stable_id,
-                extracted.images.len,
-            ) catch return error.ImageIdOverflow;
-            var ids_changed = false;
-            for (extracted.images, 0..) |image, index| {
-                const stable_id = first_stable_id + index;
-                if (stable_id == 0) return error.ImageIdOverflow;
-                for (app.pending_images.items) |pending_image| {
-                    if (pending_image.id == stable_id) return error.DuplicateImageId;
-                }
-                stable_ids[index] = stable_id;
-                ids_changed = ids_changed or stable_id != image.id;
-            }
-            if (!ids_changed) return;
-            if (extracted.image_spans.len != extracted.images.len) {
-                return error.InvalidImageOccurrence;
-            }
-
-            const stable_spans = try app.alloc.alloc(
-                image_attachments.ImagePlaceholderSpan,
-                extracted.image_spans.len,
-            );
-            errdefer app.alloc.free(stable_spans);
-            var remapped: std.Io.Writer.Allocating = .init(app.alloc);
-            defer remapped.deinit();
-            var cursor: usize = 0;
-            var span_index: usize = 0;
-            while (cursor < extracted.text.len) {
-                if (span_index < extracted.image_spans.len and
-                    extracted.image_spans[span_index].start == cursor)
-                {
-                    const source_span = extracted.image_spans[span_index];
-                    if (source_span.end > extracted.text.len or
-                        source_span.id != extracted.images[span_index].id)
-                    {
-                        return error.InvalidImageOccurrence;
-                    }
-                    const match = image_attachments.matchImagePlaceholder(
-                        extracted.text,
-                        source_span.start,
-                    ) orelse return error.InvalidImageOccurrence;
-                    if (match.id != source_span.id or
-                        source_span.start + match.length != source_span.end)
-                    {
-                        return error.InvalidImageOccurrence;
-                    }
-                    const remapped_start = remapped.written().len;
-                    var placeholder_buf: [32]u8 = undefined;
-                    try remapped.writer.writeAll(
-                        try image_attachments.formatImagePlaceholder(
-                            &placeholder_buf,
-                            stable_ids[span_index],
-                        ),
-                    );
-                    stable_spans[span_index] = .{
-                        .start = remapped_start,
-                        .end = remapped.written().len,
-                        .id = stable_ids[span_index],
-                    };
-                    cursor = source_span.end;
-                    span_index += 1;
-                    continue;
-                }
-                try remapped.writer.writeByte(extracted.text[cursor]);
-                cursor += 1;
-            }
-            if (span_index != extracted.image_spans.len) {
-                return error.InvalidImageOccurrence;
-            }
-            const text = try remapped.toOwnedSlice();
-            app.alloc.free(extracted.text);
-            app.alloc.free(extracted.image_spans);
-            extracted.text = text;
-            extracted.image_spans = stable_spans;
-            for (extracted.images, stable_ids) |*image, stable_id| image.id = stable_id;
-        }
-
         fn commitStableExtractedImageIds(
             app: *App,
             images: []const types.ImageAttachment,
@@ -1451,11 +1365,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
             for (image_occurrences) |occurrence| {
                 if (occurrence.submitted_id == 0) continue;
+                const span = occurrence.submitted_span orelse return error.InvalidImageOccurrence;
                 submitted_image_tokens.appendAssumeCapacity(.{
                     .id = occurrence.submitted_id,
                     .span = .{
-                        .raw_start = occurrence.span.start,
-                        .raw_end = occurrence.span.end,
+                        .raw_start = span.start,
+                        .raw_end = span.end,
                     },
                 });
             }
@@ -1622,57 +1537,35 @@ pub fn SubmitRuntime(comptime App: type) type {
         };
 
         const ImageOccurrence = struct {
+            /// Coordinates before collision-driven ID rewriting.
             span: Span,
             attachment_index: usize,
             source_id: usize,
             submitted_id: usize = 0,
+            submitted_span: ?Span = null,
         };
 
         fn projectImageOccurrencesForSubmit(
             alloc: std.mem.Allocator,
             raw_input: []const u8,
             expanded_text: []const u8,
-            trimmed_text: []const u8,
             effective_text: []const u8,
             pasted_blocks: []const paste_blocks.PastedBlock,
             image_tokens: []const entity_spans.ImageTokenSpan,
             pending_images: []const types.ImageAttachment,
-            extracted_spans: []const image_attachments.ImagePlaceholderSpan,
+            edits: []const image_attachments.InlineImageEdit,
             extracted_images: []const types.ImageAttachment,
-            has_inline_images: bool,
         ) !std.ArrayList(ImageOccurrence) {
             var occurrences: std.ArrayList(ImageOccurrence) = .empty;
             errdefer occurrences.deinit(alloc);
-            const trim_start = if (has_inline_images)
-                leadingTrimLen(expanded_text)
-            else
-                0;
-            const projection_source = if (has_inline_images)
-                trimmed_text
-            else
-                expanded_text;
-
             for (image_tokens) |token| {
                 if (!validRawImageToken(raw_input, token)) continue;
-                const attachment_index = image_attachments.findImageIndexById(
-                    pending_images,
-                    token.id,
-                ) orelse continue;
-                var span = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
+                const attachment_index = image_attachments.findImageIndexById(pending_images, token.id) orelse continue;
+                const expanded = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
                     .start = token.span.raw_start,
                     .end = token.span.raw_end,
                 }) orelse continue;
-                if (span.start < trim_start or span.end < span.start) continue;
-                span.start -= trim_start;
-                span.end -= trim_start;
-                if (span.end > projection_source.len) continue;
-                if (has_inline_images) {
-                    span = projectSpanThroughInlineImageExtraction(
-                        projection_source,
-                        effective_text,
-                        span,
-                    ) orelse continue;
-                }
+                const span = project_inline_span(expanded_text.len, expanded, edits) orelse continue;
                 try appendImageOccurrenceSorted(alloc, &occurrences, .{
                     .span = span,
                     .attachment_index = attachment_index,
@@ -1680,17 +1573,15 @@ pub fn SubmitRuntime(comptime App: type) type {
                 });
             }
 
-            for (extracted_spans, 0..) |span, index| {
-                if (index >= extracted_images.len or span.id != extracted_images[index].id) continue;
-                const match = image_attachments.matchImagePlaceholder(
-                    effective_text,
-                    span.start,
-                ) orelse continue;
-                if (match.id != span.id or span.start + match.length != span.end) continue;
+            if (edits.len != extracted_images.len) return error.InvalidImageOccurrence;
+            for (edits, extracted_images, 0..) |edit, image, index| {
+                if (edit.id != image.id or !edit.output.isValid(effective_text.len)) return error.InvalidImageOccurrence;
+                const match = image_attachments.matchImagePlaceholder(effective_text, edit.output.raw_start) orelse return error.InvalidImageOccurrence;
+                if (match.id != edit.id or edit.output.raw_start + match.length != edit.output.raw_end) return error.InvalidImageOccurrence;
                 try appendImageOccurrenceSorted(alloc, &occurrences, .{
-                    .span = .{ .start = span.start, .end = span.end },
+                    .span = .{ .start = edit.output.raw_start, .end = edit.output.raw_end },
                     .attachment_index = pending_images.len + index,
-                    .source_id = span.id,
+                    .source_id = edit.id,
                 });
             }
             return occurrences;
@@ -1759,6 +1650,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     remapped_id = try nextRemappedImageId(
                         text,
                         occurrences,
+                        images.items,
                         remapped_id,
                     );
                     image.id = remapped_id;
@@ -1766,6 +1658,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     ids_changed = true;
                 }
                 occurrence.submitted_id = image.id;
+                occurrence.submitted_span = occurrence.span;
                 ordered.appendAssumeCapacity(image);
                 used[occurrence.attachment_index] = true;
             }
@@ -1782,17 +1675,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(alloc);
             var cursor: usize = 0;
-            for (occurrences) |occurrence| {
+            for (occurrences) |*occurrence| {
                 if (occurrence.span.start < cursor or occurrence.span.end > text.len) {
                     return error.InvalidImageOccurrence;
                 }
                 try out.appendSlice(alloc, text[cursor..occurrence.span.start]);
+                const start = out.items.len;
                 var placeholder_buf: [64]u8 = undefined;
                 const placeholder = try image_attachments.formatImagePlaceholder(
                     &placeholder_buf,
                     occurrence.submitted_id,
                 );
                 try out.appendSlice(alloc, placeholder);
+                occurrence.submitted_span = .{ .start = start, .end = out.items.len };
                 cursor = occurrence.span.end;
             }
             try out.appendSlice(alloc, text[cursor..]);
@@ -1825,10 +1720,11 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn nextRemappedImageId(
             text: []const u8,
             occurrences: []const ImageOccurrence,
+            images: []const types.ImageAttachment,
             first_candidate: usize,
         ) !usize {
             var candidate = first_candidate;
-            while (literalImageIdUsed(text, occurrences, candidate)) {
+            while (literalImageIdUsed(text, occurrences, candidate) or image_attachments.findImageIndexById(images, candidate) != null) {
                 candidate = try std.math.add(usize, candidate, 1);
             }
             return candidate;
@@ -1892,49 +1788,26 @@ pub fn SubmitRuntime(comptime App: type) type {
             var source_cursor: usize = 0;
             var output_cursor: usize = 0;
             for (occurrences) |occurrence| {
+                const output = occurrence.submitted_span orelse return null;
                 if (occurrence.span.start < source_cursor or
-                    occurrence.span.end < occurrence.span.start or
+                    occurrence.span.end <= occurrence.span.start or
                     occurrence.span.end > text.len or
-                    occurrence.submitted_id == 0)
+                    occurrence.submitted_id == 0 or output.end <= output.start)
                 {
                     return null;
                 }
+                const start = std.math.add(usize, output_cursor, occurrence.span.start - source_cursor) catch return null;
+                if (output.start != start) return null;
                 if (source_offset < occurrence.span.start) {
-                    return std.math.add(
-                        usize,
-                        output_cursor,
-                        source_offset - source_cursor,
-                    ) catch null;
+                    return std.math.add(usize, output_cursor, source_offset - source_cursor) catch null;
                 }
-                output_cursor = std.math.add(
-                    usize,
-                    output_cursor,
-                    occurrence.span.start - source_cursor,
-                ) catch return null;
                 if (source_offset < occurrence.span.end) {
-                    return if (source_offset == occurrence.span.start)
-                        output_cursor
-                    else
-                        null;
+                    return if (source_offset == occurrence.span.start) output.start else null;
                 }
-
-                var placeholder_buf: [64]u8 = undefined;
-                const placeholder = image_attachments.formatImagePlaceholder(
-                    &placeholder_buf,
-                    occurrence.submitted_id,
-                ) catch return null;
-                output_cursor = std.math.add(
-                    usize,
-                    output_cursor,
-                    placeholder.len,
-                ) catch return null;
+                output_cursor = output.end;
                 source_cursor = occurrence.span.end;
             }
-            return std.math.add(
-                usize,
-                output_cursor,
-                source_offset - source_cursor,
-            ) catch null;
+            return std.math.add(usize, output_cursor, source_offset - source_cursor) catch null;
         }
 
         fn resolveSlashSubmission(registry: command_specs.SlashRegistry, text: []const u8, selected_index: usize) []const u8 {
@@ -1953,12 +1826,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             alloc: std.mem.Allocator,
             raw_input: []const u8,
             expanded_text: []const u8,
-            trimmed_text: []const u8,
             effective_text: []const u8,
             final_text: []const u8,
             pasted_blocks: []const paste_blocks.PastedBlock,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            has_inline_images: bool,
+            edits: []const image_attachments.InlineImageEdit,
             image_occurrences: []const ImageOccurrence,
         ) ![]registered_entities.SkillTokenSpan {
             if (skill_tokens.len == 0) return &.{};
@@ -1966,30 +1838,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             var projected: std.ArrayList(registered_entities.SkillTokenSpan) = .empty;
             errdefer projected.deinit(alloc);
 
-            const trim_start = if (has_inline_images)
-                leadingTrimLen(expanded_text)
-            else
-                0;
-            const projection_source = if (has_inline_images)
-                trimmed_text
-            else
-                expanded_text;
             for (skill_tokens) |token| {
                 if (token.name.len == 0 or token.path.len == 0) continue;
-
-                var span = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
+                const expanded = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
                     .start = token.raw_start,
                     .end = token.raw_end,
                 }) orelse continue;
-
-                if (span.start < trim_start or span.end < span.start) continue;
-                span.start -= trim_start;
-                span.end -= trim_start;
-                if (span.end > projection_source.len) continue;
-
-                if (has_inline_images) {
-                    span = projectSpanThroughInlineImageExtraction(projection_source, effective_text, span) orelse continue;
-                }
+                const span = project_inline_span(expanded_text.len, expanded, edits) orelse continue;
 
                 const final_span = projectSpanThroughSubmittedImages(
                     effective_text,
@@ -2031,96 +1886,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             return .{ .start = start, .end = end };
         }
 
-        fn leadingTrimLen(text: []const u8) usize {
-            var i: usize = 0;
-            while (i < text.len and image_attachments.isWhitespace(text[i])) : (i += 1) {}
-            return i;
-        }
-
-        fn projectSpanThroughInlineImageExtraction(
-            source: []const u8,
-            extracted_text: []const u8,
-            span: Span,
-        ) ?Span {
-            if (span.start > span.end or span.end > source.len) return null;
-            const start = projectOffsetThroughInlineImageExtraction(
-                source,
-                extracted_text,
-                span.start,
-            ) orelse return null;
-            const end = projectOffsetThroughInlineImageExtraction(
-                source,
-                extracted_text,
-                span.end,
-            ) orelse return null;
-            if (end < start) return null;
-            return .{ .start = start, .end = end };
-        }
-
-        fn projectOffsetThroughInlineImageExtraction(
-            source: []const u8,
-            extracted_text: []const u8,
-            source_offset: usize,
-        ) ?usize {
-            if (source_offset > source.len) return null;
-
-            var in_pos: usize = 0;
-            var written: usize = 0;
-            while (true) {
-                while (in_pos < source.len and image_attachments.isWhitespace(source[in_pos])) : (in_pos += 1) {}
-                if (in_pos >= source.len) break;
-
-                const token_start = in_pos;
-                const token_end = image_attachments.nextShellTokenEnd(source, token_start);
-                const raw = source[token_start..token_end];
-                in_pos = token_end;
-
-                const output_start = preservedTokenStart(extracted_text, written, raw);
-                if (token_start <= source_offset and source_offset <= token_end) {
-                    const token_output_start = output_start orelse return null;
-                    return token_output_start + (source_offset - token_start);
-                }
-
-                if (output_start) |start| {
-                    written = start + raw.len;
-                } else {
-                    const image_token = image_attachments.splitImagePathToken(raw) orelse return null;
-                    const replacement_start = written + @intFromBool(written > 0);
-                    if (replacement_start >= extracted_text.len) return null;
-                    const replacement = image_attachments.matchImagePlaceholder(
-                        extracted_text,
-                        replacement_start,
-                    ) orelse return null;
-                    const suffix_start = replacement_start + replacement.length;
-                    const suffix_end = suffix_start + image_token.suffix.len;
-                    if (suffix_end > extracted_text.len or
-                        !std.mem.eql(
-                            u8,
-                            extracted_text[suffix_start..suffix_end],
-                            image_token.suffix,
-                        ))
-                    {
-                        return null;
-                    }
-                    written = suffix_end;
-                }
-            }
-            return if (source_offset == source.len) extracted_text.len else null;
-        }
-
-        fn preservedTokenStart(output: []const u8, written: usize, raw: []const u8) ?usize {
-            if (raw.len == 0 or written > output.len) return null;
-
-            var start = written;
-            if (written > 0) {
-                if (start >= output.len or output[start] != ' ') return null;
-                start += 1;
-            }
-            if (start > output.len or output.len - start < raw.len) return null;
-            if (!std.mem.eql(u8, output[start .. start + raw.len], raw)) return null;
-            const end = start + raw.len;
-            if (end < output.len and output[end] != ' ') return null;
-            return start;
+        fn project_inline_span(source_len: usize, span: Span, edits: []const image_attachments.InlineImageEdit) ?Span {
+            const projected = image_attachments.project_inline_image_span(source_len, .{
+                .raw_start = span.start,
+                .raw_end = span.end,
+            }, edits) orelse return null;
+            return .{ .start = projected.raw_start, .end = projected.raw_end };
         }
 
         fn skillMarkerAt(text: []const u8, start: usize, name: []const u8) ?Span {
@@ -2145,6 +1916,39 @@ pub fn SubmitRuntime(comptime App: type) type {
 pub fn directCommand(expanded: []const u8) ?[]const u8 {
     if (expanded.len == 0 or expanded[0] != '!') return null;
     return expanded[1..];
+}
+
+test "inline image collision map keeps reserved stable IDs and final coordinates distinct" {
+    const alloc = std.testing.allocator;
+    const Rt = SubmitRuntime(struct {});
+    const text = "literal [Image #9]\n[Image #9] $review [Image #10]";
+    const first = "literal [Image #9]\n".len;
+    const second = text.len - "[Image #10]".len;
+    var occurrences = [_]Rt.ImageOccurrence{
+        .{ .span = .{ .start = first, .end = first + "[Image #9]".len }, .attachment_index = 0, .source_id = 9 },
+        .{ .span = .{ .start = second, .end = text.len }, .attachment_index = 1, .source_id = 10 },
+    };
+    const original_first = occurrences[0].span;
+    const original_second = occurrences[1].span;
+    var images = std.ArrayList(types.ImageAttachment).fromOwnedSlice(try types.dupeImageAttachmentSlice(alloc, &.{
+        .{ .id = 9, .path = @constCast("first.png"), .media_type = @constCast("image/png") },
+        .{ .id = 10, .path = @constCast("second.png"), .media_type = @constCast("image/png") },
+    }));
+    defer Rt.deinitOwnedImageList(alloc, &images);
+    const result = try Rt.mapSubmittedImages(alloc, text, &images, &occurrences, 9);
+    defer if (result.owned) alloc.free(result.text);
+    try std.testing.expectEqualStrings("literal [Image #9]\n[Image #11] $review [Image #10]", result.text);
+    try std.testing.expectEqual(@as(usize, 11), images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 10), images.items[1].id);
+    try std.testing.expectEqualDeep(original_first, occurrences[0].span);
+    try std.testing.expectEqualDeep(original_second, occurrences[1].span);
+    for (occurrences, [_][]const u8{ "[Image #11]", "[Image #10]" }) |occurrence, expected| {
+        const span = occurrence.submitted_span.?;
+        try std.testing.expectEqualStrings(expected, result.text[span.start..span.end]);
+    }
+    const skill_start = std.mem.find(u8, text, "$review").?;
+    const skill = Rt.projectSpanThroughSubmittedImages(text, &occurrences, .{ .start = skill_start, .end = skill_start + "$review".len }).?;
+    try std.testing.expectEqualStrings("$review", result.text[skill.start..skill.end]);
 }
 
 test "direct terminal route requires the literal first character" {
