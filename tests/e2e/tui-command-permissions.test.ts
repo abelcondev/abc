@@ -1796,7 +1796,10 @@ describe("effect-aware command permissions", () => {
     "TUI creates a private Markdown trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([]);
+      const gateway = startFakeGateway([finalText(
+        Array.from({ length: 80 }, (_, index) => `TRACE_RENDER_ROW_${index}\n`).join("") +
+          "TRACE_RENDER_DONE",
+      )]);
       const stderrPath = join(root.root, "trace-report-stderr.log");
       const clipboardPath = join(root.root, "trace-clipboard-path.txt");
       installClipboardFixture(
@@ -1812,12 +1815,20 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_TRACE_CLIPBOARD_OUTPUT: clipboardPath,
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
         height: 40,
       });
       await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Render the trace fixture.");
+      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForStableComposer(TIMEOUT);
+      await activeSession.resizeWindow(100, 32);
+      await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
@@ -1836,6 +1847,16 @@ describe("effect-aware command permissions", () => {
       expect(report).toContain("# fx trace");
       expect(report).toContain("## Summary");
       expect(report).toContain(root.workspace);
+      expect(report).toContain("terminal_hosts: tmux=true");
+      expect(report).toContain("projection: view=");
+      const rendererEvents = report.split("## Recent Renderer Events\n")[1]?.split("## Transcript Timeline")[0];
+      expect(rendererEvents).toBeDefined();
+      expect(rendererEvents).toContain("kind=transition");
+      expect(rendererEvents).toContain("kind=commit");
+      expect(rendererEvents).toContain("kind=resize");
+      expect(rendererEvents).not.toContain("TRACE_RENDER_ROW_");
+      expect(rendererEvents).not.toContain("[truncated]");
+      expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       if (process.platform === "darwin") {
         expect(readFileSync(clipboardPath, "utf8")).toBe(reportPath);
