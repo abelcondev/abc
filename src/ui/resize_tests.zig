@@ -2242,6 +2242,84 @@ test "streamed control character entity cannot erase transcript cells" {
     try expectRowTrimmedEquals(&h, row, "  keep x&#27;[2Ky and &#x9b;2J end");
 }
 
+test "streamed unmatched emphasis markers stay literal and unstyled" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "*not a list item\n**bold** then **open tail\nrun `zig build\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const star_row = try findRowContaining(&h, "not a list");
+    try expectRowTrimmedEquals(&h, star_row, "  *not a list item");
+    const star_cell = h.vt.cellAt(star_row, 4) orelse return error.TestMissingCell;
+    try std.testing.expect(star_cell.codepoint == 'n' and !star_cell.style.flags.italic);
+
+    const bold_row = try findRowContaining(&h, "then");
+    try expectRowTrimmedEquals(&h, bold_row, "  bold then **open tail");
+    const bold_cell = h.vt.cellAt(bold_row, 3) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.codepoint == 'b' and bold_cell.style.flags.bold);
+    const open_cell = h.vt.cellAt(bold_row, 15) orelse return error.TestMissingCell;
+    try std.testing.expect(open_cell.codepoint == 'o' and !open_cell.style.flags.bold);
+
+    const code_row = try findRowContaining(&h, "zig build");
+    try expectRowTrimmedEquals(&h, code_row, "  run `zig build");
+    const code_cell = h.vt.cellAt(code_row, 8) orelse return error.TestMissingCell;
+    try std.testing.expect(code_cell.codepoint == 'z' and code_cell.style.fg.eql(.default));
+}
+
+test "streamed nested and mixed emphasis pairs resolve on the grid" {
+    var h = try Harness.init(std.testing.allocator, 60, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "See _a ``b`c`` d_ end\n***both*** and **** literal **x**\nSee *italic** plain\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const under_row = try findRowContaining(&h, "See a");
+    try expectRowTrimmedEquals(&h, under_row, "  See a b`c d end");
+    const a_cell = h.vt.cellAt(under_row, 7) orelse return error.TestMissingCell;
+    try std.testing.expect(a_cell.codepoint == 'a' and a_cell.style.flags.italic);
+    const tick_cell = h.vt.cellAt(under_row, 10) orelse return error.TestMissingCell;
+    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 245 }));
+    const d_cell = h.vt.cellAt(under_row, 13) orelse return error.TestMissingCell;
+    try std.testing.expect(d_cell.codepoint == 'd' and d_cell.style.flags.italic);
+    const end_cell = h.vt.cellAt(under_row, 15) orelse return error.TestMissingCell;
+    try std.testing.expect(end_cell.codepoint == 'e' and !end_cell.style.flags.italic);
+
+    const both_row = try findRowContaining(&h, "both and");
+    try expectRowTrimmedEquals(&h, both_row, "  both and **** literal x");
+    const both_cell = h.vt.cellAt(both_row, 3) orelse return error.TestMissingCell;
+    try std.testing.expect(both_cell.codepoint == 'b' and both_cell.style.flags.bold and both_cell.style.flags.italic);
+    const stars_cell = h.vt.cellAt(both_row, 12) orelse return error.TestMissingCell;
+    try std.testing.expect(stars_cell.codepoint == '*' and !stars_cell.style.flags.bold);
+    const x_cell = h.vt.cellAt(both_row, 25) orelse return error.TestMissingCell;
+    try std.testing.expect(x_cell.codepoint == 'x' and x_cell.style.flags.bold and !x_cell.style.flags.italic);
+
+    const plain_row = try findRowContaining(&h, "plain");
+    try expectRowTrimmedEquals(&h, plain_row, "  See italic* plain");
+    const italic_cell = h.vt.cellAt(plain_row, 7) orelse return error.TestMissingCell;
+    try std.testing.expect(italic_cell.codepoint == 'i' and italic_cell.style.flags.italic);
+    const plain_cell = h.vt.cellAt(plain_row, 15) orelse return error.TestMissingCell;
+    try std.testing.expect(plain_cell.codepoint == 'p' and !plain_cell.style.flags.italic);
+}
+
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
         .{ .light = false, .fg = 245 },
