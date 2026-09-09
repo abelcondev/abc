@@ -440,6 +440,19 @@ Release notes are public product copy. Describe user-visible behavior, always sp
 
 Do not create tags manually. The workflow owns tag creation.
 
+### Validate release artifacts without publishing
+
+Run **Actions > Release** on `main` with `validate_only` enabled. This builds
+all four release targets, runs macOS arm64 PGSO qualification, and uses the
+existing `apple-signing` approval to notarize both macOS targets. It does not
+create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
+
+The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
+same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
+workflow artifacts for matched signed-binary performance checks; notarization
+and smoke checks alone do not establish performance equivalence. Normal release
+runs keep the existing signing default.
+
 ## Benchmarks
 
 Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
