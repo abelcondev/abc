@@ -390,6 +390,86 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   );
 
   test(
+    "up arrow retracts a tool-queued steer into the composer for editing",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-steer-retract-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const startPath = join(workspace, "started");
+      const releasePath = join(workspace, "release");
+      const finishedPath = join(workspace, "finished");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(
+        join(workspace, "check.sh"),
+        "printf started > started\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf done > finished\n",
+      );
+
+      const steerText = "change the header tone";
+      const editSuffix = " and keep it short";
+      gateway = startFakeGateway([
+        fakeShellRun("steer_retract_command", "sh check.sh"),
+        fakeGatewayFinalText("STEER_RETRACT_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steer-retract-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: TRACE_SCOPES,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Run the prepared check.");
+      await waitForCondition(() => existsSync(startPath), "held tool start");
+
+      await session.sendText(steerText);
+      await session.waitForText(steerText, TIMEOUT);
+      await waitForTrace(tracePath, "event=prompt_enqueue", TIMEOUT);
+
+      await session.sendKeys("Up");
+      await waitForTrace(tracePath, "event=prompt_steering_retracted", TIMEOUT);
+
+      await session.sendLiteral(editSuffix);
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => countOccurrences(readTrace(tracePath), "event=prompt_enqueue") >= 2,
+        "edited steer requeued",
+      );
+
+      writeFileSync(releasePath, "go");
+      await session.waitForText("STEER_RETRACT_COMPLETE", TIMEOUT);
+      await waitForCondition(() => existsSync(finishedPath), "held tool completion");
+
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("<user_steering>");
+      expect(gateway.requests[1]!.body).toContain(`${steerText}${editSuffix}`);
+      const trace = readTrace(tracePath);
+      expect(countOccurrences(trace, "event=prompt_steering_retracted")).toBe(1);
+      expect(countOccurrences(trace, "event=prompt_steering_consumed")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "partial output survives cancellation and the next prompt completes",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-interrupt-recovery-")));

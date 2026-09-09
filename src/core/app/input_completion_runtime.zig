@@ -271,6 +271,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     &app.input_runtime.vertical_navigation,
                 );
             } else if (direction == .up) {
+                if (try restoreQueuedSteerToComposer(app)) return;
                 try navigatePromptHistory(app, -1);
             } else if (app.input_runtime.edit_state.cursor < app.input_runtime.edit_state.input.items.len) {
                 _ = horizontal_navigation.move(
@@ -282,6 +283,30 @@ pub fn CompletionRuntime(comptime App: type) type {
             } else {
                 try navigatePromptHistory(app, 1);
             }
+        }
+
+        /// Pulls the newest queued steering prompt that still waits for a tool
+        /// boundary back into the empty composer for editing. Returns false when
+        /// no steer is retractable, leaving history navigation to run unchanged.
+        pub fn restoreQueuedSteerToComposer(app: *App) !bool {
+            if (comptime !@hasField(App, "worker")) return false;
+            if (comptime !@hasDecl(@TypeOf(app.worker), "popQueuedSteerForEdit")) return false;
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            const text = (try app.worker.popQueuedSteerForEdit(std.heap.c_allocator)) orelse return false;
+            defer std.heap.c_allocator.free(text);
+            app.input_runtime.composer_history.resetNavigation(app.alloc);
+            try app.input_runtime.edit_state.setText(app.alloc, text);
+            app.input_runtime.vertical_navigation.reset();
+            app.input_runtime.historyBoundary(app.alloc);
+            debug_trace.eventf(
+                "input",
+                "queued_steer_restored",
+                .{},
+                "bytes={d}",
+                .{text.len},
+            );
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         pub fn navigatePromptHistory(app: *App, delta: i32) !void {
