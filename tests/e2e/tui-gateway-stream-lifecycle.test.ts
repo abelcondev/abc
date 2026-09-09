@@ -5170,7 +5170,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const hold: HoldState = { started: false, cancelled: false };
       const childRequests = new Map<string, number>();
       const replies = new Map<string, { ok: boolean; result: string }>();
-      const response = heldGatewayResponse(hold, [], []);
       const childGateway = startDynamicFakeGateway((body) => {
         const request = JSON.parse(body) as {
           prompt: Array<{ role: string; content: unknown }>;
@@ -5180,7 +5179,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         if (!stage) throw new Error("missing handoff request stage");
         if (user.startsWith("CHILD_HANDOFF_")) {
           childRequests.set(stage, (childRequests.get(stage) ?? 0) + 1);
-          if (stage === "CANCEL") return response;
+          if (stage === "CANCEL") return heldGatewayResponse(hold, [], []);
           if (stage !== "SEED") expect(body).toContain(marker);
           return fakeGatewayFinalText(marker + "_" + stage);
         }
