@@ -909,11 +909,19 @@ pub fn composeFooterFrame(
             }
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
-            const window_start = picker_presentation.updateEdgeScrollPickerWindowStart(input.picker_window_start, input.file_picker_items.len, selected, input.picker_rows);
-            const window = picker_presentation.edgeScrollPickerWindowFromStart(input.file_picker_items.len, window_start, input.picker_rows);
             var row = rows.picker_start;
+            const status_rows: u16 = @intFromBool(ctx.file_completion_status != null and input.picker_rows > 1);
+            if (status_rows > 0) {
+                const status = ctx.file_completion_status.?;
+                var status_row = try picker_presentation.composePickerOptionRow(alloc, .file, input.picker_start_col, status, false, shell.layout.cols);
+                try pushFooterBandRow(alloc, &frame, plan, row, &status_row);
+                row += 1;
+            }
+            const visible_rows = input.picker_rows -| status_rows;
+            const window_start = picker_presentation.updateEdgeScrollPickerWindowStart(input.picker_window_start, input.file_picker_items.len, selected, visible_rows);
+            const window = picker_presentation.edgeScrollPickerWindowFromStart(input.file_picker_items.len, window_start, visible_rows);
             for (input.file_picker_items[window.start..window.end], window.start..) |item, i| {
-                var picker_row = try picker_presentation.composeFilePickerOptionRow(alloc, input.picker_start_col, item, i == selected, shell.layout.cols);
+                var picker_row = try picker_presentation.composeFilePickerOptionRow(alloc, input.picker_start_col, item, ctx.file_completion_has_selection and i == selected, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &picker_row);
                 row += 1;
             }
@@ -929,7 +937,10 @@ pub fn composeFooterFrame(
                 row += 1;
             }
         } else {
-            var status_row = try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
+            var status_row = if (input.picker_kind == .file and ctx.file_completion_status != null)
+                try picker_presentation.composePickerOptionRow(alloc, .file, input.picker_start_col, ctx.file_completion_status.?, false, shell.layout.cols)
+            else
+                try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
         }
     }

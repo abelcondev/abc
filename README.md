@@ -76,7 +76,9 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, you can submit a multiline update with Enter; it steers the active turn at its next safe model boundary. When no tool is running, your message appears in the transcript immediately. Updates waiting for a running tool show their first two lines with a dotted rail and an ellipsis when more text is hidden. Press Escape to interrupt the active work and apply the update as soon as the turn settles.
 
-Type `@` to find workspace files. Use `@~`, `@.`, or `@..` to browse your home, current workspace, or parent directory without typing a trailing slash. Tab or Enter inserts the selected path; selecting a directory continues browsing inside it.
+Type `@` to find workspace files. Use `@~`, `@.`, or `@..` to browse your home, current workspace, or parent directory without typing a trailing slash. Names after the last slash use fuzzy matching within that directory: both `@~/ktop` and `@~/dsktp` can match `Desktop`. Once the list appears, Tab or Enter inserts the selected path; selecting a directory continues browsing inside it. Completion keeps the selected path stable across refreshes. If that selection becomes unavailable, navigate to choose again before inserting a path. If the directory is unavailable, Tab retries and Escape dismisses the picker without changing your draft. Tab or Enter before a list is presented does not select an unseen result or queue a later submission.
+
+Selected filenames use quoting and escaping when needed for spaces, quotes, backslashes or special punctuation. For example, `@"./photo.png,"` refers to a filename ending in a comma, while manually typed or recalled `@./photo.png,` retains the image-plus-punctuation meaning. Quote or reselect an older ambiguous path before submitting it. Dollar signs inside an `@` path do not invoke skills.
 
 Use `/resume` to choose a saved conversation. The picker shares its catalog across workspace views and reuses unchanged session summaries between launches. The first catalog build, or recovery from missing cache data, scans saved sessions automatically. Changed sessions are checked again, and closing the picker stops obsolete loading work.
 
@@ -123,7 +125,7 @@ Interactive terminal tabs show `fx v<version> | <folder>` using the running bina
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
-Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
+Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. It includes the last 256 significant renderer events collected in memory without enabling `FX_TRACE`: source rewrites, viewport/history movement, scroll commits, redraws, and resets. Run it soon after a rendering problem, before quitting or changing sessions. These events describe fx's internal rendering state, not a readback of the terminal's scrollback. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
 
 fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt. Manual compaction refreshes the selected login when needed; Ctrl+C cancels preparation. If authentication fails, the chat stays open and unchanged so you can reconnect and retry `/compact`.
 

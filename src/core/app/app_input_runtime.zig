@@ -1,4 +1,5 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -73,6 +74,12 @@ const input_full_transcript_runtime = @import("input_full_transcript_runtime.zig
 const input_selection_runtime = @import("input_selection_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const app_upgrade_runtime = @import("app_upgrade_runtime.zig");
+
+test {
+    _ = file_picker_path;
+    _ = picker_state;
+    _ = input_completion_runtime;
+}
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 const ToolPermissionDecision = types.ToolPermissionDecision;
@@ -601,9 +608,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = full_transcript_rt.cancelPendingOpenForInput(app);
             }
 
-            const file_picker_was_active = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
-            defer if (comptime runtime_profile.allows(App, .file_index))
-                updateFilePickerEpisode(app, file_picker_was_active);
+            defer completion_rt.reconcileFilePicker(app);
 
             const paste_was_active = terminalPasteActive(app);
             defer {
@@ -773,24 +778,8 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn updateFilePickerEpisode(app: *App, was_active: bool) void {
-            const query = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) orelse return;
-            if (was_active) return;
-
-            app.input_runtime.picker.resetFilePickerIndex();
-            if (comptime @hasDecl(App, "fileCompletionsDependOnIndex")) {
-                if (!app.fileCompletionsDependOnIndex(query.query)) return;
-            }
-            if (!app.input_runtime.picker.file_picker_episode_seen) {
-                app.input_runtime.picker.file_picker_episode_seen = true;
-                if (comptime @hasDecl(App, "isFileIndexLoading")) {
-                    if (app.isFileIndexLoading()) return;
-                }
-            }
-            if (comptime @hasDecl(App, "refreshFileIndex")) {
-                app.refreshFileIndex();
-            }
-        }
+        pub const prepareFilePicker = completion_rt.prepareFilePicker;
+        pub const collectFilePickerFacts = completion_rt.collectFilePickerFacts;
 
         pub fn handleByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
@@ -1536,7 +1525,7 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
+                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
                             if ((try insertComposerSliceBounded(app, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
@@ -3743,6 +3732,22 @@ const RoutingFakeApp = struct {
         return count;
     }
 
+    pub fn prepareDirectoryCompletion(self: *RoutingFakeApp) void {
+        const completion = @import("../input/file_completion_state.zig");
+        const state = &self.input_runtime.picker.file_completion;
+        if (self.file_completion_error != null) {
+            state.stage(self.alloc, .{ .state = .ready }, .unavailable, null);
+            return;
+        }
+        var results: [completion.capacity]file_index.SearchResult = undefined;
+        for (self.file_completion_values, 0..) |value, i| results[i] = .{ .path = value.path, .kind = value.kind, .matched_spans = &.{} };
+        const rows = completion.Rows.copy(self.alloc, results[0..self.file_completion_values.len]) catch {
+            state.stage(self.alloc, .{ .state = .ready }, .unavailable, null);
+            return;
+        };
+        state.stage(self.alloc, .{ .state = .ready }, if (rows.results.len == 0) .empty else .ready, rows);
+    }
+
     pub fn refreshFileIndex(self: *RoutingFakeApp) void {
         self.file_index_refresh_count += 1;
     }
@@ -4669,6 +4674,33 @@ test "app_input_runtime skills menu navigation clamps before prompt history" {
     // through to prompt history.
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
+}
+
+test "app_input_runtime at path dollars do not enter typed or pasted skill menus" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{.{ .name = "review", .description = "", .path = "/tmp/review/SKILL.md", .source = .workspace_shared }};
+    for ([_][]const u8{ "@./", "@\"./space ", "@\"./escaped\\" }) |prefix| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.skills.items = @constCast(&skills);
+        try app.input_runtime.textReplacementState().replace(alloc, prefix);
+        try Runtime(RoutingFakeApp).handleByte(&app, '$', 4096, 100);
+        try std.testing.expect(!app.skills.menu.active);
+        try std.testing.expectEqual(prefix.len + 1, app.input_runtime.edit_state.input.items.len);
+    }
+    for ([_][]const u8{ "@./$review", "@\"./$review\"", "@\"./a\\\"$review\"" }) |text| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.skills.items = @constCast(&skills);
+        try input_paste_runtime.PasteEditRuntime(RoutingFakeApp).handlePastedBytes(&app, text, 4096);
+        try std.testing.expect(!app.skills.menu.active);
+        try std.testing.expectEqualStrings(text, app.input_runtime.edit_state.input.items);
+    }
+    var control = try RoutingFakeApp.init(alloc);
+    defer control.deinit();
+    control.skills.items = @constCast(&skills);
+    try input_paste_runtime.PasteEditRuntime(RoutingFakeApp).handlePastedBytes(&control, "$review", 4096);
+    try std.testing.expect(control.skills.menu.active);
 }
 
 test "app_input_runtime skills menu navigation remains interactive while streaming" {
@@ -6668,6 +6700,12 @@ test "app_input_runtime retired slash alias no longer shadows a matching skill" 
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
 }
 
+fn presentRoutingFilePicker(app: *RoutingFakeApp) void {
+    const rt = input_completion_runtime.CompletionRuntime(RoutingFakeApp);
+    rt.prepareFilePicker(app);
+    if (rt.filePickerView(app).receipt) |receipt| rt.acknowledgeFilePicker(app, receipt);
+}
+
 test "app_input_runtime file picker replaces only the active query for Tab and Enter" {
     const alloc = std.testing.allocator;
     const completions = [_]file_index.Candidate{.{ .path = "src/main.zig", .kind = .file }};
@@ -6683,6 +6721,7 @@ test "app_input_runtime file picker replaces only the active query for Tab and E
         try app.input_runtime.textReplacementState().replace(alloc, input);
         app.input_runtime.edit_state.cursor = before_suffix.len;
 
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
 
         try std.testing.expectEqualStrings(expected, app.input_runtime.edit_state.input.items);
@@ -6708,6 +6747,7 @@ test "app_input_runtime file completion preserves a selected skill binding" {
     );
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqualStrings("$review @target.txt ", app.input_runtime.edit_state.input.items);
@@ -6747,6 +6787,7 @@ test "app_input_runtime file picker reuses one existing terminator and preserves
         try app.input_runtime.textReplacementState().replace(alloc, input);
         app.input_runtime.edit_state.cursor = prefix.len;
 
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
         const expected = try std.mem.concat(alloc, u8, &.{ "prefix @src/main.zig", case.expected_tail });
@@ -6790,6 +6831,7 @@ test "app_input_runtime accepts typed directories with one synthetic slash" {
             try app.input_runtime.textReplacementState().replace(alloc, case.input);
             app.input_runtime.edit_state.cursor = case.cursor;
 
+            presentRoutingFilePicker(&app);
             try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
 
             try std.testing.expectEqualStrings(case.expected, app.input_runtime.edit_state.input.items);
@@ -6809,6 +6851,7 @@ test "app_input_runtime counts the directory slash against the input limit" {
     app.file_completion_values = &completions;
     try app.input_runtime.textReplacementState().replace(alloc, "@s");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', "@src/".len - 1, 100);
 
     try std.testing.expectEqualStrings("@s", app.input_runtime.edit_state.input.items);
@@ -6824,17 +6867,19 @@ test "app_input_runtime quotes whitespace paths only while they are active" {
     app.file_completion_values = &directory;
     try app.input_runtime.textReplacementState().replace(alloc, "@space");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expectEqualStrings("@\"space dir/", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
 
     app.file_completion_values = &file;
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expectEqualStrings("@\"space dir/item.txt\" ", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
 }
 
-test "app_input_runtime rejects whitespace paths that the quote grammar cannot represent" {
+test "app_input_runtime file completion escapes quotes inside whitespace paths" {
     const alloc = std.testing.allocator;
     const completions = [_]file_index.Candidate{.{ .path = "space\" dir", .kind = .directory }};
     var app = try RoutingFakeApp.init(alloc);
@@ -6842,8 +6887,9 @@ test "app_input_runtime rejects whitespace paths that the quote grammar cannot r
     app.file_completion_values = &completions;
     try app.input_runtime.textReplacementState().replace(alloc, "@space");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqualStrings("@space", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("@\"space\\\" dir/", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime rejects kind-changed selections and preserves the query" {
@@ -6862,10 +6908,12 @@ test "app_input_runtime rejects kind-changed selections and preserves the query"
         };
         try app.input_runtime.textReplacementState().replace(alloc, "@changed");
 
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
         try std.testing.expectEqualStrings("@changed", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(candidate.kind, app.validated_file_completion_kind.?);
+        Runtime(RoutingFakeApp).prepareFilePicker(&app);
         try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
         try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     }
@@ -6879,13 +6927,14 @@ test "app_input_runtime consumes file search errors without stale insertion" {
     app.file_completion_error = error.NoSpaceLeft;
     try app.input_runtime.textReplacementState().replace(alloc, "@stale");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqualStrings("@stale", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime file query without a selection submits as ordinary prompt text" {
+test "app_input_runtime file query submits only an acknowledged successful empty result" {
     const alloc = std.testing.allocator;
     const states = [_]struct { loading: bool, failed: bool }{
         .{ .loading = false, .failed = false },
@@ -6900,14 +6949,17 @@ test "app_input_runtime file query without a selection submits as ordinary promp
         app.file_index_failed = state.failed;
         try app.input_runtime.textReplacementState().replace(alloc, "@not-present");
 
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-        try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-        try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
-        try std.testing.expectEqualStrings(
-            "@not-present",
-            app.submitted_prompt[0..app.submitted_prompt_len],
-        );
+        if (state.loading or state.failed) {
+            try std.testing.expectEqualStrings("@not-present", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+        } else {
+            try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
+            try std.testing.expectEqualStrings("@not-present", app.submitted_prompt[0..app.submitted_prompt_len]);
+        }
     }
 }
 
@@ -6918,6 +6970,7 @@ test "app_input_runtime dismissed file query submits as ordinary prompt text" {
     try app.input_runtime.textReplacementState().replace(alloc, "@not-present");
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -6933,9 +6986,11 @@ test "app_input_runtime stale file selection is rejected and refreshed" {
     app.file_completion_current = false;
     try app.input_runtime.textReplacementState().replace(alloc, "@deleted");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqualStrings("@deleted", app.input_runtime.edit_state.input.items);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -6951,9 +7006,11 @@ test "app_input_runtime stale explicit selection does not refresh the workspace 
     app.file_completions_depend_on_index = false;
     try app.input_runtime.textReplacementState().replace(alloc, "@../deleted");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqualStrings("@../deleted", app.input_runtime.edit_state.input.items);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 0), app.file_index_refresh_count);
 }
 
@@ -6966,9 +7023,11 @@ test "app_input_runtime stale Tab selection requests a footer repaint" {
     app.file_completion_current = false;
     try app.input_runtime.textReplacementState().replace(alloc, "@deleted");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqualStrings("@deleted", app.input_runtime.edit_state.input.items);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
@@ -6985,7 +7044,9 @@ test "app_input_runtime stream file picker navigates and selects without submitt
     app.stream.active = true;
     try app.input_runtime.textReplacementState().replace(alloc, "@file");
 
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    presentRoutingFilePicker(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.stream.active);
@@ -7000,6 +7061,7 @@ test "app_input_runtime terminated and unmatched file tokens submit as prompt te
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try app.input_runtime.textReplacementState().replace(alloc, "@literal ");
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
         try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
         try std.testing.expectEqualStrings("@literal ", app.submitted_prompt[0..app.submitted_prompt_len]);
@@ -7011,6 +7073,7 @@ test "app_input_runtime terminated and unmatched file tokens submit as prompt te
         app.stream.active = true;
         try app.input_runtime.textReplacementState().replace(alloc, "@queued");
         try std.testing.expect(Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
+        presentRoutingFilePicker(&app);
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -7026,20 +7089,25 @@ test "app_input_runtime refreshes each file picker episode after startup loading
     for ("@first") |byte| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expect(app.input_runtime.picker.file_picker_episode_seen);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
 
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4096, 100);
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4096, 100);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 2), app.file_index_refresh_count);
 
     for ("second") |byte| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 2), app.file_index_refresh_count);
 
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4096, 100);
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4096, 100);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 3), app.file_index_refresh_count);
 }
 
@@ -7051,15 +7119,19 @@ test "app_input_runtime preserves exact refresh accounting across one thousand f
     for (0..1_000) |episode| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4_096, 100);
         try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
+        Runtime(RoutingFakeApp).prepareFilePicker(&app);
         try std.testing.expectEqual(episode + 1, app.file_index_refresh_count);
 
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, 'x', 4_096, 100);
+        Runtime(RoutingFakeApp).prepareFilePicker(&app);
         try std.testing.expectEqual(episode + 1, app.file_index_refresh_count);
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4_096, 100);
         try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
     }
 
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expect(app.input_runtime.picker.file_picker_episode_seen);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 1_000), app.file_index_refresh_count);
     try std.testing.expectEqual(@as(usize, 3_000), app.input_runtime.edit_state.input.items.len);
 }
@@ -7073,12 +7145,15 @@ test "app_input_runtime does not duplicate the startup file index load" {
     for ("@first") |byte| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expect(app.input_runtime.picker.file_picker_episode_seen);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 0), app.file_index_refresh_count);
 
     app.file_index_loading = false;
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4096, 100);
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4096, 100);
+    Runtime(RoutingFakeApp).prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
 }
 
@@ -7092,6 +7167,7 @@ test "app_input_runtime file picker navigation respects completion cap" {
     app.file_completion_values = values[0..];
     try app.input_runtime.textReplacementState().replace(alloc, "prefix @mai /suffix");
     app.input_runtime.edit_state.cursor = "prefix @mai".len;
+    presentRoutingFilePicker(&app);
     app.input_runtime.picker.file_completion_index = file_picker_completion_cap - 1;
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
@@ -7117,6 +7193,7 @@ test "app_input_runtime file picker window moves up before reverse scrolling" {
     try app.input_runtime.textReplacementState().replace(alloc, "prefix @mai /suffix");
     app.input_runtime.edit_state.cursor = "prefix @mai".len;
 
+    presentRoutingFilePicker(&app);
     var down: usize = 0;
     while (down < 6) : (down += 1) {
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
@@ -9459,6 +9536,7 @@ test "app_input_runtime rejects yank and file completion before owner mutation" 
         const completions = [_]file_index.Candidate{.{ .path = "long/path.zig", .kind = .file }};
         app.file_completion_values = &completions;
         try app.input_runtime.textReplacementState().replace(alloc, "@l");
+        presentRoutingFilePicker(&app);
 
         try Runtime(RoutingFakeApp).handleByte(&app, '\t', 2, 100);
 
@@ -13421,6 +13499,188 @@ test "app_input_runtime accepted prompt cleanup survives allocation failures" {
     }
 }
 
+test "app_input_runtime inline image edits compose stable collision and history spans" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "first.png");
+    try writeTestImage(&tmp, "second.png");
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const cases = [_]struct { input: []const u8, expected: []const u8, first_id: usize, image_count: usize }{
+        .{
+            .input = " \t[Pasted text #7, 2 lines]\n@./first.png,\n[Image #8]\t$review @./second.png  \r\n",
+            .expected = " \talpha\n  beta\n[Image #9],\n[Image #8]\t$review [Image #10]  \r\n",
+            .first_id = 9,
+            .image_count = 3,
+        },
+        .{
+            .input = " \t[Pasted text #7, 2 lines]\n[Image #9] @./first.png,\n[Image #8]\t$review  \r\n",
+            .expected = " \talpha\n  beta\n[Image #9] [Image #10],\n[Image #8]\t$review  \r\n",
+            .first_id = 10,
+            .image_count = 2,
+        },
+    };
+    for (cases) |case| {
+        var app = FakeSubmitApp{ .alloc = alloc, .workspace_root = root, .next_image_id_counter = 9 };
+        defer app.deinit();
+        try app.input_runtime.edit_state.input.appendSlice(alloc, case.input);
+        app.input_runtime.edit_state.cursor = case.input.len;
+        try app.input_runtime.entities.pasted_blocks.append(alloc, .{
+            .id = 7,
+            .text = try alloc.dupe(u8, "alpha\n  beta"),
+            .line_count = 2,
+            .span = .{ .raw_start = 2, .raw_end = 2 + "[Pasted text #7, 2 lines]".len },
+        });
+        try appendOwnedPendingImage(&app, 8, "/tmp/existing.png");
+        try appendImageTokenForPlaceholderAt(&app, 8, std.mem.find(u8, case.input, "[Image #8]").?);
+        const skill_start = std.mem.find(u8, case.input, "$review").?;
+        try app.input_runtime.entities.skill_tokens.append(alloc, .{
+            .raw_start = skill_start,
+            .raw_end = skill_start + "$review".len,
+            .name = try alloc.dupe(u8, "review"),
+            .path = try alloc.dupe(u8, "/tmp/review/SKILL.md"),
+        });
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+        try std.testing.expectEqualStrings(case.expected, app.last_prompt.?);
+        try std.testing.expectEqual(case.image_count, app.last_images.len);
+        try std.testing.expectEqual(case.first_id, app.last_images[0].id);
+        try std.testing.expectEqual(@as(usize, 8), app.last_images[1].id);
+        if (case.image_count == 3) try std.testing.expectEqual(@as(usize, 10), app.last_images[2].id);
+        try std.testing.expectEqual(@as(usize, 11), app.next_image_id_counter);
+        try std.testing.expectEqual(@as(usize, 1), app.last_skill_tokens.items.len);
+        const skill = app.last_skill_tokens.items[0];
+        try std.testing.expectEqualStrings("$review", app.last_prompt.?[skill.raw_start..skill.raw_end]);
+        const history = app.input_runtime.composer_history.viewEntry(0).?;
+        try std.testing.expectEqualStrings(case.expected, history.text);
+        try std.testing.expectEqual(case.image_count, history.image_tokens.len);
+        for (history.image_tokens) |token| {
+            const parsed = image_attachments.matchImagePlaceholder(history.text, token.span.raw_start).?;
+            try std.testing.expectEqual(token.id, parsed.id);
+            try std.testing.expectEqual(token.span.raw_end, token.span.raw_start + parsed.length);
+        }
+        const stored_skill = history.skill_tokens[0];
+        try std.testing.expectEqualStrings("$review", history.text[stored_skill.raw_start..stored_skill.raw_end]);
+    }
+}
+
+test "app_input_runtime inline image edits retain draft IDs and snapshots on failed admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "existing.png");
+    try writeTestImage(&tmp, "first.png");
+    try writeTestImage(&tmp, "second.png");
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const existing = try realTmpPath(alloc, &tmp, "existing.png");
+    defer alloc.free(existing);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+    const input = " \t[Image #8]\n@./first.png @./second.png  \r\n";
+    const cases = [_]struct { capture_error: ?anyerror = null, queue_admitted: bool = true, enqueue_failure: bool = false, first_id: usize = 9, expected_error: ?anyerror = null }{
+        .{ .capture_error = error.Cancelled, .expected_error = error.Cancelled },
+        .{ .capture_error = error.OutOfMemory, .expected_error = error.OutOfMemory },
+        .{ .capture_error = error.ImageTooLarge },
+        .{ .queue_admitted = false },
+        .{ .enqueue_failure = true, .expected_error = error.InjectedEnqueueFailure },
+        .{ .first_id = 8, .expected_error = error.DuplicateImageId },
+        .{ .first_id = std.math.maxInt(usize), .expected_error = error.ImageIdOverflow },
+    };
+    for (cases) |case| {
+        var app = FakeSubmitApp{
+            .alloc = alloc,
+            .workspace_root = root,
+            .snapshot_dir = snapshot_dir,
+            .next_image_id_counter = case.first_id,
+            .capture_error_id = if (case.capture_error != null) 10 else null,
+            .capture_error = case.capture_error,
+            .queue_admitted = case.queue_admitted,
+            .fail_enqueue_after_snapshot = case.enqueue_failure,
+        };
+        defer app.deinit();
+        try appendOwnedPendingImage(&app, 8, existing);
+        try image_attachments.captureImageSnapshot(alloc, &app.pending_images.items[0], snapshot_dir);
+        const digest = try alloc.dupe(u8, app.pending_images.items[0].snapshot_sha256.?);
+        defer alloc.free(digest);
+        try app.input_runtime.edit_state.input.appendSlice(alloc, input);
+        app.input_runtime.edit_state.cursor = input.len;
+        try appendImageTokenForPlaceholderAt(&app, 8, 2);
+        const result = Runtime(FakeSubmitApp).submit(&app, 100);
+        if (case.expected_error) |err| try std.testing.expectError(err, result) else try result;
+        try std.testing.expectEqualStrings(input, app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(input.len, app.input_runtime.edit_state.cursor);
+        try std.testing.expectEqual(case.first_id, app.next_image_id_counter);
+        try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+        try std.testing.expectEqual(@as(usize, 8), app.pending_images.items[0].id);
+        try std.testing.expectEqualStrings(digest, app.pending_images.items[0].snapshot_sha256.?);
+        try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+        try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+        try std.testing.expect(app.last_prompt == null);
+    }
+}
+
+fn check_inline_image_edit_allocation_failure(failing: *std.testing.FailingAllocator, root: []const u8, snapshot_dir: []const u8) !void {
+    const alloc = failing.allocator();
+    const input = " \t[Image #8]\n@./first.png $review  \r\n";
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .workspace_root = root,
+        .snapshot_dir = snapshot_dir,
+        .next_image_id_counter = 9,
+        .queue_admitted = false,
+    };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, input);
+    app.input_runtime.edit_state.cursor = input.len;
+    try appendOwnedPendingImage(&app, 8, "/tmp/retained.png");
+    try appendImageTokenForPlaceholderAt(&app, 8, 2);
+    const skill_start = std.mem.find(u8, input, "$review").?;
+    try app.input_runtime.entities.skill_tokens.ensureUnusedCapacity(alloc, 1);
+    const name = try alloc.dupe(u8, "review");
+    const path = alloc.dupe(u8, "/tmp/review/SKILL.md") catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    app.input_runtime.entities.skill_tokens.appendAssumeCapacity(.{ .raw_start = skill_start, .raw_end = skill_start + "$review".len, .name = name, .path = path });
+    const result = Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expectEqualStrings(input, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(input.len, app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 9), app.next_image_id_counter);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 8), app.pending_images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
+    try std.testing.expectEqual(skill_start, app.input_runtime.entities.skill_tokens.items[0].raw_start);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+    try result;
+}
+
+test "app_input_runtime inline image edits roll back across allocation failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "first.png");
+    const root = try realTmpPath(std.testing.allocator, &tmp, ".");
+    defer std.testing.allocator.free(root);
+    const snapshot_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "snapshots" });
+    defer std.testing.allocator.free(snapshot_dir);
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try check_inline_image_edit_allocation_failure(&probe, root, snapshot_dir);
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+    for (0..probe.alloc_index) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        check_inline_image_edit_allocation_failure(&failing, root, snapshot_dir) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+    }
+}
+
 test "app_input_runtime submit projects selected skill spans onto transformed prompt text" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -13461,14 +13721,14 @@ test "app_input_runtime submit projects selected skill spans onto transformed pr
 
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
-    try std.testing.expectEqualStrings("pasted [Image #1], $review", app.last_prompt.?);
+    try std.testing.expectEqualStrings("  pasted [Image #1], $review", app.last_prompt.?);
     try std.testing.expectEqual(@as(usize, 1), app.last_images.len);
     try std.testing.expectEqualStrings(image_path, app.last_images[0].path);
     try std.testing.expectEqual(@as(usize, 1), app.last_skill_tokens.items.len);
     try std.testing.expectEqualStrings("review", app.last_skill_tokens.items[0].name);
     try std.testing.expectEqualStrings("/tmp/.codex/skills/review/SKILL.md", app.last_skill_tokens.items[0].path);
-    try std.testing.expectEqual(@as(usize, "pasted [Image #1], ".len), app.last_skill_tokens.items[0].raw_start);
-    try std.testing.expectEqual(@as(usize, "pasted [Image #1], $review".len), app.last_skill_tokens.items[0].raw_end);
+    try std.testing.expectEqual(@as(usize, "  pasted [Image #1], ".len), app.last_skill_tokens.items[0].raw_start);
+    try std.testing.expectEqual(@as(usize, "  pasted [Image #1], $review".len), app.last_skill_tokens.items[0].raw_end);
 }
 
 test "app_input_runtime submit preserves side whitespace around semantic entities" {

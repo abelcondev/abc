@@ -1,4 +1,5 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -2649,7 +2650,10 @@ pub fn collectExplicitSkillSelections(alloc: Allocator, prompt: []const u8, skil
     var selections: std.ArrayList(ExplicitSelection) = .empty;
     defer selections.deinit(alloc);
     const trimmed = std.mem.trimStart(u8, prompt, " \t\r\n");
-    const natural_end = std.mem.findScalar(u8, prompt, '$') orelse prompt.len;
+    var natural_end: usize = 0;
+    while (natural_end < prompt.len) : (natural_end += 1) {
+        if (file_picker_path.parse_at(prompt, natural_end) != null or prompt[natural_end] == '$') break;
+    }
     var natural = try parseNaturalLanguageSkillReference(alloc, prompt[0..natural_end]);
     defer if (natural) |*reference| reference.deinit(alloc);
     for (skills, 0..) |skill, index| {
@@ -2691,6 +2695,10 @@ pub fn collectExplicitSkillSelections(alloc: Allocator, prompt: []const u8, skil
         }
         if (quote) |active| {
             if (byte == active) quote = null;
+            continue;
+        }
+        if (file_picker_path.parse_at(prompt, index)) |path| {
+            index = path.end - 1;
             continue;
         }
         if (byte == '`' or byte == '~') {
@@ -3981,6 +3989,33 @@ test "skill runtime replaces and frees owned discovery diagnostics" {
         &.{},
     );
     try std.testing.expectEqual(@as(usize, 0), runtime.diagnostics.len);
+}
+
+test "explicit skill matching excludes at path regions in dollar and natural references" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        staticSkill("review", "review", .workspace_shared),
+        staticSkill("release", "release", .global_fx),
+    };
+    for ([_][]const u8{
+        "@./$review.txt",
+        "@\"./$review.txt\"",
+        "@\"./a\\\"$review.txt\"",
+        "@\"./a\\\\$review.txt\"",
+        "Use @\"review skill\"",
+        "Use @review skill",
+        "@\"broken$review",
+        "@\"a.png\"invalid$review",
+    }) |prompt| {
+        const selected = try collectExplicitSkillSelections(alloc, prompt, &skills);
+        defer alloc.free(selected);
+        try std.testing.expectEqual(@as(usize, 0), selected.len);
+    }
+    for ([_][]const u8{ "$release @./$review.txt", "Use release skill @\"./$review.txt\"", "@./$review.txt use $release" }) |prompt| {
+        const selected = try matchExplicitSkillIndices(alloc, prompt, &skills);
+        defer alloc.free(selected);
+        try std.testing.expectEqualSlices(usize, &.{1}, selected);
+    }
 }
 
 test "explicit skill matching finds multiple mentions in request order" {

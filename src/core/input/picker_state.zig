@@ -1,4 +1,6 @@
 const std = @import("std");
+const file_picker_path = @import("file_picker_path.zig");
+const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -75,16 +77,7 @@ pub const ProviderPickerQuery = struct {
     token_start: usize,
 };
 
-pub const FilePickerQuery = struct {
-    /// Bytes between `@` and the cursor, without the leading `@`.
-    query: []const u8,
-    /// Byte offset of the `@` in the composer text.
-    at_offset: usize,
-    /// Byte offset where `query` begins.
-    token_start: usize,
-    /// The query begins with `@"` and stays open across spaces.
-    quoted: bool = false,
-};
+pub const FilePickerQuery = file_picker_path.Query;
 
 pub const InlineSkillQuery = struct {
     /// Bytes between `$` and the cursor, without the leading `$`.
@@ -126,11 +119,14 @@ pub const State = struct {
     team_column_window_start: usize = 0,
     key_source_column_index: usize = 0,
     key_source_column_window_start: usize = 0,
+    file_completion: file_completion_state.State = .{},
+    // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
@@ -138,6 +134,7 @@ pub const State = struct {
     }
 
     pub fn resetInlinePickerEpisode(self: *State) void {
+        self.file_completion.invalidate();
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
         self.inline_picker_suppression = null;
@@ -151,6 +148,7 @@ pub const State = struct {
     }
 
     pub fn dismissInlinePicker(self: *State, kind: InlinePickerKind) void {
+        if (kind == .file) self.file_completion.invalidate();
         self.inline_picker_suppression = .{ .dismissed_until_trigger_change = kind };
     }
 
@@ -509,49 +507,7 @@ fn leadingWhitespaceLen(bytes: []const u8) usize {
 }
 
 fn findFilePickerQuery(items: []const u8, cursor: usize) ?FilePickerQuery {
-    if (cursor > items.len) return null;
-
-    var index = cursor;
-    while (index > 0) {
-        const byte = items[index - 1];
-        if (byte == '@') {
-            const at_offset = index - 1;
-            if (at_offset > 0 and !isFilePickerStartBoundary(items[at_offset - 1])) {
-                index -= 1;
-                continue;
-            }
-            const quoted = index < cursor and items[index] == '"';
-            const token_start = index + @intFromBool(quoted);
-            return .{
-                .query = items[token_start..cursor],
-                .at_offset = at_offset,
-                .token_start = token_start,
-                .quoted = quoted,
-            };
-        }
-        if (isFilePickerTerminator(byte)) break;
-        index -= 1;
-    }
-
-    index = cursor;
-    while (index > 1) {
-        const byte = items[index - 1];
-        if (byte == '\t' or byte == '\n' or byte == '\r') return null;
-        if (byte == '"') {
-            const at_offset = index - 2;
-            if (items[at_offset] != '@') return null;
-            if (at_offset > 0 and !isFilePickerStartBoundary(items[at_offset - 1])) return null;
-            return .{
-                .query = items[index..cursor],
-                .at_offset = at_offset,
-                .token_start = index,
-                .quoted = true,
-            };
-        }
-        index -= 1;
-    }
-
-    return null;
+    return file_picker_path.query_at(items, cursor);
 }
 
 fn findInlineSkillQuery(items: []const u8, cursor: usize) ?InlineSkillQuery {
@@ -563,6 +519,7 @@ fn findInlineSkillQuery(items: []const u8, cursor: usize) ?InlineSkillQuery {
         if (isFilePickerTerminator(byte)) return null;
         index -= 1;
         if (byte != '$') continue;
+        if (file_picker_path.contains_position(items, index)) return null;
         return .{
             .query = items[index + 1 .. cursor],
             .dollar_offset = index,
@@ -583,14 +540,6 @@ fn findInlineSlashQuery(items: []const u8, cursor: usize) ?InlineSlashQuery {
     if (std.mem.trim(u8, items[0..token_start], " \t\r\n").len == 0) return null;
 
     return .{ .prefix = items[token_start..cursor] };
-}
-
-fn isFilePickerStartBoundary(byte: u8) bool {
-    if (isFilePickerTerminator(byte)) return true;
-    return switch (byte) {
-        '(', '[', '{', '<', '\'', '"', '`' => true,
-        else => false,
-    };
 }
 
 fn modelPickerTokenStart(trimmed: []const u8, model: []const u8, stage: ModelPickerStage) ?usize {

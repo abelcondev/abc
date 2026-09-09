@@ -172,6 +172,16 @@ pub fn run(
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
+    debug_trace.logf(
+        "subagent",
+        "child turn routed child_id={s} provider={s} model={s} effort={s}",
+        .{
+            turn.child_id orelse "unknown",
+            @tagName(admission.provider),
+            admission.model,
+            admission.effort.label(),
+        },
+    );
     if (!routed_config.tool_context.provider_capabilities.fx_search) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;

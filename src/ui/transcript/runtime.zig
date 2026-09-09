@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
@@ -93,6 +94,9 @@ pub const TranscriptCommitDiagnostic = struct {
     state: TranscriptCommitDiagnosticState,
     stable_start_line: ?usize = null,
     visual_offset: u32 = 0,
+    history_visual_offset: u32 = 0,
+    total_visual_rows: u32 = 0,
+    source_bytes: usize = 0,
     layout_id: u64 = 0,
     remaining_inline_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
@@ -4089,6 +4093,40 @@ const CompactTranscriptSourceCache = struct {
     }
 };
 
+test "render diagnostic commit skips unchanged same-row paints" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const shell: TranscriptRuntime = .{ .layout = .{
+        .rows = 4,
+        .cols = 20,
+        .content_bottom = 1,
+        .divider_top_row = 2,
+        .input_row = 3,
+        .divider_bottom_row = 4,
+        .hint_row = 4,
+    } };
+    const before = shell.transcriptCommitDiagnostic();
+    const scroll_plan = render_engine.frame_scroll_plan.merge(4, 1, 0, 0);
+    var result: render_engine.terminal_diff.FrameCommitResult = .{
+        .bytes_written = 12,
+        .changed_cells = 1,
+        .full_repaint = false,
+        .committed_cursor_row = 3,
+        .committed_cursor_col = 1,
+        .shadow_state = .committed,
+        .next_invalidation = .{},
+    };
+    shell.recordRenderCommit(before, false, false, scroll_plan, result, false);
+    var events: [2]diagnostics.RenderEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotRenderEvents(&events));
+    result.full_repaint = true;
+    shell.recordRenderCommit(before, false, false, scroll_plan, result, false);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotRenderEvents(&events));
+    try std.testing.expectEqual(.commit, events[0].kind);
+    try std.testing.expect(!events[0].truncated);
+    try std.testing.expect(std.mem.find(u8, events[0].detail(), "repaint=true") != null);
+}
+
 pub const TranscriptRuntime = struct {
     stdout_file: std.Io.File = std.Io.File.stdout(),
     sync_updates_enabled: bool = true,
@@ -6531,6 +6569,12 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn requestTerminalReset(self: *TranscriptRuntime, metrics: *Metrics) !void {
+        const before = self.transcriptCommitDiagnostic();
+        diagnostics.recordRenderEvent(
+            .reset,
+            "state={s} view={d} history={d} terminal={d}x{d} owned_top={d} cursor={d},{d}",
+            .{ @tagName(before.state), before.visual_offset, before.history_visual_offset, self.layout.cols, self.layout.rows, self.owned_top_row, self.cursor_row, self.cursor_col },
+        );
         const min_body_rows = self.min_visible_viewport_rows;
         self.reflow_clear_guard_rows = 0;
         self.resize_history_row_delta = null;
@@ -6583,15 +6627,36 @@ pub const TranscriptRuntime = struct {
                 .state = .stable,
                 .stable_start_line = anchor.selection.start_line,
                 .visual_offset = anchor.visual_offset,
+                .history_visual_offset = anchor.history_visual_offset,
+                .total_visual_rows = anchor.total_visual_rows,
+                .source_bytes = anchor.flow.len,
                 .layout_id = anchor.layout_id,
             },
             .recovering => |receipt| .{
                 .state = .recovering,
                 .visual_offset = receipt.accepted_visual_offset,
+                .history_visual_offset = receipt.accepted_history_visual_offset,
+                .total_visual_rows = receipt.attempt_total_visual_rows,
+                .source_bytes = receipt.flow.len,
                 .remaining_inline_rows = @as(u32, receipt.remaining_resize_reflow_rows) +
                     receipt.remaining_semantic_rows,
                 .remaining_unplanned_scroll_rows = receipt.remaining_unplanned_scroll_rows,
             },
+        };
+    }
+
+    pub fn normalBufferRecoveryPending(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid => false,
+            .stable => |anchor| anchor.normal_buffer_recovery_pending,
+            .recovering => |receipt| receipt.normal_buffer_recovery_pending,
+        };
+    }
+
+    pub fn historyCatchupPending(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid, .recovering => false,
+            .stable => |anchor| anchor.history_catchup_pending,
         };
     }
 
@@ -6677,6 +6742,11 @@ pub const TranscriptRuntime = struct {
     pub fn invalidateTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
         const diagnostic = self.transcriptCommitDiagnostic();
         if (diagnostic.state != .invalid) {
+            diagnostics.recordRenderEvent(
+                .source_invalidated,
+                "reason={s} state={s} view={d} history={d} rows={d} source_bytes={d} recovery={} catchup={}",
+                .{ reason, @tagName(diagnostic.state), diagnostic.visual_offset, diagnostic.history_visual_offset, diagnostic.total_visual_rows, diagnostic.source_bytes, self.normalBufferRecoveryPending(), self.historyCatchupPending() },
+            );
             debug_trace.logf(
                 "scroll",
                 "transcript_anchor_invalidate state={s} stable_start={d} visual_offset={d} reason={s}",
@@ -6738,6 +6808,11 @@ pub const TranscriptRuntime = struct {
                                     reason,
                                 },
                             );
+                            diagnostics.recordRenderEvent(
+                                .source_rewrite,
+                                "action=preserve reason={s} old_bytes={d} new_bytes={d} view={d} history={d} rows={d} start={d} layout={x} recovery={}->true catchup={}",
+                                .{ reason, anchor.flow.len, rendered_flow.len, anchor.visual_offset, anchor.history_visual_offset, anchor.total_visual_rows, anchor.selection.start_line, anchor.layout_id, anchor.normal_buffer_recovery_pending, anchor.history_catchup_pending },
+                            );
                             anchor.normal_buffer_recovery_pending = true;
                             return;
                         }
@@ -6769,6 +6844,11 @@ pub const TranscriptRuntime = struct {
                         if (receipt.document_append_committed) "true" else "false",
                         reason,
                     },
+                );
+                diagnostics.recordRenderEvent(
+                    .source_rewrite,
+                    "action=rebase_recovery reason={s} old_bytes={d} new_bytes={d} view={d} history={d} dropped_rows={d} append_committed={}",
+                    .{ reason, receipt.flow.len, rendered_flow.len, receipt.accepted_visual_offset, receipt.accepted_history_visual_offset, receipt.remaining_semantic_rows, receipt.document_append_committed },
                 );
                 receipt.remaining_semantic_rows = 0;
                 receipt.remaining_semantic_progress_rows = 0;
@@ -7241,6 +7321,13 @@ pub const TranscriptRuntime = struct {
             semantic_rows,
             semantic_rows,
         );
+        if (semantic_rows > releasable_advance) {
+            diagnostics.recordRenderEvent(
+                .transition,
+                "release_past_finality view={d}->{d} history={d} releasable={d} semantic={d} planned={d} compatible={} geometry={} recovery_rebase={} restore={} catchup={}",
+                .{ committed_projection_offset, target_offset, anchor.history_visual_offset, releasable_offset, semantic_rows, planned, source_compatible, geometry_rebase, recovery_rebase, anchor.normal_buffer_recovery_pending, anchor.history_catchup_pending },
+            );
+        }
         debug_trace.logf(
             "scroll",
             "transcript_transition_plan source_state=stable source_start={d} target_start={d} source_visual_offset={d} source_history_visual_offset={d} target_visual_offset={d} releasable_visual_offset={d} source_total_visual_rows={d} target_total_visual_rows={d} resize_reflow_candidate={d} resize_reflow_rows={d} semantic_rows={d} planned_rows={d} width_stable={s} source_compatible={s} footer_reservation_changed={s} replay_displaced_footer_history={s} geometry_rebase={s} recovery_rebase={s}",
@@ -7459,6 +7546,7 @@ pub const TranscriptRuntime = struct {
             target_area: render_engine.frame_layout.FrameRect,
         ) !void {
             const logical_visual_offset = self.visual_offset;
+            const previous_start_line = self.selection.start_line;
             try self.stagePreparedProjection(
                 alloc,
                 layout,
@@ -7468,6 +7556,11 @@ pub const TranscriptRuntime = struct {
             );
             self.visual_offset = logical_visual_offset;
             self.source_endpoint_visual_offset = self.history_visual_offset;
+            diagnostics.recordRenderEvent(
+                .history_projection,
+                "logical_view={d} history={d} start={d}->{d} endpoint={d} cursor={d},{d} terminal={d}x{d} area={d}..{d}",
+                .{ logical_visual_offset, self.history_visual_offset, previous_start_line, self.selection.start_line, self.source_endpoint_visual_offset, self.cursor_row, self.cursor_col, layout.cols, layout.rows, target_area.top, target_area.bottom },
+            );
         }
     };
 
@@ -7656,6 +7749,11 @@ pub const TranscriptRuntime = struct {
                     scroll_facts,
                     destructive_invalidation,
                 )) {
+                    diagnostics.recordRenderEvent(
+                        .transition,
+                        "rejected=rewind view={d}->{d} history={d}->{d} requested_view={d} compatible={} geometry={} restore={} catchup={}",
+                        .{ anchor.visual_offset, target.visual_offset, anchor.history_visual_offset, target.history_visual_offset, scroll_facts.target_visual_offset, scroll_facts.source_compatible, scroll_facts.geometry_rebase, target.normal_buffer_recovery_pending, target.history_catchup_pending },
+                    );
                     return error.InvalidTranscriptTransition;
                 }
                 if (semanticProgressNeedsStaging(
@@ -8692,6 +8790,16 @@ pub const TranscriptRuntime = struct {
             target_flow.len,
             target_layout.transcript_area,
         );
+        if (!scroll_facts.source_compatible or scroll_facts.geometry_rebase or
+            scroll_facts.recovery_rebase or scroll_plan.terminal_scroll_rows > 0 or plan.reset_terminal)
+        {
+            const before = self.transcriptCommitDiagnostic();
+            diagnostics.recordRenderEvent(
+                .transition,
+                "prepared view={d}->{d} history={d}->{d} start={d}->{d} rows={d}->{d} bytes={d}->{d} compatible={} geometry={} rebase={} hold={} restore={} catchup={} append={d}@{d},{d} scroll={d} reset={} body={d}..{d} footer={d}..{d}",
+                .{ before.visual_offset, target.visual_offset, before.history_visual_offset, target.history_visual_offset, before.stable_start_line orelse 0, target.selection.start_line, before.total_visual_rows, target.total_visual_rows, before.source_bytes, target_flow.len, scroll_facts.source_compatible, scroll_facts.geometry_rebase, scroll_facts.recovery_rebase, target.hold_staged, target.normal_buffer_recovery_pending, target.history_catchup_pending, document_append.bytes.len, document_append.start_row, document_append.start_col, scroll_plan.terminal_scroll_rows, plan.reset_terminal, target_layout.transcript_area.top, target_layout.transcript_area.bottom, target_layout.footer_area.top, target_layout.footer_area.bottom },
+            );
+        }
         return .{
             .scroll_plan = scroll_plan,
             .document_append = document_append,
@@ -8762,6 +8870,9 @@ pub const TranscriptRuntime = struct {
         result: render_engine.terminal_diff.FrameCommitResult,
         transition: ?*TranscriptTransition,
     ) void {
+        const before = self.transcriptCommitDiagnostic();
+        const before_recovery_pending = self.normalBufferRecoveryPending();
+        const before_history_catchup_pending = self.historyCatchupPending();
         const terminal_reset_commit =
             result.is_committed() and self.terminal_reset_pending;
         const resize_reset_commit =
@@ -8785,6 +8896,43 @@ pub const TranscriptRuntime = struct {
             if (committed_selection) |selection| selection.tail_kind else null,
             if (committed_selection) |selection| selection.last_visible_row else 0,
             self.layout.content_bottom,
+        );
+        self.recordRenderCommit(
+            before,
+            before_recovery_pending,
+            before_history_catchup_pending,
+            scroll_plan,
+            result,
+            terminal_reset_commit,
+        );
+    }
+
+    fn recordRenderCommit(
+        self: *const TranscriptRuntime,
+        before: TranscriptCommitDiagnostic,
+        before_recovery_pending: bool,
+        before_history_catchup_pending: bool,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        result: render_engine.terminal_diff.FrameCommitResult,
+        reset: bool,
+    ) void {
+        const after = self.transcriptCommitDiagnostic();
+        // Idle animation and same-row token paints must not evict the transitions
+        // that explain a jump before the user can request a trace.
+        if (result.is_committed() and !result.full_repaint and !reset and
+            scroll_plan.terminal_scroll_rows == 0 and
+            before.state == after.state and
+            before.visual_offset == after.visual_offset and
+            before.history_visual_offset == after.history_visual_offset and
+            before.total_visual_rows == after.total_visual_rows and
+            before.layout_id == after.layout_id and
+            before_recovery_pending == self.normalBufferRecoveryPending() and
+            before_history_catchup_pending == self.historyCatchupPending()) return;
+
+        diagnostics.recordRenderEvent(
+            .commit,
+            "state={s}->{s} result={s} view={d}->{d} history={d}->{d} rows={d}->{d} layout={x}->{x} terminal={d}x{d} cursor={d},{d} planned_scroll={d} accepted_scroll={d} bytes={d} repaint={} reset={} recovery={}->{} catchup={}->{}",
+            .{ @tagName(before.state), @tagName(after.state), @tagName(result.state()), before.visual_offset, after.visual_offset, before.history_visual_offset, after.history_visual_offset, before.total_visual_rows, after.total_visual_rows, before.layout_id, after.layout_id, self.layout.cols, self.layout.rows, result.committed_cursor_row, result.committed_cursor_col, scroll_plan.terminal_scroll_rows, result.terminal_scroll_rows_applied(), result.bytes_written, result.full_repaint, reset, before_recovery_pending, self.normalBufferRecoveryPending(), before_history_catchup_pending, self.historyCatchupPending() },
         );
     }
 
