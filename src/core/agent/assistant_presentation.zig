@@ -2214,6 +2214,32 @@ test "unordered list asterisk gets bullet" {
     try std.testing.expectEqualStrings("\x1b[2m\xe2\x80\xa2 \x1b[22msecond item\n", out.items);
 }
 
+test "unordered list literal bullet gets dim marker" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "\xe2\x80\xa2 third item\n  \xe2\x80\xa2 nested\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x80\xa2 \x1b[22mthird item\n" ++
+            "  \x1b[2m\xe2\x80\xa2 \x1b[22mnested\n",
+        out.items,
+    );
+}
+
+test "literal bullet without trailing space stays prose" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "\xe2\x80\xa2item\n\xe2\x80\xa2\n", &out);
+    try std.testing.expectEqualStrings("\xe2\x80\xa2item\n\xe2\x80\xa2\n", out.items);
+}
+
 test "ordered list keeps number marker" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};

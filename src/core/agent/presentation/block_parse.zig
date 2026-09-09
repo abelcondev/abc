@@ -151,13 +151,21 @@ const ParsedUnorderedList = struct {
     content: []const u8,
 };
 
+/// Accepts Markdown `-` and `*` markers plus a literal bullet so model output
+/// that already uses `•` gets the same styling and wrap continuation.
 pub fn parseUnorderedList(line: []const u8) ?ParsedUnorderedList {
+    const literal_bullet = "\xe2\x80\xa2";
     var i: usize = 0;
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    if (i + 1 >= line.len) return null;
-    if (line[i] != '-' and line[i] != '*') return null;
-    if (line[i + 1] != ' ') return null;
-    return .{ .indent = line[0..i], .content = line[i + 2 ..] };
+    const rest = line[i..];
+    const marker_len: usize = if (rest.len > 0 and (rest[0] == '-' or rest[0] == '*'))
+        1
+    else if (std.mem.startsWith(u8, rest, literal_bullet))
+        literal_bullet.len
+    else
+        return null;
+    if (marker_len >= rest.len or rest[marker_len] != ' ') return null;
+    return .{ .indent = line[0..i], .content = rest[marker_len + 1 ..] };
 }
 
 const ParsedOrderedList = struct {
