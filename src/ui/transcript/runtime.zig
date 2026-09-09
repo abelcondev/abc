@@ -97,8 +97,6 @@ pub const TranscriptCommitDiagnostic = struct {
     history_visual_offset: u32 = 0,
     total_visual_rows: u32 = 0,
     source_bytes: usize = 0,
-    normal_buffer_recovery_pending: bool = false,
-    history_catchup_pending: bool = false,
     layout_id: u64 = 0,
     remaining_inline_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
@@ -4118,11 +4116,11 @@ test "render diagnostic commit skips unchanged same-row paints" {
         .shadow_state = .committed,
         .next_invalidation = .{},
     };
-    shell.recordRenderCommit(before, scroll_plan, result, false);
+    shell.recordRenderCommit(before, false, false, scroll_plan, result, false);
     var events: [2]diagnostics.RenderEvent = undefined;
     try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotRenderEvents(&events));
     result.full_repaint = true;
-    shell.recordRenderCommit(before, scroll_plan, result, false);
+    shell.recordRenderCommit(before, false, false, scroll_plan, result, false);
     try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotRenderEvents(&events));
     try std.testing.expectEqual(.commit, events[0].kind);
     try std.testing.expect(!events[0].truncated);
@@ -6632,8 +6630,6 @@ pub const TranscriptRuntime = struct {
                 .history_visual_offset = anchor.history_visual_offset,
                 .total_visual_rows = anchor.total_visual_rows,
                 .source_bytes = anchor.flow.len,
-                .normal_buffer_recovery_pending = anchor.normal_buffer_recovery_pending,
-                .history_catchup_pending = anchor.history_catchup_pending,
                 .layout_id = anchor.layout_id,
             },
             .recovering => |receipt| .{
@@ -6642,11 +6638,25 @@ pub const TranscriptRuntime = struct {
                 .history_visual_offset = receipt.accepted_history_visual_offset,
                 .total_visual_rows = receipt.attempt_total_visual_rows,
                 .source_bytes = receipt.flow.len,
-                .normal_buffer_recovery_pending = receipt.normal_buffer_recovery_pending,
                 .remaining_inline_rows = @as(u32, receipt.remaining_resize_reflow_rows) +
                     receipt.remaining_semantic_rows,
                 .remaining_unplanned_scroll_rows = receipt.remaining_unplanned_scroll_rows,
             },
+        };
+    }
+
+    pub fn normalBufferRecoveryPending(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid => false,
+            .stable => |anchor| anchor.normal_buffer_recovery_pending,
+            .recovering => |receipt| receipt.normal_buffer_recovery_pending,
+        };
+    }
+
+    pub fn historyCatchupPending(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid, .recovering => false,
+            .stable => |anchor| anchor.history_catchup_pending,
         };
     }
 
@@ -6735,7 +6745,7 @@ pub const TranscriptRuntime = struct {
             diagnostics.recordRenderEvent(
                 .source_invalidated,
                 "reason={s} state={s} view={d} history={d} rows={d} source_bytes={d} recovery={} catchup={}",
-                .{ reason, @tagName(diagnostic.state), diagnostic.visual_offset, diagnostic.history_visual_offset, diagnostic.total_visual_rows, diagnostic.source_bytes, diagnostic.normal_buffer_recovery_pending, diagnostic.history_catchup_pending },
+                .{ reason, @tagName(diagnostic.state), diagnostic.visual_offset, diagnostic.history_visual_offset, diagnostic.total_visual_rows, diagnostic.source_bytes, self.normalBufferRecoveryPending(), self.historyCatchupPending() },
             );
             debug_trace.logf(
                 "scroll",
@@ -8861,6 +8871,8 @@ pub const TranscriptRuntime = struct {
         transition: ?*TranscriptTransition,
     ) void {
         const before = self.transcriptCommitDiagnostic();
+        const before_recovery_pending = self.normalBufferRecoveryPending();
+        const before_history_catchup_pending = self.historyCatchupPending();
         const terminal_reset_commit =
             result.is_committed() and self.terminal_reset_pending;
         const resize_reset_commit =
@@ -8885,12 +8897,21 @@ pub const TranscriptRuntime = struct {
             if (committed_selection) |selection| selection.last_visible_row else 0,
             self.layout.content_bottom,
         );
-        self.recordRenderCommit(before, scroll_plan, result, terminal_reset_commit);
+        self.recordRenderCommit(
+            before,
+            before_recovery_pending,
+            before_history_catchup_pending,
+            scroll_plan,
+            result,
+            terminal_reset_commit,
+        );
     }
 
     fn recordRenderCommit(
         self: *const TranscriptRuntime,
         before: TranscriptCommitDiagnostic,
+        before_recovery_pending: bool,
+        before_history_catchup_pending: bool,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         result: render_engine.terminal_diff.FrameCommitResult,
         reset: bool,
@@ -8905,13 +8926,13 @@ pub const TranscriptRuntime = struct {
             before.history_visual_offset == after.history_visual_offset and
             before.total_visual_rows == after.total_visual_rows and
             before.layout_id == after.layout_id and
-            before.normal_buffer_recovery_pending == after.normal_buffer_recovery_pending and
-            before.history_catchup_pending == after.history_catchup_pending) return;
+            before_recovery_pending == self.normalBufferRecoveryPending() and
+            before_history_catchup_pending == self.historyCatchupPending()) return;
 
         diagnostics.recordRenderEvent(
             .commit,
             "state={s}->{s} result={s} view={d}->{d} history={d}->{d} rows={d}->{d} layout={x}->{x} terminal={d}x{d} cursor={d},{d} planned_scroll={d} accepted_scroll={d} bytes={d} repaint={} reset={} recovery={}->{} catchup={}->{}",
-            .{ @tagName(before.state), @tagName(after.state), @tagName(result.state()), before.visual_offset, after.visual_offset, before.history_visual_offset, after.history_visual_offset, before.total_visual_rows, after.total_visual_rows, before.layout_id, after.layout_id, self.layout.cols, self.layout.rows, result.committed_cursor_row, result.committed_cursor_col, scroll_plan.terminal_scroll_rows, result.terminal_scroll_rows_applied(), result.bytes_written, result.full_repaint, reset, before.normal_buffer_recovery_pending, after.normal_buffer_recovery_pending, before.history_catchup_pending, after.history_catchup_pending },
+            .{ @tagName(before.state), @tagName(after.state), @tagName(result.state()), before.visual_offset, after.visual_offset, before.history_visual_offset, after.history_visual_offset, before.total_visual_rows, after.total_visual_rows, before.layout_id, after.layout_id, self.layout.cols, self.layout.rows, result.committed_cursor_row, result.committed_cursor_col, scroll_plan.terminal_scroll_rows, result.terminal_scroll_rows_applied(), result.bytes_written, result.full_repaint, reset, before_recovery_pending, self.normalBufferRecoveryPending(), before_history_catchup_pending, self.historyCatchupPending() },
         );
     }
 

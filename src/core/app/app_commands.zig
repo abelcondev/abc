@@ -2593,7 +2593,7 @@ fn writeRendererState(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Alloc
     );
     try writer.print(
         "projection: view={d} history={d} total_rows={d} source_bytes={d} recovery={s} catchup={s}\n",
-        .{ transcript_commit.visual_offset, transcript_commit.history_visual_offset, transcript_commit.total_visual_rows, transcript_commit.source_bytes, boolLabel(transcript_commit.normal_buffer_recovery_pending), boolLabel(transcript_commit.history_catchup_pending) },
+        .{ transcript_commit.visual_offset, transcript_commit.history_visual_offset, transcript_commit.total_visual_rows, transcript_commit.source_bytes, boolLabel(app.shell.normalBufferRecoveryPending()), boolLabel(app.shell.historyCatchupPending()) },
     );
     try writer.print(
         "replaceable: active={s} row={d} start={d}\n",
