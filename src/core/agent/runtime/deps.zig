@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -27,12 +28,20 @@ const DiffEntryPayload = tool_contracts.DiffEntryPayload;
 const ToolCallValidationResult = tool_contracts.ToolCallValidationResult;
 const ToolExecutionRequest = tool_contracts.ToolExecutionRequest;
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
-const SandboxScopeRequired = tool_contracts.SandboxScopeRequired;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+};
+
+pub const ContextCompactionCommitEffect = struct {
+    commit: *const fn (
+        ctx: *anyopaque,
+        summary: types.CompactedSummaryHistoryTurn,
+        active_prefix: ?types.AssistantHistoryTurn,
+        retained_from: ?types.ContextHistoryCut,
+    ) anyerror!void,
 };
 
 pub const LiveToolAuthorityDecision = enum {
@@ -110,24 +119,6 @@ fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model
     return model_capabilities.capabilitiesForModel(model);
 }
 
-fn sandboxWideningUnavailable(
-    _: *anyopaque,
-    _: Allocator,
-    _: ToolCall,
-    _: permission_auto_classifier.ReviewTurnContext,
-    _: PermissionMode,
-    _: []const PermissionGrant,
-    _: ?LiveToolAuthority,
-    _: []const []const u8,
-    _: SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    return .{
-        .decision = .permission_required,
-        .denial_reason = .permission_required,
-        .requirement = .sandbox_widening,
-    };
-}
-
 pub const RouteRecoveryDecision = enum {
     disable_fast,
     switch_model,
@@ -171,8 +162,10 @@ pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
 /// duration of the callback.
 pub const TextEmission = union(enum) {
+    assistant_started,
     assistant_source: []const u8,
     assistant_rendered: []const u8,
+    assistant_restarted: []const u8,
     operational: []const u8,
 };
 
@@ -187,35 +180,51 @@ pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
+    render_assistant_text: bool = true,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
+    /// Samples host-owned root permission mode at an action boundary.
+    snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
     finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
+    /// Classifies one observed steering boundary. Continued text is arena-owned
+    /// non-authoritative context; handoff leaves the prompt host-owned.
+    take_steering_boundary: ?*const fn (
+        ctx: *anyopaque,
+        arena: Allocator,
+        turn_id: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) anyerror!worker_runtime.SteeringBoundaryResult = null,
+    release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
-    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
+    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
+    snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
+    prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
-    request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome,
+    request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
     request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
-    request_sandbox_widening: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8, required: SandboxScopeRequired) anyerror!command_admission.PermissionOutcome = sandboxWideningUnavailable,
-    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    resolve_tool_action_display_target: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
+    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     permission_target_for_call: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     execute_tool_call: *const fn (ctx: *anyopaque, request: ToolExecutionRequest) anyerror!ToolExecutionResult,
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
     publish_deferred_tool_completion: ?*const fn (ctx: *anyopaque, completion: DeferredToolCompletion) TransportPublicationOutcome = null,
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
+    commit_context_compaction: ?ContextCompactionCommitEffect = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
+    push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
     push_tool_lifecycle: *const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = discardToolLifecycle,
     push_diff_block: *const fn (ctx: *anyopaque, payload: DiffEntryPayload) anyerror!void,
     push_system_notice: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
@@ -226,7 +235,7 @@ pub const AgentRuntimeDeps = struct {
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode) anyerror!?[]u8 = null,
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
@@ -246,3 +255,7 @@ pub const AgentRuntimeDeps = struct {
         return self.push_system_notice(self.ctx, text);
     }
 };
+
+fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
+    return error.TerminalLeaseCleanupUnavailable;
+}

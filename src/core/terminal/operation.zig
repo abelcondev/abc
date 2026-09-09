@@ -13,12 +13,10 @@ pub const AuthorityPreparation = struct {
     workspace_root: []const u8,
     cwd: []const u8,
     transport_role: contracts.TransportRole,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     backend: contracts.Backend,
     actor: contracts.ActorRole,
     controls: contracts.AllowedControls,
     lifetime: contracts.TerminalLifetime,
-    repeated_probes: []const contracts.RepeatedProbeAuthority = &.{},
     direct_human_model_read_only: bool = false,
 };
 
@@ -36,10 +34,6 @@ pub const PreparedAuthority = struct {
         std.crypto.secureZero(
             u8,
             @volatileCast(self.persistence.proof.bytes[0..]),
-        );
-        free_repeated_probes(
-            self.alloc,
-            self.persistence.grant.repeated_probes,
         );
         free_principal(self.alloc, self.persistence.grant.principal);
         self.* = undefined;
@@ -119,14 +113,12 @@ fn construct_start_persistence(
                 .workspace_root = input.workspace_root,
                 .cwd = input.cwd,
                 .transport_role = input.transport_role,
-                .sandbox_backend = input.sandbox_backend,
                 .backend = input.backend,
                 .lifetime = input.lifetime,
             },
             .actor = input.actor,
             .controls = input.controls,
             .generation = try contracts.AuthorityGeneration.init(1),
-            .repeated_probes = input.repeated_probes,
         },
         .proof = proof,
         .direct_human_model_read_only = input.direct_human_model_read_only,
@@ -137,10 +129,6 @@ fn construct_start_persistence(
     });
     const principal = try dupe_principal(alloc, borrowed.grant.principal);
     errdefer free_principal(alloc, principal);
-    const repeated_probes = try dupe_repeated_probes(
-        alloc,
-        borrowed.grant.repeated_probes,
-    );
     return .{
         .alloc = alloc,
         .persistence = .{
@@ -149,7 +137,6 @@ fn construct_start_persistence(
                 .actor = borrowed.grant.actor,
                 .controls = borrowed.grant.controls,
                 .generation = borrowed.grant.generation,
-                .repeated_probes = repeated_probes,
             },
             .proof = borrowed.proof,
             .direct_human_model_read_only = borrowed.direct_human_model_read_only,
@@ -157,44 +144,24 @@ fn construct_start_persistence(
     };
 }
 
-fn dupe_repeated_probes(
-    alloc: Allocator,
-    probes: []const contracts.RepeatedProbeAuthority,
-) ![]contracts.RepeatedProbeAuthority {
-    const owned = try alloc.alloc(contracts.RepeatedProbeAuthority, probes.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |probe| {
-            alloc.free(probe.cwd);
-            alloc.free(probe.command);
-        }
-        alloc.free(owned);
-    }
-    for (probes, 0..) |probe, index| {
-        try probe.validate();
-        const command = try alloc.dupe(u8, probe.command);
-        errdefer alloc.free(command);
-        owned[index] = .{
-            .command = command,
-            .cwd = try alloc.dupe(u8, probe.cwd),
-            .check_schedule = probe.check_schedule,
-            .notify_schedule = probe.notify_schedule,
-            .lifetime = probe.lifetime,
-        };
-        initialized += 1;
-    }
-    return owned;
+inline fn failOwnedAuthorityClaim(err: anytype) @TypeOf(err)!OwnedAuthorityClaim {
+    return @errorCast(failOwnedAuthorityClaimDynamic(err));
 }
 
-fn free_repeated_probes(
-    alloc: Allocator,
-    probes: []const contracts.RepeatedProbeAuthority,
-) void {
-    for (probes) |probe| {
-        alloc.free(probe.cwd);
-        alloc.free(probe.command);
-    }
-    alloc.free(probes);
+noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorityClaim {
+    return err;
+}
+
+test "owned authority claim failures preserve exact error types and identities" {
+    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failOwnedAuthorityClaim(error.OutOfMemory),
+    );
 }
 
 pub fn ownAuthorityClaim(
@@ -202,12 +169,17 @@ pub fn ownAuthorityClaim(
     authority_claim: contracts.AuthorityClaim,
     controls: contracts.AllowedControls,
 ) !OwnedAuthorityClaim {
-    try authority_claim.validate();
-    if (!controls.any()) return error.InvalidAuthorityGrant;
+    authority_claim.validate() catch |err|
+        return failOwnedAuthorityClaim(err);
+    if (!controls.any()) {
+        return failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    }
+    const principal = dupe_principal(alloc, authority_claim.principal) catch |err|
+        return failOwnedAuthorityClaim(err);
     return .{
         .alloc = alloc,
         .value = .{
-            .principal = try dupe_principal(alloc, authority_claim.principal),
+            .principal = principal,
             .actor = authority_claim.actor,
             .generation = authority_claim.generation,
             .proof = authority_claim.proof,
@@ -252,7 +224,6 @@ fn dupe_principal(
         .workspace_root = workspace_root,
         .cwd = cwd,
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
         .backend = principal.backend,
         .lifetime = principal.lifetime,
     };
@@ -278,7 +249,6 @@ fn dupe_owner_catalog_principal(
         .durable_session_id = durable_session_id,
         .workspace_root = try alloc.dupe(u8, principal.workspace_root),
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
     };
 }
 
@@ -305,7 +275,6 @@ pub fn validate(request: contracts.ActionRequest) ValidationError!void {
         .screen => |value| try require_claim(value.authority),
         .write => |value| try require_claim(value.authority),
         .wait => |value| try require_claim(value.authority),
-        .monitor => |value| try require_claim(value.authority),
         .inspect => |value| try require_claim(value.authority),
         .list => |value| {
             const owner_authority = value.owner_authority orelse
@@ -330,7 +299,6 @@ pub fn claim(request: contracts.ActionRequest) ?contracts.AuthorityClaim {
         .screen => |value| value.authority,
         .write => |value| value.authority,
         .wait => |value| value.authority,
-        .monitor => |value| value.authority,
         .inspect => |value| value.authority,
         .list => null,
         .resize => |value| value.authority,
@@ -358,7 +326,6 @@ pub fn authoritySessionId(request: contracts.ActionRequest) ?[]const u8 {
         .screen => |value| value.session_id,
         .write => |value| value.session_id,
         .wait => |value| value.session_id,
-        .monitor => |value| value.session_id,
         .inspect => |value| value.session_id,
         .list => null,
         .resize => |value| value.session_id,
@@ -369,9 +336,8 @@ pub fn authoritySessionId(request: contracts.ActionRequest) ?[]const u8 {
 
 pub fn requiresOrderedMutation(request: contracts.ActionRequest) bool {
     return switch (request) {
-        .write, .monitor, .resize, .signal, .close => true,
-        .inspect => |inspect| inspect.acknowledge_event_id != null,
-        .start, .read, .screen, .wait, .list => false,
+        .write, .resize, .signal, .close => true,
+        .start, .read, .screen, .wait, .inspect, .list => false,
     };
 }
 
@@ -410,10 +376,6 @@ test "terminal mutations that share session write ownership stay ordered" {
         .session_id = "terminal-1",
         .policy = .graceful,
     } }));
-    try std.testing.expect(requiresOrderedMutation(.{ .inspect = .{
-        .session_id = "terminal-1",
-        .acknowledge_event_id = 1,
-    } }));
     try std.testing.expect(!requiresOrderedMutation(.{ .inspect = .{
         .session_id = "terminal-1",
     } }));
@@ -431,7 +393,6 @@ fn test_preparation() AuthorityPreparation {
         .workspace_root = "/workspace",
         .cwd = "/workspace/project",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .backend = .native,
         .actor = .agent,
         .controls = .full(),
@@ -453,38 +414,6 @@ test "production preparation mints canonical generation one authority" {
     try std.testing.expectEqual(@as(u64, 1), persistence.grant.generation.value);
     try std.testing.expectEqual(contracts.TerminalLifetime.session, persistence.grant.principal.lifetime);
     try persistence.proof.validate();
-}
-
-test "production preparation owns exact repeated probe authority" {
-    const probes = [_]contracts.RepeatedProbeAuthority{.{
-        .command = "test -f ready",
-        .cwd = "/workspace/project",
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .{ .every_n_checks = 2 },
-        .lifetime = .{ .duration_ms = 500 },
-    }};
-    var input = test_preparation();
-    input.repeated_probes = &probes;
-    var prepared = try construct_start_persistence(
-        std.testing.allocator,
-        input,
-        .{ .bytes = @splat(6) },
-    );
-    defer prepared.deinit();
-    const owned = prepared.view().grant.repeated_probes;
-    try std.testing.expectEqual(@as(usize, 1), owned.len);
-    try std.testing.expect(owned.ptr != probes[0..].ptr);
-    try std.testing.expect(owned[0].command.ptr != probes[0].command.ptr);
-    try std.testing.expect(owned[0].cwd.ptr != probes[0].cwd.ptr);
-    try std.testing.expect(owned[0].matches(.{
-        .condition = .{ .custom_probe = .{
-            .command = "test -f ready",
-            .cwd = "/workspace/project",
-        } },
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .{ .every_n_checks = 2 },
-        .lifetime = .{ .duration_ms = 500 },
-    }));
 }
 
 test "pure authority construction validates direct human policy" {

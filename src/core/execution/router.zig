@@ -5,7 +5,7 @@ const command_environment = @import("command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_executor = @import("local_executor.zig");
-const sandbox = @import("../permissions/sandbox.zig");
+const command_runner = @import("../execution/command_runner.zig");
 
 pub const RouteKind = local_executor.RouteKind;
 pub const PreparedCommandRoute = local_executor.PreparedCommand;
@@ -27,10 +27,6 @@ pub fn prepareAuthorizedRoute(
     authority: command_admission.CommandExecutionAuthority,
 ) !PreparedCommandRoute {
     if (command_ctx.target_os != builtin.os.tag) return error.CommandTargetMismatch;
-    if (sandbox.resolveBackend(command_ctx.resolved_backend) != command_ctx.resolved_backend) {
-        return error.CommandBackendNotResolved;
-    }
-
     return switch (authority) {
         .direct_only => |fingerprint| blk: {
             if (!fingerprint.matches(command_ctx)) return error.CommandAdmissionChanged;
@@ -38,13 +34,12 @@ pub fn prepareAuthorizedRoute(
                 alloc,
                 command_ctx.command,
                 command_ctx.resolved_cwd,
-                command_ctx.background,
-                command_ctx.resolved_backend,
+                false,
                 command_ctx.target_os,
             ) catch return error.CommandAdmissionChanged;
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "terminal.exec authority=direct_only route=direct_read_only", .{});
+                    debug_trace.logf("core", "shell.run authority=direct_only route=direct_read_only", .{});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => {
@@ -60,7 +55,7 @@ pub fn prepareAuthorizedRoute(
             if (command_ctx.environment.requiresShellRoute()) {
                 debug_trace.logf(
                     "core",
-                    "terminal.exec authority=shell_allowed source={s} route=approved_shell environment={s}",
+                    "shell.run authority=shell_allowed source={s} route=approved_shell environment={s}",
                     .{
                         @tagName(shell.source),
                         @tagName(std.meta.activeTag(command_ctx.environment)),
@@ -76,8 +71,7 @@ pub fn prepareAuthorizedRoute(
                 alloc,
                 command_ctx.command,
                 command_ctx.resolved_cwd,
-                command_ctx.background,
-                command_ctx.resolved_backend,
+                false,
                 command_ctx.target_os,
             ) catch break :blk .{ .approved_shell = .{
                 .command_ctx = command_ctx,
@@ -86,11 +80,11 @@ pub fn prepareAuthorizedRoute(
             } };
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
+                    debug_trace.logf("core", "shell.run authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => |reason| {
-                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
+                    debug_trace.logf("core", "shell.run authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
                     break :blk .{ .approved_shell = .{
                         .command_ctx = command_ctx,
                         .reason = reason,
@@ -103,7 +97,7 @@ pub fn prepareAuthorizedRoute(
 }
 
 pub fn executePreparedRoute(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     route: PreparedCommandRoute,
 ) !RoutedCommandResult {
@@ -111,7 +105,7 @@ pub fn executePreparedRoute(
 }
 
 pub fn executePlannedCommand(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     command_ctx: command_admission.CommandContext,
     authority: command_admission.CommandExecutionAuthority,
@@ -122,21 +116,18 @@ pub fn executePlannedCommand(
 }
 
 pub fn validateConfigContext(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     command_ctx: command_admission.CommandContext,
 ) !void {
-    if (sandbox.resolveBackend(cfg.backend) != command_ctx.resolved_backend) {
-        return error.CommandBackendMismatch;
-    }
+    _ = cfg;
     if (command_ctx.target_os != builtin.os.tag) return error.CommandTargetMismatch;
 }
 
 fn context(command: []const u8, background: bool) command_admission.CommandContext {
+    _ = background;
     return .{
         .command = command,
         .resolved_cwd = "/tmp",
-        .background = background,
-        .resolved_backend = .none,
         .target_os = builtin.os.tag,
     };
 }
@@ -178,7 +169,7 @@ test "router keeps direct grammar on the safer route for every shell source" {
     const sources = [_]command_admission.ShellAuthorizationSource{
         .configured_rule,
         .session_grant,
-        .js_host_workspace_sandbox,
+        .js_host,
         .interactive_once,
         .interactive_always,
         .auto_mode,
@@ -242,7 +233,7 @@ test "router permits approval-bearing grammar only with sourced shell authority"
     );
 }
 
-test "router rejects shell fingerprint backend and target mismatches" {
+test "router rejects shell fingerprint and target mismatches" {
     const ctx = context("git status", false);
     var changed = ctx;
     changed.resolved_cwd = "/other";
@@ -255,12 +246,12 @@ test "router rejects shell fingerprint backend and target mismatches" {
         ),
     );
 
-    const cfg = sandbox.Config{
-        .backend = .macos,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-    };
-    try std.testing.expectError(error.CommandBackendMismatch, validateConfigContext(cfg, ctx));
+    var changed_target = ctx;
+    changed_target.target_os = if (builtin.os.tag == .macos) .linux else .macos;
+    try std.testing.expectError(
+        error.CommandTargetMismatch,
+        validateConfigContext(.{ .max_command_output_bytes = 1024 }, changed_target),
+    );
 
     var changed_environment = ctx;
     changed_environment.environment = .{ .clean = "/bin/zsh" };
@@ -280,14 +271,12 @@ test "router executes direct plan without consulting approved shell capacity" {
     const arena = arena_state.allocator();
     const ctx = context("printf x | wc -c", false);
     const routed = try executePlannedCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, arena, ctx, directAuthority(ctx));
     try std.testing.expectEqual(RouteKind.direct_read_only, routed.route);
     try std.testing.expect(std.mem.find(u8, routed.result.output, "<stdout>\n1\n</stdout>") != null);
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        routed.result.command_result.?.foreground.output_file,
+        routed.result.command_result.?.output_file,
     );
 }

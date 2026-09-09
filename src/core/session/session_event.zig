@@ -1,16 +1,598 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const event_frame_max_bytes: usize = 8 * 1024 * 1024;
+pub const event_frame_max_bytes: usize = context_limits.emergency_ceiling_bytes;
 pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
+
+pub const conversation_schema_version: u8 = 2;
+pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
+pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
+pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
+pub const max_conversation_preview_bytes: usize = 4 * 1024;
+
+pub const ArtifactCompleteness = enum {
+    complete,
+    partial,
+    unknown,
+};
+
+pub const ConversationText = struct {
+    text: []const u8,
+};
+
+pub const ConversationAssistant = struct {
+    text: []const u8,
+    provider_replay: ?types.ProviderReplay = null,
+    standalone_response: bool = false,
+};
+
+pub const ConversationUser = struct {
+    text: []const u8,
+    images: []const types.ImageAttachment = &.{},
+    work_id: ?[]const u8 = null,
+};
+
+pub const ConversationToolCall = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+    argument_integrity: types.ToolArgumentIntegrity = .valid,
+    provisional_id: ?[]const u8 = null,
+    provider_result: ?[]const u8 = null,
+    final_identity: types.FinalToolIdentity = .valid,
+    provenance: types.ToolExecutionProvenance = .fx_local,
+};
+
+pub const ConversationToolResult = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    status: types.PersistedToolStatus,
+    artifact_ref: []const u8,
+    tool_image_handle: ?[]const u8 = null,
+    output_bytes: ?u64 = null,
+    stored_bytes: u64,
+    completeness: ArtifactCompleteness,
+    preview: ?[]const u8 = null,
+    provider_native: bool = false,
+    created_at_ms: i64 = 0,
+    permission_feedback: []const []const u8 = &.{},
+    committed_file_presentation: ?types.CommittedFilePresentation = null,
+    command_replay_ref: ?[]const u8 = null,
+    command_replay_bytes: ?u64 = null,
+    command_process_presentation: ?types.CommandProcessPresentation = null,
+    terminal_action_presentation: ?types.TerminalActionPresentation = null,
+};
+
+pub const ConversationInterruption = struct {
+    reason: session.InterruptedTerminalReason,
+    partial_text: ?[]const u8 = null,
+    command_replay_ref: ?[]const u8 = null,
+    command_replay_bytes: ?u64 = null,
+    command_artifact_ref: ?[]const u8 = null,
+    files: []const types.FileEvidence = &.{},
+    turn_summary: ?types.TurnSummary = null,
+};
+
+pub const ConversationTurnCompleted = struct {
+    files: []const types.FileEvidence = &.{},
+    turn_summary: ?types.TurnSummary = null,
+};
+
+pub const ConversationCheckpoint = struct {
+    covers_through_seq: u64,
+    summary: []const u8,
+};
+
+pub const ConversationEvent = union(enum) {
+    user: ConversationUser,
+    assistant: ConversationAssistant,
+    tool_call: ConversationToolCall,
+    tool_result: ConversationToolResult,
+    steering: ConversationText,
+    turn_completed: ConversationTurnCompleted,
+    interrupted: ConversationInterruption,
+    context_checkpoint: ConversationCheckpoint,
+};
+
+pub const ConversationEnvelope = struct {
+    schema_version: u8 = conversation_schema_version,
+    seq: u64,
+    timestamp_ms: i64,
+    event: ConversationEvent,
+};
+
+pub const DecodedConversationFrame = std.json.Parsed(ConversationEnvelope);
+
+pub const PendingToolCall = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    seq: u64,
+};
+
+pub const ConversationStateView = struct {
+    last_seq: u64 = 0,
+    latest_checkpoint_coverage: u64 = 0,
+    pending_tool_calls: []const PendingToolCall = &.{},
+};
+
+pub const ConversationTransitionError = error{
+    UnsupportedConversationSchema,
+    OutOfOrderConversationEvent,
+    InvalidConversationEvent,
+    DuplicateToolCall,
+    OrphanToolResult,
+    ToolIdentityMismatch,
+    InvalidCheckpointCoverage,
+    UnresolvedToolCall,
+};
+
+pub fn validateConversationTransition(
+    state: ConversationStateView,
+    envelope: ConversationEnvelope,
+) ConversationTransitionError!void {
+    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
+        return error.UnsupportedConversationSchema;
+    }
+    const expected_seq = std.math.add(u64, state.last_seq, 1) catch
+        return error.OutOfOrderConversationEvent;
+    if (envelope.seq != expected_seq) return error.OutOfOrderConversationEvent;
+    if (envelope.timestamp_ms < 0) return error.InvalidConversationEvent;
+    try validateConversationEventShape(envelope.event, envelope.schema_version);
+
+    switch (envelope.event) {
+        .tool_call => |call| {
+            for (state.pending_tool_calls) |pending| {
+                if (std.mem.eql(u8, pending.call_id, call.call_id)) {
+                    return error.DuplicateToolCall;
+                }
+            }
+        },
+        .tool_result => |result| {
+            const pending = findPendingToolCall(state.pending_tool_calls, result.call_id) orelse
+                return error.OrphanToolResult;
+            if (!std.mem.eql(u8, pending.tool_name, result.tool_name)) {
+                return error.ToolIdentityMismatch;
+            }
+        },
+        .context_checkpoint => |checkpoint| {
+            if (checkpoint.covers_through_seq < state.latest_checkpoint_coverage or
+                checkpoint.covers_through_seq > state.last_seq)
+            {
+                return error.InvalidCheckpointCoverage;
+            }
+            for (state.pending_tool_calls) |pending| {
+                if (pending.seq <= checkpoint.covers_through_seq) {
+                    return error.UnresolvedToolCall;
+                }
+            }
+        },
+        .turn_completed => if (state.pending_tool_calls.len != 0) {
+            return error.UnresolvedToolCall;
+        },
+        .user, .assistant, .steering, .interrupted => {},
+    }
+}
+
+fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
+    switch (event) {
+        .user => |value| {
+            try validateConversationText(value.text);
+            if (value.images.len > 128) return error.InvalidConversationEvent;
+            for (value.images) |image| {
+                if (image.path.len == 0 or
+                    image.path.len > std.Io.Dir.max_path_bytes or
+                    image.media_type.len == 0 or
+                    image.media_type.len > max_conversation_identity_bytes or
+                    !std.unicode.utf8ValidateSlice(image.path) or
+                    !std.unicode.utf8ValidateSlice(image.media_type))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+            if (value.work_id) |work_id| try validateConversationIdentity(work_id);
+        },
+        .assistant => |value| {
+            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return error.InvalidConversationEvent;
+            try validateOptionalConversationText(value.text);
+            if (value.provider_replay) |replay| {
+                try validateConversationIdentity(replay.source.model);
+                if (replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
+                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidConversationEvent;
+            }
+        },
+        .steering => |value| try validateConversationText(value.text),
+        .tool_call => |call| {
+            try validateConversationIdentity(call.call_id);
+            try validateConversationIdentity(call.tool_name);
+            if (call.arguments_json.len == 0 or
+                call.arguments_json.len > max_conversation_arguments_bytes or
+                !std.unicode.utf8ValidateSlice(call.arguments_json))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (call.provisional_id) |value| try validateConversationIdentity(value);
+            if (call.provider_result) |value| {
+                if (value.len > max_conversation_arguments_bytes or
+                    !std.unicode.utf8ValidateSlice(value))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+        },
+        .tool_result => |result| {
+            try validateConversationIdentity(result.call_id);
+            try validateConversationIdentity(result.tool_name);
+            if (result.artifact_ref.len == 0 or
+                result.artifact_ref.len > max_conversation_identity_bytes or
+                !std.unicode.utf8ValidateSlice(result.artifact_ref))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (result.preview) |preview| {
+                if (preview.len > max_conversation_preview_bytes or
+                    !std.unicode.utf8ValidateSlice(preview))
+                {
+                    return error.InvalidConversationEvent;
+                }
+            }
+            if (result.tool_image_handle) |handle| {
+                try validateConversationIdentity(handle);
+            }
+            if (result.created_at_ms < 0) return error.InvalidConversationEvent;
+            for (result.permission_feedback) |feedback| {
+                try validateOptionalConversationText(feedback);
+            }
+            if (result.committed_file_presentation) |presentation| {
+                try validateConversationPath(presentation.path);
+                for (presentation.lines) |line| {
+                    try validateOptionalConversationText(line.text);
+                }
+                if (presentation.previous_content) |content| {
+                    try validateOptionalConversationText(content);
+                }
+                if (presentation.after_content) |content| {
+                    try validateOptionalConversationText(content);
+                }
+                if (presentation.lifecycle_id) |lifecycle_id| {
+                    try validateConversationIdentity(lifecycle_id.call_id);
+                }
+            }
+            if ((result.command_replay_ref == null) !=
+                (result.command_replay_bytes == null))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (result.command_replay_ref) |handle| {
+                try validateConversationIdentity(handle);
+            }
+        },
+        .interrupted => |interrupted| {
+            if (interrupted.partial_text) |text| try validateOptionalConversationText(text);
+            if ((interrupted.command_replay_ref == null) !=
+                (interrupted.command_replay_bytes == null))
+            {
+                return error.InvalidConversationEvent;
+            }
+            if (interrupted.command_replay_ref) |handle| {
+                try validateConversationIdentity(handle);
+            }
+            if (interrupted.command_artifact_ref) |handle| {
+                try validateConversationIdentity(handle);
+            }
+            try validateConversationFiles(interrupted.files);
+        },
+        .context_checkpoint => |checkpoint| try validateConversationText(checkpoint.summary),
+        .turn_completed => |completed| try validateConversationFiles(completed.files),
+    }
+}
+
+fn validateConversationFiles(files: []const types.FileEvidence) ConversationTransitionError!void {
+    for (files) |file| {
+        try validateConversationPath(file.path);
+        if (file.new_path) |path| try validateConversationPath(path);
+        try validateConversationIdentity(file.tool_call_id);
+        try validateConversationIdentity(file.tool_name);
+    }
+}
+
+fn validateConversationPath(path: []const u8) ConversationTransitionError!void {
+    if (path.len == 0 or
+        path.len > std.Io.Dir.max_path_bytes or
+        !std.unicode.utf8ValidateSlice(path))
+    {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn validateConversationText(text: []const u8) ConversationTransitionError!void {
+    if (text.len == 0) return error.InvalidConversationEvent;
+    return validateOptionalConversationText(text);
+}
+
+fn validateOptionalConversationText(text: []const u8) ConversationTransitionError!void {
+    if (text.len > max_conversation_text_bytes or !std.unicode.utf8ValidateSlice(text)) {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn validateConversationIdentity(value: []const u8) ConversationTransitionError!void {
+    if (types.ConversationIdentity.invalidReason(value) != null) {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn findPendingToolCall(
+    pending_calls: []const PendingToolCall,
+    call_id: []const u8,
+) ?PendingToolCall {
+    for (pending_calls) |pending| {
+        if (std.mem.eql(u8, pending.call_id, call_id)) return pending;
+    }
+    return null;
+}
+
+pub fn encodeConversationFrame(
+    alloc: Allocator,
+    envelope: ConversationEnvelope,
+) ![]u8 {
+    if (envelope.schema_version != conversation_schema_version or
+        envelope.seq == 0 or
+        envelope.timestamp_ms < 0)
+    {
+        return error.InvalidConversationEvent;
+    }
+    try validateConversationEventShape(envelope.event, envelope.schema_version);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(envelope, .{}, &out.writer);
+    try out.writer.writeByte('\n');
+    if (out.written().len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeConversationFrame(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedConversationFrame {
+    if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
+        return error.InvalidConversationFrame;
+    }
+    var parsed = std.json.parseFromSlice(ConversationEnvelope, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .max_value_len = event_frame_max_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidConversationFrame,
+    };
+    errdefer parsed.deinit();
+    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
+        parsed.value.seq == 0 or
+        parsed.value.timestamp_ms < 0)
+    {
+        return error.InvalidConversationFrame;
+    }
+    validateConversationEventShape(parsed.value.event, parsed.value.schema_version) catch
+        return error.InvalidConversationFrame;
+    return parsed;
+}
+
+/// Appends borrowed conversational events for one canonical history turn.
+/// The caller owns only the destination list storage; event payloads remain
+/// valid for the lifetime of `turn`.
+pub fn appendHistoryTurnConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    turn: types.HistoryTurn,
+) !void {
+    const initial_len = events.items.len;
+    errdefer events.shrinkRetainingCapacity(initial_len);
+    switch (turn) {
+        .assistant => |entry| {
+            try events.append(alloc, .{ .user = .{
+                .text = entry.user.text,
+                .images = entry.user.images,
+                .work_id = entry.user.work_id,
+            } });
+            try appendExecutionConversationEvents(alloc, events, entry.execution);
+            const follows_standalone = entry.execution.tool_steps.len > 0 and
+                entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0;
+            if (entry.assistant.len > 0 or entry.provider_replay != null or follows_standalone) {
+                try events.append(alloc, .{ .assistant = .{ .text = entry.assistant, .provider_replay = entry.provider_replay } });
+            }
+            try events.append(alloc, .{ .turn_completed = .{
+                .files = entry.execution.files,
+                .turn_summary = entry.execution.turn_summary,
+            } });
+        },
+        .interrupted => |entry| {
+            try events.append(alloc, .{ .user = .{
+                .text = entry.user.text,
+                .images = entry.user.images,
+                .work_id = entry.user.work_id,
+            } });
+            try appendExecutionConversationEvents(alloc, events, entry.execution);
+            if (entry.tool_call) |call| {
+                if (entry.execution.tool_steps.len > 0 and
+                    entry.execution.tool_steps[entry.execution.tool_steps.len - 1].tool_calls.len == 0)
+                {
+                    try events.append(alloc, .{ .assistant = .{ .text = "" } });
+                }
+                try events.append(alloc, .{ .tool_call = .{
+                    .call_id = call.id,
+                    .tool_name = call.name,
+                    .arguments_json = call.arguments_json,
+                    .argument_integrity = call.argument_integrity,
+                    .provisional_id = call.provisional_id,
+                    .provider_result = call.provider_result,
+                    .final_identity = call.final_identity,
+                    .provenance = call.provenance,
+                } });
+            }
+            try events.append(alloc, .{ .interrupted = .{
+                .reason = entry.terminal_reason,
+                .partial_text = entry.assistant,
+                .command_replay_ref = interruptedCommandReplayRef(entry),
+                .command_replay_bytes = interruptedCommandReplayBytes(entry),
+                .command_artifact_ref = if (entry.cancelled_command) |presentation|
+                    presentation.command_artifact_handle
+                else
+                    null,
+                .files = entry.execution.files,
+                .turn_summary = entry.execution.turn_summary,
+            } });
+        },
+        .compacted_summary => return error.ConversationCheckpointRequiresSequence,
+    }
+}
+
+fn interruptedCommandReplayRef(
+    entry: types.InterruptedHistoryTurn,
+) ?[]const u8 {
+    const replay = (entry.cancelled_command orelse return null).output_replay orelse
+        return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn interruptedCommandReplayBytes(
+    entry: types.InterruptedHistoryTurn,
+) ?u64 {
+    const replay = (entry.cancelled_command orelse return null).output_replay orelse
+        return null;
+    return switch (replay) {
+        .available => |descriptor| @intCast(descriptor.framed_bytes),
+        .unavailable => null,
+    };
+}
+
+fn appendExecutionConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    execution: types.ExecutionMemory,
+) !void {
+    var steering_index: usize = 0;
+    while (steering_index < execution.steering.len and
+        execution.steering[steering_index].after_tool_step_count == 0)
+    {
+        try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
+        steering_index += 1;
+    }
+    for (execution.tool_steps, 0..) |step, step_index| {
+        const assistant: []const u8 = step.assistant orelse "";
+        const follows_standalone = step_index > 0 and execution.tool_steps[step_index - 1].tool_calls.len == 0;
+        if (assistant.len > 0 or step.provider_replay != null or follows_standalone) {
+            try events.append(alloc, .{ .assistant = .{
+                .text = assistant,
+                .provider_replay = step.provider_replay,
+                .standalone_response = step.tool_calls.len == 0,
+            } });
+        }
+        for (step.tool_calls) |call| {
+            try events.append(alloc, .{ .tool_call = .{
+                .call_id = call.id,
+                .tool_name = call.name,
+                .arguments_json = call.arguments_json,
+                .argument_integrity = call.argument_integrity,
+                .provisional_id = call.provisional_id,
+                .provider_result = call.provider_result,
+                .final_identity = call.final_identity,
+                .provenance = call.provenance,
+            } });
+        }
+        for (step.tool_results) |result| {
+            const artifact_ref = resultArtifactRef(result) orelse
+                return error.ConversationArtifactRequired;
+            if (result.tool_images.len > 0 and result.tool_image_handle == null) {
+                return error.ConversationArtifactRequired;
+            }
+            try events.append(alloc, .{ .tool_result = .{
+                .call_id = result.tool_call_id,
+                .tool_name = result.tool_name,
+                .status = result.status,
+                .artifact_ref = artifact_ref,
+                .tool_image_handle = result.tool_image_handle,
+                .output_bytes = std.math.cast(u64, result.output_bytes) orelse
+                    return error.InvalidConversationEvent,
+                .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
+                    return error.InvalidConversationEvent,
+                .completeness = if (result.truncated) .partial else .complete,
+                .preview = result.preview orelse if (result.output.len <= max_conversation_preview_bytes)
+                    result.output
+                else
+                    null,
+                .provider_native = result.provider_native,
+                .created_at_ms = result.created_at_ms,
+                .permission_feedback = result.permission_feedback,
+                .committed_file_presentation = result.committed_file_presentation,
+                .command_replay_ref = resultCommandReplayRef(result),
+                .command_replay_bytes = resultCommandReplayBytes(result),
+                .command_process_presentation = result.command_process_presentation,
+                .terminal_action_presentation = result.terminal_action_presentation,
+            } });
+        }
+        const completed_steps = step_index + 1;
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == completed_steps)
+        {
+            try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
+            steering_index += 1;
+        }
+    }
+    if (steering_index != execution.steering.len) {
+        return error.InvalidConversationEvent;
+    }
+}
+
+fn appendSteeringConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    steering: types.PersistedSteering,
+) !void {
+    if (steering.assistant_prefix) |assistant| {
+        if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
+    }
+    if (steering.text.len > 0) {
+        try events.append(alloc, .{ .steering = .{ .text = steering.text } });
+    }
+}
+
+fn resultArtifactRef(result: types.PersistedToolResult) ?[]const u8 {
+    if (result.output_handle) |handle| return handle;
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn resultCommandReplayRef(result: types.PersistedToolResult) ?[]const u8 {
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| descriptor.handle,
+        .unavailable => null,
+    };
+}
+
+fn resultCommandReplayBytes(result: types.PersistedToolResult) ?u64 {
+    const replay = result.command_output_replay orelse return null;
+    return switch (replay) {
+        .available => |descriptor| @intCast(descriptor.framed_bytes),
+        .unavailable => null,
+    };
+}
 
 pub const Kind = enum {
     session_started,
@@ -40,6 +622,7 @@ pub const SessionStarted = struct {
     conversation_language: session.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
     usage: ?session_usage.Snapshot = null,
+    subagent_child: bool = false,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
         alloc.free(self.id);
@@ -52,6 +635,7 @@ pub const SessionStarted = struct {
 };
 
 pub const PreferencesChanged = struct {
+    provider: ?model_provider.ProviderId = null,
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
@@ -199,32 +783,6 @@ pub const SequenceValidator = struct {
     }
 };
 
-pub const IdentifierSource = struct {
-    context: *anyopaque,
-    next_fn: *const fn (context: *anyopaque) Identifier,
-
-    pub fn next(self: IdentifierSource) Identifier {
-        return self.next_fn(self.context);
-    }
-};
-
-pub const ReplacementWriteOptions = struct {
-    log_generation: Identifier,
-    first_seq: u64,
-    replacement_id: Identifier,
-    event_ids: IdentifierSource,
-    timestamp_ms: i64,
-    reason: ReplacementReason,
-};
-
-pub const ReplacementWriteSummary = struct {
-    encoded_bytes: u64,
-    sha256: Digest,
-    chunk_count: u64,
-    last_seq: u64,
-    last_event_id: Identifier,
-};
-
 pub const ReductionStart = struct {
     generation: ?Identifier = null,
     next_seq: u64 = 1,
@@ -249,7 +807,10 @@ pub const Reduction = struct {
     }
 };
 
-pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
+/// Test-fixture encoder for the read-only v3 importer. Current runtime code
+/// must never emit the legacy envelope.
+pub fn encodeLegacyFixtureFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
+    if (!builtin.is_test) @compileError("legacy session encoding is test-only");
     try validateEnvelope(envelope);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -267,20 +828,35 @@ pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+inline fn failEnvelope(err: anytype) @TypeOf(err)!Envelope {
+    return @errorCast(failEnvelopeDynamic(err));
+}
+
+noinline fn failEnvelopeDynamic(err: anyerror) anyerror!Envelope {
+    return err;
+}
+
+test "session envelope failures preserve exact error types and identities" {
+    const invalid = failEnvelope(error.InvalidEventFrame);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidEventFrame}!Envelope);
+    try std.testing.expectError(error.InvalidEventFrame, invalid);
+    try std.testing.expectError(error.OutOfMemory, failEnvelope(error.OutOfMemory));
+}
+
 pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
-    if (line.len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
     if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line[0 .. line.len - 1], .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEventFrame,
+        error.OutOfMemory => return failEnvelope(error.OutOfMemory),
+        else => return failEnvelope(error.InvalidEventFrame),
     };
     defer parsed.deinit();
     const root = try exactObject(parsed.value, &.{
@@ -292,97 +868,19 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
         "kind",
         "payload",
     });
-    if (try requireU64(root, "schema_version") != 1) return error.UnsupportedEventSchema;
+    if (try requireU64(root, "schema_version") != 1) return failEnvelope(error.UnsupportedEventSchema);
     const kind = std.meta.stringToEnum(Kind, try requireString(root, "kind")) orelse
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     var envelope = Envelope{
         .log_generation = try parseIdentifier(try requireString(root, "log_generation")),
         .seq = try requireU64(root, "seq"),
         .event_id = try parseIdentifier(try requireString(root, "event_id")),
         .timestamp_ms = try requireI64(root, "timestamp_ms"),
-        .event = try parsePayload(alloc, kind, root.get("payload") orelse return error.InvalidEventFrame),
+        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame)),
     };
     errdefer envelope.deinit(alloc);
     try validateEnvelope(envelope);
     return envelope;
-}
-
-pub fn writeStateReplacement(
-    alloc: Allocator,
-    writer: *std.Io.Writer,
-    state: session_codec.DurableSessionState,
-    options: ReplacementWriteOptions,
-) !ReplacementWriteSummary {
-    var discard_buffer: [4096]u8 = undefined;
-    var discard = std.Io.Writer.Discarding.init(&discard_buffer);
-    const state_summary = try session_codec.encodeState(state, &discard.writer);
-    if (state_summary.encoded_bytes == 0) return error.InvalidReplacement;
-    const chunk_count = std.math.divCeil(
-        u64,
-        state_summary.encoded_bytes,
-        raw_state_chunk_bytes,
-    ) catch return error.InvalidReplacement;
-
-    const start = Envelope{
-        .log_generation = options.log_generation,
-        .seq = options.first_seq,
-        .event_id = options.event_ids.next(),
-        .timestamp_ms = options.timestamp_ms,
-        .event = .{ .state_replacement_started = .{
-            .replacement_id = options.replacement_id,
-            .reason = options.reason,
-            .encoded_bytes = state_summary.encoded_bytes,
-            .sha256 = state_summary.sha256,
-            .chunk_count = chunk_count,
-        } },
-    };
-    const start_line = try encodeFrame(alloc, start);
-    defer alloc.free(start_line);
-    try writer.writeAll(start_line);
-
-    var chunk_writer: ReplacementChunkWriter = undefined;
-    try chunk_writer.init(alloc, writer, options, state_summary, chunk_count);
-    defer chunk_writer.deinit();
-    const second_summary = session_codec.encodeState(state, &chunk_writer.interface) catch |err| {
-        return chunk_writer.failure orelse err;
-    };
-    chunk_writer.interface.flush() catch |err| return chunk_writer.failure orelse err;
-    try chunk_writer.finish();
-    if (second_summary.encoded_bytes != state_summary.encoded_bytes or
-        !std.mem.eql(u8, &second_summary.sha256, &state_summary.sha256) or
-        chunk_writer.chunk_index != chunk_count)
-    {
-        return error.InvalidReplacement;
-    }
-
-    const transaction_frame_count = std.math.add(u64, chunk_count, 1) catch
-        return error.InvalidReplacement;
-    const commit_seq = std.math.add(u64, options.first_seq, transaction_frame_count) catch
-        return error.InvalidReplacement;
-    const commit_id = options.event_ids.next();
-    const commit = Envelope{
-        .log_generation = options.log_generation,
-        .seq = commit_seq,
-        .event_id = commit_id,
-        .timestamp_ms = options.timestamp_ms,
-        .event = .{ .state_replacement_committed = .{
-            .replacement_id = options.replacement_id,
-            .encoded_bytes = state_summary.encoded_bytes,
-            .sha256 = state_summary.sha256,
-            .chunk_count = chunk_count,
-        } },
-    };
-    const commit_line = try encodeFrame(alloc, commit);
-    defer alloc.free(commit_line);
-    try writer.writeAll(commit_line);
-
-    return .{
-        .encoded_bytes = state_summary.encoded_bytes,
-        .sha256 = state_summary.sha256,
-        .chunk_count = chunk_count,
-        .last_seq = commit_seq,
-        .last_event_id = commit_id,
-    };
 }
 
 pub fn reduceJsonl(
@@ -431,6 +929,23 @@ pub fn applyEventFrame(
     return reductionBoundary(envelope, frame_bytes);
 }
 
+inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
+    return @errorCast(failReductionDynamic(err));
+}
+
+noinline fn failReductionDynamic(err: anyerror) anyerror!Reduction {
+    return err;
+}
+
+test "session event reduction failures preserve exact error types and identities" {
+    const invalid = failReduction(error.InvalidReductionStart);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidReductionStart}!Reduction,
+    );
+    try std.testing.expectError(error.InvalidReductionStart, invalid);
+    try std.testing.expectError(error.MissingSessionStarted, failReduction(error.MissingSessionStarted));
+}
+
 pub fn reduceJsonlFrom(
     alloc: Allocator,
     source: *std.Io.Reader,
@@ -442,7 +957,7 @@ pub fn reduceJsonlFrom(
     if (start.next_seq == 0 or
         (state == null and (start.generation != null or start.next_seq != 1)))
     {
-        return error.InvalidReductionStart;
+        return failReduction(error.InvalidReductionStart);
     }
     var validator = SequenceValidator{
         .generation = start.generation,
@@ -465,7 +980,7 @@ pub fn reduceJsonlFrom(
         try validator.validate(envelope);
 
         if (envelope.kind() == .state_replacement_started) {
-            if (state == null) return error.InvalidReplacement;
+            if (state == null) return failReduction(error.InvalidReplacement);
             const replacement = try reduceReplacement(
                 alloc,
                 source,
@@ -491,128 +1006,18 @@ pub fn reduceJsonlFrom(
         if (envelope.kind() == .state_replacement_chunk or
             envelope.kind() == .state_replacement_committed)
         {
-            return error.InvalidReplacement;
+            return failReduction(error.InvalidReplacement);
         }
         try applyDelta(alloc, &state, envelope);
         through = reductionBoundary(envelope, byte_offset);
     }
 
     return .{
-        .state = state orelse return error.MissingSessionStarted,
+        .state = state orelse return failReduction(error.MissingSessionStarted),
         .through = through,
         .bytes_consumed = byte_offset,
     };
 }
-
-const ReplacementChunkWriter = struct {
-    alloc: Allocator,
-    destination: *std.Io.Writer,
-    options: ReplacementWriteOptions,
-    state_summary: session_codec.EncodeSummary,
-    expected_chunk_count: u64,
-    raw: []u8,
-    raw_len: usize = 0,
-    chunk_index: u64 = 0,
-    interface_buffer: [4096]u8 = undefined,
-    interface: std.Io.Writer = undefined,
-    failure: ?anyerror = null,
-
-    fn init(
-        self: *ReplacementChunkWriter,
-        alloc: Allocator,
-        destination: *std.Io.Writer,
-        options: ReplacementWriteOptions,
-        state_summary: session_codec.EncodeSummary,
-        expected_chunk_count: u64,
-    ) !void {
-        self.* = .{
-            .alloc = alloc,
-            .destination = destination,
-            .options = options,
-            .state_summary = state_summary,
-            .expected_chunk_count = expected_chunk_count,
-            .raw = try alloc.alloc(u8, raw_state_chunk_bytes),
-        };
-        self.interface = .{
-            .vtable = &.{ .drain = drain },
-            .buffer = &self.interface_buffer,
-            .end = 0,
-        };
-    }
-
-    fn deinit(self: *ReplacementChunkWriter) void {
-        self.alloc.free(self.raw);
-        self.* = undefined;
-    }
-
-    fn drain(
-        writer: *std.Io.Writer,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!usize {
-        const self: *ReplacementChunkWriter = @alignCast(@fieldParentPtr("interface", writer));
-        var consumed: usize = 0;
-        if (writer.end > 0) {
-            self.consume(writer.buffer[0..writer.end]) catch |err| {
-                self.failure = err;
-                return error.WriteFailed;
-            };
-            writer.end = 0;
-        }
-        for (data, 0..) |part, index| {
-            const repeat = if (index == data.len - 1) splat else 1;
-            for (0..repeat) |_| {
-                self.consume(part) catch |err| {
-                    self.failure = err;
-                    return error.WriteFailed;
-                };
-                consumed += part.len;
-            }
-        }
-        return consumed;
-    }
-
-    fn consume(self: *ReplacementChunkWriter, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len > 0) {
-            const count = @min(remaining.len, self.raw.len - self.raw_len);
-            @memcpy(self.raw[self.raw_len..][0..count], remaining[0..count]);
-            self.raw_len += count;
-            remaining = remaining[count..];
-            if (self.raw_len == self.raw.len) try self.emitChunk();
-        }
-    }
-
-    fn finish(self: *ReplacementChunkWriter) !void {
-        if (self.raw_len > 0) try self.emitChunk();
-    }
-
-    fn emitChunk(self: *ReplacementChunkWriter) !void {
-        if (self.chunk_index >= self.expected_chunk_count or self.raw_len == 0) {
-            return error.InvalidReplacement;
-        }
-        const chunk = self.raw[0..self.raw_len];
-        const envelope = Envelope{
-            .log_generation = self.options.log_generation,
-            .seq = std.math.add(u64, self.options.first_seq, self.chunk_index + 1) catch
-                return error.InvalidReplacement,
-            .event_id = self.options.event_ids.next(),
-            .timestamp_ms = self.options.timestamp_ms,
-            .event = .{ .state_replacement_chunk = .{
-                .replacement_id = self.options.replacement_id,
-                .chunk_index = self.chunk_index,
-                .raw_bytes = chunk.len,
-                .chunk_sha256 = sha256(chunk),
-                .bytes = chunk,
-            } },
-        };
-        const line = try encodeFrame(self.alloc, envelope);
-        defer self.alloc.free(line);
-        try self.destination.writeAll(line);
-        self.chunk_index += 1;
-        self.raw_len = 0;
-    }
-};
 
 const ReplacementOutcome = struct {
     state: ?session_codec.DurableSessionState,
@@ -639,7 +1044,7 @@ fn reduceReplacement(
     );
     defer chunk_reader.deinit();
 
-    var decoded = session_codec.decodeState(alloc, &chunk_reader.interface, .{}) catch |err| {
+    var decoded = session_codec.decodeLegacyState(alloc, &chunk_reader.interface, .{}) catch |err| {
         if (chunk_reader.truncated) return .{ .state = null };
         if (chunk_reader.failure) |failure| return failure;
         return err;
@@ -885,6 +1290,7 @@ fn applyDelta(
                 .history = &.{},
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
+                .subagent_child = payload.subagent_child,
             };
             errdefer alloc.free(next.id);
             next.origin_workspace_root = try alloc.dupe(u8, payload.origin_workspace_root);
@@ -904,6 +1310,7 @@ fn applyDelta(
         .preferences_changed => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
             var proposed = current.*;
+            if (payload.provider) |provider| proposed.preferences.provider = provider;
             if (payload.model) |model| proposed.preferences.model = model;
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
@@ -917,6 +1324,7 @@ fn applyDelta(
                 alloc.free(current.preferences.model);
                 current.preferences.model = copy;
             }
+            if (payload.provider) |provider| current.preferences.provider = provider;
             if (payload.effort) |effort| current.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| current.preferences.fast_mode = fast_mode;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -959,6 +1367,9 @@ fn applyDelta(
                 current.history = try alloc.realloc(current.history, current.history.len + 1);
             }
             current.history[current.history.len - 1] = turn;
+            if (payload.turn == .compacted_summary) {
+                current.context_history_start = current.history.len - 1;
+            }
             current.conversation_language = payload.conversation_language;
             current.total_input_tokens = payload.total_input_tokens;
             current.total_output_tokens = payload.total_output_tokens;
@@ -999,6 +1410,26 @@ fn applyDelta(
     }
 }
 
+pub fn applyEventToState(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+    event: Event,
+    timestamp_ms: i64,
+) !void {
+    const zero_id = [_]u8{0} ** 16;
+    const envelope = Envelope{
+        .log_generation = zero_id,
+        .seq = 1,
+        .event_id = zero_id,
+        .timestamp_ms = timestamp_ms,
+        .event = event,
+    };
+    try validateEnvelope(envelope);
+    var current: ?session_codec.DurableSessionState = state.*;
+    try applyDelta(alloc, &current, envelope);
+    state.* = current.?;
+}
+
 fn validateEnvelope(envelope: Envelope) !void {
     if (envelope.seq == 0 or envelope.timestamp_ms < 0) return error.InvalidEventFrame;
     switch (envelope.event) {
@@ -1015,11 +1446,12 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .usage = payload.usage,
+                .subagent_child = payload.subagent_child,
             };
             try session_codec.validateState(state);
         },
         .preferences_changed => |payload| {
-            if (payload.model == null and payload.effort == null and payload.fast_mode == null) {
+            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
                 return error.InvalidEventFrame;
             }
             if (payload.model) |model| {
@@ -1111,12 +1543,21 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
                 try writer.writeAll(",\"usage\":");
                 try session_usage.writeSnapshot(writer, usage);
             }
+            if (payload.subagent_child) {
+                try writer.writeAll(",\"subagent_child\":true");
+            }
             try writer.writeByte('}');
         },
         .preferences_changed => |payload| {
             try writer.writeByte('{');
             var wrote = false;
+            if (payload.provider) |provider| {
+                try writer.writeAll("\"provider\":");
+                try writeJsonString(writer, @tagName(provider));
+                wrote = true;
+            }
             if (payload.model) |model| {
+                if (wrote) try writer.writeByte(',');
                 try writer.writeAll("\"model\":");
                 try writeJsonString(writer, model);
                 wrote = true;
@@ -1200,25 +1641,20 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
-            const object = if (source.count() == 6)
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                })
-            else
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                    "usage",
-                });
+            if (source.count() < 6 or source.count() > 8) {
+                return error.InvalidEventFrame;
+            }
+            try rejectUnknownKeys(source, &.{
+                "id",
+                "created_at_ms",
+                "origin_workspace_root",
+                "workspace_root",
+                "conversation_language",
+                "preferences",
+                "usage",
+                "subagent_child",
+            });
+            const object = source;
             const id = try dupeString(alloc, object, "id");
             errdefer alloc.free(id);
             const origin = try dupeString(alloc, object, "origin_workspace_root");
@@ -1234,13 +1670,20 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 owned.deinit(alloc);
             }
             var usage = if (object.get("usage")) |usage_value|
-                session_usage.parseSnapshotValue(alloc, usage_value) catch |err| switch (err) {
+                session_usage.parseLegacySnapshotValue(alloc, usage_value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.InvalidEventFrame,
                 }
             else
                 null;
             errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+            const subagent_child = if (object.get("subagent_child")) |raw|
+                if (raw == .bool and raw.bool)
+                    true
+                else
+                    return error.InvalidEventFrame
+            else
+                false;
             break :blk .{ .session_started = .{
                 .id = id,
                 .created_at_ms = try requireI64(object, "created_at_ms"),
@@ -1251,12 +1694,17 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 ) catch return error.InvalidEventFrame,
                 .preferences = preferences,
                 .usage = usage,
+                .subagent_child = subagent_child,
             } };
         },
         .preferences_changed => blk: {
             const object = try requireObject(value);
-            if (object.count() == 0 or object.count() > 3) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "model", "effort", "fast_mode" });
+            if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
+            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
+            const provider = if (object.get("provider")) |provider_value| provider_blk: {
+                if (provider_value != .string) return error.InvalidEventFrame;
+                break :provider_blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+            } else null;
             const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
             errdefer if (model) |owned| alloc.free(owned);
             const effort = if (object.get("effort")) |_|
@@ -1266,6 +1714,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 null;
             const fast_mode = if (object.get("fast_mode")) |_| try requireBool(object, "fast_mode") else null;
             break :blk .{ .preferences_changed = .{
+                .provider = provider,
                 .model = model,
                 .effort = effort,
                 .fast_mode = fast_mode,
@@ -1316,7 +1765,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .usage_checkpointed => blk: {
             const object = try exactObject(value, &.{"usage"});
-            var usage = session_usage.parseSnapshotValue(
+            var usage = session_usage.parseLegacySnapshotValue(
                 alloc,
                 object.get("usage") orelse return error.InvalidEventFrame,
             ) catch |err| switch (err) {
@@ -1428,15 +1877,9 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
-    errdefer alloc.free(model);
-    return .{
-        .model = model,
-        .effort = types.ReasoningEffort.parse(
-            try requireString(object, "effort"),
-        ) orelse return error.InvalidEventFrame,
-        .fast_mode = try requireBool(object, "fast_mode"),
+    return session_codec.parse_preferences(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEventFrame,
     };
 }
 
@@ -1448,9 +1891,11 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}}}", .{
+    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    try writeJsonString(writer, @tagName(preferences.provider));
+    try writer.writeByte('}');
 }
 
 fn exactObject(value: std.json.Value, keys: []const []const u8) !std.json.ObjectMap {
@@ -1587,12 +2032,13 @@ test "event frame codec is deterministic and validates contiguous sequence and g
                 .effort = types.ReasoningEffort.literal("medium"),
                 .fast_mode = false,
             },
+            .subagent_child = true,
         } },
     };
 
-    const first = try encodeFrame(alloc, frame);
+    const first = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(first);
-    const second = try encodeFrame(alloc, frame);
+    const second = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(first[first.len - 1] == '\n');
@@ -1600,6 +2046,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
     var decoded = try decodeFrame(alloc, first);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(Kind.session_started, decoded.kind());
+    try std.testing.expect(decoded.event.session_started.subagent_child);
     try std.testing.expectEqualSlices(u8, &generation, &decoded.log_generation);
     try std.testing.expectEqual(@as(u64, 1), decoded.seq);
 
@@ -1655,7 +2102,7 @@ test "history_turn_committed event decode repairs duplicate-key tool arguments" 
         } },
     };
 
-    const encoded = try encodeFrame(std.testing.allocator, frame);
+    const encoded = try encodeLegacyFixtureFrame(std.testing.allocator, frame);
     defer std.testing.allocator.free(encoded);
     var decoded = try decodeFrame(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
@@ -1677,7 +2124,7 @@ test "event frame cap is inclusive of the required newline" {
         .timestamp_ms = 1,
         .event = .{ .preferences_changed = .{ .fast_mode = true } },
     };
-    const encoded = try encodeFrame(alloc, frame);
+    const encoded = try encodeLegacyFixtureFrame(alloc, frame);
     defer alloc.free(encoded);
 
     const exact = try alloc.alloc(u8, event_frame_max_bytes);
@@ -1694,176 +2141,6 @@ test "event frame cap is inclusive of the required newline" {
     oversized[oversized.len - 2] = ' ';
     oversized[oversized.len - 1] = '\n';
     try std.testing.expectError(error.EventFrameTooLarge, decodeFrame(alloc, oversized));
-}
-
-test "replacement writer uses four MiB chunks and reducer commits only complete replacement" {
-    const alloc = std.testing.allocator;
-    const large_text = try alloc.alloc(u8, raw_state_chunk_bytes + 1);
-    defer alloc.free(large_text);
-    @memset(large_text, 'x');
-
-    const initial = session_codec.DurableSessionState{
-        .id = @constCast("session-1"),
-        .origin_workspace_root = @constCast("/tmp/origin"),
-        .workspace_root = @constCast("/tmp/current"),
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = @constCast("model-a"),
-            .effort = types.ReasoningEffort.literal("low"),
-            .fast_mode = false,
-        },
-        .history = @constCast(&.{}),
-        .total_input_tokens = 1,
-        .total_output_tokens = 2,
-    };
-    var large_history = [_]session.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("large") },
-        .assistant = large_text,
-    } }};
-    const replacement = session_codec.DurableSessionState{
-        .id = initial.id,
-        .origin_workspace_root = initial.origin_workspace_root,
-        .workspace_root = initial.workspace_root,
-        .created_at_ms = initial.created_at_ms,
-        .updated_at_ms = 15,
-        .conversation_language = session.ConversationLanguage.literal("fr"),
-        .preferences = .{
-            .model = @constCast("model-b"),
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = true,
-        },
-        .history = large_history[0..],
-        .total_input_tokens = 9,
-        .total_output_tokens = 8,
-    };
-
-    var complete: std.Io.Writer.Allocating = .init(alloc);
-    defer complete.deinit();
-    var event_id_source = TestIdentifierSource.init(0x33);
-    const replacement_summary = try writeStateReplacement(alloc, &complete.writer, replacement, .{
-        .log_generation = identifier(0x11),
-        .first_seq = 5,
-        .replacement_id = identifier(0x22),
-        .event_ids = event_id_source.source(),
-        .timestamp_ms = 15,
-        .reason = .recovery,
-    });
-    try std.testing.expect(replacement_summary.chunk_count >= 2);
-    try std.testing.expectEqualSlices(
-        u8,
-        &identifier(0x33 + @as(u8, @intCast(replacement_summary.chunk_count + 1))),
-        &replacement_summary.last_event_id,
-    );
-
-    var source = std.Io.Reader.fixed(complete.written());
-    var reduced = try reduceJsonlFrom(
-        alloc,
-        &source,
-        try initial.dupe(alloc),
-        .{ .generation = identifier(0x11), .next_seq = 5 },
-    );
-    defer reduced.deinit(alloc);
-    try std.testing.expect(reduced.truncate_from == null);
-    try std.testing.expectEqualStrings("model-b", reduced.state.preferences.model);
-    try std.testing.expectEqual(@as(i64, 15), reduced.state.updated_at_ms);
-    try std.testing.expectEqual(@as(usize, 1), reduced.state.history.len);
-    try std.testing.expectEqual(large_text.len, reduced.state.history[0].assistant.assistant.len);
-
-    const commit_start = std.mem.lastIndexOf(u8, complete.written(), "{\"schema_version\":1") orelse return error.TestExpectedEqual;
-    var incomplete_source = std.Io.Reader.fixed(complete.written()[0..commit_start]);
-    var incomplete = try reduceJsonlFrom(
-        alloc,
-        &incomplete_source,
-        try initial.dupe(alloc),
-        .{ .generation = identifier(0x11), .next_seq = 5 },
-    );
-    defer incomplete.deinit(alloc);
-    try std.testing.expectEqual(@as(?u64, 0), incomplete.truncate_from);
-    try std.testing.expectEqualStrings("model-a", incomplete.state.preferences.model);
-    try std.testing.expectEqual(@as(i64, 20), incomplete.state.updated_at_ms);
-
-    const FailingAfterReader = struct {
-        bytes: []const u8,
-        fail_at: usize,
-        offset: usize = 0,
-        buffer: [1]u8 = undefined,
-        interface: std.Io.Reader = undefined,
-
-        fn init(self: *@This(), bytes: []const u8, fail_at: usize) void {
-            self.* = .{ .bytes = bytes, .fail_at = fail_at };
-            self.interface = .{
-                .vtable = &.{
-                    .stream = stream,
-                    .readVec = readVec,
-                },
-                .buffer = &self.buffer,
-                .seek = 0,
-                .end = 0,
-            };
-        }
-
-        fn readVec(reader: *std.Io.Reader, destinations: [][]u8) std.Io.Reader.Error!usize {
-            const self: *@This() = @alignCast(@fieldParentPtr("interface", reader));
-            if (self.offset >= self.fail_at) return error.ReadFailed;
-            if (self.offset >= self.bytes.len) return error.EndOfStream;
-            for (destinations) |destination| {
-                if (destination.len == 0) continue;
-                const count = @min(
-                    destination.len,
-                    @min(
-                        self.fail_at - self.offset,
-                        self.bytes.len - self.offset,
-                    ),
-                );
-                if (count == 0) return error.ReadFailed;
-                @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);
-                self.offset += count;
-                return count;
-            }
-            const destination = reader.buffer[reader.end..];
-            if (destination.len == 0) return 0;
-            const count = @min(
-                destination.len,
-                @min(
-                    self.fail_at - self.offset,
-                    self.bytes.len - self.offset,
-                ),
-            );
-            if (count == 0) return error.ReadFailed;
-            @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);
-            self.offset += count;
-            reader.end += count;
-            return 0;
-        }
-
-        fn stream(
-            reader: *std.Io.Reader,
-            writer: *std.Io.Writer,
-            limit: std.Io.Limit,
-        ) std.Io.Reader.StreamError!usize {
-            const destination = limit.slice(try writer.writableSliceGreedy(1));
-            var destinations = [1][]u8{destination};
-            const count = try readVec(reader, &destinations);
-            writer.advance(count);
-            return count;
-        }
-    };
-    const first_frame_end =
-        (std.mem.findScalar(u8, complete.written(), '\n') orelse
-            return error.TestExpectedEqual) + 1;
-    var failing_source: FailingAfterReader = undefined;
-    failing_source.init(complete.written(), first_frame_end + 16);
-    try std.testing.expectError(
-        error.ReadFailed,
-        reduceJsonlFrom(
-            alloc,
-            &failing_source.interface,
-            try initial.dupe(alloc),
-            .{ .generation = identifier(0x11), .next_seq = 5 },
-        ),
-    );
 }
 
 test "semantic reducer uses event timestamps and enforces immutable identity" {
@@ -1910,7 +2187,7 @@ test "semantic reducer uses event timestamps and enforces immutable identity" {
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
     for (frames) |frame| {
-        const line = try encodeFrame(alloc, frame);
+        const line = try encodeLegacyFixtureFrame(alloc, frame);
         defer alloc.free(line);
         try jsonl.writer.writeAll(line);
     }
@@ -1925,12 +2202,12 @@ test "semantic reducer uses event timestamps and enforces immutable identity" {
 
     var bad = frames[2];
     bad.event.workspace_rebound.previous_workspace_root = @constCast("/tmp/not-current");
-    const bad_line = try encodeFrame(alloc, bad);
+    const bad_line = try encodeLegacyFixtureFrame(alloc, bad);
     defer alloc.free(bad_line);
     var bad_log: std.Io.Writer.Allocating = .init(alloc);
     defer bad_log.deinit();
     for (frames[0..2]) |frame| {
-        const line = try encodeFrame(alloc, frame);
+        const line = try encodeLegacyFixtureFrame(alloc, frame);
         defer alloc.free(line);
         try bad_log.writer.writeAll(line);
     }
@@ -1965,7 +2242,7 @@ test "semantic reducer resumes a contiguous suffix from owned state" {
         .timestamp_ms = 30,
         .event = .{ .preferences_changed = .{ .fast_mode = true } },
     };
-    const line = try encodeFrame(alloc, envelope);
+    const line = try encodeLegacyFixtureFrame(alloc, envelope);
     defer alloc.free(line);
 
     var source = std.Io.Reader.fixed(line);
@@ -2040,7 +2317,7 @@ test "single event application updates caller-owned state without replaying its 
             } },
         } },
     };
-    const line = try encodeFrame(alloc, history);
+    const line = try encodeLegacyFixtureFrame(alloc, history);
     defer alloc.free(line);
     const boundary = try applyEventFrame(
         alloc,
@@ -2064,6 +2341,51 @@ test "single event application updates caller-owned state without replaying its 
     try std.testing.expectEqual(@as(i64, 30), state.updated_at_ms);
 }
 
+test "compacted summary event advances the durable replacement boundary" {
+    const alloc = std.testing.allocator;
+    var state: ?session_codec.DurableSessionState = try singleEventTestState(
+        "session-compaction-checkpoint",
+    ).dupe(alloc);
+    defer if (state) |*current| current.deinit(alloc);
+
+    const generation = identifier(0xb0);
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = identifier(0xb1),
+        .timestamp_ms = 30,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 10,
+            .total_output_tokens = 5,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("exact prompt") },
+                .assistant = @constCast("exact reply"),
+            } },
+        } },
+    });
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = identifier(0xb2),
+        .timestamp_ms = 40,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 20,
+            .total_output_tokens = 10,
+            .turn = .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>\nsummary\n</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.?.history.len);
+    try std.testing.expectEqual(@as(usize, 1), state.?.context_history_start);
+    try std.testing.expectEqualStrings("exact prompt", state.?.history[0].assistant.user.text);
+}
+
 test "single event application preserves caller-owned state on allocation failure" {
     const alloc = std.testing.allocator;
     const generation = identifier(0xa1);
@@ -2082,7 +2404,7 @@ test "single event application preserves caller-owned state on allocation failur
             } },
         } },
     };
-    const line = try encodeFrame(alloc, event);
+    const line = try encodeLegacyFixtureFrame(alloc, event);
     defer alloc.free(line);
 
     const AllocationCheck = struct {
@@ -2167,7 +2489,7 @@ test "single event application validates boundaries for every semantic event kin
     };
 
     for (events, 0..) |event, index| {
-        const line = try encodeFrame(alloc, event);
+        const line = try encodeLegacyFixtureFrame(alloc, event);
         defer alloc.free(line);
         if (index == 0) {
             try std.testing.expectError(
@@ -2300,7 +2622,7 @@ test "history_turn_committed leaves absent session usage unchanged" {
         } },
     };
 
-    const committed_line = try encodeFrame(alloc, committed);
+    const committed_line = try encodeLegacyFixtureFrame(alloc, committed);
     defer alloc.free(committed_line);
 
     var decoded = try decodeFrame(alloc, committed_line);
@@ -2324,7 +2646,7 @@ test "history_turn_committed leaves absent session usage unchanged" {
 
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
-    const started_line = try encodeFrame(alloc, started);
+    const started_line = try encodeLegacyFixtureFrame(alloc, started);
     defer alloc.free(started_line);
     try jsonl.writer.writeAll(started_line);
     try jsonl.writer.writeAll(committed_line);
@@ -2463,7 +2785,7 @@ test "history event provenance rejects conflicts and malformed IDs" {
     var persisted_conflict = base;
     persisted_conflict.event.history_turn_committed.work_id = @constCast("work-a");
     persisted_conflict.event.history_turn_committed.turn.assistant.user.work_id = @constCast("work-a");
-    const encoded = try encodeFrame(std.testing.allocator, persisted_conflict);
+    const encoded = try encodeLegacyFixtureFrame(std.testing.allocator, persisted_conflict);
     defer std.testing.allocator.free(encoded);
     const final_id = std.mem.lastIndexOf(u8, encoded, "work-a") orelse
         return error.TestExpectedEqual;
@@ -2544,6 +2866,94 @@ test "history provenance replay frees every partial allocation" {
     );
 }
 
+test "legacy cache accounting remains readable without invented totals" {
+    const alloc = std.testing.allocator;
+    const frame = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":2," ++
+        "\"event_id\":\"02020202020202020202020202020202\",\"timestamp_ms\":20,\"kind\":\"usage_checkpointed\",\"payload\":{\"usage\":{" ++
+        "\"billing\":\"complete\",\"api_duration_complete\":true,\"wall_duration_complete\":true,\"code_complete\":true,\"next_sequence\":2,\"settled_through_sequence\":1," ++
+        "\"api_duration_ms\":10,\"wall_duration_ms\":20,\"total_cost\":1,\"input_tokens\":1,\"output_tokens\":3,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0,\"lines_added\":0,\"lines_removed\":0," ++
+        "\"models\":[{\"model\":\"test/model\",\"first_sequence\":1,\"total_cost\":1,\"input_tokens\":1,\"output_tokens\":3,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0}],\"pending\":[]}}}\n";
+    var decoded = try decodeFrame(alloc, frame);
+    defer decoded.deinit(alloc);
+    const usage = decoded.event.usage_checkpointed.usage;
+    try session_usage.validateSnapshot(usage);
+    try std.testing.expectEqual(session_usage.Availability.legacy, usage.billing);
+    try std.testing.expectEqual(@as(usize, 0), usage.models.len);
+    try std.testing.expectEqual(@as(usize, 0), usage.pending.len);
+    try std.testing.expect(!usage.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 2), decoded.seq);
+}
+
+test "legacy usage replacement retains framing and checksum validation" {
+    const alloc = std.testing.allocator;
+    const usage_json = "{\"billing\":\"complete\",\"api_duration_complete\":true,\"wall_duration_complete\":true,\"code_complete\":true,\"next_sequence\":2,\"settled_through_sequence\":1," ++
+        "\"api_duration_ms\":0,\"wall_duration_ms\":0,\"total_cost\":0,\"input_tokens\":1,\"output_tokens\":0,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0,\"lines_added\":0,\"lines_removed\":0," ++
+        "\"models\":[{\"model\":\"test/model\",\"first_sequence\":1,\"total_cost\":0,\"input_tokens\":1,\"output_tokens\":0,\"cache_read_tokens\":2,\"cache_write_tokens\":0,\"billable_web_search_calls\":0}],\"pending\":[]}";
+    const common = "\"id\":\"legacy-replacement\",\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false}";
+    const state_json = "{" ++ common ++ ",\"history\":[],\"total_input_tokens\":7,\"total_output_tokens\":3,\"usage\":" ++ usage_json ++ "}";
+    const started = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":1,\"event_id\":\"01010101010101010101010101010101\",\"timestamp_ms\":1,\"kind\":\"session_started\",\"payload\":{" ++
+        "\"id\":\"legacy-replacement\",\"created_at_ms\":1,\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"usage\":" ++ usage_json ++ "}}\n";
+    const replacement_id = [_]u8{9} ** 16;
+    const digest = sha256(state_json);
+    for ([_]bool{ false, true }) |corrupt| {
+        var declared_digest = digest;
+        if (corrupt) declared_digest[0] ^= 1;
+        const transaction = [_]Event{
+            .{ .state_replacement_started = .{ .replacement_id = replacement_id, .reason = .compaction, .encoded_bytes = state_json.len, .sha256 = declared_digest, .chunk_count = 1 } },
+            .{ .state_replacement_chunk = .{ .replacement_id = replacement_id, .chunk_index = 0, .raw_bytes = state_json.len, .chunk_sha256 = digest, .bytes = @constCast(state_json) } },
+            .{ .state_replacement_committed = .{ .replacement_id = replacement_id, .encoded_bytes = state_json.len, .sha256 = declared_digest, .chunk_count = 1 } },
+        };
+        var log: std.Io.Writer.Allocating = .init(alloc);
+        defer log.deinit();
+        try log.writer.writeAll(started);
+        for (transaction, 2..) |event, seq| {
+            const frame = try encodeLegacyFixtureFrame(alloc, .{
+                .log_generation = [_]u8{1} ** 16,
+                .seq = seq,
+                .event_id = [_]u8{@intCast(seq)} ** 16,
+                .timestamp_ms = 2,
+                .event = event,
+            });
+            defer alloc.free(frame);
+            try log.writer.writeAll(frame);
+        }
+        var source = std.Io.Reader.fixed(log.written());
+        if (corrupt) {
+            try std.testing.expectError(error.InvalidReplacement, reduceJsonl(alloc, &source, null));
+        } else {
+            var reduced = try reduceJsonl(alloc, &source, null);
+            defer reduced.deinit(alloc);
+            try std.testing.expectEqualStrings("legacy-replacement", reduced.state.id);
+            try std.testing.expectEqual(@as(u64, 4), reduced.through.?.seq);
+            try std.testing.expectEqual(log.written().len, reduced.bytes_consumed);
+            try std.testing.expectEqual(@as(u64, 7), reduced.state.total_input_tokens);
+            try std.testing.expectEqual(session_usage.Availability.legacy, reduced.state.usage.?.billing);
+            try std.testing.expect(reduced.truncate_from == null);
+
+            var known = session_usage.Usage.initFresh();
+            defer known.deinit(alloc);
+            try known.recordCommittedLines(6, 2);
+            var snapshot = try known.snapshot(alloc);
+            defer snapshot.deinit(alloc);
+            const later_frame = try encodeLegacyFixtureFrame(alloc, .{
+                .log_generation = [_]u8{1} ** 16,
+                .seq = 5,
+                .event_id = [_]u8{5} ** 16,
+                .timestamp_ms = 3,
+                .event = .{ .usage_checkpointed = .{ .usage = snapshot } },
+            });
+            defer alloc.free(later_frame);
+            try log.writer.writeAll(later_frame);
+            var later_source = std.Io.Reader.fixed(log.written());
+            var later = try reduceJsonl(alloc, &later_source, null);
+            defer later.deinit(alloc);
+            try std.testing.expectEqual(session_usage.Availability.complete, later.state.usage.?.billing);
+            try std.testing.expectEqual(@as(u64, 6), later.state.usage.?.lines_added);
+            try std.testing.expectEqual(@as(u64, 5), later.through.?.seq);
+        }
+    }
+}
+
 test "usage checkpoint event decodes a cumulative snapshot" {
     const alloc = std.testing.allocator;
     var usage = session_usage.Usage.initFresh();
@@ -2588,7 +2998,7 @@ test "usage checkpoint event decodes a cumulative snapshot" {
             },
         } },
     };
-    const started_line = try encodeFrame(alloc, started);
+    const started_line = try encodeLegacyFixtureFrame(alloc, started);
     defer alloc.free(started_line);
     var jsonl: std.Io.Writer.Allocating = .init(alloc);
     defer jsonl.deinit();
@@ -2706,7 +3116,7 @@ test "recovery checkpoint events replace and clear deterministically" {
         .assistant_source = @constCast("partial"),
         .cause = .network_interrupted,
         .action = .continuing_response,
-        .route_model = @constCast("test/model"),
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -2786,24 +3196,200 @@ fn identifier(seed: u8) Identifier {
     return value;
 }
 
-const TestIdentifierSource = struct {
-    next_seed: u8,
+test "conversation transition validates sequence tool identity and checkpoint safety" {
+    try validateConversationTransition(.{}, .{
+        .seq = 1,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{
+            .covers_through_seq = 0,
+            .summary = "first-turn checkpoint",
+        } },
+    });
+    const pending = [_]PendingToolCall{.{ .call_id = "call-shell", .tool_name = "shell", .seq = 2 }};
+    const state = ConversationStateView{ .last_seq = 2, .pending_tool_calls = &pending };
+    try validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .tool_result = .{
+            .call_id = "call-shell",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:abc",
+            .stored_bytes = 4,
+            .completeness = .complete,
+            .preview = "done",
+        } },
+    });
+    try std.testing.expectError(error.OrphanToolResult, validateConversationTransition(.{ .last_seq = 2 }, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .tool_result = .{
+            .call_id = "missing",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:missing",
+            .stored_bytes = 0,
+            .completeness = .unknown,
+        } },
+    }));
+    try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "checkpoint" } },
+    }));
+    try std.testing.expectError(error.UnresolvedToolCall, validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .turn_completed = .{} },
+    }));
+    try validateConversationTransition(state, .{
+        .seq = 3,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 1, .summary = "checkpoint" } },
+    });
+    const checkpointed = ConversationStateView{ .last_seq = 3, .latest_checkpoint_coverage = 1, .pending_tool_calls = &pending };
+    try validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 1, .summary = "same covered prefix" } },
+    });
+    try std.testing.expectError(error.InvalidCheckpointCoverage, validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 0, .summary = "backwards coverage" } },
+    }));
+    try std.testing.expectError(error.InvalidCheckpointCoverage, validateConversationTransition(checkpointed, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .context_checkpoint = .{ .covers_through_seq = 4, .summary = "future coverage" } },
+    }));
+    try std.testing.expectError(error.OutOfOrderConversationEvent, validateConversationTransition(state, .{
+        .seq = 4,
+        .timestamp_ms = 10,
+        .event = .{ .assistant = .{ .text = "skipped sequence" } },
+    }));
+}
 
-    fn init(seed: u8) TestIdentifierSource {
-        return .{ .next_seed = seed };
-    }
+test "conversation frame round trips an external tool result reference" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeConversationFrame(alloc, .{
+        .seq = 7,
+        .timestamp_ms = 42,
+        .event = .{ .tool_result = .{
+            .call_id = "call-shell",
+            .tool_name = "shell",
+            .status = .success,
+            .artifact_ref = "sha256:abcdef",
+            .stored_bytes = 4096,
+            .completeness = .partial,
+            .preview = "bounded preview",
+        } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.endsWith(u8, encoded, "\n"));
+    try std.testing.expect(std.mem.find(u8, encoded, "full result bytes") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "DurableSessionState") == null);
 
-    fn source(self: *TestIdentifierSource) IdentifierSource {
-        return .{
-            .context = self,
-            .next_fn = next,
-        };
-    }
+    var decoded = try decodeConversationFrame(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 7), decoded.value.seq);
+    try std.testing.expectEqual(@as(i64, 42), decoded.value.timestamp_ms);
+    const result = decoded.value.event.tool_result;
+    try std.testing.expectEqualStrings("call-shell", result.call_id);
+    try std.testing.expectEqualStrings("shell", result.tool_name);
+    try std.testing.expectEqualStrings("sha256:abcdef", result.artifact_ref);
+    try std.testing.expectEqual(ArtifactCompleteness.partial, result.completeness);
+    try std.testing.expectEqualStrings("bounded preview", result.preview.?);
+}
 
-    fn next(context: *anyopaque) Identifier {
-        const self: *TestIdentifierSource = @ptrCast(@alignCast(context));
-        const value = identifier(self.next_seed);
-        self.next_seed +%= 1;
-        return value;
-    }
-};
+test "conversation frame reads old records and preserves new reasoning-only assistants" {
+    const alloc = std.testing.allocator;
+    var old = try decodeConversationFrame(alloc, "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"old\"}}}\n");
+    defer old.deinit();
+    try std.testing.expect(old.value.event.assistant.provider_replay == null);
+    try validateConversationTransition(.{}, old.value);
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    const encoded = try encodeConversationFrame(alloc, .{ .seq = 2, .timestamp_ms = 2, .event = .{ .assistant = .{ .text = "", .provider_replay = replay } } });
+    defer alloc.free(encoded);
+    var current = try decodeConversationFrame(alloc, encoded);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u8, 2), current.value.schema_version);
+    try std.testing.expectEqualStrings(replay.parts_json, current.value.event.assistant.provider_replay.?.parts_json);
+    try validateConversationTransition(.{ .last_seq = 1 }, current.value);
+}
+
+test "conversation frame decoder stays bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzConversationFrame, .{
+        .corpus = &.{
+            "",
+            "{}\n",
+            "{\"schema_version\":1}\n",
+            "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
+        },
+    });
+}
+
+fn fuzzConversationFrame(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var decoded = decodeConversationFrame(
+        std.testing.allocator,
+        buffer[0..len],
+    ) catch return;
+    decoded.deinit();
+}
+
+test "history turn projects to flat conversation events with artifact references" {
+    var images = [_]types.ToolImage{.{ .data = @constCast("image bytes"), .mime_type = @constCast("image/png") }};
+    var calls = [_]types.ToolCall{.{
+        .id = "call-shell",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"printf done\"}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_handle = @constCast("result-shell.txt"),
+        .tool_image_handle = @constCast("image-result-shell.txt"),
+        .tool_images = &images,
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("I will run it."),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const turn = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("Run the command.") },
+        .assistant = @constCast("It completed."),
+        .execution = .{ .tool_steps = &steps },
+    } };
+    var events: std.ArrayList(ConversationEvent) = .empty;
+    defer events.deinit(std.testing.allocator);
+
+    try appendHistoryTurnConversationEvents(std.testing.allocator, &events, turn);
+
+    try std.testing.expectEqual(@as(usize, 6), events.items.len);
+    try std.testing.expectEqualStrings("Run the command.", events.items[0].user.text);
+    try std.testing.expectEqualStrings("I will run it.", events.items[1].assistant.text);
+    try std.testing.expectEqualStrings("call-shell", events.items[2].tool_call.call_id);
+    try std.testing.expectEqualStrings("result-shell.txt", events.items[3].tool_result.artifact_ref);
+    try std.testing.expectEqualStrings("image-result-shell.txt", events.items[3].tool_result.tool_image_handle.?);
+    const encoded = try encodeConversationFrame(std.testing.allocator, .{
+        .seq = 4,
+        .timestamp_ms = 1,
+        .event = events.items[3],
+    });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "image bytes") == null);
+    var decoded = try decodeConversationFrame(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("image-result-shell.txt", decoded.value.event.tool_result.tool_image_handle.?);
+    try std.testing.expectEqualStrings("It completed.", events.items[4].assistant.text);
+    try std.testing.expect(events.items[5] == .turn_completed);
+    results[0].tool_image_handle = null;
+    try std.testing.expectError(error.ConversationArtifactRequired, appendHistoryTurnConversationEvents(std.testing.allocator, &events, turn));
+}

@@ -56,7 +56,7 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null);
 }
 
 fn wrapAssistantTextWithBaseGutter(
@@ -67,9 +67,17 @@ fn wrapAssistantTextWithBaseGutter(
     replace_wide_runes_at_one_content_col: bool,
     literal_command: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    finalized_prefix_bytes: ?*usize,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    if (finalized_prefix_bytes) |bytes| bytes.* = 0;
+    var finalized_source_end: usize = 0;
+    if (finalized_prefix_bytes != null) {
+        if (std.mem.findScalarLast(u8, text, '\n')) |newline| {
+            finalized_source_end = newline + 1;
+        }
+    }
 
     if (cols == 0) {
         return out.toOwnedSlice(alloc);
@@ -135,6 +143,9 @@ fn wrapAssistantTextWithBaseGutter(
             try out.append(alloc, ch);
             col = base_gutter + 1;
             i += 1;
+            if (finalized_prefix_bytes) |bytes| {
+                if (i == finalized_source_end) bytes.* = out.items.len;
+            }
             continuation = if (literal_command) null else assistantContinuation(text, i);
             word_breaks = .{};
             has_word_on_row = false;
@@ -391,7 +402,38 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         true,
         false,
         checkpoint,
+        null,
     );
+}
+
+/// `bytes` is owned by the caller. `finalized_prefix_bytes` ends after the
+/// last source hard newline and excludes soft wraps from the unfinished line.
+pub const TranscriptAssistantWrap = struct {
+    bytes: []u8,
+    finalized_prefix_bytes: usize,
+};
+
+pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !TranscriptAssistantWrap {
+    var finalized_prefix_bytes: usize = 0;
+    const bytes = try wrapAssistantTextWithBaseGutter(
+        alloc,
+        text,
+        cols,
+        gutterWidth(cols),
+        true,
+        false,
+        checkpoint,
+        &finalized_prefix_bytes,
+    );
+    return .{
+        .bytes = bytes,
+        .finalized_prefix_bytes = finalized_prefix_bytes,
+    };
 }
 
 /// Reflow canonical command output as literal terminal text. Every physical
@@ -412,6 +454,7 @@ pub fn wrapLiteralCommandOutput(
         gutter,
         true,
         true,
+        null,
         null,
     );
 }
@@ -444,6 +487,7 @@ pub fn wrapLiteralToolOutputInterruptible(
         true,
         true,
         checkpoint,
+        null,
     );
 }
 
@@ -768,8 +812,39 @@ fn assistantContinuation(text: []const u8, line_start: usize) ?AssistantContinua
         depth += 1;
         i = end;
     }
-    if (depth == 0) return null;
-    return .{ .blockquote = .{ .indent = indent, .depth = depth } };
+    if (depth > 0) return .{ .blockquote = .{ .indent = indent, .depth = depth } };
+    return if (proseIndent(text, line_start)) |width| .{ .list_indent = width } else null;
+}
+
+fn proseIndent(text: []const u8, line_start: usize) ?usize {
+    var i = line_start;
+    var width: usize = 0;
+    var line_end: ?usize = null;
+    while (i < text.len) {
+        switch (text[i]) {
+            ' ' => {
+                width += 1;
+                i += 1;
+            },
+            0x1b => {
+                // Bound control parsing to this logical line, including incomplete tails.
+                if (line_end == null) {
+                    var end = i;
+                    while (end < text.len and text[end] != '\r' and text[end] != '\n') : (end += 1) {}
+                    line_end = end;
+                }
+                const sequence_end = display_width.ansiSequenceEnd(text[0..line_end.?], i);
+                const seq = text[i..sequence_end];
+                if (seq.len < 3) return null;
+                const sgr = std.mem.startsWith(u8, seq, "\x1b[") and seq[seq.len - 1] == 'm';
+                if (!sgr and osc8Update(seq) == null) return null;
+                i = sequence_end;
+            },
+            0...8, 9...13, 14...26, 28...31, 127 => return null,
+            else => return if (width > 0) width else null,
+        }
+    }
+    return null;
 }
 
 fn definitionPrefixEnd(text: []const u8, start: usize) ?usize {
@@ -973,6 +1048,56 @@ fn skipPacerDimReassertions(text: []const u8, start: usize) usize {
     var i = start;
     while (std.mem.startsWith(u8, text[i..], reassert)) : (i += reassert.len) {}
     return i;
+}
+
+test "wrapAssistantText preserves explicit paragraph indentation" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "1. Heading\n   alpha beta gamma delta\n\n  alpha beta gamma delta\nalpha beta gamma delta", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "1. Heading\n   alpha beta\n   gamma delta\n\n  alpha beta\n  gamma delta\nalpha beta\ngamma delta",
+        out,
+    );
+}
+
+test "wrapAssistantText preserves paced paragraph indentation and links" {
+    const alloc = std.testing.allocator;
+    const prefix = "\x1b[1m \x1b[0m\x1b[1m  ";
+    const link = "\x1b]8;;https://example.com\x1b\\";
+    const close = "\x1b]8;;\x1b\\";
+    const out = try wrapAssistantText(alloc, prefix ++ link ++ "alpha beta gamma delta" ++ close ++ "\x1b[0m", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(prefix ++ link ++ "alpha beta\x1b[0m" ++ close ++ "\n   \x1b[1m" ++ link ++ "gamma delta" ++ close ++ "\x1b[0m", out);
+}
+
+test "paragraph indentation ignores blank incomplete and non-prose prefixes" {
+    for ([_][]const u8{ "   ", "   \nnext", "   \rnext", "  \ttext", "  \x1b[", "  \x1b[\ntext", "  \x1b]8;;unfinished", "  \x1b[Atext" }) |text| {
+        try std.testing.expectEqual(@as(?usize, null), proseIndent(text, 0));
+    }
+    try std.testing.expectEqual(@as(?usize, 3), proseIndent("\x1b[2m \x1b[0m  text", 0));
+    try std.testing.expectEqual(@as(?usize, 2), proseIndent(" \x1b]8;;https://example.com\x07 text", 0));
+}
+
+test "wrapAssistantText explicit indentation respects narrow widths and wide units" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "   abcdef", 3);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("   \nabc\ndef", out);
+    const wide = try wrapAssistantText(alloc, "  界界界", 4);
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings("  界\n  界\n  界", wide);
+}
+
+test "paragraph indentation preserves finalized source boundaries" {
+    const alloc = std.testing.allocator;
+    const text = "   alpha beta gamma delta\n  unfinished";
+    const partial = try wrapTranscriptAssistantTextWithFinalityInterruptible(alloc, text, 18, null);
+    defer alloc.free(partial.bytes);
+    const finished = try wrapTranscriptAssistantTextWithFinalityInterruptible(alloc, text ++ "\n", 18, null);
+    defer alloc.free(finished.bytes);
+    try std.testing.expectEqualStrings("     alpha beta\n     gamma delta\n", partial.bytes[0..partial.finalized_prefix_bytes]);
+    try std.testing.expectEqualStrings(partial.bytes, finished.bytes[0 .. finished.bytes.len - 1]);
+    try std.testing.expectEqual(finished.bytes.len, finished.finalized_prefix_bytes);
 }
 
 test "wrapAssistantText wraps plain ascii at cols" {

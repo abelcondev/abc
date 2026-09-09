@@ -1,7 +1,9 @@
 const std = @import("std");
 const mcp_contract = @import("mcp_contract.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
+const max_pending_summary_names: usize = 4;
 
 pub const ConnectionState = enum {
     disconnected,
@@ -77,14 +79,17 @@ pub fn subscriptionStateFor(observation: SubscriptionObservation) SubscriptionSt
 
 pub const ServerSnapshot = struct {
     configured_name: []u8,
+    identity_name: ?[]u8 = null,
     negotiated_name: ?[]u8,
     negotiated_version: ?[]u8,
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
+    workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
     required: bool,
     transport: mcp_contract.McpTransport,
     protocol_version: ?[]u8,
     connection: ConnectionState,
+    reloading: bool = false,
     authentication: AuthenticationState,
     counts: CapabilityCounts,
     cache_freshness: CacheFreshness,
@@ -98,10 +103,73 @@ pub const ServerSnapshot = struct {
 
     pub fn deinit(self: *ServerSnapshot, alloc: Allocator) void {
         alloc.free(self.configured_name);
+        if (self.identity_name) |name| alloc.free(name);
         if (self.negotiated_name) |value| alloc.free(value);
         if (self.negotiated_version) |value| alloc.free(value);
         if (self.protocol_version) |value| alloc.free(value);
         if (self.failure) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    /// Borrows the exact configured identity for this snapshot's lifetime.
+    pub fn identity(self: *const ServerSnapshot) []const u8 {
+        return self.identity_name orelse self.configured_name;
+    }
+};
+
+pub fn sameState(a: Snapshot, b: Snapshot) bool {
+    if (a.servers.len != b.servers.len or a.configuration_issues.len != b.configuration_issues.len) return false;
+    for (a.configuration_issues, b.configuration_issues) |left, right| {
+        if (!std.mem.eql(u8, left.message, right.message)) return false;
+    }
+    for (a.servers, b.servers) |left, right| {
+        const left_text = [_]?[]const u8{ left.identity(), left.configured_name, left.negotiated_name, left.negotiated_version, left.protocol_version, left.failure };
+        const right_text = [_]?[]const u8{ right.identity(), right.configured_name, right.negotiated_name, right.negotiated_version, right.protocol_version, right.failure };
+        for (left_text, right_text) |x, y| {
+            if (x) |value| {
+                if (y == null or !std.mem.eql(u8, value, y.?)) return false;
+            } else if (y != null) return false;
+        }
+        if (!std.meta.eql(
+            .{ left.source, left.scope, left.workspace_admission, left.required, left.transport, left.connection, left.reloading, left.authentication, left.counts, left.cache_freshness, left.subscription, left.runtime_generation, left.catalog_generation, left.retry_attempt, left.retry_in_ms, left.last_successful_discovery_ms },
+            .{ right.source, right.scope, right.workspace_admission, right.required, right.transport, right.connection, right.reloading, right.authentication, right.counts, right.cache_freshness, right.subscription, right.runtime_generation, right.catalog_generation, right.retry_attempt, right.retry_in_ms, right.last_successful_discovery_ms },
+        )) return false;
+    }
+    return true;
+}
+
+pub const ConfigurationIssue = struct {
+    message: []u8,
+
+    pub fn deinit(self: *ConfigurationIssue, alloc: Allocator) void {
+        alloc.free(self.message);
+        self.* = undefined;
+    }
+};
+
+pub const ConfiguredServerSnapshot = struct {
+    configured_name: []u8,
+    source: mcp_contract.ConfigSource,
+    scope: mcp_contract.ConfigScope,
+    workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
+    required: bool,
+    transport: mcp_contract.McpTransport,
+
+    pub fn deinit(self: *ConfiguredServerSnapshot, alloc: Allocator) void {
+        alloc.free(self.configured_name);
+        self.* = undefined;
+    }
+};
+
+pub const LocalConfigSnapshot = struct {
+    servers: []ConfiguredServerSnapshot,
+    configuration_issues: []ConfigurationIssue,
+
+    pub fn deinit(self: *LocalConfigSnapshot, alloc: Allocator) void {
+        for (self.servers) |*server| server.deinit(alloc);
+        alloc.free(self.servers);
+        for (self.configuration_issues) |*issue| issue.deinit(alloc);
+        alloc.free(self.configuration_issues);
         self.* = undefined;
     }
 };
@@ -109,13 +177,44 @@ pub const ServerSnapshot = struct {
 pub const Snapshot = struct {
     captured_at_ms: u64,
     servers: []ServerSnapshot,
+    configuration_issues: []ConfigurationIssue = &.{},
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         for (self.servers) |*server| server.deinit(alloc);
         alloc.free(self.servers);
+        for (self.configuration_issues) |*issue| issue.deinit(alloc);
+        alloc.free(self.configuration_issues);
         self.* = undefined;
     }
 };
+
+pub const LocalConfigInspection = struct {
+    profile_diagnostic: mcp_contract.ProfileConfigDiagnostic = .clear,
+    snapshot: LocalConfigSnapshot,
+    inspection_error: ?[]const u8 = null,
+
+    pub fn deinit(self: *LocalConfigInspection, alloc: Allocator) void {
+        self.snapshot.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const InspectLocalConfigFn = *const fn (
+    Allocator,
+    []const u8,
+) error{OutOfMemory}!LocalConfigInspection;
+
+pub fn inspectLocalConfigUnavailable(
+    alloc: Allocator,
+    _: []const u8,
+) error{OutOfMemory}!LocalConfigInspection {
+    const servers = try alloc.alloc(ConfiguredServerSnapshot, 0);
+    errdefer alloc.free(servers);
+    return .{ .snapshot = .{
+        .servers = servers,
+        .configuration_issues = try alloc.alloc(ConfigurationIssue, 0),
+    } };
+}
 
 pub const StartupDecision = enum {
     ready,
@@ -142,15 +241,17 @@ pub fn publishCandidateForDecision(decision: StartupDecision) bool {
 }
 
 pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
-    if (snapshot.servers.len == 0) {
+    if (snapshot.servers.len == 0 and snapshot.configuration_issues.len == 0) {
         return alloc.dupe(u8, "No MCP servers configured.\n");
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.print("MCP health ({d} {s}):\n", .{
-        snapshot.servers.len,
-        if (snapshot.servers.len == 1) "server" else "servers",
-    });
+    if (snapshot.servers.len > 0) {
+        try out.writer.print("MCP health ({d} {s}):\n", .{
+            snapshot.servers.len,
+            if (snapshot.servers.len == 1) "server" else "servers",
+        });
+    }
     for (snapshot.servers) |server| {
         try out.writer.print(
             "  {s} source={s} scope={s} policy={s} transport={s} state={s} auth={s}\n",
@@ -164,6 +265,9 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
                 @tagName(server.authentication),
             },
         );
+        if (server.workspace_admission) |admission| {
+            try out.writer.print("    admission={s}\n", .{@tagName(admission)});
+        }
         try out.writer.print(
             "    negotiated_name={s} negotiated_version={s} protocol={s}\n",
             .{
@@ -193,14 +297,30 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
         try out.writer.writeByte('\n');
         if (server.failure) |failure| try out.writer.print("    failure={s}\n", .{failure});
     }
+    if (snapshot.configuration_issues.len > 0) {
+        try out.writer.writeAll("Project MCP configuration errors:\n");
+        for (snapshot.configuration_issues) |issue| {
+            try out.writer.print("  {s}\n", .{issue.message});
+        }
+    }
     return out.toOwnedSlice();
 }
 
 pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
-    if (snapshot.servers.len == 0) {
+    if (snapshot.servers.len == 0 and snapshot.configuration_issues.len == 0) {
         return alloc.dupe(
             u8,
             "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
+        );
+    }
+    if (snapshot.servers.len == 0) {
+        return std.fmt.allocPrint(
+            alloc,
+            "MCP: {d} project .mcp.json {s}. Use /mcp list for details.",
+            .{
+                snapshot.configuration_issues.len,
+                if (snapshot.configuration_issues.len == 1) "error" else "errors",
+            },
         );
     }
     var ready: usize = 0;
@@ -208,7 +328,17 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     var auth_required: usize = 0;
     var failed: usize = 0;
     var first_auth_server: ?[]const u8 = null;
+    var pending_names: [max_pending_summary_names][]const u8 = undefined;
+    var pending_count: usize = 0;
     for (snapshot.servers) |server| {
+        if (server.source == .workspace and
+            server.workspace_admission == .pending)
+        {
+            if (pending_count < pending_names.len) {
+                pending_names[pending_count] = server.configured_name;
+            }
+            pending_count += 1;
+        }
         if (server.authentication == .required) {
             auth_required += 1;
             if (first_auth_server == null) first_auth_server = server.configured_name;
@@ -237,6 +367,26 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     );
     if (first_auth_server) |name| {
         try out.writer.print(" Run /mcp auth {s} --open.", .{name});
+    }
+    if (pending_count > 0) {
+        try out.writer.writeAll(" Pending approval: ");
+        const rendered_count = @min(pending_count, pending_names.len);
+        for (pending_names[0..rendered_count], 0..) |name, index| {
+            if (index > 0) try out.writer.writeAll(", ");
+            var encoded = try text_utils.encodeTerminalSafe(alloc, name, 128);
+            defer encoded.deinit(alloc);
+            try out.writer.writeAll(encoded.bytes);
+        }
+        if (pending_count > rendered_count) {
+            try out.writer.print(", +{d} more", .{pending_count - rendered_count});
+        }
+        try out.writer.writeByte('.');
+    }
+    if (snapshot.configuration_issues.len > 0) {
+        try out.writer.print(
+            " Project .mcp.json errors: {d}.",
+            .{snapshot.configuration_issues.len},
+        );
     }
     try out.writer.writeAll(" Use /mcp list for details.");
     return out.toOwnedSlice();
@@ -370,6 +520,57 @@ test "compact health summary reports actionable aggregate state" {
         "MCP: 4 servers — 1 ready, 1 connecting, 1 needs auth, 1 failed. Run /mcp auth plain --open. Use /mcp list for details.",
         summary,
     );
+}
+
+test "compact health summary names pending workspace servers" {
+    const alloc = std.testing.allocator;
+    var servers = [_]ServerSnapshot{
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+    };
+    servers[0].configured_name = @constCast("docs");
+    servers[0].source = .workspace;
+    servers[0].scope = .workspace;
+    servers[0].workspace_admission = .pending;
+    servers[1].configured_name = @constCast("db");
+    servers[1].source = .workspace;
+    servers[1].scope = .workspace;
+    servers[1].workspace_admission = .pending;
+    servers[2].configured_name = @constCast("approved");
+    servers[2].source = .workspace;
+    servers[2].scope = .workspace;
+    servers[2].workspace_admission = .approved;
+
+    const summary = try renderSummary(alloc, .{
+        .captured_at_ms = 0,
+        .servers = &servers,
+    });
+    defer alloc.free(summary);
+    try std.testing.expect(std.mem.find(
+        u8,
+        summary,
+        "Pending approval: docs, db.",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Pending approval: approved") == null);
+}
+
+test "health equality compares values and ignores capture time" {
+    const alloc = std.testing.allocator;
+    var left = emptyServerSnapshot();
+    left.configured_name = try alloc.dupe(u8, "plain");
+    defer left.deinit(alloc);
+    var right = emptyServerSnapshot();
+    right.configured_name = try alloc.dupe(u8, "plain");
+    defer right.deinit(alloc);
+    const a: Snapshot = .{ .captured_at_ms = 1, .servers = @as(*[1]ServerSnapshot, &left) };
+    const b: Snapshot = .{ .captured_at_ms = 200, .servers = @as(*[1]ServerSnapshot, &right) };
+    try std.testing.expect(sameState(a, b));
+    right.reloading = true;
+    try std.testing.expect(!sameState(a, b));
+    right.reloading = false;
+    right.connection = .failed;
+    try std.testing.expect(!sameState(a, b));
 }
 
 fn emptyServerSnapshot() ServerSnapshot {

@@ -2,7 +2,7 @@ const std = @import("std");
 
 const command_admission = @import("../permissions/command_admission.zig");
 const direct_command = @import("../permissions/direct_command.zig");
-const sandbox = @import("../permissions/sandbox.zig");
+const command_runner = @import("../execution/command_runner.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 
 pub const RouteKind = enum {
@@ -32,7 +32,7 @@ pub const PreparedCommand = union(enum) {
 
 pub const CommandResult = struct {
     route: RouteKind,
-    result: sandbox.CommandExecutionResult,
+    result: command_runner.CommandExecutionResult,
 };
 
 /// Upper bound for raw callback bytes that can still be represented by the
@@ -50,7 +50,7 @@ pub fn foregroundResultComparisonLimit(
 
 /// Executes a prepared foreground command without taking ownership of it.
 pub fn executePreparedCommand(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     command: PreparedCommand,
 ) !CommandResult {
@@ -61,7 +61,7 @@ pub fn executePreparedCommand(
         },
         .approved_shell => |shell| .{
             .route = .approved_shell,
-            .result = try sandbox.executeCommandInEnvironment(
+            .result = try command_runner.executeCommandInEnvironment(
                 cfg,
                 alloc,
                 shell.command_ctx.command,
@@ -87,8 +87,6 @@ test "local executor keeps route-specific foreground result limits" {
         .command_ctx = .{
             .command = "",
             .resolved_cwd = "",
-            .background = false,
-            .resolved_backend = .none,
             .target_os = @import("builtin").os.tag,
         },
         .reason = .process_or_system,
@@ -109,16 +107,12 @@ test "local executor runs an approved shell command with its admitted context" {
         .command_ctx = .{
             .command = "printf local-executor",
             .resolved_cwd = "/tmp",
-            .background = false,
-            .resolved_backend = .none,
             .target_os = @import("builtin").os.tag,
         },
         .reason = .process_or_system,
         .source = .interactive_once,
     } };
     const executed = try executePreparedCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
     }, arena, command);
 
@@ -128,7 +122,7 @@ test "local executor runs an approved shell command with its admitted context" {
         executed.result.output,
         "<stdout>\nlocal-executor\n</stdout>",
     ) != null);
-    const foreground = executed.result.command_result.?.foreground;
+    const foreground = executed.result.command_result.?;
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.command, foreground.command);
     try std.testing.expectEqualStrings(command.approved_shell.command_ctx.resolved_cwd, foreground.cwd);
     try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);

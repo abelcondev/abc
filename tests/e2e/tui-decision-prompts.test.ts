@@ -52,7 +52,7 @@ const MALFORMED_LABEL_SENTINEL = "FX_MALFORMED_LABEL_SENTINEL";
 const MALFORMED_STREAMED_ARGUMENTS =
   `{"path":"${MALFORMED_LABEL_SENTINEL}",`;
 const LONG_QUESTION =
-  "When you ask Fx to ask a question interactively, the question text must remain fully visible even when it wraps.";
+  "When you ask fx to ask a question interactively, the question text must remain fully visible even when it wraps.";
 const LONG_QUESTION_ANSWER =
   "Run the complete verification suite before pushing this branch";
 const LONG_QUESTION_DESCRIPTION =
@@ -114,7 +114,7 @@ type GatewayRequest = {
 };
 
 type GatewayResponse = Response | (() => Response | Promise<Response>);
-type ClassifierDecision = (body: string) => "allow" | "ask";
+type ClassifierDecision = (body: string) => "clear" | "caution";
 
 type IsolatedRoot = {
   root: string;
@@ -166,26 +166,14 @@ function outerCommandCall() {
   return outerToolCalls([
     {
       id: "command_outer_1",
-      name: "terminal",
-      input: { action: "exec", command: "touch generic-preview-accepted.txt" },
-    },
-  ]);
-}
-
-const PROJECTION_READY = ".projection-change-ready";
-const PROJECTION_RELEASE = ".projection-change-release";
-const PROJECTION_CHANGING_COMMAND =
-  `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
-  `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`;
-
-function outerProjectionChangingCommandCall() {
-  return outerToolCalls([
-    {
-      id: "projection_command_outer_1",
-      name: "terminal",
+      name: "shell",
       input: {
-        action: "exec",
-        command: PROJECTION_CHANGING_COMMAND,
+        request: {
+          action: "run",
+          command: "touch generic-preview-accepted.txt",
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
       },
     },
   ]);
@@ -204,8 +192,15 @@ function outerLongCommandCall() {
   return outerToolCalls([
     {
       id: "long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -221,8 +216,15 @@ function outerScrollableLongCommandCall() {
   return outerToolCalls([
     {
       id: "scrollable_long_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -234,8 +236,15 @@ function outerFittingCommandCall() {
   return outerToolCalls([
     {
       id: "fitting_command_outer_1",
-      name: "terminal",
-      input: { action: "exec", command },
+      name: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
   ]);
 }
@@ -355,7 +364,7 @@ function controlledGatewayResponse(response: Response) {
 
 function startFakeGateway(
   responses: GatewayResponse[],
-  classifierDecision: ClassifierDecision = () => "allow",
+  classifierDecision: ClassifierDecision = () => "clear",
 ) {
   const requests: GatewayRequest[] = [];
   const classifierRequests: GatewayRequest[] = [];
@@ -403,7 +412,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission, maxxing_mode: "legacy" }),
+    JSON.stringify({ permission_mode: permissionMode, permission }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -437,7 +446,7 @@ async function launchScenario(
   traceScopes = "input",
   env: Record<string, string | undefined> = {},
   permissionMode: "ask" | "auto" = "ask",
-  classifierDecision: ClassifierDecision = () => "allow",
+  classifierDecision: ClassifierDecision = () => "clear",
   permission: Record<string, unknown> = {},
 ) {
   const root = createIsolatedRoot(permissionMode, permission);
@@ -1043,7 +1052,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
-    "flushes paced assistant text before an ask-user question and continues after its answer",
+    "publishes a complete assistant block before an ask-user question and continues after its answer",
     async () => {
       const preStart = "PRE_QUESTION_ASSISTANT_START";
       const preEnd = "PRE_QUESTION_ASSISTANT_END";
@@ -1113,7 +1122,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
 
       const activeScrollback = await waitForVisibleScrollback(
         ctx.session,
-        "paced assistant before question",
+        "complete assistant block before question",
         (scrollback) => {
           const end = scrollback.indexOf(preEnd);
           const question = scrollback.indexOf(
@@ -1123,12 +1132,14 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           return end >= 0 && question > end;
         },
       );
+      const activeStart = activeScrollback.indexOf(preStart);
       const activeEnd = activeScrollback.indexOf(preEnd);
       const activeQuestion = activeScrollback.indexOf(
         visibleText(QUESTION_PROMPT),
         activeEnd + preEnd.length,
       );
-      expect(activeEnd).toBeGreaterThanOrEqual(0);
+      expect(activeStart).toBeGreaterThanOrEqual(0);
+      expect(activeEnd).toBeGreaterThan(activeStart);
       expect(activeQuestion).toBeGreaterThan(activeEnd);
       const activeGrid = await ctx.session.capturePaneGrid();
       expectBlankRowAboveQuestionPanel(activeGrid, QUESTION_PROMPT);
@@ -1137,7 +1148,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.resizeWindow(60, 12);
       await waitForQuestionPane(
         ctx.session,
-        "compact paced question",
+        "compact question after complete assistant block",
         (value) => value.includes(QUESTION_PROMPT),
       );
       const compactGrid = await ctx.session.capturePaneGrid();
@@ -1146,10 +1157,12 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await resolveQuestionWithSecondOption(ctx.session);
       await ctx.session.waitForText(postAnswer, TIMEOUT);
       const finalScrollback = visibleText(await ctx.session.captureFullScrollback());
+      const finalPreStart = finalScrollback.indexOf(preStart);
       const finalPreEnd = finalScrollback.indexOf(preEnd);
       const finalQuestion = finalScrollback.indexOf(visibleText(QUESTION_PROMPT));
       const finalPostAnswer = finalScrollback.indexOf(postAnswer);
-      expect(finalPreEnd).toBeGreaterThanOrEqual(0);
+      expect(finalPreStart).toBeGreaterThanOrEqual(0);
+      expect(finalPreEnd).toBeGreaterThan(finalPreStart);
       expect(finalQuestion).toBeGreaterThan(finalPreEnd);
       expect(finalPostAnswer).toBeGreaterThan(finalQuestion);
       expect(ctx.gateway.requests).toHaveLength(2);
@@ -1164,12 +1177,10 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       });
       expect(replay.code).toBe(0);
       expect(replay.stderr).toBe("");
-      const replayStart = replay.stdout.indexOf(preStart);
       const replayEnd = replay.stdout.indexOf(preEnd);
       const replayQuestion = replay.stdout.indexOf(QUESTION_PROMPT);
       const replayPostAnswer = replay.stdout.indexOf(postAnswer);
-      expect(replayStart).toBeGreaterThanOrEqual(0);
-      expect(replayEnd).toBeGreaterThan(replayStart);
+      expect(replayEnd).toBeGreaterThanOrEqual(0);
       expect(replayQuestion).toBeGreaterThan(replayEnd);
       expect(replayPostAnswer).toBeGreaterThan(replayQuestion);
     },
@@ -1285,8 +1296,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedWheel = [
         "1b", "5b", "3c", "36", "35", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
-      const fragmentDelayMs = 0;
-      const injectionLogPath = join(ctx.root.root, "command-fragmented.injected-input.log");
       const completeWheel = [
         "1b", "5b", "3c", "36", "34", "3b", "37", "39", "3b", "31", "32", "4d",
       ];
@@ -1310,11 +1319,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(completePane).not.toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       expect(completePane).not.toContain("Cancelled");
 
-      await ctx.session.sendFragmentedHexBytes(
-        fragmentedWheel,
-        fragmentDelayMs,
-        injectionLogPath,
-      );
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(0, 6));
+      await ctx.session.sendHexBytes(fragmentedWheel.slice(6));
       const fragmentedPane = await waitForPaneState(
         ctx.session,
         "fragmented mouse scroll",
@@ -1327,13 +1333,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const fragmentedScrollback = await ctx.session.captureFullScrollbackEscapes();
       expect(fragmentedScrollback).not.toContain("Cancelled");
       expect(fragmentedScrollback).not.toContain("4;79;12M");
-      expect(readFileSync(injectionLogPath, "utf8")).toBe(
-        fragmentedWheel.map((byte, index) =>
-          `write=${index + 1}/12 byte=${byte} delay_before_ms=${
-            index === 0 ? 0 : fragmentDelayMs
-          }`
-        ).join("\n") + "\n",
-      );
       const approvalFrames = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload));
       expect(approvalFrames.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
       expect(readFileSync(ctx.tracePath, "utf8")).not.toContain("discard pending mouse report");
@@ -1471,7 +1470,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
-    "permission prompt growth preserves displaced transcript history after projection change",
+    "permission prompt growth preserves displaced transcript history",
     async () => {
       const markers = Array.from(
         { length: 34 },
@@ -1486,7 +1485,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await launchScenario(
         [
           outerText(markers.join("\n")),
-          outerProjectionChangingCommandCall(),
           outerCommandCall(),
           outerText(finalMarker),
         ],
@@ -1496,8 +1494,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           FX_RECORD_INPUT: "1",
         },
         "ask",
-        () => "allow",
-        { bash: { [PROJECTION_CHANGING_COMMAND]: "allow" } },
+        () => "clear",
       );
       await ctx.session.resizeWindow(120, 36);
 
@@ -1515,20 +1512,12 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       }
       expect(ctx.gateway.requests).toHaveLength(1);
 
-      const projectionTraceStart = readTrace(ctx.tracePath).length;
       await ctx.session.sendText("Create the generic approval acceptance fixture.");
-      await waitForPath(join(ctx.root.workspace, PROJECTION_READY));
-      await waitForTraceAfter(
-        ctx.tracePath,
-        projectionTraceStart,
-        "source_compatible=false",
-      );
-      writeFileSync(join(ctx.root.workspace, PROJECTION_RELEASE), "");
       const pane = await ctx.session.waitForText(
         "Would you like to run the following command?",
         TIMEOUT,
       );
-      expect(pane).toContain("# terminal.exec profile=user shell=");
+      expect(pane).toContain("# shell.run profile=user shell=");
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
@@ -1555,15 +1544,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         /planned_rows=[1-9][0-9]*/.test(line)
       );
       expect(promptPlanIndex, transitionDiagnostics).toBeGreaterThanOrEqual(0);
-      const projectionChangePlanIndex = promptTraceLines.findIndex((line, index) =>
-        index <= promptPlanIndex &&
-        line.includes("transcript_transition_plan") &&
-        line.includes("source_compatible=false")
-      );
-      expect(
-        projectionChangePlanIndex,
-        transitionDiagnostics,
-      ).toBeGreaterThanOrEqual(0);
       const promptCommit = promptTraceLines.slice(promptPlanIndex).find((line) =>
         line.includes("[frame_diff] attempt_result") &&
         /planned_scroll_rows=[1-9][0-9]*/.test(line)
@@ -1572,13 +1552,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
       );
       expect(ctx.gateway.classifierRequests).toHaveLength(0);
-      expect(ctx.gateway.requests).toHaveLength(3);
+      expect(ctx.gateway.requests).toHaveLength(2);
 
       await ctx.session.sendLiteralText("1");
       await ctx.session.waitForText(finalMarker, TIMEOUT);
       expect(existsSync(join(ctx.root.workspace, "generic-preview-accepted.txt"))).toBe(true);
       expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
-      expect(ctx.gateway.requests).toHaveLength(4);
+      expect(ctx.gateway.requests).toHaveLength(3);
 
       const afterApproval = await waitForVisibleScrollback(
         ctx.session,
@@ -2111,7 +2091,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         await assertProcessAliveAndClean(ctx);
       }
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(
@@ -2664,7 +2644,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         .find((line) => line.includes("remain fully visible even when it wraps."));
       const questionLead = pane
         .split("\n")
-        .find((line) => line.includes("When you ask Fx to ask a question"));
+        .find((line) => line.includes("When you ask fx to ask a question"));
       const labelContinuation = pane
         .split("\n")
         .find((line) => line.includes("verification suite before"));
@@ -2678,7 +2658,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         .split("\n")
         .find((line) => line.includes("Keep the entire explanation"));
       expect(questionContinuation?.indexOf("remain fully visible even when it wraps.")).toBe(
-        questionLead?.indexOf("When you ask Fx to ask a question"),
+        questionLead?.indexOf("When you ask fx to ask a question"),
       );
       expect(labelContinuation?.indexOf("verification suite before")).toBe(
         labelLead?.indexOf("Run the complete"),

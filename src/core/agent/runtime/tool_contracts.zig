@@ -1,12 +1,13 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
-const command_contract = @import("../../execution/command_contract.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
-const tool_admission = @import("../../tooling/tool_admission.zig");
 const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
+const result_commit = @import("../../tooling/result_commit.zig");
+const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -25,7 +26,6 @@ pub const LiveToolAuthority = struct {
     generation: u64,
     root_id: []const u8,
     tools: []const []const u8,
-    sandbox_backend: types.BackendKind,
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const PermissionGrant,
@@ -38,49 +38,11 @@ pub const ToolExecutionStatus = enum {
     failure,
 };
 
-pub const SandboxWideningPhase = enum {
-    preflight,
-    reactive,
-};
-
-/// A command reached the existing OS sandbox boundary and needs a fresh,
-/// broader authority decision before any permissive execution can occur.
-/// Reactive dispositions retain the completed restricted attempt verbatim.
-pub const SandboxScopeRequired = struct {
-    phase: SandboxWideningPhase,
-    /// Frozen admission identity used by the completed restricted attempt.
-    restricted_fingerprint: command_admission.AdmissionFingerprint,
-    /// Original foreground command timeout origin. A broader retry must share
-    /// this budget instead of starting a second full timeout window.
-    command_timeout_started_ms: ?i64 = null,
-    restricted_model_output: ?[]const u8 = null,
-    restricted_command_result_json: ?[]const u8 = null,
-    command_replay_capture: ?*command_replay_store.Capture = null,
-    command_replay_unavailable: bool = false,
-
-    pub fn wideningInput(self: SandboxScopeRequired) tool_admission.SandboxWideningInput {
-        return .{
-            .phase = switch (self.phase) {
-                .preflight => .preflight,
-                .reactive => .reactive,
-            },
-            .restricted_fingerprint = self.restricted_fingerprint,
-            .restricted_result = self.restricted_model_output,
-            .restricted_command_result = self.restricted_command_result_json,
-        };
-    }
-};
-
 /// Exact action identity and approval provenance retained while a child action
 /// is revalidated against a newer live-authority generation.
 pub const LivePermissionRevalidation = union(enum) {
     action: struct {
         authority: command_admission.ToolExecutionAuthority,
-        human_approval: command_admission.HumanApprovalProvenance,
-    },
-    sandbox_widening: struct {
-        authority: command_admission.ToolExecutionAuthority,
-        required: SandboxScopeRequired,
         human_approval: command_admission.HumanApprovalProvenance,
     },
 };
@@ -112,30 +74,52 @@ pub const SecondaryPublicationReport = struct {
 };
 
 pub const ToolExecutionResult = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
     status_detail: ?[]const u8 = null,
-    display_output: ?[]const u8 = null,
     diff_entry: ?DiffEntryPayload = null,
     finish_turn: bool = false,
     system_notice: ?[]const u8 = null,
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
-    background_command: ?command_contract.BackgroundCommand = null,
     command_result_json: ?[]const u8 = null,
+    turn_control: ?tool_dispatch.TurnControl = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,
-    selected_dynamic_tool_name: ?[]const u8 = null,
-    selected_dynamic_tool_schema_json: ?[]const u8 = null,
+    selected_dynamic_tools: []const @import("../../tooling/tool_mcp_runtime.zig").SelectedTool = &.{},
+    retired_dynamic_tool_names: []const []const u8 = &.{},
     tool_result_memory: ?types.ToolResultMemory = null,
-    prepared_result_memory: ?types.ToolResultMemory = null,
+    tool_result_memory_prepared: bool = false,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
     deferred_tool_completion: ?DeferredToolCompletion = null,
-    sandbox_scope_required: ?SandboxScopeRequired = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
+    result_commit: ?result_commit.Token = null,
 };
+
+test "tool result retains one memory payload across preparation" {
+    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory"));
+    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory_prepared"));
+    try std.testing.expect(!@hasField(ToolExecutionResult, "prepared_result_memory"));
+}
+
+pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
+    return @errorCast(failToolExecutionResultDynamic(err));
+}
+
+noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
+    return err;
+}
+
+test "tool result failure writer preserves exact error type and identity" {
+    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
+    try std.testing.expect(
+        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
+    );
+    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
+}
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{
@@ -145,10 +129,15 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
+    credential: types.CredentialLease = .{ .direct = .{} },
+    /// Action-scoped root mode sampled before permission admission. Direct
+    /// callers without a sampled mode retain their execution context value.
+    permission_mode: ?types.PermissionMode = null,
     /// Borrowed root-user evidence for subagent execution. This is never
     /// populated from an assistant-authored task prompt.
     root_user_intent_context: []const u8 = "",
@@ -162,61 +151,31 @@ pub const ToolExecutionRequest = struct {
     current_turn_messages: []const ChatMessage = &.{},
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
+    expected_mcp_runtime_generation: ?u64 = null,
+    expected_mcp_binding: ?types.McpToolBinding = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and
     /// availability classifiers for this exact effective call.
     classification_complete: bool = false,
-    /// Reused only for a broader sandbox retry of the same command.
+    /// Timeout origin retained across preparation and execution.
     command_timeout_started_ms: ?i64 = null,
-    /// Continues the accepted-byte capture across a reactive sandbox retry.
+    /// Continues accepted-byte capture across the prepared execution.
     command_replay_capture: ?*command_replay_store.Capture = null,
     command_replay_unavailable: bool = false,
     /// Present for interactive tool calls so streamed command output can stay
     /// attached to the status row that owns this exact call.
     lifecycle_id: ?types.ToolLifecycleId = null,
-
-    pub fn isSandboxWideningRetryCancellation(
-        self: ToolExecutionRequest,
-        result: ToolExecutionResult,
-    ) bool {
-        return result.cancelled and self.isSandboxWideningRetry();
-    }
-
-    /// True when the result is not final for the surface: it either requests
-    /// a broader sandbox scope or is a cancelled broader retry, and the
-    /// widening flow owns projecting and recording the combined evidence.
-    pub fn resultAwaitsSandboxWidening(
-        self: ToolExecutionRequest,
-        result: ToolExecutionResult,
-    ) bool {
-        return result.sandbox_scope_required != null or
-            self.isSandboxWideningRetryCancellation(result);
-    }
-
-    pub fn isSandboxWideningRetry(self: ToolExecutionRequest) bool {
-        return switch (self.authority) {
-            .run_command => |authority| switch (authority) {
-                .direct_only => false,
-                .shell_allowed => |allowed| allowed.fingerprint.scope == .broader,
-            },
-            else => false,
-        };
-    }
-
-    pub fn isSandboxWideningRetryCancellationError(
-        self: ToolExecutionRequest,
-        err: anyerror,
-    ) bool {
-        return self.isSandboxWideningRetry() and
-            (err == error.Cancelled or err == error.CancelledBeforeExecution);
-    }
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
 
+pub const ToolCallValidationWitness = struct {
+    mcp_runtime_generation: ?u64 = null,
+};
+
 pub const ToolCallValidationResult = union(enum) {
     not_registered,
-    valid,
+    valid: ToolCallValidationWitness,
     failure: []const u8,
 };

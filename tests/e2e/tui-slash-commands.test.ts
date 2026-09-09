@@ -1,20 +1,36 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const TMUX_SKIP = !tmuxAvailable();
 const SKIP = TMUX_SKIP || !HAS_API_KEY;
 const TIMEOUT = 30_000;
 
 let session: TmuxSession | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | null = null;
 const tempDirs: string[] = [];
 
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
+  if (gateway) { gateway.stop(); gateway = null; }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -82,11 +98,11 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       session = launched.terminal;
 
       await session.sendText("/permissions");
-      await session.waitForText("usage: /permissions [ask|auto|yolo|reset]", 5_000);
+      await session.waitForText("usage: /permissions [ask|auto|full-access|reset]", 5_000);
       const scrollback = await session.captureFullScrollback();
       const statusIndex = scrollback.search(/● Permissions: mode=(?:ask|auto)/);
       const usageIndex = scrollback.indexOf(
-        "usage: /permissions [ask|auto|yolo|reset]",
+        "usage: /permissions [ask|auto|full-access|reset]",
       );
       expect(statusIndex).toBeGreaterThanOrEqual(0);
       expect(usageIndex).toBeGreaterThan(statusIndex);
@@ -142,7 +158,6 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         "Run /help for commands",
         "auth_refreshable=",
         "permission_mode=auto",
-        process.platform === "darwin" ? "sandbox=os" : "sandbox=none",
       ]) {
         expect(scrollback.split(field)).toHaveLength(2);
       }
@@ -189,10 +204,10 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/models lists available models",
+    "/model Enter lists available models inline",
     async () => {
       session = await launchAndWait();
-      await session.sendText("/models");
+      await session.sendText("/model");
       const pane = await session.waitForText(/anthropic|model/i, 10_000);
       expect(pane.length).toBeGreaterThan(0);
     },
@@ -200,12 +215,14 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/compact shows compaction message",
+    "/compact reports when there is no eligible context",
     async () => {
-      session = await launchAndWait();
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
       await session.sendText("/compact");
-      const pane = await session.waitForText(/compact/i, 5_000);
-      expect(pane.toLowerCase()).toContain("compact");
+      const pane = await session.waitForText("No context to compact.", 5_000);
+      expect(pane).toContain("No context to compact.");
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );
@@ -222,6 +239,7 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         "/issue",
         "/history",
         "/rules",
+        "/models",
       ].entries()) {
         await session.sendText(command);
         const expectedCount = index + 1;

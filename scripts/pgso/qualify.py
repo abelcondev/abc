@@ -35,7 +35,7 @@ from scripts.pgso.toolchain import Toolchain
 
 
 MINIMUM_SAMPLES = 50
-STARTUP_MINIMUM_SAMPLES = 100
+STARTUP_MINIMUM_SAMPLES = 1_000
 STARTUP_WARMUP_RUNS = 10
 STARTUP_MINIMUM_ROUNDS = 10
 STARTUP_MAX_RUNS_PER_ROUND = 10
@@ -54,7 +54,6 @@ STARTUP_COMMANDS = (
     ("help", ("help",)),
     ("version", ("--version",)),
     ("status", ("status", "--json")),
-    ("background", ("background", "--json")),
     ("doctor", ("doctor", "--json")),
     ("sessions", ("sessions", "--json")),
 )
@@ -693,21 +692,22 @@ def build_profile_linked_benchmarks(
                 production_paths.logs / "supplements" / plan.selector
             ),
         )
+        linked[plan.selector] = ProfileLinkedBenchmark(
+            pair=pair,
+            supplement_path=supplement_path,
+            supplement=supplement,
+        )
+    for plan in BENCHMARK_PLANS:
         merge_profile_supplement(
             toolchain,
             production_profile=production_paths.merged_profile,
-            supplement_text=supplement_path,
+            supplement_text=linked[plan.selector].supplement_path,
             log_path=(
                 production_paths.logs
                 / "supplements"
                 / plan.selector
                 / "merge.json"
             ),
-        )
-        linked[plan.selector] = ProfileLinkedBenchmark(
-            pair=pair,
-            supplement_path=supplement_path,
-            supplement=supplement,
         )
     return linked
 

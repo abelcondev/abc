@@ -47,6 +47,18 @@ pub const Paint = struct {
     }
 };
 
+pub const TranscriptDocumentPlan = union(enum) {
+    none,
+    progressive: bool,
+    projected,
+};
+
+pub const TranscriptDocument = union(enum) {
+    none,
+    progressive: bool,
+    projected: []const u8,
+};
+
 const ReviewPaintResult = struct {
     changed_or_notice_visible: bool,
     painted_rows: u16,
@@ -210,12 +222,28 @@ pub fn needsScreen(
     ));
 }
 
+pub fn transcriptDocumentPlan(
+    approval: approval_prompt.Projection,
+    screen_state: *const interaction_state.ApprovalScreenState,
+    entries: []const transcript_blocks.TranscriptEntry,
+    layout: Layout,
+) !TranscriptDocumentPlan {
+    if (approval.request.file == null or layout.rows < file_screen_min_rows) return .none;
+    const review = try fileReviewSource(approval);
+    if (!screen_state.file_document_hydrated and
+        screen_state.document_scroll_rows == 0 and
+        fileDocumentNeedsProgressiveFirstFrame(entries, review))
+    {
+        return .{ .progressive = entries.len > 0 };
+    }
+    return .projected;
+}
+
 pub fn paint(
     alloc: Allocator,
     approval: approval_prompt.Projection,
     screen_state: *interaction_state.ApprovalScreenState,
-    entries: []const transcript_blocks.TranscriptEntry,
-    styles: transcript_blocks.Styles,
+    transcript_document: TranscriptDocument,
     layout: Layout,
     clear_display: bool,
 ) !Paint {
@@ -223,15 +251,14 @@ pub fn paint(
     if (request.file == null) {
         return paintCommandApproval(alloc, approval, screen_state, layout, clear_display);
     }
-    return paintFileApproval(alloc, approval, screen_state, entries, styles, layout, clear_display);
+    return paintFileApproval(alloc, approval, screen_state, transcript_document, layout, clear_display);
 }
 
 fn paintFileApproval(
     alloc: Allocator,
     approval: approval_prompt.Projection,
     screen_state: *interaction_state.ApprovalScreenState,
-    entries: []const transcript_blocks.TranscriptEntry,
-    styles: transcript_blocks.Styles,
+    transcript_document: TranscriptDocument,
     layout: Layout,
     clear_display: bool,
 ) !Paint {
@@ -266,21 +293,14 @@ fn paintFileApproval(
         );
     } else {
         const screen_layout = fileScreenLayout(layout.rows);
-        const review: FileReviewSource = if (approval.currentReview()) |value|
-            .{ .full = value }
-        else switch (request.origin) {
-            .active_session => return error.MissingFileReview,
-            .subagent => .{ .preview = file_request.preview },
-        };
-        const progressive = !screen_state.file_document_hydrated and
-            screen_state.document_scroll_rows == 0 and
-            fileDocumentNeedsProgressiveFirstFrame(entries, review);
+        const review = try fileReviewSource(approval);
+        const progressive = transcript_document == .progressive;
         const document_result = if (progressive) blk: {
             needs_full_file_projection = true;
             break :blk try writeProgressiveFileDocumentRows(
                 &out.writer,
                 alloc,
-                entries.len > 0,
+                transcript_document.progressive,
                 review,
                 file_request,
                 approval.choice_index,
@@ -290,13 +310,10 @@ fn paintFileApproval(
                 layout.cols,
             );
         } else blk: {
-            const transcript = try transcript_blocks.renderEntriesToBytes(
-                alloc,
-                entries,
-                layout.cols,
-                styles,
-            );
-            defer alloc.free(transcript);
+            const transcript = switch (transcript_document) {
+                .projected => |bytes| bytes,
+                .none, .progressive => return error.MissingTranscriptProjection,
+            };
             const transcript_layout = try TranscriptDocumentLayout.init(
                 alloc,
                 transcript,
@@ -762,6 +779,15 @@ const FileReviewSource = union(enum) {
         };
     }
 };
+
+fn fileReviewSource(approval: approval_prompt.Projection) !FileReviewSource {
+    if (approval.currentReview()) |review| return .{ .full = review };
+    const file_request = approval.request.file orelse return error.MissingFileApprovalRequest;
+    return switch (approval.request.origin) {
+        .active_session => return error.MissingFileReview,
+        .subagent => .{ .preview = file_request.preview },
+    };
+}
 
 fn walkReviewRows(
     alloc: Allocator,
@@ -1470,6 +1496,45 @@ fn testLayout(rows: u16, cols: u16) Layout {
     };
 }
 
+fn paintTest(
+    alloc: Allocator,
+    approval: approval_prompt.Projection,
+    screen_state: *interaction_state.ApprovalScreenState,
+    entries: []const transcript_blocks.TranscriptEntry,
+    styles: transcript_blocks.Styles,
+    layout: Layout,
+    clear_display: bool,
+) !Paint {
+    return switch (try transcriptDocumentPlan(approval, screen_state, entries, layout)) {
+        .none => paint(alloc, approval, screen_state, .none, layout, clear_display),
+        .progressive => |present| paint(
+            alloc,
+            approval,
+            screen_state,
+            .{ .progressive = present },
+            layout,
+            clear_display,
+        ),
+        .projected => {
+            const transcript = try transcript_blocks.renderEntriesToBytes(
+                alloc,
+                entries,
+                layout.cols,
+                styles,
+            );
+            defer alloc.free(transcript);
+            return paint(
+                alloc,
+                approval,
+                screen_state,
+                .{ .projected = transcript },
+                layout,
+                clear_display,
+            );
+        },
+    };
+}
+
 const test_preview_lines = [_]diff_mod.PreviewLine{
     .{
         .op = .addition,
@@ -1502,7 +1567,7 @@ test "command approval screen wraps and scrolls a complete command review" {
     var screen_state = interaction_state.ApprovalScreenState{};
     var label: std.ArrayList(u8) = .empty;
     defer label.deinit(alloc);
-    try label.appendSlice(alloc, "terminal.exec printf '%s' 'LONG_COMMAND_APPROVAL_START");
+    try label.appendSlice(alloc, "shell.run printf '%s' 'LONG_COMMAND_APPROVAL_START");
     try label.appendNTimes(alloc, 'x', 2048);
     try label.appendSlice(alloc, "LONG_COMMAND_APPROVAL_END'");
 
@@ -1516,13 +1581,13 @@ test "command approval screen wraps and scrolls a complete command review" {
         0,
     ));
 
-    var first = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
+    var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
     defer first.deinit(alloc);
     try std.testing.expect(first.document_scrollable);
     try std.testing.expectEqual(@as(usize, 0), screen_state.document_scroll_rows);
 
     screen_state.scrollDocument(100_000);
-    var last = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), false);
+    var last = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), false);
     defer last.deinit(alloc);
     try std.testing.expect(last.document_scrollable);
     try std.testing.expect(screen_state.document_scroll_rows > 0);
@@ -1552,11 +1617,11 @@ test "command approval screen preserves raw command newlines as rows" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "terminal.exec cat <<'EOF'...",
+        .label = "shell.run cat <<'EOF'...",
         .command = "cat <<'EOF'\nline one\nEOF",
     }));
 
-    var rendered = try paint(
+    var rendered = try paintTest(
         alloc,
         approval.projection().?,
         &screen_state,
@@ -1587,13 +1652,13 @@ test "command approval screen preserves raw command newlines as rows" {
 test "command approval screen includes compact permission header" {
     const alloc = std.testing.allocator;
     var screen_state = interaction_state.ApprovalScreenState{};
-    const label = "terminal.exec printf '%s' '" ++ ("x" ** 256) ++ "'";
+    const label = "shell.run printf '%s' '" ++ ("x" ** 256) ++ "'";
 
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, .{ .label = label }));
 
-    var rendered = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(16, 80), true);
+    var rendered = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(16, 80), true);
     defer rendered.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Permission needed · Choose one") != null);
@@ -1631,10 +1696,10 @@ test "command approval screen wraps commands at word boundaries" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "terminal.exec curl --header alpha --header bravo",
+        .label = "shell.run curl --header alpha --header bravo",
     }));
 
-    var rendered = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(13, 32), true);
+    var rendered = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(13, 32), true);
     defer rendered.deinit(alloc);
 
     var grid = try vt_emulator.Grid.init(alloc, 32, 13);
@@ -1653,7 +1718,7 @@ test "command approval screen wraps commands at word boundaries" {
 test "bounded command approval previews route by complete command fit" {
     const command = "printf '" ++ ("x" ** 160) ++ "'";
     const request: permission_request.PermissionRequest = .{
-        .label = "terminal.exec printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
+        .label = "shell.run printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
         .command = command,
     };
 
@@ -1675,7 +1740,7 @@ test "command and file approval screen routing preserves short inline and file r
     try std.testing.expect(!try needsScreen(
         std.testing.allocator,
         .{
-            .label = "terminal.exec printf short",
+            .label = "shell.run printf short",
             .command = "printf short",
         },
         testLayout(24, 80),
@@ -1698,7 +1763,7 @@ test "subagent file approval renders its bounded preview without a live review" 
     try std.testing.expect(try active.syncRequest(alloc, testFileRequest()));
     try std.testing.expectError(
         error.MissingFileReview,
-        paint(alloc, active.projection().?, &active_screen, &.{}, .{}, testLayout(24, 96), true),
+        paintTest(alloc, active.projection().?, &active_screen, &.{}, .{}, testLayout(24, 96), true),
     );
 
     var approval = approval_prompt.ApprovalPrompt{};
@@ -1708,7 +1773,7 @@ test "subagent file approval renders its bounded preview without a live review" 
     try std.testing.expect(try approval.syncRequest(alloc, request));
     try std.testing.expect(approval.currentReview() == null);
 
-    var rendered = try paint(
+    var rendered = try paintTest(
         alloc,
         approval.projection().?,
         &screen_state,
@@ -1798,14 +1863,14 @@ test "file approval screen exposes a scrollable full review" {
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var first = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
+    var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, first.bytes, "line-01") == null);
     try std.testing.expect(std.mem.indexOf(u8, first.bytes, "line-30") != null);
     try std.testing.expect(first.document_scrollable);
 
     screen_state.scrollDocument(1024);
-    var last = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), false);
+    var last = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), false);
     defer last.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, last.bytes, "line-01") != null);
     try std.testing.expect(last.changed_or_notice_visible);
@@ -1838,7 +1903,7 @@ test "file approval screen anchors transcript and review at the document tail" {
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var tail = try paint(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), true);
+    var tail = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), true);
     defer tail.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "review-tail") != null);
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "approval-history-0001") == null);
@@ -1862,7 +1927,7 @@ test "file approval screen anchors transcript and review at the document tail" {
     try std.testing.expect(fileApprovalAffirmativeReady(&shell, approval.projection().?, &screen_state));
 
     screen_state.scrollDocument(10_000);
-    var head = try paint(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), false);
+    var head = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), false);
     defer head.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, head.bytes, "approval-history-0001") != null);
     try std.testing.expect(std.mem.indexOf(u8, head.bytes, "review-tail") == null);
@@ -1882,7 +1947,7 @@ test "file approval screen anchors transcript and review at the document tail" {
     try std.testing.expect(!fileApprovalAffirmativeReady(&shell, approval.projection().?, &screen_state));
 
     screen_state.scrollDocument(-10_000);
-    var returned = try paint(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), false);
+    var returned = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), false);
     defer returned.deinit(alloc);
     screen_state.recordScreenCommit(approval.request.?.id, .{
         .request_id = approval.request.?.id,
@@ -1938,7 +2003,7 @@ test "large file approval paints a bounded tail before hydrating the full docume
 
     var first_frame_storage: [64 * 1024]u8 = undefined;
     var first_frame_allocator = std.heap.FixedBufferAllocator.init(&first_frame_storage);
-    var first = try paint(
+    var first = try paintTest(
         first_frame_allocator.allocator(),
         approval.projection().?,
         &screen_state,
@@ -1956,7 +2021,7 @@ test "large file approval paints a bounded tail before hydrating the full docume
     try std.testing.expect(first.changed_or_notice_visible);
 
     screen_state.scrollDocument(std.math.maxInt(i32));
-    var hydrated = try paint(
+    var hydrated = try paintTest(
         alloc,
         approval.projection().?,
         &screen_state,
@@ -2008,7 +2073,7 @@ test "file approval document separates transcript, diff, and controls" {
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var screen = try paint(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 48), true);
+    var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 48), true);
     defer screen.deinit(alloc);
 
     var grid = try vt_emulator.Grid.init(alloc, 48, 14);
@@ -2033,6 +2098,40 @@ test "file approval document separates transcript, diff, and controls" {
 
     const approval_divider = grid.cellAt(5, 1) orelse return error.TestMissingApprovalDivider;
     try std.testing.expectEqual(@as(u21, 0x2504), approval_divider.codepoint);
+}
+
+test "file approval transcript uses the current rail presentation" {
+    const alloc = std.testing.allocator;
+    var screen_state = interaction_state.ApprovalScreenState{};
+    var entries = [_]transcript_blocks.TranscriptEntry{
+        .{ .user_turn = .{
+            .id = 1,
+            .turn = .{ .text = try alloc.dupe(u8, "approval-current-prompt") },
+        } },
+    };
+    defer entries[0].deinit(alloc);
+
+    var review = try diff_mod.FileReview.init(alloc, "", "review-current-prompt\n");
+    defer review.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
+    try std.testing.expect(approval.syncReview(&review));
+
+    var screen = try paintTest(
+        alloc,
+        approval.projection().?,
+        &screen_state,
+        &entries,
+        .{},
+        testLayout(24, 80),
+        true,
+    );
+    defer screen.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, screen.bytes, "approval-current-prompt") != null);
+    try std.testing.expect(std.mem.find(u8, screen.bytes, "┃") != null);
+    try std.testing.expect(std.mem.find(u8, screen.bytes, "❯ approval-current-prompt") == null);
 }
 
 test "file approval top-aligns a fitting welcome document and clears below" {
@@ -2063,12 +2162,12 @@ test "file approval top-aligns a fitting welcome document and clears below" {
     var grid = try vt_emulator.Grid.init(alloc, 80, 24);
     defer grid.deinit();
     try std.testing.expect(approval.syncReview(&previous_review));
-    var previous = try paint(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), true);
+    var previous = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), true);
     defer previous.deinit(alloc);
     try grid.feed(previous.bytes);
 
     try std.testing.expect(approval.syncReview(&review));
-    var screen = try paint(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), false);
+    var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), false);
     defer screen.deinit(alloc);
     try grid.feed(screen.bytes);
 
@@ -2122,7 +2221,7 @@ test "file approval transcript viewport resumes styled links without leaking int
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var screen = try paint(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 12), true);
+    var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 12), true);
     defer screen.deinit(alloc);
 
     var grid = try vt_emulator.Grid.init(alloc, 12, 14);
@@ -2158,12 +2257,12 @@ test "file approval screen wraps changed source without omitting bytes" {
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var first = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), true);
+    var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), true);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, first.bytes, "gh") != null);
 
     screen_state.scrollDocument(3);
-    var last = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), false);
+    var last = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), false);
     defer last.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, last.bytes, "ab") != null);
 }
@@ -2186,7 +2285,7 @@ test "file approval renders exact unchanged-line elision markers" {
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
     try std.testing.expect(approval.syncReview(&review));
 
-    var screen = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(40, 80), true);
+    var screen = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(40, 80), true);
     defer screen.deinit(alloc);
     var grid = try vt_emulator.Grid.init(alloc, 80, 40);
     defer grid.deinit();
@@ -2292,7 +2391,7 @@ test "file approval renders controls ready after inspecting a changed row" {
         .document_scrollable = true,
     });
 
-    var screen = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(14, 80), true);
+    var screen = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(14, 80), true);
     defer screen.deinit(alloc);
     try std.testing.expect(!screen.changed_or_notice_visible);
 

@@ -73,6 +73,10 @@ pub const ResumeProjection = struct {
         return entry_id;
     }
 
+    pub fn setCreatedAtMs(self: *ResumeProjection, created_at_ms: i64) void {
+        if (created_at_ms > 0) self.created_at_ms = created_at_ms;
+    }
+
     pub fn appendNotice(self: *ResumeProjection, notice: types.SemanticNotice) !u32 {
         const owned = try types.dupeSemanticNotice(self.alloc, notice);
         errdefer types.freeSemanticNotice(self.alloc, owned);
@@ -187,6 +191,10 @@ pub const ResumeProjection = struct {
         } });
     }
 
+    pub fn appendTurnSummary(self: *ResumeProjection, summary: types.TurnSummary) !void {
+        _ = try self.runtime.appendTurnSummaryEntry(self.alloc, summary);
+    }
+
     pub fn appendCommandOutput(
         self: *ResumeProjection,
         lifecycle_id: ?types.ToolLifecycleId,
@@ -233,6 +241,20 @@ pub const ResumeProjection = struct {
             call,
             activity_kind,
             result,
+        );
+    }
+
+    pub fn setHistoricalToolCommandMetadata(
+        self: *ResumeProjection,
+        entry_id: u32,
+        display: []const u8,
+        action_label: []const u8,
+    ) !void {
+        try self.runtime.setToolCommandMetadataForEntry(
+            self.alloc,
+            entry_id,
+            display,
+            action_label,
         );
     }
 
@@ -498,7 +520,7 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
     try std.testing.expect(projection.runtime.entries.items.len < 13);
 }
 
-test "empty resume projection keeps presentation policy without source conversation" {
+test "empty resume projection keeps layout without source conversation" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -510,13 +532,11 @@ test "empty resume projection keeps presentation policy without source conversat
         .divider_bottom_row = 23,
         .hint_row = 24,
     };
-    source.maxxing_mode = .minimal;
     defer source.deinit(alloc);
     _ = try source.appendRawTranscriptEntry(alloc, "main-only marker\n");
 
     var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
-    try std.testing.expectEqual(source.maxxing_mode, projection.runtime.maxxing_mode);
     try std.testing.expectEqual(source.layout.cols, projection.runtime.layout.cols);
     try std.testing.expectEqual(@as(usize, 0), projection.runtime.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), projection.runtime.transcript.items.len);
@@ -670,11 +690,39 @@ test "resume projection uses its explicit timestamp for command output" {
     try std.testing.expect(command_entries > 0);
 }
 
+test "resume projection preserves turn timestamps and usage rows" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 80;
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    projection.setCreatedAtMs(100);
+    _ = try projection.appendUserTurn(.{ .text = @constCast("prompt") });
+    projection.setCreatedAtMs(250);
+    try projection.appendAssistantText("response");
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+    try projection.appendTurnSummary(summary);
+
+    try std.testing.expectEqual(@as(i64, 100), projection.runtime.entries.items[0].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[1].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[2].createdAtMs());
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.turn_summary,
+        projection.runtime.entries.items[2].raw_bytes.class,
+    );
+}
+
 test "live resume projection preserves an incomplete command block" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout.cols = 80;
-    source.maxxing_mode = .legacy;
     defer source.deinit(alloc);
 
     const lifecycle_id = types.ToolLifecycleId{
@@ -693,7 +741,11 @@ test "live resume projection preserves an incomplete command block" {
         projection.runtime.command_output_display.open_command_block != null,
     );
     try std.testing.expect(
-        std.mem.find(u8, projection.publication_source.?.bytes, "partial output") != null,
+        std.mem.find(u8, projection.publication_source.?.bytes, "partial output") == null,
+    );
+    try std.testing.expectEqualStrings(
+        "partial output",
+        projection.runtime.command_output_blocks.items[0].lines.items[0].text,
     );
 
     var runtime = projection.intoRuntime();

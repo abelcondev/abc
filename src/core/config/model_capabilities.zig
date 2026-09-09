@@ -24,6 +24,12 @@ pub const ReasoningEffortOptions = struct {
     }
 };
 
+pub const ImageInputSupport = enum {
+    unknown,
+    non_native,
+    native,
+};
+
 pub const GatewayMetadata = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
@@ -42,13 +48,14 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
+    image_input_support: ImageInputSupport = .unknown,
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
-    prompt_caching: bool = false,
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -69,31 +76,8 @@ pub const Resolver = struct {
     }
 };
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn localCapabilitiesForModel(model: []const u8) Capabilities {
-    var capabilities: Capabilities = .{};
-    if (std.mem.startsWith(u8, model, "anthropic/")) {
-        capabilities.prompt_caching = true;
-    } else if (std.mem.startsWith(u8, model, "xai/")) {
-        capabilities.parallel_tool_calls = true;
-    }
-    capabilities.context_window = localContextWindowSize(model);
-    return capabilities;
-}
-
-pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
-    var capabilities = localCapabilitiesForModel(model);
+pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?GatewayMetadata) Capabilities {
+    var capabilities = capabilities_value;
     if (gateway_metadata) |metadata| {
         capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
         capabilities.reasoning_efforts = metadata.reasoning_efforts;
@@ -101,6 +85,10 @@ pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
+        capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
+            .native
+        else
+            .non_native;
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
@@ -110,15 +98,22 @@ pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata
     return capabilities;
 }
 
+pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
+    return mergeCapabilities(capabilitiesForModel(model), gateway_metadata);
+}
+
 pub fn capabilitiesForModel(model: []const u8) Capabilities {
-    return resolveCapabilities(model, null);
+    return .{ .intrinsic_fast = std.mem.endsWith(u8, model, "-fast") };
 }
 
 pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilities {
-    if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
-        return app.resolvedModelCapabilities(model);
-    }
-    return capabilitiesForModel(model);
+    const generic = capabilitiesForModel(model);
+    var capabilities = if (comptime @hasDecl(App, "resolvedModelCapabilities"))
+        app.resolvedModelCapabilities(model)
+    else
+        generic;
+    capabilities.intrinsic_fast = capabilities.intrinsic_fast or generic.intrinsic_fast;
+    return capabilities;
 }
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
@@ -151,44 +146,6 @@ pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
     return if (capabilities.reasoning_efforts.len == 0) 0 else capabilities.reasoning_efforts.len + 1;
 }
 
-fn localContextWindowSize(model: []const u8) ?u32 {
-    if (std.mem.startsWith(u8, model, "anthropic/")) {
-        const million_context_models = [_][]const u8{
-            "anthropic/claude-fable-5",
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-4-6",
-            "anthropic/claude-opus-4.7",
-            "anthropic/claude-opus-4-7",
-            "anthropic/claude-opus-4.8",
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-sonnet-5",
-            "anthropic/claude-sonnet-4.6",
-            "anthropic/claude-sonnet-4-6",
-        };
-        for (million_context_models) |candidate| {
-            if (std.mem.eql(u8, model, candidate)) return 1_000_000;
-        }
-        return 200_000;
-    }
-    if (std.mem.startsWith(u8, model, "openai/")) {
-        if (containsIgnoreCase(model, "gpt-5")) return 256_000;
-        if (containsIgnoreCase(model, "o3") or containsIgnoreCase(model, "o4") or containsIgnoreCase(model, "o1"))
-            return 200_000;
-        return 128_000;
-    }
-    if (std.mem.startsWith(u8, model, "xai/")) return 131_072;
-    if (std.mem.startsWith(u8, model, "google/")) return 1_000_000;
-    return null;
-}
-
-pub fn contextWindowSize(model: []const u8) ?u32 {
-    return capabilitiesForModel(model).context_window;
-}
-
-pub fn resolveProviderOptions(model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) ResolvedProviderOptions {
-    return resolveProviderOptionsForCapabilities(capabilitiesForModel(model), effort, fast_mode);
-}
-
 pub fn resolveProviderOptionsForCapabilities(
     capabilities: Capabilities,
     effort: types.ReasoningEffort,
@@ -196,7 +153,6 @@ pub fn resolveProviderOptionsForCapabilities(
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
         .parallel_tool_calls = capabilities.parallel_tool_calls,
-        .prompt_caching = capabilities.prompt_caching,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
         resolved.reasoning = effort;
@@ -205,26 +161,40 @@ pub fn resolveProviderOptionsForCapabilities(
     return resolved;
 }
 
-test "capabilities never infer reasoning or Fast controls from model IDs" {
-    const models = [_][]const u8{
-        "openai/gpt-5.6-sol",
-        "anthropic/claude-opus-4.8",
-        "zai/glm-5.2",
-        "zai/glm-5.2-fast",
+test "capabilities infer intrinsic fast identity but not controls from model IDs" {
+    const models = [_]struct { id: []const u8, intrinsic_fast: bool }{
+        .{ .id = "openai/gpt-5.6-sol", .intrinsic_fast = false },
+        .{ .id = "anthropic/claude-opus-4.8", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2-fast", .intrinsic_fast = true },
+        .{ .id = "provider/breakfast", .intrinsic_fast = false },
     };
     for (models) |model| {
-        const capabilities = capabilitiesForModel(model);
+        const capabilities = capabilitiesForModel(model.id);
         try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
         try std.testing.expect(!capabilities.supports_fast_mode);
+        try std.testing.expectEqual(model.intrinsic_fast, capabilities.intrinsic_fast);
     }
 }
 
-test "resolveCapabilities preserves Gateway controls and unrelated local policy" {
+test "resolveForApp adds intrinsic fast identity to provider capabilities" {
+    const App = struct {
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) Capabilities {
+            return .{};
+        }
+    };
+    var app = App{};
+
+    try std.testing.expect(resolveForApp(App, &app, "provider/model-fast").intrinsic_fast);
+    try std.testing.expect(!resolveForApp(App, &app, "provider/model-default").intrinsic_fast);
+}
+
+test "mergeCapabilities preserves provider controls and supplied fallback policy" {
     const efforts = [_]types.ReasoningEffort{
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = resolveCapabilities("anthropic/claude-future", .{
+    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -238,6 +208,7 @@ test "resolveCapabilities preserves Gateway controls and unrelated local policy"
     });
 
     try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expect(capabilities.intrinsic_fast);
     try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
     try std.testing.expectEqualStrings("future-tier", capabilities.reasoning_efforts.values[0].label());
     try std.testing.expect(capabilities.supports_fast_mode);
@@ -247,9 +218,27 @@ test "resolveCapabilities preserves Gateway controls and unrelated local policy"
     try std.testing.expect(capabilities.supports_web_search);
     try std.testing.expect(capabilities.supports_explicit_caching);
     try std.testing.expect(capabilities.supports_implicit_caching);
-    try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
+}
+
+test "image input support distinguishes unknown native and non native capability" {
+    try std.testing.expectEqual(
+        ImageInputSupport.unknown,
+        capabilitiesForModel("provider/unknown").image_input_support,
+    );
+
+    const native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = true,
+    });
+    try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
+
+    const non_native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = false,
+    });
+    try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {
@@ -327,12 +316,7 @@ test "request controls remain safe across repeated state transitions" {
     }
 }
 
-test "local non-control capabilities remain available" {
-    const anthropic = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(anthropic.prompt_caching);
-    try std.testing.expectEqual(@as(?u32, 200_000), anthropic.context_window);
-
-    const xai = capabilitiesForModel("xai/grok-any");
-    try std.testing.expectEqual(@as(?bool, true), xai.parallel_tool_calls);
-    try std.testing.expectEqual(@as(?u32, 131_072), xai.context_window);
+test "generic fallback capabilities contain no vendor policy" {
+    const fallback = capabilitiesForModel("anthropic/claude-any");
+    try std.testing.expect(fallback.context_window == null);
 }

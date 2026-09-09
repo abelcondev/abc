@@ -40,7 +40,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
     return .{
         .name = name,
         .description = "Selected dynamic MCP tool.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },
@@ -94,7 +94,9 @@ fn call(
     } orelse return unsupported(ctx);
     const status = output.status;
     if (ctx.mcp_call_status_sink) |sink| sink.* = status;
+    const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));
+    if (images.len > 0) return .{ .rich = .{ .text = body, .images = images, .is_error = status != .success } };
     return switch (status) {
         .success => .{ .success = body },
         .tool_failure, .protocol_failure, .input_required => .{ .failure = body },
@@ -146,6 +148,8 @@ test "dynamic MCP descriptor executes through registered dispatch" {
     const tools = [_]tool_dispatch.Tool{tool};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
     var execution_error: ?anyerror = null;
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .tool_call_name = "mcp_fs_read",
@@ -156,7 +160,7 @@ test "dynamic MCP descriptor executes through registered dispatch" {
         .id = "dynamic-test",
         .name = "mcp_fs_read",
         .arguments_json = "{\"path\":\"README.md\"}",
-    });
+    }, &status_detail);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(execution_error == null);

@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText as finalText,
   fakeGatewaySse,
@@ -78,7 +79,6 @@ function createIsolatedRoot(): IsolatedRoot {
       sandbox: "none",
       permission_mode: "ask",
       permission: {},
-      maxxing_mode: "legacy",
     }),
   );
   roots.push(root);
@@ -172,12 +172,13 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
   const syncStart = payload.indexOf("\x1b[?2026h");
   const syncEnd = payload.indexOf("\x1b[?2026l");
   const cursorHide = payload.indexOf("\x1b[?25l");
-  const resetClear = payload.indexOf("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
+  const resetClear = payload.indexOf("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
   expect(syncStart).toBeGreaterThanOrEqual(0);
   expect(cursorHide).toBeGreaterThan(syncStart);
   if (resetClear >= 0) {
     expect(resetClear).toBeGreaterThan(cursorHide);
-    expect(resetClear).toBeLessThan(restoreIndex);
+    expect(resetClear).toBeGreaterThan(restoreIndex);
+    expect(resetClear).toBeLessThan(syncEnd);
   }
   expect(restoreIndex).toBeGreaterThan(syncStart);
   expect(syncEnd).toBeGreaterThan(restoreIndex);
@@ -353,6 +354,88 @@ async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
 
 describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
+  test("resized file approval restores complete history once", async () => {
+    const paragraphs = Array.from({ length: 28 }, (_, index) => {
+      const row = String(index + 1).padStart(2, "0");
+      return `ROW${row} ALPHA${row}_abcdefghijklmnopqrstuvwxyz0123456789 ` +
+        `BRAVO${row}_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`;
+    });
+    const draft = "retained approval draft";
+    for (const decision of ["1", "3", "C-c"]) {
+      const root = createIsolatedRoot();
+      const target = join(root.workspace, "target.txt");
+      const tracePath = join(root.root, "trace.log");
+      const tapePath = join(root.root, "approval-resize.fxtape");
+      writeFileSync(target, "original line\n");
+      let releaseEdit!: () => void;
+      const editReady = new Promise<void>((resolve) => { releaseEdit = resolve; });
+      const gateway = startFakeGateway([
+        finalText(paragraphs.join("\n\n")),
+        async () => {
+          await editReady;
+          return toolCall("approval-resize", "edit_file", {
+            path: "target.txt",
+            old_string: "original line\n",
+            new_string: "approved line\n",
+          });
+        },
+        finalText("The edit request has finished."),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway, {
+        width: 120,
+        height: 36,
+      }, {
+        FX_RECORD: tapePath,
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "agent,permission,frame_commit,scroll",
+      });
+      const expectCompleteHistory = async () => {
+        const text = (await session.captureFullScrollback()).replace(/\s+/g, "");
+        let previous = -1;
+        for (const paragraph of paragraphs) {
+          const needle = paragraph.replace(/\s+/g, "");
+          const index = text.indexOf(needle);
+          expect(index).toBeGreaterThan(previous);
+          expect(text.indexOf(needle, index + 1)).toBe(-1);
+          previous = index;
+        }
+      };
+      try {
+        await session.sendText("Show the prepared paragraphs.");
+        await session.waitForText("ROW28", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        await expectCompleteHistory();
+        await session.sendText("Change the prepared file.");
+        await session.waitForPane(() => gateway.requests.length === 2, TIMEOUT);
+        await session.sendLiteralText(draft);
+        releaseEdit();
+        await waitForFileApproval(session);
+        expect(readFileSync(target, "utf8")).toBe("original line\n");
+        await session.resizeWindow(72, 18, 400);
+        await waitForFileApproval(session);
+        const approvalExitFrameStart = stdoutFrames(tapePath).length;
+        await session.sendKeys(decision);
+        await session.waitForPane((pane) => {
+          const finished = readFileSync(tracePath, "utf8").match(/event=prompt_finish /g)?.length ?? 0;
+          return finished === 2 && composerContains(pane, draft) && !pane.includes(APPLY_QUESTION);
+        }, TIMEOUT);
+        expectAtomicApprovalExit(tapePath, approvalExitFrameStart);
+        await expectCompleteHistory();
+        expect(readFileSync(target, "utf8")).toBe(
+          decision === "1" ? "approved line\n" : "original line\n",
+        );
+        expectCleanStderr(stderrPath);
+        await session.sendKeys("C-u");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        releaseEdit();
+        await session.kill();
+        activeSession = null;
+      }
+    }
+  }, 90_000);
+
   test(
     "decomposed prompt and file approval remain visible across resize",
     async () => {
@@ -379,6 +462,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(gateway.requests[0]!.body).toContain(marker);
       expect(gateway.requests[0]!.body).not.toContain(plainMarker);
 
@@ -388,6 +473,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
 
       await decide(session, 1);
@@ -399,7 +486,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
-    "pauses paced assistant text while a file approval is active",
+    "preserves assistant output while a file approval owns the screen",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.workspace, "pacer-gate.txt");
@@ -440,13 +527,28 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["pacer-gate.txt", "+ must not be written"],
         timeoutMs: 5_000,
       });
+      const initialReview = normalizeVolatileStatusRows(await session.capturePaneGrid());
       await session.sendKeys("Down");
       await session.sendKeys("Up");
+      await waitForFileApproval(session, {
+        required: ["pacer-gate.txt", "+ must not be written"],
+      });
+      expect(normalizeVolatileStatusRows(await session.capturePaneGrid())).toEqual(initialReview);
 
       const stdoutBeforeDecision = Buffer.concat(
         stdoutFrames(tapePath).map((frame) => frame.payload),
-      ).toString().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-      expect(stdoutBeforeDecision.includes(marker)).toBe(false);
+      ).toString();
+      const approvalEnter = stdoutBeforeDecision.indexOf("\x1b[?1049h");
+      expect(approvalEnter).toBeGreaterThanOrEqual(0);
+      expect(stdoutBeforeDecision.indexOf("\x1b[?1049l")).toBe(-1);
+      const publishedBeforeApproval = stdoutBeforeDecision.slice(0, approvalEnter)
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes(marker);
+      // Complete blocks may publish before approval and be repainted as review
+      // context. Only text not yet published must stay out of the owned screen.
+      if (!publishedBeforeApproval) {
+        expect(stdoutBeforeDecision.slice(approvalEnter)
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain(marker);
+      }
 
       const approvalExitFrameStart = stdoutFrames(tapePath).length;
       await decide(session, 3);
@@ -455,8 +557,16 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       const stdoutAfterDecision = Buffer.concat(
         stdoutFrames(tapePath).map((frame) => frame.payload),
-      ).toString().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-      expect(stdoutAfterDecision.split(marker)).toHaveLength(2);
+      ).toString();
+      const approvalExit = stdoutAfterDecision.indexOf("\x1b[?1049l", approvalEnter);
+      expect(approvalExit).toBeGreaterThan(approvalEnter);
+      if (!publishedBeforeApproval) {
+        expect(stdoutAfterDecision.slice(approvalEnter, approvalExit)
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain(marker);
+      }
+      expect((await session.capturePane()).split(marker)).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body.split(marker)).toHaveLength(2);
       expect(existsSync(target)).toBe(false);
       expectCleanStderr(stderrPath);
     },
@@ -1039,15 +1149,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
-    "denied and cancelled file tools use terminal markers",
+    "denied and cancelled file tools use current compact outcomes",
     async () => {
       const cases = [
         {
           name: "denied",
-          marker: "⊘",
-          markerStyle: "\x1b[38;5;252m",
-          hasStandaloneCancellationNotice: false,
-          status: "Denied",
+          outcome: "1 denied",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1061,10 +1168,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         },
         {
           name: "cancelled",
-          marker: "■",
-          markerStyle: "\x1b[38;5;252m",
-          hasStandaloneCancellationNotice: true,
-          status: "Cancelled",
+          outcome: "■ Cancelled",
           resolve: async (session: TmuxSession) => {
             await session.sendKeys("Escape");
           },
@@ -1093,13 +1197,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
           required: [target.split("/").at(-1)!],
         });
         await testCase.resolve(launched.session);
-        await launched.session.waitForText(testCase.status, TIMEOUT);
+        await launched.session.waitForText(testCase.outcome, TIMEOUT);
 
-        const escapes = await launched.session.capturePaneEscapes();
-        expect(escapes).toContain(`${testCase.markerStyle}${testCase.marker}`);
-        if (testCase.hasStandaloneCancellationNotice) {
-          expect(escapes).not.toContain("\x1b[38;5;245mcancelled\x1b[39m");
-        }
+        const compact = await launched.session.captureFullScrollback();
+        expect(compact).toContain(testCase.outcome);
+        expect(compact).not.toContain("⊘");
         expect(existsSync(target)).toBe(false);
         expectCleanStderr(launched.stderrPath);
 
@@ -1341,9 +1443,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --record`,
+        cmd: FX_BIN,
         cwd: root.workspace,
-        env: gatewayEnv(root, gateway),
+        env: { ...gatewayEnv(root, gateway), FX_DEBUG_RECORD: "1" },
         stderrPath,
         width: 180,
         height: 40,
@@ -1382,12 +1484,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       const compactGrid = await session.capturePaneGrid();
       const compactScrollback = await session.captureFullScrollback();
-      expect(compactScrollback).toContain("⋯ +");
+      expect(compactScrollback).toContain("Wrote first.txt +120");
+      expect(compactScrollback).toContain("Wrote second.txt +60");
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");
-      await session.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await session.sendKeys("Right");
+      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       for (let page = 0; page < 20; page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);
       }
@@ -1406,8 +1508,13 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(fullFirst).not.toContain("omitted");
       expect(fullFirst).not.toContain('"content":"CTRL_O_FIRST');
 
+      for (let page = 0; page < 20; page += 1) {
+        await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+      }
+      await session.waitForText("CTRL_O_FIRST_001", TIMEOUT);
+
       await session.sendKeys("C-o");
-      await session.waitForText("⋯ +", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
       expect(normalizeVolatileStatusRows(
         await session.waitForStableGrid(compactGrid, normalizeVolatileStatusRows, TIMEOUT),
       )).toEqual(
@@ -1460,27 +1567,23 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(readFileSync(target, "utf8")).toBe(newLine);
 
       const inline = await session.captureFullScrollback();
-      expectDiffSentinelOnRail(inline, "OLD_WRAP_TAIL");
-      expectDiffSentinelOnRail(inline, "NEW_WRAP_TAIL");
+      expect(inline).not.toContain("OLD_WRAP_TAIL");
+      expect(inline).not.toContain("NEW_WRAP_TAIL");
 
       await session.sendKeys("C-o");
-      await session.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      const review = await session.capturePane();
-      expectDiffSentinelOnRail(review, "OLD_WRAP_TAIL");
-      expectDiffSentinelOnRail(review, "NEW_WRAP_TAIL");
-
-      await session.sendKeys("Right");
-      await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       const full = await session.capturePane();
       expectDiffSentinelOnRail(full, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(full, "NEW_WRAP_TAIL");
 
       await session.resizeWindow(56, 40, 500);
+      await session.waitForText("OLD_WRAP_TAIL", TIMEOUT);
       const narrow = await session.capturePane();
       expectDiffSentinelOnRail(narrow, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(narrow, "NEW_WRAP_TAIL");
 
       await session.resizeWindow(100, 40, 500);
+      await session.waitForText("OLD_WRAP_TAIL", TIMEOUT);
       const wide = await session.capturePane();
       expectDiffSentinelOnRail(wide, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(wide, "NEW_WRAP_TAIL");
@@ -1525,6 +1628,37 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(scrollback).not.toContain("preflight failed");
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(readFileSync(target, "utf8")).toBe("before\n");
+      expect(gateway.requests).toHaveLength(2);
+      expectCleanStderr(stderrPath);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "search preflight failure shows the target resolution reason",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        toolCall("grep_preflight_failure", "grep_files", {
+          pattern: "upgrade",
+          path: "missing-map/behavior-index",
+        }),
+        finalText("search failure handled"),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway);
+
+      await session.sendText("Search the generated map once.");
+      const settled = await session.waitForText(
+        "search failure handled",
+        TIMEOUT,
+      );
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).toContain(
+        "Permission target resolution failed for grep_files: FileNotFound",
+      );
+      expect(scrollback).not.toContain("preflight failed");
+      expect(settled).not.toContain(APPLY_QUESTION);
       expect(gateway.requests).toHaveLength(2);
       expectCleanStderr(stderrPath);
     },
@@ -1683,6 +1817,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const expectedHash = createHash("sha256").update(content).digest("hex");
       const gateway = startFakeGateway([
         chunkedWriteToolCall("maximum_write", "maximum.txt", content),
+        finalText("The maximum-size write completed successfully."),
         finalText("maximum write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1701,6 +1836,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(statSync(target).size).toBe(content.length);
       expect(fileHash(target)).toBe(expectedHash);
+      expect(gateway.requests).toHaveLength(3);
       expectCleanStderr(stderrPath);
     },
     MAXIMUM_WRITE_TIMEOUT + 30_000,
@@ -1714,6 +1850,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const content = "x".repeat(4 * 1024 * 1024 + 1);
       const gateway = startFakeGateway([
         chunkedWriteToolCall("oversized_write", "oversized.txt", content),
+        finalText("The oversized write was rejected before execution."),
         finalText("oversized write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1726,10 +1863,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1]!.body).toContain(
-        "write_file failed: content exceeds the 4 MiB preparation limit",
-      );
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[1]!.body).toContain("Tool write_file (failure)");
+      expect(gateway.requests[2]!.body).toContain("context_handoff");
       expectCleanStderr(stderrPath);
     },
     90_000,

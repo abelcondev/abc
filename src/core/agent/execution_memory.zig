@@ -31,7 +31,13 @@ pub fn makePersistedToolResult(
     else
         null else null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (memory) |info| if (info.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = if (memory) |info| if (tool_image_handle == null) try types.dupeToolImages(alloc, info.tool_images) else try alloc.alloc(types.ToolImage, 0) else try alloc.alloc(types.ToolImage, 0);
+    errdefer types.freeToolImages(alloc, tool_images);
     var result: types.PersistedToolResult = .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = status,
@@ -45,6 +51,7 @@ pub fn makePersistedToolResult(
         .created_at_ms = io_mod.milliTimestamp(),
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
+        .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {
@@ -69,6 +76,26 @@ pub fn buildNormalChatExecutionMemory(
     messages: []const types.ChatMessage,
 ) !types.ExecutionMemory {
     return buildNormalExecutionMemory(ChatMessageAdapter, alloc, messages);
+}
+
+test "completed tool exchange retains provider replay with its assistant" {
+    const alloc = std.testing.allocator;
+    const state = types.ProviderReplay{
+        .source = .{ .provider = .gateway, .model = "test/model" },
+        .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]",
+    };
+    const calls = [_]ToolCall{.{ .id = "read", .name = "read_file", .arguments_json = "{ \"path\": \"file\" }" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_replay = state },
+        .{ .role = .tool, .tool_call_id = "read", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
+    };
+    const execution = try buildNormalChatExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    const stored = execution.tool_steps[0].provider_replay orelse return error.TestExpectedProviderReplay;
+    try std.testing.expectEqualStrings(state.parts_json, stored.parts_json);
+    try std.testing.expectEqualStrings(state.source.model, stored.source.model);
+    try std.testing.expect(stored.parts_json.ptr != state.parts_json.ptr);
 }
 
 pub fn buildNormalMessageExecutionMemory(
@@ -179,22 +206,14 @@ pub fn appendFileEvidenceForTool(
     const object = parsed.value.object;
 
     const path = switch (action) {
-        .rename => stringField(object, "old_path"),
-        .copy => stringField(object, "source"),
-        .search, .list => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
+        .search => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
         else => stringField(object, "path"),
     } orelse return;
-    const new_path = switch (action) {
-        .rename => stringField(object, "new_path"),
-        .copy => stringField(object, "destination"),
-        else => null,
-    };
 
     const evidence = try makeFileEvidence(
         alloc,
         call,
         path,
-        new_path,
         action,
         status,
         memory,
@@ -211,15 +230,8 @@ pub fn markStaleFileEvidence(files: []types.FileEvidence) void {
         var prior_index: usize = 0;
         while (prior_index < i) : (prior_index += 1) {
             if (files[prior_index].action != .read) continue;
-            if (file.action != .copy and
-                std.mem.eql(u8, files[prior_index].path, file.path))
-            {
+            if (std.mem.eql(u8, files[prior_index].path, file.path)) {
                 files[prior_index].stale = true;
-            }
-            if (file.new_path) |new_path| {
-                if (std.mem.eql(u8, files[prior_index].path, new_path)) {
-                    files[prior_index].stale = true;
-                }
             }
         }
     }
@@ -233,7 +245,14 @@ pub fn findToolCallById(calls: []const ToolCall, id: []const u8) ?ToolCall {
 }
 
 const ChatMessageAdapter = struct {
+    fn standalone(value: Message) bool {
+        return value.standalone_response or value.provider_replay != null;
+    }
     pub const Message = types.ChatMessage;
+
+    fn providerReplay(value: Message) ?types.ProviderReplay {
+        return value.provider_replay;
+    }
 
     fn isAssistant(value: Message) bool {
         return value.role == .assistant;
@@ -277,7 +296,14 @@ const ChatMessageAdapter = struct {
 };
 
 const MessageAdapter = struct {
+    fn standalone(_: Message) bool {
+        return false;
+    }
     pub const Message = message.Message;
+
+    fn providerReplay(_: Message) ?types.ProviderReplay {
+        return null;
+    }
 
     fn isAssistant(value: Message) bool {
         return value.role == .assistant;
@@ -344,7 +370,18 @@ fn buildNormalExecutionMemory(
     while (i < messages.len) {
         const msg = messages[i];
         const tool_calls = Adapter.toolCalls(msg);
-        if (!Adapter.isAssistant(msg) or tool_calls.len == 0) {
+        if (!Adapter.isAssistant(msg)) {
+            i += 1;
+            continue;
+        }
+        if (tool_calls.len == 0) {
+            if (Adapter.standalone(msg)) {
+                const assistant = if (Adapter.content(msg)) |content| try alloc.dupe(u8, content) else null;
+                errdefer if (assistant) |text| alloc.free(text);
+                const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, &.{}, &.{});
+                errdefer if (replay) |value| types.freeProviderReplay(alloc, value);
+                try tool_steps.append(alloc, .{ .assistant = assistant, .provider_replay = replay });
+            }
             i += 1;
             continue;
         }
@@ -423,10 +460,13 @@ fn buildNormalExecutionMemory(
             results.items,
         );
         errdefer types.freeToolCallSlice(alloc, persisted_calls);
+        const replay = try dupeUnchangedProviderReplay(alloc, Adapter.providerReplay(msg), Adapter.content(msg), assistant, tool_calls, persisted_calls);
+        errdefer if (replay) |value| types.freeProviderReplay(alloc, value);
         const owned_results = try results.toOwnedSlice(alloc);
         errdefer types.freePersistedToolResults(alloc, owned_results);
         const step = types.ToolExecutionStep{
             .assistant = assistant,
+            .provider_replay = replay,
             .tool_calls = persisted_calls,
             .tool_results = owned_results,
         };
@@ -468,8 +508,35 @@ pub fn freeTransientToolExecutionStep(
     step: types.ToolExecutionStep,
 ) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
     types.freeToolCallSlice(alloc, step.tool_calls);
     types.freePersistedToolResults(alloc, step.tool_results);
+}
+
+/// Caller owns the copy. Never bind signed metadata to redacted or incomplete history.
+pub fn dupeUnchangedProviderReplay(
+    alloc: Allocator,
+    replay: ?types.ProviderReplay,
+    source_text: ?[]const u8,
+    stored_text: ?[]const u8,
+    source_calls: []const ToolCall,
+    stored_calls: []const ToolCall,
+) !?types.ProviderReplay {
+    const value = replay orelse return null;
+    var unchanged = std.mem.eql(u8, source_text orelse "", stored_text orelse "") and source_calls.len == stored_calls.len;
+    if (unchanged) for (source_calls, stored_calls) |source, stored| {
+        if (!std.mem.eql(u8, source.id, stored.id) or !std.mem.eql(u8, source.name, stored.name) or
+            !try @import("../shared/json_comparison.zig").serializedEqual(alloc, source.arguments_json, stored.arguments_json))
+        {
+            unchanged = false;
+            break;
+        }
+    };
+    if (!unchanged) {
+        debug_trace.logf("session", "provider replay omitted reason=redacted_or_incomplete_association", .{});
+        return null;
+    }
+    return try types.dupeProviderReplay(alloc, value);
 }
 
 pub fn freeTransientPersistedToolResult(
@@ -479,6 +546,8 @@ pub fn freeTransientPersistedToolResult(
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    types.freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     types.freePermissionFeedback(alloc, result.permission_feedback);
@@ -522,7 +591,7 @@ pub fn dupeRedactedToolCall(alloc: Allocator, call: ToolCall) !ToolCall {
     errdefer alloc.free(id);
     const name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(name);
-    const arguments_json = try redactToolArgumentsJsonForTool(
+    const arguments_json = try redactToolArgumentsJson(
         alloc,
         call.name,
         call.arguments_json,
@@ -547,7 +616,7 @@ const ArgumentRedactionPolicy = struct {
     web_fetch: bool = false,
 };
 
-fn redactToolArgumentsJsonForTool(
+pub fn redactToolArgumentsJson(
     alloc: Allocator,
     tool_name: []const u8,
     arguments_json: []const u8,
@@ -679,28 +748,23 @@ fn makeFileEvidence(
     alloc: Allocator,
     call: ToolCall,
     path_src: []const u8,
-    new_path_src: ?[]const u8,
     action: types.FileEvidenceAction,
     status: types.PersistedToolStatus,
     memory: ?types.ToolResultMemory,
 ) !types.FileEvidence {
     const path = try redactText(alloc, path_src);
     errdefer alloc.free(path);
-    const new_path = if (new_path_src) |value| try redactText(alloc, value) else null;
-    errdefer if (new_path) |value| alloc.free(value);
     const tool_call_id = try durableIdentifier(alloc, call.id);
     errdefer alloc.free(tool_call_id);
     const tool_name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(tool_name);
     const model_view_covers_full_file = if (memory) |info|
         (info.model_view_covers_full_file orelse false) and
-            !info.truncated and
-            info.output_handle == null
+            !info.truncated
     else
         false;
     return .{
         .path = path,
-        .new_path = new_path,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .action = action,
@@ -716,12 +780,8 @@ fn fileEvidenceActionForTool(tool_name: []const u8) types.FileEvidenceAction {
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "write_file")) return .write;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "delete_file")) return .delete;
-    if (std.mem.eql(u8, tool_name, "rename_file")) return .rename;
-    if (std.mem.eql(u8, tool_name, "copy_file")) return .copy;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .search;
-    if (std.mem.eql(u8, tool_name, "list_files")) return .list;
     return .unknown;
 }
 
@@ -733,7 +793,7 @@ fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 
 fn isMutationFileAction(action: types.FileEvidenceAction) bool {
     return switch (action) {
-        .write, .edit, .delete, .rename, .copy => true,
+        .write, .edit => true,
         else => false,
     };
 }
@@ -1136,56 +1196,6 @@ test "read evidence trusts typed model coverage instead of output text" {
     try std.testing.expect(!files.items[3].model_view_covers_full_file);
 }
 
-test "copy evidence uses real schema and preserves source read freshness" {
-    const alloc = std.testing.allocator;
-    var files: std.ArrayList(types.FileEvidence) = .empty;
-    defer {
-        for (files.items) |file| freeTransientFileEvidence(alloc, file);
-        files.deinit(alloc);
-    }
-
-    try appendFileEvidenceForTool(
-        alloc,
-        &files,
-        .{
-            .id = "call_source_read",
-            .name = "read_file",
-            .arguments_json = "{\"path\":\"source.txt\"}",
-        },
-        .success,
-        null,
-    );
-    try appendFileEvidenceForTool(
-        alloc,
-        &files,
-        .{
-            .id = "call_destination_read",
-            .name = "read_file",
-            .arguments_json = "{\"path\":\"destination.txt\"}",
-        },
-        .success,
-        null,
-    );
-    try appendFileEvidenceForTool(
-        alloc,
-        &files,
-        .{
-            .id = "call_copy",
-            .name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-        },
-        .success,
-        null,
-    );
-    markStaleFileEvidence(files.items);
-
-    try std.testing.expectEqual(@as(usize, 3), files.items.len);
-    try std.testing.expectEqualStrings("source.txt", files.items[2].path);
-    try std.testing.expectEqualStrings("destination.txt", files.items[2].new_path.?);
-    try std.testing.expect(!files.items[0].stale);
-    try std.testing.expect(files.items[1].stale);
-}
-
 test "normal execution memory attaches marked permission feedback to its tool result" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{.{
@@ -1238,7 +1248,7 @@ test "normal execution memory scans the deferred user tail by source call" {
         .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
         .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
         .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
-        .{ .role = .user, .content = "sandbox hint", .permission_feedback = false },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
         .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
     };
 

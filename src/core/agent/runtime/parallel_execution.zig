@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -18,12 +19,10 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
     const tool = registry.lookup(call.name) orelse return false;
     return switch (tool.executor_kind) {
-        .list_files, .glob_files => tool.activity_kind == .list,
+        .glob_files => tool.activity_kind == .list,
         .read_file,
         .read_tool_result,
-        .semantic_search,
         .grep_files,
-        .file_info,
         .skill,
         .web_fetch,
         .web_search,
@@ -36,6 +35,36 @@ pub fn parallelReadOnlyPrefixLen(registry: tool_dispatch.Registry, calls: []cons
     var len: usize = 0;
     while (len < calls.len and isReadOnlyCall(registry, calls[len])) : (len += 1) {}
     return len;
+}
+
+fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+    if (call.provider_result != null) return false;
+    const tool = registry.lookup(call.name) orelse return false;
+    return tool.executor_kind == .subagent and tool.activity_kind == .subagent;
+}
+
+fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var len: usize = 0;
+    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    return len;
+}
+
+pub const GroupKind = enum { none, read_only, subagent };
+
+pub const LeadingGroup = struct {
+    kind: GroupKind = .none,
+    len: usize = 0,
+};
+
+pub fn leadingParallelGroup(
+    registry: tool_dispatch.Registry,
+    calls: []const ToolCall,
+) LeadingGroup {
+    const read_only_len = parallelReadOnlyPrefixLen(registry, calls);
+    if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
+    const subagent_len = parallelSubagentPrefixLen(registry, calls);
+    if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
+    return .{};
 }
 
 pub const ParallelToolResult = struct {
@@ -66,11 +95,13 @@ pub const ParallelRunResult = struct {
 };
 
 pub const ParallelHookExecContext = struct {
+    skill_locations: ?*const skill_contract.Locations = null,
     hooks: *const AgentRuntimeDeps,
     turn_id: u64,
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     session_grants: []const PermissionGrant,
+    permission_mode: types.PermissionMode,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     classification_complete: []const bool = &.{},
@@ -95,7 +126,7 @@ const ParallelWorkerSlot = struct {
     owner_cancelled_at_error: bool = false,
 };
 
-pub fn runSequentialReadOnlyCalls(
+pub fn runSequentialCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -137,7 +168,7 @@ pub fn runSequentialReadOnlyCalls(
     return .{ .attempts = attempts, .first_cancelled_index = first_cancelled_index };
 }
 
-pub fn runParallelReadOnlyCalls(
+pub fn runParallelCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -248,10 +279,12 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
     return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
+        .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
         .call = call,
         .authority = .ordinary,
+        .permission_mode = exec_ctx.permission_mode,
         .root_user_intent_context = exec_ctx.root_user_intent_context,
         .current_turn_messages = exec_ctx.current_turn_messages,
         .session_grants = exec_ctx.session_grants,
@@ -274,12 +307,11 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     const tool_name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(tool_name);
 
-    if (execution.background_command != null or
-        execution.diff_entry != null or
+    if (execution.diff_entry != null or
         execution.finish_turn or
-        execution.selected_dynamic_tool_name != null or
-        execution.selected_dynamic_tool_schema_json != null or
-        execution.prepared_result_memory != null or
+        execution.selected_dynamic_tools.len != 0 or
+        execution.retired_dynamic_tool_names.len != 0 or
+        execution.tool_result_memory_prepared or
         execution.committed_file_handoff != null or
         execution.deferred_tool_completion != null)
     {
@@ -288,11 +320,12 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
             .tool_name = tool_name,
             .execution = .{
                 .status = .failure,
-                .model_output = try alloc.dupe(u8, "Parallel read-only tool returned an unsupported side-effect payload."),
+                .model_output = try alloc.dupe(u8, "Parallel tool returned an unsupported side-effect payload."),
             },
         };
     }
     var duplicated_execution: ToolExecutionResult = .{
+        .model_content_kind = execution.model_content_kind,
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
         .web_search_completion = execution.web_search_completion,
@@ -302,9 +335,6 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
-    }
-    if (execution.display_output) |display| {
-        duplicated_execution.display_output = try alloc.dupe(u8, display);
     }
     if (execution.system_notice) |notice| {
         duplicated_execution.system_notice = try alloc.dupe(u8, notice);
@@ -349,7 +379,12 @@ fn duplicateToolResultMemory(
         null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
 
+    const image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (image_handle) |handle| alloc.free(handle);
+    const tool_images = try types.dupeToolImages(alloc, memory.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = image_handle,
         .output_handle = output_handle,
         .preview = preview,
         .output_bytes = memory.output_bytes,
@@ -358,6 +393,7 @@ fn duplicateToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 
@@ -376,12 +412,13 @@ fn freeParallelToolResult(alloc: Allocator, result: ParallelToolResult) void {
 fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) void {
     alloc.free(result.model_output);
     if (result.status_detail) |value| alloc.free(value);
-    if (result.display_output) |value| alloc.free(value);
     if (result.system_notice) |value| alloc.free(value);
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
     if (result.command_result_json) |value| alloc.free(value);
     if (result.tool_result_memory) |memory| {
+        types.freeToolImages(alloc, memory.tool_images);
+        if (memory.tool_image_handle) |handle| alloc.free(handle);
         if (memory.output_handle) |value| alloc.free(value);
         if (memory.preview) |value| alloc.free(value);
         if (memory.command_output_replay) |replay| {
@@ -425,12 +462,12 @@ const ParallelTestFixture = struct {
     max_in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
 
-fn runParallelReadOnlyCallsForTest(
+fn runParallelCallsForTest(
     alloc: Allocator,
     calls: []const ToolCall,
     fixture: *ParallelTestFixture,
 ) Allocator.Error!ParallelRunResult {
-    return runParallelReadOnlyCalls(alloc, calls, .{
+    return runParallelCalls(alloc, calls, .{
         .exec_ctx = fixture,
         .execute = parallelTestExecute,
         .format_ctx = fixture,
@@ -507,6 +544,24 @@ test "parallel classifier keeps only a leading safe read-only group" {
     try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
 }
 
+test "parallel classifier keeps one leading registered subagent group" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.subagent,
+        builtin_tools.read_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{
+        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
+        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
+        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
+    };
+
+    const group = leadingParallelGroup(registry, &calls);
+    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(@as(usize, 2), group.len);
+}
+
 test "parallel classifier admits approval-bearing web fetch read groups" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
@@ -543,7 +598,7 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
         builtin_tools.mcp_select_tool,
         builtin_tools.subagent,
         builtin_tools.install_skill,
-        builtin_tools.terminal,
+        builtin_tools.shell,
         builtin_tools.read_file,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
@@ -571,7 +626,7 @@ test "parallel read-only execution preserves order and failure fan-in" {
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 20 },
@@ -580,7 +635,7 @@ test "parallel read-only execution preserves order and failure fan-in" {
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 3), run.attempts.len);
@@ -600,7 +655,7 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 10 },
@@ -609,7 +664,7 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
@@ -633,7 +688,7 @@ test "parallel workers start no execution when owner cancellation is already set
     var fixture = ParallelTestFixture{ .plans = &plans };
     fixture.cancel_flag.store(true, .seq_cst);
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expectEqual(@as(?usize, 0), run.first_cancelled_index);
@@ -647,7 +702,7 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .err = error.Cancelled, .delay_ms = 1 },
@@ -656,7 +711,7 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
@@ -689,7 +744,7 @@ test "parallel read-only execution reports no active call when cancellation foll
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
@@ -705,9 +760,9 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         "{\"path\":\"notes.txt\"}",
     );
     const execution: ToolExecutionResult = .{
+        .model_content_kind = .complete_skill,
         .model_output = "contents",
         .status_detail = "detail",
-        .display_output = "display",
         .system_notice = "notice",
         .interactive_notice = .{
             .topic = "background",
@@ -717,6 +772,8 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         .context_notices = &.{ "first context notice", "second context notice" },
         .command_result_json = "{}",
         .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }},
+            .tool_image_handle = "image-result-handle",
             .output_handle = "result-handle",
             .preview = "preview",
             .output_bytes = 8,
@@ -730,6 +787,12 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         execution,
     );
     defer freeParallelToolResult(alloc, duplicated);
+    try std.testing.expectEqual(execution.model_content_kind, duplicated.execution.model_content_kind);
+    const memory = duplicated.execution.tool_result_memory.?;
+    try std.testing.expectEqualStrings("image-result-handle", memory.tool_image_handle.?);
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_images.len);
+    try std.testing.expectEqualStrings("cG5n", memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("image/png", memory.tool_images[0].mime_type);
     try std.testing.expectEqualStrings("notice", duplicated.execution.system_notice.?);
     const interactive_notice = duplicated.execution.interactive_notice.?;
     try std.testing.expectEqualStrings("background", interactive_notice.topic);

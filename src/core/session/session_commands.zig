@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -8,11 +9,12 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const prompt_history_runtime = @import("../app/prompt_history_runtime.zig");
+const provider_runtime = @import("../app/provider_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -20,7 +22,7 @@ const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
-const permissions_usage = "usage: /permissions [ask|auto|yolo|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
+const permissions_usage = "usage: /permissions [ask|auto|full-access|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
 
 pub fn reportUserSettingsCommit(
     app: anytype,
@@ -168,25 +170,30 @@ fn appendShadowedUserSources(
     sources: config_runtime.ConfigSources,
 ) !void {
     var wrote_header = false;
-    try appendShadowedUserSource(writer, "model", patch.model != null, sources.model, &wrote_header);
+    const model_source = if (patch.model_preference) |preference|
+        sources.models.get(preference.provider)
+    else
+        .compiled_default;
+    try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
-    try appendShadowedUserSource(writer, "input_appearance", patch.input_appearance != null, sources.input_appearance, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
-        const source = switch (item.item) {
-            .sandbox => sources.statusline_sandbox,
+        const source: ?config_runtime.ConfigSource = switch (item.item) {
             .context => sources.statusline_context,
             .session => sources.statusline_session,
+            .workspace => null,
         };
-        const field = switch (item.item) {
-            .sandbox => "statusLine.sandbox",
-            .context => "statusLine.context",
-            .session => "statusLine.session",
-        };
-        try appendShadowedUserSource(writer, field, true, source, &wrote_header);
+        if (source) |resolved| {
+            const field = switch (item.item) {
+                .context => "statusLine.context",
+                .session => "statusLine.session",
+                .workspace => unreachable,
+            };
+            try appendShadowedUserSource(writer, field, true, resolved, &wrote_header);
+        }
     }
     try appendShadowedUserSource(
         writer,
@@ -265,19 +272,26 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn showStatus(app: *App) !void {
-            const auth = app.auth.statusSnapshot();
+            const provider = provider_runtime.provider(app);
+            var preferred: ?types.CredentialSource = null;
+            if (provider == .gateway and app.auth.credentialSource() == null) {
+                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                    try writeSettingsLoadError(app, err);
+                    return;
+                };
+                defer settings.deinit(app.alloc);
+                preferred = settings.credential_source;
+            }
+            const auth = app.auth.statusSnapshot(provider, preferred);
             const text = try (output_contracts.StatusSnapshot{
-                .model = app.selected_model.items,
+                .model = provider_runtime.model(app),
+                .provider = provider,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
                 .auth = auth,
                 .auth_help = auth.missingHelp(.interactive),
                 .permission_mode = app.permission_engine.mode,
-                .sandbox_backend = sandbox.effectiveBackend(
-                    app.permission_engine.mode,
-                    app.permission_state.sandbox_backend,
-                ),
                 .workspace_root = app.workspace_root,
                 .history_turns = app.session.historyLen(),
                 .session_permission_grants = app.permission_engine.grants.items.len,
@@ -332,7 +346,7 @@ pub fn Commands(comptime App: type) type {
 
         pub fn handleModel(app: *App, query: []const u8) !void {
             if (query.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = app.selected_model.items }, true);
+                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
                 return;
             }
 
@@ -347,21 +361,17 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            if (std.ascii.eqlIgnoreCase(rest, "ask")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .ask);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to ask" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "auto")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .auto);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to auto" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "yolo")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .yolo);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .warning, .body = "mode set to yolo" }, true);
+            if (config_runtime.parsePermissionMode(rest)) |mode| {
+                try app_permission_runtime.Runtime(App).selectMode(app, mode);
+                try app.writeDomainNotice(.{
+                    .topic = "permissions",
+                    .tone = if (mode == .yolo) .warning else .neutral,
+                    .body = switch (mode) {
+                        .ask => "mode set to ask",
+                        .auto => "mode set to auto",
+                        .yolo => "mode set to full access",
+                    },
+                }, true);
                 return;
             }
 
@@ -679,7 +689,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn toggleFast(app: *App) !void {
-            try toggleFastForModel(app, app.selected_model.items, true);
+            try toggleFastForModel(app, provider_runtime.model(app), true);
         }
 
         fn toggleFastForModel(app: *App, model: []const u8, announce: bool) !void {
@@ -712,15 +722,19 @@ pub fn Commands(comptime App: type) type {
                 .{
                     if (previous) "true" else "false",
                     if (app.fast_mode) "true" else "false",
-                    app.selected_model.items,
-                    if (model_capabilities.resolveForApp(App, app, app.selected_model.items).supports_fast_mode) "true" else "false",
+                    provider_runtime.model(app),
+                    if (model_capabilities.resolveForApp(App, app, provider_runtime.model(app)).supports_fast_mode) "true" else "false",
                 },
             );
 
             if (persist) {
                 try persistPreferenceTargets(
                     app,
-                    .{ .fast_mode = app.fast_mode },
+                    .{
+                        .provider = provider_runtime.provider(app),
+                        .model = provider_runtime.model(app),
+                        .fast_mode = app.fast_mode,
+                    },
                     "fast",
                     !announce,
                 );
@@ -759,21 +773,20 @@ pub fn Commands(comptime App: type) type {
 
         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
             try setResolvedModelRuntime(app, model, true);
-            var patch = app_session_runtime.SessionPreferencePatch{ .model = model };
+            var patch = app_session_runtime.SessionPreferencePatch{
+                .provider = provider_runtime.provider(app),
+                .model = model,
+            };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len == 0) {
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
-            } else {
+            if (capabilities.reasoning_efforts.len > 0) {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
             }
+            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
+            if (selected_fast_mode != app.fast_mode) {
+                try applyFastMode(app, selected_fast_mode, false, false);
+            }
+            patch.fast_mode = selected_fast_mode;
             try persistPreferenceTargets(app, patch, "model picker", false);
         }
 
@@ -925,9 +938,9 @@ pub fn Commands(comptime App: type) type {
 
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
-                app.selected_model.items,
-                @tagName(detailed.sources.model),
-                permissions.permissionModeLabel(app.permission_engine.mode),
+                provider_runtime.model(app),
+                @tagName(detailed.sources.models.get(.gateway)),
+                permissions.permissionModeDisplayLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
                 startup_scrollback_label,
@@ -1029,10 +1042,18 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
+            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
             try setResolvedModelRuntime(app, resolved, announce);
+            if (model_changed and app.fast_mode) {
+                try applyFastMode(app, false, false, false);
+            }
             try persistPreferenceTargets(
                 app,
-                .{ .model = resolved },
+                .{
+                    .provider = provider_runtime.provider(app),
+                    .model = resolved,
+                    .fast_mode = app.fast_mode,
+                },
                 "model",
                 !announce,
             );
@@ -1051,11 +1072,7 @@ pub fn Commands(comptime App: type) type {
                 var committed = app_session_runtime.PreferenceCommitResult{};
                 const attempt = config_runtime.attemptUserPreferences(
                     app.alloc,
-                    .{
-                        .model = patch.model,
-                        .effort = patch.effort,
-                        .fast_mode = patch.fast_mode,
-                    },
+                    patch.userSettingsPatch(),
                 );
                 switch (attempt) {
                     .outcome => |outcome| committed.settings_outcome = outcome,
@@ -1085,11 +1102,7 @@ pub fn Commands(comptime App: type) type {
                 _ = try reportUserSettingsCommit(
                     app,
                     label,
-                    .{
-                        .model = patch.model,
-                        .effort = patch.effort,
-                        .fast_mode = patch.fast_mode,
-                    },
+                    patch.userSettingsPatch(),
                     outcome,
                     result.session_error,
                     announce_commit,
@@ -1112,18 +1125,12 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModelRuntime(app: *App, resolved: []const u8, announce: bool) !void {
-            if (!std.mem.eql(u8, app.selected_model.items, resolved)) {
-                const stable = try app.alloc.dupe(u8, resolved);
-                defer app.alloc.free(stable);
-                try app.selected_model.ensureTotalCapacity(app.alloc, stable.len);
-                app.selected_model.clearRetainingCapacity();
-                app.selected_model.appendSliceAssumeCapacity(stable);
+            if (!std.mem.eql(u8, provider_runtime.model(app), resolved)) {
+                try provider_runtime.replaceModel(app, resolved);
             }
-            const selected = app.selected_model.items;
+            const selected = provider_runtime.model(app);
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
-            // Keep the session or workspace discriminator while updating the
-            // model shown as secondary terminal-tab context.
             app_session_runtime.Runtime(App).syncTerminalTitle(app);
 
             if (announce) {
@@ -1242,17 +1249,10 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
 
     const categories = [_][]const u8{
         "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
         "read",
-        "list",
         "glob",
         "grep",
         "skill",
-        "memory",
-        "semantic_search",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -1415,12 +1415,7 @@ fn writeAllowlistPattern(writer: *std.Io.Writer, group: AllowlistRuleGroup, patt
 fn isWorkspacePathToolPermission(permission: []const u8) bool {
     const path_permissions = [_][]const u8{
         "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
         "read",
-        "list",
         "glob",
         "grep",
     };
@@ -1655,6 +1650,7 @@ const FakeApp = struct {
     workspace_root: []u8,
     tool_registry: tool_dispatch.Registry = .{},
     selected_model: std.ArrayList(u8) = .empty,
+    selected_provider: model_provider.ProviderId = .gateway,
     auth: auth_runtime.Runtime = .{},
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -1675,6 +1671,7 @@ const FakeApp = struct {
     last_tone: ?types.NoticeTone = null,
     preference_commit_count: usize = 0,
     last_preference_model: std.ArrayList(u8) = .empty,
+    last_preference_provider: ?model_provider.ProviderId = null,
     last_preference_effort: ?types.ReasoningEffort = null,
     last_preference_fast_mode: ?bool = null,
     preference_settings_error: ?anyerror = null,
@@ -1822,6 +1819,7 @@ const FakeApp = struct {
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {
         self.preference_commit_count += 1;
+        self.last_preference_provider = patch.provider;
         self.last_preference_model.clearRetainingCapacity();
         if (patch.model) |model| {
             self.last_preference_model.appendSlice(self.alloc, model) catch
@@ -1832,11 +1830,7 @@ const FakeApp = struct {
         if (self.preference_settings_error == null) {
             const attempt = config_runtime.attemptUserPreferences(
                 self.alloc,
-                .{
-                    .model = patch.model,
-                    .effort = patch.effort,
-                    .fast_mode = patch.fast_mode,
-                },
+                patch.userSettingsPatch(),
             );
             return switch (attempt) {
                 .outcome => |outcome| .{
@@ -1932,6 +1926,12 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
 
 test "session_commands showStatus writes session status snapshot" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+    const env = try SessionCommandTestHome.install(alloc, home_root);
+    defer env.deinit();
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/test-model");
     defer app.deinit();
     app.permission_engine.mode = .auto;
@@ -1948,14 +1948,8 @@ test "session_commands showStatus writes session status snapshot" {
 
     app.clearTranscript();
     app.permission_engine.mode = .yolo;
-    app.permission_state.sandbox_backend = .macos;
     try Commands(FakeApp).showStatus(&app);
-    try expectTranscriptContains(&app, "permission_mode=yolo\n");
-    try expectTranscriptContains(&app, "sandbox=none\n");
-    try std.testing.expectEqual(
-        sandbox.BackendKind.macos,
-        app.permission_state.sandbox_backend,
-    );
+    try expectTranscriptContains(&app, "permission_mode=full access\n");
 }
 
 test "session_commands history setting toggles durable input history" {
@@ -2123,15 +2117,15 @@ test "session_commands statusline shadow notice names the preference field" {
         &out.writer,
         .{
             .statusline_item = .{
-                .item = .sandbox,
+                .item = .context,
                 .enabled = false,
             },
         },
-        .{ .statusline_sandbox = .project },
+        .{ .statusline_context = .project },
     );
 
     try std.testing.expectEqualStrings(
-        "; fresh sessions here use higher-precedence statusLine.sandbox=project",
+        "; fresh sessions here use higher-precedence statusLine.context=project",
         out.written(),
     );
 }
@@ -2206,13 +2200,15 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
     defer app.deinit();
     app.cached_ids = &ids;
+    app.selected_provider = .codex;
 
     try Commands(FakeApp).handleModel(&app, "claude sonnet");
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-sonnet-4-20250514",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
@@ -2229,7 +2225,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "workspace · custom/provider-model",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -2253,7 +2249,7 @@ test "session_commands handlePermissions persists modes and reset clears session
     try std.testing.expectEqual(types.PermissionMode.yolo, app.worker.synced_mode.?);
     try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.last_preference_permission_mode);
-    try expectTranscriptContains(&app, "mode set to yolo");
+    try expectTranscriptContains(&app, "mode set to full access");
 
     app.clearTranscript();
     try Commands(FakeApp).handlePermissions(&app, "ask");
@@ -2306,11 +2302,11 @@ test "session_commands handlePermissions reports usage and invalid action before
     defer app.deinit();
 
     try Commands(FakeApp).handlePermissions(&app, "add");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
 
     app.clearTranscript();
     try Commands(FakeApp).handlePermissions(&app, "remove");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
 }
 
@@ -2634,27 +2630,28 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     defer home.deinit();
 
     const provider_tool = blk: {
-        var tool = builtin_tools.memory;
-        tool.name = "provider_memory";
+        var tool = builtin_tools.read_file;
+        tool.name = "provider_custom";
         break :blk tool;
     };
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "test-model");
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_memory");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_memory: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
+    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
-    try expectRule(settings.permission_rules.rules[0], "provider_memory", "*", .allow);
+    try expectRule(settings.permission_rules.rules[0], "provider_custom", "*", .allow);
 
     app.tool_registry = .{};
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_memory");
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
     try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
+    try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
 }
 
 test "session_commands toggleFast reports unsupported model and redraws footer" {
@@ -2764,7 +2761,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-opus-4.6",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
@@ -2787,7 +2784,29 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
     try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands model selection clears fast mode when the selected model has no fast control" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.fast_mode = true;
+    app.worker.synced_fast_mode = true;
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
+    app.setGatewayControls("zai/glm-5.3", &efforts, false);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        "zai/glm-5.3",
+        types.ReasoningEffort.literal("max"),
+        true,
+    );
+
+    try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
 }
 
 test "session_commands selectModelFromPicker syncs queued fast mode and effort for supported models" {
@@ -2842,6 +2861,7 @@ test "session_commands model picker emits one combined preference transaction" {
         "anthropic/claude-opus-4.7",
     );
     defer app.deinit();
+    app.selected_provider = .codex;
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     app.setGatewayControls("anthropic/claude-opus-4.7", &efforts, true);
 
@@ -2853,6 +2873,7 @@ test "session_commands model picker emits one combined preference transaction" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
         "anthropic/claude-opus-4.7",
         app.last_preference_model.items,
@@ -2936,7 +2957,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
         workspace_root,
     );
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("user/new", settings.model.?);
+    try std.testing.expectEqualStrings("user/new", settings.models.get(.gateway).?);
 }
 
 test "session_commands durable user save survives post-commit resolver diagnostic" {
@@ -3074,7 +3095,7 @@ test "session_commands no-op model still attempts its durable targets" {
     );
 }
 
-test "session_commands model controls remain catalog validated" {
+test "session_commands model controls remain catalog validated and clear unsupported fast state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3095,9 +3116,9 @@ test "session_commands model controls remain catalog validated" {
 
     try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
 
-    try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
     const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,
@@ -3116,7 +3137,7 @@ test "session_commands model controls remain catalog validated" {
     try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
 
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);
     const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,

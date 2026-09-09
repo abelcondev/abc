@@ -29,245 +29,134 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
-pub const PermissionActionId = [std.crypto.hash.sha2.Sha256.digest_length]u8;
-const max_turn_permission_denials: usize = 64;
+const PermissionActionId = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+const max_turn_review_holds: usize = 64;
+const max_turn_unavailable_attempts: usize = 64;
+const max_consecutive_malformed_argument_batches: usize = 3;
 
-const ApprovedAction = struct {
-    authority: command_admission.ToolExecutionAuthority,
-    human_approval: command_admission.HumanApprovalProvenance,
-    consumed: bool = false,
-};
-
-const DeniedAction = struct {
-    request_id: PermissionActionId,
+const CachedReviewHold = struct {
     exact_id: PermissionActionId,
-    semantic_id: PermissionActionId,
-    call: ToolCall,
-    approval: ?ApprovedAction = null,
+    detail: union(enum) {
+        caution: struct {
+            risk: permission_auto_classifier.Risk,
+            rationale: []u8,
+        },
+        evidence_incomplete,
+    },
 };
 
-pub const TurnPermissionRecovery = struct {
-    denied: std.ArrayList(DeniedAction) = .empty,
-    next_request_sequence: u64 = 1,
+pub const TurnReviewCache = struct {
+    holds: std.ArrayList(CachedReviewHold) = .empty,
+    /// Exact actions that already spent one unavailable reviewer attempt this
+    /// turn. This is an I/O budget, not a cached security decision.
+    unavailable_attempts: std.ArrayList(PermissionActionId) = .empty,
+    unavailable_budget_exhausted: bool = false,
 
-    pub fn deinit(self: *TurnPermissionRecovery, alloc: Allocator) void {
-        for (self.denied.items) |entry| types.freeToolCall(alloc, entry.call);
-        self.denied.deinit(alloc);
+    pub fn deinit(self: *TurnReviewCache, alloc: Allocator) void {
+        for (self.holds.items) |entry| switch (entry.detail) {
+            .caution => |caution| alloc.free(caution.rationale),
+            .evidence_incomplete => {},
+        };
+        self.holds.deinit(alloc);
+        self.unavailable_attempts.deinit(alloc);
         self.* = .{};
     }
 
-    pub fn rememberAutoDenial(
-        self: *TurnPermissionRecovery,
+    pub fn remember(
+        self: *TurnReviewCache,
         alloc: Allocator,
-        workspace_root: []const u8,
         call: ToolCall,
         outcome: command_admission.PermissionOutcome,
-    ) Allocator.Error!?PermissionActionId {
-        const reason = outcome.denial_reason orelse
-            outcome.decision.denialReason() orelse return null;
-        if (reason != .auto_denied) return null;
+    ) Allocator.Error!void {
+        const denial_reason = outcome.denial_reason orelse return;
+        switch (denial_reason) {
+            .review_caution, .review_evidence_incomplete => {},
+            .review_unavailable => {
+                if (outcome.auto_review_failure == null) return;
+                if (self.unavailable_budget_exhausted) return;
+                const exact_id = permissionActionId(call);
+                for (self.unavailable_attempts.items) |entry| {
+                    if (std.mem.eql(u8, &entry, &exact_id)) return;
+                }
+                if (self.unavailable_attempts.items.len == max_turn_unavailable_attempts) return;
+                try self.unavailable_attempts.append(alloc, exact_id);
+                self.unavailable_budget_exhausted =
+                    self.unavailable_attempts.items.len == max_turn_unavailable_attempts;
+                return;
+            },
+            .user_denied, .auto_denied, .policy_denied, .permission_required => return,
+        }
         const exact_id = permissionActionId(call);
-        if (self.indexForExactId(exact_id)) |index| {
-            return self.denied.items[index].request_id;
+        for (self.holds.items) |entry| {
+            if (std.mem.eql(u8, &entry.exact_id, &exact_id)) return;
         }
-        if (self.denied.items.len == max_turn_permission_denials) return null;
-        const next_sequence = std.math.add(
-            u64,
-            self.next_request_sequence,
-            1,
-        ) catch return null;
-        const request_id = permissionRequestId(self.next_request_sequence);
-        const owned_call = try types.dupeToolCall(alloc, call);
-        errdefer types.freeToolCall(alloc, owned_call);
-        try self.denied.append(alloc, .{
-            .request_id = request_id,
-            .exact_id = exact_id,
-            .semantic_id = try permissionSemanticActionId(
-                alloc,
-                workspace_root,
-                call,
-            ),
-            .call = owned_call,
-        });
-        self.next_request_sequence = next_sequence;
-        return request_id;
-    }
+        if (self.holds.items.len == max_turn_review_holds) return;
 
-    pub fn deniedCall(
-        self: *const TurnPermissionRecovery,
-        id: PermissionActionId,
-    ) ?ToolCall {
-        const index = self.indexForRequestId(id) orelse return null;
-        return self.denied.items[index].call;
-    }
-
-    pub fn preservedOutcome(
-        self: *const TurnPermissionRecovery,
-        alloc: Allocator,
-        workspace_root: []const u8,
-        call: ToolCall,
-    ) Allocator.Error!?command_admission.PermissionOutcome {
-        const semantic_id = try permissionSemanticActionId(
-            alloc,
-            workspace_root,
-            call,
-        );
-        for (self.denied.items) |entry| {
-            if (std.mem.eql(u8, &entry.semantic_id, &semantic_id)) {
-                return .{
-                    .decision = .deny,
-                    .denial_reason = .auto_denied,
-                };
-            }
+        switch (denial_reason) {
+            .review_caution => {
+                const review = outcome.auto_review_result orelse return;
+                if (review.decision != .caution) return;
+                const rationale = try alloc.dupe(u8, review.rationale);
+                errdefer alloc.free(rationale);
+                try self.holds.append(alloc, .{
+                    .exact_id = exact_id,
+                    .detail = .{ .caution = .{
+                        .risk = review.risk,
+                        .rationale = rationale,
+                    } },
+                });
+            },
+            .review_evidence_incomplete => try self.holds.append(alloc, .{
+                .exact_id = exact_id,
+                .detail = .evidence_incomplete,
+            }),
+            .user_denied, .auto_denied, .review_unavailable, .policy_denied, .permission_required => unreachable,
         }
-        return null;
     }
 
-    pub fn rememberApproval(
-        self: *TurnPermissionRecovery,
-        id: PermissionActionId,
-        authority: command_admission.ToolExecutionAuthority,
-        human_approval: command_admission.HumanApprovalProvenance,
-    ) bool {
-        if (human_approval == .none) return false;
-        const index = self.indexForRequestId(id) orelse return false;
-        self.denied.items[index].approval = .{
-            .authority = authority,
-            .human_approval = human_approval,
-        };
+    pub fn reviewAttemptAvailable(self: *const TurnReviewCache, call: ToolCall) bool {
+        if (self.unavailable_budget_exhausted) return false;
+        const exact_id = permissionActionId(call);
+        for (self.unavailable_attempts.items) |entry| {
+            if (std.mem.eql(u8, &entry, &exact_id)) return false;
+        }
         return true;
     }
 
-    pub fn takeApproval(
-        self: *TurnPermissionRecovery,
+    pub fn cached(
+        self: *const TurnReviewCache,
         call: ToolCall,
-    ) ?runtime_tool_contracts.LivePermissionRevalidation {
-        const index = self.indexForExactId(permissionActionId(call)) orelse
-            return null;
-        const approval = if (self.denied.items[index].approval) |*value|
-            value
-        else
-            return null;
-        if (approval.consumed) return null;
-        approval.consumed = true;
-        return .{ .action = .{
-            .authority = approval.authority,
-            .human_approval = approval.human_approval,
-        } };
-    }
-
-    fn indexForRequestId(
-        self: *const TurnPermissionRecovery,
-        id: PermissionActionId,
-    ) ?usize {
-        for (self.denied.items, 0..) |entry, index| {
-            if (std.mem.eql(u8, &entry.request_id, &id)) return index;
-        }
-        return null;
-    }
-
-    fn indexForExactId(
-        self: *const TurnPermissionRecovery,
-        id: PermissionActionId,
-    ) ?usize {
-        for (self.denied.items, 0..) |entry, index| {
-            if (std.mem.eql(u8, &entry.exact_id, &id)) return index;
+    ) ?command_admission.PermissionOutcome {
+        const exact_id = permissionActionId(call);
+        for (self.holds.items) |entry| {
+            if (!std.mem.eql(u8, &entry.exact_id, &exact_id)) continue;
+            return switch (entry.detail) {
+                .caution => |caution| .{
+                    .decision = .deny,
+                    .denial_reason = .review_caution,
+                    .auto_review_result = .{
+                        .risk = caution.risk,
+                        .decision = .caution,
+                        .rationale = caution.rationale,
+                    },
+                },
+                .evidence_incomplete => .{
+                    .decision = .deny,
+                    .denial_reason = .review_evidence_incomplete,
+                },
+            };
         }
         return null;
     }
 };
 
-pub fn permissionActionId(call: ToolCall) PermissionActionId {
+fn permissionActionId(call: ToolCall) PermissionActionId {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fx.permission-action.v1\x00");
     hash.update(call.name);
     hash.update("\x00");
     hash.update(call.arguments_json);
     return hash.finalResult();
-}
-
-fn permissionRequestId(sequence: u64) PermissionActionId {
-    var buffer: [64]u8 = undefined;
-    const rendered = std.fmt.bufPrint(
-        &buffer,
-        "fx.permission-request.v1:{d}",
-        .{sequence},
-    ) catch unreachable;
-    var id: PermissionActionId = undefined;
-    std.crypto.hash.sha2.Sha256.hash(rendered, &id, .{});
-    return id;
-}
-
-fn permissionSemanticActionId(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    call: ToolCall,
-) Allocator.Error!PermissionActionId {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var parsed = std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        call.arguments_json,
-        .{},
-    ) catch null;
-    defer if (parsed) |*value| value.deinit();
-    if (parsed) |value| {
-        if (value.value == .object) {
-            const object = value.value.object;
-            if (object.get("command")) |command_value| {
-                if (command_value == .string) {
-                    const command = normalizeRecoveryCommand(
-                        command_value.string,
-                    );
-                    const cwd = if (object.get("cwd")) |cwd_value|
-                        if (cwd_value == .string and
-                            !std.mem.eql(u8, cwd_value.string, "."))
-                            cwd_value.string
-                        else
-                            workspace_root
-                    else
-                        workspace_root;
-                    hash.update("command\x00");
-                    hash.update(command);
-                    hash.update("\x00cwd\x00");
-                    hash.update(cwd);
-                    return hash.finalResult();
-                }
-            }
-        }
-    }
-    return permissionActionId(call);
-}
-
-fn normalizeRecoveryCommand(command: []const u8) []const u8 {
-    var normalized = std.mem.trim(u8, command, " \t\r\n");
-    if (std.mem.endsWith(u8, normalized, " 2>&1")) {
-        normalized = std.mem.trimEnd(
-            u8,
-            normalized[0 .. normalized.len - " 2>&1".len],
-            " \t",
-        );
-    }
-    for ([_][]const u8{
-        "sh -c '",
-        "bash -c '",
-        "zsh -c '",
-        "/bin/sh -c '",
-        "/bin/bash -c '",
-        "/bin/zsh -c '",
-    }) |prefix| {
-        if (std.mem.startsWith(u8, normalized, prefix) and
-            std.mem.endsWith(u8, normalized, "'") and
-            normalized.len > prefix.len)
-        {
-            return std.mem.trim(
-                u8,
-                normalized[prefix.len .. normalized.len - 1],
-                " \t\r\n",
-            );
-        }
-    }
-    return normalized;
 }
 
 const TerminalValidationDigestDecision = struct {
@@ -318,7 +207,7 @@ pub const TerminalValidationRetryState = struct {
         call: ToolCall,
         model_output: []const u8,
     ) Allocator.Error!void {
-        if (!std.mem.eql(u8, call.name, "terminal")) return;
+        if (!std.mem.eql(u8, call.name, "shell")) return;
         if (try tool_result_errors.inspectTerminalActionFieldCorrection(
             alloc,
             model_output,
@@ -345,6 +234,147 @@ pub const TerminalValidationRetryState = struct {
     }
 };
 
+pub const ShellExecutionFailureRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *ShellExecutionFailureRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        execution: ToolExecutionResult,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "shell") or execution.status != .failure) {
+            return;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.shell-execution-failure.v1\x00");
+        hash.update(call.arguments_json);
+        const digest = hash.finalResult();
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
+pub const MalformedArgumentsRetryState = struct {
+    consecutive_malformed_batches: usize = 0,
+    current_call_count: usize = 0,
+    current_malformed_count: usize = 0,
+
+    pub fn beginBatch(self: *MalformedArgumentsRetryState) void {
+        self.current_call_count = 0;
+        self.current_malformed_count = 0;
+    }
+
+    pub fn observe(self: *MalformedArgumentsRetryState, call: ToolCall) void {
+        self.current_call_count += 1;
+        if (call.argument_integrity == .valid) return;
+        self.current_malformed_count += 1;
+    }
+
+    pub fn finishBatch(self: *MalformedArgumentsRetryState) bool {
+        const all_malformed = self.current_call_count > 0 and
+            self.current_call_count == self.current_malformed_count;
+        if (!all_malformed) {
+            self.consecutive_malformed_batches = 0;
+            return false;
+        }
+        if (self.consecutive_malformed_batches < max_consecutive_malformed_argument_batches) {
+            self.consecutive_malformed_batches += 1;
+        }
+        return self.consecutive_malformed_batches == max_consecutive_malformed_argument_batches;
+    }
+};
+
+test "non-object arguments use the existing bounded invalid-argument retry budget" {
+    var state = MalformedArgumentsRetryState{};
+    const call: ToolCall = .{ .id = "bad", .name = "read_file", .arguments_json = "{}", .argument_integrity = .non_object_json };
+    for (0..3) |index| {
+        state.beginBatch();
+        state.observe(call);
+        try std.testing.expectEqual(index == 2, state.finishBatch());
+    }
+    state.beginBatch();
+    state.observe(.{ .id = "good", .name = "read_file", .arguments_json = "{}" });
+    try std.testing.expect(!state.finishBatch());
+}
+
+test "malformed arguments retry state stops consecutive all-malformed batches" {
+    const malformed_read: ToolCall = .{
+        .id = "read-1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const malformed_fetch: ToolCall = .{
+        .id = "fetch-1",
+        .name = "web_fetch",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const valid_read: ToolCall = .{
+        .id = "read-valid",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    };
+
+    var state: MalformedArgumentsRetryState = .{};
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    try std.testing.expect(state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    state.observe(valid_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(state.finishBatch());
+}
+
 test "terminal validation retry state retains independent batch corrections" {
     const alloc = std.testing.allocator;
     const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
@@ -365,7 +395,7 @@ test "terminal validation retry state retains independent batch corrections" {
     defer alloc.free(correction_t);
     const call: ToolCall = .{
         .id = "terminal-call",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = "{}",
     };
 
@@ -386,61 +416,236 @@ test "terminal validation retry state retains independent batch corrections" {
     try std.testing.expect(state.finishBatch());
 }
 
-test "turn permission recovery binds approval exactly and deduplicates static wrappers" {
+test "shell request corrections stop after the complete repeated batch" {
     const alloc = std.testing.allocator;
-    var state: TurnPermissionRecovery = .{};
+    const shell = @import("../../../tools/shell/shell.zig");
+    var state: TerminalValidationRetryState = .{};
     defer state.deinit(alloc);
-    const direct: ToolCall = .{
-        .id = "direct",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin HEAD\"}",
+    const inputs = [_][]const u8{
+        "{\"command\":\"true\",\"yield_time_ms\":\"1000\"}",
+        "{\"yield_time_ms\":\"1000\",\"command\":\"true\"}",
     };
-    const wrapped: ToolCall = .{
-        .id = "wrapped",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sh -c 'git push origin HEAD'\"}",
-    };
-    const changed: ToolCall = .{
-        .id = "changed",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin main\"}",
-    };
-    const request_id = (try state.rememberAutoDenial(
-        alloc,
-        "/workspace",
-        direct,
-        .{ .decision = .deny, .denial_reason = .auto_denied },
-    )) orelse return error.TestExpectedPermissionRequest;
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &request_id,
-        &permissionActionId(direct),
-    ));
-    try std.testing.expect(state.deniedCall(request_id) != null);
-    try std.testing.expect((try state.preservedOutcome(
-        alloc,
-        "/workspace",
-        wrapped,
-    )) != null);
-    try std.testing.expect((try state.preservedOutcome(
-        alloc,
-        "/workspace",
-        changed,
-    )) == null);
+    for (inputs, 0..) |args, index| {
+        const call: ToolCall = .{ .id = "invalid", .name = "shell", .arguments_json = args };
+        state.beginBatch();
+        const decoded = try shell.decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try state.observe(alloc, call, failure);
+            },
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+        }
+        try state.observe(alloc, call, "ordinary successful neighboring result");
+        try std.testing.expectEqual(index == 1, state.finishBatch());
+    }
+}
 
-    try std.testing.expect(state.rememberApproval(
-        request_id,
-        .ordinary,
-        .once,
-    ));
-    const first = state.takeApproval(direct) orelse
-        return error.TestExpectedPermissionApproval;
+test "shell execution failures retain independent batch identities" {
+    const alloc = std.testing.allocator;
+    const first: ToolCall = .{
+        .id = "first",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"first\"}",
+    };
+    const second: ToolCall = .{
+        .id = "second",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"second\"}",
+    };
+    const failed = ToolExecutionResult{
+        .status = .failure,
+        .model_output = "session lost",
+    };
+    const succeeded = ToolExecutionResult{ .model_output = "ok" };
+    var state: ShellExecutionFailureRetryState = .{};
+    defer state.deinit(alloc);
+
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(state.finishBatch());
+
+    state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(state.finishBatch());
+}
+
+test "turn review cache reuses only exact deterministic holds" {
+    const alloc = std.testing.allocator;
+    var cache: TurnReviewCache = .{};
+    defer cache.deinit(alloc);
+    const first = ToolCall{
+        .id = "first",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf frames\"}",
+    };
+    const same = ToolCall{
+        .id = "same-new-call-id",
+        .name = "shell",
+        .arguments_json = first.arguments_json,
+    };
+    const wrapped = ToolCall{
+        .id = "wrapped",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"sh -c 'rm -rf frames'\"}",
+    };
+    try cache.remember(alloc, first, .{
+        .decision = .deny,
+        .denial_reason = .review_caution,
+        .auto_review_result = .{
+            .risk = .high,
+            .decision = .caution,
+            .rationale = "Deletion came from untrusted content.",
+        },
+    });
+
+    const preserved = cache.cached(same) orelse
+        return error.TestExpectedPermissionDenial;
     try std.testing.expectEqual(
-        command_admission.HumanApprovalProvenance.once,
-        first.action.human_approval,
+        types.ToolPermissionDenialReason.review_caution,
+        preserved.denial_reason.?,
     );
-    try std.testing.expect(state.takeApproval(direct) == null);
-    try std.testing.expect(state.takeApproval(changed) == null);
+    try std.testing.expectEqualStrings(
+        "Deletion came from untrusted content.",
+        preserved.auto_review_result.?.rationale,
+    );
+    try std.testing.expect(cache.cached(wrapped) == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.holds.items.len);
+    try cache.remember(alloc, wrapped, .{
+        .decision = .once,
+        .auto_review_result = .{
+            .risk = .low,
+            .decision = .clear,
+            .rationale = "Exact action matches the current request.",
+        },
+    });
+    try cache.remember(alloc, wrapped, .{
+        .decision = .deny,
+        .denial_reason = .review_unavailable,
+        .auto_review_failure = .transport_timed_out,
+    });
+    const repeated_unavailable = ToolCall{
+        .id = "same-unavailable",
+        .name = wrapped.name,
+        .arguments_json = wrapped.arguments_json,
+    };
+    try std.testing.expect(cache.cached(repeated_unavailable) == null);
+    try std.testing.expect(!cache.reviewAttemptAvailable(repeated_unavailable));
+    try std.testing.expect(cache.reviewAttemptAvailable(.{
+        .id = "changed-unavailable",
+        .name = wrapped.name,
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
+    }));
+    try std.testing.expectEqual(@as(usize, 1), cache.holds.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.unavailable_attempts.items.len);
+
+    const incomplete = ToolCall{
+        .id = "incomplete",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\".zshrc\",\"new_string\":\"API_KEY=literal\"}",
+    };
+    try cache.remember(alloc, incomplete, .{
+        .decision = .deny,
+        .denial_reason = .review_evidence_incomplete,
+    });
+    const preserved_incomplete = cache.cached(.{
+        .id = "same-incomplete",
+        .name = incomplete.name,
+        .arguments_json = incomplete.arguments_json,
+    }) orelse return error.TestExpectedPermissionDenial;
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.review_evidence_incomplete,
+        preserved_incomplete.denial_reason.?,
+    );
+    try std.testing.expect(cache.cached(.{
+        .id = "changed-incomplete",
+        .name = incomplete.name,
+        .arguments_json = "{\"path\":\".zshrc\",\"new_string\":\"API_KEY=$key\"}",
+    }) == null);
+    try std.testing.expectEqual(@as(usize, 2), cache.holds.items.len);
+
+    var arguments_buffer: [128]u8 = undefined;
+    for (1..65) |index| {
+        const arguments = try std.fmt.bufPrint(
+            &arguments_buffer,
+            "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
+            .{index},
+        );
+        try cache.remember(alloc, .{
+            .id = "bounded",
+            .name = "shell",
+            .arguments_json = arguments,
+        }, .{
+            .decision = .deny,
+            .denial_reason = .review_caution,
+            .auto_review_result = .{
+                .risk = .high,
+                .decision = .caution,
+                .rationale = "Deletion came from untrusted content.",
+            },
+        });
+    }
+    try std.testing.expectEqual(max_turn_review_holds, cache.holds.items.len);
+    const overflow_arguments = try std.fmt.bufPrint(
+        &arguments_buffer,
+        "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
+        .{@as(usize, 64)},
+    );
+    try std.testing.expect(cache.cached(.{
+        .id = "overflow",
+        .name = "shell",
+        .arguments_json = overflow_arguments,
+    }) == null);
+}
+
+test "turn review cache closes after the unavailable transport budget" {
+    const alloc = std.testing.allocator;
+    var cache: TurnReviewCache = .{};
+    defer cache.deinit(alloc);
+
+    var arguments_buffer: [128]u8 = undefined;
+    for (0..max_turn_unavailable_attempts) |index| {
+        const arguments = try std.fmt.bufPrint(
+            &arguments_buffer,
+            "{{\"action\":\"run\",\"command\":\"unknown-{d}\"}}",
+            .{index},
+        );
+        const call = ToolCall{
+            .id = "unavailable",
+            .name = "shell",
+            .arguments_json = arguments,
+        };
+        try std.testing.expect(cache.reviewAttemptAvailable(call));
+        try cache.remember(alloc, call, .{
+            .decision = .deny,
+            .denial_reason = .review_unavailable,
+            .auto_review_failure = .transport_timed_out,
+        });
+    }
+
+    try std.testing.expectEqual(
+        max_turn_unavailable_attempts,
+        cache.unavailable_attempts.items.len,
+    );
+    try std.testing.expect(!cache.reviewAttemptAvailable(.{
+        .id = "after-budget",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
+    }));
 }
 
 /// Human denials retained only for the current agent turn. Entries use the
@@ -505,19 +710,19 @@ pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
         );
 }
 
-test "auto permission lifecycle deferral applies only to terminal exec" {
+test "auto permission lifecycle deferral applies only to shell run" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const exec = ToolCall{
         .id = "exec",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     const start = ToolCall{
         .id = "start",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"start\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"list\"}",
     };
     try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
         test_builtin_tools.registry,
@@ -545,12 +750,23 @@ pub fn requestToolPermissionTraced(
     live_authority: ?runtime_tool_contracts.LiveToolAuthority,
     revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
     advertised_dynamic_tool_names: []const []const u8,
+    advertised_dynamic_tools: []const @import("../stream_provider.zig").DynamicFunctionTool,
     workspace_root: []const u8,
     ctx: TraceContext,
 ) !command_admission.PermissionOutcome {
     const target_class = classifyPermissionTarget(hooks, arena, call, advertised_dynamic_tool_names, workspace_root);
     tracePermissionRequest(call, mode, local_grants.len, target_class, ctx);
-    const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, review_turn, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names) catch |err| {
+    const review_schema = schema: {
+        for (advertised_dynamic_tools) |tool| {
+            if (!std.mem.eql(u8, tool.name, call.name)) continue;
+            var input: std.Io.Writer.Allocating = .init(arena);
+            defer input.deinit();
+            try std.json.Stringify.value(tool.input_schema, .{}, &input.writer);
+            break :schema try @import("../../tooling/model_tool_schema.zig").dynamicFunctionSchemaJsonAlloc(arena, tool.name, tool.description, input.written());
+        }
+        break :schema null;
+    };
+    const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, review_turn, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, review_schema) catch |err| {
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
     };
     tracePermissionOutcome(call, mode, local_grants.len, target_class, ctx, outcome);
@@ -596,7 +812,7 @@ fn tracePermissionRequest(
     target_class: []const u8,
     ctx: TraceContext,
 ) void {
-    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s} sandbox_outcome=not_applicable", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
+    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
     debug_trace.eventf("permission", "permission_requested", ctx, "call_id={s} tool_name={s} permission_mode={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), target_class });
 }
 
@@ -632,55 +848,6 @@ fn tracePermissionOutcome(
         debug_trace.eventf("permission", "after_permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
         debug_trace.eventf("permission", "permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
     }
-}
-
-pub fn requestSandboxWideningTraced(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    call: ToolCall,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-    mode: PermissionMode,
-    local_grants: []const PermissionGrant,
-    live_authority: ?runtime_tool_contracts.LiveToolAuthority,
-    advertised_dynamic_tool_names: []const []const u8,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    cancel_flag: *std.atomic.Value(bool),
-    ctx: TraceContext,
-) !command_admission.PermissionOutcome {
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_requested",
-        ctx,
-        "call_id={s} tool_name={s} phase={s}",
-        .{ call.id, call.name, @tagName(required.phase) },
-    );
-    const outcome = try hooks.request_sandbox_widening(
-        hooks.ctx,
-        arena,
-        call,
-        review_turn,
-        mode,
-        local_grants,
-        live_authority,
-        advertised_dynamic_tool_names,
-        required,
-    );
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_decision",
-        ctx,
-        "call_id={s} tool_name={s} phase={s} decision={s}",
-        .{
-            call.id,
-            call.name,
-            @tagName(required.phase),
-            permissionDecisionName(outcome.decision),
-        },
-    );
-    if (outcome.decision.isDenied() and cancel_flag.load(.seq_cst)) {
-        return error.Cancelled;
-    }
-    return outcome;
 }
 
 fn classifyPermissionTarget(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8, workspace_root: []const u8) []const u8 {
@@ -723,6 +890,9 @@ pub noinline fn permissionDeniedStatusLabel(reason: types.ToolPermissionDenialRe
     return switch (reason) {
         .user_denied => "Denied",
         .auto_denied => "Denied by auto agent",
+        .review_caution => "Safety caution",
+        .review_evidence_incomplete => "Review evidence incomplete",
+        .review_unavailable => "Review unavailable",
         .policy_denied => "Denied",
         .permission_required => "Permission required",
     };
@@ -739,274 +909,6 @@ pub fn retainSessionGrant(hooks: *const AgentRuntimeDeps, arena: Allocator, loca
     };
     try appendLocalGrant(arena, local_grants, grant);
     try propagateGrant(hooks, grant);
-}
-
-pub fn repeatedDynamicMcpFailure(
-    arena: Allocator,
-    current_turn_messages: []const types.ChatMessage,
-    call: ToolCall,
-    advertised_dynamic_tool_names: []const []const u8,
-) !?ToolExecutionResult {
-    if (!containsName(advertised_dynamic_tool_names, call.name)) return null;
-    if (!try hasTwoEquivalentDynamicMcpFailures(
-        arena,
-        current_turn_messages,
-        call,
-    )) return null;
-    return .{
-        .status = .failure,
-        .model_output = try arena.dupe(
-            u8,
-            "Repeated MCP tool call blocked: two equivalent attempts failed. Change the top-level argument structure, reselect the tool, ask the user, or stop.",
-        ),
-    };
-}
-
-fn hasTwoEquivalentDynamicMcpFailures(
-    arena: Allocator,
-    messages: []const types.ChatMessage,
-    current_call: ToolCall,
-) !bool {
-    var matching_failures: usize = 0;
-    var batch_end = messages.len;
-    while (batch_end > 0) {
-        var assistant_index = batch_end;
-        var found_assistant = false;
-        while (assistant_index > 0) {
-            assistant_index -= 1;
-            if (messages[assistant_index].role == .assistant) {
-                found_assistant = true;
-                break;
-            }
-        }
-        if (!found_assistant) return false;
-
-        const calls = messages[assistant_index].tool_calls;
-        const results = messages[assistant_index + 1 .. batch_end];
-        var completed_calls: usize = 0;
-        var matching_in_batch: usize = 0;
-        var target_completed = false;
-        for (calls) |prior_call| {
-            const status = completedResultStatus(results, prior_call) orelse continue;
-            completed_calls += 1;
-            if (std.mem.eql(u8, prior_call.name, "mcp_select_tool") and
-                status == .success)
-            {
-                return false;
-            }
-            if (!std.mem.eql(u8, prior_call.name, current_call.name)) continue;
-            target_completed = true;
-            if (status != .failure or
-                !try sameTopLevelArgumentShape(
-                    arena,
-                    prior_call.arguments_json,
-                    current_call.arguments_json,
-                ))
-            {
-                return false;
-            }
-            matching_in_batch += 1;
-        }
-        if (target_completed) {
-            matching_failures += matching_in_batch;
-            if (matching_failures >= 2) return true;
-        } else if (completed_calls > 0) {
-            return false;
-        }
-        batch_end = assistant_index;
-    }
-    return false;
-}
-
-fn completedResultStatus(
-    messages: []const types.ChatMessage,
-    call: ToolCall,
-) ?types.PersistedToolStatus {
-    var matched: ?types.PersistedToolStatus = null;
-    for (messages) |message| {
-        if (message.role != .tool) continue;
-        const call_id = message.tool_call_id orelse continue;
-        if (!std.mem.eql(u8, call_id, call.id)) continue;
-        if (matched != null or
-            message.tool_name == null or
-            !std.mem.eql(u8, message.tool_name.?, call.name) or
-            message.tool_result_status == null)
-        {
-            return null;
-        }
-        matched = message.tool_result_status.?;
-    }
-    return matched;
-}
-
-fn sameTopLevelArgumentShape(
-    alloc: Allocator,
-    left_json: []const u8,
-    right_json: []const u8,
-) Allocator.Error!bool {
-    var left = try parseArgumentValue(alloc, left_json);
-    defer if (left) |*parsed| parsed.deinit();
-    var right = try parseArgumentValue(alloc, right_json);
-    defer if (right) |*parsed| parsed.deinit();
-    if (left == null or right == null) return left == null and right == null;
-
-    const left_value = left.?.value;
-    const right_value = right.?.value;
-    if (std.meta.activeTag(left_value) != std.meta.activeTag(right_value)) return false;
-    if (left_value != .object) return true;
-    if (left_value.object.count() != right_value.object.count()) return false;
-    var fields = left_value.object.iterator();
-    while (fields.next()) |field| {
-        const right_field = right_value.object.get(field.key_ptr.*) orelse return false;
-        if (std.meta.activeTag(field.value_ptr.*) != std.meta.activeTag(right_field)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn parseArgumentValue(
-    alloc: Allocator,
-    bytes: []const u8,
-) Allocator.Error!?std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => null,
-    };
-}
-
-fn containsName(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.eql(u8, value, needle)) return true;
-    }
-    return false;
-}
-
-test "third equivalent dynamic MCP failure is blocked from existing turn history" {
-    const first_calls = [_]ToolCall{.{
-        .id = "call-1",
-        .name = "mcp_plain_getThreads",
-        .arguments_json = "{\"customerId\":\"\",\"labels\":[]}",
-    }};
-    const second_calls = [_]ToolCall{.{
-        .id = "call-2",
-        .name = "mcp_plain_getThreads",
-        .arguments_json = "{\"customerId\":\"placeholder\",\"labels\":[\"fake\"]}",
-    }};
-    const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &first_calls },
-        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &second_calls },
-        .{ .role = .tool, .tool_call_id = "call-2", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
-    };
-    const advertised = [_][]const u8{"mcp_plain_getThreads"};
-    const current = ToolCall{
-        .id = "call-3",
-        .name = "mcp_plain_getThreads",
-        .arguments_json = "{\"labels\":[\"another\"],\"customerId\":\"invented\"}",
-    };
-
-    const blocked = (try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        &messages,
-        current,
-        &advertised,
-    )) orelse return error.TestExpectedEqual;
-    defer std.testing.allocator.free(blocked.model_output);
-    try std.testing.expectEqual(runtime_tool_contracts.ToolExecutionStatus.failure, blocked.status);
-    try std.testing.expect(std.mem.find(u8, blocked.model_output, "two equivalent attempts") != null);
-}
-
-test "dynamic MCP retry containment resets on success shape tool and reselection" {
-    const failures = [_]ToolCall{
-        .{ .id = "failure-1", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"one\"}" },
-        .{ .id = "failure-2", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"two\"}" },
-    };
-    const other = [_]ToolCall{.{ .id = "other", .name = "read_file", .arguments_json = "{}" }};
-    const reselect = [_]ToolCall{.{ .id = "select", .name = "mcp_select_tool", .arguments_json = "{\"name\":\"mcp_plain_getThreads\"}" }};
-    const current = ToolCall{ .id = "current", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"three\"}" };
-    const advertised = [_][]const u8{"mcp_plain_getThreads"};
-
-    const success_messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = failures[0..1] },
-        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = failures[1..2] },
-        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .success },
-    };
-    try std.testing.expect((try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        &success_messages,
-        current,
-        &advertised,
-    )) == null);
-
-    const other_messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &failures },
-        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
-        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &other },
-        .{ .role = .tool, .tool_call_id = "other", .tool_name = "read_file", .tool_result_status = .failure },
-    };
-    try std.testing.expect((try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        &other_messages,
-        current,
-        &advertised,
-    )) == null);
-
-    const reselected_messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &failures },
-        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
-        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &reselect },
-        .{ .role = .tool, .tool_call_id = "select", .tool_name = "mcp_select_tool", .tool_result_status = .success },
-    };
-    try std.testing.expect((try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        &reselected_messages,
-        current,
-        &advertised,
-    )) == null);
-
-    const changed_shape = ToolCall{ .id = "changed", .name = current.name, .arguments_json = "{\"id\":3}" };
-    try std.testing.expect((try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        other_messages[0..3],
-        changed_shape,
-        &advertised,
-    )) == null);
-}
-
-test "parallel unrelated results do not reset matching dynamic MCP failures" {
-    const first_batch = [_]ToolCall{
-        .{ .id = "target-1", .name = "mcp_plain_getThreads", .arguments_json = "not-json" },
-        .{ .id = "other-1", .name = "read_file", .arguments_json = "{}" },
-    };
-    const second_batch = [_]ToolCall{.{
-        .id = "target-2",
-        .name = "mcp_plain_getThreads",
-        .arguments_json = "also-not-json",
-    }};
-    const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = &first_batch },
-        .{ .role = .tool, .tool_call_id = "other-1", .tool_name = "read_file", .tool_result_status = .success },
-        .{ .role = .tool, .tool_call_id = "target-1", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &second_batch },
-        .{ .role = .tool, .tool_call_id = "target-2", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
-    };
-    const advertised = [_][]const u8{"mcp_plain_getThreads"};
-    const current = ToolCall{
-        .id = "target-3",
-        .name = "mcp_plain_getThreads",
-        .arguments_json = "still-not-json",
-    };
-    const blocked = (try repeatedDynamicMcpFailure(
-        std.testing.allocator,
-        &messages,
-        current,
-        &advertised,
-    )) orelse return error.TestExpectedEqual;
-    defer std.testing.allocator.free(blocked.model_output);
 }
 
 fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
@@ -1042,9 +944,6 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
-        // A broader sandbox retry is a separate scope and must receive its own
-        // decision. Only that widening decision may retain a sandbox grant.
-        if (std.mem.eql(u8, grant.tool_name, "sandbox")) continue;
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }
@@ -1086,12 +985,21 @@ fn propagateGrant(hooks: *const AgentRuntimeDeps, grant: PermissionGrant) !void 
 }
 
 pub fn registeredToolValidationFailure(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall) !?ToolExecutionResult {
-    if (call.provider_result != null) return null;
-    const validate = hooks.validate_tool_call orelse return null;
-    return switch (try validate(hooks.ctx, arena, call)) {
-        .not_registered, .valid => null,
+    return switch (try toolCallValidation(hooks, arena, call)) {
+        .not_registered => null,
+        .valid => null,
         .failure => |reason| .{ .model_output = reason, .status = .failure },
     };
+}
+
+pub fn toolCallValidation(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+) !runtime_tool_contracts.ToolCallValidationResult {
+    if (call.provider_result != null) return .{ .valid = .{} };
+    const validate = hooks.validate_tool_call orelse return .{ .valid = .{} };
+    return validate(hooks.ctx, arena, call);
 }
 
 pub fn toolAvailabilityFailure(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall) !?ToolExecutionResult {

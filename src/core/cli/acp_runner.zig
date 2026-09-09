@@ -1,27 +1,26 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
-);
+const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
+const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
-const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
+    auth_mode: credentials.AuthMode = .local,
     default_model: []const u8,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
-    background_process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    provider_set: provider_set.Set,
+    process_provider: process_provider.Provider = process_provider.unavailable_provider,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
     ignored_list_entries: []const []const u8,
@@ -34,8 +33,6 @@ pub const Config = struct {
     max_history_turns: usize,
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
-    devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
@@ -46,6 +43,7 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    minimal_kernel: bool = false,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

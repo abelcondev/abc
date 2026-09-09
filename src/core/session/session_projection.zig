@@ -74,6 +74,27 @@ pub const Checkpoint = struct {
     }
 };
 
+inline fn failCheckpoint(err: anytype) @TypeOf(err)!Checkpoint {
+    return @errorCast(failCheckpointDynamic(err));
+}
+
+noinline fn failCheckpointDynamic(err: anyerror) anyerror!Checkpoint {
+    return err;
+}
+
+test "checkpoint failures preserve exact error types and identities" {
+    const invalid = failCheckpoint(error.InvalidCheckpoint);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidCheckpoint}!Checkpoint,
+    );
+    try std.testing.expectError(error.InvalidCheckpoint, invalid);
+    try std.testing.expectError(
+        error.CheckpointTooLarge,
+        failCheckpoint(error.CheckpointTooLarge),
+    );
+    try std.testing.expectError(error.OutOfMemory, failCheckpoint(error.OutOfMemory));
+}
+
 pub const EventBoundary = struct {
     log_generation: session_event.Identifier,
     seq: u64,
@@ -283,6 +304,7 @@ fn durablePreferencesEqual(
     right: session_codec.DurableSessionPreferences,
 ) bool {
     return std.mem.eql(u8, left.model, right.model) and
+        left.provider == right.provider and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode;
 }
@@ -312,9 +334,9 @@ pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
 
 pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8) !Checkpoint {
     return decodeCheckpointImpl(alloc, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CheckpointTooLarge => return error.CheckpointTooLarge,
-        else => return error.InvalidCheckpoint,
+        error.OutOfMemory => return failCheckpoint(error.OutOfMemory),
+        error.CheckpointTooLarge => return failCheckpoint(error.CheckpointTooLarge),
+        else => return failCheckpoint(error.InvalidCheckpoint),
     };
 }
 
@@ -456,20 +478,17 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}}}", .{
+    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    try writeJsonString(writer, @tagName(preferences.provider));
+    try writer.writeByte('}');
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
-    errdefer alloc.free(model);
-    return .{
-        .model = model,
-        .effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
-            return error.InvalidManifest,
-        .fast_mode = try requireBool(object, "fast_mode"),
+    return session_codec.parse_preferences(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidManifest,
     };
 }
 
@@ -497,12 +516,6 @@ fn requireString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
 
 fn dupeString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
     return try alloc.dupe(u8, try requireString(object, key));
-}
-
-fn requireBool(object: std.json.ObjectMap, key: []const u8) !bool {
-    const value = object.get(key) orelse return error.InvalidManifest;
-    if (value != .bool) return error.InvalidManifest;
-    return value.bool;
 }
 
 fn requireI64(object: std.json.ObjectMap, key: []const u8) !i64 {

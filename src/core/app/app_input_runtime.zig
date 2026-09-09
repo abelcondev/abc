@@ -5,6 +5,8 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
+const project_config = @import("../mcp/project_config.zig");
+const mcp_menu_state = @import("../mcp/menu_state.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -23,6 +25,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -39,7 +42,6 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const types = @import("../shared/types.zig");
-const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -49,6 +51,9 @@ const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
+const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
+const mcp_menu_presentation = @import("../../ui/footer/mcp_menu_presentation.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -57,10 +62,9 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
-const input_subagent_runtime = @import("input_subagent_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
@@ -100,43 +104,22 @@ const ExplicitModelSelectionParse = union(enum) {
     selection: ExplicitModelSelection,
 };
 
-fn shortcutMayMutateQueuedDraft(action: input_action.ShortcutAction) bool {
-    return switch (action) {
-        .move,
-        .select_all,
-        .copy_selection,
-        .redraw,
-        => false,
-        .cut_selection,
-        .undo,
-        .redo,
-        .history_previous,
-        .history_next,
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-        .yank,
-        .insert_newline,
-        => true,
-    };
-}
+const ProjectMcpPromptInputState = struct {
+    active: bool,
+    question_active: bool,
+    approval_active: bool,
+    subagent_active: bool,
+    menu_active: bool,
+    authentication_active: bool,
+};
 
-fn shortcutDeletesQueuedDraft(action: input_action.ShortcutAction) bool {
-    return switch (action) {
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-        => true,
-        else => false,
-    };
+fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
+    return state.active and
+        !state.question_active and
+        !state.approval_active and
+        !state.subagent_active and
+        !state.menu_active and
+        !state.authentication_active;
 }
 
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
@@ -190,14 +173,13 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
 pub fn Runtime(comptime App: type) type {
     return struct {
         const history_rt = input_history_runtime.HistoryRuntime(App);
-        const subagent_rt = input_subagent_runtime.SubagentRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+        const provider_picker_rt = provider_picker_runtime.Runtime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
         const approval_rt = input_approval_runtime.ApprovalRuntime(App);
         const question_rt = input_question_runtime.QuestionRuntime(App);
         const interrupt_rt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
         const full_transcript_rt = input_full_transcript_runtime.Runtime(App);
 
         const ctrl_c_exit_window_ms = gesture_state.ctrl_c_exit_window_ms;
@@ -214,12 +196,6 @@ pub fn Runtime(comptime App: type) type {
         const navigateModelPicker = completion_rt.navigateModelPicker;
         const cancelApprovalOperation = approval_rt.cancelApprovalOperation;
 
-        fn selectedChildRouteActive(app: *const App) bool {
-            if (comptime @hasDecl(@TypeOf(app.subagents), "childRouteId")) {
-                return app.subagents.childRouteId() != null;
-            }
-            return false;
-        }
         const routeApprovalEscapeAction = approval_rt.routeApprovalEscapeAction;
         const routeQuestionEscapeAction = question_rt.routeQuestionEscapeAction;
         const submitQuestionBatch = question_rt.submitQuestionBatch;
@@ -269,27 +245,41 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeComposerShortcutAction(app: *App, action: input_action.ShortcutAction, max_input_len: usize) !void {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (shortcutDeletesQueuedDraft(action) and try queue_rt.deleteEmptyVisibleDraft(app)) return;
-                if (shortcutMayMutateQueuedDraft(action)) queue_rt.markVisibleSelectionDirty(app);
-            }
             switch (action) {
                 .move => |intent| {
                     switch (intent.kind) {
                         .character_left => {
                             app.input_runtime.vertical_navigation.reset();
                             if (!intent.extend_selection and
-                                app.input_runtime.edit_state.selectionRange() == null and
-                                !app.stream.active and
-                                try completion_rt.stepBackModelPicker(app))
+                                app.input_runtime.edit_state.selectionRange() == null)
                             {
-                                app.shell.render_requests.request(.footer);
-                                return;
+                                if (!app.stream.active and try provider_picker_rt.stepBack(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
+                                if (try completion_rt.stepBackModelPicker(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
                             }
                             _ = app.input_runtime.moveInputCursor(intent);
                         },
                         .character_right => {
                             app.input_runtime.vertical_navigation.reset();
+                            // In the provider picker the arrows walk columns:
+                            // Left reopens the previous one, Right acts as
+                            // Enter on the highlighted row. Only from the end
+                            // of the text, so Right keeps moving the cursor
+                            // while editing.
+                            if (!intent.extend_selection and
+                                app.input_runtime.edit_state.selectionRange() == null and
+                                !app.stream.active and
+                                app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len and
+                                try provider_picker_rt.submit(app))
+                            {
+                                app.shell.render_requests.request(.footer);
+                                return;
+                            }
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null)
                             {
@@ -575,7 +565,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn terminalDecodeContext(
-            app: *const App,
+            app: *App,
             paste_active: bool,
         ) input_action.TerminalDecodeContext {
             if (paste_active) {
@@ -583,15 +573,13 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = 0,
                     .paste_active = true,
                     .cancel_pending = false,
-                    .child_route_active = false,
                     .question_freeform_selected = false,
                 };
             }
             return .{
                 .now_ms = io_mod.milliTimestamp(),
                 .paste_active = false,
-                .cancel_pending = app.stream.active,
-                .child_route_active = selectedChildRouteActive(app),
+                .cancel_pending = interrupt_rt.hasActiveOperation(app),
                 .question_freeform_selected = app.question_prompt.isFreeformSelected(),
             };
         }
@@ -609,6 +597,9 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
+                _ = full_transcript_rt.cancelPendingOpenForInput(app);
+            }
 
             const file_picker_was_active = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
             defer if (comptime runtime_profile.allows(App, .file_index))
@@ -637,6 +628,11 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
+            if (replay_byte) |byte| {
+                if (byte != 0x1b and try routeProjectMcpPromptByte(app, byte)) {
+                    replay_byte = null;
+                }
+            }
             if (ingress.event) |event| {
                 switch (event) {
                     .paste_byte => |byte| {
@@ -656,7 +652,6 @@ pub fn Runtime(comptime App: type) type {
                             decoded.composer_shortcut,
                             decoded.approval_focused_edit,
                             decoded.question_action,
-                            decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
                         )) {
@@ -726,11 +721,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn terminalPasteActive(app: *const App) bool {
-            if (app.input_runtime.paste.active()) return true;
-            if (comptime @hasDecl(@TypeOf(app.subagents), "managerPasteActive")) {
-                return app.subagents.managerPasteActive();
-            }
-            return false;
+            return app.input_runtime.paste.active();
+        }
+
+        fn terminalIngressCancelsPendingFullTranscriptOpen(
+            ingress: input_action.TerminalInputIngress,
+        ) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .paste_byte, .raw => true,
+                .action => |decoded| decoded.action != .toggle_full_transcript,
+            };
         }
 
         pub fn routeActivePasteIngressByteWithLimits(
@@ -762,40 +763,6 @@ pub fn Runtime(comptime App: type) type {
                     io_mod.milliTimestamp(),
                 );
             };
-
-            if (comptime @hasDecl(@TypeOf(app.subagents), "settleManagerPasteDeliveryEpoch")) {
-                if (app.subagents.managerPasteActive()) {
-                    const failure_before = if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "childPresentationView",
-                    ))
-                        if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null
-                    else
-                        null;
-                    const settled = app.subagents.settleManagerPasteDeliveryEpoch(app.alloc);
-                    if (!settled) return;
-                    if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "invalidateChildConversationProjection",
-                    )) {
-                        const failure_after = if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null;
-                        if (!std.meta.eql(failure_before, failure_after)) {
-                            app.subagents.invalidateChildConversationProjection(app.alloc);
-                        }
-                    }
-                    app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                        app,
-                        .subagent_panel,
-                    );
-                    return;
-                }
-            }
 
             if (app.input_runtime.paste.active()) {
                 const settled = try paste_rt.settlePasteDeliveryEpoch(
@@ -838,43 +805,91 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             byte: u8,
         ) !bool {
-            if (comptime @hasDecl(@TypeOf(app.subagents), "managerPasteActive")) {
-                if (app.subagents.managerPasteActive()) {
-                    const failure_before = if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "childPresentationView",
-                    ))
-                        if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null
-                    else
-                        null;
-                    _ = try app.subagents.consumeManagerPasteByte(app.alloc, byte);
-                    if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "invalidateChildConversationProjection",
-                    )) {
-                        const failure_after = if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null;
-                        if (!std.meta.eql(failure_before, failure_after)) {
-                            app.subagents.invalidateChildConversationProjection(app.alloc);
-                        }
-                    }
-                    app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                        app,
-                        .subagent_panel,
-                    );
-                    return true;
-                }
-            }
             if (app.input_runtime.paste.active()) {
                 try paste_rt.handleActivePasteByte(app, byte);
                 return true;
             }
             return false;
+        }
+
+        fn projectMcpPromptOwnsInput(app: *App) bool {
+            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
+            const menu_active = activeCompactCommandMenu(app) != null or
+                settingsMenuActive(app) or
+                skillsMenuActive(app) or
+                modelMenuActive(app) or
+                sessionMenuActive(app) or
+                mcpMenuActive(app) or
+                helpMenuActive(app);
+            var authentication_active = false;
+            if (comptime runtime_profile.allows(App, .native_auth)) {
+                authentication_active = app.auth.apiKeyEntryActive();
+            }
+            return projectMcpPromptMayOwnInput(.{
+                .active = app.projectMcpPromptActive(),
+                .question_active = app.question_prompt.isActive(),
+                .approval_active = app.approval_prompt.isActive(),
+                .subagent_active = false,
+                .menu_active = menu_active,
+                .authentication_active = authentication_active,
+            });
+        }
+
+        fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
+            if (comptime !@hasDecl(App, "projectMcpPromptName")) return false;
+            const owns_input = projectMcpPromptOwnsInput(app);
+            debug_trace.logf(
+                "mcp",
+                "project prompt input byte={d} owns_input={s}",
+                .{ byte, if (owns_input) "true" else "false" },
+            );
+            if (!owns_input) return false;
+            const action: project_config.ProjectMcpAction = switch (byte) {
+                '1' => {
+                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
+                    defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Approving project MCP server '{s}'.",
+                        .{display.bytes},
+                    );
+                    defer app.alloc.free(body);
+                    try app_commands.Handlers(App).applyProjectMcpAction(
+                        app,
+                        .{ .approve = name },
+                        body,
+                    );
+                    return true;
+                },
+                '2' => .approve_all,
+                '3' => {
+                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
+                    defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Rejecting project MCP server '{s}'.",
+                        .{display.bytes},
+                    );
+                    defer app.alloc.free(body);
+                    try app_commands.Handlers(App).applyProjectMcpAction(
+                        app,
+                        .{ .reject = name },
+                        body,
+                    );
+                    return true;
+                },
+                else => return true,
+            };
+            try app_commands.Handlers(App).applyProjectMcpAction(
+                app,
+                action,
+                "Approving all project MCP servers for this workspace.",
+            );
+            return true;
         }
 
         fn handleRawTerminalInputWithLimits(
@@ -909,14 +924,14 @@ pub fn Runtime(comptime App: type) type {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
-
+            if (try routeProjectMcpPromptByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
                 return;
             }
             if (try routeUpgradeShortcut(app, byte)) return;
-            if (routePickerControlByte(app, byte)) return;
+            if (try routePickerControlByte(app, byte)) return;
 
             if (isComposerEditingByte(byte, raw.composer_shortcut) and
                 !activeCatalogMenuOwnsByte(app, byte) and
@@ -924,14 +939,6 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.shell.render_requests.request(.footer);
             }
-            if (isComposerEditingByte(byte, raw.composer_shortcut) and
-                !activeCatalogMenuOwnsByte(app, byte))
-            {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.markVisibleSelectionDirty(app);
-                }
-            }
-
             try handleComposerByte(
                 app,
                 byte,
@@ -947,7 +954,6 @@ pub fn Runtime(comptime App: type) type {
             composer_shortcut: ?input_action.ShortcutAction,
             approval_focused_edit: ?approval_decision.DraftAction,
             question_action: ?question_prompt.Action,
-            subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
@@ -958,6 +964,17 @@ pub fn Runtime(comptime App: type) type {
 
             if (resolved == .escape) {
                 if (try full_transcript_rt.routeAction(app, resolved)) return .done;
+                if (comptime @hasDecl(App, "suppressProjectMcpPrompts")) {
+                    if (projectMcpPromptOwnsInput(app)) {
+                        app.suppressProjectMcpPrompts();
+                        try app.writeDomainNotice(.{
+                            .topic = "mcp",
+                            .tone = .neutral,
+                            .body = "Project MCP approval prompts dismissed for this process.",
+                        }, true);
+                        return .done;
+                    }
+                }
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
                 try resolveEscape(app, was_cancel_pending, now);
@@ -971,29 +988,15 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeAction(app, resolved)) return .done;
 
             if (resolved == .paste_start) {
-                if (comptime @hasDecl(@TypeOf(app.subagents), "beginManagerPaste")) {
-                    if (app.subagents.isViewActive()) {
-                        app.subagents.beginManagerPaste();
-                        app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                            app,
-                            .subagent_panel,
-                        );
-                        return .done;
-                    }
-                } else if (comptime @hasDecl(@TypeOf(app.subagents), "beginChildPaste")) {
-                    if (app.subagents.childRouteId() != null) {
-                        app.subagents.beginChildPaste();
-                        app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                            app,
-                            .subagent_panel,
-                        );
+                if (comptime runtime_profile.allows(App, .native_auth) and
+                    @hasDecl(@TypeOf(app.auth), "signInCodeEntryActive"))
+                {
+                    if (app.auth.signInCodeEntryActive()) {
+                        paste_rt.beginPaste(app, max_input_len);
                         return .done;
                     }
                 }
                 dismissActiveMenusThenRedraw(app);
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.markVisibleSelectionDirty(app);
-                }
                 paste_rt.beginPaste(app, max_input_len);
                 return .done;
             }
@@ -1005,26 +1008,6 @@ pub fn Runtime(comptime App: type) type {
             switch (resolved) {
                 .remapped_byte => |byte| return .{ .remapped_byte = byte },
                 else => {},
-            }
-
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    if (approvalOwnsCurrentSurface(app)) {
-                        try approval_rt.routeApprovalEscapeAction(
-                            app,
-                            resolved,
-                            approval_focused_edit,
-                        );
-                    } else {
-                        try subagent_rt.routeSubagentEscapeAction(
-                            app,
-                            resolved,
-                            composer_shortcut,
-                            subagent_action,
-                        );
-                    }
-                    return .done;
-                }
             }
 
             if (app.question_prompt.isActive()) {
@@ -1056,9 +1039,19 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (appearanceMenuActive(app)) {
-                try routeAppearanceMenuEscapeAction(app, resolved);
-                return .done;
+            if (mcpMenuActive(app)) {
+                switch (resolved) {
+                    .cursor_up => _ = moveMcpMenu(app, -1),
+                    .cursor_down => _ = moveMcpMenu(app, 1),
+                    .cursor_left => _ = try cycleMcpMenuSection(app, -1),
+                    .cursor_right => _ = try cycleMcpMenuSection(app, 1),
+                    else => {},
+                }
+                if (resolved == .cursor_up or resolved == .cursor_down or
+                    resolved == .cursor_left or resolved == .cursor_right)
+                {
+                    return .done;
+                }
             }
 
             if (settingsMenuActive(app) and
@@ -1074,6 +1067,7 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
+                if (routeMcpFilterShortcut(app, action)) return .done;
                 try routeComposerShortcutAction(app, action, max_input_len);
                 return .done;
             }
@@ -1117,20 +1111,14 @@ pub fn Runtime(comptime App: type) type {
                 => {},
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app);
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        if (try queue_rt.deleteEmptyVisibleDraft(app)) return .done;
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
                     if (draftHasState(app)) {
                         clearDraftState(app, "clear_line");
                         app.shell.render_requests.request(.footer);
                     }
                 },
                 .toggle_permission_mode => {
-                    if (settingsMenuActive(app)) {
-                        return .done;
-                    } else if (helpMenuActive(app)) {
-                        return .done;
+                    if (cycleHelpMenuCategory(app, -1) or cycleSettingsMenuCategory(app, -1)) {
+                        app.shell.render_requests.request(.footer);
                     } else if (try toggleSessionPickerScopeIfActive(app)) {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
@@ -1159,10 +1147,10 @@ pub fn Runtime(comptime App: type) type {
             return .done;
         }
 
-        fn routePickerControlByte(app: *App, byte: u8) bool {
+        fn routePickerControlByte(app: *App, byte: u8) !bool {
             if (!composerPickerSurfaceVisible(app)) return false;
             const delta = pickerControlDelta(byte) orelse return false;
-            if (!routeVisiblePickerMove(app, delta)) return false;
+            if (!try routeVisiblePickerMove(app, delta)) return false;
             app.input_runtime.vertical_navigation.reset();
             app.shell.render_requests.request(.footer);
             return true;
@@ -1200,16 +1188,6 @@ pub fn Runtime(comptime App: type) type {
             const byte = raw.byte;
             if ((app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) and byte == ctrl_g_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, byte);
-                return true;
-            }
-            // A presented child approval is resolvable from the main chat or
-            // the manager, so only that exact modal may delegate Ctrl-X.
-            if ((comptime runtime_profile.allows(App, .subagents)) and
-                app.approval_prompt.isActive() and
-                byte == ctrl_x_manager_byte and
-                presentedSubagentApproval(app))
-            {
-                try subagent_rt.toggleSubagentView(app);
                 return true;
             }
             if (app.question_prompt.isActive()) {
@@ -1262,6 +1240,51 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (mcpMenuActive(app)) {
+                if (comptime @hasField(App, "mcp")) {
+                    if (app.mcp.menu.screen == .add) {
+                        return try handleMcpAddInput(app, byte, max_input_len);
+                    }
+                    if (app.mcp.menu.screen == .arguments) {
+                        return try handleMcpArgumentInput(app, byte, max_input_len);
+                    }
+                    if (app.mcp.menu.filter_active) {
+                        if (byte == 0x7f) {
+                            _ = applyMcpMenuEvent(app, .delete_filter_byte);
+                            return true;
+                        }
+                        if (byte >= 0x20 and byte < 0x7f and byte != '\r') {
+                            _ = applyMcpMenuEvent(app, .{ .append_filter_byte = byte });
+                            return true;
+                        }
+                    }
+                }
+                if (byte >= 0x80) {
+                    input_reset.resetPendingTextScalarWithTrace(
+                        &app.input_runtime.text_scalar,
+                        "mcp_menu_active",
+                    );
+                    return true;
+                }
+                switch (byte) {
+                    '\t' => _ = try cycleMcpMenuSection(app, 1),
+                    '\r' => _ = try submitMcpMenuSelection(app),
+                    'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
+                    'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
+                    'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
+                    'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
+                    'p', 'P' => _ = confirmMcpMenuAction(app, .trust_approve_all),
+                    'z', 'Z' => _ = confirmMcpMenuAction(app, .trust_reset),
+                    'c', 'C' => _ = applyMcpMenuEvent(app, .show_info),
+                    'r', 'R' => _ = try refreshMcpMenu(app),
+                    'i', 'I' => _ = try insertMcpMenuPreview(app, max_input_len),
+                    '/' => _ = applyMcpMenuEvent(app, .begin_filter),
+                    10 => _ = moveMcpMenu(app, 1),
+                    11 => _ = moveMcpMenu(app, -1),
+                    else => {},
+                }
+                return true;
+            }
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1271,10 +1294,13 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 switch (byte) {
+                    '\t' => if (menu == .usage) {
+                        try cycleUsageMenuScope(app, 1);
+                    },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
                     'r', 'R' => if (menu == .usage) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try refreshUsageMenu(
+                            try reloadUsageMenu(
                                 app,
                                 app.input_runtime.usage_menu.navigationScope(),
                             );
@@ -1292,61 +1318,16 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
-            if (appearanceMenuActive(app)) {
-                if (byte >= 0x80) {
-                    input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "appearance_menu_active",
-                    );
-                    return true;
-                }
-                switch (byte) {
-                    '\t' => {
-                        _ = app.input_runtime.appearance_menu.cycleSection(1);
-                        app.shell.render_requests.request(.footer);
-                    },
-                    '\r' => try submitAppearanceMenuSelection(app),
-                    10 => {
-                        _ = app.input_runtime.appearance_menu.move(1);
-                        app.shell.render_requests.request(.footer);
-                    },
-                    11 => {
-                        _ = app.input_runtime.appearance_menu.move(-1);
-                        app.shell.render_requests.request(.footer);
-                    },
-                    else => {},
-                }
-                return true;
-            }
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    try subagent_rt.handleSubagentRawInput(app, raw);
-                    return true;
-                }
-            }
             return false;
         }
 
         fn presentedSubagentApproval(app: *const App) bool {
-            if (comptime !@hasField(App, "subagents")) return false;
-            if (comptime !@hasDecl(@TypeOf(app.subagents), "mainApprovalPresented")) {
-                return false;
-            }
-            return app.subagents.mainApprovalPresented();
+            _ = app;
+            return false;
         }
 
         fn approvalOwnsCurrentSurface(app: *const App) bool {
-            if (!app.approval_prompt.isActive()) return false;
-            if (!app.subagents.isViewActive()) return true;
-            if (comptime !@hasDecl(@TypeOf(app.subagents), "childRouteId") or
-                !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding"))
-            {
-                return true;
-            }
-            const child_id = app.subagents.childRouteId() orelse return false;
-            const request = app.approval_prompt.request orelse return false;
-            const binding = app.subagents.mainApprovalBinding(request.id) orelse return false;
-            return std.mem.eql(u8, binding.child_id, child_id);
+            return app.approval_prompt.isActive();
         }
 
         fn handleTextByte(app: *App, owner: text_scalar.Owner, byte: u8, max_input_len: usize) !void {
@@ -1390,9 +1371,6 @@ pub fn Runtime(comptime App: type) type {
                     if (dismissActiveMenusForComposerEdit(app)) {
                         app.shell.render_requests.request(.footer);
                     }
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
                     switch (try insertComposerSliceBounded(
                         app,
                         bytes,
@@ -1428,27 +1406,25 @@ pub fn Runtime(comptime App: type) type {
                     try handleSemanticCtrlD(app, max_input_len);
                 },
                 '\t' => {
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
-                    if (helpMenuActive(app) or settingsMenuActive(app)) {
-                        return;
+                    if (cycleHelpMenuCategory(app, 1) or cycleSettingsMenuCategory(app, 1)) {
+                        app.shell.render_requests.request(.footer);
                     } else if (moveAuthPickerIfActive(app, 1)) {
                         app.shell.render_requests.request(.footer);
                     } else if (try toggleSessionPickerScopeIfActive(app)) {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentModelPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
                         }
                         app.shell.render_requests.request(.footer);
+                    } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
+                        if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
-                        // Mid-turn: list is hidden — do not autocomplete a hidden index.
-                        if (!app.stream.active) {
-                            try completion_rt.autocompleteModelPickerSelection(app);
-                        }
+                        try completion_rt.autocompleteModelPickerSelection(app);
                     } else if (completion_rt.visibleInlineCompletion(app) != null) {
                         if ((try completion_rt.autocompleteInlineCompletion(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1473,7 +1449,6 @@ pub fn Runtime(comptime App: type) type {
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
                                 }
-                                completion_rt.syncArgCompletionIndex(app);
                                 app.shell.render_requests.request(.footer);
                             }
                         }
@@ -1488,10 +1463,16 @@ pub fn Runtime(comptime App: type) type {
                         if (try completion_rt.advanceModelPickerOnSpace(app)) {
                             app.shell.render_requests.request(.footer);
                         }
+                    } else if (app.input_runtime.edit_state.selectionRange() == null and
+                        !app.stream.active and
+                        !commandSkillsMenuActive(app) and
+                        provider_picker_rt.hasQuery(app) and
+                        try provider_picker_rt.advanceOnSpace(app))
+                    {
+                        app.shell.render_requests.request(.footer);
                     } else {
                         switch (try insertComposerSliceBounded(app, " ", max_input_len, false)) {
                             .inserted => {
-                                completion_rt.syncArgCompletionIndex(app);
                                 syncCatalogMenus(app);
                                 app.shell.render_requests.request(.footer);
                             },
@@ -1504,10 +1485,7 @@ pub fn Runtime(comptime App: type) type {
                     try image_commands.Commands(App).attachClipboard(app);
                 },
                 24 => {
-                    if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app)) return;
-                    if (comptime runtime_profile.allows(App, .subagents)) {
-                        try subagent_rt.toggleSubagentView(app);
-                    }
+                    return;
                 },
                 '\r' => {
                     if (try submitSettingsMenuSelection(app)) return;
@@ -1515,7 +1493,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitAuthPickerSelection(app)) return;
                     if (try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (try submitSlashSkillSelection(app)) return;
+                    if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
                     }
@@ -1527,23 +1505,14 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
-                        try completion_rt.openCurrentModelPicker(app);
+                        try openModelBrowseCatalog(app);
                         return;
                     }
+                    if (provider_picker_rt.hasQuery(app)) {
+                        if (try app_auth_runtime.Runtime(App).reject_provider_picker_if_busy(app)) return;
+                        if (try provider_picker_rt.submit(app)) return;
+                    }
                     if (completion_rt.hasModelQuery(app)) {
-                        if (app.stream.active) {
-                            if (try submitExplicitModelSelection(
-                                app,
-                                resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
-                            )) return;
-                            try app.writeDomainNotice(.{
-                                .topic = "model",
-                                .tone = .neutral,
-                                .body = "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
                         if (try completion_rt.submitModelPicker(app)) return;
                     }
                     if (try submitExplicitModelSelection(
@@ -1555,7 +1524,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
-                    try submit_rt.submitInput(app, max_prompt_history);
+                    try submit_rt.submit(app, max_prompt_history);
                 },
                 else => {
                     if (composer_shortcut) |action| {
@@ -1567,11 +1536,12 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and insertion_start == 0 and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
+                        if (byte == '$' and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
                             if ((try insertComposerSliceBounded(app, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
                             }
+                            app.input_runtime.picker.resetInlinePickerEpisode();
                             if (comptime @hasField(App, "skills")) {
                                 app.skills.openMenuWithQuery(.dollar, .{ .start = insertion_start, .end = insertion_start + 1 }, "");
                             }
@@ -1598,6 +1568,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn handleSemanticCtrlC(app: *App) !void {
+            if (app.stream.active and draftHasState(app)) {
+                clearDraftState(app, "ctrl_c");
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
             const now = io_mod.milliTimestamp();
             const transition = gesture_state.pressCtrlCExit(
                 app.input_runtime.gestures,
@@ -1612,10 +1588,14 @@ pub fn Runtime(comptime App: type) type {
 
             debug_trace.logf("input", "ctrl_c_exit_hint_armed", .{});
 
-            if (app.stream.active) {
+            if (interrupt_rt.hasActiveOperation(app)) {
                 try interrupt_rt.cancelActiveOperation(app);
                 app.shell.render_requests.request(.footer);
                 return;
+            }
+
+            if (comptime @hasDecl(App, "cancelPendingSubmission")) {
+                if (App.cancelPendingSubmission(app)) return;
             }
 
             if (draftHasState(app)) clearDraftState(app, "ctrl_c");
@@ -1740,6 +1720,7 @@ pub fn Runtime(comptime App: type) type {
         fn dismissAuthPickerForComposerEdit(app: *App) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (!app.auth.pickerView().active) return false;
+            cancelPromptRetryAfterAuth(app);
             app.auth.closePicker(app.alloc);
             return true;
         }
@@ -1748,34 +1729,25 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "auth")) return false;
             const picker = app.auth.pickerView();
             if (!picker.active) return false;
+            cancelPromptRetryAfterAuth(app);
             if (picker.stage == .root and picker.include_skip) app.auth.skipOnboarding();
             return app.auth.popPickerStage(app.alloc);
         }
 
-        fn dismissSkillsMenuForComposerEdit(app: *App) bool {
-            if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
-            if (isMentionSkillsMenuOrigin(app.skills.menu.origin) or commandSkillsMenuActive(app)) return false;
-            app.skills.closeMenu();
-            return true;
-        }
-
-        fn isMentionSkillsMenuOrigin(origin: skill_runtime.SkillMenuOrigin) bool {
-            return origin == .dollar or origin == .paste;
-        }
-
-        fn isCommandSkillsMenuOrigin(origin: skill_runtime.SkillMenuOrigin) bool {
-            return origin == .command or origin == .slash;
+        fn cancelPromptRetryAfterAuth(app: *App) void {
+            if (comptime @hasDecl(App, "cancelPromptRetryAfterAuth")) {
+                app.cancelPromptRetryAfterAuth();
+            }
         }
 
         fn commandSkillsMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            return app.skills.menu.active and isCommandSkillsMenuOrigin(app.skills.menu.origin);
+            return app.skills.menu.active and !app.skills.menu.origin.isMention();
         }
 
         fn skillsMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            return app.skills.menu.active;
+            return app.skills.menuVisible();
         }
 
         fn modelMenuActive(app: *App) bool {
@@ -1796,20 +1768,419 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.settings_menu.active;
         }
 
-        fn appearanceMenuActive(app: *App) bool {
-            return app.input_runtime.appearance_menu.active;
+        fn mcpMenuActive(app: *App) bool {
+            if (comptime @hasField(App, "mcp")) {
+                return app.mcp.menu.active;
+            }
+            return false;
+        }
+
+        fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
+            if (comptime @hasField(App, "mcp")) {
+                const view = app.mcp.menuView();
+                return .{
+                    .state = view.state,
+                    .servers = if (view.health) |health| health.servers else &.{},
+                    .tools = view.tools,
+                    .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
+                    .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
+                    .prompts = if (view.prompts) |catalog| catalog.items else &.{},
+                    .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                    .preview = view.preview,
+                    .feedback = view.feedback,
+                    .add_name = view.add_form.name.items,
+                    .add_target = view.add_form.target.items,
+                    .add_arguments = view.add_form.arguments.items,
+                    .add_draft = app.input_runtime.edit_state.input.items,
+                    .arguments = view.argument_fields,
+                    .argument_draft = app.input_runtime.edit_state.input.items,
+                };
+            }
+            return .{};
+        }
+
+        fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
+            const effect = applyMcpMenuEventDeferred(app, event);
+            app.shell.render_requests.request(.footer);
+            return effect;
+        }
+
+        fn applyMcpMenuEventDeferred(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
+            if (comptime @hasField(App, "mcp")) {
+                return mcp_menu_state.apply(&app.mcp.menu, event);
+            }
+            return null;
+        }
+
+        fn routeMcpFilterShortcut(app: *App, action: input_action.ShortcutAction) bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (!app.mcp.menu.filter_active) return false;
+                switch (action) {
+                    .delete_backward => _ = applyMcpMenuEvent(app, .delete_filter_byte),
+                    .delete_word_left, .delete_whitespace_word_left, .delete_to_line_start => _ = applyMcpMenuEvent(app, .clear_filter_text),
+                    else => return false,
+                }
+                return true;
+            }
+            return false;
+        }
+
+        fn startMcpMenuEffect(app: *App, effect: mcp_menu_state.Effect) !void {
+            if (comptime !@hasDecl(App, "beginMcpMenuEffect")) return;
+            app.beginMcpMenuEffect(effect) catch |err| {
+                const generation = switch (effect) {
+                    .load_catalog => |request| request.generation,
+                    .load_preview => |request| request.generation,
+                    .complete_argument => |request| request.generation,
+                    .action => |request| request.generation,
+                    .cancel => |value| value,
+                };
+                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                    try app.recordMcpMenuEffectFailure(generation, err);
+                }
+            };
+        }
+
+        fn moveMcpMenu(app: *App, delta: i8) bool {
+            if (!mcpMenuActive(app)) return false;
+            const projection = mcpMenuProjection(app);
+            if (projection.state.screen == .preview) {
+                _ = applyMcpMenuEvent(app, .{ .scroll_preview = .{
+                    .delta = delta,
+                    .row_count = mcp_menu_presentation.previewVisualRowCount(
+                        projection.preview,
+                        app.shell.layout.cols,
+                    ),
+                } });
+                return true;
+            }
+            _ = applyMcpMenuEvent(app, .{ .move = .{
+                .delta = delta,
+                .item_count = projection.itemCount(),
+                .visible_count = mcp_menu_presentation.visibleItemsForBudget(
+                    mcp_menu_presentation.max_inline_rows,
+                ),
+            } });
+            return true;
+        }
+
+        fn cycleMcpMenuSection(app: *App, delta: i8) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (applyMcpMenuEventDeferred(app, .{ .cycle_section = delta })) |effect| {
+                try startMcpMenuEffect(app, effect);
+            }
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.load_state == .loading) return true;
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        fn submitMcpMenuSelection(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                const state = app.mcp.menu;
+                if (state.screen == .browse and state.section == .servers and
+                    mcpMenuProjection(app).itemCount() > 0)
+                {
+                    _ = applyMcpMenuEvent(app, .show_details);
+                } else if (state.screen == .browse and state.section != .servers and
+                    mcpMenuProjection(app).itemCount() > 0)
+                {
+                    if (try app.mcp.prepareMenuArguments(app.alloc)) {
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        app.shell.render_requests.request(.footer);
+                    } else {
+                        if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
+                            try startMcpMenuEffect(app, effect);
+                        }
+                    }
+                } else if (state.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (mcp_menu_state.serverActionAvailable(.authenticate, server)) {
+                        try authenticateMcpMenuServer(app);
+                    }
+                } else if (state.screen == .confirm) {
+                    if (state.confirmation_action) |action| {
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = action },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| try executeMcpMenuAction(app, request),
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        fn insertMcpMenuPreview(app: *App, max_input_len: usize) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                const view = app.mcp.menuView();
+                const insert = view.insert orelse return true;
+                const effect = applyMcpMenuEvent(
+                    app,
+                    .{ .request_action = .insert_preview },
+                ) orelse return true;
+                switch (effect) {
+                    .action => |request| {
+                        if (request.action != .insert_preview) return true;
+                        switch (try insertComposerSliceBounded(
+                            app,
+                            insert,
+                            max_input_len,
+                            false,
+                        )) {
+                            .inserted => {
+                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+                                }
+                            },
+                            .limit_exceeded => try input_limit_feedback.report(
+                                App,
+                                app,
+                                .composer,
+                                insert.len,
+                            ),
+                            .inactive => {},
+                        }
+                        app.shell.render_requests.request(.footer);
+                    },
+                    .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                }
+            }
+            return true;
+        }
+
+        fn refreshMcpMenu(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen != .browse or app.mcp.menu.section != .servers) return true;
+            }
+            const effect = applyMcpMenuEvent(
+                app,
+                .{ .request_action = .refresh },
+            ) orelse return true;
+            switch (effect) {
+                .action => |request| {
+                    if (request.action != .refresh) return true;
+                    if (comptime @hasDecl(App, "beginMcpMenuReload")) {
+                        app.beginMcpMenuReload(request.generation) catch |err| {
+                            if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                                try app.recordMcpMenuEffectFailure(request.generation, err);
+                            }
+                        };
+                    }
+                },
+                .load_catalog, .load_preview, .complete_argument, .cancel => {},
+            }
+            return true;
+        }
+
+        fn authenticateMcpMenuServer(app: *App) !void {
+            const effect = applyMcpMenuEvent(
+                app,
+                .{ .request_action = .authenticate },
+            ) orelse return;
+            switch (effect) {
+                .action => |request| {
+                    if (request.action == .authenticate) try executeMcpMenuAction(app, request);
+                },
+                .load_catalog, .load_preview, .complete_argument, .cancel => {},
+            }
+        }
+
+        fn confirmMcpMenuAction(app: *App, action: mcp_menu_state.Action) bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen != .details and
+                    !(app.mcp.menu.screen == .browse and
+                        app.mcp.menu.section == .servers and
+                        (action == .trust_approve_all or action == .trust_reset))) return true;
+                if (app.mcp.menu.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (!mcp_menu_state.serverActionAvailable(action, server)) return true;
+                }
+                _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
+            }
+            return true;
+        }
+
+        fn executeMcpMenuAction(
+            app: *App,
+            request: mcp_menu_state.ActionRequest,
+        ) !void {
+            const result = switch (request.action) {
+                .authenticate => if (comptime @hasDecl(App, "beginMcpMenuAuthentication"))
+                    app.beginMcpMenuAuthentication(request.generation)
+                else
+                    error.McpMenuActionUnavailable,
+                .remove => if (comptime @hasDecl(App, "removeMcpMenuServer"))
+                    app.removeMcpMenuServer(request.generation)
+                else
+                    error.McpMenuActionUnavailable,
+                .logout => if (comptime @hasDecl(App, "beginMcpMenuEffect"))
+                    app.beginMcpMenuEffect(.{ .action = request })
+                else
+                    error.McpMenuActionUnavailable,
+                .trust_approve, .trust_reject, .trust_approve_all, .trust_reset => if (comptime @hasDecl(App, "applyMcpMenuTrustAction"))
+                    app.applyMcpMenuTrustAction(request.generation, request.action)
+                else
+                    error.McpMenuActionUnavailable,
+                else => error.McpMenuActionUnavailable,
+            };
+            result catch |err| {
+                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                    try app.recordMcpMenuEffectFailure(request.generation, err);
+                }
+            };
+        }
+
+        fn handleMcpMenuPrimaryAction(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (mcp_menu_state.serverActionAvailable(.trust_approve, server)) {
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = .trust_approve },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| try executeMcpMenuAction(app, request),
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                    return true;
+                }
+                if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
+                    _ = applyMcpMenuEvent(app, .show_add);
+                }
+            }
+            return true;
+        }
+
+        fn handleMcpAddInput(app: *App, byte: u8, max_input_len: usize) !bool {
+            if (comptime !@hasField(App, "mcp")) return false;
+            switch (byte) {
+                '\t' => {
+                    try commitMcpAddDraft(app);
+                    _ = applyMcpMenuEvent(app, .cycle_add_transport);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                },
+                '\r' => {
+                    try commitMcpAddDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const field_count: usize = if (app.mcp.menu.add_transport == .local) 3 else 2;
+                    if (app.mcp.menu.add_field_index + 1 < field_count) {
+                        _ = applyMcpMenuEvent(app, .{ .move_add_field = .{
+                            .delta = 1,
+                            .field_count = field_count,
+                        } });
+                    } else {
+                        const action: mcp_menu_state.Action = if (app.mcp.menu.add_transport == .local)
+                            .add_local
+                        else
+                            .add_http;
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = action },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| {
+                                if (comptime @hasDecl(App, "saveMcpMenuAdd")) {
+                                    app.saveMcpMenuAdd(
+                                        request.generation,
+                                        app.mcp.menu.add_transport,
+                                    ) catch |err| {
+                                        if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                                            try app.recordMcpMenuEffectFailure(request.generation, err);
+                                        }
+                                    };
+                                }
+                            },
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                    app.shell.render_requests.request(.footer);
+                },
+                else => try handleTextByte(app, .composer, byte, max_input_len),
+            }
+            return true;
+        }
+
+        fn commitMcpAddDraft(app: *App) !void {
+            if (comptime @hasField(App, "mcp")) {
+                try app.mcp.setMenuAddField(
+                    app.alloc,
+                    app.mcp.menu.add_field_index,
+                    app.input_runtime.edit_state.input.items,
+                );
+            }
+        }
+
+        fn handleMcpArgumentInput(app: *App, byte: u8, max_input_len: usize) !bool {
+            if (comptime !@hasField(App, "mcp")) return false;
+            if (app.mcp.menu.pending_generation != null) return true;
+            switch (byte) {
+                '\t' => {
+                    try commitMcpArgumentDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const effect = applyMcpMenuEvent(app, .request_completion) orelse return true;
+                    try startMcpMenuEffect(app, effect);
+                },
+                '\r' => {
+                    try commitMcpArgumentDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const field_count = mcpMenuProjection(app).arguments.len;
+                    if (app.mcp.menu.argument_index + 1 < field_count) {
+                        _ = applyMcpMenuEvent(app, .{ .move_argument = .{
+                            .delta = 1,
+                            .field_count = field_count,
+                        } });
+                    } else if (!app.mcp.menuArgumentsValid()) {
+                        try app.mcp.setMenuFeedback(app.alloc, "Complete every required MCP argument.");
+                        app.shell.render_requests.request(.footer);
+                    } else if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
+                        try startMcpMenuEffect(app, effect);
+                    }
+                },
+                else => try handleTextByte(app, .composer, byte, max_input_len),
+            }
+            return true;
+        }
+
+        fn commitMcpArgumentDraft(app: *App) !void {
+            if (comptime @hasField(App, "mcp")) {
+                const draft = app.input_runtime.edit_state.input.items;
+                const arguments = mcpMenuProjection(app).arguments;
+                if (draft.len == 0 and
+                    app.mcp.menu.argument_index < arguments.len and
+                    arguments[app.mcp.menu.argument_index].value.items.len > 0)
+                {
+                    return;
+                }
+                try app.mcp.setMenuArgumentField(
+                    app.alloc,
+                    app.mcp.menu.argument_index,
+                    draft,
+                );
+            }
         }
 
         const CompactCommandMenuKind = enum {
             statusline,
-            sandbox,
             usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
-            if (app.input_runtime.sandbox_menu.active) return .sandbox;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
             return null;
@@ -1820,7 +2191,7 @@ pub fn Runtime(comptime App: type) type {
         fn dismissMentionSkillsMenuForSpace(app: *App) void {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
-            if (!isMentionSkillsMenuOrigin(app.skills.menu.origin)) return;
+            if (!app.skills.menu.origin.isMention()) return;
             app.skills.closeMenu();
             app.shell.render_requests.request(.footer);
         }
@@ -1863,6 +2234,16 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        fn openModelBrowseCatalog(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            try app.model_cache.openMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
+        }
+
         fn toggleSessionPickerScopeIfActive(app: *App) !bool {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !@hasField(App, "session_persistence")) return false;
@@ -1871,9 +2252,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            var dismissed = dismissAuthPickerForComposerEdit(app);
-            dismissed = dismissSkillsMenuForComposerEdit(app) or dismissed;
-            return dismissed;
+            return dismissAuthPickerForComposerEdit(app);
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -1890,14 +2269,14 @@ pub fn Runtime(comptime App: type) type {
             const origin = app.skills.menu.origin;
             syncSkillsMenu(app);
             const skill = app.skills.selectedMenuSkill() orelse {
-                if (isMentionSkillsMenuOrigin(origin)) {
+                if (origin.isMention()) {
                     app.skills.closeMenu();
                     app.shell.render_requests.request(.footer);
                     return false;
                 }
                 return true;
             };
-            const target = if (isCommandSkillsMenuOrigin(origin))
+            const target = if (!origin.isMention())
                 skill_runtime.SkillMenuTarget{ .start = 0, .end = app.input_runtime.edit_state.input.items.len }
             else
                 app.skills.menu.target orelse skill_runtime.SkillMenuTarget{
@@ -1997,14 +2376,6 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn submitAppearanceMenuSelection(app: *App) !void {
-            const change = app.input_runtime.appearance_menu.selectedChange() orelse return;
-            if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogMenuChange(app, change);
-            }
-            app.shell.render_requests.request(.footer);
-        }
-
         fn submitCompactCommandMenuSelection(
             app: *App,
             menu: CompactCommandMenuKind,
@@ -2016,7 +2387,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (menu == .usage) {
                 _ = app.input_runtime.usage_menu.toggleExpanded(
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 );
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2024,7 +2395,6 @@ pub fn Runtime(comptime App: type) type {
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .sandbox => app.input_runtime.sandbox_menu.selectedChange(),
                 .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
@@ -2067,10 +2437,9 @@ pub fn Runtime(comptime App: type) type {
         fn moveCompactCommandMenu(app: *App, menu: CompactCommandMenuKind, delta: i32) bool {
             return switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
-                .sandbox => app.input_runtime.sandbox_menu.move(delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 ),
                 .workspace => if (comptime @hasDecl(App, "workspaceAccess"))
                     app.input_runtime.workspace_menu.move(
@@ -2080,6 +2449,27 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        fn usageMenuVisibleModelItems(app: *App) u16 {
+            const projection = render_input.usageMenuProjection(
+                &app.input_runtime.usage_menu,
+            );
+            const menu: render_input.CompactCommandMenuProjection = .{
+                .usage = projection,
+            };
+            const visible_rows = @min(
+                compact_command_menu_presentation.desiredRowCount(
+                    menu,
+                    app.shell.layout.cols,
+                ),
+                app.shell.layout.rows -| 3,
+            );
+            return compact_command_menu_presentation.usageVisibleModelItems(
+                projection,
+                visible_rows,
+                app.shell.layout.cols,
+            );
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2100,14 +2490,17 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
-            if ((menu == .statusline or menu == .sandbox) and
+            if (menu == .usage and resolved == .toggle_permission_mode) {
+                try cycleUsageMenuScope(app, -1);
+                return;
+            }
+            if (menu == .statusline and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
                 const snapshot = app_commands.settingsCatalogSnapshot(app);
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .sandbox => app.input_runtime.sandbox_menu.changeSelectedOption(&snapshot, delta),
                     .usage, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
@@ -2133,25 +2526,33 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) !void {
-            switch (resolved) {
-                .cursor_up, .cursor_down => {
-                    _ = app.input_runtime.appearance_menu.cycleSection(1);
-                },
-                .cursor_left, .cursor_right => {
-                    const snapshot = app_commands.settingsCatalogSnapshot(app);
-                    const change = app.input_runtime.appearance_menu.changeSelectedOption(
-                        &snapshot,
-                        if (resolved == .cursor_left) -1 else 1,
-                    ) orelse return;
-                    if (comptime @hasDecl(App, "notificationPreferences")) {
-                        try app_commands.applySettingsCatalogMenuChange(app, change);
-                    }
-                },
-                .toggle_permission_mode => _ = app.input_runtime.appearance_menu.cycleSection(-1),
-                else => return,
+        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+            if (comptime !runtime_profile.allows(App, .profile_usage)) return;
+            if (comptime @hasDecl(App, "reloadUsageMenu")) {
+                try app.reloadUsageMenu(scope);
+            } else if (comptime @hasDecl(App, "refreshUsageMenu")) {
+                try app.refreshUsageMenu(scope);
+            } else {
+                try app_commands.Handlers(App).reloadUsageMenu(app, scope);
             }
-            app.shell.render_requests.request(.footer);
+        }
+
+        fn cycleUsageMenuScope(app: *App, delta: i32) !void {
+            const current = app.input_runtime.usage_menu.navigationScope();
+            const next: usage_report.Scope = if (delta < 0)
+                switch (current) {
+                    .days_30 => .session,
+                    .days_7 => .days_30,
+                    .hours_24 => .days_7,
+                    .session => .hours_24,
+                }
+            else switch (current) {
+                .days_30 => .days_7,
+                .days_7 => .hours_24,
+                .hours_24 => .session,
+                .session => .days_30,
+            };
+            try refreshUsageMenu(app, next);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -2184,7 +2585,7 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             }
-            try submit_rt.submitInput(app, max_prompt_history);
+            try submit_rt.submit(app, max_prompt_history);
             return true;
         }
 
@@ -2227,7 +2628,7 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn submitSlashSkillSelection(app: *App) !bool {
+        fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
@@ -2239,6 +2640,23 @@ pub fn Runtime(comptime App: type) type {
             const count = completion_rt.visibleSlashCompletionCount(app);
             if (count == 0) return false;
             const idx = app.input_runtime.picker.slash_completion_index % count;
+            if (!picker_presentation.mixedSlashCompletionIsSkill(
+                app.slashRegistry(),
+                prefix,
+                app.skills.items,
+                idx,
+            )) {
+                const selected = picker_presentation.nthMixedSlashCompletionText(
+                    app.slashRegistry(),
+                    prefix,
+                    app.skills.items,
+                    idx,
+                ) orelse return false;
+                const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.kind != .model) return false;
+                try openModelBrowseCatalog(app);
+                return true;
+            }
             return try bindSelectedSlashSkill(app, idx);
         }
 
@@ -2342,9 +2760,11 @@ pub fn Runtime(comptime App: type) type {
         fn syncSkillsMenu(app: *App) void {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
-            if (isCommandSkillsMenuOrigin(app.skills.menu.origin)) {
-                app.skills.menu.setQuery(app.input_runtime.edit_state.input.items);
-                app.skills.menu.clamp(app.skills.items);
+            if (!app.skills.menu.origin.isMention()) {
+                app.skills.setMenuQuery(
+                    app.alloc,
+                    app.input_runtime.edit_state.input.items,
+                );
                 return;
             }
             const target = app.skills.menu.target orelse return;
@@ -2355,8 +2775,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const end = skillTokenEnd(items, target.start + 1);
             app.skills.menu.target = .{ .start = target.start, .end = end };
-            app.skills.menu.setQuery(items[target.start + 1 .. end]);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(app.alloc, items[target.start + 1 .. end]);
         }
 
         fn syncModelMenu(app: *App) void {
@@ -2383,7 +2802,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn cycleSkillsMenuSource(app: *App, delta: i32) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
+            if (!app.skills.menuVisible()) return false;
             return app.skills.moveMenuSourceFilter(delta);
         }
 
@@ -2413,7 +2832,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cycleSettingsMenuCategory(app: *App, delta: i32) bool {
-            return app.input_runtime.settings_menu.cycleCategory(delta);
+            if (!app.input_runtime.settings_menu.cycleCategory(delta)) return false;
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            return true;
+        }
+
+        fn cycleHelpMenuCategory(app: *App, delta: i32) bool {
+            return app.input_runtime.help_menu.cycleCategory(delta);
         }
 
         fn expireEscClearArm(app: *App, now: i64) void {
@@ -2468,24 +2893,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    _ = disarmEscapeClear(app);
-                    if (approvalOwnsCurrentSurface(app)) {
-                        if (was_cancel_pending) {
-                            try approval_rt.cancelApprovalOperation(app);
-                        }
-                        return;
-                    }
-                    try subagent_rt.routeSubagentEscapeAction(
-                        app,
-                        .escape,
-                        null,
-                        .escape,
-                    );
-                    return;
-                }
-            }
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {
                     // Freeform answers mirror the composer's Esc contract:
@@ -2513,7 +2920,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or cancelAppearanceMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
@@ -2522,12 +2929,6 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
-                }
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (try queue_rt.hideVisibleDraft(app)) {
-                        _ = disarmEscapeClear(app);
-                        return;
-                    }
                 }
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
                     try interrupt_rt.cancelActiveOperation(app);
@@ -2540,19 +2941,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    _ = disarmEscapeClear(app);
-                    try subagent_rt.routeSubagentEscapeAction(
-                        app,
-                        .escape,
-                        null,
-                        .escape,
-                    );
-                    return;
-                }
-            }
-            if (cancelCompactCommandMenu(app) or cancelAppearanceMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2566,16 +2955,6 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
-            }
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (try queue_rt.hideVisibleDraft(app)) {
-                    _ = disarmEscapeClear(app);
-                    return;
-                }
-                if (queue_rt.cancelAllHiddenPostCancelQueued(app)) {
-                    _ = disarmEscapeClear(app);
-                    return;
-                }
             }
             if (!draftHasState(app)) {
                 _ = disarmEscapeClear(app);
@@ -2597,9 +2976,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelSkillsMenu(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
-            const clear_query = isCommandSkillsMenuOrigin(app.skills.menu.origin);
+            if (!app.skills.menuVisible()) return false;
+            const mention = app.skills.menu.origin.isMention();
+            const clear_query = !mention;
             app.skills.closeMenu();
+            if (mention) app.input_runtime.picker.dismissInlinePicker(.skill);
             if (clear_query) {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -2607,19 +2988,9 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn cancelAppearanceMenu(app: *App) bool {
-            if (!app.input_runtime.appearance_menu.active) return false;
-            app.input_runtime.appearance_menu.close();
-            return true;
-        }
-
         fn cancelCompactCommandMenu(app: *App) bool {
             if (app.input_runtime.statusline_menu.active) {
                 app.input_runtime.statusline_menu.close();
-                return true;
-            }
-            if (app.input_runtime.sandbox_menu.active) {
-                app.input_runtime.sandbox_menu.close();
                 return true;
             }
             if (app.input_runtime.usage_menu.active) {
@@ -2635,6 +3006,34 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelHelpMenu(app: *App) bool {
             return closeHelpMenu(app, true);
+        }
+
+        fn cancelMcpMenu(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
+                if (app.mcp.menu.filter_active) {
+                    _ = applyMcpMenuEvent(app, .clear_filter);
+                    return true;
+                }
+                if (app.mcp.menu.screen != .browse) {
+                    if (app.mcp.menu.screen == .add or app.mcp.menu.screen == .arguments) {
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    }
+                    if (applyMcpMenuEvent(app, .back)) |effect| switch (effect) {
+                        .cancel => app.mcp.cancelMenuOperation(),
+                        .load_catalog, .load_preview, .complete_argument, .action => {},
+                    };
+                    return true;
+                }
+            }
+            if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+            }
+            return true;
         }
 
         fn cancelSettingsMenu(app: *App) bool {
@@ -2754,10 +3153,7 @@ const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
-    .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance", .completion_description = "choose appearance", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
-    .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
 };
 const routing_test_slash_registry = command_specs.SlashRegistry{ .commands = routing_test_slash_specs[0..] };
@@ -2867,14 +3263,6 @@ const FakeApprovalCancelApp = struct {
     }
 };
 
-const RoutingSelectedSubagent = struct {
-    id: u64,
-    label: []const u8,
-    status: @import("../../ui/subagent/runtime.zig").Status,
-    tool_calls: usize,
-    current_activity: ?[]const u8,
-};
-
 const RoutingSubagents = struct {
     active: bool = false,
     main_approval_presented: bool = false,
@@ -2898,50 +3286,12 @@ const RoutingSubagents = struct {
         return self.main_approval_presented;
     }
 
-    pub fn selectedInfo(_: *const RoutingSubagents) ?RoutingSelectedSubagent {
-        return null;
-    }
-
     pub fn count(_: *const RoutingSubagents) usize {
         return 0;
     }
 
     pub fn panelText(_: *RoutingSubagents, alloc: std.mem.Allocator, _: u16, _: u16, _: transcript_runtime.Styles) ![]u8 {
         return alloc.dupe(u8, "");
-    }
-
-    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !subagent_input.Command {
-        self.handled_keys += 1;
-        self.handled_raw_keys += 1;
-        self.last_handled_key = byte;
-        return .none;
-    }
-
-    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: subagent_input.Action) !subagent_input.Command {
-        self.handled_keys += 1;
-        self.handled_actions += 1;
-        self.last_handled_key = switch (action) {
-            .escape => 0x1b,
-            .up, .left => 25,
-            .down, .right => 9,
-            else => null,
-        };
-        return .none;
-    }
-
-    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !subagent_input.Command {
-        self.last_main_approval_id = main_approval_id;
-        return self.handleKey(alloc, byte);
-    }
-
-    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: subagent_input.Action, main_approval_id: ?u64) !subagent_input.Command {
-        self.last_main_approval_id = main_approval_id;
-        return self.handleAction(alloc, action);
-    }
-
-    pub fn toggleView(self: *RoutingSubagents) @import("../../ui/subagent/controller.zig").ToggleResult {
-        self.toggle_view_calls += 1;
-        return .changed;
     }
 
     pub fn managerPasteActive(self: *const RoutingSubagents) bool {
@@ -3013,10 +3363,6 @@ const RoutingWorker = struct {
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
 
-    pub fn queuePreview(_: *RoutingWorker, _: []u8) @import("../agent/worker_runtime.zig").QueuePreview {
-        return .{};
-    }
-
     pub fn queuedPromptCount(self: *const RoutingWorker) usize {
         return self.queued_count;
     }
@@ -3030,6 +3376,10 @@ const RoutingWorker = struct {
     }
 
     pub fn requestCancel(self: *RoutingWorker) void {
+        self.cancel_requested = true;
+    }
+
+    pub fn requestInteractiveCancel(self: *RoutingWorker) void {
         self.cancel_requested = true;
     }
 
@@ -3109,6 +3459,25 @@ const RoutingWorker = struct {
     pub fn syncQueuedPromptFastMode(_: *RoutingWorker, _: bool) void {}
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
+
+    pub fn clearQueuedPrompts(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: []const types.ImageAttachment,
+    ) void {
+        self.queued_count = 0;
+    }
+
+    pub fn removeQueuedPrompt(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: u64,
+        _: []const types.ImageAttachment,
+    ) bool {
+        if (self.queued_count == 0) return false;
+        self.queued_count -= 1;
+        return true;
+    }
 };
 
 const RoutingPacer = struct {
@@ -3145,38 +3514,34 @@ fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i
     ).next;
 }
 
-test "queued draft cursor movement does not lock vertical navigation" {
-    const cursor_actions = [_]input_action.ShortcutAction{
-        .{ .move = .{ .kind = .character_left } },
-        .{ .move = .{ .kind = .character_right } },
-        .{ .move = .{ .kind = .line_start } },
-        .{ .move = .{ .kind = .line_end } },
-        .{ .move = .{ .kind = .word_left } },
-        .{ .move = .{ .kind = .word_right } },
+test "project MCP prompt waits for every existing modal owner" {
+    const base = ProjectMcpPromptInputState{
+        .active = true,
+        .question_active = false,
+        .approval_active = false,
+        .subagent_active = false,
+        .menu_active = false,
+        .authentication_active = false,
     };
-    for (cursor_actions) |action| {
-        try std.testing.expect(!shortcutMayMutateQueuedDraft(action));
-    }
-    try std.testing.expect(shortcutMayMutateQueuedDraft(.delete_backward));
-    try std.testing.expect(shortcutMayMutateQueuedDraft(.insert_newline));
-}
-
-test "all destructive composer shortcuts can delete an empty queued draft" {
-    const deletion_actions = [_]input_action.ShortcutAction{
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-    };
-    for (deletion_actions) |action| {
-        try std.testing.expect(shortcutDeletesQueuedDraft(action));
-    }
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.cut_selection));
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.{ .move = .{ .kind = .character_left } }));
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.insert_newline));
+    try std.testing.expect(projectMcpPromptMayOwnInput(base));
+    var blocked = base;
+    blocked.question_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.approval_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.subagent_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.menu_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.authentication_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    var inactive = base;
+    inactive.active = false;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
 }
 
 const RoutingFakeApp = struct {
@@ -3214,7 +3579,6 @@ const RoutingFakeApp = struct {
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     should_exit: bool = false,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     permission_state: app_permission_runtime.State = .{},
     total_input_tokens: u64 = 0,
@@ -3255,6 +3619,7 @@ const RoutingFakeApp = struct {
     selected_credential_source: ?types.CredentialSource = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
     selected_auth_team: ?usize = null,
+    prompt_retry_after_auth: bool = false,
     upgrade_apply_count: usize = 0,
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
@@ -3316,6 +3681,10 @@ const RoutingFakeApp = struct {
     }
 
     pub fn flushBeforeBlockingExternalWork(_: *RoutingFakeApp) !void {}
+
+    pub fn cancelPromptRetryAfterAuth(self: *RoutingFakeApp) void {
+        self.prompt_retry_after_auth = false;
+    }
 
     pub fn suspendToJobControl(self: *RoutingFakeApp) !void {
         self.suspend_count += 1;
@@ -3491,6 +3860,7 @@ const RoutingFakeApp = struct {
 
     pub fn applyAuthPickerChoice(self: *RoutingFakeApp, choice: auth_runtime.Choice) !void {
         switch (choice) {
+            .provider => {},
             .source => |source| _ = try self.selectCredentialSource(source),
             .action => |action| self.selected_auth_action = action,
             .team => |index| self.selected_auth_team = index,
@@ -3647,8 +4017,8 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn activateFullTranscriptForRoutingTest(app: *RoutingFakeApp) void {
     app.terminal.alternate_screen_owner = .full_transcript;
-    app.terminal.alternate_mouse_tracking_active = true;
-    app.shell.full_transcript = .{ .depth = .review, .follow_tail = true };
+    app.terminal.alternate_mouse_tracking_active = false;
+    app.shell.full_transcript = .{ .depth = .full, .follow_tail = true };
 }
 
 fn appendRoutingSessionPickerSummary(
@@ -3724,7 +4094,7 @@ test "app_input_runtime slash completion window moves up before reverse scrollin
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_window_start);
 }
 
-test "app_input_runtime session picker window moves up before reverse scrolling" {
+test "app_input_runtime one-row session picker keeps reverse scrolling sticky" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3739,14 +4109,14 @@ test "app_input_runtime session picker window moves up before reverse scrolling"
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     }
     try std.testing.expectEqual(@as(usize, 5), picker.selected);
-    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 5), picker.window_start);
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, -1);
     try std.testing.expectEqual(@as(usize, 4), picker.selected);
-    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 4), picker.window_start);
 }
 
-test "app_input_runtime session picker waits for rendered bottom before scrolling" {
+test "app_input_runtime roomy session picker scrolls after twenty inline rows" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3760,15 +4130,19 @@ test "app_input_runtime session picker waits for rendered bottom before scrollin
     const picker = &app.session_persistence.session_picker;
     picker.active = true;
     picker.load_state = .ready;
-    for (0..10) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
+    for (0..25) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
 
     var down: usize = 0;
-    while (down < 7) : (down += 1) {
+    while (down < 20) : (down += 1) {
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     }
 
-    try std.testing.expectEqual(@as(usize, 7), picker.selected);
-    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 20), picker.selected);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
+
+    try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, -1);
+    try std.testing.expectEqual(@as(usize, 19), picker.selected);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
 }
 
 test "app_input_runtime help menu navigation skips headings and Enter executes selection" {
@@ -3833,7 +4207,7 @@ test "app_input_runtime Escape closes help and clears its composer search" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime session picker uses spare footer row before scrolling" {
+test "app_input_runtime session picker uses the expanded responsive window before scrolling" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3858,7 +4232,7 @@ test "app_input_runtime session picker uses spare footer row before scrolling" {
     try std.testing.expectEqual(@as(usize, 0), picker.window_start);
 }
 
-test "app_input_runtime session picker navigation keeps fixed catalog rows" {
+test "app_input_runtime session picker navigation keeps the inline window stable" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3900,7 +4274,7 @@ test "app_input_runtime routes auth picker navigation before composer history" {
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .setup }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_provider }).eql(app.auth.pickerView().selected_choice.?));
     try std.testing.expectEqual(@as(?usize, null), app.input_runtime.composer_history.activeIndex());
 }
 
@@ -3913,7 +4287,7 @@ test "app_input_runtime Tab cycles the active auth picker" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .setup }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_provider }).eql(app.auth.pickerView().selected_choice.?));
 }
 
 test "app_input_runtime Tab leaves a dismissed slash query unchanged" {
@@ -4006,12 +4380,15 @@ test "app_input_runtime auth picker enter closes before selecting a switched sou
     try std.testing.expectEqual(types.CredentialSource.fx_login, app.selected_credential_source.?);
 }
 
-test "app_input_runtime auth picker delegates typed acquisition actions" {
+test "app_input_runtime connections picker delegates typed acquisition actions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     app.auth.openPicker(alloc);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqual(auth_runtime.PickerStage.connections, app.auth.pickerView().stage);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -4025,10 +4402,12 @@ test "app_input_runtime Escape closes auth picker without arming composer clear"
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
     app.auth.openPicker(alloc);
+    app.prompt_retry_after_auth = true;
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
 
     try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expect(!app.prompt_retry_after_auth);
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
 }
 
@@ -4052,7 +4431,7 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
     app.auth.openPicker(alloc);
 
-    for (0..3) |_| _ = app.auth.movePicker(1);
+    _ = app.auth.movePicker(-1);
     try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
@@ -4073,22 +4452,22 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "app_input_runtime disabled change team action stays silent" {
+test "app_input_runtime navigation bypasses disabled change team action" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
     app.auth.openPicker(alloc);
 
-    for (0..2) |_| _ = app.auth.movePicker(1);
-    try std.testing.expect((auth_runtime.Choice{ .action = .change_team }).eql(
+    for (0..5) |_| _ = app.auth.movePicker(1);
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.auth.pickerView().active);
-    try std.testing.expectEqual(auth_runtime.PickerStage.root, app.auth.pickerView().stage);
+    try std.testing.expectEqual(auth_runtime.PickerStage.switch_credential, app.auth.pickerView().stage);
     try std.testing.expect(app.selected_auth_action == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
@@ -4118,6 +4497,20 @@ test "app_input_runtime Escape dismisses visible slash completions without armin
         @as(?i64, 2),
         app.input_runtime.gestures.escapeClearArmedAt(),
     );
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime Escape leaves unmatched slash input with the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/hezzzzz");
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
+
+    try std.testing.expectEqualStrings("/hezzzzz", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.slash));
+    try std.testing.expectEqual(@as(?i64, 1), app.input_runtime.gestures.escapeClearArmedAt());
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -4231,10 +4624,12 @@ test "app_input_runtime composer editing dismisses auth picker before inserting"
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
     app.auth.openPicker(alloc);
+    app.prompt_retry_after_auth = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
 
     try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expect(!app.prompt_retry_after_auth);
     try std.testing.expectEqualStrings("x", app.input_runtime.edit_state.input.items);
 }
 
@@ -4275,7 +4670,7 @@ test "app_input_runtime skills menu navigation remains interactive while streami
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
 }
 
-test "app_input_runtime skills menu navigation uses the dedicated composer window" {
+test "app_input_runtime command skills navigation uses the inline composer window" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4301,7 +4696,7 @@ test "app_input_runtime skills menu navigation uses the dedicated composer windo
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.window_start);
+    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
 }
 
 test "app_input_runtime Escape closes an idle skills menu before empty-composer handling" {
@@ -4522,6 +4917,69 @@ test "app_input_runtime Tab cycles skills menu sources while streaming" {
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.fx, app.skills.menu.source_filter);
+}
+
+test "app_input_runtime Tab advances settings categories before autocomplete" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.settings_menu.open();
+    app.input_runtime.settings_menu.selected_index = 2;
+    app.input_runtime.settings_menu.window_start = 1;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqual(@import("../config/settings_catalog.zig").Category.interface, app.input_runtime.settings_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.window_start);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.input_runtime.settings_menu.selected_index = 2;
+    app.input_runtime.settings_menu.window_start = 1;
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(@import("../config/settings_catalog.zig").Category.all, app.input_runtime.settings_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.window_start);
+}
+
+test "app_input_runtime Tab advances help categories before autocomplete" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.help_menu.open();
+    app.input_runtime.help_menu.selected_index = 2;
+    app.input_runtime.help_menu.window_start = 1;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqual(@as(?command_specs.SlashPresentationCategory, .general), app.input_runtime.help_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.input_runtime.help_menu.selected_index = 2;
+    app.input_runtime.help_menu.window_start = 1;
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expect(app.input_runtime.help_menu.category == null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
+}
+
+test "app_input_runtime Tab cycles usage scopes in both directions" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {
@@ -4846,9 +5304,19 @@ test "app_input_runtime dollar opens skills menu and Escape preserves raw text" 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 102);
     try std.testing.expect(!app.skills.menu.active);
     try std.testing.expectEqualStrings("$s", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.skill));
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 'c', 4096, 103);
+    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expect(input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleInlineSkillCompletion(&app) == null);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '$', 4096, 104);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.skill));
+    try std.testing.expectEqual(@as(usize, "$sc".len), app.skills.menu.target.?.start);
 }
 
-test "app_input_runtime non-leading dollar stays in the composer" {
+test "app_input_runtime typed dollar opens an anchored skills menu at every composer position" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "scale",
@@ -4856,7 +5324,7 @@ test "app_input_runtime non-leading dollar stays in the composer" {
         .path = "/tmp/scale/SKILL.md",
         .source = .global_fx,
     }};
-    const inputs = [_][]const u8{ " $", "hello $" };
+    const inputs = [_][]const u8{ " $", "hello $", "price$" };
 
     for (inputs) |input| {
         var app = try RoutingFakeApp.init(alloc);
@@ -4866,7 +5334,11 @@ test "app_input_runtime non-leading dollar stays in the composer" {
         try feedRoutingBytes(&app, input);
 
         try std.testing.expectEqualStrings(input, app.input_runtime.edit_state.input.items);
-        try std.testing.expect(!app.skills.menu.active);
+        try std.testing.expect(app.skills.menu.active);
+        try std.testing.expectEqual(skill_runtime.SkillMenuOrigin.dollar, app.skills.menu.origin);
+        try std.testing.expectEqual(input.len - 1, app.skills.menu.target.?.start);
+        try std.testing.expectEqual(input.len, app.skills.menu.target.?.end);
+        try std.testing.expectEqualStrings("", app.skills.menu.query());
     }
 }
 
@@ -4883,7 +5355,7 @@ test "app_input_runtime Tab and Right Arrow accept visible inline skill completi
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.skills.items = @constCast(&skills);
-        try feedRoutingBytes(&app, "explain $man");
+        try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
 
         const completion = input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleInlineSkillCompletion(&app).?;
         try std.testing.expectEqualStrings("aged-menu", completion.suffix);
@@ -4948,7 +5420,7 @@ test "app_input_runtime Right Arrow collapses selection before inline completion
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.skills.items = @constCast(&skills);
-    try feedRoutingBytes(&app, "explain $man");
+    try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
     const end = app.input_runtime.edit_state.input.items.len;
     _ = app.input_runtime.selectionState().begin(end - 1);
     _ = app.input_runtime.selectionState().extend(end);
@@ -4987,7 +5459,6 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         &app,
         .{ .composer_shortcut = .redraw },
         .redraw,
-        null,
         null,
         null,
         false,
@@ -5038,7 +5509,7 @@ test "app_input_runtime inline skill acceptance preserves input on limit rejecti
         .source = .global_fx,
     }};
     app.skills.items = @constCast(&skills);
-    try feedRoutingBytes(&app, "explain $man");
+    try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
     const original_len = app.input_runtime.edit_state.input.items.len;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', original_len, 100);
@@ -5064,7 +5535,8 @@ test "app_input_runtime no-match dollar text keeps spaces and submits raw" {
     app.skills.items = @constCast(&skills);
 
     try feedRoutingBytes(&app, "Explain echo $HOME");
-    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
     try std.testing.expectEqualStrings("Explain echo $HOME", app.input_runtime.edit_state.input.items);
 
     try feedRoutingBytes(&app, " please");
@@ -5194,16 +5666,43 @@ test "app_input_runtime zero-match dollar query recovers matches on backspace" {
 
     try feedRoutingBytes(&app, "$mzz");
     try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
     try std.testing.expect(app.skills.selectedMenuSkill() == null);
 
     try feedRoutingBytes(&app, "\x7f\x7f");
     try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(app.skills.menuVisible());
     try std.testing.expectEqualStrings("m", app.skills.menu.query());
     try std.testing.expect(app.skills.selectedMenuSkill() != null);
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
     try std.testing.expectEqualStrings("managed", app.input_runtime.entities.skill_tokens.items[0].name);
+}
+
+test "app_input_runtime hidden zero-match dollar menu yields navigation to the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed",
+        .description = "",
+        .path = "/tmp/managed/SKILL.md",
+        .source = .global_fx,
+    }};
+    app.skills.items = @constCast(&skills);
+
+    try feedRoutingBytes(&app, "$missing");
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
+    try std.testing.expectEqual("$missing".len, app.input_runtime.edit_state.cursor);
+
+    try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, 1);
+
+    try std.testing.expectEqualStrings("$missing", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
 }
 
 test "app_input_runtime Escape cancels an idle session picker before empty-composer handling" {
@@ -5496,7 +5995,7 @@ test "app_input_runtime approval escape arrows move choices directly" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     app.approval_prompt.decision.choice_index = 1;
     try Runtime(RoutingFakeApp).routeApprovalEscapeAction(&app, .history_up, null);
@@ -5529,7 +6028,7 @@ test "app_input_runtime approval amendment arrows edit the selected draft" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try Runtime(RoutingFakeApp).handleByte(&app, 'a', 4096, 100);
@@ -5549,7 +6048,7 @@ test "app_input_runtime routes approval amendment home end delete and word movem
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     for ("alpha beta") |byte| try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
@@ -5571,7 +6070,7 @@ test "app_input_runtime routes focused editor aliases into approval amendment on
     try app.input_runtime.edit_state.input.appendSlice(alloc, "hidden composer");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
@@ -5827,7 +6326,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings(model, app.last_preference_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.effort);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
@@ -5836,27 +6335,30 @@ test "active stream Enter commits a complete model choice for the next turn" {
     );
 }
 
-test "active stream Enter explains an incomplete hidden model choice" {
+test "active stream Enter selects the visible model choice" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
+    const model = "provider/plain-model";
+    app.model_completion_values = &.{model};
 
-    try app.input_runtime.textReplacementState().replace(alloc, "/model openai/gpt");
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/plain");
     app.stream.active = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-    try std.testing.expectEqualStrings("/model openai/gpt", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
+        "Next turn will use " ++ model,
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
+test "app_input_runtime staged model picker Enter ignores hidden slash skill matches" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "model-helper",
@@ -5872,7 +6374,7 @@ test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
     app.model_completion_values = &completions;
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
@@ -5886,7 +6388,47 @@ test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Invalid /model selection") == null);
 }
 
-test "app_input_runtime bare model opens on current scrolled selection before staging effort" {
+test "app_input_runtime Tab on bare model opens the staged picker" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &.{"openai/gpt-5"};
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
+    try std.testing.expect(!app.model_cache.menu.active);
+}
+
+test "app_input_runtime Enter on bare model opens the browse catalog" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "app_input_runtime Enter on selected model slash completion opens browse on first try" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/mode");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "app_input_runtime bare model Tab opens on current scrolled selection before staging effort" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     const completions = [_][]const u8{
@@ -5910,7 +6452,7 @@ test "app_input_runtime bare model opens on current scrolled selection before st
     app.fast_mode = false;
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
     var projected: [32][]const u8 = undefined;
@@ -5941,7 +6483,7 @@ test "app_input_runtime bare model opens on current scrolled selection before st
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime bare model keeps current selection across catalog readiness" {
+test "app_input_runtime bare model Tab keeps current selection across catalog readiness" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     const completions = [_][]const u8{
@@ -5959,7 +6501,7 @@ test "app_input_runtime bare model keeps current selection across catalog readin
     try app.selected_model.appendSlice(alloc, current_model);
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     app.model_cache_loading = false;
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -5967,7 +6509,7 @@ test "app_input_runtime bare model keeps current selection across catalog readin
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime bare model keeps current selection beyond completion window" {
+test "app_input_runtime bare model Tab keeps current selection beyond completion window" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     var completions = [_][]const u8{"anthropic/claude-opus-4.8-preview"} ** 33;
@@ -5982,51 +6524,60 @@ test "app_input_runtime bare model keeps current selection beyond completion win
     try app.selected_model.appendSlice(alloc, current_model);
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqualStrings(current_model, app.input_runtime.picker.model_picker_pending_model.items);
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime stream model-shaped keys stay model-owned" {
+test "app_input_runtime stream model picker opens navigates and selects" {
     const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "model-helper",
-        .description = "model helper",
-        .path = "/tmp/model-helper/SKILL.md",
-        .source = .global_fx,
-    }};
-    const completions = [_][]const u8{"xai/grok-build-1"};
-    const cases = [_]struct {
-        input: []const u8,
-        byte: u8,
-        expect_input: []const u8,
-    }{
-        .{ .input = "/model ", .byte = '\r', .expect_input = "/model " },
-        .{ .input = "/model", .byte = '\r', .expect_input = "/model " },
-        .{ .input = "/model", .byte = '\t', .expect_input = "/model" },
-        .{ .input = "/model ", .byte = '\t', .expect_input = "/model " },
+    const models = [_][]const u8{
+        "provider/first-model",
+        "provider/second-model",
     };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &models;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    for (cases) |case| {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.skills.items = @constCast(&skills);
-        app.model_completion_values = &completions;
-        app.selected_model.clearRetainingCapacity();
-        try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.7");
-        app.stream.active = true;
-        try app.input_runtime.textReplacementState().replace(alloc, case.input);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, case.byte, 4096, 100);
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(models[1], app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
 
-        try std.testing.expectEqualStrings(case.expect_input, app.input_runtime.edit_state.input.items);
-        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
-        try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", app.selected_model.items);
-        try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-    }
+test "app_input_runtime fast-only model opens the Fast stage while streaming" {
+    const alloc = std.testing.allocator;
+    const model = "provider/fast-only-model";
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls(model, &.{}, true);
+    app.model_completion_values = &.{model};
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/fast");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ModelPickerStage.fast, query.stage);
+    try std.testing.expectEqualStrings("", query.query);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings("Next turn will use " ++ model, app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -6078,11 +6629,11 @@ test "app_input_runtime Enter binds a slash skill after multiline whitespace" {
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime exact hidden slash alias wins over a matching skill" {
+test "app_input_runtime retired slash alias no longer shadows a matching skill" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "input-helper",
-        .description = "input appearance helper",
+        .description = "input helper",
         .path = "/tmp/input-helper/SKILL.md",
         .source = .global_fx,
     }};
@@ -6094,9 +6645,9 @@ test "app_input_runtime exact hidden slash alias wins over a matching skill" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-    try std.testing.expect(app.last_command != null);
-    try std.testing.expectEqualStrings("/input", app.last_command.?);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
+    try std.testing.expect(app.last_command == null);
+    try std.testing.expectEqualStrings("$input-helper ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
 }
 
 test "app_input_runtime file picker replaces only the active query for Tab and Enter" {
@@ -6404,7 +6955,27 @@ test "app_input_runtime stale Tab selection requests a footer repaint" {
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime terminated file tokens submit while streaming queries stay local" {
+test "app_input_runtime stream file picker navigates and selects without submitting" {
+    const alloc = std.testing.allocator;
+    const completions = [_]file_index.Candidate{
+        .{ .path = "first.txt", .kind = .file },
+        .{ .path = "second.txt", .kind = .file },
+    };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.file_completion_values = &completions;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "@file");
+
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqualStrings("@second.txt ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime terminated and unmatched file tokens submit as prompt text" {
     const alloc = std.testing.allocator;
 
     {
@@ -6421,7 +6992,7 @@ test "app_input_runtime terminated file tokens submit while streaming queries st
         defer app.deinit();
         app.stream.active = true;
         try app.input_runtime.textReplacementState().replace(alloc, "@queued");
-        try std.testing.expect(!Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
+        try std.testing.expect(Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -6491,38 +7062,6 @@ test "app_input_runtime does not duplicate the startup file index load" {
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4096, 100);
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
-}
-
-test "app_input_runtime synchronizes input and sandbox completion with active settings" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-
-    app.input_runtime.input_appearance = .tint;
-    app.input_runtime.picker.slash_completion_index = 0;
-    try app.input_runtime.textReplacementState().replace(alloc, "/input");
-    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
-    try std.testing.expectEqual(
-        command_specs.argCompletionIndexForLabel("/input ", "tint").?,
-        app.input_runtime.picker.slash_completion_index,
-    );
-
-    app.input_runtime.input_appearance = .lines;
-    app.input_runtime.picker.slash_completion_index = 1;
-    try app.input_runtime.textReplacementState().replace(alloc, "/input");
-    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
-    try std.testing.expectEqual(
-        command_specs.argCompletionIndexForLabel("/input ", "lines").?,
-        app.input_runtime.picker.slash_completion_index,
-    );
-
-    app.permission_state.sandbox_backend = .none;
-    try app.input_runtime.textReplacementState().replace(alloc, "/sandbox");
-    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
-    try std.testing.expectEqual(
-        command_specs.argCompletionIndexForLabel("/sandbox ", "none").?,
-        app.input_runtime.picker.slash_completion_index,
-    );
 }
 
 test "app_input_runtime file picker navigation respects completion cap" {
@@ -6697,7 +7236,7 @@ test "app_input_runtime model picker commits a model without options directly" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -6724,7 +7263,7 @@ test "app_input_runtime model picker skips effort stage for reasoning model with
     try std.testing.expectEqual(ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -6756,7 +7295,7 @@ test "app_input_runtime model picker exposes opaque Gateway reasoning effort" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.effort);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7016,7 +7555,7 @@ test "app_input_runtime approval modal ignores non-modal text" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "queue approval sentinel text");
 
@@ -7055,7 +7594,7 @@ test "app_input_runtime modal controls win before ordinary modal input" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
             .amendment_allowed = true,
         }));
 
@@ -7071,7 +7610,7 @@ test "app_input_runtime modal controls win before ordinary modal input" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try Runtime(RoutingFakeApp).handleByte(&app, '3', 4096, 100);
 
@@ -7090,7 +7629,7 @@ test "app_input_runtime raw CSI-u digits stay isolated from approval selection" 
     for (sequences) |sequence| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
         app.approval_prompt.decision.choice_index = 2;
 
         try feedRoutingBytes(&app, sequence);
@@ -7207,7 +7746,7 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, "\x1b[27u");
 
@@ -7240,6 +7779,65 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
     }
+}
+
+test "pending full transcript open cancels after complete escape input" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\x1b[A",
+        "\x1b[B",
+        "\x1b[5~",
+        "\x1b[6~",
+    };
+
+    for (sequences) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        _ = try app.shell.appendRawTranscriptEntryClassified(
+            alloc,
+            "pending transcript\n",
+            .unknown_raw,
+        );
+        try std.testing.expect(!app.shell.requestFullTranscriptOpen());
+
+        try feedRoutingBytes(&app, sequence);
+
+        try std.testing.expectEqualStrings(
+            "",
+            app.input_runtime.edit_state.input.items,
+        );
+        try std.testing.expect(!app.shell.cancelPendingFullTranscriptOpen());
+    }
+}
+
+test "app_input_runtime Ghostty Escape press closes the usage dashboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try feedRoutingBytes(&app, "\x1b[27;1:3u");
+
+    try std.testing.expect(app.input_runtime.usage_menu.active);
 }
 
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {
@@ -7307,7 +7905,7 @@ test "app_input_runtime remapped ctrl+c reaches prompt cancellation" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, "\x1b[99;5u");
 
@@ -7426,14 +8024,15 @@ test "app_input_runtime immediate Ctrl-U follows slash completion Escape" {
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
-test "app_input_runtime immediate Ctrl-X follows bare Escape" {
+test "app_input_runtime Ctrl-X is inert after bare Escape" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
     try feedRoutingBytes(&app, "\x1b\x18");
 
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
@@ -7517,7 +8116,7 @@ test "app_input_runtime ctrl+c drops an active approval amendment" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try feedRoutingBytes(&app, "\tsummarize the result");
@@ -7734,7 +8333,7 @@ fn activateRoutingDecision(app: *RoutingFakeApp, kind: RoutingDecisionKind) !voi
             try app.question_prompt.syncFrom(app.alloc, &entries);
         },
         .approval => try std.testing.expect(try app.approval_prompt.syncRequest(app.alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         })),
     }
 }
@@ -7832,6 +8431,38 @@ test "app_input_runtime ctrl+p and ctrl+n navigate prompt history directly" {
     try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
 }
 
+test "app_input_runtime plain arrows keep history ownership across recalled slash commands" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "/help" });
+
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app),
+    );
+
+    try feedRoutingBytes(&app, "\x1b[A");
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
+
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try feedRoutingBytes(&app, "\x7f");
+    try std.testing.expectEqualStrings("/hel", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app) > 0,
+    );
+
+    app.input_runtime.inputResetState().clearCurrent(alloc);
+    try Runtime(RoutingFakeApp).handleByte(&app, '/', 4096, 100);
+    try std.testing.expect(
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app) > 0,
+    );
+}
+
 test "app_input_runtime decoded history recall disarms pending Ctrl-C exit" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -7886,9 +8517,9 @@ test "app_input_runtime ctrl+j and ctrl+k navigate visible composer pickers" {
         bytes: []const u8,
         expected_index: usize,
     }{
-        .{ .bytes = "\x0a", .expected_index = 2 },
+        .{ .bytes = "\x0a", .expected_index = 3 },
         .{ .bytes = "\x0b", .expected_index = 0 },
-        .{ .bytes = "\x1b[106;5u", .expected_index = 2 },
+        .{ .bytes = "\x1b[106;5u", .expected_index = 3 },
         .{ .bytes = "\x1b[107;5u", .expected_index = 0 },
     };
 
@@ -8180,7 +8811,6 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         null,
         null,
-        null,
         false,
         4096,
     );
@@ -8281,7 +8911,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     const payload = "typing\t\r\n" ++ "\x03" ++ "\x1b[99;5u" ++ "\x1b[A" ++ "\x1b[200~";
     try feedRoutingBytes(&app, "\x1b[200~");
@@ -8342,7 +8972,7 @@ test "app_input_runtime approval amendment accepts bracketed paste" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\t");
     try std.testing.expect(app.approval_prompt.isAmending());
@@ -8379,7 +9009,7 @@ test "app_input_runtime approval amendment rejects oversized paste visibly" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 2, 100);
 
@@ -8412,7 +9042,7 @@ test "app_input_runtime keeps composer and decision input limits independent" {
 
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     try Runtime(RoutingFakeApp).handleTerminalByteWithLimits(&app, '\t', limits, 100);
     for ("xyz") |byte| {
@@ -8432,7 +9062,7 @@ test "app_input_runtime approval amendment paste finalization resets state after
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\t");
     try std.testing.expect(app.approval_prompt.isAmending());
     try app.input_runtime.paste.buffer.ensureTotalCapacity(alloc, 1);
@@ -8505,7 +9135,7 @@ test "app_input_runtime zero-content decision paste logs once" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -8521,7 +9151,7 @@ test "app_input_runtime decision paste start clears pending ctrl-c and esc gestu
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     armCtrlCExitForTest(&app.input_runtime, io_mod.milliTimestamp());
     armEscapeClearForTest(&app.input_runtime, io_mod.milliTimestamp());
     app.shell.render_requests.clearReason(.footer);
@@ -8598,7 +9228,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
 
         try feedRoutingBytes(&app, "\x1b[200~\x1b[201~1\r");
@@ -8612,7 +9242,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
         try feedRoutingBytes(&app, "\tkeep");
 
@@ -8762,7 +9392,7 @@ test "app_input_runtime bounds typed question and approval drafts with visible f
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
         try Runtime(RoutingFakeApp).handleByte(&app, '\t', 2, 100);
 
@@ -8832,7 +9462,7 @@ test "app_input_runtime routes typed utf8 scalars to modal editors" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
         try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
         try feedRoutingBytes(&app, "🙂");
@@ -8846,7 +9476,7 @@ test "app_input_runtime question prompt owns paste over an approval amendment" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\tkeep");
     try std.testing.expect(app.approval_prompt.isAmending());
     try std.testing.expectEqualStrings("keep", app.approval_prompt.decision.selectedDraft());
@@ -8876,7 +9506,7 @@ test "app_input_runtime routes input to the innermost active modal" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     const opts = [_]types.QuestionOption{
         .{ .label = "Alpha", .description = null },
@@ -8886,8 +9516,6 @@ test "app_input_runtime routes input to the innermost active modal" {
         .{ .question = "Continue?", .options = &opts },
     };
     try app.question_prompt.syncFrom(alloc, &entries);
-    app.subagents.active = true;
-
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expect(app.question_prompt.isActive());
     try std.testing.expect(!app.approval_prompt.isAmending());
@@ -8901,44 +9529,14 @@ test "app_input_runtime routes input to the innermost active modal" {
 
     app.approval_prompt.clear(alloc);
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-}
-
-test "app_input_runtime delegates only presented child approval ctrl-x" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        alloc,
-        .{ .label = "terminal.exec npm test" },
-    ));
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_x_manager_byte, 4096, 100);
-    try std.testing.expect(app.approval_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-
-    app.subagents.main_approval_presented = true;
-    try Runtime(RoutingFakeApp).handleByte(&app, '3', 4096, 100);
-    try std.testing.expectEqual(ToolPermissionDecision.deny, app.worker.submitted_permission.?);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        alloc,
-        .{ .label = "terminal.exec cargo test" },
-    ));
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_x_manager_byte, 4096, 100);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
+    try std.testing.expectEqualStrings("x", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime active paste shields prompts from escape timeout cancellation" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~");
     try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
@@ -9000,7 +9598,7 @@ test "app_input_runtime false paste starts leave decision prompt controls usable
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[0200~");
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -9025,7 +9623,7 @@ test "app_input_runtime false paste starts preserve stale paste and gestures" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.input_runtime.paste.decision_bytes = 7;
     try app.input_runtime.paste.buffer.appendSlice(alloc, "old");
     armCtrlCExitForTest(&app.input_runtime, 123);
@@ -9048,149 +9646,6 @@ test "app_input_runtime false paste starts preserve stale paste and gestures" {
         app.input_runtime.gestures.escapeClearArmedAt(),
     );
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-}
-
-test "app_input_runtime manager root paste preserves all main composer and session state" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "MAIN");
-    app.input_runtime.edit_state.cursor = 2;
-    try app.input_runtime.composer_history.record(alloc, 100, "history entry", &.{}, &.{}, &.{}, &.{});
-    const pasted_text = try alloc.dupe(u8, "preserved backing");
-    try app.input_runtime.entities.pasted_blocks.append(alloc, .{
-        .id = 7,
-        .text = pasted_text,
-        .line_count = 1,
-    });
-    app.input_runtime.entities.next_paste_id = 8;
-    app.session_persistence.degraded_warning_emitted = true;
-
-    try feedRoutingBytes(&app, "\x1b[0200~");
-    try feedRoutingBytes(&app, "\x1b[200;1~");
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-    try std.testing.expectEqualStrings("MAIN", app.input_runtime.edit_state.input.items);
-
-    try feedRoutingBytes(&app, "\x1b[200~");
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expect(app.subagents.managerPasteActive());
-    try feedRoutingBytes(&app, "ROOT_PASTE_LEAK" ++ "\x19" ++ "\x1b[A");
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-    try feedRoutingBytes(&app, "\x1b[201~");
-
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expect(!app.subagents.managerPasteActive());
-    try std.testing.expectEqualStrings("MAIN", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.pasted_blocks.items.len);
-    try std.testing.expectEqualStrings("preserved backing", app.input_runtime.entities.pasted_blocks.items[0].text);
-    try std.testing.expectEqual(@as(usize, 8), app.input_runtime.entities.next_paste_id);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
-    try std.testing.expectEqualStrings("history entry", app.input_runtime.composer_history.entryText(0).?);
-    try std.testing.expect(app.session_persistence.degraded_warning_emitted);
-    try std.testing.expect(app.subagents.isViewActive());
-}
-
-test "app_input_runtime manager paste pauses and resumes cursor probe at exact boundaries" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-    try app.terminal_input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
-
-    for ("\x1b[200~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .none => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    for ("\x1b[201;1~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .none => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    for ("\x1b[201~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try Runtime(RoutingFakeApp).settleTerminalPasteDeliveryEpochWithLimits(
-        &app,
-        paste_framing.InputLimits.single(4096),
-    );
-    try std.testing.expect(!app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .probe_timed_out => {},
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "app_input_runtime routes keys to subagent view when no modal is active" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-
-    try feedRoutingBytes(&app, "\x1b[A");
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_raw_keys);
-
-    try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
-    try std.testing.expectEqual(@as(usize, 2), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_raw_keys);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-}
-
-test "app_input_runtime routes bare and decoded Kitty Escape to the active subagent view" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        bytes: []const u8,
-        flush_pending: bool = false,
-    }{
-        .{ .bytes = "\x1b", .flush_pending = true },
-        .{ .bytes = "\x1b[27u" },
-    };
-
-    for (cases) |case| {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.subagents.active = true;
-
-        try feedRoutingBytes(&app, case.bytes);
-        if (case.flush_pending) {
-            try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
-        }
-
-        try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-        try std.testing.expectEqual(@as(?u8, 0x1b), app.subagents.last_handled_key);
-        try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
-    }
-}
-
-test "app_input_runtime active subagent manager owns stream Escape" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.stream.active = true;
-    app.subagents.active = true;
-
-    try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
-    try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
-
-    try std.testing.expect(!app.worker.cancel_requested);
-    try std.testing.expect(app.stream.active);
-    try std.testing.expect(app.subagents.isViewActive());
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(?u8, 0x1b), app.subagents.last_handled_key);
 }
 
 test "app_input_runtime inline scroll actions do not open the transcript viewer" {
@@ -9217,7 +9672,7 @@ test "app_input_runtime inline scroll actions do not open the transcript viewer"
     }
 }
 
-test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch detail" {
+test "app_input_runtime ctrl-o toggles full transcript while arrows preserve detail" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9234,12 +9689,12 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         app.shell.render_requests.clearReason(.modal);
         try Runtime(RoutingFakeApp).handleByte(&app, 15, 4096, 100);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
         try std.testing.expect(app.shell.full_transcript.follow_tail);
         try std.testing.expect(app.shell.render_requests.hasReason(.modal));
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9252,7 +9707,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[D");
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9263,7 +9718,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[111;5u");
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
 
         app.shell.render_requests.clearReason(.footer);
@@ -9273,7 +9728,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
         try feedRoutingBytes(&app, "\x1b[C");
@@ -9288,7 +9743,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try feedRoutingBytes(&app, "\x1b[120;5u");
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-        try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+        try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 
         app.shell.render_requests.clearReason(.modal);
@@ -9315,14 +9770,14 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
-        try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+        try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
     }
 
     {
         var approval_app = try RoutingFakeApp.init(alloc);
         defer approval_app.deinit();
         approval_app.shell.stdout_file = sink;
-        try std.testing.expect(try approval_app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try approval_app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try Runtime(RoutingFakeApp).handleByte(&approval_app, 15, 4096, 100);
         try std.testing.expect(!approval_app.terminal.fullTranscriptScreenActive());
@@ -9345,10 +9800,10 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006l"));
 }
 
 test "app_input_runtime skills catalog owns ctrl-o without opening another screen" {
@@ -9366,7 +9821,7 @@ test "app_input_runtime skills catalog owns ctrl-o without opening another scree
     try std.testing.expect(!app.shell.fullTranscriptActive());
 }
 
-test "app_input_runtime skills catalog owns ctrl-x without activating subagents" {
+test "app_input_runtime skills catalog ignores ctrl-x" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9392,7 +9847,7 @@ test "app_input_runtime skills catalog owns the all-sessions shortcut" {
     try std.testing.expectEqual(@as(usize, 0), app.notice_body.items.len);
 }
 
-test "app_input_runtime full transcript rejects ctrl-x manager entry without losing ownership" {
+test "app_input_runtime full transcript retains ownership while ctrl-x is inert" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9409,7 +9864,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
         app.shell.transcriptPresentationDepth(),
     );
 
@@ -9417,12 +9872,12 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try feedRoutingBytes(&app, "\x1b[120;5u");
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
     try std.testing.expect(!app.subagents.isViewActive());
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 }
 
-test "app_input_runtime full transcript page and wheel keys scroll the projection" {
+test "app_input_runtime full transcript page wheel and alternate-scroll keys scroll the projection" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9444,11 +9899,16 @@ test "app_input_runtime full transcript page and wheel keys scroll the projectio
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
     try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
 
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime ctrl-o opens review and closes active transcript from each encoding" {
+test "app_input_runtime ctrl-o opens full detail and closes it from each encoding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9463,7 +9923,7 @@ test "app_input_runtime ctrl-o opens review and closes active transcript from ea
         try feedRoutingBytes(&app, "\x1b[111;5u");
 
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
     }
 
@@ -9608,7 +10068,7 @@ test "app_input_runtime approval prompt blocks full transcript key interception"
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     activateFullTranscriptForRoutingTest(&app);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.shell.full_transcript.scroll_rows = 10;
 
     try feedRoutingBytes(&app, "\x1b[5~");
@@ -9677,7 +10137,7 @@ test "app_input_runtime new paste traces and clears stale inactive state" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.input_runtime.paste.decision_bytes = 7;
     try app.input_runtime.paste.buffer.appendSlice(alloc, "old");
 
@@ -9702,7 +10162,7 @@ test "app_input_runtime composer paste stays composer owned when prompt appears"
     try feedRoutingBytes(&app, "\x1b[200~");
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
     try feedRoutingBytes(&app, "hi");
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\x1b[201~");
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -9745,7 +10205,7 @@ test "app_input_runtime modal disappearance keeps decision-owned paste pinned" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~");
     app.approval_prompt.clear(app.alloc);
@@ -9846,6 +10306,46 @@ test "app_input_runtime raw and Kitty Ctrl-C preserve double-press exit" {
     }
 }
 
+test "app_input_runtime active Ctrl-C clears drafts before cancelling work" {
+    const sequences = [_][]const u8{ "\x03", "\x1b[99;5u" };
+    const drafts = [_]RoutingDraftKind{ .text, .paste, .image };
+    for (sequences) |sequence| {
+        for (drafts) |draft| {
+            for ([_]bool{ false, true }) |tool_active| {
+                const alloc = std.testing.allocator;
+                var app = try RoutingFakeApp.init(alloc);
+                defer app.deinit();
+                app.stream.active = true;
+                if (tool_active) {
+                    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                        .id = .{ .turn_id = 1, .call_id = "command" },
+                        .reconciles_provisional_call_id = null,
+                        .tool_name = "shell",
+                        .activity_kind = .command,
+                    } });
+                }
+                try seedRoutingDraftForGuard(&app, draft);
+                app.shell.render_requests.clearReason(.footer);
+
+                try feedRoutingBytes(&app, sequence);
+
+                try std.testing.expect(!Runtime(RoutingFakeApp).draftHasState(&app));
+                try std.testing.expect(app.stream.active);
+                try std.testing.expect(!app.worker.cancel_requested);
+                try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
+                try std.testing.expect(!app.should_exit);
+                try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+                try feedRoutingBytes(&app, sequence);
+
+                try std.testing.expect(app.worker.cancel_requested);
+                try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmed());
+                try std.testing.expect(!app.should_exit);
+            }
+        }
+    }
+}
+
 test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -9857,17 +10357,20 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expectEqualStrings("● System: cancelled", app.transcript.items);
-    try std.testing.expectEqualStrings("system", app.notice_topic.items);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, app.notice_tone);
-    try std.testing.expectEqualStrings("cancelled", app.notice_body.items);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmed());
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmedAt() != null);
     try std.testing.expect(!app.should_exit);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime active tool Escape waits for terminal feedback before repainting" {
+test "app_input_runtime active tool Escape presents final cancellation immediately" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9885,10 +10388,16 @@ test "app_input_runtime active tool Escape waits for terminal feedback before re
 
     try std.testing.expect(app.stream.active);
     try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expectEqualStrings("", app.transcript.items);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
     try std.testing.expectEqualStrings("", app.notice_topic.items);
     try std.testing.expectEqualStrings("", app.notice_body.items);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "app_input_runtime second Ctrl-C after active cancellation exits without duplicate notice" {
@@ -9901,8 +10410,13 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     try Runtime(RoutingFakeApp).handleByte(&app, 3, 4096, 100);
 
     try std.testing.expect(app.should_exit);
-    try std.testing.expectEqualStrings("● System: cancelled", app.transcript.items);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, app.notice_tone);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
 }
 
 test "app_input_runtime pending Ctrl-C exits before repeating active cancellation" {
@@ -9923,7 +10437,7 @@ test "app_input_runtime expired incomplete control sequence preserves approval" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.terminal_input_runtime.terminal_action_decoder.stage = 3;
     app.terminal_input_runtime.terminal_action_decoder.param = 20;
     app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
@@ -9983,7 +10497,7 @@ test "app_input_runtime expired mouse prefixes discard their tails without cance
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, case.prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10007,7 +10521,7 @@ test "app_input_runtime tail-less expired mouse recovery releases quietly" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10030,7 +10544,7 @@ test "app_input_runtime fresh Escape restarts expired mouse recovery before canc
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10052,7 +10566,7 @@ test "app_input_runtime fresh escape rearms generic decoder before paste start" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.terminal_input_runtime.terminal_action_decoder.stage = 3;
     app.terminal_input_runtime.terminal_action_decoder.param = 20;
     app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
@@ -10159,7 +10673,7 @@ test "approval cancellation uses one worker-owned terminal transition" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
 
     try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app);
@@ -10226,7 +10740,7 @@ test "bare escape during approval uses worker-owned cancellation" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     app.terminal_input_runtime.terminal_action_decoder.stage = 1;
     app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
@@ -10339,6 +10853,45 @@ fn installReadyRoutingFileApproval(app: *RoutingFakeApp) !void {
         .document_scrollable = true,
     });
 }
+
+const ApprovalOwnershipBinding = struct {
+    child_id: []const u8,
+};
+
+const ApprovalOwnershipSubagents = struct {
+    view_active: bool = true,
+    child_id: []const u8 = "selected-child",
+    presented_binding: ?ApprovalOwnershipBinding = null,
+    card_binding: ?ApprovalOwnershipBinding = null,
+
+    pub fn isViewActive(self: *const ApprovalOwnershipSubagents) bool {
+        return self.view_active;
+    }
+
+    pub fn childRouteId(self: *const ApprovalOwnershipSubagents) ?[]const u8 {
+        return self.child_id;
+    }
+
+    pub fn mainApprovalBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.presented_binding;
+    }
+
+    pub fn mainApprovalCardBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.card_binding;
+    }
+};
+
+const ApprovalOwnershipApp = struct {
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    approval_screen: interaction_state.ApprovalScreenState = .{},
+    subagents: ApprovalOwnershipSubagents = .{},
+};
 
 test "app_input_runtime consumes legacy X10 reports during active file approval" {
     const alloc = std.testing.allocator;
@@ -10538,7 +11091,7 @@ test "approval submission transfers feedback to the worker without a local card"
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf done",
+        .label = "shell.run printf done",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     for ("summarize the output") |byte| {
@@ -10743,7 +11296,7 @@ test "bare escape trace captures approval interrupt context" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     app.terminal_input_runtime.terminal_action_decoder.stage = 1;
     app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
@@ -10893,19 +11446,94 @@ const FakeSubmitApp = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     stream: types.StreamState = .{},
     pacer: struct {
+        pending: bool = false,
         completed_assistant_presentation_tail: bool = false,
+
+        pub fn hasPending(self: *const @This()) bool {
+            return self.pending;
+        }
 
         pub fn hasCompletedAssistantPresentationTail(self: *const @This()) bool {
             return self.completed_assistant_presentation_tail;
         }
     } = .{},
     worker: struct {
+        hold_available: bool = false,
+        held: bool = false,
+        queued_turn_id: ?u64 = null,
+        queued_images: []types.ImageAttachment = &.{},
+        queued_images_alloc: ?std.mem.Allocator = null,
+
         pub fn queuedPromptCount(_: *@This()) usize {
             return 0;
         }
+
+        pub fn tryHoldTurnStart(self: *@This()) bool {
+            if (!self.hold_available or self.held) return false;
+            self.held = true;
+            return true;
+        }
+
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            self.held = false;
+        }
+
+        pub fn removeQueuedPrompt(
+            self: *@This(),
+            _: std.mem.Allocator,
+            turn_id: u64,
+            retained_images: []const types.ImageAttachment,
+        ) bool {
+            if (self.queued_turn_id != turn_id) return false;
+            image_attachments.deleteUnreferencedImageSnapshots(
+                self.queued_images,
+                retained_images,
+            );
+            self.freeQueuedImageMetadata();
+            self.queued_turn_id = null;
+            return true;
+        }
+
+        pub fn clearQueuedPrompts(
+            self: *@This(),
+            _: std.mem.Allocator,
+            retained_images: []const types.ImageAttachment,
+        ) void {
+            image_attachments.deleteUnreferencedImageSnapshots(
+                self.queued_images,
+                retained_images,
+            );
+            self.freeQueuedImageMetadata();
+            self.queued_turn_id = null;
+        }
+
+        fn freeQueuedImageMetadata(self: *@This()) void {
+            if (self.queued_images_alloc) |alloc| {
+                types.freeImageAttachmentSlice(alloc, self.queued_images);
+            }
+            self.queued_images = &.{};
+            self.queued_images_alloc = null;
+        }
+
+        pub fn clearQueuedPromptsForSessionTransition(
+            self: *@This(),
+            alloc: std.mem.Allocator,
+            _: u64,
+            retained_images: []const types.ImageAttachment,
+        ) void {
+            self.clearQueuedPrompts(alloc, retained_images);
+        }
+
+        pub fn activeTurnId(_: *const @This()) u64 {
+            return 0;
+        }
+
+        pub fn requestCancel(_: *@This()) void {}
     } = .{},
+    submission: input_submit_runtime.State = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
+        full_transcript_active: bool = false,
         layout: types.Layout = .{
             .rows = 24,
             .cols = 80,
@@ -10915,6 +11543,10 @@ const FakeSubmitApp = struct {
             .divider_bottom_row = 23,
             .hint_row = 24,
         },
+
+        pub fn fullTranscriptActive(self: *const @This()) bool {
+            return self.full_transcript_active;
+        }
     } = .{},
     next_image_id_counter: usize = 1,
     transcript: std.ArrayList(u8) = .empty,
@@ -10938,6 +11570,7 @@ const FakeSubmitApp = struct {
     capture_error_id: ?usize = null,
     capture_error: ?anyerror = null,
     fail_enqueue_after_snapshot: bool = false,
+    fail_pending_finalization: bool = false,
     fail_command_after_pending_clear: bool = false,
     snapshot_dir: ?[]const u8 = null,
 
@@ -10946,6 +11579,8 @@ const FakeSubmitApp = struct {
     }
 
     fn deinit(self: *FakeSubmitApp) void {
+        if (self.submission.pending) |*pending| pending.deinit(self.alloc);
+        self.submission.pending = null;
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
@@ -10958,6 +11593,7 @@ const FakeSubmitApp = struct {
         types.freeImageAttachmentSlice(self.alloc, self.last_images);
         self.clearLastSkillTokens();
         self.last_skill_tokens.deinit(self.alloc);
+        self.worker.freeQueuedImageMetadata();
     }
 
     pub fn writeDomainNotice(self: *FakeSubmitApp, notice: types.SemanticNotice, _: bool) !void {
@@ -11018,6 +11654,27 @@ const FakeSubmitApp = struct {
     pub fn ensurePromptCredential(self: *FakeSubmitApp) !bool {
         self.preflight_count += 1;
         return self.prompt_admitted;
+    }
+
+    pub fn adoptPendingUserPrompt(
+        _: *FakeSubmitApp,
+        _: *const input_submit_runtime.PendingPromptDraft,
+    ) !void {}
+
+    pub fn finalizePendingSubmission(
+        self: *FakeSubmitApp,
+        draft: *const input_submit_runtime.PendingPromptDraft,
+    ) !void {
+        if (self.fail_pending_finalization) {
+            return error.InjectedPendingFinalizationFailure;
+        }
+        self.worker.freeQueuedImageMetadata();
+        self.worker.queued_images = try types.dupeImageAttachmentSlice(
+            self.alloc,
+            draft.images,
+        );
+        self.worker.queued_images_alloc = self.alloc;
+        self.worker.queued_turn_id = draft.turn_id;
     }
 
     pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
@@ -11218,7 +11875,6 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             .delete_to_line_start,
             null,
             null,
-            null,
             false,
             4096,
         );
@@ -11298,7 +11954,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .delete_to_line_start,
         null,
         null,
-        null,
         false,
         4096,
     );
@@ -11312,7 +11967,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         &app,
         .delete_to_line_end,
         .delete_to_line_end,
-        null,
         null,
         null,
         false,
@@ -11418,6 +12072,73 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime idle submit commits its frame before credential preflight" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "pending first");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expect(app.submission.pending != null);
+    try std.testing.expectEqualStrings("pending first", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(
+        input_submit_runtime.PendingPhase.awaiting_frame,
+        app.submission.pending.?.phase,
+    );
+    try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).noteCommittedFrame(&app);
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).collectPendingSubmissionFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(
+        input_submit_runtime.PendingPhase.queued,
+        app.submission.pending.?.phase,
+    );
+}
+
+test "app_input_runtime second Enter preserves the newer draft until pending acknowledgement" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "pending first");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "newer draft");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("pending first", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqualStrings("newer draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
+    try std.testing.expectEqual(@as(usize, 0), app.capture_count);
+    try std.testing.expect(app.worker.held);
+
+    app.input_runtime.inputResetState().clearCurrent(alloc);
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/help");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
 }
 
 test "app_input_runtime recalls a submitted slash command with history previous" {
@@ -11974,10 +12695,11 @@ test "app_input_runtime slash command records output without a pre-frame termina
     try std.testing.expectEqual(@as(u64, 0), try sink.length(io_mod.getIo()));
 }
 
-test "app_input_runtime idle pasted prompt defers frames until worker presentation" {
+test "app_input_runtime idle pasted prompt enters the pending acknowledgement frame" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
+    app.worker.hold_available = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "before [Pasted text #7, 2 lines] after");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -11994,11 +12716,15 @@ test "app_input_runtime idle pasted prompt defers frames until worker presentati
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expect(app.last_command == null);
-    try std.testing.expectEqualStrings("before alpha\nbeta after", app.last_prompt.?);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqualStrings(
+        "before alpha\nbeta after",
+        app.submission.pending.?.draft.prompt,
+    );
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.pasted_blocks.items.len);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
 test "app_input_runtime submit rejects oversized registered paste backing" {
@@ -12033,6 +12759,7 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc, .stream = .{ .active = true } };
     defer app.deinit();
+    app.worker.hold_available = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "queued follow-up");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -12040,12 +12767,12 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expectEqualStrings("queued follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.shell.render_requests.submittedPromptTransitionPending());
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
-test "app_input_runtime completed presentation tail defers prompt frames until canonical admission" {
+test "app_input_runtime completed presentation tail keeps the active queue path unblocked" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{
         .alloc = alloc,
@@ -12061,8 +12788,43 @@ test "app_input_runtime completed presentation tail defers prompt frames until c
 
     try std.testing.expectEqualStrings("paced-tail follow-up", app.last_prompt.?);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
+}
+
+test "app_input_runtime pending paced output keeps the active queue path" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .pacer = .{ .pending = true },
+    };
+    defer app.deinit();
+    app.worker.hold_available = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "paced-output follow-up");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("paced-output follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expect(!app.worker.held);
+}
+
+test "app_input_runtime full transcript keeps the active queue path" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    app.shell.full_transcript_active = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "full-transcript follow-up");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("full-transcript follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expect(!app.worker.held);
 }
 
 test "app_input_runtime blank submit repaints without a worker event" {
@@ -12078,23 +12840,24 @@ test "app_input_runtime blank submit repaints without a worker event" {
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.shell.render_requests.submittedPromptTransitionPending());
 }
 
-test "app_input_runtime idle image-only prompt waits for begin prompt repaint" {
+test "app_input_runtime idle image-only prompt enters the pending acknowledgement frame" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
+    app.worker.hold_available = true;
     try appendOwnedPendingImage(&app, 1, "/tmp/image.png");
 
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
-    try std.testing.expectEqualStrings("", app.last_prompt.?);
-    try std.testing.expectEqual(@as(usize, 1), app.last_images.len);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqualStrings("", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.submission.pending.?.draft.images.len);
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
 test "app_input_runtime submit preserves direct prompt boundary whitespace" {
@@ -12267,6 +13030,115 @@ test "app_input_runtime recalled image and skill resubmit with fresh provenance"
     );
 }
 
+test "app_input_runtime recalls image after post-ack finalization failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "failed-image.png");
+    const image_path = try realTmpPath(alloc, &tmp, "failed-image.png");
+    defer alloc.free(image_path);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .snapshot_dir = snapshot_dir,
+        .fail_pending_finalization = true,
+    };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, image_path);
+    app.input_runtime.edit_state.cursor = image_path.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.submission.pending != null);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).noteCommittedFrame(&app);
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).collectPendingSubmissionFacts(&app);
+
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+        &app,
+        -1,
+    );
+    try std.testing.expectEqualStrings("[Image #2]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.pending_images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 2), try countTestSnapshotFiles(snapshot_dir));
+
+    app.clearPendingImages();
+    try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+    app.input_runtime.composer_history.clear(alloc);
+    try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+}
+
+test "app_input_runtime terminal pending cleanup preserves image history" {
+    const alloc = std.testing.allocator;
+    const PendingRuntime = input_submit_runtime.SubmitRuntime(FakeSubmitApp);
+    const cases = [_]struct {
+        name: []const u8,
+        queued: bool,
+        session_transition: bool,
+    }{
+        .{ .name = "ctrl-c-awaiting.png", .queued = false, .session_transition = false },
+        .{ .name = "ctrl-c-queued.png", .queued = true, .session_transition = false },
+        .{ .name = "reset-awaiting.png", .queued = false, .session_transition = true },
+        .{ .name = "reset-queued.png", .queued = true, .session_transition = true },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeTestImage(&tmp, case.name);
+        const image_path = try realTmpPath(alloc, &tmp, case.name);
+        defer alloc.free(image_path);
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+        defer alloc.free(snapshot_dir);
+
+        var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+        defer app.deinit();
+        app.worker.hold_available = true;
+        try app.input_runtime.edit_state.input.appendSlice(alloc, image_path);
+        app.input_runtime.edit_state.cursor = image_path.len;
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+        if (case.queued) {
+            PendingRuntime.noteCommittedFrame(&app);
+            PendingRuntime.collectPendingSubmissionFacts(&app);
+            try std.testing.expectEqual(
+                input_submit_runtime.PendingPhase.queued,
+                app.submission.pending.?.phase,
+            );
+        }
+
+        if (case.session_transition) {
+            PendingRuntime.clearPendingSubmissionForSessionTransition(&app);
+            app.input_runtime.inputResetState().resetForSession(alloc);
+        } else {
+            try std.testing.expect(PendingRuntime.cancelPendingSubmission(&app));
+        }
+
+        try std.testing.expect(app.submission.pending == null);
+        try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+        try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+            &app,
+            -1,
+        );
+        try std.testing.expectEqualStrings("[Image #2]", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 2), try countTestSnapshotFiles(snapshot_dir));
+
+        app.clearPendingImages();
+        try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+        app.input_runtime.composer_history.clear(alloc);
+        try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+    }
+}
+
 test "app_input_runtime missing auth preserves the complete composer before prompt admission" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc, .prompt_admitted = false };
@@ -12344,7 +13216,7 @@ test "app_input_runtime preflight rejection removes captured inline snapshot" {
     try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
 }
 
-test "app_input_runtime gates model selection but not model discovery" {
+test "app_input_runtime gates direct model selection but not bare model browse" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         input: []const u8,
@@ -12352,7 +13224,7 @@ test "app_input_runtime gates model selection but not model discovery" {
         command: ?[]const u8,
         remaining_input: []const u8,
     }{
-        .{ .input = "/models", .preflight_count = 0, .command = "/models", .remaining_input = "" },
+        .{ .input = "/model", .preflight_count = 0, .command = "/model", .remaining_input = "" },
         .{ .input = "/model claude", .preflight_count = 1, .command = null, .remaining_input = "/model claude" },
     };
 
@@ -13259,6 +14131,17 @@ test "app_input_runtime paste edit keeps the original history draft reachable" {
     try std.testing.expectEqualStrings("recalled prompt pasted edit", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(?usize, 0), app.input_runtime.composer_history.activeIndex());
     try std.testing.expectEqualStrings("unsent draft", app.input_runtime.composer_history.draftText().?);
+}
+
+test "ordinary submit uses one interactive prompt path" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.stream.active = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "steer now");
+    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expectEqualStrings("steer now", app.last_prompt.?);
 }
 
 test "app_input_runtime small paste opens skills menu for matching dollar token" {

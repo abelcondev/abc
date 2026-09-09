@@ -6,8 +6,10 @@ const token_estimate = @import("../../../shared/token_estimate.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const gateway_json = @import("../../../gateway/gateway_json.zig");
+const session_store = @import("../../../session/session_store.zig");
+const session_usage = @import("../../../session/session_usage.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
 const io_mod = @import("../../../shared/io.zig");
@@ -18,6 +20,8 @@ const vision_executor = @import("../vision_executor.zig");
 const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
+const prompt_context = @import("../prompt_context.zig");
 
 const test_support = @import("support.zig");
 
@@ -32,6 +36,7 @@ const FakeGateway = test_support.FakeGateway;
 const FakeAgentRuntimeDeps = test_support.FakeAgentRuntimeDeps;
 const ModelCapabilityOverride = test_support.ModelCapabilityOverride;
 const PromptFixture = test_support.PromptFixture;
+const ToolExecutionOverride = test_support.ToolExecutionOverride;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 const ExecuteDelegate = test_support.ExecuteDelegate;
 const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
@@ -53,6 +58,13 @@ const vision_and_read_file_tools = [_]tool_dispatch.Tool{
     builtin_tools.vision,
     builtin_tools.read_file,
 };
+const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
+    builtin_tools.vision,
+    builtin_tools.read_file,
+    builtin_tools.shell,
+};
+const terminal_advertised_names = [_][]const u8{"shell"};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -166,6 +178,126 @@ test "processQueuedPrompt projects lifecycle session identity to the provider" {
     );
 }
 
+test "processQueuedPrompt accounts exact direct-provider usage without deferred capability" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .content = "ok",
+        .generation_id = "response-codex-1",
+        .billing = .{
+            .created_at_ms = 1,
+            .model = "codex/gpt-test",
+            .total_cost = 0,
+            .input_tokens = 17,
+            .output_tokens = 7,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = null,
+            .billable_web_search_calls = 0,
+        },
+        .exact_usage_provider = .codex,
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.usage = &usage;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.provider_capabilities = .{};
+    var job = fixture.job();
+    job.provider = .codex;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 17), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
+}
+
+test "terminal assistant completion continues with steering admitted during the response" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Original answer" },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"change direction"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Original answer",
+        "user_steering",
+        "change direction",
+    });
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("change direction", execution.steering[0].text);
+
+    const resumed_completions = [_]FakeCompletion{.{ .content = "Follow-up answer" }};
+    var resumed_gateway = FakeGateway.init(alloc, &resumed_completions);
+    defer resumed_gateway.deinit();
+    var resumed_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_hooks.deinit();
+    var resumed_fixture = PromptFixture{};
+    var resumed_job = resumed_fixture.job();
+    resumed_job.prompt = @constCast("follow up");
+    resumed_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(
+        &resumed_gateway,
+        &resumed_hooks,
+        resumed_fixture.config(),
+        resumed_job,
+    );
+
+    try expectBodyContainsInOrder(&resumed_gateway, 0, &.{
+        "user prompt",
+        "Original answer",
+        "change direction",
+        "Updated answer",
+        "follow up",
+    });
+}
+
+test "promoted steering remains model marked across the worker handoff" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Updated answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.delivery = .continuation;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 0, &.{
+        "user_steering",
+        "user prompt",
+    });
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        "user prompt",
+        hooks.history_turns.items[0].assistant.user.text,
+    );
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -193,7 +325,7 @@ fn expectPromptEntryRole(entry: std.json.Value, expected_role: types.ChatRole) !
     try std.testing.expect(entry == .object);
     const role = entry.object.get("role") orelse return error.TestExpectedPromptRoleMissing;
     try std.testing.expect(role == .string);
-    try std.testing.expectEqualStrings(gateway_json.roleName(expected_role), role.string);
+    try std.testing.expectEqualStrings(@tagName(expected_role), role.string);
 }
 
 fn expectGatewayPromptRoles(gateway: *const FakeGateway, index: usize, expected_roles: []const types.ChatRole) !void {
@@ -428,18 +560,24 @@ const VisionProviderScript = struct {
     fn stream(
         context: ?*anyopaque,
         _: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) anyerror!agent_stream_provider.Result {
         const self: *VisionProviderScript = @ptrCast(@alignCast(context.?));
         if (self.calls >= self.responses.len) return error.TestVisionScriptExhausted;
         const response = self.responses[self.calls];
         self.calls += 1;
+        try request.admission.admit();
         return switch (response) {
-            .content => |text| .{ .status = .ok, .completion = .{ .content = text } },
-            .http_status => |status| .{ .status = status },
+            .content => |text| .{ .completed = .{ .completion = .{ .content = text } } },
+            .http_status => |status| .{ .failed = .{ .kind = switch (status) {
+                .unauthorized => .unauthorized,
+                .too_many_requests => .rate_limited,
+                .service_unavailable => .unavailable,
+                else => .provider_error,
+            } } },
             .cancel => blk: {
                 request.cancel_flag.store(true, .seq_cst);
-                break :blk .{ .status = .ok };
+                break :blk .{ .completed = .{} };
             },
         };
     }
@@ -460,7 +598,6 @@ fn runScriptedVision(
         .api_key = "key",
         .gateway_team = null,
         .retry_count = 1,
-        .chat_url = "https://example.invalid",
         .cancel_flag = null,
         .usage = null,
         .usage_allocator = alloc,
@@ -470,29 +607,6 @@ fn runScriptedVision(
             .source = .command_line,
         },
     });
-}
-
-fn expectGatewayPromptEntryCacheControl(gateway: *const FakeGateway, index: usize, needle: []const u8, expected: bool) !void {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(index < gateway.request_bodies.items.len);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[index], .{});
-    defer parsed.deinit();
-
-    const prompt = parsed.value.object.get("prompt").?.array.items;
-    for (prompt) |entry| {
-        if (countPromptEntryText(entry, needle) == 0) continue;
-        try std.testing.expectEqual(expected, entry.object.get("providerOptions") != null);
-        return;
-    }
-    return error.TestExpectedPromptMessageMissing;
-}
-
-fn expectNoPromptCacheControlAfter(gateway: *const FakeGateway, index: usize, needle: []const u8) !void {
-    try std.testing.expect(index < gateway.request_bodies.items.len);
-    const body = gateway.request_bodies.items[index];
-    const start = std.mem.indexOf(u8, body, needle) orelse return error.TestExpectedBodyNeedleMissing;
-    try std.testing.expect(std.mem.find(u8, body[start..], "cacheControl") == null);
 }
 
 test "processQueuedPrompt gates text-only images through the real Vision runtime" {
@@ -595,12 +709,8 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectGatewayPromptTailText(
-        &gateway,
-        2,
-        .tool,
-        "FX logo",
-    );
+    try expectGatewayPromptTextCount(&gateway, 2, "FX logo", 1);
+    try expectGatewayPromptTailText(&gateway, 2, .tool, "FX logo");
     try expectGatewayPromptTailText(
         &gateway,
         3,
@@ -914,10 +1024,12 @@ test "required Vision rejects non-Vision before effects and stays required until
     defer types.freeImageAttachment(alloc, image);
     var images = [_]types.ImageAttachment{image};
 
+    const wrapped_terminal_arguments =
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf must-not-run\"}}";
     const blocked_calls = [_]ToolCall{toolCall(
-        "call_read_while_vision_required",
-        "read_file",
-        "{\"path\":\"must-not-read.txt\"}",
+        "call_terminal_while_vision_required",
+        "shell",
+        wrapped_terminal_arguments,
     )};
     const vision_calls = [_]ToolCall{toolCall(
         "call_required_vision",
@@ -941,7 +1053,7 @@ test "required Vision rejects non-Vision before effects and stays required until
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.tool_registry = .{ .tools = vision_and_read_file_tools[0..] };
+    hooks.tool_registry = .{ .tools = vision_read_and_terminal_tools[0..] };
     defer hooks.deinit();
     var vision_runtime = VisionAgentToolRuntime{
         .alloc = alloc,
@@ -968,7 +1080,9 @@ test "required Vision rejects non-Vision before effects and stays required until
     job.authorized_image_catalog = &images;
     job.permission_mode = .ask;
 
-    const config = fixture.config();
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
     var lifecycle = test_support.testLifecycleContext(
         lifecycle_view,
         alloc,
@@ -990,7 +1104,7 @@ test "required Vision rejects non-Vision before effects and stays required until
     }
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"required\"}");
-    try expectBodyContains(&gateway, 1, "call_read_while_vision_required");
+    try expectBodyContains(&gateway, 1, "call_terminal_while_vision_required");
     try expectBodyContains(&gateway, 1, "Only Vision can be called while attached images are pending.");
     try expectBodyNotContains(&gateway, 3, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 2, "\"type\":\"file\"");
@@ -1013,11 +1127,29 @@ test "required Vision rejects non-Vision before effects and stays required until
     try std.testing.expectEqualStrings("call_read_after_vision", hooks.executed_call_ids.items[1]);
     try expectNoLifecycleForCall(
         hooks.lifecycle_events.items,
-        "call_read_while_vision_required",
+        "call_terminal_while_vision_required",
     );
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("read_file", hooks.rejected_names.items[0]);
+    try std.testing.expectEqualStrings("shell", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.execution_count);
+    var persisted_arguments: ?[]const u8 = null;
+    for (hooks.history_turns.items) |turn| {
+        const assistant = switch (turn) {
+            .assistant => |value| value,
+            else => continue,
+        };
+        for (assistant.execution.tool_steps) |step| {
+            for (step.tool_calls) |call| {
+                if (std.mem.eql(u8, call.id, "call_terminal_while_vision_required")) {
+                    persisted_arguments = call.arguments_json;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqualStrings(
+        wrapped_terminal_arguments,
+        persisted_arguments orelse return error.TestExpectedEqual,
+    );
     try std.testing.expectEqualStrings("Final after ordinary read", hooks.finish_assistant_text.?);
 }
 
@@ -2250,6 +2382,7 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "google/gemini-2.5-flash",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2275,6 +2408,42 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     try expectBodyNotContains(&gateway, 0, "<image_context>");
     try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try std.testing.expectEqualStrings("Native image answer", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt never uses the vision fallback for Codex" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const capability_overrides = [_]ModelCapabilityOverride{.{
+        .model = "gpt-5.6-sol",
+        .capabilities = .{ .image_input_support = .non_native },
+    }};
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &capability_overrides;
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.model = @constCast("gpt-5.6-sol");
+    job.prompt = @constCast("Describe the attached image.");
+    job.images = &images;
+    job.authorized_image_catalog = &images;
+
+    var config = fixture.config();
+    config.provider_capabilities = .{};
+    try std.testing.expectError(
+        error.SubscriptionNativeImageUnavailable,
+        runFakePrompt(&gateway, &hooks, config, job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
 }
 
 test "processQueuedPrompt routes images natively only when vision and file input are both supported" {
@@ -2304,6 +2473,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
             .capabilities = .{
+                .image_input_support = if (entry.expect_native) .native else .non_native,
                 .supports_vision = entry.supports_vision,
                 .supports_file_input = entry.supports_file_input,
             },
@@ -2349,7 +2519,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
-            try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+            try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
             try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2370,7 +2540,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
     }
 }
 
-test "processQueuedPrompt rejects native-route attachment ID Vision calls before permission or execution" {
+test "processQueuedPrompt rejects unadvertised native-route Vision calls before permission or execution" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2395,6 +2565,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "native/test-vision",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2420,7 +2591,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-    try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+    try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try expectBodyNotContains(&gateway, 1, image_path);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -2574,11 +2745,11 @@ test "processQueuedPrompt omits Fast without catalog support" {
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     try expectBodyNotContains(&gateway, 0, "\"maxOutputTokens\"");
 }
 
-test "processQueuedPrompt uses one available capability snapshot for history and output" {
+test "processQueuedPrompt uses one available capability snapshot for compaction and output" {
     const alloc = std.testing.allocator;
     const old_marker = "OLD_HISTORY_MUST_BE_PROJECTED_OUT";
     const old_user = try alloc.alloc(u8, 48_000);
@@ -2605,7 +2776,10 @@ test "processQueuedPrompt uses one available capability snapshot for history and
             .{ .context_window = 32_000, .max_output_tokens = 16_000 },
         ),
     }};
-    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
+        .{ .content = "Done" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -2618,10 +2792,116 @@ test "processQueuedPrompt uses one available capability snapshot for history and
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
-    try expectBodyContains(&gateway, 0, "NEW_HISTORY_USER");
-    try expectBodyContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
-    try expectBodyNotContains(&gateway, 0, old_marker);
-    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":16000");
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, old_marker);
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":");
+    try expectBodyContains(&gateway, 1, "context_handoff");
+    try expectBodyNotContains(&gateway, 1, old_marker);
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
+}
+
+test "processQueuedPrompt compacts with the selected working model" {
+    const alloc = std.testing.allocator;
+    const old_user = try alloc.alloc(u8, 48_000);
+    defer alloc.free(old_user);
+    @memset(old_user, 'u');
+    const old_assistant = try alloc.alloc(u8, 48_000);
+    defer alloc.free(old_assistant);
+    @memset(old_assistant, 'a');
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = old_user },
+            .assistant = old_assistant,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("recent user") },
+            .assistant = @constCast("recent assistant"),
+        } },
+    };
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        credential_source: types.CredentialSource,
+        working_model: []const u8,
+    }{
+        .{
+            .provider = .codex,
+            .credential_source = .chatgpt_subscription,
+            .working_model = "gpt-5.6-sol",
+        },
+        .{
+            .provider = .grok,
+            .credential_source = .grok_subscription,
+            .working_model = "grok-4.6",
+        },
+        .{
+            .provider = .gateway,
+            .credential_source = .ai_gateway_api_key,
+            .working_model = "zai/glm-5.2",
+        },
+        .{
+            .provider = .gateway,
+            .credential_source = .ai_gateway_api_key,
+            .working_model = "moonshotai/kimi-k3",
+        },
+    };
+    for (cases) |case| {
+        const available_overrides = [_]ModelCapabilityOverride{.{
+            .model = case.working_model,
+            .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
+        }};
+        const completions = [_]FakeCompletion{
+            .{ .content = "Continue from the compacted conversation." },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = case.provider;
+        job.credential_source = case.credential_source;
+        job.model = @constCast(case.working_model);
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[0]);
+        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[1]);
+    }
+
+    const unavailable_capabilities = [_]ModelCapabilityOverride{.{
+        .model = "anthropic/claude-opus-4.6",
+        .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
+    }};
+    const unused = [_]FakeCompletion{.{ .content = "must not run" }};
+    var unavailable_gateway = FakeGateway.init(alloc, &unused);
+    defer unavailable_gateway.deinit();
+    var unavailable_hooks = FakeAgentRuntimeDeps.init(alloc);
+    unavailable_hooks.available_capability_overrides = &unavailable_capabilities;
+    defer unavailable_hooks.deinit();
+    var unavailable_fixture = PromptFixture{};
+    var unavailable_job = unavailable_fixture.job();
+    unavailable_job.provider = .codex;
+    unavailable_job.credential_source = .ai_gateway_api_key;
+    unavailable_job.history = &history;
+
+    try std.testing.expectError(
+        error.ContextCompactionUnavailable,
+        runFakePrompt(
+            &unavailable_gateway,
+            &unavailable_hooks,
+            unavailable_fixture.config(),
+            unavailable_job,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), unavailable_gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt projects bounded output limits into gateway requests" {
@@ -2666,6 +2946,851 @@ test "processQueuedPrompt projects bounded output limits into gateway requests" 
     }
 }
 
+test "processQueuedPrompt semantically compacts history at eighty percent and continues" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    const first_calls = [_]ToolCall{toolCall(
+        "auto_compact_1",
+        "read_file",
+        "{\"path\":\"first.txt\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Finish after the verified read and return the result." },
+        .{ .tool_calls = &first_calls },
+        .{ .content = "Automatic compaction complete." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const model = "provider/automatic-compaction";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "AUTO_RESULT_SENTINEL" } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    config.host_instructions = "AUTO_COMPACTION_HOST_INSTRUCTIONS";
+    config.skill_catalog = .{ .skills = &.{.{
+        .name = "auto-compaction-workflow",
+        .description = "Keep the selected workflow available during compaction.",
+        .path = "/skills/auto-compaction-workflow",
+        .source = .global_fx,
+    }} };
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var restored_calls = [_]ToolCall{toolCall(
+        "auto_restored_1",
+        "read_file",
+        "{\"path\":\"restored.txt\"}",
+    )};
+    var restored_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("auto_restored_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("AUTO_RESTORED_AVAILABLE_BYTES"),
+        .output_bytes = 100,
+        .stored_output_bytes = 29,
+        .truncated = true,
+    }};
+    var restored_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &restored_calls,
+        .tool_results = &restored_results,
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
+            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
+            .execution = .{ .tool_steps = &restored_steps },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("AUTO_RECENT_USER") },
+            .assistant = @constCast("AUTO_RECENT_ASSISTANT"),
+        } },
+    };
+    job.history = &history;
+    job.unversioned_history_count = history.len;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.history_turns.items[0].compacted_summary.summary,
+        "Finish after the verified read",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
+    try expectBodyContains(&gateway, 0, "Result handle:");
+    try expectBodyContains(&gateway, 0, "AUTO_RESTORED_AVAILABLE_BYTES");
+    try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 0, "\"tools\":[]");
+    try expectBodyContains(&gateway, 1, "context_handoff");
+    try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[1], .{
+        .model = model,
+        .messages = &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
+    })).estimated_input_tokens <= 4_500);
+    try expectBodyContains(&gateway, 1, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectBodyContains(&gateway, 1, "auto-compaction-workflow");
+    try expectBodyContains(&gateway, 1, "available_skills");
+    try expectBodyNotContains(&gateway, 1, "AUTO_HISTORY_ASSISTANT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "AUTO_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectBodyContains(&gateway, 2, "auto-compaction-workflow");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        hooks.successful_effect_count.load(.seq_cst),
+    );
+}
+
+test "automatic compaction rejects fixed request overhead above its total target" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "The earlier task is complete." },
+        .{ .content = "Finished." },
+    });
+    defer gateway.deinit();
+    const model = "provider/fixed-compaction-overhead";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.system_prompt = "fixed instruction " ** 10_000;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("history " ** 30_000),
+    } }};
+    job.history = &history;
+
+    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, config, job));
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+}
+
+test "automatic compaction shrinks recent history to fit fixed instructions" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "The earlier work is complete. Preserve the recent facts." },
+        .{ .content = "Continued after compaction." },
+    });
+    defer gateway.deinit();
+    const model = "fixture/retained-budget";
+    const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 128_000, .max_output_tokens = 8_192 } }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.system_prompt = "i" ** 104_000;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("middle") }, .assistant = @constCast("MIDDLE_BUDGET_FACT " ++ ("m" ** 8_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("recent") }, .assistant = @constCast("RECENT_BUDGET_FACT " ++ ("r" ** 8_000)) } },
+    };
+    job.history = &history;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "OLD_BUDGET_FACT");
+    try expectBodyContains(&gateway, 0, "MIDDLE_BUDGET_FACT");
+    try expectBodyContains(&gateway, 1, "RECENT_BUDGET_FACT");
+    try expectBodyNotContains(&gateway, 1, "MIDDLE_BUDGET_FACT");
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+}
+
+test "compaction remeasures its rebuilt continuation after calibrated preflight" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var calls: [4][1]ToolCall = undefined;
+    var states: [4][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (states[0..initialized]) |state| alloc.free(state);
+    const ids = [_][]const u8{ "calibration-one", "calibration-two", "calibration-three", "calibration-four" };
+    const inputs = [_]u64{ 10, 4_000, 8_000, 15_000 };
+    var completions: [6]FakeCompletion = undefined;
+    for (ids, 0..) |id, index| {
+        calls[index] = .{toolCall(id, "read_file", "{\"path\":\"fixture.txt\"}")};
+        states[index] = try std.fmt.allocPrint(alloc, "[{{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEncryptedContent\":\"{s}\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}]", .{ "r" ** 200_000, id });
+        initialized += 1;
+        completions[index] = .{ .tool_calls = &calls[index], .provider_state_json = states[index], .usage = .{ .input_tokens = inputs[index] } };
+    }
+    completions[4] = .{ .content = "The fixture reads completed successfully." };
+    completions[5] = .{ .content = "Calibrated continuation completed." };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "fixture/calibrated-compaction";
+    const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 20_000 } }};
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once, .once, .once };
+    hooks.exec_plans = &.{ .{ .result = .{ .model_output = "read one" } }, .{ .result = .{ .model_output = "read two" } }, .{ .result = .{ .model_output = "read three" } }, .{ .result = .{ .model_output = "read four" } } };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 5, "context_handoff");
+    const raw = try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[5], .{ .model = model, .messages = &.{}, .tool_choice = .auto, .provider_options = .{} });
+    try std.testing.expect(raw.estimated_input_tokens < 20_000);
+    try std.testing.expectEqualStrings("Calibrated continuation completed.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 4), hooks.successful_effect_count.load(.seq_cst));
+}
+
+test "compaction can summarize the newest exchange when fixed context prevents retaining it" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_older_history| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        const calls = [_]ToolCall{toolCall("completed-large-write", "write_file", "{\"path\":\"large.txt\",\"content\":\"" ++ ("x" ** 68_000) ++ "\"}")};
+        var gateway = FakeGateway.init(alloc, &.{
+            .{ .tool_calls = &calls },
+            .{ .content = "The large write completed. Do not repeat it." },
+            .{ .content = "Continued with the completed write preserved." },
+        });
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const model = "fixture/fixed-newest-budget";
+        const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 20_000 } }};
+        hooks.available_capability_overrides = &overrides;
+        hooks.permission_decisions = &.{.once};
+        hooks.exec_plans = &.{.{ .result = .{ .model_output = "Write completed." } }};
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.system_prompt = "i" ** 16_000;
+        config.tool_result_dir = result_dir;
+        var job = fixture.job();
+        job.model = @constCast(model);
+        var older = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older fact") } }};
+        if (with_older_history) job.history = &older;
+        try runFakePrompt(&gateway, &hooks, config, job);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 1, "completed-large-write");
+        try expectBodyContains(&gateway, 2, "context_handoff");
+        try expectBodyNotContains(&gateway, 2, "x" ** 68_000);
+        try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    }
+}
+
+test "automatic compaction validates serialized handoff cost before committing" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "\"" ** 10_000 }});
+    defer gateway.deinit();
+    const model = "provider/escaped-compaction-summary";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier request") },
+        .assistant = @constCast("history " ** 19_000),
+    } }};
+    job.history = &history;
+
+    try std.testing.expectError(error.ContextCapacityExceeded, runFakePrompt(&gateway, &hooks, fixture.config(), job));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    for (hooks.history_turns.items) |turn| try std.testing.expect(turn != .compacted_summary);
+}
+
+test "processQueuedPrompt compacts and retries one context overflow" {
+    const alloc = std.testing.allocator;
+    const model = "provider/context-overflow-recovery";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .bad_request,
+            .err_body =
+            \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+            ,
+        },
+        .{ .content = "Retain the completed prior turn and continue from it." },
+        .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
+        .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "\"tools\":[]");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+    try std.testing.expectEqualStrings(
+        "CONTEXT_OVERFLOW_RECOVERED",
+        hooks.finish_assistant_text.?,
+    );
+    try std.testing.expect(hooks.http_status == null);
+}
+
+test "processQueuedPrompt stops after one context overflow recovery" {
+    const alloc = std.testing.allocator;
+    const model = "provider/repeated-context-overflow";
+    const overflow_body =
+        \\{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}
+    ;
+    const completions = [_]FakeCompletion{
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "Compact the prior turn once." },
+        .{ .status = .bad_request, .err_body = overflow_body },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &.{.{
+        .model = model,
+        .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
+    }};
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior user") },
+        .assistant = @constCast("prior assistant"),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.index);
+    try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "image context overflow keeps one recovery and preserves the current image" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(path);
+    const image = try testCapturedImage(alloc, &tmp, path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const overflow = FakeCompletion{
+        .status = .bad_request,
+        .err_body = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"maximum context length exceeded\"}}",
+    };
+    for ([_]bool{ false, true }) |repeated| {
+        const completions = [_]FakeCompletion{
+            overflow,
+            .{ .content = "Retain the previous answer." },
+            if (repeated) overflow else .{ .content = "IMAGE_OVERFLOW_RECOVERED" },
+            .{ .content = "MUST_NOT_RUN" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.available_capability_overrides = &.{.{ .model = "fixture/image", .capabilities = .{
+            .context_window = 128_000,
+            .max_output_tokens = 16_384,
+            .image_input_support = .native,
+            .supports_vision = true,
+            .supports_file_input = true,
+        } }};
+        hooks.capability_overrides = hooks.available_capability_overrides;
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("fixture/image");
+        job.images = &images;
+        job.authorized_image_catalog = &images;
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("prior request") },
+            .assistant = @constCast("prior answer"),
+        } }};
+        job.history = &history;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(@as(usize, 3), gateway.index);
+        try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 2, "\"type\":\"file\"");
+        try expectBodyContains(&gateway, 2, "context_handoff");
+        if (repeated) {
+            try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        } else {
+            try std.testing.expectEqualStrings("IMAGE_OVERFLOW_RECOVERED", hooks.finish_assistant_text.?);
+            try std.testing.expect(hooks.http_status == null);
+        }
+    }
+}
+
+test "cancelled automatic compaction is retried by the next prompt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    const model = "provider/cancelled-automatic-compaction";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("CANCELLED_AUTO_HISTORY_USER") },
+            .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("CANCELLED_AUTO_RECENT_USER") },
+            .assistant = @constCast("CANCELLED_AUTO_RECENT_ASSISTANT"),
+        } },
+    };
+    var cancelled_job = fixture.job();
+    cancelled_job.model = @constCast(model);
+    cancelled_job.history = &history;
+    const cancelled_completions = [_]FakeCompletion{.{
+        .cancel_before_output = true,
+    }};
+    var cancelled_gateway = FakeGateway.init(alloc, &cancelled_completions);
+    defer cancelled_gateway.deinit();
+
+    try runFakePrompt(&cancelled_gateway, &hooks, config, cancelled_job);
+
+    try std.testing.expectEqual(@as(usize, 1), cancelled_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    var compacted_count: usize = 0;
+    for (hooks.history_turns.items) |turn| {
+        if (turn == .compacted_summary) compacted_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), compacted_count);
+
+    fixture.cancel_flag.store(false, .seq_cst);
+    var follow_up_history = [_]HistoryTurn{
+        history[0],
+        history[1],
+        hooks.history_turns.items[0],
+    };
+    var follow_up_job = fixture.job();
+    follow_up_job.prompt = @constCast("Continue after cancelled automatic compaction.");
+    follow_up_job.model = @constCast(model);
+    follow_up_job.history = &follow_up_history;
+    const follow_up_completions = [_]FakeCompletion{
+        .{ .content = "Preserve the prior work and continue from the follow-up." },
+        .{ .content = "AUTOMATIC_COMPACTION_FOLLOW_UP_OK" },
+    };
+    var follow_up_gateway = FakeGateway.init(alloc, &follow_up_completions);
+    defer follow_up_gateway.deinit();
+
+    try runFakePrompt(&follow_up_gateway, &hooks, config, follow_up_job);
+
+    try std.testing.expectEqual(@as(usize, 2), follow_up_gateway.request_bodies.items.len);
+    try expectBodyContains(&follow_up_gateway, 0, "CANCELLED_AUTO_HISTORY_ASSISTANT");
+    try expectBodyContains(&follow_up_gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&follow_up_gateway, 1, "context_handoff");
+    try expectBodyNotContains(&follow_up_gateway, 1, "CANCELLED_AUTO_HISTORY_ASSISTANT");
+    compacted_count = 0;
+    for (hooks.history_turns.items) |turn| {
+        if (turn == .compacted_summary) compacted_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), compacted_count);
+    try std.testing.expectEqualStrings("AUTOMATIC_COMPACTION_FOLLOW_UP_OK", hooks.finish_assistant_text.?);
+}
+
+test "retained context automatic compaction continues with the exact recent parallel exchange" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ ("a" ** 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ ("b" ** 13_000);
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("previous work") },
+        .assistant = @constCast(old_text),
+    } }};
+    const calls = [_]ToolCall{
+        toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("retained-b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &calls },
+        .{ .content = "Earlier work established the project facts." },
+        .{ .content = "Continued from the observed results." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/retained-context";
+    const old_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .assistant, .content = old_text }});
+    const recent_tokens = prompt_context.estimateCompactionSourceTokens(&.{ .{ .role = .tool, .content = result_a }, .{ .role = .tool, .content = result_b } });
+    const context_window = (old_tokens + recent_tokens / 2) * 5 / 4;
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.history = @constCast(&history);
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
+    try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
+    const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
+    try std.testing.expect(continued_tokens > context_window / 4);
+    try std.testing.expect(continued_tokens < context_window);
+    try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
+    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_A");
+    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyContains(&gateway, 2, "retained-a");
+    try expectBodyContains(&gateway, 2, "retained-b");
+    try expectBodyContains(&gateway, 2, "a" ** 13_000);
+    try expectBodyContains(&gateway, 2, "b" ** 13_000);
+    try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    const completed = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), completed.execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), completed.execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings(result_a, completed.execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(result_b, completed.execution.tool_steps[0].tool_results[1].output);
+    for (gateway.request_models.items) |requested_model| try std.testing.expectEqualStrings(model, requested_model);
+}
+
+test "retained context compaction preserves recovered historical replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
+    const recent_result = "RECENT_RECOVERED_RESULT\n" ++ ("r" ** 1_000);
+    const model = "provider/retained-recovery";
+    const state = "[{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"},{\"type\":\"text\",\"offset\":0,\"length\":42,\"providerOptions\":{\"fixture\":{\"id\":\"discarded_text\"}}}]";
+    var calls = [_]ToolCall{toolCall("old_read", "read_file", "{\"path\":\"a.txt\"}")};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("old_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast(recent_result),
+        .output_bytes = recent_result.len,
+        .stored_output_bytes = recent_result.len,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast(""),
+        .tool_calls = &calls,
+        .tool_results = &results,
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = model }, .parts_json = state },
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("earlier work") }, .assistant = @constCast(old_text) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("recent work") }, .assistant = @constCast(""), .execution = .{ .tool_steps = &steps } } },
+    };
+    const old_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .assistant, .content = old_text }});
+    const recent_tokens = prompt_context.estimateCompactionSourceTokens(&.{.{ .role = .tool, .content = recent_result }});
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast((old_tokens + recent_tokens / 2) * 5 / 4) } }};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "Earlier work established the project facts." },
+        .{ .content = "The saved read result remains available." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &capabilities;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.history = &history;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectBodyContains(&gateway, 0, "OLDER_HISTORY_SENTINEL");
+    try expectBodyContains(&gateway, 1, "context_handoff");
+    try expectBodyContains(&gateway, 1, "RECENT_RECOVERED_RESULT");
+    try expectBodyContains(&gateway, 1, "retained_reasoning");
+    try expectBodyNotContains(&gateway, 1, "discarded_text");
+    try expectBodyNotContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
+    try std.testing.expectEqualStrings(state, steps[0].provider_replay.?.parts_json);
+}
+
+test "processQueuedPrompt does not compact away its only recent exchange" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Completed from the observed result." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/recent-only";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "RECENT_ONLY\n" ++ ("r" ** 10_000) } }};
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "r" ** 10_000);
+    try expectBodyNotContains(&gateway, 1, "context_handoff");
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+}
+
+test "automatic compaction summarizes a newest exchange larger than the input window" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const arguments = "{\"path\":\"large.txt\",\"content\":\"" ++ ("x" ** 40_000) ++ "\"}";
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("oversized-newest", "write_file", arguments)} },
+        .{ .content = "The large file was written successfully. Do not repeat the write." },
+        .{ .content = "Continued after the large write." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const model = "provider/oversized-newest";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 8_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "Write completed." } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "Tool write_file (success)");
+    try expectBodyContains(&gateway, 1, "oversized-newest");
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, "x" ** 40_000);
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("Continued after the large write.", hooks.finish_assistant_text.?);
+}
+
+test "interruption after automatic compaction retains the recent and new execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const first_calls = [_]ToolCall{toolCall("before-checkpoint", "read_file", "{\"path\":\"first.txt\"}")};
+    const later_calls = [_]ToolCall{toolCall("after-checkpoint", "read_file", "{\"path\":\"later.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .content = "The first read completed." },
+        .{ .tool_calls = &later_calls },
+        .{ .chunks = &.{"partial after checkpoint"}, .cancel_after_chunks = true },
+    });
+    defer gateway.deinit();
+    const model = "provider/compaction-interruption";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 28_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = "later result" } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier work") },
+        .assistant = @constCast("o" ** 80_000),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    const interrupted = hooks.history_turns.items[1].interrupted;
+    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("before-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[1].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+}
+
+test "context overflow after automatic compaction retries with new execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const first_calls = [_]ToolCall{toolCall("before-checkpoint", "read_file", "{\"path\":\"first.txt\"}")};
+    const later_calls = [_]ToolCall{toolCall("after-checkpoint", "read_file", "{\"path\":\"later.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &first_calls },
+        .{ .content = "The first read completed." },
+        .{ .tool_calls = &later_calls },
+        .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"input exceeds the context window\"}}" },
+        .{ .content = "The prior reads both completed." },
+        .{ .content = "Recovered after a second compaction." },
+    });
+    defer gateway.deinit();
+    const model = "provider/compaction-interruption";
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 28_000 },
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = "later result" } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
+
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier work") },
+        .assistant = @constCast("o" ** 80_000),
+    } }};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("Recovered after a second compaction.", hooks.finish_assistant_text.?);
+    const finished = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), finished.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", finished.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 2), finished.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+}
+
+test "compaction preserves an incomplete handle-free result when it cannot fit" {
+    const alloc = std.testing.allocator;
+    const model = "provider/capacity-failure";
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = model,
+        .capabilities = .{ .context_window = 1_500 },
+    }};
+    const calls = [_]ToolCall{toolCall(
+        "capacity_result_1",
+        "read_file",
+        "{\"path\":\"capacity.txt\"}",
+    )};
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "ineligible result\n" ++ ("x" ** (70 * 1024)),
+    } }};
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+
+    try std.testing.expectError(
+        error.IncompleteCompactionResult,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), hooks.compaction_prefixes.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finish_terminal_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
+    const retained = execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqualStrings("capacity_result_1", retained.tool_call_id);
+    try std.testing.expect(retained.truncated);
+    try std.testing.expect(retained.output_handle == null);
+    try std.testing.expect(std.mem.find(u8, retained.output, "ineligible result") != null);
+}
+
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2705,7 +3830,7 @@ test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqualStrings("provider/new-reasoning-model", hooks.capability_queries.items[0]);
     try expectBodyContains(&gateway, 0, "\"reasoning\":\"future-tier\"");
-    try expectBodyNotContains(&gateway, 0, "\"providerOptions\"");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
@@ -2742,7 +3867,7 @@ test "processQueuedPrompt traces why stale controls are omitted" {
 
     try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
@@ -2827,7 +3952,7 @@ test "processQueuedPrompt keeps exact model identity and emits Gateway Fast" {
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
 }
 
 test "processQueuedPrompt keeps directly selected fast model identity for portable lookup" {
@@ -2887,7 +4012,7 @@ test "processQueuedPrompt filters stale controls against each queued model" {
 
         try expectBodyContains(&gateway, 0, "\"reasoning\":\"xhigh\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 
     {
@@ -2906,7 +4031,7 @@ test "processQueuedPrompt filters stale controls against each queued model" {
 
         try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
 }
 
@@ -2930,7 +4055,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
 
     {
@@ -2949,7 +4074,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 }
 
@@ -2983,7 +4108,7 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
 
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectRootFieldAbsent(&gateway, 0, "providerOptions");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     }
     worker.finishProcessing();
 
@@ -3017,7 +4142,7 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
         try expectRootFieldAbsent(&gateway, 0, "fast");
-        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+        try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     }
 }
 
@@ -3192,6 +4317,45 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
     try std.testing.expect(summary.turn_duration_ms >= summary.thinking_duration_ms);
 }
 
+test "processQueuedPrompt enables Gateway automatic caching across model families and tool steps" {
+    const alloc = std.testing.allocator;
+    const models = [_][]const u8{
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.6-luna",
+        "zai/glm-5.2",
+        "moonshotai/kimi-k3",
+        "google/gemini-3-flash",
+        "xai/grok-4.5",
+        "provider/new-model",
+    };
+    for (models) |model| {
+        const calls = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"a\"}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.runtime_context_text = "runtime context remains visible";
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        for (gateway.request_bodies.items) |body| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            const options = parsed.value.object.get("providerOptions").?.object;
+            try std.testing.expectEqualStrings("auto", options.get("gateway").?.object.get("caching").?.string);
+            try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+            try std.testing.expect(std.mem.find(u8, body, "runtime context remains visible") != null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    }
+}
+
 test "processQueuedPrompt places transient overlay before history and current prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "No" }};
@@ -3202,10 +4366,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     hooks.static_context_text = "static project context unique";
     hooks.runtime_context_text = "runtime tail context unique";
 
-    var history = [_]HistoryTurn{.{ .background_command = .{
+    var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("past background prompt") },
-        .log_path = @constCast("/tmp/past-background.log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command is no longer owned"),
     } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -3225,12 +4388,306 @@ test "processQueuedPrompt places transient overlay before history and current pr
     try std.testing.expect(static_idx < runtime_idx);
     try std.testing.expect(runtime_idx < history_idx);
     try std.testing.expect(history_idx < current_idx);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "system", true);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "static project context unique", true);
-    try expectGatewayPromptEntryCacheControl(&gateway, 0, "runtime tail context unique", false);
-    try expectNoPromptCacheControlAfter(&gateway, 0, "runtime tail context unique");
     try expectGatewayPromptFinalUserText(&gateway, 0, "is it still running");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "processQueuedPrompt keeps search advertised after an empty search" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("search_empty", "capability_search", "{\"query\":\"missing capability\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "{\"state\":\"no_match\",\"skills\":[],\"tools\":[]}" } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &.{ "capability_search", "skill" };
+    config.advertised_functions = &.{ builtin_tools.capability_search.model_schema, builtin_tools.skill.model_schema };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    for (gateway.request_bodies.items, 0..) |body, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        var found = false;
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            const name = tool.object.get("name") orelse continue;
+            if (name == .string and std.mem.eql(u8, name.string, "capability_search")) found = true;
+        }
+        if (!found) return if (index == 0) error.MissingInitialSearchSchema else error.SearchSchemaLostAfterNoMatch;
+    }
+}
+
+test "processQueuedPrompt retains complete skill content without granting ordinary results that status" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { kind: tool_dispatch.ModelContentKind, parallel: bool }{
+        .{ .kind = .ordinary, .parallel = false },
+        .{ .kind = .ordinary, .parallel = true },
+        .{ .kind = .complete_skill, .parallel = false },
+        .{ .kind = .complete_skill, .parallel = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        const calls = [_]ToolCall{
+            toolCall("skill_one", "skill", "{\"location\":\"/skills/one\"}"),
+            toolCall("skill_two", "skill", "{\"location\":\"/skills/two\"}"),
+        };
+        const count: usize = if (case.parallel) 2 else 1;
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = calls[0..count] },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.tool_registry = builtin_tools.registry;
+        const result: runtime_tool_contracts.ToolExecutionResult = .{
+            .model_content_kind = case.kind,
+            .model_output = "SKILL START\n" ++ ("required instruction\n" ** 1400) ++ "COMPLETE_SKILL_TAIL",
+        };
+        hooks.exec_plans = &.{ .{ .result = result }, .{ .result = result } };
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.tool_result_dir = result_dir;
+        config.advertised_tool_names = &.{"skill"};
+        config.advertised_functions = &.{builtin_tools.skill.model_schema};
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        try std.testing.expectEqual(count, hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        if (case.kind == .complete_skill) {
+            try expectBodyContains(&gateway, 1, "COMPLETE_SKILL_TAIL");
+        } else {
+            try expectBodyNotContains(&gateway, 1, "COMPLETE_SKILL_TAIL");
+        }
+    }
+}
+
+test "processQueuedPrompt prepares skill metadata from the supplied inventory" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "release",
+        .description = "Release the package",
+        .path = "/tmp/skills/release",
+        .source = .global_fx,
+    }};
+    config.skill_catalog = .{ .skills = &skills };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try expectGatewayPromptTextCount(&gateway, 0, "- release: Release the package", 1);
+}
+
+test "explicit skill loads publish one interactive summary without extra tool calls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "requested-workflow");
+    var file = try tmp.dir.createFile(std.testing.io, "requested-workflow/SKILL.md", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "---\nname: requested-workflow\ndescription: Requested workflow\n---\nREQUESTED_SKILL_CONTENT\n");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "requested-workflow");
+    defer alloc.free(path);
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "requested-workflow",
+        .description = "Requested workflow",
+        .path = path,
+        .source = .workspace_shared,
+    }};
+    const read_call = [_]ToolCall{toolCall("status_read", "read_file", "{\"path\":\"file.txt\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "Finished", .chunks = &.{"Finished"} },
+        .{ .content = "Finished" },
+        .{ .tool_calls = &read_call },
+        .{ .content = "Finished after read" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_interactive_notices = true;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    var job = fixture.job();
+    job.prompt = @constCast("Use $requested-workflow.");
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "REQUESTED_SKILL_CONTENT");
+    try expectBodyNotContains(&gateway, 0, "1 requested skill loaded");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    const notice_index = logIndex(&hooks, "interactive_notice::1 requested skill loaded\n└ Loaded skill requested-workflow") orelse return error.TestExpectedEqual;
+    const reply_index = reply: {
+        for (hooks.log.items, 0..) |entry, index| {
+            if (std.mem.startsWith(u8, entry, "text:") and std.mem.find(u8, entry, "Finished") != null) break :reply index;
+        }
+        return error.TestExpectedReply;
+    };
+    try std.testing.expect(notice_index < reply_index);
+
+    hooks.enable_interactive_notices = false;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+
+    hooks.enable_interactive_notices = true;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 2), hooks.interactive_notices.items.len);
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+}
+
+test "unchanged skill catalog keeps its request prefix across user turns" {
+    const alloc = std.testing.allocator;
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "release",
+        .description = "Release the package",
+        .path = "/tmp/skills/release",
+        .source = .global_fx,
+    }};
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "First" }, .{ .content = "Second" } });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+}
+
+test "processQueuedPrompt reports a retained skill binding when discovery becomes empty" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "Final" }});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.skill_bindings = &.{.{ .name = "removed-workflow", .path = "/skills/removed-workflow" }};
+    var job = fixture.job();
+    job.prompt = @constCast("Apply the workflow selected in the picker.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "was not found at advertised location");
+    try expectBodyContains(&gateway, 0, "removed-workflow");
+    try expectBodyContains(&gateway, 0, "/skills/removed-workflow");
+    try expectBodyNotContains(&gateway, 0, "<skill_content");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "processQueuedPrompt skill catalog is invariant under harmless request expansion" {
+    const alloc = std.testing.allocator;
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{
+        .{ .name = "alpha", .description = "Unrelated instructions", .path = "/tmp/skills/alpha", .source = .global_fx },
+        .{ .name = "release", .description = "Release the package", .path = "/tmp/skills/release", .source = .global_fx },
+    };
+    const prompts = [_][]const u8{ "Release the package", "Release the package." ++ (" Keep existing behavior unchanged." ** 24) };
+    var first: ?[]u8 = null;
+    defer if (first) |value| alloc.free(value);
+    for (prompts) |prompt| {
+        const completions = [_]FakeCompletion{.{ .content = "Final" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.skill_catalog = .{ .skills = &skills };
+        var job = fixture.job();
+        job.prompt = @constCast(prompt);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        const body = gateway.request_bodies.items[0];
+        const start = std.mem.find(u8, body, "<available_skills>") orelse return error.SkillCatalogMissing;
+        const end = std.mem.find(u8, body[start..], "</available_skills>") orelse return error.SkillCatalogMissing;
+        const catalog = body[start..][0..end];
+        const namespace_start = (std.mem.find(u8, catalog, "skill:") orelse return error.SkillLocationMissing) + "skill:".len;
+        const namespace_len = std.mem.findScalar(u8, catalog[namespace_start..], ':') orelse return error.SkillLocationMissing;
+        const normalized = try std.mem.replaceOwned(u8, alloc, catalog, catalog[namespace_start..][0..namespace_len], "turn");
+        if (first) |expected| {
+            defer alloc.free(normalized);
+            try std.testing.expectEqualStrings(expected, normalized);
+        } else first = normalized;
+    }
+}
+
+test "processQueuedPrompt prepares each origin skill catalog with its supplied model and workspace" {
+    const alloc = std.testing.allocator;
+    const Skill = @import("../../../skills/skill_runtime.zig").Skill;
+    const description = "Instruction detail. " ** 50;
+    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    const cases = [_]struct { model: []const u8, workspace: []const u8, context_window: u32, child: bool }{
+        .{ .model = "fixture/parent-model", .workspace = "/tmp/parent-workspace", .context_window = 64_000, .child = false },
+        .{ .model = "fixture/child-model", .workspace = "/tmp/child-workspace", .context_window = 16_000, .child = true },
+    };
+    var parent_catalog_bytes: usize = 0;
+    for (cases) |case| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var skills: [names.len]Skill = undefined;
+        for (names, &skills) |name, *skill| {
+            skill.* = .{
+                .name = name,
+                .description = description,
+                .path = try std.fs.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
+                .source = .workspace_shared,
+            };
+        }
+        const completions = [_]FakeCompletion{.{ .content = "Final" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const overrides = [_]ModelCapabilityOverride{.{
+            .model = case.model,
+            .capabilities = .{ .context_window = case.context_window },
+        }};
+        hooks.available_capability_overrides = &overrides;
+        var fixture = PromptFixture{ .workspace_root = case.workspace };
+        var config = fixture.config();
+        config.origin = if (case.child) .subagent else .root;
+        config.skill_catalog = .{ .skills = &skills };
+        var job = fixture.job();
+        job.model = @constCast(case.model);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqualStrings(case.model, gateway.request_models.items[0]);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[0], .{});
+        defer parsed.deinit();
+        const catalog = parsed.value.object.get("prompt").?.array.items[1].object.get("content").?.string;
+        try std.testing.expect(std.mem.find(u8, catalog, "<available_skills>") != null);
+        try std.testing.expect(catalog.len <= @as(usize, case.context_window) * 2 / 100 * 4);
+        for (names) |name| {
+            const entry = try std.fmt.allocPrint(scratch.allocator(), "- {s}: ", .{name});
+            try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
+        }
+        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
+        if (case.child) {
+            try std.testing.expect(catalog.len < parent_catalog_bytes);
+            try std.testing.expect(std.mem.find(u8, catalog, cases[0].workspace) == null);
+            try std.testing.expect(std.mem.find(u8, catalog, description) == null);
+        } else {
+            parent_catalog_bytes = catalog.len;
+            try std.testing.expect(std.mem.find(u8, catalog, description) != null);
+        }
+    }
 }
 
 test "processQueuedPrompt keeps supplied system prompt components in stable order without duplication" {
@@ -3254,7 +4711,15 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     var config = fixture.config();
     config.system_prompt = "base guidance-order prompt";
     config.custom_tool_guidance = "custom tool guidance unique needle";
-    config.skills_prompt_section = "skills guidance-order section";
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "order",
+        .description = "skills guidance-order section",
+        .path = "/tmp/skills/order",
+        .source = .global_fx,
+    }};
+    config.skill_catalog = .{ .skills = &skills };
+    config.context_limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1024 }, .source = .command_line };
+    config.host_instructions = "host guidance-order instructions\n" ++ ("Required host instruction.\n" ** 80);
     config.model_prompt_overlay = "model guidance-order overlay";
     var job = fixture.job();
     job.history = history[0..];
@@ -3262,21 +4727,24 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
         try expectGatewayPromptStringEntry(&gateway, request_index, 0, "base guidance-order prompt");
         try expectGatewayPromptStringEntry(&gateway, request_index, 1, "custom tool guidance unique needle");
-        try expectGatewayPromptStringEntry(&gateway, request_index, 2, "skills guidance-order section");
-        try expectGatewayPromptStringEntry(&gateway, request_index, 3, "model guidance-order overlay");
+        try expectGatewayPromptTextCount(&gateway, request_index, "skills guidance-order section", 1);
+        try expectGatewayPromptStringEntry(&gateway, request_index, 3, config.host_instructions);
+        try expectGatewayPromptStringEntry(&gateway, request_index, 4, "model guidance-order overlay");
         try expectGatewayPromptTextCount(&gateway, request_index, "custom tool guidance unique needle", 1);
+        try expectGatewayPromptTextCount(&gateway, request_index, "host guidance-order instructions", 1);
         try expectGatewayPromptTextCount(&gateway, request_index, "model guidance-order overlay", 1);
         const order = [_][]const u8{
             "base guidance-order prompt",
             "custom tool guidance unique needle",
             "skills guidance-order section",
+            "host guidance-order instructions",
             "model guidance-order overlay",
             "static guidance-order context",
             "transient guidance-order context",
@@ -3292,6 +4760,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try std.testing.expectEqualStrings("Final guidance-order answer", persisted.assistant);
     try std.testing.expect(std.mem.find(u8, persisted.user.text, "custom tool guidance unique needle") == null);
     try std.testing.expect(std.mem.find(u8, persisted.assistant, "custom tool guidance unique needle") == null);
+    try std.testing.expect(std.mem.find(u8, persisted.user.text, "host guidance-order instructions") == null);
+    try std.testing.expect(std.mem.find(u8, persisted.assistant, "host guidance-order instructions") == null);
 }
 
 test "processQueuedPrompt omits an empty custom tool guidance message" {
@@ -3307,7 +4777,7 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    const roles = [_]types.ChatRole{ .system, .user };
+    const roles = [_]types.ChatRole{ .system, .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &roles);
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
@@ -3337,8 +4807,8 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
@@ -3500,48 +4970,6 @@ test "processQueuedPrompt delivers parent context created between tool steps" {
     try expectBodyContains(&first_gateway, 1, "late child delivery");
 }
 
-test "processQueuedPrompt blocks accidental terminal restart of non-live background history" {
-    const alloc = std.testing.allocator;
-    const command = "while true; do echo labs7; sleep 1; done";
-    const args = "{\"action\":\"start\",\"command\":\"while true; do echo labs7; sleep 1; done\"}";
-    const calls = [_]ToolCall{toolCall("call_restart", "terminal", args)};
-    const completions = [_]FakeCompletion{
-        .{ .content = "I will check it.", .tool_calls = &calls },
-        .{ .content = "No." },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.runtime_context_text =
-        "Runtime context: previous background command history includes command(s) that are no longer live. Treat these as terminal historical records, not running tasks.\n" ++
-        "- command=while true; do echo labs7; sleep 1; done; log=/tmp/labs7.log; state=stopped\n" ++
-        "For any listed command, answer liveness questions from this state; do not assume it is still running or reuse it as a live background task. Restart a listed command only if the user explicitly asks.";
-
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.prompt = @constCast("Is the background command you just started still running? Do not run or restart it unless I ask.");
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
-    try std.testing.expect(hooks.lifecycle_events.items[0] == .authoritative_started);
-    try std.testing.expect(hooks.lifecycle_events.items[1] == .progress);
-    try std.testing.expectEqual(
-        types.ToolOutcomeKind.denied,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
-    );
-    try std.testing.expectEqualStrings("No.", hooks.finish_assistant_text.?);
-    try expectBodyContains(
-        &gateway,
-        1,
-        "Blocked restarting non-live background command from history",
-    );
-    try expectBodyContains(&gateway, 1, command);
-}
-
 test "processQueuedPrompt projects history exactly once into each gateway request" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
@@ -3564,8 +4992,8 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -3594,7 +5022,7 @@ test "processQueuedPrompt keeps completed history before the final current user 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    const expected_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
+    const expected_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .user };
     try expectGatewayPromptRoles(&gateway, 0, &expected_roles);
     try expectGatewayPromptTextCount(&gateway, 0, "prior user structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "prior assistant structural needle", 1);
@@ -3609,6 +5037,339 @@ test "processQueuedPrompt keeps completed history before the final current user 
     try expectGatewayPromptFinalUserText(&gateway, 0, "current structural prompt needle");
     try expectGatewayPromptTextCount(&gateway, 0, "Earlier messages are session history from previous turns.", 0);
     try expectGatewayPromptTextCount(&gateway, 0, "Do not re-run, re-answer, or continue earlier user turns", 0);
+}
+
+test "processQueuedPrompt projects response language authority only for root turns" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+
+    var root_gateway = FakeGateway.init(alloc, &completions);
+    defer root_gateway.deinit();
+    var root_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer root_hooks.deinit();
+    var root_fixture = PromptFixture{};
+    try runFakePrompt(&root_gateway, &root_hooks, root_fixture.config(), root_fixture.job());
+    try expectGatewayPromptTextCount(
+        &root_gateway,
+        0,
+        "Use the response language requested by the current external human.",
+        1,
+    );
+    try expectGatewayPromptFinalUserText(&root_gateway, 0, "user prompt");
+
+    var subagent_gateway = FakeGateway.init(alloc, &completions);
+    defer subagent_gateway.deinit();
+    var subagent_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer subagent_hooks.deinit();
+    var subagent_fixture = PromptFixture{};
+    var subagent_config = subagent_fixture.config();
+    subagent_config.origin = .subagent;
+    try runFakePrompt(
+        &subagent_gateway,
+        &subagent_hooks,
+        subagent_config,
+        subagent_fixture.job(),
+    );
+    try expectBodyNotContains(
+        &subagent_gateway,
+        0,
+        "Use the response language requested by the current external human.",
+    );
+}
+
+test "processQueuedPrompt holds matching output to completion after conflicting history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{ "I will inspect ", "the lockfile next." };
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .content = "I will inspect the lockfile next.",
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Answer in Chinese.") },
+        .assistant = @constCast("我会先检查锁文件和依赖清单。"),
+    } }};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(
+        "I will inspect the lockfile next.",
+        hooks.assistant_sources.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "I will inspect the lockfile next.",
+        hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
+test "processQueuedPrompt retries one clear language mismatch without publishing or persisting it" {
+    const alloc = std.testing.allocator;
+    const rejected_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const accepted_chunks = [_][]const u8{"I will inspect the lockfile next."};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &rejected_chunks, .content = rejected_chunks[0] },
+        .{ .chunks = &accepted_chunks, .content = accepted_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectGatewayPromptTextCount(
+        &gateway,
+        1,
+        "The previous candidate used a different language",
+        1,
+    );
+    try expectGatewayPromptTailText(
+        &gateway,
+        1,
+        .user,
+        "The previous candidate used a different language",
+    );
+    try expectGatewayPromptTextCount(&gateway, 1, "The lockfile is broken again.", 1);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(accepted_chunks[0], hooks.assistant_sources.items[0]);
+    for (hooks.texts.items) |text| {
+        try std.testing.expect(std.mem.find(u8, text, rejected_chunks[0]) == null);
+    }
+    for (hooks.recovery_checkpoints.items) |checkpoint| {
+        try std.testing.expect(std.mem.find(u8, checkpoint.assistant_source, rejected_chunks[0]) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        accepted_chunks[0],
+        hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
+test "processQueuedPrompt fails a second clear language mismatch without assistant history" {
+    const alloc = std.testing.allocator;
+    const first_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const second_chunks = [_][]const u8{"Сначала я проверю файл блокировки и манифест."};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &first_chunks, .content = first_chunks[0] },
+        .{ .chunks = &second_chunks, .content = second_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try std.testing.expectError(
+        error.ResponseLanguageMismatch,
+        runFakePrompt(&gateway, &hooks, config, job),
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.system_notices.items[0],
+        "different language",
+    ) != null);
+}
+
+test "processQueuedPrompt preserves explicit language switches without runtime correction" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"次にロックファイルを確認します。"};
+    const completions = [_]FakeCompletion{.{ .chunks = &chunks, .content = chunks[0] }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("Answer in Japanese and keep it short.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqualStrings(chunks[0], hooks.history_turns.items[0].assistant.assistant);
+}
+
+test "processQueuedPrompt does not language-retry a tool-bearing response" {
+    const alloc = std.testing.allocator;
+    const tool_chunks = [_][]const u8{"我会先检查锁文件。"};
+    const final_chunks = [_][]const u8{"I inspected the lockfile."};
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &tool_chunks, .content = tool_chunks[0], .tool_calls = &calls },
+        .{ .chunks = &final_chunks, .content = final_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(final_chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(hooks.history_turns.items[0].assistant.execution.tool_steps[0].assistant == null);
+}
+
+test "processQueuedPrompt discards prose replay without losing reasoning or tool metadata" {
+    const alloc = std.testing.allocator;
+    const prose = "我会先检查锁文件和依赖清单。";
+    const state = try std.fmt.allocPrint(
+        alloc,
+        "[{{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"}},{{\"type\":\"text\",\"offset\":0,\"length\":{d},\"providerOptions\":{{\"fixture\":{{\"id\":\"discarded_text\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"call_read\",\"providerOptions\":{{\"fixture\":{{\"id\":\"retained_tool\"}}}}}}]",
+        .{prose.len},
+    );
+    defer alloc.free(state);
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{prose}, .content = prose, .tool_calls = &calls, .provider_state_json = state },
+        .{ .content = "The notes are checked." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("Please check the notes.");
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try expectBodyNotContains(&gateway, 1, prose);
+    try expectBodyNotContains(&gateway, 1, "discarded_text");
+    try expectBodyContains(&gateway, 1, "retained_reasoning");
+    try expectBodyContains(&gateway, 1, "retained_tool");
+    const step = hooks.history_turns.items[0].assistant.execution.tool_steps[0];
+    try std.testing.expect(step.assistant == null);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "retained_reasoning") != null);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "retained_tool") != null);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "discarded_text") == null);
+}
+
+test "processQueuedPrompt recovers empty historical prose without changing source or repeating tools" {
+    const alloc = std.testing.allocator;
+    const state = "[{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"},{\"type\":\"text\",\"offset\":0,\"length\":42,\"providerOptions\":{\"fixture\":{\"id\":\"discarded_text\"}}},{\"type\":\"tool-call\",\"toolCallId\":\"call_read\",\"providerOptions\":{\"fixture\":{\"id\":\"retained_tool\"}}}]";
+    var calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("retained_result"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast(""),
+        .tool_calls = &calls,
+        .tool_results = &results,
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture-model" }, .parts_json = state },
+    }};
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Please read the notes.") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    for (0..2) |_| {
+        const completions = [_]FakeCompletion{.{ .content = "The saved result is intact." }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("fixture-model");
+        job.history = &history;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        try expectBodyContains(&gateway, 0, "retained_reasoning");
+        try expectBodyContains(&gateway, 0, "retained_tool");
+        try expectBodyContains(&gateway, 0, "retained_result");
+        try expectBodyNotContains(&gateway, 0, "discarded_text");
+        try std.testing.expectEqualStrings(state, steps[0].provider_replay.?.parts_json);
+        try std.testing.expectEqualStrings("", steps[0].assistant.?);
+    }
+}
+
+test "processQueuedPrompt empty history recovery preserves validation and source boundaries" {
+    const Case = struct {
+        content: []const u8 = "",
+        state: []const u8,
+        provider: model_provider.ProviderId = .gateway,
+        model: []const u8 = "fixture-model",
+        failure: bool = true,
+    };
+    const cases = [_]Case{
+        .{ .state = "{" },
+        .{ .state = "[42]" },
+        .{ .state = "[{\"type\":\"unknown\"}]" },
+        .{ .content = "x", .state = "[{\"type\":\"text\",\"offset\":0,\"length\":42}]" },
+        .{ .content = " ", .state = "[{\"type\":\"text\",\"offset\":0,\"length\":42}]" },
+        .{ .content = "kept", .state = "[{\"type\":\"text\",\"offset\":0,\"length\":4}]", .failure = false },
+        .{ .state = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]", .failure = false },
+        .{ .state = "not-json", .provider = .codex, .failure = false },
+        .{ .state = "not-json", .model = "other-model", .failure = false },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("Please check the notes.") },
+            .assistant = @constCast(case.content),
+            .provider_replay = .{ .source = .{ .provider = case.provider, .model = case.model }, .parts_json = case.state },
+        } }};
+        const completions = [_]FakeCompletion{.{ .content = "The saved result is intact." }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("fixture-model");
+        job.history = &history;
+        if (case.failure) {
+            try std.testing.expectError(error.InvalidProviderState, runFakePrompt(&gateway, &hooks, fixture.config(), job));
+            try std.testing.expectEqual(@as(usize, 0), gateway.admitted_requests);
+        } else {
+            try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+            try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
+        }
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        try std.testing.expectEqualStrings(case.state, history[0].assistant.provider_replay.?.parts_json);
+        try std.testing.expectEqualStrings(case.content, history[0].assistant.assistant);
+    }
 }
 
 test "processQueuedPrompt reconciles provider error before tool execution" {
@@ -3637,9 +5398,10 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
 test "processQueuedPrompt pauses when uncertain tool reconciliation returns another tool" {
@@ -3700,8 +5462,11 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    var initial_job = fixture.job();
+    initial_job.credential_source = .fx_login;
+    initial_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, initial_job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -3744,6 +5509,8 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     var restored_hooks = FakeAgentRuntimeDeps.init(alloc);
     defer restored_hooks.deinit();
     var restored_job = fixture.job();
+    restored_job.credential_source = .fx_login;
+    restored_job.account_id = @constCast("acct_1");
     restored_job.recovery_checkpoint = restored_checkpoint;
 
     try runFakePrompt(&restored_gateway, &restored_hooks, config, restored_job);
@@ -3920,10 +5687,73 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s · attempt 2/3");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request · attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s · attempt 2/3");
+    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request · attempt 3/3");
+    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
+}
+
+test "processQueuedPrompt pauses gateway stream timeout without retry" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .finish_reason = .provider_error,
+        .provider_failure_cause = .gateway_stream_timeout,
+        .provider_failure_detail = "gateway_stream_timeout: stream exceeded maximum duration",
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expect(hooks.recovery_checkpoints.items.len > 0);
+    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.provider_stream_timeout,
+        checkpoint.cause,
+    );
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
+    try std.testing.expect(!checkpoint.outstanding_reservation);
+    try expectRouteStatus(
+        &hooks,
+        0,
+        .terminal_provider_error,
+        "⚠ Gateway stream timed out · gateway_stream_timeout: stream exceeded maximum duration · automatic retry paused · attempt 1/10",
+    );
+}
+
+test "processQueuedPrompt retries post-tool provider error without synthetic recovery message" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .finish_reason = .provider_error, .provider_failure_detail = "route failed after tool" },
+        .{ .content = "Recovered after tool" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    const retry_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
+    try expectBodyNotContains(&gateway, 2, "network_recovery");
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
 
 test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
@@ -3949,6 +5779,58 @@ test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
         .terminal_provider_error,
         "⚠ Provider unavailable · provider_down: AI_GATEWAY_API_KEY=[redacted] bad\\x1b[31m · recovery paused after 1/1 attempts",
     );
+}
+
+fn expect_rejected_replacement_retains_preview(cancel_after_replacement: bool) !void {
+    const alloc = std.testing.allocator;
+    const accepted = "The accepted English preview.";
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{accepted}, .stream_error_after_chunks = error.ReadFailed },
+        .{
+            .chunks = &.{rejected},
+            .content = rejected,
+            .cancel_after_chunks = cancel_after_replacement,
+            .stream_error_after_chunks = if (cancel_after_replacement) null else error.ReadFailed,
+        },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("Explain the lockfile issue in English.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 1, accepted);
+    try expectBodyNotContains(&gateway, 1, rejected);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(accepted, hooks.assistant_sources.items[0]);
+    if (cancel_after_replacement) {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+        try std.testing.expectEqualStrings(accepted, hooks.history_turns.items[0].interrupted.assistant orelse "");
+    } else {
+        try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+        const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+        try std.testing.expectEqualStrings(accepted, checkpoint.assistant_source);
+        try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
+        try std.testing.expect(!checkpoint.outstanding_reservation);
+    }
+}
+
+test "processQueuedPrompt cancellation retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(true);
+}
+
+test "processQueuedPrompt exhaustion retains preview during a rejected replacement" {
+    try expect_rejected_replacement_retains_preview(false);
 }
 
 test "processQueuedPrompt cancellation during provider backoff finishes interrupted" {
@@ -4048,9 +5930,38 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
+}
+
+test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error, .provider_failure_cause = .rate_limited, .provider_failure_detail = "rate_limit_exceeded: retry later" },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = "fixture/model",
+        .capabilities = model_capabilities.resolveCapabilities("fixture/model", .{ .supports_fast_mode = true }),
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast("fixture/model");
+    var config = fixture.config();
+    config.fast_mode = true;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    for (0..2) |index| try expectBodyContains(&gateway, index, "\"speed\":\"fast\"");
+    try std.testing.expectEqual(@as(?types.ModelRecoveryCause, .rate_limited), hooks.route_recovery_statuses.items[0].cause);
 }
 
 test "processQueuedPrompt disables provider option fast after a replay safe HTTP failure" {
@@ -4076,9 +5987,9 @@ test "processQueuedPrompt disables provider option fast after a replay safe HTTP
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
 }
 
 test "processQueuedPrompt retries directly selected intrinsic fast model without rewriting its ID" {
@@ -4162,9 +6073,12 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
+    try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
+    try std.testing.expect(hooks.route_recovery_statuses.items[1].retry_deadline == null);
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
@@ -4208,6 +6122,12 @@ test "processQueuedPrompt counts and retries a definitely unsent native setup fa
     try expectRouteStatus(
         &hooks,
         1,
+        .auto_retry,
+        "⚠ Network interrupted · TlsInitializationFailed · retrying request · attempt 2/2",
+    );
+    try expectRouteStatus(
+        &hooks,
+        2,
         .auto_recovered,
         "✓ recovered · succeeded on attempt 2/2",
     );
@@ -4252,12 +6172,15 @@ test "processQueuedPrompt routes native network failure classes through one hear
         try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
         try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+        try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
         try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, hooks.route_recovery_statuses.items[0].kind);
         try std.testing.expectEqual(case.cause, hooks.route_recovery_statuses.items[0].cause.?);
         try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items[0].failed_attempt);
-        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_recovered, hooks.route_recovery_statuses.items[1].kind);
-        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[1].succeeded_attempt);
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, hooks.route_recovery_statuses.items[1].kind);
+        try std.testing.expectEqual(case.cause, hooks.route_recovery_statuses.items[1].cause.?);
+        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[1].failed_attempt);
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_recovered, hooks.route_recovery_statuses.items[2].kind);
+        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[2].succeeded_attempt);
     }
 }
 
@@ -4282,8 +6205,8 @@ test "processQueuedPrompt starts network pacing independently from the shared re
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 6), hooks.route_recovery_statuses.items.len);
-    const network_status = hooks.route_recovery_statuses.items[5];
+    try std.testing.expectEqual(@as(usize, 11), hooks.route_recovery_statuses.items.len);
+    const network_status = hooks.route_recovery_statuses.items[10];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, network_status.kind);
     try std.testing.expectEqual(types.ModelRecoveryCause.network_interrupted, network_status.cause.?);
     try std.testing.expectEqual(@as(usize, 6), network_status.failed_attempt);
@@ -4384,6 +6307,35 @@ test "processQueuedPrompt carries one durable budget across transport recovery" 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
+test "processQueuedPrompt retains interrupted source in the next reservation" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"retained interrupted preview"};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .stream_error_after_chunks = error.ReadFailed },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    const settled = hooks.recovery_checkpoints.items[1];
+    const reserved = hooks.recovery_checkpoints.items[2];
+    try std.testing.expectEqualStrings("retained interrupted preview", settled.assistant_source);
+    try std.testing.expectEqualStrings("retained interrupted preview", reserved.assistant_source);
+    try std.testing.expect(reserved.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 1), reserved.consumed_provider_attempts);
+    try expectBodyNotContains(&gateway, 1, "retained interrupted preview");
+    try std.testing.expectEqualStrings("Recovered", hooks.history_turns.items[0].assistant.assistant);
+}
+
 test "processQueuedPrompt preserves fallback route and budget until selection changes" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
@@ -4393,7 +6345,15 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         .assistant_source = @constCast("partial"),
         .cause = .provider_unavailable,
         .action = .paused,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .credential_source = .fx_login,
+            .credential_identity = @import("../../../auth/credential_authority.zig").derive(
+                .fx_login,
+                "acct_1",
+            ),
+        },
         .requested_fast_mode = true,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4412,6 +6372,8 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         config.max_provider_attempts = 4;
         var job = fixture.job();
         job.model = @constCast("zai/glm-5.2");
+        job.credential_source = .fx_login;
+        job.account_id = @constCast("acct_1");
         job.recovery_checkpoint = checkpoint;
 
         try runFakePrompt(&gateway, &hooks, config, job);
@@ -4420,6 +6382,7 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         const reserved = hooks.recovery_checkpoints.items[0];
         try std.testing.expectEqual(@as(usize, 10), reserved.max_provider_attempts);
         try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
+        try std.testing.expectEqualStrings("partial", reserved.assistant_source);
         try std.testing.expect(reserved.requested_fast_mode);
         try std.testing.expect(!reserved.fast_mode);
     }
@@ -4436,6 +6399,8 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         config.max_provider_attempts = 4;
         var job = fixture.job();
         job.model = @constCast("zai/glm-5.2");
+        job.credential_source = .fx_login;
+        job.account_id = @constCast("acct_1");
         job.recovery_checkpoint = checkpoint;
 
         try runFakePrompt(&gateway, &hooks, config, job);
@@ -4448,7 +6413,7 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
     }
 }
 
-test "processQueuedPrompt restores legacy connectivity checkpoints through evidence" {
+test "processQueuedPrompt fails closed without stable credential authority" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
     const checkpoint = session_codec.RecoveryCheckpoint{
@@ -4457,7 +6422,11 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
         .assistant_source = @constCast("partial response"),
         .cause = .system_resumed,
         .action = .waiting_for_connectivity,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .credential_source = .ai_gateway_api_key,
+        },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4473,20 +6442,11 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
     job.model = @constCast("zai/glm-5.2");
     job.recovery_checkpoint = checkpoint;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        gateway.request_bodies.items[0],
-        "<partial_assistant>\\npartial response\\n</partial_assistant>",
-    ) != null);
-    const reserved = hooks.recovery_checkpoints.items[0];
-    try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
-    try std.testing.expect(reserved.outstanding_reservation);
-    for (hooks.route_recovery_statuses.items) |status| {
-        try std.testing.expect(status.action != .waiting_for_connectivity);
-    }
+    try std.testing.expectError(
+        error.RecoveryCredentialAuthorityChanged,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
@@ -4507,8 +6467,11 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    var initial_job = fixture.job();
+    initial_job.credential_source = .fx_login;
+    initial_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, initial_job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
@@ -4518,7 +6481,7 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expect(!checkpoint.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.tool_steps.len);
     try std.testing.expectEqual(types.ModelRecoveryCause.provider_unavailable, checkpoint.cause);
-    try expectRouteStatus(&hooks, 1, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2/2 attempts");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2/2 attempts");
 
     var continued_checkpoint = try checkpoint.dupe(alloc);
     defer continued_checkpoint.deinit(alloc);
@@ -4529,13 +6492,15 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     continued_hooks.enable_recovery_checkpoint = true;
     defer continued_hooks.deinit();
     var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
     continued_job.recovery_checkpoint = continued_checkpoint;
 
     try runFakePrompt(&continued_gateway, &continued_hooks, config, continued_job);
 
     try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_models.items.len);
     try expectBodyContains(&continued_gateway, 0, "call_first");
-    try expectBodyContains(&continued_gateway, 0, "Re-run the response for the same user request.");
+    try expectBodyNotContains(&continued_gateway, 0, "Re-run the response for the same user request.");
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 
@@ -4554,8 +6519,11 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     var fixture = PromptFixture{};
     var first_config = fixture.config();
     first_config.max_provider_attempts = 1;
+    var first_job = fixture.job();
+    first_job.credential_source = .fx_login;
+    first_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&first_gateway, &first_hooks, first_config, fixture.job());
+    try runFakePrompt(&first_gateway, &first_hooks, first_config, first_job);
     const saved = first_hooks.recovery_checkpoints.items[first_hooks.recovery_checkpoints.items.len - 1];
     var checkpoint = try saved.dupe(alloc);
     defer checkpoint.deinit(alloc);
@@ -4571,6 +6539,8 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     second_hooks.enable_recovery_checkpoint = true;
     defer second_hooks.deinit();
     var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
     continued_job.recovery_checkpoint = checkpoint;
     var continued_config = fixture.config();
     continued_config.max_provider_attempts = 2;
@@ -4578,7 +6548,8 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
 
     try std.testing.expectEqual(@as(usize, 1), second_gateway.request_models.items.len);
-    try expectBodyContains(&second_gateway, 0, "<partial_assistant>\\npartial\\n</partial_assistant>");
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    try expectGatewayPromptTextCount(&second_gateway, 0, "partial", 0);
     try std.testing.expectEqualStrings("partial response finished", second_hooks.history_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
 }
@@ -4707,6 +6678,105 @@ test "processQueuedPrompt sends nothing when durable reservation fails" {
     try std.testing.expectEqual(@as(usize, 0), gateway.request_models.items.len);
 }
 
+test "processQueuedPrompt clears scheduled retry when the next reservation fails" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    hooks.recovery_checkpoint_error_at = 3;
+    hooks.recovery_checkpoint_error = error.TestCheckpointWriteFailed;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(
+        error.TestCheckpointWriteFailed,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
+    try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
+    try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        hooks.recovery_checkpoints.items[1].consumed_provider_attempts,
+    );
+}
+
+test "processQueuedPrompt replaces scheduled retry after provider pre-admission failure" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .pre_admission_error = error.TestProviderSerializationFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(
+        error.TestProviderSerializationFailed,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
+    try expectRouteStatus(
+        &hooks,
+        1,
+        .terminal_provider_error,
+        "⚠ Provider unavailable · TestProviderSerializationFailed · recovery paused after 1/2 attempts",
+    );
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
+}
+
+test "processQueuedPrompt replaces scheduled retry when in-flight publication fails" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.route_recovery_status_error_attempt = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(
+        error.TestRouteRecoveryPublicationFailed,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
+    try expectRouteStatus(
+        &hooks,
+        1,
+        .terminal_provider_error,
+        "⚠ Provider unavailable · TestRouteRecoveryPublicationFailed · recovery paused after 1/2 attempts",
+    );
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
+}
+
 test "processQueuedPrompt pauses replay-safe ReadFailed at attempt limit" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -4729,10 +6799,12 @@ test "processQueuedPrompt pauses replay-safe ReadFailed at attempt limit" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request in 1s · attempt 2/3");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 3/3 attempts");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request in 1s · attempt 2/3");
+    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 3/3");
+    try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · ReadFailed · recovery paused after 3/3 attempts");
 }
 
 test "processQueuedPrompt replaces retry status after a different stream error" {
@@ -4753,9 +6825,10 @@ test "processQueuedPrompt replaces retry status after a different stream error" 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
 }
 
 test "processQueuedPrompt clears retry status when a replay is cancelled" {
@@ -4776,8 +6849,9 @@ test "processQueuedPrompt clears retry status when a replay is cancelled" {
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
@@ -4800,9 +6874,10 @@ test "processQueuedPrompt replaces retry status when replay finish is missing" {
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .terminal_provider_error, "⚠ Response ended early · StreamInterrupted · recovery paused after 2/2 attempts");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Response ended early · StreamInterrupted · recovery paused after 2/2 attempts");
 }
 
 test "processQueuedPrompt replaces retry status after an invalid replay completion" {
@@ -4826,9 +6901,10 @@ test "processQueuedPrompt replaces retry status after an invalid replay completi
     );
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · recovery paused after 2/3 attempts");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · retrying request · attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · recovery paused after 2/3 attempts");
 }
 
 test "processQueuedPrompt pauses ReadFailed after assistant source is published" {
@@ -4920,6 +6996,35 @@ test "processQueuedPrompt pauses a local tool after assistant source when budget
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt settles retry tool starts before pausing" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("interrupted-read", "read_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &starts, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .stream_error_after_chunks = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 2;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    const paused = logIndex(&hooks, "event:turn_finished").?;
+    var settled: usize = 0;
+    for (hooks.log.items, 0..) |entry, index| {
+        if (std.mem.startsWith(u8, entry, "status:finished:")) {
+            try std.testing.expect(index < paused);
+            settled += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), settled);
+}
+
 test "processQueuedPrompt cancellation absorbs ReadFailed after published source" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"partial cancelled"};
@@ -4983,16 +7088,17 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings("call_read_recovered", hooks.executed_call_ids.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 1/3");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
-    try expectBodyContains(&gateway, 1, "did not execute the incomplete tool call");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
+    try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyContains(&gateway, 2, "call_read_recovered");
     try expectBodyContains(&gateway, 2, "\"output\":{\"type\":\"text\",\"value\":\"ok\"}");
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
     try std.testing.expectEqualStrings("Finished", hooks.history_turns.items[0].assistant.assistant);
 }
@@ -5021,11 +7127,12 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · regenerating unstarted tool · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Network interrupted · ConnectionResetByPeer · recovery paused after 2/2 attempts");
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
 }
 
@@ -5057,7 +7164,7 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
 }
 
@@ -5166,23 +7273,24 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · ReadFailed · checking uncertain tool state · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · ReadFailed · checking uncertain tool state · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
-test "processQueuedPrompt continues provider error after visible text without duplication" {
+test "processQueuedPrompt restarts failed response without committing its partial preview" {
     const alloc = std.testing.allocator;
-    const chunks = [_][]const u8{"partial"};
-    const recovered_chunks = [_][]const u8{"partial response"};
+    const chunks = [_][]const u8{"DISCARDED_PREVIEW software"};
+    const recovered_chunks = [_][]const u8{"A complete replacement response."};
     const completions = [_]FakeCompletion{
         .{
             .chunks = &chunks,
-            .content = "partial",
+            .content = "DISCARDED_PREVIEW software",
             .finish_reason = .provider_error,
             .provider_failure_detail = "failed after text",
         },
-        .{ .chunks = &recovered_chunks, .content = "partial response" },
+        .{ .chunks = &recovered_chunks, .content = "A complete replacement response." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5196,13 +7304,16 @@ test "processQueuedPrompt continues provider error after visible text without du
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Restart that response from the beginning");
+    try expectBodyNotContains(&gateway, 1, "DISCARDED_PREVIEW");
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
-    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "partial"));
+    try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "DISCARDED_PREVIEW software"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · continuing response · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
-    try std.testing.expectEqualStrings("partial response", hooks.history_turns.items[0].assistant.assistant);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
+    try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 1/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try std.testing.expectEqualStrings("A complete replacement response.", hooks.history_turns.items[0].assistant.assistant);
 }
 
 test "processQueuedPrompt recovers provider error after streamed tool start" {
@@ -5231,9 +7342,10 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
 test "processQueuedPrompt routes content filter to local recovery without replay" {
@@ -5302,17 +7414,18 @@ test "processQueuedPrompt disable Fast recovery retries the same exact model" {
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[1]);
-    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
+    try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}");
     try expectRootFieldAbsent(&gateway, 0, "fast");
-    try expectRootFieldAbsent(&gateway, 1, "providerOptions");
+    try expectBodyContains(&gateway, 1, "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}");
     try std.testing.expectEqual(@as(usize, 1), hooks.capability_queries.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", hooks.capability_queries.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "Recovered without Fast"));
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request · attempt 1/2");
-    try expectRouteStatus(&hooks, 1, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request · attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
 }
 
 test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
@@ -5336,6 +7449,35 @@ test "processQueuedPrompt exhaustion pauses without invoking route recovery" {
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .terminal_provider_error, "⚠ Provider unavailable · provider_error: route failed · recovery paused after 1/1 attempts");
+}
+
+test "processQueuedPrompt stops nonretryable provider outcomes without releasing tools" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"accepted partial response"};
+    const calls = [_]ToolCall{toolCall("rejected_call", "read_file", "{\"path\":\"a.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .content = "accepted partial response", .finish_reason = .provider_error, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_prompt: request rejected", .tool_calls = &calls },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "invalid_prompt: request rejected") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const interrupted = hooks.history_turns.items[0].interrupted;
+    try std.testing.expectEqualStrings("accepted partial response", interrupted.assistant.?);
+    try std.testing.expectEqual(@as(?types.InterruptedTerminalReason, .failed), interrupted.terminal_reason);
+    try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
 test "processQueuedPrompt spacer newline is skipped for ask first tool" {
@@ -5391,18 +7533,71 @@ test "processQueuedPrompt uses configured tool choice only for first call" {
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"auto\"}");
 }
 
-test "processQueuedPrompt injects silent-tool continuation without synthetic assistant text" {
+test "processQueuedPrompt omits blank assistant messages from silent-tool continuation" {
+    const alloc = std.testing.allocator;
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    for ([_]?[]const u8{ null, "", " ", "\t\r\n" }) |blank| {
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &call_one },
+            .{ .tool_calls = &call_two },
+            .{ .content = blank },
+            .{ .content = "Summary" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+        try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+        try expectBodyNotContains(&gateway, 3, "Done.");
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[3], .{});
+        defer parsed.deinit();
+        var assistant_count: usize = 0;
+        for (parsed.value.object.get("prompt").?.array.items) |message| {
+            if (!std.mem.eql(u8, message.object.get("role").?.string, "assistant")) continue;
+            assistant_count += 1;
+            const content = message.object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), content.len);
+            try std.testing.expectEqualStrings("tool-call", content[0].object.get("type").?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 2), assistant_count);
+        try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+        try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
+    }
+}
+
+test "processQueuedPrompt preserves provider state during silent-tool continuation" {
+    const StateObserver = struct {
+        const state = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
+
+        fn observe(request: agent_stream_provider.ModelRequest) !void {
+            const last = request.messages[request.messages.len - 1];
+            if (!std.mem.eql(u8, last.content orelse "", "Summarize what you just did.")) return;
+            const previous = request.messages[request.messages.len - 2];
+            try std.testing.expectEqual(types.ChatRole.assistant, previous.role);
+            try std.testing.expectEqualStrings(" \n", previous.content.?);
+            try std.testing.expectEqualStrings(state, if (previous.provider_replay) |value| value.parts_json else "");
+            try std.testing.expectEqual(@as(usize, 0), previous.tool_calls.len);
+        }
+    };
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
-        .{},
+        .{ .content = " \n", .provider_state_json = StateObserver.state },
         .{ .content = "Summary" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
+    gateway.observe_request = StateObserver.observe;
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5410,8 +7605,31 @@ test "processQueuedPrompt injects silent-tool continuation without synthetic ass
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 3, "Summarize what you just did.");
-    try expectBodyNotContains(&gateway, 3, "Done.");
+    try expectGatewayPromptFinalUserText(&gateway, 3, "Summarize what you just did.");
+    try expectBodyContains(&gateway, 3, "\"reasoningEncryptedContent\":\"opaque\"");
+    try std.testing.expectEqualStrings("Summary", hooks.finish_assistant_text.?);
+    const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
+    try std.testing.expectEqual(@as(usize, 3), steps.len);
+    try std.testing.expectEqualStrings(StateObserver.state, steps[2].provider_replay.?.parts_json);
+}
+
+test "completed assistant provider replay survives turn materialization" {
+    const alloc = std.testing.allocator;
+    const state = "[{\"type\":\"reasoning\",\"text\":\"Kept reasoning\"}]";
+    const completions = [_]FakeCompletion{.{ .content = "Answer", .provider_state_json = state }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    const turn = hooks.history_turns.items[0].assistant;
+    try std.testing.expectEqualStrings("Answer", turn.assistant);
+    try std.testing.expectEqualStrings(state, turn.provider_replay.?.parts_json);
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session_runtime.appendHistoryChatMessages(alloc, &messages, hooks.history_turns.items);
+    try std.testing.expectEqualStrings(state, messages.items[messages.items.len - 1].provider_replay.?.parts_json);
 }
 
 test "tool presentation groups span silent steps and split on visible assistant prose" {
@@ -5532,7 +7750,12 @@ test "processQueuedPrompt non-ok gateway response records schema diagnostics" {
     const detail =
         \\{"error":{"message":"Invalid input: expected string, received array","param":["prompt",0,"content"]}}
     ;
-    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = detail }};
+    const completions = [_]FakeCompletion{.{
+        .status = .bad_request,
+        .err_body = detail,
+        .failure_schema = "path=prompt.0.content expected=string received=array",
+        .failure_request_shape = "prompt.0 role=system content=string prompt.1 role=user content=array",
+    }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5595,15 +7818,46 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     var job = fixture.job();
     job.credential_source = .fx_login;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    var config = fixture.config();
+    config.max_provider_attempts = 1;
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_api_keys.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "forced auth refresh reaches later permission and tool consumers in the same turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "call_read",
+        "read_file",
+        "{\"path\":\"README.md\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{ .tool_calls = &calls },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-after-401" };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqualStrings("fresh-after-401", hooks.last_permission_credential.?);
+    try std.testing.expectEqualStrings("fresh-after-401", hooks.last_execute_credential.?);
 }
 
 test "processQueuedPrompt does not retry a second fx login 401" {
@@ -5634,6 +7888,86 @@ test "processQueuedPrompt does not retry a second fx login 401" {
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
+    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "Codex 401 replay keeps payload and semantic recovery unchanged for the captured account" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{
+            .content = "Done.",
+            .generation_id = "response-replay-success",
+            .billing = .{
+                .created_at_ms = 1,
+                .model = "codex/gpt-test",
+                .total_cost = 0,
+                .input_tokens = 17,
+                .output_tokens = 7,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .billable_web_search_calls = 0,
+            },
+            .exact_usage_provider = .codex,
+        },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.usage = &usage;
+    hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-token" };
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("acct-a");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+    try std.testing.expectEqualStrings("stale-loaded", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("fresh-token", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    var usage_snapshot = try usage.snapshot(alloc);
+    defer usage_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 17), usage_snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), usage_snapshot.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), usage_snapshot.request_count);
+    try std.testing.expectEqual(@as(u64, 3), usage_snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 2), usage_snapshot.settled_through_sequence);
+}
+
+test "Codex 401 account change makes no second provider request" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.credential_refresh_error = error.ChatGptAccountChanged;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("acct-a");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
@@ -5845,8 +8179,8 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=projection_end") != null);
     try std.testing.expect(std.mem.find(u8, trace, "history_turn_kinds=interrupted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "projected_message_roles=user,assistant,tool,user") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=before_payload_build") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=after_payload_build") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=before_provider_preflight") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=provider_admitted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=returned_tool_call") != null);
     try std.testing.expect(std.mem.find(u8, trace, "call_id=call_1 tool_name=write_file") != null);
     try std.testing.expect(std.mem.find(u8, trace, "args_preview=<object_fields=3 values=[") != null);
@@ -5861,4 +8195,135 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "super secret file contents") == null);
     try std.testing.expect(std.mem.find(u8, trace, "secret.txt") == null);
     try std.testing.expect(std.mem.find(u8, trace, "abc123") == null);
+}
+
+test "processQueuedPrompt assigns trace lineage to subagent runs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "subagent-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "agent");
+
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.origin = .subagent;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    debug_trace.shutdown();
+
+    const trace = try readTraceFile(alloc, trace_path, 65536);
+    defer alloc.free(trace);
+    const prompt_start = std.mem.find(u8, trace, "event=prompt_start") orelse
+        return error.TestExpectedEqual;
+    const prompt_line_end = std.mem.findScalarPos(u8, trace, prompt_start, '\n') orelse
+        trace.len;
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace[prompt_start..prompt_line_end],
+        "subagent_id=",
+    ) != null);
+}
+
+test "processQueuedPrompt trace emits one canonical result for tool execution errors" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "tool-error-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
+
+    const calls = [_]ToolCall{toolCall("call_error", "read_file", "{\"path\":\"missing.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const FailingExecution = struct {
+        fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {
+            return error.SystemResources;
+        }
+    };
+    var override_context: u8 = 0;
+    hooks.tool_execution_override = ToolExecutionOverride{
+        .context = &override_context,
+        .execute_fn = FailingExecution.execute,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFile(alloc, trace_path, 65536);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=after_tool_execution"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=execution_result"),
+    );
+    try std.testing.expect(std.mem.find(u8, trace, "err=SystemResources") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "model_output_bytes=") != null);
+}
+
+test "processQueuedPrompt keeps provider uncertainty without tool terminals after pause" {
+    const alloc = std.testing.allocator;
+    const local = [_]ToolCall{toolCall("local-read", "read_file", "{}")};
+    const provider = [_]ToolCall{toolCall("provider-search", "web_search", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .streamed_tool_starts = &local, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .streamed_tool_starts = &provider, .stream_error_after_tool_starts = error.ReadFailed },
+        .{ .pause_before_output = true },
+    };
+    var pause_flag = std.atomic.Value(bool).init(false);
+    var gateway = FakeGateway.init(alloc, &completions);
+    gateway.recovery_pause_flag = &pause_flag;
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.recovery_pause_flag = &pause_flag;
+    config.gateway_retry_count = 3;
+    config.max_provider_attempts = 4;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.paused, checkpoint.action);
+    try std.testing.expectEqual(.uncertain, checkpoint.tool_state);
+    const paused = logIndex(&hooks, "event:turn_finished").?;
+    var settled: usize = 0;
+    for (hooks.log.items, 0..) |entry, index| {
+        if (std.mem.startsWith(u8, entry, "status:finished:")) {
+            try std.testing.expect(index < paused);
+            settled += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), settled);
+    try expectFailedLifecycleContains(hooks.lifecycle_events.items, "local-read", "before tool call ran");
 }

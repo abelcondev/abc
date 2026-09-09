@@ -79,7 +79,7 @@ function createRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "minimal" }),
+    JSON.stringify({}),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),
@@ -173,15 +173,36 @@ function preserveLegacyFailure(
 }
 
 describe("version-scoped legacy MCP remote transports", () => {
+  for (const version of VERSIONS) {
+    test(`default MCP v1 initializes Streamable HTTP ${version} without probing discovery`, async () => {
+      streamable = startLegacyStreamableHttpFixture(version);
+      const root = createRoot(`default-v1-${version}`, "http", streamable.url);
+      gateway = startToolGateway("Default remote MCP v1 complete.");
+      const result = await runAsk(root, gateway, "Use the MCP tool.");
+      expect(result.code).toBe(0);
+      expect(streamable.initializeCalls).toBe(1);
+      expect(streamable.toolsListCalls).toBe(1);
+      expect(streamable.toolCallCalls).toBe(1);
+      const requests = streamable.requests.filter((entry) => entry.message?.method);
+      expect(requests[0]?.message?.method).toBe("initialize");
+      expect(requests.filter((entry) => entry.message?.method === "server/discover")).toHaveLength(0);
+    }, 30_000);
+  }
+
   for (const sdkDiscoveryError of [
     "uninitialized",
     "unsupported-version",
+    "unsupported-version-string-id",
   ] as const) {
     test(`stock SDK ${sdkDiscoveryError} discovery error falls back to Streamable HTTP initialization`, async () => {
       streamable = startLegacyStreamableHttpFixture("2025-11-25", {
         sdkDiscoveryError,
       });
       const root = createRoot(`sdk-discovery-${sdkDiscoveryError}`, "http", streamable.url);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startToolGateway("Stock SDK fallback complete.");
 
       const result = await runAsk(root, gateway, "Use the legacy MCP tool.");
@@ -308,12 +329,12 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`list-changed-${version}`, "http", streamable.url);
       const freshTool = "mcp_fixture_fresh";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        fakeGatewayToolCall("activate_listener", "capability_search", {
           query: "echo",
         }),
         async () => {
           await Bun.sleep(100);
-          return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+          return fakeGatewayToolCall("search_fresh", "capability_search", {
             query: "fresh",
           });
         },
@@ -369,12 +390,12 @@ describe("version-scoped legacy MCP remote transports", () => {
     const root = createRoot("sse-list-changed", "sse", legacySse.url);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_sse_reader", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_sse_reader", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -427,7 +448,6 @@ describe("version-scoped legacy MCP remote transports", () => {
         .filter((entry) => entry.message)
         .map((entry) => entry.message!.method);
       expect(messages).toEqual([
-        "server/discover",
         "initialize",
         "notifications/initialized",
         "tools/list",
@@ -496,6 +516,31 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Call the no-session fixture.");
 
     expect(result.code).toBe(0);
+    expect(streamable.deleteCalls).toBe(0);
+    for (const entry of streamable.requests) {
+      expect(entry.headers["mcp-session-id"]).toBeUndefined();
+    }
+  }, 30_000);
+
+  test("Clerk-like SSE initialization without a session remains searchable", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-11-25", {
+      initializeSse: true,
+      sdkDiscoveryError: "unsupported-version",
+      session: false,
+    });
+    const root = createRoot("clerk-like-sse-no-session", "http", streamable.url);
+    gateway = startToolGateway("Clerk-like search complete.");
+
+    const result = await runAsk(
+      root,
+      gateway,
+      "Find and call the legacy MCP tool.",
+    );
+
+    expect(result.code).toBe(0);
+    expect(streamable.initializeCalls).toBe(1);
+    expect(streamable.toolsListCalls).toBe(1);
+    expect(streamable.toolCallCalls).toBe(1);
     expect(streamable.deleteCalls).toBe(0);
     for (const entry of streamable.requests) {
       expect(entry.headers["mcp-session-id"]).toBeUndefined();
@@ -999,7 +1044,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       });
       const root = createRoot(`sse-version-${label}`, "sse", legacySse.url);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_invalid_sse", "mcp_search_tools", {
+        fakeGatewayToolCall("inspect_invalid_sse", "capability_search", {
           query: "echo",
         }),
         fakeGatewayFinalText("Invalid SSE version isolated."),
@@ -1036,7 +1081,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       legacySse.url,
     );
     gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_malformed_sse", "mcp_search_tools", {
+      fakeGatewayToolCall("inspect_malformed_sse", "capability_search", {
         query: "echo",
       }),
       fakeGatewayFinalText("Malformed SSE startup isolated."),

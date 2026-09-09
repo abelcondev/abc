@@ -6,9 +6,9 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const default_session_diagnostics_limit: usize = 64;
@@ -34,6 +34,7 @@ pub const Check = struct {
 pub const Snapshot = struct {
     workspace_root: []u8,
     model: []const u8,
+    provider: model_provider.ProviderId = .gateway,
     owned_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
@@ -108,10 +109,12 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
+    snapshot.provider = detailed.settings.provider orelse .gateway;
 
-    snapshot.auth = try auth_runtime.loadStatusSnapshot(
+    snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
         alloc,
         secret_store,
+        snapshot.provider,
         detailed.settings.credential_source,
     );
 
@@ -120,7 +123,7 @@ pub fn collect(
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = detailed.settings.model,
+        .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_model, default_agent_step_limit);
@@ -236,7 +239,7 @@ fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator,
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, sandbox.configErrorMessage(err) orelse @errorName(err) });
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
 }
 
 fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
@@ -269,14 +272,20 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_
         try appendSessionDiagnosticsTruncatedCheck(checks, alloc, inspection.inspected_count);
     }
 
-    if (try store.readStateSummary(alloc)) |summary_value| {
-        var summary = summary_value;
-        defer summary.deinit(alloc);
-        try appendSessionsCountCheck(checks, alloc, summary.count, summary.latest_id orelse "");
+    var summaries = store.list(alloc) catch {
+        try appendSessionsCountUnavailableCheck(checks, alloc);
         return;
+    };
+    defer {
+        for (summaries.items) |*summary| summary.deinit(alloc);
+        summaries.deinit(alloc);
     }
-
-    try appendSessionsCountUnavailableCheck(checks, alloc);
+    try appendSessionsCountCheck(
+        checks,
+        alloc,
+        summaries.items.len,
+        if (summaries.items.len > 0) summaries.items[0].id else "",
+    );
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -547,16 +556,39 @@ fn appendMcpConfigCheck(
     alloc: Allocator,
     diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) !void {
-    const err = switch (diagnostic) {
+    switch (diagnostic) {
         .clear => return,
-        .failed => |value| value,
-    };
-    const detail = try std.fmt.allocPrint(
-        alloc,
-        "failed to load ~/.fx/mcp.json: {s}",
-        .{@errorName(err)},
-    );
-    try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
+        .warning => |warning| {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "~/.fx/mcp.json warning: {s}",
+                .{@tagName(warning.cause)},
+            );
+            if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
+            try out.writer.print(
+                " additional_matches={d}",
+                .{warning.additional_matches},
+            );
+            try appendCheckOwned(
+                checks,
+                alloc,
+                "mcp_config",
+                .warn,
+                try out.toOwnedSlice(),
+            );
+            return;
+        },
+        .failed => |err| {
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "failed to load ~/.fx/mcp.json: {s}",
+                .{@errorName(err)},
+            );
+            try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
+            return;
+        },
+    }
 }
 
 fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {
@@ -655,7 +687,7 @@ fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return switch (mode) {
         .ask => "ask",
         .auto => "auto",
-        .yolo => "yolo",
+        .yolo => "full access",
     };
 }
 
