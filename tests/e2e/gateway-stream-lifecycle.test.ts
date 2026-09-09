@@ -71,6 +71,113 @@ function createFixtureRoot(label: string): FixtureRoot {
   return { root, home, workspace: realpathSync(workspace) };
 }
 
+for (const action of ["run", "message"] as const) for (const stop of [false, true]) {
+  test(`subagent steering responds before ${action} finishes, stop=${stop}`, async () => {
+    const root = createFixtureRoot("subagent-steering");
+    const held = heldFakeGatewayFinalText();
+    const requests: string[] = [];
+    let childRequests = 0;
+    let delegated = false;
+    let afterChildTool = false;
+    writeFileSync(join(root.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      if (latest.includes("STEERING_CHILD")) {
+        childRequests++;
+        return held.response;
+      }
+      requests.push(raw);
+      if (!delegated) {
+        delegated = true;
+        return fakeGatewayToolCall("steering-delegation", "subagent", { request: action === "run"
+          ? { action, task: "STEERING_CHILD" }
+          : { action, agent: "worker", message: "STEERING_CHILD" } });
+      }
+      if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
+      if (raw.includes("HELD_CHILD_RESULT")) {
+        expect(JSON.stringify(body.prompt.filter((item: any) => item.role === "user"))).not.toContain("HELD_CHILD_RESULT");
+        if (!afterChildTool) {
+          afterChildTool = true;
+          return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
+        }
+        expect(raw).toContain("AFTER_CHILD_TOOL_OK");
+        return fakeGatewayFinalText("CHILD_COMPLETE");
+      }
+      expect(afterChildTool).toBe(false);
+      return fakeGatewayFinalText(latest.includes("STEERING_SECOND") ? "SECOND_ACCEPTED" : "FIRST_ACCEPTED");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const registry = () => {
+      const sessions = join(root.home, ".fx/sessions");
+      for (const id of readdirSync(sessions)) {
+        const path = join(sessions, id, "subagent/children.json");
+        if (existsSync(path)) {
+          const value = JSON.parse(readFileSync(path, "utf8"));
+          if (value.children.length) return { id, value };
+        }
+      }
+      throw new Error("child registry unavailable");
+    };
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true,
+        stderrPath: join(root.root, "stderr.log"),
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "synthetic-steering", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_LOG: join(root.root, "trace.log"), FX_TRACE_SCOPES: "subagent,worker,agent,tool",
+        },
+      });
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("STEERING_START");
+      await tui.waitForPane(() => childRequests === 1, 10000);
+      const original = registry().value.children[0];
+      await tui.sendText("STEERING_FIRST");
+      await tui.waitForText("FIRST_ACCEPTED", 10000);
+      await tui.sendText("STEERING_SECOND");
+      await tui.waitForText("SECOND_ACCEPTED", 10000);
+      expect(childRequests).toBe(1);
+      const pending = registry().value.children[0];
+      expect(pending.id).toBe(original.id);
+      expect(pending.active.id).toBe(original.active.id);
+      expect(requests.some(raw => raw.includes(original.id) && raw.includes(original.active.id))).toBe(true);
+      expect(pending.phase).toBe("running");
+      expect(pending.last_outcome).toBeNull();
+      expect(await tui.captureFullScrollback()).toContain("still running");
+      if (stop) {
+        await tui.sendKeys("Escape");
+        await tui.waitForPane(() => registry().value.children[0].last_outcome === "cancelled", 10000);
+      } else {
+        held.release("HELD_CHILD_RESULT");
+        await tui.waitForText("CHILD_COMPLETE", 10000);
+        expect(requests.filter(raw => raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
+      }
+      await tui.waitForStableComposer(10000);
+      await tui.sendText("STEERING_LATER");
+      await tui.waitForText("LATER_OK", 10000);
+      expect(childRequests).toBe(1);
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
+      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
+      const trace = readFileSync(join(root.root, "trace.log"), "utf8");
+      expect(trace).toContain("event=steering_wait_yielded ");
+      expect(trace.split("\n").filter(line => line.includes("event=steering_result_delivered "))).toHaveLength(stop ? 0 : 1);
+    } finally {
+      held.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60000);
+}
+
 function writeContextLimitFixture(root: FixtureRoot) {
   const skillDirectory = join(
     root.workspace,

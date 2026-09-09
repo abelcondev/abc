@@ -1019,7 +1019,9 @@ pub fn finishExecutedToolStatus(
         else
             base;
     } else switch (result.status) {
-        .success => if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
+        .success => if (try tooling_presentation.subagentPendingLine(arena, call, result.model_output)) |line|
+            line
+        else if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
             result.model_output
         else
             try hooks.describe_tool_action_completed(

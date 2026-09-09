@@ -33,6 +33,7 @@ pub const ToolActionInput = struct {
 pub const SubagentActionState = union(enum) {
     identity,
     active,
+    pending,
     completed,
     stopped: []const u8,
 };
@@ -75,6 +76,7 @@ pub fn subagentAction(
     const label = switch (state) {
         .identity => try alloc.dupe(u8, name.bytes),
         .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
+        .pending => try std.fmt.allocPrint(alloc, "{s} still running", .{name.bytes}),
         .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
         .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
             try std.fmt.allocPrint(alloc, "{s} failed", .{name.bytes})
@@ -116,6 +118,19 @@ fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return encoded.bytes;
 }
 
+pub fn subagentPendingLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
+    if (!std.mem.eql(u8, call.name, "subagent")) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const pending = parsed.value.object.get("pending") orelse return null;
+    if (pending != .bool or !pending.bool) return null;
+    return formatSubagentPlainAction(alloc, call, .pending);
+}
+
 /// Only structured child terminal failures change the failure label.
 pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
     if (!std.mem.eql(u8, call.name, "subagent")) return "Failed";
@@ -129,6 +144,15 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
     if (ok != .bool or ok.bool) return "Failed";
     const code = tool_args.optionalStringArg(parsed.value.object, "error_code") orelse return "Failed";
     return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
+}
+
+test "subagent pending result does not claim completion" {
+    const alloc = std.testing.allocator;
+    const call = ToolCall{ .id = "call", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"work\"}" };
+    const line = (try subagentPendingLine(alloc, call, "{\"ok\":true,\"pending\":true}")).?;
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("Subagent still running · work", line);
+    try std.testing.expect((try subagentPendingLine(alloc, call, "{\"ok\":true,\"result\":\"done\"}")) == null);
 }
 
 test "subagent rows project request identity state and bounded safe previews" {

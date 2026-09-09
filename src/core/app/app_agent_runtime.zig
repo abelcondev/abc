@@ -976,6 +976,9 @@ pub fn Runtime(comptime App: type) type {
             }
             app.worker.active_context_snapshot = &job.context_snapshot;
             defer app.worker.active_context_snapshot = null;
+            defer if (comptime !@import("builtin").single_threaded) {
+                if (app.session_persistence.subagent_host) |child_host| child_host.cancelYielded();
+            };
             app.worker.active_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
                 writable.external_prompt_origin == .persistent_child and
                     job.recovery_checkpoint == null

@@ -5,6 +5,7 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -112,6 +113,19 @@ pub const Owner = struct {
             return;
         }
         return error.ChildUnavailable;
+    }
+
+    /// The parent drains tool callers before releasing its borrowed context.
+    pub fn cancelAndJoin(self: *Owner, child_id: []const u8) void {
+        self.cancel(child_id) catch return;
+        const slot = self.findSlot(child_id) orelse return;
+        debug_trace.eventf("subagent", "steering_child_join_started", .{}, "child_id={s}", .{child_id});
+        if (slot.thread) |thread| {
+            thread.join();
+            slot.thread = null;
+        }
+        self.reapSlot(slot) catch |err| debugFailure(child_id, "cancel_join", err);
+        debug_trace.eventf("subagent", "steering_child_join_finished", .{}, "child_id={s}", .{child_id});
     }
 
     pub fn recoverInterrupted(self: *Owner) !void {
