@@ -1750,6 +1750,130 @@ test "streamed markdown lists reflow through shrink and grow" {
     try expectRowPrefix(&h, nested_wide + 1, "      ");
 }
 
+test "streamed longer code fence keeps inner fences inside the block" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(
+        h.alloc,
+        "````md\n```zig\nconst inner = 1;\n```\n````\nafter the block\n",
+        &formatted,
+    );
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const open_row = try findRowContaining(&h, "```zig");
+    try expectRowPrefix(&h, open_row, "  │ ```zig");
+    try expectRowPrefix(&h, open_row + 1, "  │ const inner = 1;");
+    try expectRowPrefix(&h, open_row + 2, "  │ ```");
+    try expectRowPrefix(&h, open_row + 3, "  after the block");
+    try expectGridNotContains(&h, "````");
+
+    try h.driveResize(24, 40, 4, true);
+    const narrow_row = try findRowContaining(&h, "```zig");
+    try expectRowPrefix(&h, narrow_row, "  │ ```zig");
+    try expectRowPrefix(&h, narrow_row + 2, "  │ ```");
+    try expectGridNotContains(&h, "````");
+}
+
+test "streamed tab indented fence closes and releases the following prose" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "1. item\n\t```sh\n\tls\n\t```\n\tprose after\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const code_row = try findRowContaining(&h, "ls");
+    try expectRowPrefix(&h, code_row, "  │ ls");
+    const prose_row = try findRowContaining(&h, "prose after");
+    try std.testing.expect(prose_row > code_row);
+    const prose_cell = h.vt.cellAt(prose_row, 2) orelse return error.TestMissingCell;
+    try std.testing.expect(prose_cell.style.fg.eql(.default));
+    try expectGridNotContains(&h, "│ ```");
+    try expectGridNotContains(&h, "│ prose");
+}
+
+test "streamed plus and paren list markers wrap under their text" {
+    var h = try Harness.init(std.testing.allocator, 20, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(
+        h.alloc,
+        "+ plus-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n" ++
+            "1) paren-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n",
+        &formatted,
+    );
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const plus_row = try findRowContaining(&h, "plus-");
+    try expectRowPrefix(&h, plus_row, "  • plus-");
+    try expectRowPrefix(&h, plus_row + 1, "    ");
+    try expectGridNotContains(&h, "+ plus");
+
+    const paren_row = try findRowContaining(&h, "paren-");
+    try expectRowPrefix(&h, paren_row, "  1) paren-");
+    try expectRowPrefix(&h, paren_row + 1, "     ");
+
+    try h.driveResize(14, 40, 4, true);
+    const plus_narrow = try findRowContaining(&h, "plus-");
+    const paren_narrow = try findRowContaining(&h, "paren-");
+    try expectRowPrefix(&h, plus_narrow + 1, "    ");
+    try expectRowPrefix(&h, paren_narrow + 1, "     ");
+}
+
+test "streamed blockquote keeps heading and bullet styling inside the quote" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(h.alloc, "> ## Quoted note\n> - quoted item\n", &formatted);
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const heading_row = try findRowContaining(&h, "Quoted note");
+    try expectRowPrefix(&h, heading_row, "  │ Quoted note");
+    const heading_cell = h.vt.cellAt(heading_row, 5) orelse return error.TestMissingHeadingCell;
+    try std.testing.expect(heading_cell.style.flags.bold);
+    try expectGridNotContains(&h, "## Quoted");
+
+    const item_row = try findRowContaining(&h, "quoted item");
+    try expectRowPrefix(&h, item_row, "  │ • quoted item");
+    try expectGridNotContains(&h, "- quoted");
+}
+
 test "streamed markdown definitions reflow through shrink and grow" {
     const Capture = struct {
         fn deliver(_: *anyopaque, _: *std.ArrayList(u8)) !void {}
