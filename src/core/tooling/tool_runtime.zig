@@ -1991,6 +1991,7 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .steering_worker = if (ctx.interactive) ctx.worker else null,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;

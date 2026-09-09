@@ -5,6 +5,7 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -53,6 +54,15 @@ pub const Owner = struct {
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (slot.completion == .running) return true;
+        }
+        return false;
+    }
+
+    pub fn hasRunningChild(self: *Owner, child_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (std.mem.eql(u8, slot.child_id, child_id)) return slot.completion == .running;
         }
         return false;
     }
@@ -112,6 +122,31 @@ pub const Owner = struct {
             return;
         }
         return error.ChildUnavailable;
+    }
+
+    /// The parent drains tool callers before releasing its borrowed context.
+    pub fn cancelAndJoin(self: *Owner, child_id: []const u8) void {
+        const slot = blk: {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            for (self.slots.items) |candidate| {
+                if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
+                if (candidate.completion == .running) {
+                    candidate.cancel.store(true, .seq_cst);
+                    // Stop approval waits without changing explicit cancellation to interruption.
+                    if (candidate.worker) |worker| worker.requestShutdown();
+                }
+                break :blk candidate;
+            }
+            return;
+        };
+        debug_trace.eventf("subagent", "steering_child_join_started", .{}, "child_id={s}", .{child_id});
+        if (slot.thread) |thread| {
+            thread.join();
+            slot.thread = null;
+        }
+        self.reapSlot(slot) catch |err| debugFailure(child_id, "cancel_join", err);
+        debug_trace.eventf("subagent", "steering_child_join_finished", .{}, "child_id={s}", .{child_id});
     }
 
     pub fn recoverInterrupted(self: *Owner) !void {
@@ -299,6 +334,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_fn = Owner.phaseTransition;
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
+    if (slot.cancel.load(.seq_cst)) slot.worker.?.requestShutdown();
     owner.mutex.unlock(io_mod.getIo());
     turn.approval_worker_route = workerRoute(slot);
     defer detachWorker(slot);
@@ -499,6 +535,241 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
         "managed child state update failed child_id={s} stage={s} err={s}",
         .{ child_id, stage, @errorName(err) },
     );
+}
+
+test "managed owner cancellation join wakes pending permission" {
+    try testCancellationJoin(.pending);
+}
+
+test "managed owner cancellation join stops late permission registration" {
+    try testCancellationJoin(.before_permission);
+}
+
+test "managed owner cancellation join reaches worker attached after cancellation" {
+    try testCancellationJoin(.before_attachment);
+}
+
+const CancellationJoinTest = struct {
+    owner: *Owner,
+    slot: *Slot,
+    start: std.Io.Event = .unset,
+    entered: std.Io.Event = .unset,
+    permission: std.Io.Event = .unset,
+    registered: std.Io.Event = .unset,
+    returned: std.Io.Event = .unset,
+    finish: std.Io.Event = .unset,
+    turn: ?*execution.TurnContext = null,
+    request_id: u64 = 0,
+    decision: ?types.ToolPermissionDecision = null,
+    effects: usize = 0,
+    commits: usize = 0,
+
+    fn childMain(self: *@This()) void {
+        self.start.waitUncancelable(io_mod.getIo());
+        slotMain(self.slot);
+    }
+
+    fn joinMain(self: *@This()) void {
+        self.owner.cancelAndJoin("child");
+    }
+
+    fn capture(_: ?*anyopaque, alloc: Allocator, request: execution.CaptureRequest) execution.ServiceError!domain.AdmissionSnapshot {
+        return domain.captureAdmission(alloc, .{
+            .parent_id = request.parent_id,
+            .source_id = request.source_id,
+            .model = request.preferences.model,
+            .effort = request.preferences.effort,
+        }) catch return error.AdmissionFailed;
+    }
+
+    fn run(raw: ?*anyopaque, turn: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.turn = turn;
+        defer {
+            self.returned.set(io_mod.getIo());
+            self.finish.waitUncancelable(io_mod.getIo());
+        }
+        const worker = turn.workerRuntime();
+        worker.worker_mutex.lockUncancelable(io_mod.getIo());
+        worker.worker_processing = true;
+        worker.worker_mutex.unlock(io_mod.getIo());
+        self.entered.set(io_mod.getIo());
+        self.permission.waitUncancelable(io_mod.getIo());
+        var response = worker.requestPermissionBlockingObserved(
+            turn.alloc,
+            .{ .label = "review child action" },
+            null,
+            .{ .context = self, .observe_fn = observe },
+        ) catch return error.ProviderFailed;
+        defer response.deinit();
+        self.decision = response.decision;
+        if (cancel.load(.seq_cst) or worker.isCancelRequested()) return error.Cancelled;
+        self.effects += 1;
+        return .completed;
+    }
+
+    fn observe(raw: *anyopaque, _: *worker_runtime.WorkerRuntime, request: permission_request.PermissionRequest) error{ OutOfMemory, PermissionRegistrationFailed, PermissionCapacityExceeded }!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const turn = self.turn.?;
+        Owner.phaseTransition(self.owner, "child", "work", .awaiting_approval) catch
+            return error.PermissionRegistrationFailed;
+        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, &.{}, turn.approval_worker_route.?, 1) catch
+            return error.PermissionRegistrationFailed;
+        self.request_id = request.id;
+        self.registered.set(io_mod.getIo());
+    }
+
+    fn commit(raw: *anyopaque) worker_runtime.WorkerRuntime.PermissionCommitError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.commits += 1;
+    }
+
+    fn rescue(self: *@This()) void {
+        self.owner.mutex.lockUncancelable(io_mod.getIo());
+        defer self.owner.mutex.unlock(io_mod.getIo());
+        self.slot.cancel.store(true, .seq_cst);
+        if (self.slot.worker) |worker| worker.requestShutdown();
+    }
+
+    fn wait(event: *std.Io.Event) !void {
+        try event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(1000),
+        } });
+    }
+};
+
+fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var sessions = try session_store.Store.initFromHome(alloc, root, root);
+    defer sessions.deinit(alloc);
+    for ([_][]const u8{ "parent", "child" }) |id| {
+        var writable = try sessions.startWritableSession(alloc, .{
+            .id = @constCast(id),
+            .origin_workspace_root = @constCast(root),
+            .workspace_root = @constCast(root),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+            .history = &.{},
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        });
+        writable.deinit(alloc);
+    }
+    const state_store = child_state.Store{ .sessions = &sessions, .parent_id = "parent" };
+    {
+        var registry = try child_state.Registry.init(alloc, "parent");
+        defer registry.deinit(alloc);
+        try registry.appendOneOff(alloc, "child", .{
+            .id = @constCast("work"),
+            .message = @constCast("child request"),
+            .created_at_ms = 1,
+        });
+        try state_store.save(alloc, registry);
+    }
+    var approvals = approval_registry.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    var owner = Owner{
+        .alloc = alloc,
+        .sessions = &sessions,
+        .state_store = state_store,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = &approvals,
+    };
+    defer owner.deinit();
+    const slot = try alloc.create(Slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child") };
+    try owner.slots.append(alloc, slot);
+    var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot };
+    owner.services = .{ .context = &fixture, .capture_fn = CancellationJoinTest.capture, .run_fn = CancellationJoinTest.run };
+    slot.thread = try std.Thread.spawn(.{}, CancellationJoinTest.childMain, .{&fixture});
+    // Release every gate and stop the real worker even when an assertion fails.
+    errdefer {
+        fixture.start.set(io_mod.getIo());
+        fixture.permission.set(io_mod.getIo());
+        fixture.finish.set(io_mod.getIo());
+    }
+    if (timing != .before_attachment) {
+        fixture.start.set(io_mod.getIo());
+        try CancellationJoinTest.wait(&fixture.entered);
+    }
+    if (timing == .pending) {
+        fixture.permission.set(io_mod.getIo());
+        try CancellationJoinTest.wait(&fixture.registered);
+    }
+    var rescued = false;
+    {
+        const joiner = try std.Thread.spawn(.{}, CancellationJoinTest.joinMain, .{&fixture});
+        var route_pinned = false;
+        const route = workerRoute(slot);
+        defer joiner.join();
+        defer {
+            fixture.rescue();
+            fixture.start.set(io_mod.getIo());
+            fixture.permission.set(io_mod.getIo());
+            fixture.finish.set(io_mod.getIo());
+            if (route_pinned) route.release_fn(route.context);
+        }
+        // The owner lock makes cancellation observation occur after its worker request.
+        var cancelled = false;
+        for (0..1000) |_| {
+            owner.mutex.lockUncancelable(io_mod.getIo());
+            cancelled = slot.cancel.load(.seq_cst);
+            owner.mutex.unlock(io_mod.getIo());
+            if (cancelled) break;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        try std.testing.expect(cancelled);
+        fixture.start.set(io_mod.getIo());
+        try CancellationJoinTest.wait(&fixture.entered);
+        route_pinned = route.pin_fn(route.context);
+        try std.testing.expect(route_pinned);
+        fixture.permission.set(io_mod.getIo());
+        // Rescue blocked permission waits so regressions fail instead of hanging.
+        rescued = if (CancellationJoinTest.wait(&fixture.returned)) |_| false else |_| blk: {
+            fixture.rescue();
+            try CancellationJoinTest.wait(&fixture.returned);
+            break :blk true;
+        };
+        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), fixture.decision);
+        for ([_]types.ToolPermissionDecision{ .once, .deny }) |decision| {
+            try std.testing.expectEqual(worker_runtime.PermissionSubmissionResult.no_pending, try route.submit_fn(
+                route.context,
+                fixture.request_id,
+                permission_request.OwnedPermissionResponse.init(alloc, decision, null),
+                .{ .context = &fixture, .commit_fn = CancellationJoinTest.commit },
+            ));
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+        try std.testing.expect(!slot.shutdown.load(.seq_cst));
+        fixture.finish.set(io_mod.getIo());
+        // Detach invalidates the approval, but cannot release the worker while pinned.
+        for (0..1000) |_| {
+            if (approvals.pendingRevision() >= 2) break;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        try std.testing.expectEqual(@as(u64, 2), approvals.pendingRevision());
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        const retained = slot.worker != null and slot.route_refs == 1 and slot.completion == .running;
+        owner.mutex.unlock(io_mod.getIo());
+        try std.testing.expect(retained);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.effects);
+    try std.testing.expectEqual(@as(usize, 0), owner.slots.items.len);
+    const observation = try owner.observe("child");
+    try std.testing.expectEqual(child_state.Outcome.cancelled, observation.outcome.?);
+    try std.testing.expect(observation.failure == null);
+    var pending = try approvals.firstPendingRequest(alloc, "parent");
+    defer if (pending) |*request| request.deinit(alloc);
+    try std.testing.expect(pending == null);
+    try std.testing.expectEqual(false, rescued);
 }
 
 test "subagent failure to publish completion returns state unavailable instead of waiting" {

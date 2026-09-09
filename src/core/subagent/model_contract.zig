@@ -251,8 +251,11 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     return hash.finalResult();
 }
 
+pub const steering_pending_result = "The subagent is still running. Handle the user's steering now. Its result will arrive automatically; do not delegate again to poll for it.";
+
 pub const Result = struct {
     ok: bool,
+    pending: bool = false,
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
 };
@@ -269,6 +272,7 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
         &out.writer,
         if (result.error_code) |code| code[0..@min(code.len, max_error_code_bytes)] else null,
     );
+    if (result.pending) try out.writer.writeAll(",\"pending\":true");
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
