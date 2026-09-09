@@ -88,10 +88,9 @@ const Delimiter = struct {
 };
 
 const Token = union(enum) {
-    /// Literal bytes copied from the source line.
+    /// Literal bytes copied from the source line, including the character
+    /// produced by a backslash escape.
     text: []const u8,
-    /// A single literal byte produced by a backslash escape.
-    byte: u8,
     entity: DecodedEntity,
     code: []const u8,
     link: struct { link: InlineLink, visible_prefix: ?[]const u8 },
@@ -114,9 +113,18 @@ fn tokenize(
     var i: usize = 0;
     var literal_start: usize = 0;
     var link_admission_suppressed_until: usize = 0;
+    // No footnote, link, or image can start after the last `]`, so bracket
+    // candidates past it are never scanned; without this every `[` on a line
+    // with no `]` would rescan to the end of the line.
+    const last_close_bracket = std.mem.lastIndexOfScalar(u8, text, ']') orelse 0;
+    // End of the most recent delimiter run that can open emphasis. A bare URL
+    // may follow such a run directly, and the tokenizer owns that decision
+    // rather than a second flanking rule inside the URL parser.
+    var opening_delimiter_end: usize = 0;
 
     while (i < text.len) {
         const c = text[i];
+        const after_opening_delimiter = i > 0 and opening_delimiter_end == i;
 
         if (c == '`') {
             if (codeSpanAt(text, i)) |span| {
@@ -163,13 +171,13 @@ fn tokenize(
                     link_admission_suppressed_until = @max(link_admission_suppressed_until, candidate_end);
                 }
             }
-            try tokens.append(alloc, .{ .byte = text[i + 1] });
+            try tokens.append(alloc, .{ .text = text[i + 1 .. i + 2] });
             i += 2;
             literal_start = i;
             continue;
         }
 
-        if (i >= link_admission_suppressed_until and c == '!' and i + 1 < text.len and text[i + 1] == '[') {
+        if (i >= link_admission_suppressed_until and c == '!' and i + 1 < last_close_bracket and text[i + 1] == '[') {
             if (parseInlineImage(text, i)) |image| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .link = .{ .link = image, .visible_prefix = "▧ " } });
@@ -182,7 +190,7 @@ fn tokenize(
             }
         }
 
-        if (c == '[') {
+        if (c == '[' and i < last_close_bracket) {
             if (footnotes) |sink| {
                 if (parseFootnoteReference(text, i)) |reference| {
                     try flushLiteral(alloc, text, tokens, literal_start, i);
@@ -195,7 +203,7 @@ fn tokenize(
             }
         }
 
-        if (i >= link_admission_suppressed_until and c == '[') {
+        if (i >= link_admission_suppressed_until and c == '[' and i < last_close_bracket) {
             if (parseInlineLink(text, i)) |link| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .link = .{ .link = link, .visible_prefix = null } });
@@ -223,7 +231,7 @@ fn tokenize(
         }
 
         if (i >= link_admission_suppressed_until) {
-            if (parseBareUrl(text, i)) |link| {
+            if (parseBareUrl(text, i, after_opening_delimiter)) |link| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .link = .{ .link = link, .visible_prefix = null } });
                 i = link.end;
@@ -238,6 +246,7 @@ fn tokenize(
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .delimiter = delimiter });
                 literal_start = run_end;
+                if (delimiter.can_open) opening_delimiter_end = run_end;
             }
             i = run_end;
             continue;
@@ -358,7 +367,6 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
                 if (opener.marker != closer.marker) continue;
                 if (opener.marker != '~' and violatesRuleOfThree(opener.*, closer.*)) continue;
 
-                matched_in_search = true;
                 const use_len: usize = if (opener.marker == '~' or (opener.remaining >= 2 and closer.remaining >= 2)) 2 else 1;
                 const style: Style = switch (opener.marker) {
                     '~' => .strike,
@@ -421,7 +429,6 @@ fn emitTokens(
     var depth: [3]usize = .{ 0, 0, 0 };
     for (tokens) |token| switch (token) {
         .text => |slice| try out.appendSlice(alloc, slice),
-        .byte => |b| try out.append(alloc, b),
         .entity => |entity| try out.appendSlice(alloc, entity.utf8[0..entity.len]),
         .code => |content| {
             try out.appendSlice(alloc, ansi.inline_code_open);
@@ -680,9 +687,12 @@ const DecodedEntity = struct {
     end: usize,
 };
 
-/// Decodes the HTML entities models commonly emit plus numeric references.
+/// Longest reference body accepted between `&` and `;`: the numeric form
+/// `#x10FFFF` is eight characters and every named entity in the table is
+/// shorter, so the terminator search never needs to look further.
 const max_entity_name_len = 8;
 
+/// Decodes the HTML entities models commonly emit plus numeric references.
 fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
     if (start >= text.len or text[start] != '&') return null;
     // Bound the terminator search so a line full of ampersands stays linear.
@@ -823,8 +833,8 @@ fn isValidAngleAutolinkEmailDomainLabel(label: []const u8) bool {
 /// punctuation, including `*`, `_`, and `~`, is left outside the link the
 /// way GFM autolinks do, so a delimiter that follows a URL can still close
 /// the span that contains it.
-fn parseBareUrl(text: []const u8, start: usize) ?InlineLink {
-    if (!isBareUrlBoundary(text, start)) return null;
+fn parseBareUrl(text: []const u8, start: usize, after_opening_delimiter: bool) ?InlineLink {
+    if (!isBareUrlBoundary(text, start, after_opening_delimiter)) return null;
     const scheme_len: usize = if (std.mem.startsWith(u8, text[start..], "https://"))
         "https://".len
     else if (std.mem.startsWith(u8, text[start..], "http://"))
@@ -871,15 +881,11 @@ fn isValidLinkUrlWithPrefix(prefix: []const u8, url: []const u8) bool {
     return isValidLinkUrl(url);
 }
 
-/// A bare URL may start at the line start, after a non word byte other than
-/// `<`, or directly after an underscore run that can open emphasis.
-fn isBareUrlBoundary(text: []const u8, start: usize) bool {
-    if (start == 0) return true;
+/// A bare URL may start at the line start, directly after a delimiter run
+/// that can open emphasis, or after a non word byte other than `<`.
+fn isBareUrlBoundary(text: []const u8, start: usize, after_opening_delimiter: bool) bool {
+    if (start == 0 or after_opening_delimiter) return true;
     const previous = text[start - 1];
-    if (previous == '_') {
-        return tu.isValidUnderscoreOpen(text, start - 1, 1) or
-            (start >= 2 and tu.isValidUnderscoreOpen(text, start - 2, 2));
-    }
     return !tu.isAsciiWordByte(previous) and previous != '<';
 }
 

@@ -75,29 +75,6 @@ pub fn withoutTerminalHardBreakMarker(line: []const u8, line_has_lf: bool) []con
     return line[0 .. line.len - 1];
 }
 
-fn isExactUnderscoreRun(text: []const u8, index: usize, marker_len: usize) bool {
-    if (marker_len != 1 and marker_len != 2) return false;
-    if (index + marker_len > text.len) return false;
-    if (index > 0 and text[index - 1] == '_') return false;
-    if (index + marker_len < text.len and text[index + marker_len] == '_') return false;
-    for (text[index .. index + marker_len]) |c| if (c != '_') return false;
-    return true;
-}
-
-pub fn isValidUnderscoreOpen(text: []const u8, index: usize, marker_len: usize) bool {
-    if (!isExactUnderscoreRun(text, index, marker_len)) return false;
-    const after = index + marker_len;
-    if (after >= text.len or isSpace(text[after])) return false;
-    return index == 0 or !isAsciiWordByte(text[index - 1]);
-}
-
-pub fn isValidUnderscoreClose(text: []const u8, index: usize, marker_len: usize) bool {
-    if (!isExactUnderscoreRun(text, index, marker_len)) return false;
-    if (index == 0 or isSpace(text[index - 1])) return false;
-    const after = index + marker_len;
-    return after >= text.len or !isAsciiWordByte(text[after]);
-}
-
 pub fn nthLine(buf: []const u8, n: usize) ?[]const u8 {
     var idx: usize = 0;
     var start: usize = 0;

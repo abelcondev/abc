@@ -1,20 +1,30 @@
-//! Unicode classification for CommonMark emphasis flanking.
+//! Unicode 17.0 emphasis flanking classes.
 //!
-//! CommonMark defines a punctuation character as any code point in the
-//! general categories P* or S*, and whitespace as Zs plus tab, line feed,
-//! form feed, and carriage return. The range tables below were generated
-//! from Unicode 13.0.0 general category data for code points at or above
-//! U+0080; ASCII is classified directly.
+//! Generated from:
+//! https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt
+//! SHA-256: 2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c
+//!
+//! Selected properties: general categories P* and S* (punctuation and
+//! symbols) and Zs (space separators), which CommonMark uses to decide
+//! whether a delimiter run is left or right flanking. Code points below
+//! U+0080 are classified directly. To regenerate, parse the general
+//! category field of UnicodeData.txt, expanding First/Last range pairs,
+//! and emit maximal runs of matching code points at or above U+0080.
+//!
+//! Unicode data is used under https://www.unicode.org/license.txt.
 
 const std = @import("std");
 
 const Range = struct { first: u21, last: u21 };
 
+/// CommonMark punctuation: any code point in general category P* or S*.
 pub fn isPunctuationOrSymbol(cp: u21) bool {
     if (cp < 0x80) return cp > 0x20 and cp < 0x7f and !std.ascii.isAlphanumeric(@intCast(cp));
     return containsCodepoint(&punctuation_ranges, cp);
 }
 
+/// CommonMark whitespace: general category Zs plus tab, line feed, form
+/// feed, and carriage return.
 pub fn isWhitespace(cp: u21) bool {
     if (cp < 0x80) return cp == ' ' or cp == '\t' or cp == '\n' or cp == 0x0c or cp == '\r';
     return containsCodepoint(&space_ranges, cp);
@@ -77,7 +87,7 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x05F3, .last = 0x05F4 },
     .{ .first = 0x0606, .last = 0x060F },
     .{ .first = 0x061B, .last = 0x061B },
-    .{ .first = 0x061E, .last = 0x061F },
+    .{ .first = 0x061D, .last = 0x061F },
     .{ .first = 0x066A, .last = 0x066D },
     .{ .first = 0x06D4, .last = 0x06D4 },
     .{ .first = 0x06DE, .last = 0x06DE },
@@ -88,6 +98,7 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x07FE, .last = 0x07FF },
     .{ .first = 0x0830, .last = 0x083E },
     .{ .first = 0x085E, .last = 0x085E },
+    .{ .first = 0x0888, .last = 0x0888 },
     .{ .first = 0x0964, .last = 0x0965 },
     .{ .first = 0x0970, .last = 0x0970 },
     .{ .first = 0x09F2, .last = 0x09F3 },
@@ -135,8 +146,9 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x1A1E, .last = 0x1A1F },
     .{ .first = 0x1AA0, .last = 0x1AA6 },
     .{ .first = 0x1AA8, .last = 0x1AAD },
+    .{ .first = 0x1B4E, .last = 0x1B4F },
     .{ .first = 0x1B5A, .last = 0x1B6A },
-    .{ .first = 0x1B74, .last = 0x1B7C },
+    .{ .first = 0x1B74, .last = 0x1B7F },
     .{ .first = 0x1BFC, .last = 0x1BFF },
     .{ .first = 0x1C3B, .last = 0x1C3F },
     .{ .first = 0x1C7E, .last = 0x1C7F },
@@ -152,7 +164,7 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x2030, .last = 0x205E },
     .{ .first = 0x207A, .last = 0x207E },
     .{ .first = 0x208A, .last = 0x208E },
-    .{ .first = 0x20A0, .last = 0x20BF },
+    .{ .first = 0x20A0, .last = 0x20C1 },
     .{ .first = 0x2100, .last = 0x2101 },
     .{ .first = 0x2103, .last = 0x2106 },
     .{ .first = 0x2108, .last = 0x2109 },
@@ -168,23 +180,22 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x214A, .last = 0x214D },
     .{ .first = 0x214F, .last = 0x214F },
     .{ .first = 0x218A, .last = 0x218B },
-    .{ .first = 0x2190, .last = 0x2426 },
+    .{ .first = 0x2190, .last = 0x2429 },
     .{ .first = 0x2440, .last = 0x244A },
     .{ .first = 0x249C, .last = 0x24E9 },
     .{ .first = 0x2500, .last = 0x2775 },
     .{ .first = 0x2794, .last = 0x2B73 },
-    .{ .first = 0x2B76, .last = 0x2B95 },
-    .{ .first = 0x2B97, .last = 0x2BFF },
+    .{ .first = 0x2B76, .last = 0x2BFF },
     .{ .first = 0x2CE5, .last = 0x2CEA },
     .{ .first = 0x2CF9, .last = 0x2CFC },
     .{ .first = 0x2CFE, .last = 0x2CFF },
     .{ .first = 0x2D70, .last = 0x2D70 },
     .{ .first = 0x2E00, .last = 0x2E2E },
-    .{ .first = 0x2E30, .last = 0x2E52 },
+    .{ .first = 0x2E30, .last = 0x2E5D },
     .{ .first = 0x2E80, .last = 0x2E99 },
     .{ .first = 0x2E9B, .last = 0x2EF3 },
     .{ .first = 0x2F00, .last = 0x2FD5 },
-    .{ .first = 0x2FF0, .last = 0x2FFB },
+    .{ .first = 0x2FF0, .last = 0x2FFF },
     .{ .first = 0x3001, .last = 0x3004 },
     .{ .first = 0x3008, .last = 0x3020 },
     .{ .first = 0x3030, .last = 0x3030 },
@@ -195,7 +206,8 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x30FB, .last = 0x30FB },
     .{ .first = 0x3190, .last = 0x3191 },
     .{ .first = 0x3196, .last = 0x319F },
-    .{ .first = 0x31C0, .last = 0x31E3 },
+    .{ .first = 0x31C0, .last = 0x31E5 },
+    .{ .first = 0x31EF, .last = 0x31EF },
     .{ .first = 0x3200, .last = 0x321E },
     .{ .first = 0x322A, .last = 0x3247 },
     .{ .first = 0x3250, .last = 0x3250 },
@@ -230,9 +242,11 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0xAB6A, .last = 0xAB6B },
     .{ .first = 0xABEB, .last = 0xABEB },
     .{ .first = 0xFB29, .last = 0xFB29 },
-    .{ .first = 0xFBB2, .last = 0xFBC1 },
-    .{ .first = 0xFD3E, .last = 0xFD3F },
-    .{ .first = 0xFDFC, .last = 0xFDFD },
+    .{ .first = 0xFBB2, .last = 0xFBD2 },
+    .{ .first = 0xFD3E, .last = 0xFD4F },
+    .{ .first = 0xFD90, .last = 0xFD91 },
+    .{ .first = 0xFDC8, .last = 0xFDCF },
+    .{ .first = 0xFDFC, .last = 0xFDFF },
     .{ .first = 0xFE10, .last = 0xFE19 },
     .{ .first = 0xFE30, .last = 0xFE52 },
     .{ .first = 0xFE54, .last = 0xFE66 },
@@ -264,8 +278,12 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x10AF0, .last = 0x10AF6 },
     .{ .first = 0x10B39, .last = 0x10B3F },
     .{ .first = 0x10B99, .last = 0x10B9C },
+    .{ .first = 0x10D6E, .last = 0x10D6E },
+    .{ .first = 0x10D8E, .last = 0x10D8F },
     .{ .first = 0x10EAD, .last = 0x10EAD },
+    .{ .first = 0x10ED0, .last = 0x10ED8 },
     .{ .first = 0x10F55, .last = 0x10F59 },
+    .{ .first = 0x10F86, .last = 0x10F89 },
     .{ .first = 0x11047, .last = 0x1104D },
     .{ .first = 0x110BB, .last = 0x110BC },
     .{ .first = 0x110BE, .last = 0x110C1 },
@@ -277,6 +295,8 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x111DD, .last = 0x111DF },
     .{ .first = 0x11238, .last = 0x1123D },
     .{ .first = 0x112A9, .last = 0x112A9 },
+    .{ .first = 0x113D4, .last = 0x113D5 },
+    .{ .first = 0x113D7, .last = 0x113D8 },
     .{ .first = 0x1144B, .last = 0x1144F },
     .{ .first = 0x1145A, .last = 0x1145B },
     .{ .first = 0x1145D, .last = 0x1145D },
@@ -284,6 +304,7 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x115C1, .last = 0x115D7 },
     .{ .first = 0x11641, .last = 0x11643 },
     .{ .first = 0x11660, .last = 0x1166C },
+    .{ .first = 0x116B9, .last = 0x116B9 },
     .{ .first = 0x1173C, .last = 0x1173F },
     .{ .first = 0x1183B, .last = 0x1183B },
     .{ .first = 0x11944, .last = 0x11946 },
@@ -291,27 +312,38 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x11A3F, .last = 0x11A46 },
     .{ .first = 0x11A9A, .last = 0x11A9C },
     .{ .first = 0x11A9E, .last = 0x11AA2 },
+    .{ .first = 0x11B00, .last = 0x11B09 },
+    .{ .first = 0x11BE1, .last = 0x11BE1 },
     .{ .first = 0x11C41, .last = 0x11C45 },
     .{ .first = 0x11C70, .last = 0x11C71 },
     .{ .first = 0x11EF7, .last = 0x11EF8 },
+    .{ .first = 0x11F43, .last = 0x11F4F },
     .{ .first = 0x11FD5, .last = 0x11FF1 },
     .{ .first = 0x11FFF, .last = 0x11FFF },
     .{ .first = 0x12470, .last = 0x12474 },
+    .{ .first = 0x12FF1, .last = 0x12FF2 },
     .{ .first = 0x16A6E, .last = 0x16A6F },
     .{ .first = 0x16AF5, .last = 0x16AF5 },
     .{ .first = 0x16B37, .last = 0x16B3F },
     .{ .first = 0x16B44, .last = 0x16B45 },
+    .{ .first = 0x16D6D, .last = 0x16D6F },
     .{ .first = 0x16E97, .last = 0x16E9A },
     .{ .first = 0x16FE2, .last = 0x16FE2 },
     .{ .first = 0x1BC9C, .last = 0x1BC9C },
     .{ .first = 0x1BC9F, .last = 0x1BC9F },
+    .{ .first = 0x1CC00, .last = 0x1CCEF },
+    .{ .first = 0x1CCFA, .last = 0x1CCFC },
+    .{ .first = 0x1CD00, .last = 0x1CEB3 },
+    .{ .first = 0x1CEBA, .last = 0x1CED0 },
+    .{ .first = 0x1CEE0, .last = 0x1CEF0 },
+    .{ .first = 0x1CF50, .last = 0x1CFC3 },
     .{ .first = 0x1D000, .last = 0x1D0F5 },
     .{ .first = 0x1D100, .last = 0x1D126 },
     .{ .first = 0x1D129, .last = 0x1D164 },
     .{ .first = 0x1D16A, .last = 0x1D16C },
     .{ .first = 0x1D183, .last = 0x1D184 },
     .{ .first = 0x1D18C, .last = 0x1D1A9 },
-    .{ .first = 0x1D1AE, .last = 0x1D1E8 },
+    .{ .first = 0x1D1AE, .last = 0x1D1EA },
     .{ .first = 0x1D200, .last = 0x1D241 },
     .{ .first = 0x1D245, .last = 0x1D245 },
     .{ .first = 0x1D300, .last = 0x1D356 },
@@ -332,6 +364,7 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x1DA85, .last = 0x1DA8B },
     .{ .first = 0x1E14F, .last = 0x1E14F },
     .{ .first = 0x1E2FF, .last = 0x1E2FF },
+    .{ .first = 0x1E5FF, .last = 0x1E5FF },
     .{ .first = 0x1E95E, .last = 0x1E95F },
     .{ .first = 0x1ECAC, .last = 0x1ECAC },
     .{ .first = 0x1ECB0, .last = 0x1ECB0 },
@@ -349,31 +382,32 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x1F240, .last = 0x1F248 },
     .{ .first = 0x1F250, .last = 0x1F251 },
     .{ .first = 0x1F260, .last = 0x1F265 },
-    .{ .first = 0x1F300, .last = 0x1F6D7 },
-    .{ .first = 0x1F6E0, .last = 0x1F6EC },
+    .{ .first = 0x1F300, .last = 0x1F6D8 },
+    .{ .first = 0x1F6DC, .last = 0x1F6EC },
     .{ .first = 0x1F6F0, .last = 0x1F6FC },
-    .{ .first = 0x1F700, .last = 0x1F773 },
-    .{ .first = 0x1F780, .last = 0x1F7D8 },
+    .{ .first = 0x1F700, .last = 0x1F7D9 },
     .{ .first = 0x1F7E0, .last = 0x1F7EB },
+    .{ .first = 0x1F7F0, .last = 0x1F7F0 },
     .{ .first = 0x1F800, .last = 0x1F80B },
     .{ .first = 0x1F810, .last = 0x1F847 },
     .{ .first = 0x1F850, .last = 0x1F859 },
     .{ .first = 0x1F860, .last = 0x1F887 },
     .{ .first = 0x1F890, .last = 0x1F8AD },
-    .{ .first = 0x1F8B0, .last = 0x1F8B1 },
-    .{ .first = 0x1F900, .last = 0x1F978 },
-    .{ .first = 0x1F97A, .last = 0x1F9CB },
-    .{ .first = 0x1F9CD, .last = 0x1FA53 },
+    .{ .first = 0x1F8B0, .last = 0x1F8BB },
+    .{ .first = 0x1F8C0, .last = 0x1F8C1 },
+    .{ .first = 0x1F8D0, .last = 0x1F8D8 },
+    .{ .first = 0x1F900, .last = 0x1FA57 },
     .{ .first = 0x1FA60, .last = 0x1FA6D },
-    .{ .first = 0x1FA70, .last = 0x1FA74 },
-    .{ .first = 0x1FA78, .last = 0x1FA7A },
-    .{ .first = 0x1FA80, .last = 0x1FA86 },
-    .{ .first = 0x1FA90, .last = 0x1FAA8 },
-    .{ .first = 0x1FAB0, .last = 0x1FAB6 },
-    .{ .first = 0x1FAC0, .last = 0x1FAC2 },
-    .{ .first = 0x1FAD0, .last = 0x1FAD6 },
+    .{ .first = 0x1FA70, .last = 0x1FA7C },
+    .{ .first = 0x1FA80, .last = 0x1FA8A },
+    .{ .first = 0x1FA8E, .last = 0x1FAC6 },
+    .{ .first = 0x1FAC8, .last = 0x1FAC8 },
+    .{ .first = 0x1FACD, .last = 0x1FADC },
+    .{ .first = 0x1FADF, .last = 0x1FAEA },
+    .{ .first = 0x1FAEF, .last = 0x1FAF8 },
     .{ .first = 0x1FB00, .last = 0x1FB92 },
-    .{ .first = 0x1FB94, .last = 0x1FBCA },
+    .{ .first = 0x1FB94, .last = 0x1FBEF },
+    .{ .first = 0x1FBFA, .last = 0x1FBFA },
 };
 
 test "flanking classes follow Unicode general categories" {
@@ -381,7 +415,8 @@ test "flanking classes follow Unicode general categories" {
     try std.testing.expect(isPunctuationOrSymbol(0x201C)); // left double quote, Pi
     try std.testing.expect(isPunctuationOrSymbol(0x00D7)); // multiplication sign, Sm
     try std.testing.expect(isPunctuationOrSymbol(0xFF0C)); // fullwidth comma, Po
-    try std.testing.expect(isPunctuationOrSymbol(0x1F600)); // emoji, So
+    try std.testing.expect(isPunctuationOrSymbol(0x1F600)); // grinning face, So
+    try std.testing.expect(isPunctuationOrSymbol(0x1F979)); // face holding back tears, So, Unicode 14
     try std.testing.expect(!isPunctuationOrSymbol(0x00B5)); // micro sign, Ll
     try std.testing.expect(!isPunctuationOrSymbol(0x00AA)); // feminine ordinal, Lo
     try std.testing.expect(!isPunctuationOrSymbol(0x3031)); // vertical kana repeat mark, Lm

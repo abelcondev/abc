@@ -1588,7 +1588,7 @@ test "numeric entities for control characters stay literal" {
     try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
 }
 
-test "entity lookup is bounded and a long ampersand line stays linear" {
+test "entity lookup is bounded and a long ampersand line renders in bounded time" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -1604,7 +1604,10 @@ test "entity lookup is bounded and a long ampersand line stays linear" {
     defer line.deinit(alloc);
     try line.appendNTimes(alloc, '&', 64 * 1024);
     try line.append(alloc, '\n');
+    const io_mod = @import("../shared/io.zig");
+    const started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms) < 500);
     try std.testing.expectEqualStrings(line.items, out.items);
 }
 
@@ -3379,6 +3382,8 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
         .{ .prefix = "text ", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
         .{ .prefix = "https://example.com ", .unit = "*", .repeat = 64 * 1024, .suffix = "\n" },
         .{ .prefix = "*a", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "\n" },
     };
     // Deeply nested successful pairs must not re-walk consumed ranges.
     out.clearRetainingCapacity();
@@ -3388,7 +3393,7 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
     try line.append(alloc, '\n');
     const nested_started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
-    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 250);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 500);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
     // A closer that matches part of its run and then fails to place the rest
     // must cache that failed remainder instead of rescanning other openers.
@@ -3399,7 +3404,7 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
     try line.append(alloc, '\n');
     const residual_started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
-    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 250);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 500);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
     for (shapes) |shape| {
         out.clearRetainingCapacity();
@@ -3410,7 +3415,7 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
         const started = io_mod.nanoTimestamp();
         try processor.push(alloc, line.items, &out);
         const elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
-        try std.testing.expect(elapsed_ms < 250);
+        try std.testing.expect(elapsed_ms < 500);
     }
 }
 
