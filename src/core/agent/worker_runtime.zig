@@ -1205,6 +1205,51 @@ pub const WorkerRuntime = struct {
         return true;
     }
 
+    /// Removes the newest queued text-only steering prompt that still waits for
+    /// a tool boundary and returns an allocator-owned copy of its text so the
+    /// composer can restore it for editing. Returns null when nothing is safely
+    /// retractable: no active turn, no tool boundary (an immediate steer is
+    /// already committed to its interrupt), a cancel already in flight, or only
+    /// handoff-class steers with images or skill bindings.
+    pub fn popQueuedSteerForEdit(self: *WorkerRuntime, alloc: std.mem.Allocator) !?[]u8 {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or self.active_turn_id == 0) return null;
+        if (!self.hasActiveToolBoundaryLocked()) return null;
+        if (self.worker_cancel_requested.load(.seq_cst)) return null;
+
+        var retractable: ?usize = null;
+        var index: usize = self.queued_prompts.items.len;
+        while (index > 0) {
+            index -= 1;
+            const prompt = self.queued_prompts.items[index];
+            if (prompt.delivery.activeTurnId() != self.active_turn_id) continue;
+            if (!sameTurnSteeringEligible(prompt)) continue;
+            retractable = index;
+            break;
+        }
+        const remove_index = retractable orelse return null;
+
+        const text = try alloc.dupe(u8, self.queued_prompts.items[remove_index].prompt);
+        const prompt = self.queued_prompts.orderedRemove(remove_index);
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        const turn_id = prompt.turn_id;
+        const remaining = self.queuedWorkCountLocked();
+        freeQueuedPrompt(alloc, prompt);
+        debug_trace.eventf(
+            "worker",
+            "prompt_steering_retracted",
+            .{ .turn_id = turn_id },
+            "remaining={d}",
+            .{remaining},
+        );
+        self.worker_cond.broadcast(io_mod.getIo());
+        return text;
+    }
+
     pub fn waitAndTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -4555,6 +4600,138 @@ test "rich interactive input remains steering and hands off at the tool boundary
     try std.testing.expect(!runtime.isCancelRequested());
     const boundary = try runtime.takeSteeringBoundary(alloc, 41, .model);
     try std.testing.expect(boundary == .handoff);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "queued steer waiting at a tool boundary pops back for editing" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_running" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+    } } });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first steer", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second steer", "model"));
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    const second = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("second steer", second);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.messages.len);
+    try std.testing.expectEqualStrings("first steer", snapshot.messages[0]);
+    try std.testing.expect(snapshot.waits_for_tool);
+
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .model),
+    );
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("first steer", guidance[0]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
+}
+
+test "immediate steer already committed to an interrupt is not retractable" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+
+    try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
+    );
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+}
+
+test "steer retraction skips handoff prompts and takes the newest text steer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_running" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+    } } });
+
+    var rich = try makePrompt(alloc, "inspect this image", "model");
+    rich.images = try alloc.alloc(types.ImageAttachment, 1);
+    rich.images[0] = .{
+        .path = try alloc.dupe(u8, "/tmp/steering.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    try runtime.admitInteractivePrompt(alloc, rich);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "plain text", "model"));
+
+    const text = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("plain text", text);
+
+    try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    const boundary = try runtime.takeSteeringBoundary(alloc, 41, .model);
+    try std.testing.expect(boundary == .handoff);
+}
+
+test "steer retraction requires an active processing turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
+    try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "failed steer retraction preserves the queue" {
+    const backing = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(backing);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(backing, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_running" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+    } } });
+    try runtime.admitInteractivePrompt(backing, try makePrompt(backing, "steer", "model"));
+
+    var failing = std.testing.FailingAllocator.init(
+        backing,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.popQueuedSteerForEdit(failing.allocator()),
+    );
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
