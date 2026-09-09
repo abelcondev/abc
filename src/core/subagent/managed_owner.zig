@@ -282,8 +282,10 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
     const outcome = runOne(slot);
-    const published = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
+    // Startup must not inspect the old slot between saved and in-memory completion.
+    // Take owner before registry, matching cancellation and approval lock ordering.
     owner.mutex.lockUncancelable(io_mod.getIo());
+    const published = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
     slot.completion = if (published) .published else .unpublished;
     slot.done.set(io_mod.getIo());
     owner.mutex.unlock(io_mod.getIo());
@@ -535,6 +537,122 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
         "managed child state update failed child_id={s} stage={s} err={s}",
         .{ child_id, stage, @errorName(err) },
     );
+}
+
+test "subagent completion takes the owner lock before the registry lock" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        owner: *Owner = undefined,
+        outcome: child_state.Outcome,
+        fail_save: bool,
+        finishing: bool = false,
+        checked: bool = false,
+        owner_was_unlocked: bool = false,
+
+        fn capture(_: ?*anyopaque, allocator: Allocator, request: execution.CaptureRequest) execution.ServiceError!domain.AdmissionSnapshot {
+            return domain.captureAdmission(allocator, .{
+                .parent_id = request.parent_id,
+                .source_id = request.source_id,
+                .model = request.preferences.model,
+                .effort = request.preferences.effort,
+            }) catch return error.AdmissionFailed;
+        }
+
+        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.finishing = true;
+            return if (self.outcome == .cancelled) error.Cancelled else .completed;
+        }
+
+        fn tryLock(raw: ?*anyopaque, file: std.Io.File) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.finishing) {
+                self.checked = true;
+                if (self.owner.mutex.tryLock()) {
+                    self.owner_was_unlocked = true;
+                    self.owner.mutex.unlock(io_mod.getIo());
+                }
+            }
+            return file.tryLock(io_mod.getIo(), .exclusive);
+        }
+
+        fn syncFile(raw: ?*anyopaque, file: std.Io.File) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.finishing and self.fail_save) return error.InputOutput;
+            try file.sync(io_mod.getIo());
+        }
+    };
+    for ([_]struct { outcome: child_state.Outcome, fail_save: bool }{
+        .{ .outcome = .completed, .fail_save = false },
+        .{ .outcome = .cancelled, .fail_save = false },
+        .{ .outcome = .completed, .fail_save = true },
+    }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var sessions = try session_store.Store.initFromHome(alloc, root, root);
+        defer sessions.deinit(alloc);
+        for ([_][]const u8{ "completion-parent", "completion-child" }) |id| {
+            var writable = try sessions.startWritableSession(alloc, .{
+                .id = @constCast(id),
+                .origin_workspace_root = @constCast(root),
+                .workspace_root = @constCast(root),
+                .created_at_ms = 1,
+                .updated_at_ms = 1,
+                .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+            });
+            writable.deinit(alloc);
+        }
+        var approvals = approval_registry.Registry{ .alloc = alloc };
+        defer approvals.deinit();
+        var harness = Harness{ .outcome = case.outcome, .fail_save = case.fail_save };
+        var owner = Owner{
+            .alloc = alloc,
+            .sessions = &sessions,
+            .state_store = .{ .sessions = &sessions, .parent_id = "completion-parent" },
+            .services = .{ .context = &harness, .capture_fn = Harness.capture, .run_fn = Harness.run },
+            .authority_resolver = undefined,
+            .approvals = &approvals,
+        };
+        defer owner.deinit();
+        harness.owner = &owner;
+        {
+            var registry = try child_state.Registry.init(alloc, "completion-parent");
+            defer registry.deinit(alloc);
+            try registry.appendPersistent(alloc, "completion-child", "reviewer", "", .{
+                .id = @constCast("completion-work"),
+                .message = @constCast("reply"),
+                .created_at_ms = 1,
+            });
+            try owner.state_store.save(alloc, registry);
+        }
+        owner.state_store.options = .{
+            .replace_ops = .{ .ctx = &harness, .sync_file = Harness.syncFile },
+            .lock_ops = .{ .ctx = &harness, .try_lock = Harness.tryLock },
+        };
+        var slot = Slot{ .owner = &owner, .child_id = @constCast("completion-child") };
+        slotMain(&slot);
+        harness.finishing = false;
+        try std.testing.expectEqual(true, harness.checked);
+        try std.testing.expectEqual(false, harness.owner_was_unlocked);
+        try std.testing.expect(slot.done.isSet());
+        try std.testing.expect(slot.worker == null);
+        const expected: @TypeOf(slot.completion) = if (case.fail_save) .unpublished else .published;
+        try std.testing.expectEqual(expected, slot.completion);
+        try std.testing.expect(owner.mutex.tryLock());
+        owner.mutex.unlock(io_mod.getIo());
+        var lock = try owner.state_store.acquireLock(alloc);
+        defer lock.release();
+        var saved = try owner.state_store.load(alloc);
+        defer saved.deinit(alloc);
+        try std.testing.expectEqual(if (case.fail_save) child_state.Phase.running else .idle, saved.children[0].phase);
+        try std.testing.expectEqual(if (case.fail_save) null else case.outcome, saved.children[0].last_outcome);
+    }
 }
 
 test "managed owner cancellation join wakes pending permission" {
