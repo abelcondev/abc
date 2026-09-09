@@ -3384,6 +3384,9 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
         .{ .prefix = "*a", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
         .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "\n" },
         .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "[^", .repeat = 32 * 1024, .suffix = "]\n" },
     };
     // Deeply nested successful pairs must not re-walk consumed ranges.
     out.clearRetainingCapacity();

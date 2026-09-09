@@ -2,7 +2,7 @@
 //!
 //! Generated from:
 //! https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt
-//! SHA-256: 2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c
+//! Source SHA-256: 2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c
 //!
 //! Selected properties: general categories P* and S* (punctuation and
 //! symbols) and Zs (space separators), which CommonMark uses to decide

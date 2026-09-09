@@ -113,10 +113,13 @@ fn tokenize(
     var i: usize = 0;
     var literal_start: usize = 0;
     var link_admission_suppressed_until: usize = 0;
-    // No footnote, link, or image can start after the last `]`, so bracket
-    // candidates past it are never scanned; without this every `[` on a line
-    // with no `]` would rescan to the end of the line.
-    const last_close_bracket = std.mem.lastIndexOfScalar(u8, text, ']') orelse 0;
+    // Every bracket construct starting at `i` ends at the first `]` at or
+    // after `i`, so that position is found once and shared: a `[` whose `]`
+    // is not followed by `(` cannot be a link or image, and a footnote label
+    // ends there too. Without this every `[` in a long run rescans to the
+    // same `]`.
+    const last_close_bracket = std.mem.lastIndexOfScalar(u8, text, ']');
+    var next_close_bracket: ?usize = null;
     // End of the most recent delimiter run that can open emphasis. A bare URL
     // may follow such a run directly, and the tokenizer owns that decision
     // rather than a second flanking rule inside the URL parser.
@@ -125,6 +128,11 @@ fn tokenize(
     while (i < text.len) {
         const c = text[i];
         const after_opening_delimiter = i > 0 and opening_delimiter_end == i;
+        if (last_close_bracket != null and i <= last_close_bracket.? and (next_close_bracket == null or next_close_bracket.? < i)) {
+            next_close_bracket = std.mem.indexOfScalarPos(u8, text, i, ']');
+        }
+        const bracket_link_possible = next_close_bracket != null and next_close_bracket.? >= i and
+            next_close_bracket.? + 1 < text.len and text[next_close_bracket.? + 1] == '(';
 
         if (c == '`') {
             if (codeSpanAt(text, i)) |span| {
@@ -157,7 +165,7 @@ fn tokenize(
                     angleAutolinkCandidateEnd(text, i + 1),
                 );
             }
-            if (text[i + 1] == '!' and i + 2 < text.len and text[i + 2] == '[') {
+            if (bracket_link_possible and text[i + 1] == '!' and i + 2 < text.len and text[i + 2] == '[') {
                 if (malformedInlineLinkCandidateEnd(text, i + 2)) |candidate_end| {
                     try tokens.append(alloc, .{ .text = text[i + 1 .. candidate_end] });
                     link_admission_suppressed_until = @max(link_admission_suppressed_until, candidate_end);
@@ -166,7 +174,7 @@ fn tokenize(
                     continue;
                 }
             }
-            if (text[i + 1] == '[') {
+            if (bracket_link_possible and text[i + 1] == '[') {
                 if (malformedInlineLinkCandidateEnd(text, i + 1)) |candidate_end| {
                     link_admission_suppressed_until = @max(link_admission_suppressed_until, candidate_end);
                 }
@@ -177,7 +185,7 @@ fn tokenize(
             continue;
         }
 
-        if (i >= link_admission_suppressed_until and c == '!' and i + 1 < last_close_bracket and text[i + 1] == '[') {
+        if (bracket_link_possible and i >= link_admission_suppressed_until and c == '!' and i + 1 < text.len and text[i + 1] == '[') {
             if (parseInlineImage(text, i)) |image| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .link = .{ .link = image, .visible_prefix = "▧ " } });
@@ -190,9 +198,9 @@ fn tokenize(
             }
         }
 
-        if (c == '[' and i < last_close_bracket) {
+        if (c == '[' and next_close_bracket != null) {
             if (footnotes) |sink| {
-                if (parseFootnoteReference(text, i)) |reference| {
+                if (parseFootnoteReference(text, i, next_close_bracket.?)) |reference| {
                     try flushLiteral(alloc, text, tokens, literal_start, i);
                     const number = try sink.register(sink.ctx, alloc, reference.label);
                     try tokens.append(alloc, .{ .footnote = number });
@@ -203,7 +211,7 @@ fn tokenize(
             }
         }
 
-        if (i >= link_admission_suppressed_until and c == '[' and i < last_close_bracket) {
+        if (bracket_link_possible and i >= link_admission_suppressed_until and c == '[') {
             if (parseInlineLink(text, i)) |link| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
                 try tokens.append(alloc, .{ .link = .{ .link = link, .visible_prefix = null } });
@@ -482,10 +490,10 @@ const ParsedFootnoteReference = struct {
     end: usize,
 };
 
-fn parseFootnoteReference(text: []const u8, start: usize) ?ParsedFootnoteReference {
+/// `close` is the first `]` at or after `start`, found by the tokenizer.
+fn parseFootnoteReference(text: []const u8, start: usize, close: usize) ?ParsedFootnoteReference {
     if (start + 4 > text.len or text[start] != '[' or text[start + 1] != '^') return null;
-    const close = std.mem.indexOfScalarPos(u8, text, start + 2, ']') orelse return null;
-    if (close == start + 2) return null;
+    if (close <= start + 2 or close >= text.len or text[close] != ']') return null;
     if (close + 1 < text.len and text[close + 1] == ':') return null;
     return .{ .label = text[start + 2 .. close], .end = close + 1 };
 }
