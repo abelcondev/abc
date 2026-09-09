@@ -210,30 +210,40 @@ pub const Owner = struct {
 
     fn finish(
         self: *Owner,
-        child_id: []const u8,
+        slot: *Slot,
         work_id: []const u8,
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
-    ) bool {
-        var lock = self.state_store.acquireLock(self.alloc) catch |err| {
-            debugFailure(child_id, "state_lock", err);
-            return false;
+    ) void {
+        var lock: ?io_mod.TimedAdvisoryLock = null;
+        defer if (lock) |*held| held.release();
+        var published = false;
+        defer {
+            // Admission must not see idle while this child's old slot is running.
+            // Lock order is registry then owner; joins stay outside both locks.
+            self.mutex.lockUncancelable(io_mod.getIo());
+            slot.completion = if (published) .published else .unpublished;
+            slot.done.set(io_mod.getIo());
+            self.mutex.unlock(io_mod.getIo());
+        }
+        lock = self.state_store.acquireLock(self.alloc) catch |err| {
+            debugFailure(slot.child_id, "state_lock", err);
+            return;
         };
-        defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
-            debugFailure(child_id, "state_load", err);
-            return false;
+            debugFailure(slot.child_id, "state_load", err);
+            return;
         };
         defer registry.deinit(self.alloc);
-        registry.finish(self.alloc, child_id, work_id, outcome, failure) catch |err| {
-            debugFailure(child_id, "state_finish", err);
-            return false;
+        registry.finish(self.alloc, slot.child_id, work_id, outcome, failure) catch |err| {
+            debugFailure(slot.child_id, "state_finish", err);
+            return;
         };
         self.state_store.save(self.alloc, registry) catch |err| {
-            debugFailure(child_id, "state_save", err);
-            return false;
+            debugFailure(slot.child_id, "state_save", err);
+            return;
         };
-        return true;
+        published = true;
     }
 };
 
@@ -247,11 +257,7 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
     const outcome = runOne(slot);
-    const published = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
-    owner.mutex.lockUncancelable(io_mod.getIo());
-    slot.completion = if (published) .published else .unpublished;
-    slot.done.set(io_mod.getIo());
-    owner.mutex.unlock(io_mod.getIo());
+    owner.finish(slot, outcome.work_id, outcome.outcome, outcome.failure);
     outcome.deinit(owner.alloc);
 }
 
@@ -499,6 +505,121 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
         "managed child state update failed child_id={s} stage={s} err={s}",
         .{ child_id, stage, @errorName(err) },
     );
+}
+
+test "subagent completion holds admission until its slot is published" {
+    const alloc = std.testing.allocator;
+    const Sync = struct {
+        attempted: std.Io.Event = .unset,
+        fail: bool,
+
+        fn file(raw: ?*anyopaque, value: std.Io.File) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            defer self.attempted.set(io_mod.getIo());
+            if (self.fail) return error.InputOutput;
+            try value.sync(io_mod.getIo());
+        }
+    };
+    for ([_]struct { outcome: child_state.Outcome, fail: bool }{
+        .{ .outcome = .completed, .fail = false },
+        .{ .outcome = .cancelled, .fail = false },
+        .{ .outcome = .failed, .fail = true },
+    }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var sessions = try session_store.Store.initFromHome(alloc, root, root);
+        defer sessions.deinit(alloc);
+        {
+            var parent = try sessions.startWritableSession(alloc, .{
+                .id = @constCast("completion-parent"),
+                .origin_workspace_root = @constCast(root),
+                .workspace_root = @constCast(root),
+                .created_at_ms = 1,
+                .updated_at_ms = 1,
+                .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+            });
+            parent.deinit(alloc);
+        }
+        var approvals = approval_registry.Registry{ .alloc = alloc };
+        defer approvals.deinit();
+        var owner = Owner{
+            .alloc = alloc,
+            .sessions = &sessions,
+            .state_store = .{ .sessions = &sessions, .parent_id = "completion-parent" },
+            .services = undefined,
+            .authority_resolver = undefined,
+            .approvals = &approvals,
+        };
+        defer owner.deinit();
+        {
+            var registry = try child_state.Registry.init(alloc, "completion-parent");
+            defer registry.deinit(alloc);
+            try registry.appendPersistent(alloc, "completion-child", "reviewer", "", .{
+                .id = @constCast("completion-work"),
+                .message = @constCast("reply"),
+                .created_at_ms = 1,
+            });
+            try owner.state_store.save(alloc, registry);
+        }
+        // Keep an unlocked handle to the real admission lock for the probe.
+        const probe = try owner.state_store.acquireLock(alloc);
+        probe.file.unlock(io_mod.getIo());
+        defer probe.file.close(io_mod.getIo());
+        var sync = Sync{ .fail = case.fail };
+        owner.state_store.options.replace_ops = .{ .ctx = &sync, .sync_file = Sync.file };
+        var slot = Slot{ .owner = &owner, .child_id = @constCast("completion-child") };
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        var owner_locked = true;
+        defer if (owner_locked) owner.mutex.unlock(io_mod.getIo());
+        const thread = try std.Thread.spawn(.{}, Owner.finish, .{
+            &owner, &slot, "completion-work", case.outcome, null,
+        });
+        defer thread.join();
+        // This later defer also makes assertion failures release the blocked thread.
+        defer if (owner_locked) {
+            owner.mutex.unlock(io_mod.getIo());
+            owner_locked = false;
+        };
+        try sync.attempted.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } });
+        if (!case.fail) {
+            const deadline = io_mod.milliTimestamp() + 5000;
+            while (true) {
+                var saved = try owner.state_store.load(alloc);
+                const idle = saved.children[0].phase == .idle;
+                saved.deinit(alloc);
+                if (idle) break;
+                if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+        }
+        const admitted = try probe.file.tryLock(io_mod.getIo(), .exclusive);
+        if (admitted) probe.file.unlock(io_mod.getIo());
+        try std.testing.expect(!admitted);
+        try std.testing.expect(!slot.done.isSet());
+        owner.mutex.unlock(io_mod.getIo());
+        owner_locked = false;
+        try slot.done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } });
+        var lock = try owner.state_store.acquireLock(alloc);
+        defer lock.release();
+        var saved = try owner.state_store.load(alloc);
+        defer saved.deinit(alloc);
+        const expected: @TypeOf(slot.completion) = if (case.fail) .unpublished else .published;
+        try std.testing.expectEqual(expected, slot.completion);
+        try std.testing.expectEqual(if (case.fail) child_state.Phase.running else .idle, saved.children[0].phase);
+        try std.testing.expectEqual(if (case.fail) null else case.outcome, saved.children[0].last_outcome);
+    }
 }
 
 test "subagent failure to publish completion returns state unavailable instead of waiting" {

@@ -5157,6 +5157,112 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "persistent subagent accepts the next message after cancellation",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-completion-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const marker = "CHILD_MEMORY_" + crypto.randomUUID();
+      const hold: HoldState = { started: false, cancelled: false };
+      const childRequests = new Map<string, number>();
+      const replies = new Map<string, { ok: boolean; result: string }>();
+      const response = heldGatewayResponse(hold, [], []);
+      const childGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+        };
+        const user = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        const stage = user.match(/HANDOFF_(SEED|CANCEL|NEXT|AGAIN)/)?.[1];
+        if (!stage) throw new Error("missing handoff request stage");
+        if (user.startsWith("CHILD_HANDOFF_")) {
+          childRequests.set(stage, (childRequests.get(stage) ?? 0) + 1);
+          if (stage === "CANCEL") return response;
+          if (stage !== "SEED") expect(body).toContain(marker);
+          return fakeGatewayFinalText(marker + "_" + stage);
+        }
+        const id = "handoff_" + stage.toLowerCase();
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        );
+        const result = parts.findLast((part) =>
+          part.type === "tool-result" && part.toolCallId === id,
+        );
+        if (result) {
+          replies.set(stage, JSON.parse(result.output.value));
+          return fakeGatewayFinalText("PARENT_HANDOFF_" + stage + "_DONE");
+        }
+        return fakeGatewayToolCall(id, "subagent", {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            message: "CHILD_HANDOFF_" + stage + (stage === "SEED" ? " Remember " + marker : " Continue."),
+          },
+        });
+      }, { classifierDecision: "clear" });
+      gateway = childGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-child-completion-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: childGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, stderrPath, width: 110, height: 35 });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("PARENT_HANDOFF_SEED");
+        await session.waitForText("PARENT_HANDOFF_SEED_DONE", TIMEOUT);
+        expect(replies.get("SEED")).toMatchObject({ ok: true, result: marker + "_SEED" });
+        const sessionsPath = join(home, ".fx", "sessions");
+        const parentId = readdirSync(sessionsPath).find((id) =>
+          existsSync(join(sessionsPath, id, "subagent", "children.json")),
+        );
+        expect(parentId).toBeDefined();
+        const registryPath = join(sessionsPath, parentId!, "subagent", "children.json");
+        const registry = () => JSON.parse(readFileSync(registryPath, "utf8"));
+        const childId = registry().children[0].id;
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("PARENT_HANDOFF_CANCEL");
+        await waitForCondition(() => childRequests.get("CANCEL") === 1, "child request held");
+        await session.waitForText("reviewer working", TIMEOUT);
+        await session.sendKeys("C-c");
+        await waitForCondition(() => registry().children[0].phase === "idle", "child cancellation saved");
+        expect(registry().children[0].last_outcome).toBe("cancelled");
+        for (const stage of ["NEXT", "AGAIN"]) {
+          await session.waitForStableComposer(TIMEOUT);
+          await session.sendText("PARENT_HANDOFF_" + stage);
+          await session.waitForText("PARENT_HANDOFF_" + stage + "_DONE", TIMEOUT);
+          expect(replies.get(stage)).toMatchObject({ ok: true, result: marker + "_" + stage });
+          expect(childRequests.get(stage)).toBe(1);
+          const state = registry();
+          expect(state.children).toHaveLength(1);
+          expect(state.children[0]).toMatchObject({ id: childId, phase: "idle", active: null, last_outcome: "completed" });
+        }
+        expect(registry().children[0].work_generation).toBe(4);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback).toContain("reviewer replied");
+        expect(scrollback).not.toContain("child_busy");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        hold.release?.();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "subagent rows show task previews and named replies through resume",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-rows-")));
