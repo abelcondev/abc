@@ -2092,7 +2092,7 @@ tmuxTest(
         pane.includes("TEST-CODE") &&
         pane.includes("/verify") &&
         pane.includes("Waiting for authorization") &&
-        pane.includes("Enter reopens browser · Esc cancels"),
+        pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
     expect(signInScreen).not.toContain("Starting Vercel sign-in");
@@ -2138,12 +2138,12 @@ tmuxTest(
         pane.includes("Sign in with Codex") &&
         pane.includes("Authorize with Codex") &&
         pane.includes("Waiting for authorization") &&
-        pane.includes("Enter reopens browser · Esc cancels"),
+        pane.includes("enter reopens browser · esc cancels"),
       TIMEOUT,
     );
     expect(signInScreen).toMatch(/^Sign in with Codex\s+Waiting for authorization…$/m);
     expect(signInScreen).toMatch(/^  Open\s+Authorize with Codex$/m);
-    expect(signInScreen).toMatch(/^Enter reopens browser · Esc cancels$/m);
+    expect(signInScreen).toMatch(/^enter reopens browser · esc cancels$/m);
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
@@ -2262,7 +2262,7 @@ for (const [provider, previousProvider] of [
           expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
           expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(preferences);
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+          await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
           await session.sendKeys("C-u");
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Continue the restored provider session.");
@@ -2442,7 +2442,7 @@ tmuxTest(
       expect(codexCatalog).not.toContain(vendor);
     }
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/oauth/authorize",
@@ -2628,7 +2628,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("Codex subscription sign-in expired.") &&
-        pane.includes("Press Enter to sign in again."),
+        pane.includes("press enter to sign in again."),
       TIMEOUT,
     );
 
@@ -2672,7 +2672,7 @@ tmuxTest(
       await session.waitForPane(
         (pane) =>
           pane.includes("Grok subscription sign-in expired.") &&
-          pane.includes("Press Enter to sign in again."),
+          pane.includes("press enter to sign in again."),
         TIMEOUT,
       );
 
@@ -2822,7 +2822,7 @@ tmuxTest(
     await session.sendKeys("Down");
     await session.sendKeys("Right");
     const keyField = await session.waitForText("Paste or type a key", TIMEOUT);
-    expect(keyField).toContain("Enter saves");
+    expect(keyField).toContain("enter saves");
     await session.sendKeys("Escape");
     await session.waitForComposer(TIMEOUT);
 
@@ -4339,8 +4339,8 @@ tmuxTest(
       const collapsed = await session.waitForPane(
         (pane) =>
           pane.includes("Authorize with Grok") &&
-          pane.includes("Browser didn't return? Press Tab to enter a code") &&
-          pane.includes("Enter reopens browser · Tab enters code · Esc cancels"),
+          pane.includes("Browser didn't return? press tab to enter a code") &&
+          pane.includes("enter reopens browser · tab enters code · esc cancels"),
         TIMEOUT,
       );
       expect(collapsed).toMatch(/^Sign in with Grok\s+Waiting for authorization…$/m);
@@ -4418,10 +4418,10 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText("Browser didn't return? Press Tab to enter a code", TIMEOUT);
+      await session.waitForText("Browser didn't return? press tab to enter a code", TIMEOUT);
       await session.pasteText("grok-code");
       await session.waitForPane(
-        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
+        (pane) => pane.includes("•••••••••") && pane.includes("enter submits"),
         TIMEOUT,
       );
       const expanded = await session.capturePane();
@@ -4430,17 +4430,17 @@ tmuxTest(
       const compactEntry = await session.waitForPane(
         (pane) =>
           pane.includes("•••••••••") &&
-          pane.includes("Enter submits") &&
-          pane.includes("Esc cancels"),
+          pane.includes("enter submits") &&
+          pane.includes("esc cancels"),
         TIMEOUT,
       );
       expect(compactEntry).not.toContain("Paste the code shown by xAI");
       await session.sendKeys("Tab");
-      const collapsedWithDraft = await session.waitForText("Tab enters code", TIMEOUT);
+      const collapsedWithDraft = await session.waitForText("tab enters code", TIMEOUT);
       expect(collapsedWithDraft).not.toContain("•••••••••");
       await session.sendKeys("Tab");
       await session.waitForPane(
-        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
+        (pane) => pane.includes("•••••••••") && pane.includes("enter submits"),
         TIMEOUT,
       );
       await session.sendKeys("Enter");
@@ -6391,7 +6391,7 @@ tmuxTest(
         pane.includes("Welcome to fx") &&
         pane.includes("Sign in with Vercel") &&
         pane.includes("Add an API key") &&
-        pane.includes("Esc to set up later"),
+        pane.includes("esc to set up later"),
       TIMEOUT,
     );
     expect(onboarding).not.toMatch(/^\s+fx login\s+/m);
@@ -6599,7 +6599,7 @@ tmuxTest(
     const failed = await session.waitForPane(
       (pane) =>
         pane.includes("fx login sign-in expired.") &&
-        pane.includes("Press Enter to sign in again.") &&
+        pane.includes("press enter to sign in again.") &&
         !pane.includes("Setup"),
       TIMEOUT,
     );
@@ -7015,7 +7015,7 @@ tmuxTest(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
         pane.includes("Vercel sign-in must refresh before team-private models can load.") &&
-        pane.includes("Esc Close"),
+        pane.includes("esc close"),
       TIMEOUT,
     );
 
@@ -7087,7 +7087,7 @@ tmuxTest(
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Models ") && !pane.includes("Esc Close"),
+      (pane) => !pane.includes("Models ") && !pane.includes("esc close"),
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
@@ -7097,7 +7097,7 @@ tmuxTest(
       (pane) =>
         pane.includes(blockedPrompt) &&
         pane.includes("fx login sign-in expired.") &&
-        pane.includes("Press Enter to sign in again.") &&
+        pane.includes("press enter to sign in again.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
@@ -7165,7 +7165,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login sign-in expired.") &&
-        pane.includes("Press Enter to sign in again.") &&
+        pane.includes("press enter to sign in again.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
@@ -7183,12 +7183,12 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("Vercel sign-in refresh failed; using the public model catalog.") &&
-        pane.includes("Esc Close"),
+        pane.includes("esc close"),
       TIMEOUT,
     );
     expect(gateway.modelRequests).toHaveLength(1);
     await session.sendKeys("Escape");
-    await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
@@ -7317,7 +7317,7 @@ tmuxTest(
     const failed = await session.waitForPane(
       (pane) =>
         pane.includes("fx login sign-in expired.") &&
-        pane.includes("Press Enter to sign in again.") &&
+        pane.includes("press enter to sign in again.") &&
         pane.includes("/credits"),
       TIMEOUT,
     );

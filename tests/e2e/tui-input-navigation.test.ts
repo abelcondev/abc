@@ -325,7 +325,7 @@ tmuxTest(
     await active.waitForText("Commands 35", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+      (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
       READY_TIMEOUT,
     );
     expect(active.isAlive()).toBe(true);
@@ -355,7 +355,7 @@ tmuxTest(
 
     await active.sendKeys("Escape");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+      (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
       READY_TIMEOUT,
     );
     expect(active.isAlive()).toBe(true);
@@ -829,7 +829,7 @@ tmuxTest(
     await typeLiteral(active, draft);
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
-    const fullFooter = "Full detail · ctrl o close";
+    const fullFooter = "full detail · ctrl+o close";
     const response = "history prompt complete";
     const openRetainedTranscript = async () => {
       await active.sendKeys("C-o");
@@ -1754,7 +1754,7 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("/he"), READY_TIMEOUT);
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && pane.includes("Tab Ente"),
+      (pane) => hasEmptyComposer(pane) && pane.includes("tab ente"),
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);

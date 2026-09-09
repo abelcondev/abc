@@ -269,7 +269,7 @@ pub fn buildExplicitPromptSection(
     const summary = if (failed == 0)
         try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl o for details){s}", .{ loaded, failed, load_rows.written() });
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
     const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
     errdefer if (details) |value| alloc.free(value);
@@ -320,7 +320,7 @@ test "explicit skill requests report ambiguous names without selecting a source"
     try expectContains(section.load_notice.?.body, "ambiguous name");
     try expectNotContains(section.load_notice.?.body, "/workspace/review");
     try expectNotContains(section.load_notice.?.body, "/global/review");
-    try expectContains(section.load_notice.?.body, "ctrl o");
+    try expectContains(section.load_notice.?.body, "ctrl+o");
     try expectContains(section.load_details.?, "/workspace/review");
     try expectContains(section.load_details.?, "/global/review");
     try std.testing.expect(section.notice == null);

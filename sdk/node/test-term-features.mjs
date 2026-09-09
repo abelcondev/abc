@@ -103,7 +103,7 @@ for (const expected of ["first question", "first answer", "second question"]) {
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "alternate", "full transcript alternate screen");
 runtime.write("\x1b[C");
-await waitFor(() => grid().includes("Full detail"), "full transcript detail");
+await waitFor(() => grid().includes("full detail"), "full transcript detail");
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "normal", "full transcript close");
 
@@ -115,7 +115,7 @@ await command("/skills list", "Skills are unavailable in this host");
 runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");
 runtime.write("\x1b");
-await waitFor(() => !grid().includes("Tab Provider"), "model catalog close");
+await waitFor(() => !grid().includes("tab provider"), "model catalog close");
 
 runtime.write("/exit\r");
 const code = await Promise.race([runtime.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("exit timeout")), 5000))]);

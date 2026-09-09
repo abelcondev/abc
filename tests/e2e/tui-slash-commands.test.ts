@@ -99,7 +99,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         expect(scrollback).toContain("Run /help for commands");
         expect(scrollback).not.toMatch(/No context to compact|Context:|Compacting/);
         await session.sendKeys("C-o");
-        const transcript = await session.waitForText("Full detail", 5_000);
+        const transcript = await session.waitForText("full detail", 5_000);
         expect(transcript).not.toMatch(/No context to compact|Context:|Compacting/);
         await session.sendKeys("C-o");
         await session.waitForComposer(5_000);
@@ -232,9 +232,9 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/settings");
-      const pane = await session.waitForText("←→ Change", 5_000);
+      const pane = await session.waitForText("←→ change", 5_000);
       expect(pane).toContain("Settings");
-      expect(pane).toContain("↑↓ Navigate");
+      expect(pane).toContain("↑↓ navigate");
       expect(pane).not.toContain("[All]");
     },
     TIMEOUT,

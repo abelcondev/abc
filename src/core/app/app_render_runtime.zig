@@ -616,10 +616,10 @@ pub fn Runtime(comptime App: type) type {
             const file_selection = if (file_view.receipt) |receipt| receipt.selected else null;
             const file_status: ?[]const u8 = switch (file_view.status) {
                 .unavailable => if (app.input_runtime.picker.file_completion.indexed)
-                    "Files unavailable. Tab to retry; Esc to dismiss."
+                    "Files unavailable. tab to retry; esc to dismiss."
                 else
-                    "Directory unavailable. Tab to retry; Esc to dismiss.",
-                .stale => "Selection unavailable. Navigate to choose; Tab to retry.",
+                    "Directory unavailable. tab to retry; esc to dismiss.",
+                .stale => "Selection unavailable. navigate to choose; tab to retry.",
                 .loading, .ready, .empty => null,
             };
             const inline_completion =
@@ -4552,7 +4552,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Setup"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Connections"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Credential source"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Enter Open"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "enter open"));
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
 

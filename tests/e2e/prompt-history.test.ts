@@ -57,7 +57,7 @@ async function disablePromptHistory(
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ Change", TIMEOUT);
+  await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -76,7 +76,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
     TIMEOUT,
   );
 }
@@ -119,7 +119,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("/help");
         await session.waitForText("Commands 35", TIMEOUT);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
+        await session.waitForPane((pane) => !pane.includes("enter open"), TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;

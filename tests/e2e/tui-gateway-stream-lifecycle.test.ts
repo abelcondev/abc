@@ -5238,7 +5238,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(narrow).toContain("reviewer replied · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
-        await session.waitForText("Full detail", TIMEOUT);
+        await session.waitForText("full detail", TIMEOUT);
         let details = await session.capturePane();
         for (let page = 0; page < 8 && !details.includes("CHILD_ROW_REPLY_0"); page += 1) {
           await session.sendKeys("PPage");

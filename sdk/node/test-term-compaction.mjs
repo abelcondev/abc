@@ -215,7 +215,7 @@ async function runScenario(name) {
   async function silentTranscript() {
     assert(!forbidden.test(grid(active.terminal)), "compaction output leaked into inline scrollback");
     active.runtime.write("\x0f");
-    await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("Full detail"), "full transcript");
+    await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("full detail"), "full transcript");
     assert(!forbidden.test(grid(active.terminal)), "compaction output leaked into Ctrl+O");
     active.runtime.write("\x0f");
     await waitFor(() => active.terminal.buffer.active.type === "normal" && emptyComposer(grid(active.terminal)), "inline restoration");
@@ -235,9 +235,9 @@ async function runScenario(name) {
     await start(["--resume", sessionId]);
     if (automatic) {
       active.runtime.write("/model\r");
-      await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("Tab Provider"), "model capabilities loaded");
+      await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("tab provider"), "model capabilities loaded");
       active.runtime.write("\x1b");
-      await waitFor(() => !grid(active.terminal).includes("Tab Provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
+      await waitFor(() => !grid(active.terminal).includes("tab provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
     }
     const beforeCommits = commits;
     const beforeBytes = [...records.values()][0].bytes.slice();
@@ -284,7 +284,7 @@ async function runScenario(name) {
       phase = "reopen";
       await start(["--resume", sessionId]);
       active.runtime.write("\x0f");
-      await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("Full detail"), "reopened full transcript");
+      await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("full detail"), "reopened full transcript");
       active.runtime.write("\x1b[F");
       await waitFor(() => grid(active.terminal).includes(cancelledPrompt), "replayed interrupted prompt");
       assert(!/cancelled|compaction|HOST_INTERNAL_HANDOFF_268a/i.test(grid(active.terminal)), "compaction cancellation must replay silently");

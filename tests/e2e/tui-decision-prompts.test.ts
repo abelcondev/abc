@@ -1305,7 +1305,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(initialPane).toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       const initialRows = initialPane.split("\n");
       const initialChoiceThreeRow = initialRows.findIndex((row) => row.includes("3. No"));
-      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 Choose"));
+      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 choose"));
       expect(initialRows[initialChoiceThreeRow + 1]!.trim()).toBe("");
       expect(initialRows[initialChoiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(initialControlsRow).toBe(initialChoiceThreeRow + 3);
@@ -1371,7 +1371,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "inline command approval footer",
         (value) =>
-          value.includes(APPROVAL_PROMPT) && value.includes("1–3 Choose"),
+          value.includes(APPROVAL_PROMPT) && value.includes("1–3 choose"),
         TIMEOUT,
       );
       const command = pane.replaceAll("\n    ", " ");
@@ -1380,7 +1380,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
       const paneRows = pane.split("\n");
       const choiceThreeRow = paneRows.findIndex((row) => row.includes("3. No"));
-      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 Choose"));
+      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 choose"));
       expect(paneRows[choiceThreeRow + 1]!.trim()).toBe("");
       expect(paneRows[choiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(controlsRow).toBe(choiceThreeRow + 3);
@@ -1676,12 +1676,12 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         hasApprovalSelection(value, 2, COMMAND_ALWAYS_CHOICE),
       );
       expectApprovalSelection(pane, 2, COMMAND_ALWAYS_CHOICE);
-      expect(pane).toContain("Tab Options");
-      expect(pane).not.toContain("Tab Amend");
+      expect(pane).toContain("tab options");
+      expect(pane).not.toContain("tab amend");
 
       await ctx.session.sendKeys("Tab");
       pane = await waitForPaneState(ctx.session, "tab to denial", (value) =>
-        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("Tab Amend"),
+        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("tab amend"),
       );
       expectApprovalSelection(pane, 3, COMMAND_NO_CHOICE);
 
@@ -2725,10 +2725,10 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "question freeform narrow hint",
-        (value) => value.includes("Shift+↑↓ Options"),
+        (value) => value.includes("shift+↑↓ options"),
       );
       expect(pane).toContain(
-        "↑↓ Cursor · Shift+↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
+        "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
       );
       expect(ctx.gateway.requests).toHaveLength(1);
 
@@ -2753,9 +2753,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "approval narrow hint",
-        (value) => value.includes("Enter Confirm    Esc Cancel"),
+        (value) => value.includes("enter confirm    esc cancel"),
       );
-      expect(pane).toContain("1–3 Choose now    Enter Confirm    Esc Cancel");
+      expect(pane).toContain("1–3 choose now    enter confirm    esc cancel");
 
       await resolveApprovalWithDeny(ctx.session);
       await ctx.session.waitForText("approval narrow hint handled", TIMEOUT);

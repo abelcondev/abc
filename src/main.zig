@@ -1702,7 +1702,7 @@ const App = struct {
         var notice: std.Io.Writer.Allocating = .init(self.alloc);
         defer notice.deinit();
         try notice.writer.print(
-            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] Approve  [2] Approve all  [3] Reject  [Esc] Dismiss remaining prompts\n",
+            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] approve  [2] approve all  [3] reject  [esc] dismiss remaining prompts\n",
             .{name},
         );
         try self.writeTranscriptClassified(
