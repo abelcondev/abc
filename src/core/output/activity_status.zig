@@ -106,7 +106,7 @@ fn markedTurnPhaseLabel(phase: types.TurnPhase) []const u8 {
     return switch (phase) {
         .thinking => "• Thinking",
         .generating => "• Generating",
-        .running => "• Running",
+        .running, .waiting_for_subagent => "• Running",
     };
 }
 
@@ -330,6 +330,20 @@ test "compaction terminal feedback is static scoped and publication honest" {
     state.settle(next, .{ .outcome = .no_op }, 10_000);
     try std.testing.expectEqual(ActivityProjection.Tone.neutral, compactionProjection(&buf, state.snapshot, .{}, 11_499).turn_thinking.tone);
     try std.testing.expect(compactionProjection(&buf, state.snapshot, .{}, 11_500) == .none);
+}
+
+test "subagent wait label preserves turn time and token accounting" {
+    var buf: [128]u8 = undefined;
+    const stream: StreamState = .{
+        .active = true,
+        .phase = .waiting_for_subagent,
+        .turn_started_ms = 1_000,
+        .token_progress = .{ .input_tokens = 32, .output_tokens = 253 },
+    };
+    try std.testing.expectEqualStrings("• Running (30s) (↑32 ↓253)", buildTurnLabel(&buf, stream, 31_000).?);
+    var resumed = stream;
+    resumed.phase = .generating;
+    try std.testing.expectEqualStrings("• Generating (31s) (↑32 ↓253)", buildTurnLabel(&buf, resumed, 32_000).?);
 }
 
 test "buildTurnLabel returns thinking when no tool activity" {

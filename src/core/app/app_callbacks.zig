@@ -660,9 +660,17 @@ pub fn Bindings(comptime App: type) type {
                 @hasDecl(App, "subagentToolContextForAdmission");
         }
 
-        fn waitForSubagent(ctx: *anyopaque) !bool {
+        fn waitForSubagent(ctx: *anyopaque, turn_id: u64, step_id: u64) !bool {
             const app: *App = @ptrCast(@alignCast(ctx));
             const host = app.session_persistence.subagent_host orelse return false;
+            if (!host.hasPendingYielded()) return false;
+            agentPushEvent(ctx, .{ .turn_phase_update = .{
+                .turn_id = turn_id,
+                .step_id = step_id,
+                .phase = .waiting_for_subagent,
+            } }) catch |err| {
+                debug_trace.eventf("subagent", "wait_phase_publication_failed", .{ .turn_id = turn_id, .step_id = step_id }, "error={s}", .{@errorName(err)});
+            };
             return host.waitYielded(&app.worker);
         }
 
@@ -2060,6 +2068,131 @@ const NoOverridePersistentApp = struct {
         return false;
     }
 };
+
+const SubagentWaitTestApp = struct {
+    session_persistence: struct { subagent_host: ?*Host = null } = .{},
+    worker: Worker = .{},
+
+    const Host = struct {
+        runtime: @import("../subagent/tool_host.zig").Runtime,
+        wait_result: anyerror!bool = true,
+        wait_calls: usize = 0,
+        push_attempts_at_wait: usize = 0,
+
+        fn init() Host {
+            var host: Host = .{ .runtime = undefined };
+            // Only the yielded list is read by the real pending predicate.
+            host.runtime.yielded = .empty;
+            return host;
+        }
+
+        fn hasPendingYielded(self: *const Host) bool {
+            return self.runtime.hasPendingYielded();
+        }
+
+        fn waitYielded(self: *Host, worker: *Worker) !bool {
+            self.wait_calls += 1;
+            self.push_attempts_at_wait = worker.push_attempts;
+            return self.wait_result;
+        }
+    };
+
+    const Worker = struct {
+        event: ?WorkerEvent = null,
+        push_attempts: usize = 0,
+        fail_push: bool = false,
+
+        pub fn pushEvent(self: *Worker, _: Allocator, event: WorkerEvent) !void {
+            self.push_attempts += 1;
+            if (self.fail_push) return error.OutOfMemory;
+            try std.testing.expect(event == .turn_phase_update);
+            self.event = event;
+        }
+    };
+};
+
+test "waitForSubagent skips absent host and empty or delivered-only work" {
+    var app: SubagentWaitTestApp = .{};
+    try std.testing.expect(!try Bindings(SubagentWaitTestApp).waitForSubagent(&app, 41, 7));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.push_attempts);
+
+    var host = SubagentWaitTestApp.Host.init();
+    defer host.runtime.yielded.deinit(std.testing.allocator);
+    app.session_persistence.subagent_host = &host;
+    try std.testing.expect(!try Bindings(SubagentWaitTestApp).waitForSubagent(&app, 41, 7));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.push_attempts);
+    try std.testing.expectEqual(@as(usize, 0), host.wait_calls);
+
+    try host.runtime.yielded.append(std.testing.allocator, .{
+        .child_id = @constCast("child"),
+        .work_id = @constCast("work"),
+        .max_result_bytes = 1024,
+        .delivered = true,
+    });
+    try std.testing.expect(!try Bindings(SubagentWaitTestApp).waitForSubagent(&app, 41, 7));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.push_attempts);
+    try std.testing.expect(app.worker.event == null);
+    try std.testing.expectEqual(@as(usize, 0), host.wait_calls);
+}
+
+test "waitForSubagent publishes current identity before waiting and preserves the result" {
+    var host = SubagentWaitTestApp.Host.init();
+    defer host.runtime.yielded.deinit(std.testing.allocator);
+    try host.runtime.yielded.append(std.testing.allocator, .{
+        .child_id = @constCast("child"),
+        .work_id = @constCast("work"),
+        .max_result_bytes = 1024,
+    });
+    for ([_]bool{ true, false }, 0..) |wait_result, index| {
+        var app: SubagentWaitTestApp = .{ .session_persistence = .{ .subagent_host = &host } };
+        host.wait_result = wait_result;
+        host.wait_calls = 0;
+        const turn_id: u64 = 41 + index;
+        const step_id: u64 = 7 + index;
+        try std.testing.expectEqual(wait_result, try Bindings(SubagentWaitTestApp).waitForSubagent(&app, turn_id, step_id));
+        const event = app.worker.event orelse return error.TestExpectedEvent;
+        try std.testing.expect(event == .turn_phase_update);
+        try std.testing.expectEqual(turn_id, event.turn_phase_update.turn_id);
+        try std.testing.expectEqual(step_id, event.turn_phase_update.step_id);
+        try std.testing.expectEqual(types.TurnPhase.waiting_for_subagent, event.turn_phase_update.phase);
+        try std.testing.expectEqual(@as(usize, 1), app.worker.push_attempts);
+        try std.testing.expectEqual(@as(usize, 1), host.push_attempts_at_wait);
+        try std.testing.expectEqual(@as(usize, 1), host.wait_calls);
+    }
+}
+
+test "waitForSubagent tolerates enqueue failure but propagates wait failure" {
+    var host = SubagentWaitTestApp.Host.init();
+    defer host.runtime.yielded.deinit(std.testing.allocator);
+    try host.runtime.yielded.append(std.testing.allocator, .{
+        .child_id = @constCast("child"),
+        .work_id = @constCast("work"),
+        .max_result_bytes = 1024,
+    });
+    for ([_]bool{ false, true }) |fail_push| {
+        var app: SubagentWaitTestApp = .{
+            .session_persistence = .{ .subagent_host = &host },
+            .worker = .{ .fail_push = fail_push },
+        };
+        host.wait_calls = 0;
+        host.push_attempts_at_wait = 0;
+        host.wait_result = true;
+        try std.testing.expect(try Bindings(SubagentWaitTestApp).waitForSubagent(&app, 41, 7));
+        try std.testing.expectEqual(@as(usize, 1), app.worker.push_attempts);
+        try std.testing.expectEqual(@as(usize, 1), host.push_attempts_at_wait);
+        try std.testing.expectEqual(@as(usize, 1), host.wait_calls);
+        try std.testing.expectEqual(!fail_push, app.worker.event != null);
+
+        app.worker.push_attempts = 0;
+        host.wait_calls = 0;
+        host.push_attempts_at_wait = 0;
+        host.wait_result = error.TestWaitFailed;
+        try std.testing.expectError(error.TestWaitFailed, Bindings(SubagentWaitTestApp).waitForSubagent(&app, 42, 8));
+        try std.testing.expectEqual(@as(usize, 1), app.worker.push_attempts);
+        try std.testing.expectEqual(@as(usize, 1), host.push_attempts_at_wait);
+        try std.testing.expectEqual(@as(usize, 1), host.wait_calls);
+    }
+}
 
 const CredentialRefreshApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,

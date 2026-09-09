@@ -1471,6 +1471,7 @@ pub const WorkerRuntime = struct {
             .turn_phase_update => |update| if (update.turn_id == self.active_turn_id) {
                 switch (update.phase) {
                     .running => self.tool_phase_step_id = update.step_id,
+                    .waiting_for_subagent => {},
                     .thinking, .generating => if (self.tool_phase_step_id != update.step_id) {
                         self.tool_phase_step_id = null;
                     },
@@ -4415,6 +4416,43 @@ test "tool lifecycle decides whether interactive steering interrupts immediately
     } } });
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
     try std.testing.expect(runtime.isCancelRequested());
+}
+
+test "subagent wait phase preserves steering control and existing tool boundaries" {
+    const alloc = std.testing.allocator;
+    for ([_]?u64{ null, 7 }) |tool_step| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        runtime.active_turn_id = 41;
+        runtime.tool_phase_step_id = tool_step;
+        for ([_][]const u8{ "first steering", "second steering" }) |text| {
+            try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+                .turn_id = 41,
+                .step_id = 8,
+                .phase = .waiting_for_subagent,
+            } });
+            try std.testing.expectEqual(tool_step, runtime.tool_phase_step_id);
+            try std.testing.expectEqual(@as(usize, 0), runtime.active_tool_calls.count());
+            try std.testing.expect(!runtime.isCancelRequested());
+            try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, text, "model"));
+            try std.testing.expectEqual(tool_step == null, runtime.isCancelRequested());
+            const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(
+                alloc,
+                41,
+                if (tool_step == null) .cancelled else .model,
+            ));
+            defer {
+                for (guidance) |item| alloc.free(item);
+                alloc.free(guidance);
+            }
+            try std.testing.expectEqual(@as(usize, 1), guidance.len);
+            try std.testing.expectEqualStrings(text, guidance[0]);
+            try std.testing.expect(!runtime.isCancelRequested());
+        }
+        runtime.requestCancel();
+        try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .cancelled)) == .interrupt);
+    }
 }
 
 test "tool handoff phase holds steering only through its model step" {
