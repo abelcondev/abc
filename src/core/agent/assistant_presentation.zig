@@ -1445,16 +1445,20 @@ test "underscore formatted URLs require exact active markers" {
         try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
     }
 
-    const wrong_closer_cases = [_]struct {
+    // Trailing underscores are outside the URL, as in GFM autolinks, so the
+    // mismatched runs pair on their shared length and the extra underscore
+    // stays literal next to the styled link.
+    const mismatched_run_cases = [_]struct {
         input: []const u8,
         url: []const u8,
+        prefix: []const u8,
         tail: []const u8,
     }{
-        .{ .input = "_https://example.com/path__ tail\n", .url = "https://example.com/path__", .tail = " tail\x1b[23m\n" },
-        .{ .input = "__https://example.com/path_ tail\n", .url = "https://example.com/path_", .tail = " tail\x1b[22m\n" },
+        .{ .input = "_https://example.com/path__ tail\n", .url = ";https://example.com/path\x1b\\", .prefix = "\x1b[3m\x1b]8;", .tail = "\x1b[23m_ tail\n" },
+        .{ .input = "__https://example.com/path_ tail\n", .url = ";https://example.com/path\x1b\\", .prefix = "_\x1b[3m\x1b]8;", .tail = "\x1b[23m tail\n" },
     };
 
-    for (wrong_closer_cases) |case| {
+    for (mismatched_run_cases) |case| {
         var processor = MarkdownProcessor{};
         defer processor.deinit(alloc);
         var out: std.ArrayList(u8) = .empty;
@@ -1462,11 +1466,12 @@ test "underscore formatted URLs require exact active markers" {
 
         try processor.push(alloc, case.input, &out);
         try std.testing.expect(std.mem.indexOf(u8, out.items, case.url) != null);
+        try std.testing.expect(std.mem.startsWith(u8, out.items, case.prefix));
         try std.testing.expect(std.mem.endsWith(u8, out.items, case.tail));
     }
 }
 
-test "underscore emphasis preserves code literals and closes unpaired spans" {
+test "underscore emphasis preserves code literals and keeps unpaired markers literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -1475,8 +1480,8 @@ test "underscore emphasis preserves code literals and closes unpaired spans" {
 
     try processor.push(alloc, "_unclosed\n__unclosed\n`_literal_ __literal__`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[3munclosed\x1b[23m\n" ++
-            "\x1b[1munclosed\x1b[22m\n" ++
+        "_unclosed\n" ++
+            "__unclosed\n" ++
             "\x1b[38;5;245m_literal_ __literal__\x1b[39m\n",
         out.items,
     );
@@ -1583,7 +1588,7 @@ test "numeric entities for control characters stay literal" {
     try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
 }
 
-test "entity lookup is bounded and a long ampersand line stays linear" {
+test "entity lookup is bounded and a long ampersand line renders in bounded time" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -1599,7 +1604,10 @@ test "entity lookup is bounded and a long ampersand line stays linear" {
     defer line.deinit(alloc);
     try line.appendNTimes(alloc, '&', 64 * 1024);
     try line.append(alloc, '\n');
+    const io_mod = @import("../shared/io.zig");
+    const started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms) < 500);
     try std.testing.expectEqualStrings(line.items, out.items);
 }
 
@@ -3218,7 +3226,7 @@ test "flush emits pending line without newline" {
     try std.testing.expectEqualStrings("partial", out.items);
 }
 
-test "flush closes open styles" {
+test "flush keeps an unmatched emphasis opener literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3227,10 +3235,10 @@ test "flush closes open styles" {
 
     try processor.push(alloc, "oops **never closed", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("oops \x1b[1mnever closed\x1b[22m", out.items);
+    try std.testing.expectEqualStrings("oops **never closed", out.items);
 }
 
-test "flush closes an unpaired inline code span" {
+test "flush keeps an unpaired backtick literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3239,7 +3247,179 @@ test "flush closes an unpaired inline code span" {
 
     try processor.push(alloc, "run `zig build", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m", out.items);
+    try std.testing.expectEqualStrings("run `zig build", out.items);
+}
+
+test "emphasis pairs by the delimiter stack and unmatched runs stay literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(
+        alloc,
+        "*not a list item\n" ++
+            "**bold** then **open\n" ++
+            "~~gone~~ and ~~stays\n" ++
+            "a ` b **bold**\n" ++
+            "**bold with `code` inside** *it*\n" ++
+            "***both*** and **`code`**\n" ++
+            "See *italic** plain\n" ++
+            "text **** here **bold** and ~~~~ then ~~gone~~ and *** end\n" ++
+            "**a __b__ c** and *x _y_ z*\n" ++
+            "foo*bar*baz and snake_case_name and 3 * 5 = 15\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "*not a list item\n" ++
+            "\x1b[1mbold\x1b[22m then **open\n" ++
+            "\x1b[9mgone\x1b[29m and ~~stays\n" ++
+            "a ` b \x1b[1mbold\x1b[22m\n" ++
+            "\x1b[1mbold with \x1b[38;5;245mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
+            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;245mcode\x1b[39m\x1b[22m\n" ++
+            "See \x1b[3mitalic\x1b[23m* plain\n" ++
+            "text **** here \x1b[1mbold\x1b[22m and ~~~~ then \x1b[9mgone\x1b[29m and *** end\n" ++
+            "\x1b[1ma \x1b[1mb\x1b[22m\x1b[1m c\x1b[22m and \x1b[3mx \x1b[3my\x1b[23m\x1b[3m z\x1b[23m\n" ++
+            "foo\x1b[3mbar\x1b[23mbaz and snake_case_name and 3 * 5 = 15\n",
+        out.items,
+    );
+}
+
+test "emphasis lookahead agrees with links, code spans, and bare URLs" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A backtick inside link text is not a code opener and a star inside a
+    // code span is not a closer.
+    try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;245mcode*\x1b[39m"));
+
+    // Emphasis around a multi backtick code span still pairs.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "See _a ``b`c`` d_ end\n", &out);
+    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;245mb`c\x1b[39m d\x1b[23m end\n", out.items);
+
+    // URL punctuation is never read as markup, and a delimiter that ends a
+    // URL still closes the span around it.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m\n"));
+    // A trailing delimiter is trimmed from the URL and closes the span.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "*see https://example.com/a* and `code`\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3msee \x1b]8;id=fx-"));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        out.items,
+        ";https://example.com/a\x1b\\\x1b[4mhttps://example.com/a\x1b[24m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;245mcode\x1b[39m\n",
+    ));
+    // Like a GFM autolink, a URL extends to the next whitespace regardless of
+    // active styles, so interior punctuation belongs to the URL and the rest
+    // of the line is read after it.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "*\x1b]8;"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/a*`some\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;245m**bold**\x1b[39mx`\n"));
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "text **** https://example.com\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
+}
+
+test "emphasis flanking reads neighbouring code points not bytes" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // An em dash, curly quotes, and a fullwidth comma are punctuation, so the
+    // marker beside them opens or closes; CJK letters are word characters,
+    // so a star still delimits between them while an underscore does not.
+    // Letters outside ASCII such as the micro sign are still letters, so an
+    // underscore between them stays intraword.
+    try processor.push(alloc, "a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", &out);
+    try std.testing.expectEqualStrings("a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", out.items);
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "a\xe2\x80\x94_b_ \xe2\x80\x9c*q*\xe2\x80\x9d \xe4\xb8\xad*\xe5\xbc\xb7*\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf **x**\xef\xbc\x8c\n", &out);
+    try std.testing.expectEqualStrings(
+        "a\xe2\x80\x94\x1b[3mb\x1b[23m \xe2\x80\x9c\x1b[3mq\x1b[23m\xe2\x80\x9d \xe4\xb8\xad\x1b[3m\xe5\xbc\xb7\x1b[23m\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf \x1b[1mx\x1b[22m\xef\xbc\x8c\n",
+        out.items,
+    );
+}
+
+test "heading with unmatched strong marker keeps it literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## 2 ** 8 and **strong** and __also__\n", &out);
+    try std.testing.expectEqualStrings("\x1b[1m2 ** 8 and strong and also\x1b[22m\n", out.items);
+}
+
+test "long lines of unmatched or unbalanced delimiters render in linear time" {
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+
+    const shapes = [_]struct { prefix: []const u8, unit: []const u8, repeat: usize, suffix: []const u8 }{
+        .{ .prefix = "", .unit = "*a _b ~~c ", .repeat = 40_000, .suffix = "\n" },
+        .{ .prefix = "", .unit = "a* b_ c~~ ", .repeat = 40_000, .suffix = "\n" },
+        .{ .prefix = "", .unit = "*a https://example.com/b _c ~~d ", .repeat = 20_000, .suffix = "\n" },
+        .{ .prefix = "text ", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
+        .{ .prefix = "https://example.com ", .unit = "*", .repeat = 64 * 1024, .suffix = "\n" },
+        .{ .prefix = "*a", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "[^", .repeat = 32 * 1024, .suffix = "]\n" },
+    };
+    // Deeply nested successful pairs must not re-walk consumed ranges.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "b* ");
+    try line.append(alloc, '\n');
+    const nested_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 500);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
+    // A closer that matches part of its run and then fails to place the rest
+    // must cache that failed remainder instead of rescanning other openers.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "_b c__ ");
+    try line.append(alloc, '\n');
+    const residual_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 500);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
+    for (shapes) |shape| {
+        out.clearRetainingCapacity();
+        line.clearRetainingCapacity();
+        try line.appendSlice(alloc, shape.prefix);
+        for (0..shape.repeat) |_| try line.appendSlice(alloc, shape.unit);
+        try line.appendSlice(alloc, shape.suffix);
+        const started = io_mod.nanoTimestamp();
+        try processor.push(alloc, line.items, &out);
+        const elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+        try std.testing.expect(elapsed_ms < 500);
+    }
 }
 
 test "header with inline markdown" {
