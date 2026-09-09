@@ -482,14 +482,22 @@ pub const Runtime = struct {
             const observation = self.managed.wait(child_id, .{
                 .clock = .awake,
                 .raw = .fromMilliseconds(terminal_wait_pulse_ms),
-            }) catch |err| return self.encodeManaged(alloc, .{
-                .ok = false,
-                .error_code = switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.ChildUnavailable => "child_unavailable",
-                    error.StateUnavailable => "state_unavailable",
-                },
-            });
+            }) catch |err| {
+                if (steering_worker != null and !self.managed.hasRunningChild(child_id)) {
+                    // A timed-out observation can leave a completed slot to drain.
+                    self.managed.cancelAndJoin(child_id);
+                    debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=observation_failed_no_runner error={s}", .{ child_id, work_id, @errorName(err) });
+                    self.removeYielded(child_id, work_id);
+                }
+                return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ChildUnavailable => "child_unavailable",
+                        error.StateUnavailable => "state_unavailable",
+                    },
+                });
+            };
             switch (observation.phase) {
                 .running, .awaiting_approval => {
                     if (steering_worker) |worker| {
@@ -818,6 +826,137 @@ test "subagent failed start removes only its pending tuple for run" {
 
 test "subagent failed start removes only its pending tuple for message" {
     try checkFailedStartBookkeeping(.message);
+}
+
+fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
+    const Fixture = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        publication_failures: usize = 0,
+        cancel: ?*std.atomic.Value(bool) = null,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.cancel = cancel;
+            self.entered.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            return .completed;
+        }
+
+        fn failSync(raw: ?*anyopaque, _: std.Io.File) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.publication_failures += 1;
+            return error.InjectedPublicationFailure;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("observation-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var fixture = Fixture{};
+    const runtime = try Runtime.create(alloc, &sessions, "observation-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    defer runtime.deinit();
+    // Release the real child before teardown even when a regression assertion fails.
+    defer fixture.release.set(io_mod.getIo());
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "review this" } });
+    defer request.deinit(alloc);
+    const options = ExecuteOptions{
+        .caller_id = runtime.root_id,
+        .invocation_id = "observation-failure",
+        .identity_epoch = 1,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .steering_worker = &worker,
+    };
+    const work_id = try operationIdAlloc(alloc, options.invocation_id, options.identity_epoch);
+    defer alloc.free(work_id);
+    var admitted = try runtime.admitManagedWork(alloc, request, work_id, options);
+    defer admitted.deinit(alloc);
+    const child_id = admitted.ready.child_id;
+    try runtime.retainYielded(child_id, work_id, options.max_result_bytes);
+    try runtime.retainYielded(child_id, "other-work", 2048);
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(child_state.Phase.running, registry.findById(child_id).?.phase);
+    if (fail_publication) runtime.managed.state_store.options.replace_ops = .{ .ctx = &fixture, .sync_file = Fixture.failSync };
+    try std.testing.expectEqual(managed_owner.StartResult.started, try runtime.managed.start(child_id));
+    try fixture.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1000) } });
+    try std.testing.expect(runtime.managed.hasRunningChild(child_id));
+    try std.testing.expect(!runtime.managed.hasRunningChild("other-child"));
+    if (fail_publication) {
+        fixture.release.set(io_mod.getIo());
+        // Observe only after slotMain finishes publication; do not reap it here.
+        for (0..1000) |_| {
+            if (!runtime.managed.hasRunningWork()) break;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        try std.testing.expect(!runtime.managed.hasRunningWork());
+        try std.testing.expectEqual(@as(usize, 1), fixture.publication_failures);
+        var saved = try runtime.managed.state_store.load(alloc);
+        defer saved.deinit(alloc);
+        try std.testing.expectEqual(child_state.Phase.running, saved.findById(child_id).?.phase);
+        try std.testing.expectEqualStrings(work_id, saved.findById(child_id).?.active.?.id);
+    } else {
+        // A transient read failure while the real runner still borrows parent context.
+        var capability = try sessions.openSubagentControlCapabilityWritable(alloc, runtime.root_id, .{});
+        defer capability.deinit();
+        var entry = try capability.atomicReplace(alloc, .subagent_control, "children.json", "{");
+        entry.deinit(alloc);
+    }
+    const result = try runtime.observeManagedState(alloc, child_id, work_id, null, &worker);
+    defer alloc.free(result.body);
+    const expected = try model_contract.encodeResultAlloc(alloc, .{ .ok = false, .error_code = "state_unavailable" });
+    defer alloc.free(expected);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings(expected, result.body);
+    try std.testing.expectEqualStrings("other-work", runtime.yielded.items[runtime.yielded.items.len - 1].work_id);
+    runtime.removeYielded(child_id, "other-work");
+    if (fail_publication) {
+        // Assert before waitYielded to keep stale-state regressions bounded.
+        try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
+        try std.testing.expect(!try runtime.waitYielded(&worker));
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
+        try std.testing.expect(runtime.hasYieldedChild(child_id));
+        try std.testing.expect(runtime.managed.hasRunningWork());
+        try std.testing.expect(!fixture.cancel.?.load(.seq_cst));
+        try runtime.managed.state_store.save(alloc, registry);
+        fixture.release.set(io_mod.getIo());
+        runtime.cancelYielded();
+        try std.testing.expect(!runtime.managed.hasRunningWork());
+        try std.testing.expect(!try runtime.waitYielded(&worker));
+    }
+}
+
+test "subagent observation failure drops unpublished completed work" {
+    try checkObservationFailureBookkeeping(true);
+}
+
+test "subagent observation failure retains a live child for draining" {
+    try checkObservationFailureBookkeeping(false);
 }
 
 test "internal operation identity is deterministic and invocation-bound" {

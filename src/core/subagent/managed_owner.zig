@@ -58,6 +58,15 @@ pub const Owner = struct {
         return false;
     }
 
+    pub fn hasRunningChild(self: *Owner, child_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (std.mem.eql(u8, slot.child_id, child_id)) return slot.completion == .running;
+        }
+        return false;
+    }
+
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
         while (true) {
             const finished = blk: {
