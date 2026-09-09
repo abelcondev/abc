@@ -325,9 +325,18 @@ const runtime = await createFxTerminal({
 await runtime.interactive;
 ```
 
+The xterm adapter preserves browser-style composer editing for Shift+Enter,
+Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
+inserts a newline without submitting. A click inside the visible composer moves
+its caret; pointer drags remain xterm terminal-output selections.
+When xterm already has an output selection, Command+C copies that selection
+instead of the composer selection.
+
 The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
-`abort`. Terminal session, config, OAuth, prompt-history, URL, and workspace
-stores remain terminal-only host integrations.
+`abort`. Terminal session, config, OAuth, prompt-history, clipboard, URL, and
+workspace stores remain terminal-only host integrations. Clipboard copy writes
+through the host `clipboard.writeText(text)` adapter and defaults to
+`navigator.clipboard`.
 
 ## Security
 
