@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ansi = @import("ansi.zig");
 const tu = @import("text_util.zig");
+const unicode_classes = @import("unicode_classes.zig");
 const payload = @import("payload.zig");
 
 /// Renders heading content: emphasis is resolved normally, but bold tags are
@@ -313,25 +314,11 @@ fn codepointAt(text: []const u8, index: usize) u21 {
 }
 
 fn isFlankingWhitespace(cp: u21) bool {
-    if (cp < 0x80) return tu.isAsciiWhitespace(@intCast(cp));
-    return cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or
-        cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000;
+    return unicode_classes.isWhitespace(cp);
 }
 
-/// Punctuation and symbol code points that count as punctuation for emphasis
-/// flanking. ASCII is exact; beyond ASCII the common punctuation, symbol,
-/// dash, quote, arrow, CJK punctuation, fullwidth form, and emoji blocks are
-/// covered so a dash or curly quote next to a marker behaves like ASCII
-/// punctuation while letters in any script stay word characters.
 fn isFlankingPunctuation(cp: u21) bool {
-    if (cp < 0x80) return cp > 0x20 and cp < 0x7f and !tu.isAsciiAlphaNumeric(@intCast(cp));
-    return (cp >= 0xA1 and cp <= 0xBF) or cp == 0xD7 or cp == 0xF7 or
-        (cp >= 0x2010 and cp <= 0x2027) or (cp >= 0x2030 and cp <= 0x205E) or
-        (cp >= 0x2190 and cp <= 0x2BFF) or (cp >= 0x2E00 and cp <= 0x2E7F) or
-        (cp >= 0x3001 and cp <= 0x303F) or (cp >= 0xFE30 and cp <= 0xFE6B) or
-        (cp >= 0xFF01 and cp <= 0xFF0F) or (cp >= 0xFF1A and cp <= 0xFF20) or
-        (cp >= 0xFF3B and cp <= 0xFF40) or (cp >= 0xFF5B and cp <= 0xFF65) or
-        (cp >= 0x1F000 and cp <= 0x1FAFF);
+    return unicode_classes.isPunctuationOrSymbol(cp);
 }
 
 /// CommonMark "process emphasis" over an explicit stack of open delimiters.
@@ -358,7 +345,10 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
 
         if (closer.can_close) {
             const bottom = &openers_bottom[markerSlot(closer.marker)][@intFromBool(closer.can_open)][closer.orig_len % 3];
-            var found_any = false;
+            // Each part of the closer runs its own search: once a match pops
+            // the stack, the remainder searches again from the new top, and a
+            // failed remainder is cached like any other failed search.
+            var matched_in_search = false;
             var depth = stack.items.len;
             while (closer.remaining > 0 and depth > 0) {
                 depth -= 1;
@@ -368,7 +358,7 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
                 if (opener.marker != closer.marker) continue;
                 if (opener.marker != '~' and violatesRuleOfThree(opener.*, closer.*)) continue;
 
-                found_any = true;
+                matched_in_search = true;
                 const use_len: usize = if (opener.marker == '~' or (opener.remaining >= 2 and closer.remaining >= 2)) 2 else 1;
                 const style: Style = switch (opener.marker) {
                     '~' => .strike,
@@ -390,8 +380,9 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
                 const keep = if (opener.remaining == 0) depth else depth + 1;
                 stack.shrinkRetainingCapacity(keep);
                 depth = stack.items.len;
+                matched_in_search = closer.remaining == 0;
             }
-            if (!found_any and stack.items.len > 0) bottom.* = stack.items[stack.items.len - 1].seq;
+            if (!matched_in_search and stack.items.len > 0) bottom.* = stack.items[stack.items.len - 1].seq;
         }
 
         if (closer.can_open and closer.remaining > 0) {

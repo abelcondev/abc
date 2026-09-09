@@ -3339,6 +3339,11 @@ test "emphasis flanking reads neighbouring code points not bytes" {
     // An em dash, curly quotes, and a fullwidth comma are punctuation, so the
     // marker beside them opens or closes; CJK letters are word characters,
     // so a star still delimits between them while an underscore does not.
+    // Letters outside ASCII such as the micro sign are still letters, so an
+    // underscore between them stays intraword.
+    try processor.push(alloc, "a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", &out);
+    try std.testing.expectEqualStrings("a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", out.items);
+    out.clearRetainingCapacity();
     try processor.push(alloc, "a\xe2\x80\x94_b_ \xe2\x80\x9c*q*\xe2\x80\x9d \xe4\xb8\xad*\xe5\xbc\xb7*\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf **x**\xef\xbc\x8c\n", &out);
     try std.testing.expectEqualStrings(
         "a\xe2\x80\x94\x1b[3mb\x1b[23m \xe2\x80\x9c\x1b[3mq\x1b[23m\xe2\x80\x9d \xe4\xb8\xad\x1b[3m\xe5\xbc\xb7\x1b[23m\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf \x1b[1mx\x1b[22m\xef\xbc\x8c\n",
@@ -3385,6 +3390,17 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
     try processor.push(alloc, line.items, &out);
     try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 250);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
+    // A closer that matches part of its run and then fails to place the rest
+    // must cache that failed remainder instead of rescanning other openers.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "_b c__ ");
+    try line.append(alloc, '\n');
+    const residual_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 250);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
     for (shapes) |shape| {
         out.clearRetainingCapacity();
         line.clearRetainingCapacity();
