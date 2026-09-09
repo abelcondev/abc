@@ -124,11 +124,12 @@ fn continue_pending_subagent(
     arena: Allocator,
     suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
+    step_id: u64,
     text: []const u8,
     replay: ?types.ProviderReplay,
 ) !bool {
     const wait = deps.wait_for_subagent orelse return false;
-    if (!try wait(deps.ctx)) return false;
+    if (!try wait(deps.ctx, turn_id, step_id)) return false;
     try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
     const steered = try append_immediate_steering_after_cancel(deps, arena, suffix, turn_id, "");
     debug_trace.eventf("agent", "subagent_parent_continuation", .{ .turn_id = turn_id }, "steering_consumed={} retained_messages={d}", .{ steered, suffix.items.len });
@@ -8644,7 +8645,7 @@ fn processQueuedPromptLoop(
             }
 
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay)) continue;
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -11340,7 +11341,7 @@ fn processQueuedPromptLoop(
             }
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay)) continue;
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

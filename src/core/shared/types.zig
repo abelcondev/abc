@@ -248,6 +248,7 @@ pub const TurnPhase = enum {
     thinking,
     generating,
     running,
+    waiting_for_subagent,
 };
 
 pub const TurnPhaseUpdate = struct {

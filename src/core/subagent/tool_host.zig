@@ -583,11 +583,16 @@ pub const Runtime = struct {
         }
     }
 
+    /// Main-loop-only after tool dispatch drains; completed but undelivered work counts.
+    pub fn hasPendingYielded(self: *const Runtime) bool {
+        for (self.yielded.items) |item| {
+            if (!item.delivered) return true;
+        }
+        return false;
+    }
+
     pub fn waitYielded(self: *Runtime, worker: *worker_runtime.WorkerRuntime) !bool {
-        const pending = for (self.yielded.items) |item| {
-            if (!item.delivered) break true;
-        } else false;
-        if (!pending) return false;
+        if (!self.hasPendingYielded()) return false;
         debug_trace.eventf("subagent", "steering_parent_waiting", .{}, "pending={d}", .{self.yielded.items.len});
         while (true) {
             const cancelled = worker.worker_cancel_requested.load(.seq_cst);
@@ -684,14 +689,17 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
         const item = runtime.yielded.items[0];
         runtime.removeYielded(item.child_id, item.work_id);
     };
+    try std.testing.expect(!runtime.hasPendingYielded());
     try runtime.retainYielded("child", "work", 4096);
     try runtime.retainYielded("child", "work", 4096);
+    try std.testing.expect(runtime.hasPendingYielded());
     try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
     runtime.acknowledgeYielded("other", "work");
     try std.testing.expect(runtime.hasYieldedChild("child"));
     runtime.yielded.items[0].body = try alloc.dupe(u8, "saved result");
     runtime.acknowledgeYielded("child", "work");
     try std.testing.expect(!runtime.hasYieldedChild("child"));
+    try std.testing.expect(!runtime.hasPendingYielded());
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const retained = try runtime.prepareYielded(arena.allocator());

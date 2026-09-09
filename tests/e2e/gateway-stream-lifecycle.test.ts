@@ -75,6 +75,8 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
   test(`subagent steering responds before ${action} finishes, stop=${stop}`, async () => {
     const root = createFixtureRoot("subagent-steering");
     const held = heldFakeGatewayFinalText();
+    const parentReply = heldFakeGatewayFinalText();
+    const activity = (pane: string) => pane.match(/^[• ] (?:Thinking|Generating|Running) \([^\n]+$/gm)?.at(-1)?.slice(2) ?? "";
     const requests: string[] = [];
     let childRequests = 0;
     let delegated = false;
@@ -105,7 +107,15 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
         return fakeGatewayFinalText("CHILD_COMPLETE");
       }
       expect(afterChildTool).toBe(false);
-      return fakeGatewayFinalText(latest.includes("STEERING_SECOND") ? "SECOND_ACCEPTED" : "FIRST_ACCEPTED");
+      if (latest.includes("STEERING_SECOND")) return fakeGatewayFinalText("SECOND_ACCEPTED");
+      return new Response(parentReply.response.body!.pipeThrough(new TransformStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"type":"text-start","id":"answer_1"}\n\n' +
+              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: "FIRST_STREAMING\n\nStill composing the first reply. " })}\n\n`,
+          ));
+        },
+      })), { headers: parentReply.response.headers });
     }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const registry = () => {
       const sessions = join(root.home, ".fx/sessions");
@@ -137,9 +147,19 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => childRequests === 1, 10000);
       const original = registry().value.children[0];
       await tui.sendText("STEERING_FIRST");
+      const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
+      expect(activity(streaming)).toMatch(/^Generating \(/);
+      // Keep the parent stream open without more text after the visible prefix drains.
+      await Bun.sleep(300);
+      expect(activity(await tui.capturePane())).toMatch(/^Generating \(/);
+      expect(registry().value.children[0].phase).toBe("running");
+      expect(registry().value.children[0].last_outcome).toBeNull();
+      parentReply.release("FIRST_ACCEPTED");
       await tui.waitForText("FIRST_ACCEPTED", 10000);
+      await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
       await tui.sendText("STEERING_SECOND");
       await tui.waitForText("SECOND_ACCEPTED", 10000);
+      await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
       expect(childRequests).toBe(1);
       const pending = registry().value.children[0];
       expect(pending.id).toBe(original.id);
@@ -170,6 +190,7 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       expect(trace).toContain("event=steering_wait_yielded ");
       expect(trace.split("\n").filter(line => line.includes("event=steering_result_delivered "))).toHaveLength(stop ? 0 : 1);
     } finally {
+      parentReply.dispose();
       held.dispose();
       await tui?.kill();
       gateway.stop();
