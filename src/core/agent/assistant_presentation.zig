@@ -3329,6 +3329,23 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
 }
 
+test "emphasis flanking reads neighbouring code points not bytes" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // An em dash, curly quotes, and a fullwidth comma are punctuation, so the
+    // marker beside them opens or closes; CJK letters are word characters,
+    // so a star still delimits between them while an underscore does not.
+    try processor.push(alloc, "a\xe2\x80\x94_b_ \xe2\x80\x9c*q*\xe2\x80\x9d \xe4\xb8\xad*\xe5\xbc\xb7*\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf **x**\xef\xbc\x8c\n", &out);
+    try std.testing.expectEqualStrings(
+        "a\xe2\x80\x94\x1b[3mb\x1b[23m \xe2\x80\x9c\x1b[3mq\x1b[23m\xe2\x80\x9d \xe4\xb8\xad\x1b[3m\xe5\xbc\xb7\x1b[23m\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf \x1b[1mx\x1b[22m\xef\xbc\x8c\n",
+        out.items,
+    );
+}
+
 test "heading with unmatched strong marker keeps it literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -3358,6 +3375,16 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
         .{ .prefix = "https://example.com ", .unit = "*", .repeat = 64 * 1024, .suffix = "\n" },
         .{ .prefix = "*a", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
     };
+    // Deeply nested successful pairs must not re-walk consumed ranges.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "b* ");
+    try line.append(alloc, '\n');
+    const nested_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 250);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
     for (shapes) |shape| {
         out.clearRetainingCapacity();
         line.clearRetainingCapacity();

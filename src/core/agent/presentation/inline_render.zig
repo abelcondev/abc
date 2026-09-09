@@ -77,8 +77,6 @@ const Delimiter = struct {
     remaining: usize,
     can_open: bool,
     can_close: bool,
-    /// Still eligible as an opener on the delimiter stack.
-    active: bool = true,
     /// Matches this run opens, newest first, so emission in list order puts
     /// the outermost span first.
     open_head: ?u32 = null,
@@ -269,12 +267,12 @@ fn delimiterAt(text: []const u8, start: usize, end: usize) ?Delimiter {
     const len = end - start;
     if (marker == '~' and len != 2) return null;
 
-    const before: u8 = if (start == 0) ' ' else text[start - 1];
-    const after: u8 = if (end >= text.len) ' ' else text[end];
-    const before_space = tu.isAsciiWhitespace(before);
-    const after_space = tu.isAsciiWhitespace(after);
-    const before_punct = isAsciiPunctuation(before);
-    const after_punct = isAsciiPunctuation(after);
+    const before = codepointBefore(text, start);
+    const after = codepointAt(text, end);
+    const before_space = isFlankingWhitespace(before);
+    const after_space = isFlankingWhitespace(after);
+    const before_punct = isFlankingPunctuation(before);
+    const after_punct = isFlankingPunctuation(after);
 
     const left_flanking = !after_space and (!after_punct or before_space or before_punct);
     const right_flanking = !before_space and (!before_punct or after_space or after_punct);
@@ -297,77 +295,108 @@ fn delimiterAt(text: []const u8, start: usize, end: usize) ?Delimiter {
     };
 }
 
-fn isAsciiPunctuation(c: u8) bool {
-    return c > 0x20 and c < 0x7f and !tu.isAsciiAlphaNumeric(c);
+/// Code point ending just before `index`, or a space at the line start.
+fn codepointBefore(text: []const u8, index: usize) u21 {
+    if (index == 0) return ' ';
+    var start = index - 1;
+    var steps: usize = 0;
+    while (start > 0 and steps < 3 and text[start] & 0xC0 == 0x80) : (steps += 1) start -= 1;
+    return std.unicode.utf8Decode(text[start..index]) catch text[index - 1];
 }
 
-/// CommonMark "process emphasis": walk closers left to right, pair each with
-/// the nearest eligible opener on the stack, and drop the delimiters between
-/// them. `openers_bottom` remembers failed searches so a closer never rescans
-/// openers that already proved unusable, which keeps the pass linear.
-fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Match)) !void {
-    var openers_bottom: [3][2][3]usize = .{.{.{ 0, 0, 0 }} ** 2} ** 3;
+/// Code point starting at `index`, or a space at the line end.
+fn codepointAt(text: []const u8, index: usize) u21 {
+    if (index >= text.len) return ' ';
+    const len = std.unicode.utf8ByteSequenceLength(text[index]) catch return text[index];
+    if (index + len > text.len) return text[index];
+    return std.unicode.utf8Decode(text[index .. index + len]) catch text[index];
+}
 
-    var closer_index: usize = 0;
-    while (closer_index < tokens.len) : (closer_index += 1) {
-        const closer = switch (tokens[closer_index]) {
+fn isFlankingWhitespace(cp: u21) bool {
+    if (cp < 0x80) return tu.isAsciiWhitespace(@intCast(cp));
+    return cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or
+        cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000;
+}
+
+/// Punctuation and symbol code points that count as punctuation for emphasis
+/// flanking. ASCII is exact; beyond ASCII the common punctuation, symbol,
+/// dash, quote, arrow, CJK punctuation, fullwidth form, and emoji blocks are
+/// covered so a dash or curly quote next to a marker behaves like ASCII
+/// punctuation while letters in any script stay word characters.
+fn isFlankingPunctuation(cp: u21) bool {
+    if (cp < 0x80) return cp > 0x20 and cp < 0x7f and !tu.isAsciiAlphaNumeric(@intCast(cp));
+    return (cp >= 0xA1 and cp <= 0xBF) or cp == 0xD7 or cp == 0xF7 or
+        (cp >= 0x2010 and cp <= 0x2027) or (cp >= 0x2030 and cp <= 0x205E) or
+        (cp >= 0x2190 and cp <= 0x2BFF) or (cp >= 0x2E00 and cp <= 0x2E7F) or
+        (cp >= 0x3001 and cp <= 0x303F) or (cp >= 0xFE30 and cp <= 0xFE6B) or
+        (cp >= 0xFF01 and cp <= 0xFF0F) or (cp >= 0xFF1A and cp <= 0xFF20) or
+        (cp >= 0xFF3B and cp <= 0xFF40) or (cp >= 0xFF5B and cp <= 0xFF65) or
+        (cp >= 0x1F000 and cp <= 0x1FAFF);
+}
+
+/// CommonMark "process emphasis" over an explicit stack of open delimiters.
+/// A closer searches the stack from the top for a compatible opener; the pair
+/// is recorded and every entry above the opener is popped, since a run
+/// between a matched pair can no longer open anything. Each entry is pushed
+/// and popped at most once, and `openers_bottom` records, per closer kind,
+/// how deep a failed search reached so the same entries are never rescanned
+/// for that kind, which keeps the pass linear.
+fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Match)) !void {
+    const StackEntry = struct { token: u32, seq: u32 };
+    var stack: std.ArrayList(StackEntry) = .empty;
+    defer stack.deinit(alloc);
+    var next_seq: u32 = 1;
+    // Sequence number of the top entry when a search for this closer kind
+    // last failed; entries at or below it stay unusable for that kind.
+    var openers_bottom: [3][2][3]u32 = .{.{.{ 0, 0, 0 }} ** 2} ** 3;
+
+    for (tokens, 0..) |*token, token_index| {
+        const closer = switch (token.*) {
             .delimiter => |*d| d,
             else => continue,
         };
-        if (!closer.can_close or closer.remaining == 0) continue;
 
-        const bottom_slot = &openers_bottom[markerSlot(closer.marker)][@intFromBool(closer.can_open)][closer.orig_len % 3];
-        var found_any = false;
-        var opener_index = closer_index;
-        while (opener_index > bottom_slot.* and closer.remaining > 0) {
-            opener_index -= 1;
-            const opener = switch (tokens[opener_index]) {
-                .delimiter => |*d| d,
-                else => continue,
-            };
-            if (!opener.active or !opener.can_open or opener.remaining == 0 or opener.marker != closer.marker) continue;
-            if (opener.marker != '~' and violatesRuleOfThree(opener.*, closer.*)) continue;
+        if (closer.can_close) {
+            const bottom = &openers_bottom[markerSlot(closer.marker)][@intFromBool(closer.can_open)][closer.orig_len % 3];
+            var found_any = false;
+            var depth = stack.items.len;
+            while (closer.remaining > 0 and depth > 0) {
+                depth -= 1;
+                const entry = stack.items[depth];
+                if (entry.seq <= bottom.*) break;
+                const opener = &tokens[entry.token].delimiter;
+                if (opener.marker != closer.marker) continue;
+                if (opener.marker != '~' and violatesRuleOfThree(opener.*, closer.*)) continue;
 
-            found_any = true;
-            const use_len: usize = if (opener.marker == '~')
-                2
-            else if (opener.remaining >= 2 and closer.remaining >= 2)
-                2
-            else
-                1;
-            const style: Style = switch (opener.marker) {
-                '~' => .strike,
-                else => if (use_len == 2) .bold else .italic,
-            };
-            const match_index: u32 = @intCast(matches.items.len);
-            try matches.append(alloc, .{ .style = style });
-            matches.items[match_index].next_open = opener.open_head;
-            opener.open_head = match_index;
-            if (closer.close_tail) |tail| {
-                matches.items[tail].next_close = match_index;
-            } else {
-                closer.close_head = match_index;
-            }
-            closer.close_tail = match_index;
-            opener.remaining -= use_len;
-            closer.remaining -= use_len;
-            if (opener.remaining == 0) opener.active = false;
-
-            // Delimiters strictly between the pair can no longer open anything.
-            var between = opener_index + 1;
-            while (between < closer_index) : (between += 1) {
-                switch (tokens[between]) {
-                    .delimiter => |*d| d.active = false,
-                    else => {},
+                found_any = true;
+                const use_len: usize = if (opener.marker == '~' or (opener.remaining >= 2 and closer.remaining >= 2)) 2 else 1;
+                const style: Style = switch (opener.marker) {
+                    '~' => .strike,
+                    else => if (use_len == 2) .bold else .italic,
+                };
+                const match_index: u32 = @intCast(matches.items.len);
+                try matches.append(alloc, .{ .style = style, .next_open = opener.open_head });
+                opener.open_head = match_index;
+                if (closer.close_tail) |tail| {
+                    matches.items[tail].next_close = match_index;
+                } else {
+                    closer.close_head = match_index;
                 }
+                closer.close_tail = match_index;
+                opener.remaining -= use_len;
+                closer.remaining -= use_len;
+
+                // Everything above the opener sat between the pair.
+                const keep = if (opener.remaining == 0) depth else depth + 1;
+                stack.shrinkRetainingCapacity(keep);
+                depth = stack.items.len;
             }
-            // Any remaining part of this closer searches the stack again from
-            // the top; consumed openers are inactive and skipped.
-            opener_index = closer_index;
+            if (!found_any and stack.items.len > 0) bottom.* = stack.items[stack.items.len - 1].seq;
         }
-        if (!found_any) {
-            bottom_slot.* = closer_index;
-            if (!closer.can_open) closer.active = false;
+
+        if (closer.can_open and closer.remaining > 0) {
+            try stack.append(alloc, .{ .token = @intCast(token_index), .seq = next_seq });
+            next_seq += 1;
         }
     }
 }
