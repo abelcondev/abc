@@ -382,16 +382,12 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.parseCodeFence(tu.leftTrim(line))) |fence| {
+        if (bp.parseCodeFence(line)) |fence| {
             self.active_definition = false;
             self.in_code_block = true;
-            self.code_fence = .{
-                .marker = fence.marker,
-                .run = fence.run,
-                .indent = line.len - tu.leftTrim(line).len,
-            };
+            self.code_fence = fence;
             self.code_language.clearRetainingCapacity();
-            try self.code_language.appendSlice(alloc, bp.codeFenceLanguage(tu.leftTrim(line)));
+            try self.code_language.appendSlice(alloc, bp.codeFenceLanguage(line));
             return;
         }
 
@@ -2334,6 +2330,9 @@ test "tab indented fence inside a list item closes on a tab indented fence" {
     );
 }
 
+// Known cost of the plus rule: a loose nested list written as "- a", a blank
+// line, then "    + nested" renders the nested line as indented code, while
+// "-" or "*" at the same indent still become list items.
 test "indented plus line after a blank stays indented code" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
