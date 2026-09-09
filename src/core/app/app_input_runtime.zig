@@ -8584,10 +8584,11 @@ test "app_input_runtime up arrow retracts a queued steer into an empty composer"
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "steer text" });
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "newer" });
     app.worker.queued_steer_text = "steer text";
 
     try feedRoutingBytes(&app, "\x1b[A");
+    // The restored text matches no history entry, proving restore over recall.
     try std.testing.expectEqualStrings("steer text", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.worker.queued_steer_text == null);
     try std.testing.expect(app.input_runtime.composer_history.activeIndex() == null);
@@ -8597,10 +8598,37 @@ test "app_input_runtime up arrow retracts a queued steer into an empty composer"
     try feedRoutingBytes(&app, "\x1b[A");
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
     try feedRoutingBytes(&app, "\x1b[A");
-    try std.testing.expectEqualStrings("steer text", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.composer_history.activeIndex() != null);
     try feedRoutingBytes(&app, "\x1b[B");
     try std.testing.expectEqualStrings("steer text", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.composer_history.activeIndex() == null);
+}
+
+test "app_input_runtime up arrow during a history episode keeps the queued steer and draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "newer" });
+    app.worker.queued_steer_text = "steer text";
+
+    // Enter history with a stashed draft, then clear the recalled entry to empty.
+    try app.input_runtime.textReplacementState().replace(alloc, "unsent draft");
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
+    try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
+    try app.input_runtime.textReplacementState().replace(alloc, "");
+    try std.testing.expect(app.input_runtime.composer_history.activeIndex() != null);
+
+    // Up must not retract the steer or drop the stashed draft; it navigates history.
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.worker.queued_steer_text != null);
+
+    // Down past the newest entry restores the stashed draft intact.
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqualStrings("unsent draft", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.composer_history.activeIndex() == null);
 }
 

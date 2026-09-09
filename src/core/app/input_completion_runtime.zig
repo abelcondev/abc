@@ -288,13 +288,14 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// Pulls the newest queued steering prompt that still waits for a tool
         /// boundary back into the empty composer for editing. Returns false when
         /// no steer is retractable, leaving history navigation to run unchanged.
-        pub fn restoreQueuedSteerToComposer(app: *App) !bool {
+        /// An active history episode keeps its stashed draft untouched.
+        fn restoreQueuedSteerToComposer(app: *App) !bool {
             if (comptime !@hasField(App, "worker")) return false;
             if (comptime !@hasDecl(@TypeOf(app.worker), "popQueuedSteerForEdit")) return false;
             if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            if (app.input_runtime.composer_history.activeIndex() != null) return false;
             const text = (try app.worker.popQueuedSteerForEdit(std.heap.c_allocator)) orelse return false;
             defer std.heap.c_allocator.free(text);
-            app.input_runtime.composer_history.resetNavigation(app.alloc);
             try app.input_runtime.edit_state.setText(app.alloc, text);
             app.input_runtime.vertical_navigation.reset();
             app.input_runtime.historyBoundary(app.alloc);

@@ -440,8 +440,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await waitForCondition(() => existsSync(startPath), "held tool start");
 
       await session.sendText(steerText);
+      // The queued steer is only visible as the waiting banner above the composer.
       await session.waitForText(steerText, TIMEOUT);
-      await waitForTrace(tracePath, "event=prompt_enqueue", TIMEOUT);
 
       await session.sendKeys("Up");
       await waitForTrace(tracePath, "event=prompt_steering_retracted", TIMEOUT);
@@ -449,7 +449,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendLiteral(editSuffix);
       await session.sendKeys("Enter");
       await waitForCondition(
-        () => countOccurrences(readTrace(tracePath), "event=prompt_enqueue") >= 2,
+        () => countOccurrences(readTrace(tracePath), "event=prompt_enqueue") >= 3,
         "edited steer requeued",
       );
 
