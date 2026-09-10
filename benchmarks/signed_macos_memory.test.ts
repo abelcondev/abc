@@ -13,13 +13,13 @@ test("signed macOS variants preserve the image flow and native resource accounti
   const rows: Array<Record<string, number | string>> = [];
   writeFileSync(join(root, "memory-manifest.json"), JSON.stringify({
     fixture_sha256: new Bun.CryptoHasher("sha256").update(readFileSync(fixture)).digest("hex"),
-    bun: Bun.version, model, samples_per_binary: 50, warmup_pairs: 3,
+    bun: Bun.version, model, samples_per_binary: 200, warmup_pairs: 3,
     boundary: "native fx PID after decoded image reaches provider, before final response",
     accounting: "proc_pid_rusage; excludes the Bun gateway and MCP helper",
     order: "alternating AB/BA with reversed equal-length lanes", timeout_ms: 20_000,
     claim_limit: "resource screen, not a heap-leak proof",
   }, null, 2));
-  for (let round = -3; round < 50; round++) {
+  for (let round = -3; round < 200; round++) {
     for (const label of round % 2 === 0 ? ["control", "candidate"] : ["candidate", "control"]) {
       const dir = mkdtempSync(join(tmpdir(), "fx-signed-memory-"));
       const cohort = Math.abs(Math.floor(round / 2)) % 2;
@@ -78,5 +78,5 @@ test("signed macOS variants preserve the image flow and native resource accounti
       } finally { gateway.stop(); rmSync(dir, { recursive: true, force: true }); }
     }
   }
-  expect(rows).toHaveLength(100);
+  expect(rows).toHaveLength(400);
 }, 180_000);

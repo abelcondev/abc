@@ -1,7 +1,11 @@
+import json
+import pathlib
 import struct
+import tempfile
 import unittest
+from unittest import mock
 
-from scripts.compare_signed_macos import compare_payloads, measurement_record, signature_layout
+from scripts.compare_signed_macos import compare_payloads, main, measurement_record, signature_layout
 from scripts.pgso.qualify import MeasurementResult, compare_samples
 
 
@@ -17,6 +21,33 @@ def fixture(signature_size: int) -> bytes:
 
 
 class SignedMacosComparisonTests(unittest.TestCase):
+    def test_status_calibration_compares_identical_control_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            control, candidate, output = root / "control", root / "candidate", root / "output"
+            control.write_bytes(fixture(32))
+            candidate.write_bytes(fixture(16))
+            details = "Identifier=com.vercel.fx TeamIdentifier=JW6Y669B67 flags=0x10000(runtime) Timestamp=fixture Page size=4096 Page size=16384"
+            with mock.patch("sys.argv", ["compare_signed_macos", "--control", str(control), "--candidate", str(candidate), "--output", str(output), "--source-sha", "0" * 40]), \
+                 mock.patch("scripts.compare_signed_macos.subprocess.run", return_value=mock.Mock(stderr=details)), \
+                 mock.patch("scripts.compare_signed_macos.subprocess.check_output", return_value="fixture\n"), \
+                 mock.patch("scripts.compare_signed_macos.platform.platform", return_value="fixture"), \
+                 mock.patch("scripts.compare_signed_macos.measure_startup", return_value=()) as measure:
+                main()
+            self.assertEqual(3, measure.call_count)
+            for index, call in enumerate(measure.call_args_list):
+                args = call.kwargs
+                self.assertEqual(5000, args["samples"])
+                self.assertEqual(("status",) if index == 2 else None, args["command_names"])
+                self.assertEqual(control.read_bytes(), args["control_binary"].read_bytes())
+                expected = control if index == 2 else candidate
+                self.assertEqual(expected.read_bytes(), args["candidate_binary"].read_bytes())
+                self.assertEqual(len(str(args["control_binary"])), len(str(args["candidate_binary"])))
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(2, manifest["calibration"]["cohort"])
+            self.assertFalse((output / "control").exists())
+            self.assertFalse((output / "candidate").exists())
+
     def test_measurement_does_not_inherit_pgso_regression_allowance(self):
         control = (1.0,) * 100
         candidate = (1.07,) * 100

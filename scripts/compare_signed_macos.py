@@ -97,6 +97,7 @@ def main() -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
         parser.error("source SHA must be a full commit hash")
     repo = pathlib.Path(__file__).resolve().parents[1]
+    samples = 5_000
     binaries = {"control": args.control.resolve(), "candidate": args.candidate.resolve()}
     for label, path in binaries.items():
         if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
@@ -115,25 +116,29 @@ def main() -> None:
         "platform": platform.platform(),
         "cpu": subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip(),
         "hyperfine": subprocess.check_output(["hyperfine", "--version"], text=True).strip(),
-        "samples_per_binary_per_command_per_cohort": 1000, "cohorts": 2,
+        "samples_per_binary_per_command_per_cohort": samples, "cohorts": 2,
+        "calibration": {"cohort": 2, "commands": ["status"], "pair": "control versus identical control"},
         "order": "alternating rounds; equal-length paths; reversed lanes in cohort 1",
         "boundary": "warm process launch to exit; not first-use Gatekeeper assessment",
         "qualification": "measurement only; inspect latency and memory evidence before shipping",
     })
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    for label, path in binaries.items():
-        (args.output / label).mkdir()
-        shutil.copy2(path, args.output / label / "fx")
     hyperfine = pathlib.Path(shutil.which("hyperfine") or "hyperfine")
-    for cohort in (0, 1):
+    for cohort in (0, 1, 2):
         paths = {}
-        for label, lane in (("control", cohort), ("candidate", 1 - cohort)):
+        for label, lane in (("control", cohort % 2), ("candidate", 1 - cohort % 2)):
             directory = args.output / f"cohort-{cohort}" / f"lane-{lane}"
             directory.mkdir(parents=True)
             paths[label] = directory / "fx"
-            shutil.copy2(binaries[label], paths[label])
-        results = measure_startup(repo_root=repo, control_binary=paths["control"], candidate_binary=paths["candidate"], hyperfine_binary=hyperfine, output_dir=args.output / f"startup-{cohort}", samples=1000, timeout_s=30)
+            shutil.copy2(binaries["control" if cohort == 2 else label], paths[label])
+        results = measure_startup(
+            repo_root=repo, control_binary=paths["control"], candidate_binary=paths["candidate"],
+            hyperfine_binary=hyperfine, output_dir=args.output / f"startup-{cohort}",
+            samples=samples, timeout_s=30, command_names=("status",) if cohort == 2 else None,
+        )
         records = [measurement_record(result) for result in results]
+        for record in records:
+            record["pair"] = "control-versus-control" if cohort == 2 else "control-versus-candidate"
         (args.output / f"startup-{cohort}.json").write_text(json.dumps(records, indent=2) + "\n")
         for result in results:
             print(f"cohort {cohort} {result.name}: p50 {result.comparison.p50_change:+.3%}, p95 {result.comparison.p95_change:+.3%}", flush=True)
