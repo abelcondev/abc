@@ -1169,6 +1169,34 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("leading bang input reaches the gateway as an ordinary prompt", async () => {
+    const root = createFixtureRoot("bang-prompt-routing");
+    const trace = join(root.root, "trace.log"), stderr = join(root.root, "stderr.log");
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(promptText(body)).toContain("!echo bang-routing-probe");
+      return fakeGatewayFinalText("BANG_PROMPT_ROUTED");
+    });
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: root.workspace, isolated: true, remainOnExit: true, width: 100, height: 30, stderrPath: stderr,
+        env: { ...fixtureEnv(root, gateway, trace), FX_PERMISSION_MODE: "auto", FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+      });
+      await session.waitForStableComposer(15_000);
+      await session.sendText("!echo bang-routing-probe");
+      await session.waitForText("BANG_PROMPT_ROUTED", 15_000);
+      expect(gateway.requests).toHaveLength(1);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus().status).toBe(0);
+      expect(readFileSync(stderr, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("removed memory tool is absent and stale calls cannot touch persisted bytes", async () => {
     const root = createFixtureRoot("memory-removed");
     const tracePath = join(root.root, "trace.log");
