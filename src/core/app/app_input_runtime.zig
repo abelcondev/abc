@@ -952,11 +952,20 @@ pub fn Runtime(comptime App: type) type {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
                 else => disarmCtrlCExit(app, "semantic_action"),
             }
+            // Any other semantic key stands down an armed interrupt.
+            switch (resolved) {
+                .remapped_byte, .paste_start, .paste_end, .ignore, .escape => {},
+                else => _ = disarmEscapeInterrupt(app, "semantic_action"),
+            }
 
             if (resolved == .escape) {
-                if (try full_transcript_rt.routeAction(app, resolved)) return .done;
+                if (try full_transcript_rt.routeAction(app, resolved)) {
+                    _ = disarmEscapeInterrupt(app, "full_transcript");
+                    return .done;
+                }
                 if (comptime @hasDecl(App, "suppressProjectMcpPrompts")) {
                     if (projectMcpPromptOwnsInput(app)) {
+                        _ = disarmEscapeInterrupt(app, "mcp_prompt_suppressed");
                         app.suppressProjectMcpPrompts();
                         try app.writeDomainNotice(.{
                             .topic = "mcp",
@@ -4727,6 +4736,22 @@ test "app_input_runtime double Escape interrupts an active operation with arm, e
     try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expect(!app.stream.active);
+}
+
+test "app_input_runtime semantic action stands down an armed Escape interrupt" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+
+    try feedRoutingBytes(&app, "\x1b[A");
+
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(app.stream.active);
 }
 
 test "app_input_runtime armed interrupt disarms when the active operation settles" {
