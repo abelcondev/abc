@@ -1922,21 +1922,7 @@ fn recordToolCallRejected(
 }
 
 fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
-    if (!text_utils.isModelSafeText(result.model_output)) {
-        debug_trace.logf(
-            "acp",
-            "tool update omitted binary or non-utf8 output bytes={d}",
-            .{result.model_output.len},
-        );
-        return "binary or non-utf8 tool output omitted";
-    }
-    if (result.status == .failure and
-        (tool_result_errors.isToolPermissionDeniedOutput(result.model_output) or
-            tool_result_errors.isToolReviewHeldOutput(result.model_output)))
-    {
-        return result.model_output;
-    }
-    return text_utils.utf8PrefixByBytes(result.model_output, 200);
+    return tool_call_presentation.toolUpdateContentText(result.status == .failure, result.model_output);
 }
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {

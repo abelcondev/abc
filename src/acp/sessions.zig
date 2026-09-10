@@ -1367,7 +1367,10 @@ fn planToolCallFrame(
         .kind = tool_call_presentation.mapToolKind(name),
         .status = replayStatus(result),
         .raw_input = if (parsed) |p| p.value else null,
-        .content_text = if (result) |r| if (r.output.len > 0) r.output else null else null,
+        .content_text = if (result) |r| if (r.output.len > 0)
+            tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
+        else
+            null else null,
     };
 }
 
