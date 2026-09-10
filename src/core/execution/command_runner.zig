@@ -3098,10 +3098,11 @@ test "foreground session owner loss kills the target and descendant before delay
     defer alloc.free(quoted_pids);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
+    // Keep a write window open, but publish readiness only after the PID record is complete.
     const target_script = try std.fmt.allocPrint(
         alloc,
-        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}; sleep 3; printf FINISHED > {s}",
-        .{ quoted_pids, quoted_effect },
+        "sleep 30 & child=$!; (sleep 0.05; printf '%s %s' \"$$\" \"$child\") > {s}.pending && mv {s}.pending {s}; sleep 3; printf FINISHED > {s}",
+        .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
     );
     defer alloc.free(target_script);
 
@@ -3111,6 +3112,11 @@ test "foreground session owner loss kills the target and descendant before delay
 
     const owner_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
+    var owner_open = true;
+    errdefer if (owner_open) {
+        owner_write.close(io_mod.getIo());
+        _ = child.wait(io_mod.getIo()) catch {};
+    };
     try writeForegroundSessionFrameForTest(
         owner_write,
         foreground_session_release_byte,
@@ -3125,6 +3131,7 @@ test "foreground session owner loss kills the target and descendant before delay
     }
     const pids_text = try readAbsoluteFile(alloc, pids_path, 128);
     defer alloc.free(pids_text);
+    try std.testing.expectEqual(true, pids_text.len > 0);
     var pids = std.mem.tokenizeAny(u8, pids_text, " \r\n\t");
     const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
@@ -3133,6 +3140,7 @@ test "foreground session owner loss kills the target and descendant before delay
     defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
 
     owner_write.close(io_mod.getIo());
+    owner_open = false;
     _ = try child.wait(io_mod.getIo());
     try expectProcessGoneWithinForTest(target_pid, 2_000);
     try expectProcessGoneWithinForTest(descendant_pid, 2_000);
