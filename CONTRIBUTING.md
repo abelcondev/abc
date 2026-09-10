@@ -453,6 +453,13 @@ workflow artifacts for matched signed-binary performance checks; notarization
 and smoke checks alone do not establish performance equivalence. Normal release
 runs keep the existing signing default.
 
+To compare the retained signatures on an isolated runner, run **Actions >
+Benchmarks** with `signed_run` set to the successful main validation run ID.
+This mode downloads already-notarized binaries and does not access Apple
+credentials. It records two alternating startup cohorts and a separate native
+image-flow memory screen. Review the retained measurements before changing
+release signing defaults; successful measurement is not performance approval.
+
 ## Benchmarks
 
 Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
