@@ -90,6 +90,7 @@ pub const Runtime = struct {
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
+    admission_mutex: std.Io.Mutex = .init,
     yielded_mutex: std.Io.Mutex = .init,
     yielded: std.ArrayList(YieldedWork) = .empty,
 
@@ -241,7 +242,7 @@ pub const Runtime = struct {
                             else => .{ .ok = false, .error_code = "operation_conflict" },
                         });
                     }
-                    var admitted = try self.admitManagedWork(
+                    var admitted = try self.admitAndStartManagedWork(
                         admission_alloc,
                         request.*,
                         operation_id,
@@ -285,12 +286,6 @@ pub const Runtime = struct {
                             });
                         },
                         .ready => |ready| {
-                            try self.retainYielded(ready.child_id, operation_id, options.max_result_bytes, if (options.steering_worker != null) 64 else child_state.max_children);
-                            _ = self.managed.start(ready.child_id) catch |err| {
-                                debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ ready.child_id, operation_id, @errorName(err) });
-                                self.removeYielded(ready.child_id, operation_id);
-                                return err;
-                            };
                             const result = try self.observeManagedState(
                                 alloc,
                                 ready.child_id,
@@ -361,6 +356,32 @@ pub const Runtime = struct {
             self.* = undefined;
         }
     };
+
+    fn admitAndStartManagedWork(
+        self: *Runtime,
+        alloc: Allocator,
+        request: model_contract.Request,
+        operation_id: []const u8,
+        options: ExecuteOptions,
+    ) !ManagedAdmission {
+        // A running registry entry must not be exposed before its Slot exists.
+        // Release the registry lock before taking the managed-owner lock.
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+        var admitted = try self.admitManagedWork(alloc, request, operation_id, options);
+        errdefer admitted.deinit(alloc);
+        if (admitted == .ready) {
+            const child_id = admitted.ready.child_id;
+            try self.retainYielded(child_id, operation_id, options.max_result_bytes, if (options.steering_worker != null) 64 else child_state.max_children);
+            _ = self.managed.start(child_id) catch |err| {
+                debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ child_id, operation_id, @errorName(err) });
+                self.removeYielded(child_id, operation_id);
+                return err;
+            };
+        }
+        return admitted;
+    }
 
     fn admitManagedWork(
         self: *Runtime,
@@ -926,6 +947,133 @@ test "parallel subagent wait bookkeeping stays serialized" {
     try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
 }
 
+test "subagent feedback waits for admitted work to install its worker" {
+    const Fixture = struct {
+        release: std.Io.Event = .unset,
+        runs: usize = 0,
+        consumed: usize = 0,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.runs += 1;
+            if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
+            self.release.waitUncancelable(io_mod.getIo());
+            var arena = std.heap.ArenaAllocator.init(turn.alloc);
+            defer arena.deinit();
+            const feedback = try turn.worker.takeSteeringBoundaryInto(turn.alloc, arena.allocator(), 1, .model);
+            self.consumed = if (feedback == .continue_turn) feedback.continue_turn.len else 0;
+            turn.commit(turn.active_work_id.?, .{ .assistant = .{
+                .user = .{ .text = message.content },
+                .assistant = @constCast("ORIGINAL_RESULT"),
+            } }, 0, 0, 2) catch return error.ProviderFailed;
+            return .completed;
+        }
+    };
+    const Call = struct {
+        runtime: *Runtime,
+        text: []const u8,
+        entered: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        result: ?ManagedExecutionResult = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.set(io_mod.getIo());
+            defer self.done.set(io_mod.getIo());
+            self.result = self.execute() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+
+        fn execute(self: *@This()) !ManagedExecutionResult {
+            var request = try model_contract.validateRequest(self.runtime.alloc, .{ .message = .{ .agent = "reviewer", .message = self.text } });
+            defer request.deinit(self.runtime.alloc);
+            return self.runtime.executeManaged(self.runtime.alloc, &request, .{
+                .caller_id = self.runtime.root_id,
+                .invocation_id = self.text,
+                .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+                .max_result_bytes = 4096,
+                .timestamp_ms = 1,
+            });
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("startup-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var fixture = Fixture{};
+    const runtime = try Runtime.create(alloc, &sessions, "startup-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    defer runtime.deinit();
+    var first = Call{ .runtime = runtime, .text = "original task" };
+    var second = Call{ .runtime = runtime, .text = "parent feedback" };
+    var first_thread: ?std.Thread = null;
+    var second_thread: ?std.Thread = null;
+    runtime.yielded_mutex.lockUncancelable(io_mod.getIo());
+    var held = true;
+    defer {
+        if (held) runtime.yielded_mutex.unlock(io_mod.getIo());
+        fixture.release.set(io_mod.getIo());
+        if (first_thread) |thread| thread.join();
+        if (second_thread) |thread| thread.join();
+        if (first.result) |result| alloc.free(result.body);
+        if (second.result) |result| alloc.free(result.body);
+    }
+    first_thread = try std.Thread.spawn(.{}, Call.run, .{&first});
+    // Hold result registration after durable admission, before Slot publication.
+    var admitted = false;
+    for (0..1000) |_| {
+        admitted = blk: {
+            var lock = try runtime.managed.state_store.acquireLock(alloc);
+            defer lock.release();
+            var registry = try runtime.managed.state_store.load(alloc);
+            defer registry.deinit(alloc);
+            break :blk registry.findPersistent("reviewer") != null;
+        };
+        if (admitted) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(admitted);
+    try std.testing.expect(!runtime.managed.hasRunningWork());
+    second_thread = try std.Thread.spawn(.{}, Call.run, .{&second});
+    try second.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try std.testing.expectError(error.Timeout, second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } }));
+    runtime.yielded_mutex.unlock(io_mod.getIo());
+    held = false;
+    try second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try std.testing.expect(second.failure == null);
+    const expected = try model_contract.encodeResultAlloc(alloc, model_contract.feedbackResult(.queued));
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, second.result.?.body);
+    fixture.release.set(io_mod.getIo());
+    try first.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(first.result.?.success);
+    try std.testing.expect(std.mem.find(u8, first.result.?.body, "ORIGINAL_RESULT") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqual(@as(usize, 1), fixture.consumed);
+}
+
 fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     const Fixture = struct {
         runs: std.atomic.Value(usize) = .init(0),
@@ -1005,6 +1153,15 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     try std.testing.expectEqualStrings("other-work", retained.work_id);
     try std.testing.expectEqual(@as(usize, 2048), retained.max_result_bytes);
     try std.testing.expect(!retained.delivered);
+    if (action == .message) {
+        var feedback_options = options;
+        feedback_options.invocation_id = "feedback-after-failed-start";
+        const feedback = try runtime.executeManaged(alloc, &request, feedback_options);
+        defer alloc.free(feedback.body);
+        const expected = try model_contract.encodeResultAlloc(alloc, .{ .ok = false, .error_code = "state_unavailable" });
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, feedback.body);
+    }
     runtime.removeYielded("other-child", "other-work");
     // Keep the regression bounded even when failed starts leave pending work.
     try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);

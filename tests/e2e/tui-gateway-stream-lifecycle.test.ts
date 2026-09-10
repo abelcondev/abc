@@ -126,7 +126,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
     env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steering", FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
       FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
-      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session" } };
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt" } };
   session = await TmuxSession.create(options);
   let parentId = "";
   const childState = () => {
@@ -159,8 +159,12 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
       expect(childCalls).toBe(1);
     }
     if (cancelBeforeConsumption) {
+      await session.waitForText("CHILD_FEEDBACK_ACKNOWLEDGED", TIMEOUT);
+      await session.waitForPane(pane => /^[• ] Running \([^\n]+$/m.test(pane), TIMEOUT);
       await session.sendKeys("Escape");
-      await waitForCondition(() => childState().last_outcome === "cancelled", "child cancellation");
+      await waitForCondition(() => childState().last_outcome === "cancelled", "child cancellation").catch(async error => {
+        throw new Error(`${error}\n${JSON.stringify(childState())}\n${await session!.capturePane()}\n${readFileSync(trace, "utf8").slice(-16000)}`);
+      });
       await session.waitForStableComposer(TIMEOUT);
       await session.sendText("FOLLOWUP_AFTER_CANCELLATION: continue the same child.");
     } else writeFileSync(release, "go");
