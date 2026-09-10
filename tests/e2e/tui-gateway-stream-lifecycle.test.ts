@@ -2283,10 +2283,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           resumed.release?.();
           await session.waitForText(finalText, TIMEOUT);
         } else {
-          await session.sendKeys("Escape");
-          await session.waitForText("esc again to interrupt", TIMEOUT);
-          await Bun.sleep(150);
-          await session.sendKeys("Escape");
+          await session.sendInterruptEscapePair(TIMEOUT);
           await session.waitForText("What can fx do differently?", TIMEOUT);
         }
         await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
@@ -2466,10 +2463,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "provider_error: route failed three times",
         TIMEOUT,
       );
-      await session!.sendKeys("Escape");
-      await session!.waitForText("esc again to interrupt", TIMEOUT);
-      await Bun.sleep(150);
-      await session!.sendKeys("Escape");
+      await session!.sendInterruptEscapePair(TIMEOUT);
       await session!.waitForText("What can fx do differently?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
@@ -3862,10 +3856,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
 
-      await session.sendKeys("Escape");
-      await session.waitForText("esc again to interrupt", TIMEOUT);
-      await Bun.sleep(150);
-      await session.sendKeys("Escape");
+      await session.sendInterruptEscapePair(TIMEOUT);
       await session.waitForText(finalText, TIMEOUT);
       await waitForCondition(
         () => steeringGateway.requests.length === 2,

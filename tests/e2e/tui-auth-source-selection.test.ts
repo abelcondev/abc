@@ -1764,10 +1764,7 @@ for (const scenario of [
       expect(gateway.requests).toHaveLength(1);
 
       await session.sendKeys("C-u");
-      await session.sendKeys("Escape");
-      await session.waitForText("esc again to interrupt", TIMEOUT);
-      await Bun.sleep(150);
-      await session.sendKeys("Escape");
+      await session.sendInterruptEscapePair(TIMEOUT);
       await session.waitForText("What can fx do differently?", TIMEOUT);
       await session.sendText(scenario.command.trim());
       await session.waitForPane(

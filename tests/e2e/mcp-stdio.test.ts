@@ -4676,10 +4676,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         ),
       ).toBe(true);
 
-      await tui.sendKeys("Escape");
-      await tui.waitForText("esc again to interrupt", 10_000);
-      await Bun.sleep(150);
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
       await tui.waitForText("■ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
@@ -4751,11 +4748,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       }
       expect(existsSync(readyPath)).toBe(true);
 
-      await tui.sendKeys("Escape");
-      await tui.waitForText("esc again to interrupt", 5_000);
-      await Bun.sleep(150);
       const cancelStarted = Date.now();
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(5_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 5_000);
       expect(Date.now() - cancelStarted).toBeLessThan(5_000);
 
