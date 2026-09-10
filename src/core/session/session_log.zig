@@ -2759,6 +2759,18 @@ pub const LoadedWritableSession = struct {
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
         if (!self.freshly_started) return;
+        // A generated title (or a user rename) that landed before the first
+        // commit wins; the derived title only names an untitled session.
+        const persisted = self.conversationTitle(alloc) catch |err| {
+            debug_trace.logf(
+                "session",
+                "derived session title check failed session={s} err={s}",
+                .{ self.active_id, @errorName(err) },
+            );
+            return;
+        };
+        defer if (persisted) |value| alloc.free(value);
+        if (persisted != null) return;
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
