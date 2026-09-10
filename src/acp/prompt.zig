@@ -923,7 +923,6 @@ fn maybeStartAcpTitleTask(
         .account_id = session.account_id,
         .credential_source = session.credential_source,
         .stream_provider = agent_stream,
-        .usage = &session.session_rt.usage,
     }) catch return;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});

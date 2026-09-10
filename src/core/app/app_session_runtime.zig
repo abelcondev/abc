@@ -2799,7 +2799,6 @@ pub fn Runtime(comptime App: type) type {
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
                 .stream_provider = app.agentStreamProvider(),
-                .usage = &app.session.usage,
             }) catch return;
             task.spawn() catch |err| {
                 debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});

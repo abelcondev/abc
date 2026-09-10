@@ -3,7 +3,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
-const session_usage = @import("session_usage.zig");
 const session = @import("session.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const gateway_step = @import("../agent/runtime/gateway_step.zig");
@@ -101,8 +100,6 @@ pub const Request = struct {
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
 };
 
 pub const Outcome = union(enum) {
@@ -158,8 +155,11 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .cancel_flag = request.cancel_flag,
             .provider_attempt_owner = .transport,
         },
-        request.usage,
-        request.usage_allocator,
+        // Cosmetic side calls stay out of the session usage ledger: a title
+        // call without generation metadata would otherwise degrade the
+        // session's billing completeness and inflate its token totals.
+        null,
+        alloc,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("session", "event=title_generation result=unavailable err={s}", .{@errorName(err)});
@@ -204,7 +204,6 @@ pub const Task = struct {
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     stream_provider: stream_provider.Provider,
-    usage: ?*session_usage.Usage = null,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
 
@@ -217,7 +216,6 @@ pub const Task = struct {
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
         stream_provider: stream_provider.Provider,
-        usage: ?*session_usage.Usage = null,
     };
 
     /// Copies every input; the task owns its copies. Uses c_allocator because
@@ -247,7 +245,6 @@ pub const Task = struct {
             .account_id = account_id,
             .credential_source = init.credential_source,
             .stream_provider = init.stream_provider,
-            .usage = init.usage,
         };
         return task;
     }
@@ -311,8 +308,6 @@ pub const Task = struct {
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
-            .usage = self.usage,
-            .usage_allocator = alloc,
         }) catch |err| {
             self.failure = err;
             debug_trace.logf("session", "event=title_generation result=unavailable session={s} err={s}", .{ self.session_id, @errorName(err) });

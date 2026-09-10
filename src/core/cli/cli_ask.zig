@@ -1889,7 +1889,6 @@ fn maybeStartAskTitleTask(
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
         .stream_provider = agent_stream,
-        .usage = &ctx.session.usage,
     }) catch return null;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
