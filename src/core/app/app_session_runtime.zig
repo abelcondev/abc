@@ -2818,6 +2818,7 @@ pub fn Runtime(comptime App: type) type {
             const task = app.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
             const title = task.takeTitle() orelse return false;
+            defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(app) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
                 return false;

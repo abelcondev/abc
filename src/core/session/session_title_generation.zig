@@ -69,17 +69,20 @@ pub fn sanitizeGeneratedTitle(alloc: Allocator, raw: []const u8) !?[]u8 {
     const trimmed = std.mem.trim(u8, first_line, " \t\r\"'`");
     if (trimmed.len == 0) return null;
 
+    // Cap before the strip loop so assume-capacity appends stay in bounds on
+    // unbounded model output.
+    const bounded = capUtf8(trimmed, max_generated_title_bytes);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try out.ensureTotalCapacity(alloc, @min(trimmed.len, max_generated_title_bytes));
-    for (trimmed) |byte| {
+    try out.ensureTotalCapacity(alloc, bounded.len);
+    for (bounded) |byte| {
         if (byte < 0x20 or byte == 0x7f) continue;
         out.appendAssumeCapacity(byte);
     }
     const cleaned = std.mem.trim(u8, out.items, " \t\"'`");
     if (cleaned.len == 0) return null;
     if (!std.unicode.utf8ValidateSlice(cleaned)) return null;
-    return try alloc.dupe(u8, capUtf8(cleaned, max_generated_title_bytes));
+    return try alloc.dupe(u8, cleaned);
 }
 
 fn capUtf8(text: []const u8, max_bytes: usize) []const u8 {
@@ -431,6 +434,22 @@ test "sanitizeGeneratedTitle enforces the byte cap on a UTF-8 boundary" {
     defer alloc.free(capped);
     try std.testing.expect(capped.len <= max_generated_title_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(capped));
+}
+
+test "sanitizeGeneratedTitle bounds oversized single-line model output" {
+    const alloc = std.testing.allocator;
+    // A pathological title response can emit several KB on one line; the cap
+    // must hold without overrunning the pre-sized strip buffer.
+    const oversized = "x" ** 4096;
+    const capped = (try sanitizeGeneratedTitle(alloc, oversized)).?;
+    defer alloc.free(capped);
+    try std.testing.expectEqual(@as(usize, max_generated_title_bytes), capped.len);
+
+    const oversized_with_controls = ("ab\x07" ** 1024) ++ "";
+    const stripped = (try sanitizeGeneratedTitle(alloc, oversized_with_controls)).?;
+    defer alloc.free(stripped);
+    try std.testing.expect(stripped.len <= max_generated_title_bytes);
+    try std.testing.expect(std.mem.findScalar(u8, stripped, 0x07) == null);
 }
 
 test "run returns unavailable when the provider stream fails" {

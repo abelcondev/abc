@@ -1904,6 +1904,7 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     defer task.destroy();
     task.join();
     const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return;

@@ -919,7 +919,7 @@ fn maybeStartAcpTitleTask(
         .model = title_model,
         .prompt_excerpt = excerpt,
         .api_key = if (session.api_key.len > 0) session.api_key else null,
-        .gateway_team = null,
+        .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
         .stream_provider = agent_stream,
@@ -941,6 +941,7 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     defer task.destroy();
     task.join();
     const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (session.writable) |*value| value else return;
