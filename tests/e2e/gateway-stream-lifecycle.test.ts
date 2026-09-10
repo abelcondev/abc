@@ -7368,7 +7368,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("Delegate the prepared search.");
-      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("Esc Cancel"), 15_000);
+      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("esc cancel"), 15_000);
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");
