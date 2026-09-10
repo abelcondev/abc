@@ -2569,7 +2569,7 @@ describe("effect-aware command permissions", () => {
       }
       expect(gateway.classifierRequests).toHaveLength(1);
 
-      await activeSession.sendKeys("Escape");
+      await activeSession.sendInterruptEscapePair(TIMEOUT);
       const cancelDeadline = Date.now() + TIMEOUT;
       while (
         (!existsSync(tracePath) || !readFileSync(tracePath, "utf8").includes("fallback_reason=Cancelled")) &&

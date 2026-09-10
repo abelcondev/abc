@@ -472,6 +472,7 @@ pub const RenderContext = struct {
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
+    esc_interrupt_armed: bool = false,
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
