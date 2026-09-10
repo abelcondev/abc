@@ -107,6 +107,7 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
+const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 
 test {
     _ = tool_admission;
@@ -250,12 +251,32 @@ pub const Context = struct {
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
+            .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
         }
         return input;
+    }
+
+    fn terminalReviewContext(self: Context) ?terminal_managed_observer.Context {
+        return .{
+            .alloc = self.session_allocator,
+            .lifecycle_allocator = self.session_allocator,
+            .terminal_client = self.terminal_client orelse return null,
+            .managed_runtime = self.managed_executions orelse return null,
+            .owner = self.session_child_capability orelse return null,
+            .durable_session_id = self.lifecycle_scope.session_id orelse return null,
+            .workspace_root = self.workspace_root,
+            .transport_role = switch (self.lifecycle_scope.kind) {
+                .interactive, .subagent => .interactive,
+                .ask => .headless,
+                .acp => .acp,
+            },
+            .max_output_bytes = self.max_command_output_bytes,
+            .cancel_flag = runtimeCancelFlag(self),
+        };
     }
 
     pub fn admissionInputWithLiveAuthority(
@@ -2591,6 +2612,7 @@ const TestAutoReview = struct {
             null;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
+            .shell_input => |shell_input| self.exact_arguments_json = shell_input.arguments_json,
             .command => |command| self.exact_command = command.command,
             .file_mutation => |file| {
                 self.file_display_path = file.display_path;
