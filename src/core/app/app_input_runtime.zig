@@ -569,6 +569,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn expireTerminalInputGestures(app: *App, now: i64) void {
             expireCtrlCExitArm(app, now);
             expireEscClearArm(app, now);
+            expireEscapeInterruptArm(app, now);
         }
 
         fn terminalDecodeContext(
@@ -901,6 +902,7 @@ pub fn Runtime(comptime App: type) type {
                 if (disarmEscapeClear(app)) {
                     app.shell.render_requests.request(.footer);
                 }
+                _ = disarmEscapeInterrupt(app, "raw_input");
             }
 
             // Ctrl-Z arrives as raw byte 26 (ISIG disabled); kitty remaps here too.
@@ -2841,6 +2843,22 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn expireEscapeInterruptArm(app: *App, now: i64) void {
+            const transition = gesture_state.expireEscapeInterrupt(
+                app.input_runtime.gestures,
+                now,
+            );
+            app.input_runtime.gestures = transition.next;
+            if (transition.cleared) {
+                debug_trace.logf(
+                    "input",
+                    "event=esc_interrupt_disarmed reason=timeout",
+                    .{},
+                );
+                app.shell.render_requests.request(.footer);
+            }
+        }
+
         fn expireCtrlCExitArm(app: *App, now: i64) void {
             const transition = gesture_state.expireCtrlCExit(
                 app.input_runtime.gestures,
@@ -2880,6 +2898,22 @@ pub fn Runtime(comptime App: type) type {
             return transition.cleared;
         }
 
+        fn disarmEscapeInterrupt(app: *App, reason: []const u8) bool {
+            const transition = gesture_state.disarmEscapeInterrupt(
+                app.input_runtime.gestures,
+            );
+            app.input_runtime.gestures = transition.next;
+            if (transition.cleared) {
+                debug_trace.logf(
+                    "input",
+                    "event=esc_interrupt_disarmed reason={s}",
+                    .{reason},
+                );
+                app.shell.render_requests.request(.footer);
+            }
+            return transition.cleared;
+        }
+
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
             if (was_cancel_pending) {
@@ -2888,6 +2922,7 @@ pub fn Runtime(comptime App: type) type {
                     // Esc on a non-empty draft arms, a second press within
                     // the window clears it, and only an empty field lets
                     // Esc cancel the batch.
+                    _ = disarmEscapeInterrupt(app, "question_prompt");
                     if (app.question_prompt.freeformDraftLen() > 0) {
                         const transition = gesture_state.pressEscapeClear(
                             app.input_runtime.gestures,
@@ -2907,26 +2942,49 @@ pub fn Runtime(comptime App: type) type {
                 if (app.approval_prompt.isActive()) {
                     try approval_rt.cancelApprovalOperation(app);
                     _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
                 if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                     _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
                     return;
                 }
                 if (completion_rt.dismissVisibleInlinePicker(app)) {
                     _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "inline_picker");
                     app.shell.render_requests.request(.footer);
                     return;
                 }
                 if (interrupt_rt.dismissCompactionFeedback(app)) {
                     _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "compaction_feedback");
                     return;
                 }
-                if (!interrupt_rt.pauseActiveRecovery(app)) {
+                if (interrupt_rt.pauseActiveRecovery(app)) {
+                    _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "recovery_pause");
+                    return;
+                }
+                // Interrupting active work requires a confirming second Esc
+                // within the gesture window. The first press only arms.
+                const transition = gesture_state.pressEscapeInterrupt(
+                    app.input_runtime.gestures,
+                    now,
+                );
+                app.input_runtime.gestures = transition.next;
+                if (transition.result == .activated) {
                     try interrupt_rt.cancelActiveOperation(app);
+                } else {
+                    debug_trace.logf(
+                        "input",
+                        "event=esc_interrupt_armed target=active_operation",
+                        .{},
+                    );
                 }
                 _ = disarmEscapeClear(app);
+                app.shell.render_requests.request(.footer);
                 return;
             }
 
@@ -4626,6 +4684,42 @@ test "app_input_runtime Escape dismisses an idle inline slash completion" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
 }
 
+test "app_input_runtime double Escape interrupts an active operation with arm, expiry, and disarm" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    // First press arms the gesture without cancelling.
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(app.stream.active);
+
+    // A press outside the window re-arms instead of cancelling.
+    Runtime(RoutingFakeApp).expireTerminalInputGestures(
+        &app,
+        101 + gesture_state.escape_interrupt_window_ms,
+    );
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 102 + gesture_state.escape_interrupt_window_ms);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.worker.cancel_requested);
+
+    // Non-escape input disarms the pending interrupt.
+    try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 103 + gesture_state.escape_interrupt_window_ms);
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.worker.cancel_requested);
+
+    // Two presses inside the window cancel the active operation.
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 200);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 201);
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(app.worker.cancel_requested);
+    try std.testing.expect(!app.stream.active);
+}
+
 test "app_input_runtime active operation Escape keeps precedence over inline skill dismissal" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -4643,8 +4737,16 @@ test "app_input_runtime active operation Escape keeps precedence over inline ski
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 1);
 
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.skill));
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 2);
+
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.skill));
 }
 
@@ -5782,6 +5884,7 @@ test "app_input_runtime stream Escape retains cancellation precedence over sessi
     app.stream.active = true;
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 1);
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 2);
 
     try std.testing.expect(!app.session_persistence.session_picker.active);
     try std.testing.expect(app.worker.cancel_requested);
@@ -7861,6 +7964,12 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
+
+        try feedRoutingBytes(&app, "\x1b[27u");
+
+        try std.testing.expect(!app.worker.cancel_requested);
+        try std.testing.expect(app.stream.active);
+        try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
 
         try feedRoutingBytes(&app, "\x1b[27u");
 
@@ -10568,6 +10677,8 @@ test "automatic compaction cancellation is silent only while compaction is activ
         app.worker.compaction.running(id, .summary);
         if (settled) app.worker.compaction.settle(id, .{ .outcome = .succeeded }, 2);
         try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+        try std.testing.expect(!app.worker.cancel_requested);
+        try Runtime(RoutingFakeApp).resolveEscape(&app, true, 101);
         try std.testing.expect(app.worker.cancel_requested);
         var rendered = try app.shell.prepareTranscriptSource(alloc, null);
         defer rendered.deinit(alloc);
@@ -10591,6 +10702,12 @@ test "app_input_runtime active tool Escape presents final cancellation immediate
     app.shell.render_requests.clearReason(.footer);
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 101);
 
     try std.testing.expect(app.stream.active);
     try std.testing.expect(app.worker.cancel_requested);

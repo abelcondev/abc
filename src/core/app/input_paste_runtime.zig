@@ -87,6 +87,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .{},
                 );
             }
+            if (gesture_reset.cleared_escape_interrupt) {
+                debug_trace.logf(
+                    "input",
+                    "event=esc_interrupt_disarmed reason=pending_gesture_reset",
+                    .{},
+                );
+            }
             app.terminal_input_runtime.resetEscapeDecoder();
             if (gesture_reset.clearedAny()) {
                 app.shell.render_requests.request(.footer);

@@ -321,8 +321,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (outcome !== "provider-error") {
           await assertLive(terminal);
           expect(f.durable()).toBe(0);
-          if (outcome === "cancel") await terminal.sendKeys("Escape");
-          else f.summaryHold.release("");
+          if (outcome === "cancel") {
+            await terminal.sendKeys("Escape");
+            await terminal.waitForText("esc again to interrupt", 10_000);
+            await Bun.sleep(150);
+            await terminal.sendKeys("Escape");
+          } else f.summaryHold.release("");
         }
         const feedback = outcome === "cancel"
           ? "Compaction cancelled. Try /compact again when ready."
@@ -370,6 +374,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.sendText("Cancel this held response.");
         await until(() => trigger === "auto" ? f.counts().summaries === 1 : f.counts().ordinary === 2, "held cancellation boundary");
         await terminal.waitForText(trigger === "auto" ? ACTIVITY : /Thinking \(/, 10_000);
+        await terminal.sendKeys("Escape");
+        await terminal.waitForText("esc again to interrupt", 10_000);
+        await Bun.sleep(150);
         await terminal.sendKeys("Escape");
         if (trigger === "auto") {
           await terminal.waitForText("Compaction cancelled.", 10_000);

@@ -170,6 +170,9 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       expect(await tui.captureFullScrollback()).toContain("still running");
       if (stop) {
         await tui.sendKeys("Escape");
+        await tui.waitForText("esc again to interrupt", 10000);
+        await Bun.sleep(150);
+        await tui.sendKeys("Escape");
         await tui.waitForPane(() => registry().value.children[0].last_outcome === "cancelled", 10000);
       } else {
         held.release("HELD_CHILD_RESULT");
@@ -6268,6 +6271,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.parse(gateway.requests[2]!.body).tools).toEqual([]);
         expect(JSON.parse(gateway.requests[2]!.body).toolChoice).toEqual({ type: "none" });
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
+        tui.sendKeysImmediate(["Escape"]);
+        await tui.waitForText("esc again to interrupt", 5_000);
+        await Bun.sleep(150);
         tui.sendKeysImmediate(["Escape"]);
         await tui.waitForPane(
           (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),

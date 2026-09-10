@@ -1803,6 +1803,9 @@ while :; do :; done
       );
 
       await active.sendKeys("Escape");
+      await active.waitForText("esc again to interrupt", timeout);
+      await Bun.sleep(150);
+      await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
         () => readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
@@ -2030,6 +2033,9 @@ while :; do :; done
         "the below-cap command readiness file",
         timeout,
       );
+      await active.sendKeys("Escape");
+      await active.waitForText("esc again to interrupt", timeout);
+      await Bun.sleep(150);
       await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
@@ -6518,6 +6524,9 @@ test.skipIf(!tmuxAvailable())(
       expect(duringStream).not.toContain("updated");
 
       await active.sendKeys("Escape");
+      await active.waitForText("esc again to interrupt", TIMEOUT);
+      await Bun.sleep(150);
+      await active.sendKeys("Escape");
       await waitForCondition(() => hold.cancelled, "Escape to cancel the held response");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -6641,6 +6650,9 @@ while :; do sleep 1; done
         "the interrupt command readiness file",
         timeout,
       );
+      await active.sendKeys("Escape");
+      await active.waitForText("esc again to interrupt", timeout);
+      await Bun.sleep(150);
       await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
@@ -6792,6 +6804,9 @@ test.skipIf(!tmuxAvailable())(
         "the zero-output command readiness file",
         timeout,
       );
+      await active.sendKeys("Escape");
+      await active.waitForText("esc again to interrupt", timeout);
+      await Bun.sleep(150);
       await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(

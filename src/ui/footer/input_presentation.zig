@@ -509,8 +509,11 @@ pub fn composeHintRow(
     const danger_text = dangerStatusText(approval_active, ctx, width);
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
-    // composer and needs the same cue.
-    const right_text: []const u8 = if (ctx.esc_clear_armed)
+    // composer and needs the same cue. The armed interrupt indicator outranks
+    // both: it guards an irreversible cancel of active work.
+    const right_text: []const u8 = if (ctx.esc_interrupt_armed)
+        "esc again to interrupt"
+    else if (ctx.esc_clear_armed)
         "esc again to clear"
     else if (question_hint != null)
         ""
@@ -555,7 +558,7 @@ pub fn dangerStatusText(
 ) []const u8 {
     // Transient interaction hints own the whole row: the warning is placed at
     // an absolute column and would overwrite them on narrow terminals.
-    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.ctrl_c_pending) return "";
+    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.esc_interrupt_armed or ctx.ctrl_c_pending) return "";
     if (ctx.danger_status.len > 0 and
         display_width.visibleWidth(ctx.danger_status) <= width)
     {

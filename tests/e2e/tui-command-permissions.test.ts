@@ -2570,6 +2570,9 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests).toHaveLength(1);
 
       await activeSession.sendKeys("Escape");
+      await activeSession.waitForText("esc again to interrupt", TIMEOUT);
+      await Bun.sleep(150);
+      await activeSession.sendKeys("Escape");
       const cancelDeadline = Date.now() + TIMEOUT;
       while (
         (!existsSync(tracePath) || !readFileSync(tracePath, "utf8").includes("fallback_reason=Cancelled")) &&

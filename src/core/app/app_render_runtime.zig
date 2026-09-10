@@ -816,6 +816,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
+                .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
                 .statusline = buildStatuslineItems(
                     app,

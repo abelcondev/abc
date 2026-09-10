@@ -1760,6 +1760,9 @@ describe("modern MCP Streamable HTTP", () => {
       ).toBe(true);
 
       await tui.sendKeys("Escape");
+      await tui.waitForText("esc again to interrupt", 10_000);
+      await Bun.sleep(150);
+      await tui.sendKeys("Escape");
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {

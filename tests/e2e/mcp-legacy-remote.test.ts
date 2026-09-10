@@ -1145,6 +1145,9 @@ describe("version-scoped legacy MCP remote transports", () => {
         ).toBe(true);
 
         await tui.sendKeys("Escape");
+        await tui.waitForText("esc again to interrupt", 10_000);
+        await Bun.sleep(150);
+        await tui.sendKeys("Escape");
         await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
         const cancelDeadline = Date.now() + 5_000;
         while (
@@ -1203,6 +1206,9 @@ describe("version-scoped legacy MCP remote transports", () => {
       ) {
         await Bun.sleep(25);
       }
+      await tui.sendKeys("Escape");
+      await tui.waitForText("esc again to interrupt", 10_000);
+      await Bun.sleep(150);
       await tui.sendKeys("Escape");
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
