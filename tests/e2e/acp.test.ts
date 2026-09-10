@@ -38,6 +38,7 @@ import {
   fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
+  fakeResponsesTitleDefault,
   TITLE_GENERATION_MARKER,
   terminalFixtureShell,
   TmuxSession,
@@ -374,12 +375,6 @@ function codexFinalText(text: string): string {
     'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
 }
 
-// Finish-only Responses stream for title generation side calls: completes
-// without text deltas so SSE trace assertions stay unaffected, and the empty
-// content leaves the locally derived session title in place.
-function responsesFinishOnly(): string {
-  return 'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":0}}}\n\n';
-}
 
 function codexToolCall(callId: string, name: string, args: object): string {
   return `data: ${JSON.stringify({
@@ -444,9 +439,7 @@ function startAcpFakeCodex(options: {
       const body = await request.text();
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ ...recorded, body });
-        return new Response(responsesFinishOnly(), {
-          headers: { "content-type": "text/event-stream" },
-        });
+        return fakeResponsesTitleDefault();
       }
       requests.push({ ...recorded, body });
       if (unauthorizedResponses > 0) {
@@ -583,9 +576,7 @@ function startAcpFakeGrok(options: {
           modelOverride: request.headers.get("x-grok-model-override"),
           grokUserId: request.headers.get("x-grok-user-id"),
         });
-        return new Response(responsesFinishOnly(), {
-          headers: { "content-type": "text/event-stream" },
-        });
+        return fakeResponsesTitleDefault();
       }
       requests.push({
         path,
