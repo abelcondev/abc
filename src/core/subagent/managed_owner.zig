@@ -464,6 +464,9 @@ test "child feedback deduplicates operations and bounds queued receipts" {
     }
     try std.testing.expect(worker.beginDirectProcessing(7));
     const fingerprint = [_]u8{1} ** 32;
+    try std.testing.expect((try owner.steer("child", "previous-work", "first", fingerprint, "same text")) == .waiting);
+    try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+    try std.testing.expect(owner.feedbackReplay("first", fingerprint) == null);
     try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "first", fingerprint, "same text")).receipt);
     try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "first", fingerprint, "same text")).receipt);
     try std.testing.expect((try owner.steer("child", "work", "first", [_]u8{2} ** 32, "different")) == .conflict);

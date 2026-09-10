@@ -253,7 +253,12 @@ pub const Runtime = struct {
                         .feedback => |target| {
                             // Allocate the receipt before handing any text to the worker.
                             if (queued_receipt == null) queued_receipt = try self.encodeManaged(alloc, model_contract.feedbackResult(.queued));
-                            const result = try self.managed.steer(target.child_id, target.work_id, operation_id, model_contract.requestFingerprint(request.*), request.message.message);
+                            const result = steer: {
+                                self.admission_mutex.lockUncancelable(io_mod.getIo());
+                                defer self.admission_mutex.unlock(io_mod.getIo());
+                                if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+                                break :steer try self.managed.steer(target.child_id, target.work_id, operation_id, model_contract.requestFingerprint(request.*), request.message.message);
+                            };
                             switch (result) {
                                 .receipt => |delivery| {
                                     if (delivery == .queued) {
