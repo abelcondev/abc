@@ -2844,6 +2844,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn expireEscapeInterruptArm(app: *App, now: i64) void {
+            // An armed interrupt guards one active operation. When that
+            // operation settles on its own, the arm must not carry into
+            // whatever work starts next.
+            if (app.input_runtime.gestures.escapeInterruptArmed() and
+                !interrupt_rt.hasActiveOperation(app))
+            {
+                _ = disarmEscapeInterrupt(app, "operation_settled");
+                return;
+            }
             const transition = gesture_state.expireEscapeInterrupt(
                 app.input_runtime.gestures,
                 now,
@@ -4718,6 +4727,21 @@ test "app_input_runtime double Escape interrupts an active operation with arm, e
     try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expect(!app.stream.active);
+}
+
+test "app_input_runtime armed interrupt disarms when the active operation settles" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
+    try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
+
+    app.stream.active = false;
+    Runtime(RoutingFakeApp).expireTerminalInputGestures(&app, 101);
+    try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
+    try std.testing.expect(!app.worker.cancel_requested);
 }
 
 test "app_input_runtime active operation Escape keeps precedence over inline skill dismissal" {
