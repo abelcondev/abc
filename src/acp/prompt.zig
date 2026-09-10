@@ -57,6 +57,7 @@ const tool_specs = @import("../core/tooling/tool_specs.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const tool_presentation = @import("../core/tooling/tool_presentation.zig");
+const tool_call_presentation = @import("tool_call_presentation.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
@@ -428,9 +429,7 @@ const AcpContext = struct {
 };
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
-    if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    return tool_call_presentation.activeToolSet(state);
 }
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
@@ -1923,21 +1922,7 @@ fn recordToolCallRejected(
 }
 
 fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
-    if (!text_utils.isModelSafeText(result.model_output)) {
-        debug_trace.logf(
-            "acp",
-            "tool update omitted binary or non-utf8 output bytes={d}",
-            .{result.model_output.len},
-        );
-        return "binary or non-utf8 tool output omitted";
-    }
-    if (result.status == .failure and
-        (tool_result_errors.isToolPermissionDeniedOutput(result.model_output) or
-            tool_result_errors.isToolReviewHeldOutput(result.model_output)))
-    {
-        return result.model_output;
-    }
-    return text_utils.utf8PrefixByBytes(result.model_output, 200);
+    return tool_call_presentation.toolUpdateContentText(result.status == .failure, result.model_output);
 }
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
@@ -2679,26 +2664,11 @@ fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
     return session.mcp;
 }
 
-pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
-    if (tool_presentation.isProviderSearchAlias(tool_name)) return .search;
-    if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
-    if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
-    if (std.mem.eql(u8, tool_name, "read_file")) return .read;
-    if (std.mem.eql(u8, tool_name, "web_fetch")) return .fetch;
-    if (std.mem.eql(u8, tool_name, "web_search")) return .search;
-    if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "shell")) return .execute;
-    if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
-    if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "skill")) return .other;
-    if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
-    return .other;
-}
+pub const mapToolKind = tool_call_presentation.mapToolKind;
 
-fn acpToolName(tool_name: []const u8) []const u8 {
-    return if (tool_presentation.isProviderSearchAlias(tool_name)) "web_search" else tool_name;
-}
+const acpToolName = tool_call_presentation.acpToolName;
+
+const describeToolTitle = tool_call_presentation.describeToolTitle;
 
 fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallStatus {
     return switch (outcome) {
@@ -2706,22 +2676,6 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
         .denied, .cancelled, .failed => .failed,
         .deferred => null,
     };
-}
-
-fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (registry.lookup(call.name) != null) {
-        if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
-    }
-    if (tool_presentation.isProviderSearchAlias(call.name)) {
-        return tool_presentation.formatPlainAction(arena, .{
-            .tool_registry = registry,
-            .call = call,
-        });
-    }
-    if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
-    }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
 }
 
 test "ACP subagent titles and terminal descriptions share request projection" {
