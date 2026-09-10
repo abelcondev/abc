@@ -5,7 +5,6 @@ const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const app_terminal_runtime = @import("app_terminal_runtime.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -816,6 +815,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
+                .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
                 .statusline = buildStatuslineItems(
                     app,

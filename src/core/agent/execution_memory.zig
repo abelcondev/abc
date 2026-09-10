@@ -852,9 +852,8 @@ test "execution memory redacts secret values from arguments results and provider
     try std.testing.expect(std.mem.find(u8, parsed.value.object.get("command").?.string, "[redacted]") != null);
 }
 
-test "execution memory removes token-shaped call ids from JSON and replay" {
+test "execution memory removes token-shaped call ids from JSON" {
     const runtime_execution_memory = @import("runtime/execution_memory.zig");
-    const session_runtime = @import("../session/session.zig");
     const testing_session_json = @import("../session/session_json.zig");
     const ChatMessage = types.ChatMessage;
     const alloc = std.testing.allocator;
@@ -897,13 +896,6 @@ test "execution memory removes token-shaped call ids from JSON and replay" {
         memory,
     );
     try std.testing.expect(std.mem.find(u8, json.written(), secret_id) == null);
-
-    const replay = (try session_runtime.formatExecutionReplayContext(
-        alloc,
-        memory,
-    )).?;
-    defer alloc.free(replay);
-    try std.testing.expect(std.mem.find(u8, replay, secret_id) == null);
 }
 
 test "durable execution memory masks token-shaped values" {

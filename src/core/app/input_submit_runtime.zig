@@ -705,13 +705,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
 
-            if (directCommand(expanded.text)) |command| {
-                if (comptime @hasDecl(App, "submitDirectTerminal")) {
-                    try App.submitDirectTerminal(app, command);
-                    return;
-                }
-            }
-
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
@@ -1913,11 +1906,6 @@ pub fn SubmitRuntime(comptime App: type) type {
     };
 }
 
-pub fn directCommand(expanded: []const u8) ?[]const u8 {
-    if (expanded.len == 0 or expanded[0] != '!') return null;
-    return expanded[1..];
-}
-
 test "inline image collision map keeps reserved stable IDs and final coordinates distinct" {
     const alloc = std.testing.allocator;
     const Rt = SubmitRuntime(struct {});
@@ -1949,13 +1937,6 @@ test "inline image collision map keeps reserved stable IDs and final coordinates
     const skill_start = std.mem.find(u8, text, "$review").?;
     const skill = Rt.projectSpanThroughSubmittedImages(text, &occurrences, .{ .start = skill_start, .end = skill_start + "$review".len }).?;
     try std.testing.expectEqualStrings("$review", result.text[skill.start..skill.end]);
-}
-
-test "direct terminal route requires the literal first character" {
-    try std.testing.expectEqualStrings("printf ready", directCommand("!printf ready").?);
-    try std.testing.expectEqualStrings("", directCommand("!").?);
-    try std.testing.expect(directCommand(" !printf prompt") == null);
-    try std.testing.expect(directCommand("ordinary prompt") == null);
 }
 
 test "pending submission phase methods keep hold ownership explicit" {

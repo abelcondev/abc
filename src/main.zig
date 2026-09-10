@@ -105,7 +105,6 @@ const compiled_update_channel = update_target.Channel.parse(build_options.update
 const shell_process_provider = @import("tools/shell/process_provider.zig");
 const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
-const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
 const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
@@ -1018,19 +1017,8 @@ const App = struct {
                 callbacks,
             );
             switch (exit_cause) {
-                .requested_exit => {},
+                .requested_exit => return,
                 .input_closed => return error.TerminalInputClosed,
-            }
-            switch (app_terminal_runtime.Runtime(App).prepareGracefulExit(self)) {
-                .ready => return,
-                .deferred => {
-                    self.should_exit = false;
-                    debug_trace.logf(
-                        "terminal",
-                        "interactive exit resumed after direct graceful-exit deferral",
-                        .{},
-                    );
-                },
             }
         }
     }
@@ -2473,10 +2461,6 @@ const App = struct {
         try self.shell.writeNotice(self.alloc, &self.metrics, notice, record);
     }
 
-    pub fn submitDirectTerminal(self: *App, command: []const u8) !void {
-        try app_terminal_runtime.Runtime(App).submitDirect(self, command);
-    }
-
     pub fn appendDomainNotice(self: *App, notice: types.SemanticNotice) !u32 {
         return self.shell.appendSemanticNotice(self.alloc, notice);
     }
@@ -2938,7 +2922,6 @@ const App = struct {
         }
         if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
-            try app_terminal_runtime.Runtime(App).collectFacts(self);
         }
         try self.processNextCooperativePrompt();
 
@@ -4322,7 +4305,6 @@ test {
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
     _ = @import("core/terminal/managed_observer.zig");
-    _ = @import("core/app/app_terminal_runtime.zig");
     _ = @import("tools/shell/shell.zig");
     _ = @import("tools/shell/process_provider.zig");
     _ = @import("core/app/input_approval_runtime.zig");

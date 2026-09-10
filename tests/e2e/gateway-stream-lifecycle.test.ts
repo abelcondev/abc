@@ -169,7 +169,7 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       expect(pending.last_outcome).toBeNull();
       expect(await tui.captureFullScrollback()).toContain("still running");
       if (stop) {
-        await tui.sendKeys("Escape");
+        await tui.sendInterruptEscapePair(10000);
         await tui.waitForPane(() => registry().value.children[0].last_outcome === "cancelled", 10000);
       } else {
         held.release("HELD_CHILD_RESULT");
@@ -1168,6 +1168,34 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("leading bang input reaches the gateway as an ordinary prompt", async () => {
+    const root = createFixtureRoot("bang-prompt-routing");
+    const trace = join(root.root, "trace.log"), stderr = join(root.root, "stderr.log");
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(promptText(body)).toContain("!echo bang-routing-probe");
+      return fakeGatewayFinalText("BANG_PROMPT_ROUTED");
+    });
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: root.workspace, isolated: true, remainOnExit: true, width: 100, height: 30, stderrPath: stderr,
+        env: { ...fixtureEnv(root, gateway, trace), FX_PERMISSION_MODE: "auto", FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+      });
+      await session.waitForStableComposer(15_000);
+      await session.sendText("!echo bang-routing-probe");
+      await session.waitForText("BANG_PROMPT_ROUTED", 15_000);
+      expect(gateway.requests).toHaveLength(1);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus().status).toBe(0);
+      expect(readFileSync(stderr, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("removed memory tool is absent and stale calls cannot touch persisted bytes", async () => {
     const root = createFixtureRoot("memory-removed");
@@ -6268,7 +6296,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.parse(gateway.requests[2]!.body).tools).toEqual([]);
         expect(JSON.parse(gateway.requests[2]!.body).toolChoice).toEqual({ type: "none" });
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
-        tui.sendKeysImmediate(["Escape"]);
+        await tui.sendInterruptEscapePair(5_000);
         await tui.waitForPane(
           (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),
           5_000,
@@ -7362,7 +7390,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("Delegate the prepared search.");
-      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("Esc Cancel"), 15_000);
+      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("esc cancel"), 15_000);
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");

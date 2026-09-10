@@ -39,30 +39,6 @@ pub const Observation = struct {
     }
 };
 
-pub fn refreshAll(ctx: Context) !void {
-    try syncOwned(ctx);
-    const items = try ctx.managed_runtime.list(ctx.alloc);
-    defer {
-        for (items) |*item| item.deinit(ctx.alloc);
-        ctx.alloc.free(items);
-    }
-    for (items) |item| {
-        if (item.backend != .tty) continue;
-        refresh(ctx, item.execution_id, item.command) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (isDefinitiveLoss(err)) {
-                ctx.managed_runtime.observeTtyState(item.execution_id, .lost);
-            }
-            debug_trace.logf(
-                "terminal",
-                "managed TTY refresh skipped session={s} err={s}",
-                .{ item.execution_id, @errorName(err) },
-            );
-            continue;
-        };
-    }
-}
-
 pub fn refresh(
     ctx: Context,
     execution_id: []const u8,

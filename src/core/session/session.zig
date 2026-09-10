@@ -3273,61 +3273,6 @@ pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.Fi
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-pub fn formatExecutionReplayContext(
-    alloc: Allocator,
-    execution: core_types.ExecutionMemory,
-) !?[]u8 {
-    if (execution.isEmpty()) return null;
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll("Previous tool execution:") catch return error.OutOfMemory;
-
-    for (execution.tool_steps) |step| {
-        if (step.assistant) |assistant| {
-            if (assistant.len > 0) {
-                out.writer.print("\n\nAssistant:\n{s}", .{assistant}) catch return error.OutOfMemory;
-            }
-        }
-        for (step.tool_results) |result| {
-            out.writer.print(
-                "\n\nTool {s} ({s}):\n{s}",
-                .{ result.tool_name, @tagName(result.status), result.output },
-            ) catch return error.OutOfMemory;
-            for (result.permission_feedback) |feedback| {
-                out.writer.print(
-                    "\n\nUser permission feedback:\n{s}",
-                    .{feedback},
-                ) catch return error.OutOfMemory;
-            }
-        }
-    }
-    if (execution.files.len > 0) {
-        const files = try formatExecutionFileContext(alloc, execution.files);
-        defer alloc.free(files);
-        out.writer.print("\n\n{s}", .{files}) catch return error.OutOfMemory;
-    }
-
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-test "turn summary alone does not create model execution replay context" {
-    const execution = ExecutionMemory{ .turn_summary = .{
-        .started_at_ms = 100,
-        .completed_at_ms = 250,
-        .thinking_duration_ms = 40,
-        .turn_duration_ms = 150,
-        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
-    } };
-
-    const context = try formatExecutionReplayContext(
-        std.testing.allocator,
-        execution,
-    );
-    defer if (context) |value| std.testing.allocator.free(value);
-    try std.testing.expect(context == null);
-}
-
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
     _ = entry;
     return alloc.dupe(u8, interrupted_turn_context);
@@ -4053,8 +3998,7 @@ test "resume projections group two tool results before their feedback" {
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[5].role);
 }
 
-test "execution replay context and token estimate include permission feedback" {
-    const alloc = std.testing.allocator;
+test "execution token estimate includes permission feedback" {
     var feedback = [_][]u8{@constCast("read it after writing")};
     var with_feedback_results = [_]PersistedToolResult{.{
         .tool_call_id = @constCast("call_feedback"),
@@ -4078,10 +4022,6 @@ test "execution replay context and token estimate include permission feedback" {
     const with_feedback = ExecutionMemory{ .tool_steps = with_feedback_steps[0..] };
     const without_feedback = ExecutionMemory{ .tool_steps = without_feedback_steps[0..] };
 
-    const context = (try formatExecutionReplayContext(alloc, with_feedback)).?;
-    defer alloc.free(context);
-    try std.testing.expect(std.mem.find(u8, context, "wrote note.txt") != null);
-    try std.testing.expect(std.mem.find(u8, context, "read it after writing") != null);
     try std.testing.expect(estimateExecutionTokens(with_feedback) > estimateExecutionTokens(without_feedback));
 }
 

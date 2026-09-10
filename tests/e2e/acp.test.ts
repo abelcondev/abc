@@ -1787,6 +1787,80 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP session/load replays structured tool call frames",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-load-tool-replay-");
+      writeFileSync(join(root.workspace, "replay-note.txt"), "ACP_LOAD_REPLAY_CONTENT\n");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("replay_call_1", "read_file", { path: "replay-note.txt" }),
+        finalText("ACP_LOAD_REPLAY_ANSWER"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        const prompt = await runPrompt(client, "Read replay-note.txt for me.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 91,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const replay: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 91) break;
+          replay.push(message);
+        }
+        const updates = replay
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update);
+
+        const announce = updates.find((update) =>
+          update.sessionUpdate === "tool_call" && update.toolCallId === "replay_call_1"
+        );
+        expect(announce).toBeDefined();
+        expect(announce.name).toBe("read_file");
+        expect(announce.kind).toBe("read");
+        expect(announce.rawInput).toEqual({ path: "replay-note.txt" });
+
+        const finish = updates.find((update) =>
+          update.sessionUpdate === "tool_call_update" && update.toolCallId === "replay_call_1"
+        );
+        expect(finish?.status).toBe("completed");
+        expect(JSON.stringify(finish?.content)).toContain("ACP_LOAD_REPLAY_CONTENT");
+
+        expect(updates.some((update) =>
+          update.sessionUpdate === "user_message_chunk" &&
+          JSON.stringify(update).includes("Read replay-note.txt")
+        )).toBe(true);
+        expect(updates.some((update) =>
+          update.sessionUpdate === "agent_message_chunk" &&
+          JSON.stringify(update).includes("ACP_LOAD_REPLAY_ANSWER")
+        )).toBe(true);
+        expect(JSON.stringify(replay)).not.toContain("Previous tool execution");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
@@ -1844,8 +1918,9 @@ describe("acp: model-independent", () => {
         expect(loadUpdates).toContain(
           "Preserve this ACP prompt across a process restart.",
         );
-        expect(loadUpdates).toContain("Previous tool execution:");
-        expect(loadUpdates).toContain("Tool read_file (success):");
+        expect(loadUpdates).toContain("\"sessionUpdate\":\"tool_call\"");
+        expect(loadUpdates).toContain("\"sessionUpdate\":\"tool_call_update\"");
+        expect(loadUpdates).toContain("recovery_read_1");
         expect(occurrenceCount(loadUpdates, toolEvidence)).toBe(1);
         expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
 
@@ -7086,6 +7161,30 @@ describe("acp: model-independent", () => {
         }
 
         expect(loadResponse.error).toBeUndefined();
+        const replayedToolCalls = loadMessages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "tool_call"
+          )
+          .map((message) => message.params.update);
+        const replayedToolUpdates = loadMessages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "tool_call_update"
+          )
+          .map((message) => message.params.update);
+        expect(replayedToolCalls).toHaveLength(1);
+        expect(replayedToolCalls[0]).toMatchObject({
+          toolCallId: "history_read_1",
+          name: "read_file",
+          kind: "read",
+          status: "pending",
+          rawInput: { path: "fixture.txt" },
+        });
+        expect(replayedToolUpdates).toHaveLength(1);
+        expect(replayedToolUpdates[0].toolCallId).toBe("history_read_1");
+        expect(replayedToolUpdates[0].status).toBe("completed");
+        expect(JSON.stringify(replayedToolUpdates[0].content)).toContain("ACP_HISTORY_EVIDENCE");
         const replayedText = loadMessages
           .filter((message) =>
             message.method === "session/update" &&
@@ -7093,11 +7192,9 @@ describe("acp: model-independent", () => {
           )
           .map((message) => message.params.update.content.text);
         expect(replayedText).toEqual([
-          expect.stringContaining("Previous tool execution:"),
           "ACP load replay complete.",
         ]);
-        expect(replayedText[0]).toContain("Tool read_file (success):");
-        expect(replayedText[0]).toContain("ACP_HISTORY_EVIDENCE");
+        expect(JSON.stringify(loadMessages)).not.toContain("Previous tool execution:");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
