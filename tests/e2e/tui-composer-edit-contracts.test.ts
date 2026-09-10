@@ -264,7 +264,7 @@ async function selectReviewSkill(
   selectWorkspace = false,
 ): Promise<void> {
   await active.sendLiteralText("$review");
-  await active.waitForText("Enter Use", TIMEOUT);
+  await active.waitForText("enter use", TIMEOUT);
   if (selectWorkspace) await active.sendKeys("Down");
   await active.sendKeys("Enter");
 }

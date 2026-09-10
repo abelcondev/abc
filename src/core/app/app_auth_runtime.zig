@@ -112,7 +112,7 @@ pub fn Runtime(comptime App: type) type {
                         try writeAuthNotice(app, .{
                             .topic = "auth",
                             .tone = .@"error",
-                            .body = "Could not load authentication settings. Check user settings, then press Enter to retry.",
+                            .body = "Could not load authentication settings. Check user settings, then press enter to retry.",
                         });
                         return false;
                     };
@@ -1115,7 +1115,7 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "provider",
                 .tone = .neutral,
-                .body = "Provider preparation is still in progress. Ctrl+C cancels.",
+                .body = "Provider preparation is still in progress. ctrl+c cancels.",
             }, true);
             return true;
         }
@@ -1889,17 +1889,17 @@ pub fn Runtime(comptime App: type) type {
             return switch (failure.reason) {
                 .invalid_credential => std.fmt.allocPrint(
                     alloc,
-                    "{s} sign-in expired.\nPress Enter to sign in again. Your prompt is saved.",
+                    "{s} sign-in expired.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
                 .invalid_storage => std.fmt.allocPrint(
                     alloc,
-                    "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press Enter to retry. Your prompt is saved.",
+                    "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
                 .persistence_uncertain => std.fmt.allocPrint(
                     alloc,
-                    "{s} refresh could not be saved.\nPress Enter to sign in again. Your prompt is saved.",
+                    "{s} refresh could not be saved.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
                 .authority_changed => std.fmt.allocPrint(
@@ -1909,7 +1909,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .temporary_unavailable => std.fmt.allocPrint(
                     alloc,
-                    "{s} credential refresh failed.\nPress Enter to retry. Your prompt is saved.",
+                    "{s} credential refresh failed.\npress enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
             };
@@ -3300,7 +3300,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Press Enter to retry.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to retry.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
@@ -3354,7 +3354,7 @@ test "prompt credential admission rejects a credential that remains unavailable"
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Press Enter to sign in again.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to sign in again.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(!app.auth.picker_opened);
 }
@@ -3463,7 +3463,7 @@ test "compaction credential failure preserves the first ordinary recovery notice
     try std.testing.expect(!try runtime.recoverCredentialFailure(&app, .fx_login, error.OAuthRequestFailed));
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings(
-        "fx login credential refresh failed.\nPress Enter to retry. Your prompt is saved.",
+        "fx login credential refresh failed.\npress enter to retry. Your prompt is saved.",
         app.transcript.items,
     );
     try std.testing.expectEqualStrings("keep this ordinary prompt", app.submission.pending.?.draft.prompt);

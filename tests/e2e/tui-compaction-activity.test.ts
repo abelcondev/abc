@@ -218,9 +218,9 @@ async function assertSilent(terminal: InstanceType<typeof TmuxSession>, root: st
   expect(inline.length).toBeGreaterThan(0);
   expect(inline).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
-  await terminal.waitForText("Full detail", 5000);
+  await terminal.waitForText("full detail", 5000);
   await terminal.sendKeys("End");
-  const full = await terminal.waitForPane((pane) => pane.includes("Full detail"), 5000);
+  const full = await terminal.waitForPane((pane) => pane.includes("full detail"), 5000);
   writeFileSync(join(root, `${label}.full-transcript.txt`), full);
   expect(full).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
@@ -257,7 +257,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.counts().ordinary).toBe(f.seedTurns + (trigger === "overflow" ? 1 : 0));
         if (trigger === "manual") {
           await terminal.sendKeys("C-o");
-          await terminal.waitForText("Full detail", 5000);
+          await terminal.waitForText("full detail", 5000);
           expect(await terminal.capturePane()).not.toMatch(COMPACTION_OUTPUT);
           await terminal.sendKeys("C-o");
           await terminal.waitForText(ACTIVITY, 5000);
@@ -398,7 +398,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
 
         const reopened = await f.launch();
         await reopened.sendKeys("C-o");
-        await reopened.waitForText("Full detail", 5000);
+        await reopened.waitForText("full detail", 5000);
         await reopened.sendKeys("End");
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
@@ -429,9 +429,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const authMessage = "fx needs access to Vercel AI Gateway";
       async function authNotices(label: string) {
         await terminal.sendKeys("C-o");
-        await terminal.waitForText("Full detail", 5000);
+        await terminal.waitForText("full detail", 5000);
         await terminal.sendKeys("End");
-        const pane = await terminal.waitForPane((text) => text.includes("Full detail") && text.includes(authMessage), 5000);
+        const pane = await terminal.waitForPane((text) => text.includes("full detail") && text.includes(authMessage), 5000);
         writeFileSync(join(f.root, `${label}.txt`), pane);
         await terminal.sendKeys("C-o");
         await terminal.waitForComposer(5000);

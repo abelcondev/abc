@@ -1141,8 +1141,8 @@ test "MCP menu stays inline across the VT width matrix and restores the composer
         try expectGridContains(&h, "MCP 0");
         try expectGridContains(&h, "[Tools]");
         try expectGridContains(&h, "mcp_fixture_read_resource");
-        try expectGridContains(&h, "Tab");
-        try expectGridContains(&h, "Esc");
+        try expectGridContains(&h, "tab");
+        try expectGridContains(&h, "esc");
 
         ctx.mcp_menu = .{
             .state = .{
@@ -1158,7 +1158,7 @@ test "MCP menu stays inline across the VT width matrix and restores the composer
         try h.flush();
         try expectGridContains(&h, "untrusted content");
         try expectGridContains(&h, "RESOURCE_TEXT:");
-        try expectGridContains(&h, "I Insert");
+        try expectGridContains(&h, "i insert");
 
         ctx.mcp_menu = .{};
         h.frame_redraw = true;
@@ -1166,7 +1166,7 @@ test "MCP menu stays inline across the VT width matrix and restores the composer
         try h.flush();
         try expectGridContains(&h, "MCP menu transcript remains visible");
         try expectGridNotContains(&h, "[Resources]");
-        try expectGridNotContains(&h, "I Insert");
+        try expectGridNotContains(&h, "i insert");
     }
 }
 
@@ -4647,7 +4647,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try expectGridContains(&h, "Tests passed");
     try expectGridNotContains(&h, "│ visible");
     try expectGridNotContains(&h, "│ hidden");
-    try expectGridNotContains(&h, "ctrl o to view");
+    try expectGridNotContains(&h, "ctrl+o to view");
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
 
@@ -4680,7 +4680,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try expectGridContains(&h, "Tests passed");
     try expectGridNotContains(&h, "│ visible");
     try expectGridNotContains(&h, "│ hidden");
-    try expectGridNotContains(&h, "ctrl o to view");
+    try expectGridNotContains(&h, "ctrl+o to view");
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
     try std.testing.expect(h.shell.replaceable_start <= h.shell.transcript.items.len);
@@ -6229,11 +6229,11 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 35 · Type to filter");
+    try expectGridContains(&h, "Commands 35 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
-    try expectGridContains(&h, "↑↓ Navigate     Enter Use     Esc Close");
+    try expectGridContains(&h, "↑↓ navigate     enter use     esc close");
 
     input.picker.slash_completion_index = 6;
     h.frame_redraw = true;
@@ -6251,7 +6251,7 @@ test "slash main page renders header categories selection range and contextual c
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
     try expectGridNotContains(&h, "Commands 35");
-    try expectGridNotContains(&h, "↑↓ Navigate");
+    try expectGridNotContains(&h, "↑↓ navigate");
 }
 
 test "slash main page drops categories and ellipsizes descriptions when narrow" {

@@ -961,7 +961,7 @@ describe("gateway stream lifecycle", () => {
       expect(mixed).toContain("Could not load status-duplicate");
       expect(mixed).toContain("ambiguous");
       expect(mixed).toMatch(/^└ Could not load status-duplicate/m);
-      expect(mixed.replace(/\s+/g, " ")).toContain("ctrl o");
+      expect(mixed.replace(/\s+/g, " ")).toContain("ctrl+o");
       expect(mixed).not.toContain("duplicate-a");
       expect(mixed).not.toContain("duplicate-b");
       expect(mixed).not.toContain("Loaded skill status-duplicate");
@@ -1610,7 +1610,7 @@ describe("gateway stream lifecycle", () => {
         expect(full).not.toContain("[context]");
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
-          row.includes("┃ Full detail · ctrl o close")
+          row.includes("┃ full detail · ctrl+o close")
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");

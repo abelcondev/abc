@@ -158,7 +158,7 @@ pub fn Runtime(comptime App: type) type {
 
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl o to view)", .{summary_lead});
+            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
@@ -1035,7 +1035,7 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
@@ -1051,6 +1051,6 @@ test "app_bootstrap_runtime collapses config diagnostics into one neutral summar
 
     try runBootstrapForTest(&app, &capture);
 
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
 }

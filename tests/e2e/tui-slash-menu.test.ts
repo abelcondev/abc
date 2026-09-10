@@ -155,7 +155,7 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("←→ Change") &&
+      pane.includes("←→ change") &&
       (pane.includes("Settings") || pane.includes("Status line context"))
     ) return latest;
     await Bun.sleep(100);
@@ -212,8 +212,8 @@ async function waitForStatuslineMenu(
     const pane = latest.join("\n");
     if (
       pane.includes("Status line") &&
-      pane.includes("↑↓ Navigate") &&
-      pane.includes("←→ Change") &&
+      pane.includes("↑↓ navigate") &&
+      pane.includes("←→ change") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);
@@ -229,7 +229,7 @@ async function waitForUsageMenu(session: TmuxSession): Promise<string[]> {
     const pane = latest.join("\n");
     if (
       pane.includes("[30 days]") &&
-      pane.includes("Esc Close") &&
+      pane.includes("esc close") &&
       !pane.includes("Loading usage")
     ) return latest;
     await Bun.sleep(100);
@@ -247,7 +247,7 @@ async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
       pane.includes("Workspace") &&
       pane.includes("Additional directories") &&
       pane.includes("Add directory…") &&
-      pane.includes("Enter Use")
+      pane.includes("enter use")
     ) return latest;
     await Bun.sleep(100);
   }
@@ -602,7 +602,7 @@ function composerRow(grid: string[]): number {
 function footerStatusRow(grid: string[]): number {
   return lastRowMatching(
     grid,
-    (line) => line.includes("gpt-5") || line.includes("↑↓ Navigate"),
+    (line) => line.includes("gpt-5") || line.includes("↑↓ navigate"),
   );
 }
 
@@ -751,7 +751,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       await session.waitForText(
-        "Skills: 1 discovery issue; some skills may be missing (ctrl o to view)",
+        "Skills: 1 discovery issue; some skills may be missing (ctrl+o to view)",
         10_000,
       );
       await session.waitForComposer(10_000);
@@ -1252,7 +1252,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
       expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
       expect(modelRow).toContain("Model");
-      expect(scrolledGrid.join("\n")).toContain("↑↓ Navigate     Enter Use     Esc Close");
+      expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -1298,7 +1298,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
         5_000,
       );
       await session.sendLiteralText("/m");
@@ -1451,12 +1451,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await Bun.sleep(100);
       let pane = await session.capturePane();
       expect(composerContains(pane, "/hezzzzz")).toBe(true);
-      expect(pane).not.toContain("Enter Use");
+      expect(pane).not.toContain("enter use");
       expect(pane).not.toContain("no matching slash commands");
 
       for (let index = 0; index < 5; index++) await session.sendKeys("BSpace");
       await session.waitForPane(
-        (current) => composerContains(current, "/he") && current.includes("Enter Use"),
+        (current) => composerContains(current, "/he") && current.includes("enter use"),
         5_000,
       );
 
@@ -1470,7 +1470,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await Bun.sleep(100);
       pane = await session.capturePane();
       expect(pane).not.toContain("no matching slash commands");
-      expect(pane).not.toContain("Enter Use");
+      expect(pane).not.toContain("enter use");
 
       await session.sendKeys("C-u");
       await session.sendLiteralText("/name");
@@ -1488,7 +1488,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Enter");
       pane = await session.waitForText("Commands", 5_000);
       expect(pane).toContain("/help");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("enter open");
 
       await session.sendKeys("Escape");
       await session.waitForPane(
@@ -1500,7 +1500,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "/resume") &&
           !current.includes("resume-helper") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
       expect(pane).not.toContain("no matching slash commands");
@@ -1532,12 +1532,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await session.pasteText("\n   ");
       await session.sendLiteralText("/resume-helper");
-      await session.waitForText("Enter Use", 5_000);
+      await session.waitForText("enter use", 5_000);
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
         (current) =>
           current.includes("resume-helper") &&
-          !current.includes("Enter Use") &&
+          !current.includes("enter use") &&
           !current.includes("fx needs access to Vercel AI Gateway"),
         5_000,
       );
@@ -1584,9 +1584,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
 
       await session.sendKeys("Tab");
       grid = await waitForHelpMenu(session, 5);
@@ -1638,7 +1638,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Enter Open"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("enter open"),
         5_000,
       );
 
@@ -1687,10 +1687,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Settings");
       expect(pane).toContain("Interface");
       expect(pane).toContain("[All]");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("←→ Change");
-      expect(pane).toContain("Esc Close");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("←→ change");
+      expect(pane).toContain("esc close");
       expect(pane).not.toContain("Enter Change");
 
       expect(pane).not.toContain("Input appearance");
@@ -1712,7 +1712,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("workspace-statusline-visible") &&
-          !current.includes("←→ Change"),
+          !current.includes("←→ change"),
         5_000,
       );
       expect(capturePaneHistory(session, -1000)).not.toContain("● Settings:");
@@ -1765,7 +1765,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Status line context");
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -1815,8 +1815,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("off  on");
       expect(pane).not.toContain("❯");
       expect(pane).not.toContain("Choose what appears");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("←→ Change");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("←→ change");
 
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
@@ -1844,7 +1844,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("compact-statusline-workspace") &&
-          !current.includes("←→ Change"),
+          !current.includes("←→ change"),
         5_000,
       );
       expect(session.isAlive()).toBe(true);
@@ -2058,7 +2058,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       await session.waitForText(
-        "Usage unavailable · press R to retry",
+        "Usage unavailable · press r to retry",
         TIMEOUT,
       );
 
@@ -2136,17 +2136,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       let pane = await session.waitForText(
-        "Usage unavailable · press R to retry",
+        "Usage unavailable · press r to retry",
         TIMEOUT,
       );
       expect(pane).toContain("[30 days]");
 
       await session.sendKeys("Left");
       pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press R to retry");
+      expect(pane).toContain("Usage unavailable · press r to retry");
       await session.sendKeys("Left");
       pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press R to retry");
+      expect(pane).toContain("Usage unavailable · press r to retry");
       await session.sendKeys("Left");
       pane = await session.waitForText("[Session]", TIMEOUT);
       expect(pane).toMatch(/0 tokens/);
@@ -2370,7 +2370,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (current) =>
           composerContains(current, "/workspace add") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
 
@@ -2382,7 +2382,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       pane = await session.waitForPane(
         (current) =>
           composerContains(current, `/workspace remove ${sharedRoot}`) &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
       expect(composerContains(pane, `/workspace remove ${sharedRoot}`)).toBe(true);
@@ -2442,8 +2442,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("fx · Global");
       expect(pane).toContain("workspace-menu");
       expect(pane).toContain("fx · Workspace");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Enter Use");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("enter use");
 
       const deep_history = capturePaneHistory(session, -1000);
       const tail_history = capturePaneHistory(session, -80);
@@ -2466,7 +2466,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
-          !current.includes("↑↓ Navigate"),
+          !current.includes("↑↓ navigate"),
         5_000,
       );
 
@@ -2484,7 +2484,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "$work") &&
           current.includes("𝒇x") &&
-          !current.includes("↑↓ Navigate"),
+          !current.includes("↑↓ navigate"),
         5_000,
       );
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeDollar);
@@ -2537,7 +2537,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           composerContains(current, "explain $manzzzzzz") &&
           !current.includes("Skills ") &&
           !current.includes("No skills found.") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
 
@@ -2639,7 +2639,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await session.capturePaneGrid();
       expect(composerContains(grid.join("\n"), "workspace-menu")).toBe(true);
       expect(grid.join("\n")).toContain("𝒇x");
-      expect(grid.join("\n")).not.toContain("↑↓ Navigate");
+      expect(grid.join("\n")).not.toContain("↑↓ navigate");
       expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
       expect(session.isAlive()).toBe(true);
 
@@ -2657,7 +2657,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(codexPane).toContain("Codex · Global");
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
@@ -2668,7 +2668,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Enter Open"),
+        (current) => hasEmptyComposer(current) && !current.includes("enter open"),
         5_000,
       );
 
@@ -2679,7 +2679,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -2691,7 +2691,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Enter Resume"),
+        (current) => hasEmptyComposer(current) && !current.includes("enter resume"),
         5_000,
       );
 
@@ -2765,7 +2765,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       await session.sendKeys("C-u");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2848,7 +2848,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(await session.captureFullScrollback()).not.toContain(`● Model: ${currentModel}`);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Tab Provider"),
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
         5_000,
       );
 
@@ -2858,7 +2858,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "/model") &&
           current.includes(currentModel) &&
-          !current.includes("Tab Provider"),
+          !current.includes("tab provider"),
         5_000,
       );
       expect(stagedPane).not.toContain("Models 4");
@@ -2902,8 +2902,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Authenticated model catalog loaded.");
       expect(pane).not.toContain("Current");
       expect(pane).not.toContain("Reasoning");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Provider");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab provider");
 
       await session.sendKeys("Tab");
       grid = await waitForModelsMenu(session, 1);
@@ -2924,7 +2924,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Tab Provider"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("tab provider"),
         5_000,
       );
 
@@ -3193,11 +3193,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-x");
 
       const grid = await waitForSkillsMenu(session, 4);
-      expect(grid.join("\n")).toContain("↑↓ Navigate");
+      expect(grid.join("\n")).toContain("↑↓ navigate");
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
       await session.sendHexBytes(["1b", "18"]);
@@ -3240,7 +3240,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (pane) => pane.includes("Generating") && !pane.includes("↑↓ Navigate"),
+        (pane) => pane.includes("Generating") && !pane.includes("↑↓ navigate"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -3285,14 +3285,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForHeldSkillStream(stream);
       await session.waitForText("Generating", 10_000);
       await session.sendLiteralText("/he");
-      await session.waitForText("Esc Close", 10_000);
+      await session.waitForText("esc close", 10_000);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
         (pane) =>
           pane.includes("Generating") &&
           pane.includes("/he") &&
-          !pane.includes("Esc Close"),
+          !pane.includes("esc close"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -3352,7 +3352,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       releaseApproval();
       await session.waitForText("catalog-approval.txt", 10_000);
-      expect(await session.capturePane()).not.toContain("↑↓ Navigate");
+      expect(await session.capturePane()).not.toContain("↑↓ navigate");
 
       await session.sendKeys("3");
       let grid = await waitForSkillsMenu(session, 4);
@@ -3556,7 +3556,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       const diagnosticSummary =
-        "Skills: 1 discovery issue; some skills may be missing (ctrl o to view)";
+        "Skills: 1 discovery issue; some skills may be missing (ctrl+o to view)";
       await session.waitForText(diagnosticSummary, 10_000);
       await session.waitForComposer(10_000);
       expect(await session.captureFullScrollback()).not.toContain(

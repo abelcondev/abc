@@ -1126,10 +1126,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         env,
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("[Esc] Dismiss remaining prompts", 10_000);
+      await tui.waitForText("[esc] dismiss remaining prompts", 10_000);
       await tui.pasteText("2");
       await Bun.sleep(250);
-      expect((await tui.capturePane())).toContain("[2] Approve all");
+      expect((await tui.capturePane())).toContain("[2] approve all");
       expect(existsSync(root.launchLogPath)).toBe(false);
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .not.toContain("enableAllProjectMcpServers");

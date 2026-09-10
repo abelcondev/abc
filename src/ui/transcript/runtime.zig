@@ -2375,7 +2375,7 @@ test "nonzero streamed command reuses its active output block" {
     );
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-5") == null);
-    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 2 lines more (ctrl o to view)") != null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 2 lines more (ctrl+o to view)") != null);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, projection.bytes.items, "│ exit code 7"),

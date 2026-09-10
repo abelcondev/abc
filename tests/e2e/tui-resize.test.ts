@@ -1069,7 +1069,7 @@ function findInlineSkillsPicker(
   if (!isInputRow(grid[input]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
-  if (!grid[bottomDivider + 1]!.includes("Esc Close")) return null;
+  if (!grid[bottomDivider + 1]!.includes("esc close")) return null;
   return {
     input,
     topDivider: header - 1,
@@ -1088,7 +1088,7 @@ function findInlineHelpPicker(
   if (!isInputRow(grid[input]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
-  if (!grid[bottomDivider + 1]!.includes("Enter Open")) return null;
+  if (!grid[bottomDivider + 1]!.includes("enter open")) return null;
   return {
     input,
     topDivider: header - 1,
@@ -1235,7 +1235,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
       const grid = pane.split("\n");
       return (
         pane.includes("𝒇x") &&
-        !pane.includes("↑↓ Navigate") &&
+        !pane.includes("↑↓ navigate") &&
         findFooter(grid) !== null
       );
     }, 5_000);
@@ -1412,7 +1412,7 @@ async function runRapidSkillResizeAttempt(
       (pane) => {
         const grid = pane.replace(/\n$/, "").split("\n");
         return pane.includes("𝒇x") &&
-          !pane.includes("↑↓ Navigate") &&
+          !pane.includes("↑↓ navigate") &&
           findFooter(grid) !== null;
       },
       5_000,
@@ -2608,7 +2608,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 35 · Type to filter");
+      expect(shrinkStage).toContain("Commands 35 · type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2777,12 +2777,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "help",
       width: 72,
       height: 16,
-      surfaceMarker: "Enter Open",
+      surfaceMarker: "enter open",
       editedInput: "x",
       async openSurface(active) {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
-        await active.waitForText("Enter Open", TIMEOUT);
+        await active.waitForText("enter open", TIMEOUT);
       },
     },
     {
@@ -3267,11 +3267,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       }
 
       await session.resizeWindow(80, 17, 500);
-      pane = await session.waitForText("1–3 Choose", 5_000);
+      pane = await session.waitForText("1–3 choose", 5_000);
       expect(pane).toContain(FILE_APPROVAL_QUESTION);
       expect(pane).toContain("resize-approved.txt");
       expect(pane).toContain("+ preview-nine");
-      expect(pane).toContain("Wheel Scroll");
+      expect(pane).toContain("wheel scroll");
       expect(pane).not.toContain("omitted");
       fullBlock = findActiveFileApprovalBlock(await session.capturePaneGrid());
       expect(fullBlock).not.toBeNull();
@@ -3593,7 +3593,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
+      await session.waitForPane((pane) => !pane.includes("enter open"), 5_000);
       await session.waitForStableComposer(5_000);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(5_000)).toBe(true);
@@ -3627,7 +3627,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+        (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
         5_000,
       );
       const restored = captureScrollback();
@@ -4174,7 +4174,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
         await session.sendKeys("Escape");
         await session.waitForPane(
-          (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+          (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
           5_000,
         );
         const scrollback = await session.captureFullScrollback();

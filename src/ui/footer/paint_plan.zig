@@ -1011,7 +1011,7 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .full => "Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
+        .full => "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
         .inline_mode => unreachable,
     };
 
@@ -1331,7 +1331,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1365,7 +1365,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
     );
 }
 
@@ -1853,7 +1853,7 @@ test "approval footer composition hides cursor while rendering command prompt" {
         if (std.mem.find(u8, row.text.items, "3. No") != null) {
             choice_three_row = row.row;
         }
-        if (std.mem.find(u8, row.text.items, "1–3 Choose") != null) {
+        if (std.mem.find(u8, row.text.items, "1–3 choose") != null) {
             controls_row = row.row;
             controls_count += 1;
             try std.testing.expect(std.mem.find(u8, row.text.items, "gpt-5.1") == null);

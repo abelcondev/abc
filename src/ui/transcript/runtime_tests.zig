@@ -8925,7 +8925,7 @@ test "command output state keeps one authoritative folded hint" {
     try expectRawEntryBytes(
         &runtime,
         old_hint_entry_id,
-        "│ … 1 line more (ctrl o to view)",
+        "│ … 1 line more (ctrl+o to view)",
     );
 
     try runtime.writeCommandOutputChunk(
@@ -8943,7 +8943,7 @@ test "command output state keeps one authoritative folded hint" {
     try expectRawEntryBytes(
         &runtime,
         old_hint_entry_id,
-        "│ … 1 line more (ctrl o to view)",
+        "│ … 1 line more (ctrl+o to view)",
     );
     try expectRawEntryBytes(&runtime, newest_entry_id, "");
 
@@ -9055,7 +9055,7 @@ test "command output folding preserves rows between noncontiguous live rows" {
     try std.testing.expect(before_pos < intervening_pos);
     try std.testing.expect(intervening_pos < after_pos);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "command-visible-1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "ctrl o to view") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "ctrl+o to view") == null);
     try std.testing.expectEqual(@as(usize, 6), runtime.command_output_blocks.items[0].lines.items.len);
 }
 
@@ -9164,7 +9164,7 @@ test "production command pruning preserves deferred replay around a notice" {
     try std.testing.expect(compact_notice_pos < compact.bytes.len);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "output-0") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "output-1") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "ctrl o to view") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "ctrl+o to view") == null);
 
     runtime.full_transcript.depth = .full;
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
@@ -9539,7 +9539,7 @@ test "command output display caps at five physical rows" {
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, projection.bytes.items, "│ line-"));
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-5") == null);
-    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 21 lines more (ctrl o to view)") != null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 21 lines more (ctrl+o to view)") != null);
 }
 
 test "structured retention prunes old raw transcript entries past cap" {
@@ -9680,7 +9680,7 @@ test "hidden command output becomes count-only at the hard cap" {
     try std.testing.expectEqual(@as(usize, 8), block.total_lines);
     const expected_summary = try std.fmt.allocPrint(
         alloc,
-        "│ … {d} lines more (ctrl o to view)",
+        "│ … {d} lines more (ctrl+o to view)",
         .{block.total_lines - @min(@as(usize, 5), block.lines.items.len)},
     );
     defer alloc.free(expected_summary);
