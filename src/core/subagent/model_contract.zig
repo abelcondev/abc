@@ -173,7 +173,7 @@ fn validateText(
 }
 
 pub const Kind = enum { one_off, persistent };
-pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
+pub const Phase = @import("child_state.zig").Phase;
 pub const Snapshot = struct {
     kind: Kind,
     phase: Phase,
@@ -189,6 +189,7 @@ pub const Plan = union(enum) {
     create_one_off,
     create_persistent,
     continue_persistent,
+    steer_persistent,
     reject: RejectCode,
 };
 
@@ -199,7 +200,10 @@ pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
             .one_off => .{ .reject = .child_not_persistent },
             .persistent => switch (child.phase) {
                 .idle, .interrupted => .continue_persistent,
-                .running, .awaiting_approval => .{ .reject = .child_busy },
+                .running, .awaiting_approval => if (request.message.instructions != null)
+                    .{ .reject = .child_busy }
+                else
+                    .steer_persistent,
                 .finished => .{ .reject = .child_unavailable },
             },
         } else .create_persistent,
@@ -258,7 +262,21 @@ pub const Result = struct {
     pending: bool = false,
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
+    delivery: ?types.SteeringDelivery = null,
 };
+
+pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
+    return .{
+        .ok = delivery != .not_applied,
+        .delivery = delivery,
+        .result = switch (delivery) {
+            .queued => "Feedback queued for the running child. Its result will arrive automatically.",
+            .applied => "Feedback consumed at the child's safe boundary. This is not a task-completion result.",
+            .not_applied => "Feedback was not applied before the child stopped.",
+        },
+        .error_code = if (delivery == .not_applied) "feedback_not_applied" else null,
+    };
+}
 
 pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -273,6 +291,7 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
         if (result.error_code) |code| code[0..@min(code.len, max_error_code_bytes)] else null,
     );
     if (result.pending) try out.writer.writeAll(",\"pending\":true");
+    if (result.delivery) |delivery| try out.writer.print(",\"delivery\":\"{s}\"", .{@tagName(delivery)});
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -288,7 +307,6 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".fields.len);
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Plan).@"union".fields.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);
     try std.testing.expectEqual(Action.run, run.action());
@@ -398,7 +416,7 @@ test "creation overrides validate and participate in operation identity" {
     );
 }
 
-test "persistent planning derives continue and busy" {
+test "persistent planning derives continuation steering and busy overlay changes" {
     const alloc = std.testing.allocator;
     var message = try validateRequest(alloc, .{ .message = .{
         .agent = "reviewer",
@@ -410,7 +428,9 @@ test "persistent planning derives continue and busy" {
         plan(message, .{ .kind = .persistent, .phase = .idle }),
     );
     const busy = plan(message, .{ .kind = .persistent, .phase = .running });
-    try std.testing.expectEqual(RejectCode.child_busy, busy.reject);
+    try std.testing.expect(busy == .steer_persistent);
+    message.message.instructions = try alloc.dupe(u8, "new overlay");
+    try std.testing.expectEqual(RejectCode.child_busy, plan(message, .{ .kind = .persistent, .phase = .running }).reject);
 }
 
 test "terminal result omits scheduler identities and phases" {

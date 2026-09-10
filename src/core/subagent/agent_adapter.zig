@@ -391,6 +391,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeChildSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
@@ -429,6 +430,17 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn takeChildSteeringBoundary(
+    raw: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return if (kind == .cancelled) .interrupt else .none;
+    return context.turn.workerRuntime().takeSteeringBoundaryInto(context.turn.alloc, arena, turn_id, kind);
 }
 
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {

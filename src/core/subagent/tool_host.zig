@@ -18,6 +18,7 @@ const session_codec = @import("../session/session_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
+const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -92,8 +93,8 @@ pub const Runtime = struct {
     yielded_mutex: std.Io.Mutex = .init,
     yielded: std.ArrayList(YieldedWork) = .empty,
 
-    const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, body: ?[]u8 = null, delivered: bool = false };
-    pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool };
+    const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
+    pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
 
     /// Returns a host only after abandoned child work has been recovered.
     /// Borrows the store and callback contexts until deinit.
@@ -226,44 +227,86 @@ pub const Runtime = struct {
                         .error_code = "caller_unavailable",
                     });
                 }
-                var admitted = try self.admitManagedWork(
-                    alloc,
-                    request.*,
-                    operation_id,
-                    options,
-                );
-                defer admitted.deinit(alloc);
-                switch (admitted) {
-                    .rejected => |failure| {
-                        break :blk self.encodeManaged(alloc, .{
-                            .ok = false,
-                            .error_code = failure.code,
+                var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer admission_arena.deinit();
+                var queued_receipt: ?ManagedExecutionResult = null;
+                defer if (queued_receipt) |queued| alloc.free(queued.body);
+                while (true) {
+                    _ = admission_arena.reset(.retain_capacity);
+                    const admission_alloc = admission_arena.allocator();
+                    if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+                    if (self.managed.feedbackReplay(operation_id, model_contract.requestFingerprint(request.*))) |replay| {
+                        break :blk try self.encodeManaged(alloc, switch (replay) {
+                            .receipt => |delivery| model_contract.feedbackResult(delivery),
+                            else => .{ .ok = false, .error_code = "operation_conflict" },
                         });
-                    },
-                    .ready => |ready| {
-                        if (options.steering_worker != null) try self.retainYielded(ready.child_id, operation_id, options.max_result_bytes);
-                        _ = self.managed.start(ready.child_id) catch |err| {
-                            if (options.steering_worker != null) {
+                    }
+                    var admitted = try self.admitManagedWork(
+                        admission_alloc,
+                        request.*,
+                        operation_id,
+                        options,
+                    );
+                    defer admitted.deinit(admission_alloc);
+                    switch (admitted) {
+                        .feedback => |target| {
+                            // Allocate the receipt before handing any text to the worker.
+                            if (queued_receipt == null) queued_receipt = try self.encodeManaged(alloc, model_contract.feedbackResult(.queued));
+                            const result = try self.managed.steer(target.child_id, target.work_id, operation_id, model_contract.requestFingerprint(request.*), request.message.message);
+                            switch (result) {
+                                .receipt => |delivery| {
+                                    if (delivery == .queued) {
+                                        const queued = queued_receipt.?;
+                                        queued_receipt = null;
+                                        break :blk queued;
+                                    }
+                                    break :blk try self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
+                                },
+                                .waiting => {
+                                    io_mod.sleep(terminal_wait_pulse_ms * std.time.ns_per_ms);
+                                    continue;
+                                },
+                                .unavailable, .cancelled, .conflict, .capacity => break :blk try self.encodeManaged(alloc, .{
+                                    .ok = false,
+                                    .error_code = switch (result) {
+                                        .unavailable => "state_unavailable",
+                                        .cancelled => "child_cancelled",
+                                        .conflict => "operation_conflict",
+                                        .capacity => "feedback_capacity",
+                                        else => unreachable,
+                                    },
+                                }),
+                            }
+                        },
+                        .rejected => |failure| {
+                            break :blk self.encodeManaged(alloc, .{
+                                .ok = false,
+                                .error_code = failure.code,
+                            });
+                        },
+                        .ready => |ready| {
+                            try self.retainYielded(ready.child_id, operation_id, options.max_result_bytes, if (options.steering_worker != null) 64 else child_state.max_children);
+                            _ = self.managed.start(ready.child_id) catch |err| {
                                 debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ ready.child_id, operation_id, @errorName(err) });
                                 self.removeYielded(ready.child_id, operation_id);
-                            }
-                            return err;
-                        };
-                        const result = try self.observeManagedState(
+                                return err;
+                            };
+                            const result = try self.observeManagedState(
+                                alloc,
+                                ready.child_id,
+                                operation_id,
+                                options.cancel_flag,
+                                options.steering_worker,
+                            );
+                            break :blk result;
+                        },
+                        .completed => |completed| break :blk self.completeManagedResult(
                             alloc,
-                            ready.child_id,
+                            completed.child_id,
                             operation_id,
-                            options.cancel_flag,
-                            options.steering_worker,
-                        );
-                        break :blk result;
-                    },
-                    .completed => |completed| break :blk self.completeManagedResult(
-                        alloc,
-                        completed.child_id,
-                        operation_id,
-                        completed.observation,
-                    ),
+                            completed.observation,
+                        ),
+                    }
                 }
             },
         };
@@ -293,6 +336,7 @@ pub const Runtime = struct {
 
     const ManagedAdmission = union(enum) {
         ready: struct { child_id: []u8 },
+        feedback: struct { child_id: []u8, work_id: []u8 },
         completed: struct {
             child_id: []u8,
             observation: managed_owner.Observation,
@@ -305,6 +349,10 @@ pub const Runtime = struct {
         fn deinit(self: *ManagedAdmission, alloc: Allocator) void {
             switch (self.*) {
                 .ready => |ready| alloc.free(ready.child_id),
+                .feedback => |value| {
+                    alloc.free(value.child_id);
+                    alloc.free(value.work_id);
+                },
                 .completed => |completed| alloc.free(completed.child_id),
                 .rejected => |failure| if (failure.child_id) |child_id| {
                     alloc.free(child_id);
@@ -416,20 +464,18 @@ pub const Runtime = struct {
                             "override_after_create",
                         );
                     }
-                    if (self.hasYieldedChild(child.id)) return managedAdmissionRejected(alloc, child.id, "child_busy");
-                    switch (child.phase) {
-                        .running, .awaiting_approval => return managedAdmissionRejected(
-                            alloc,
-                            child.id,
-                            "child_busy",
-                        ),
-                        .finished => return managedAdmissionRejected(
-                            alloc,
-                            child.id,
-                            "child_unavailable",
-                        ),
-                        .idle, .interrupted => {},
+                    switch (model_contract.plan(request, .{ .kind = .persistent, .phase = child.phase })) {
+                        .steer_persistent => {
+                            const active_work = child.active orelse return managedAdmissionRejected(alloc, child.id, "state_unavailable");
+                            const id = try alloc.dupe(u8, child.id);
+                            errdefer alloc.free(id);
+                            return .{ .feedback = .{ .child_id = id, .work_id = try alloc.dupe(u8, active_work.id) } };
+                        },
+                        .reject => |code| return managedAdmissionRejected(alloc, child.id, @tagName(code)),
+                        .continue_persistent => {},
+                        .create_one_off, .create_persistent => unreachable,
                     }
+                    if (self.hasYieldedChild(child.id)) try self.capturePriorYielded(child.*);
                     const started = try registry.startPersistentWork(
                         alloc,
                         message.agent,
@@ -519,11 +565,13 @@ pub const Runtime = struct {
                     return error.Cancelled;
                 }
             }
+            if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
             const observation = self.managed.wait(child_id, .{
                 .clock = .awake,
                 .raw = .fromMilliseconds(terminal_wait_pulse_ms),
             }) catch |err| {
-                if (steering_worker != null and !self.managed.hasRunningChild(child_id)) {
+                if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
+                if (!self.managed.hasRunningChild(child_id)) {
                     // A timed-out observation can leave a completed slot to drain.
                     self.managed.cancelAndJoin(child_id);
                     debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=observation_failed_no_runner error={s}", .{ child_id, work_id, @errorName(err) });
@@ -538,6 +586,7 @@ pub const Runtime = struct {
                     },
                 });
             };
+            if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
             switch (observation.phase) {
                 .running, .awaiting_approval => {
                     if (steering_worker) |worker| {
@@ -553,7 +602,7 @@ pub const Runtime = struct {
                 .idle, .finished, .interrupted => {},
             }
             const result = try self.completeManagedResult(alloc, child_id, work_id, observation);
-            if (steering_worker != null) self.removeYielded(child_id, work_id);
+            self.removeYielded(child_id, work_id);
             return result;
         }
     }
@@ -565,11 +614,43 @@ pub const Runtime = struct {
         return false;
     }
 
-    fn retainYielded(self: *Runtime, child_id: []const u8, work_id: []const u8, max_result_bytes: usize) !void {
+    // Registry is held by admission. Preserve the old work's result before a
+    // newer generation can become observable through this child ID.
+    fn capturePriorYielded(self: *Runtime, child: child_state.Child) !void {
+        self.yielded_mutex.lockUncancelable(io_mod.getIo());
+        defer self.yielded_mutex.unlock(io_mod.getIo());
+        for (self.yielded.items) |*item| {
+            if (item.delivered or item.result != null or !std.mem.eql(u8, item.child_id, child.id)) continue;
+            if (!std.mem.eql(u8, item.work_id, child.last_work_id orelse return error.StaleWork)) return error.StaleWork;
+            item.result = try self.completeManagedResult(self.alloc, child.id, item.work_id, .{
+                .phase = child.phase,
+                .outcome = child.last_outcome,
+                .failure = child.last_failure,
+            });
+        }
+    }
+
+    fn takeCapturedResult(self: *Runtime, alloc: Allocator, child_id: []const u8, work_id: []const u8) !?ManagedExecutionResult {
+        self.yielded_mutex.lockUncancelable(io_mod.getIo());
+        defer self.yielded_mutex.unlock(io_mod.getIo());
+        for (self.yielded.items, 0..) |item, index| {
+            if (!std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
+            const stored = item.result orelse return null;
+            const result = ManagedExecutionResult{ .success = stored.success, .body = try alloc.dupe(u8, stored.body) };
+            _ = self.yielded.orderedRemove(index);
+            self.alloc.free(item.child_id);
+            self.alloc.free(item.work_id);
+            self.alloc.free(stored.body);
+            return result;
+        }
+        return null;
+    }
+
+    fn retainYielded(self: *Runtime, child_id: []const u8, work_id: []const u8, max_result_bytes: usize, capacity: usize) !void {
         self.yielded_mutex.lockUncancelable(io_mod.getIo());
         defer self.yielded_mutex.unlock(io_mod.getIo());
         for (self.yielded.items) |item| if (std.mem.eql(u8, item.work_id, work_id)) return;
-        if (self.yielded.items.len >= 64) return error.TooManyYieldedChildren;
+        if (self.yielded.items.len >= capacity) return error.TooManyYieldedChildren;
         const child = try self.alloc.dupe(u8, child_id);
         errdefer self.alloc.free(child);
         const work = try self.alloc.dupe(u8, work_id);
@@ -584,21 +665,36 @@ pub const Runtime = struct {
     pub fn prepareYielded(self: *Runtime, arena: Allocator) ![]YieldedResult {
         var results: std.ArrayList(YieldedResult) = .empty;
         for (self.yielded.items) |*item| {
-            if (item.body == null) {
+            if (item.result == null) {
                 const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
                 if (state.phase == .running or state.phase == .awaiting_approval) continue;
-                item.body = (try self.completeManagedResult(self.alloc, item.child_id, item.work_id, state)).body;
-                debug_trace.eventf("subagent", "steering_result_captured", .{}, "child_id={s} work_id={s} phase={s} result_bytes={d}", .{ item.child_id, item.work_id, @tagName(state.phase), item.body.?.len });
+                item.result = try self.completeManagedResult(self.alloc, item.child_id, item.work_id, state);
+                debug_trace.eventf("subagent", "steering_result_captured", .{}, "child_id={s} work_id={s} phase={s} result_bytes={d}", .{ item.child_id, item.work_id, @tagName(state.phase), item.result.?.body.len });
             }
             try results.append(arena, .{
                 .child_id = try arena.dupe(u8, item.child_id),
                 .work_id = try arena.dupe(u8, item.work_id),
-                .body = try arena.dupe(u8, item.body.?),
+                .body = try arena.dupe(u8, item.result.?.body),
                 .max_result_bytes = item.max_result_bytes,
                 .delivered = item.delivered,
             });
         }
+        for (try self.managed.feedbackUpdates(arena)) |update| {
+            try results.append(arena, .{
+                .child_id = update.child_id,
+                .work_id = update.operation_id,
+                .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
+                .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+                .delivered = false,
+                .receipt_sequence = @as(u64, @intFromEnum(update.delivery)) + 1,
+            });
+        }
         return results.toOwnedSlice(arena);
+    }
+
+    pub fn acknowledgeFeedback(self: *Runtime, child_id: []const u8, operation_id: []const u8, sequence: u64) void {
+        const delivery = std.enums.fromInt(types.SteeringDelivery, sequence -| 1) orelse return;
+        self.managed.acknowledgeFeedback(child_id, operation_id, delivery);
     }
 
     pub fn acknowledgeYielded(self: *Runtime, child_id: []const u8, work_id: []const u8) void {
@@ -618,7 +714,7 @@ pub const Runtime = struct {
             _ = self.yielded.orderedRemove(index);
             self.alloc.free(item.child_id);
             self.alloc.free(item.work_id);
-            if (item.body) |body| self.alloc.free(body);
+            if (item.result) |result| self.alloc.free(result.body);
             return;
         }
     }
@@ -661,7 +757,7 @@ pub const Runtime = struct {
         }
         for (self.yielded.items) |item| {
             if (!item.delivered) self.managed.cancelAndJoin(item.child_id);
-            if (item.body) |body| self.alloc.free(body);
+            if (item.result) |result| self.alloc.free(result.body);
             debug_trace.eventf("subagent", "steering_continuation_released", .{}, "child_id={s} work_id={s} delivered={} reason=parent_turn_end", .{ item.child_id, item.work_id, item.delivered });
             self.alloc.free(item.child_id);
             self.alloc.free(item.work_id);
@@ -724,19 +820,20 @@ fn operationIdAlloc(
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
     var runtime = Runtime{ .alloc = alloc, .sessions = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    runtime.managed = .{ .alloc = alloc, .sessions = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer runtime.yielded.deinit(alloc);
     defer while (runtime.yielded.items.len > 0) {
         const item = runtime.yielded.items[0];
         runtime.removeYielded(item.child_id, item.work_id);
     };
     try std.testing.expect(!runtime.hasPendingYielded());
-    try runtime.retainYielded("child", "work", 4096);
-    try runtime.retainYielded("child", "work", 4096);
+    try runtime.retainYielded("child", "work", 4096, 64);
+    try runtime.retainYielded("child", "work", 4096, 64);
     try std.testing.expect(runtime.hasPendingYielded());
     try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
     runtime.acknowledgeYielded("other", "work");
     try std.testing.expect(runtime.hasYieldedChild("child"));
-    runtime.yielded.items[0].body = try alloc.dupe(u8, "saved result");
+    runtime.yielded.items[0].result = .{ .success = true, .body = try alloc.dupe(u8, "saved result") };
     runtime.acknowledgeYielded("child", "work");
     try std.testing.expect(!runtime.hasYieldedChild("child"));
     try std.testing.expect(!runtime.hasPendingYielded());
@@ -751,6 +848,52 @@ test "subagent yielded identity is owned and allocation failures do not leak" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
 }
 
+test "subagent admission preserves an undelivered result before advancing its child" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old task"), .work_id = @constCast("old-work") },
+        .assistant = @constCast("ORIGINAL_RESULT"),
+    } }};
+    var loaded = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("frozen-child"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer loaded.deinit(alloc);
+    var runtime = Runtime{ .alloc = alloc, .sessions = &sessions, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    defer runtime.yielded.deinit(alloc);
+    try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
+    defer runtime.removeYielded("frozen-child", "old-work");
+    var child = child_state.Child{ .id = @constCast("frozen-child"), .kind = .{ .persistent = .{ .agent = @constCast("reviewer"), .instructions = &.{} } }, .phase = .idle, .last_work_id = @constCast("old-work"), .last_outcome = .completed };
+    try runtime.capturePriorYielded(child);
+    const original = try alloc.dupe(u8, runtime.yielded.items[0].result.?.body);
+    defer alloc.free(original);
+    try std.testing.expect(std.mem.find(u8, original, "ORIGINAL_RESULT") != null);
+    child.last_work_id = @constCast("new-work");
+    try runtime.capturePriorYielded(child);
+    try std.testing.expectEqualStrings(original, runtime.yielded.items[0].result.?.body);
+    const captured = (try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")).?;
+    defer alloc.free(captured.body);
+    try std.testing.expect(captured.success);
+    try std.testing.expectEqualStrings(original, captured.body);
+    try std.testing.expect((try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")) == null);
+    try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
+    try std.testing.expectError(error.StaleWork, runtime.capturePriorYielded(child));
+}
+
 test "parallel subagent wait bookkeeping stays serialized" {
     const alloc = std.testing.allocator;
     var runtime = Runtime{ .alloc = alloc, .sessions = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
@@ -761,7 +904,7 @@ test "parallel subagent wait bookkeeping stays serialized" {
         failure: ?anyerror = null,
         fn run(self: *@This()) void {
             for (0..100) |_| {
-                self.runtime.retainYielded(self.id, self.id, 4096) catch |err| {
+                self.runtime.retainYielded(self.id, self.id, 4096, 64) catch |err| {
                     self.failure = err;
                     return;
                 };
@@ -824,7 +967,7 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     var worker = worker_runtime.WorkerRuntime{};
     defer worker.deinit(alloc);
     runtime.managed.closed = true;
-    try runtime.retainYielded("other-child", "other-work", 2048);
+    try runtime.retainYielded("other-child", "other-work", 2048, 64);
 
     var request = try model_contract.validateRequest(alloc, switch (action) {
         .run => .{ .run = .{ .task = "review this" } },
@@ -944,8 +1087,8 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     var admitted = try runtime.admitManagedWork(alloc, request, work_id, options);
     defer admitted.deinit(alloc);
     const child_id = admitted.ready.child_id;
-    try runtime.retainYielded(child_id, work_id, options.max_result_bytes);
-    try runtime.retainYielded(child_id, "other-work", 2048);
+    try runtime.retainYielded(child_id, work_id, options.max_result_bytes, 64);
+    try runtime.retainYielded(child_id, "other-work", 2048, 64);
     var registry = try runtime.managed.state_store.load(alloc);
     defer registry.deinit(alloc);
     try std.testing.expectEqual(child_state.Phase.running, registry.findById(child_id).?.phase);
