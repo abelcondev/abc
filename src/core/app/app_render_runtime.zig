@@ -137,7 +137,7 @@ const RenderReconciliation = union(enum) {
 const SteeringProjection = struct {
     messages: [][]u8 = &.{},
     pending_feedback: [][]u8 = &.{},
-    waits_for_tool: bool = false,
+    waits_for_boundary: bool = false,
 
     fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
@@ -296,7 +296,7 @@ fn buildPendingSteeringCardProjection(
     steering: SteeringProjection,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !?PendingCardProjection {
-    const queued_count = if (steering.waits_for_tool) 0 else steering.messages.len;
+    const queued_count = if (steering.waits_for_boundary) 0 else steering.messages.len;
     var index = steering.pending_feedback.len + queued_count;
     if (index == 0) return null;
 
@@ -399,7 +399,7 @@ fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
     if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
         var snapshot = try app.worker.snapshotSteeringPresentation(app.alloc);
         defer snapshot.deinit(app.alloc);
-        projection.waits_for_tool = snapshot.waits_for_tool;
+        projection.waits_for_boundary = snapshot.waits_for_boundary;
         projection.messages = snapshot.messages;
         snapshot.messages = &.{};
         projection.pending_feedback = snapshot.pending_feedback;
@@ -697,7 +697,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .ask,
                 .steering_messages = steering.messages,
-                .steering_waits_for_tool = steering.waits_for_tool,
+                .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
@@ -2569,7 +2569,7 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card.bytes, "┃"));
     try std.testing.expect(std.mem.find(u8, card.bytes, "┋") == null);
 
-    steering.waits_for_tool = true;
+    steering.waits_for_boundary = true;
     var waiting = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
     defer waiting.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted earlier") != null);
@@ -2577,7 +2577,7 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     steering.pending_feedback = &.{};
     try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
 
-    steering.waits_for_tool = false;
+    steering.waits_for_boundary = false;
     shell.layout.content_bottom = 1;
     var clipped = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
     defer clipped.deinit(alloc);

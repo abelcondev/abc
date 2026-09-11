@@ -60,11 +60,11 @@ pub fn composeSteeringMessageRows(
     message: []const u8,
     width: u16,
     row_limit: u16,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
 ) !ComposedInputRows {
     var composed: ComposedInputRows = .{};
     errdefer composed.deinit(alloc);
-    const layout = render_input.steering_message_layout(message, width, waits_for_tool, row_limit);
+    const layout = render_input.steering_message_layout(message, width, waits_for_boundary, row_limit);
     for (layout.rows[0..layout.row_count], 0..) |content, index| {
         const normalized = try alloc.dupe(u8, content);
         defer alloc.free(normalized);
@@ -76,8 +76,8 @@ pub fn composeSteeringMessageRows(
 
         var row: std.ArrayList(u8) = .empty;
         errdefer row.deinit(alloc);
-        try row.appendSlice(alloc, if (waits_for_tool) ui_render.dim_style else ui_render.hint_style);
-        if (waits_for_tool) try row_text.appendClipped(alloc, &row, "┋ ", width);
+        try row.appendSlice(alloc, if (waits_for_boundary) ui_render.dim_style else ui_render.hint_style);
+        if (waits_for_boundary) try row_text.appendClipped(alloc, &row, "┋ ", width);
         const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
         try row_text.appendClipped(alloc, &row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
         if (ellipsis) {
