@@ -2956,6 +2956,14 @@ test "input escape parser admits raw ctrl+o control byte" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(3));
 }
 
+test "input escape parser admits raw ctrl+p control byte" {
+    try std.testing.expectEqual(
+        @as(?InputEscapeAction, .open_model_picker),
+        controlByteFeatureAction(16),
+    );
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
+}
+
 test "input escape parser handles ctrl+o csi u sequence" {
     var stage: u8 = 1;
     var param: u16 = 0;

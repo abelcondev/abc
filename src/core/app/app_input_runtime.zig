@@ -14,6 +14,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const composer_insertion = @import("../input/composer_insertion.zig");
+const composer_stash = @import("../input/composer_stash.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const input_action = @import("../input/input_action.zig");
@@ -1138,6 +1139,17 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                 },
+                .open_model_picker => {
+                    if (comptime @hasField(App, "model_cache")) {
+                        if (modelMenuActive(app)) {
+                            _ = closeModelMenu(app, true);
+                            app.shell.render_requests.request(.footer);
+                            return .done;
+                        }
+                        if (modelPickerShortcutBlocked(app)) return .done;
+                        try openModelPickerShortcut(app);
+                    }
+                },
                 .paste_start => dismissActiveMenusThenRedraw(app),
                 .paste_end => {},
                 .remapped_byte => unreachable,
@@ -2231,6 +2243,7 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             }
+            restoreModelPickerDraft(app);
             return true;
         }
 
@@ -2242,6 +2255,48 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Ctrl+P opens the same catalog `/model` opens, but the composer is
+        /// only lent to the menu: the draft moves into a stash and comes back
+        /// verbatim when the picker closes, whether a model was picked or not.
+        fn openModelPickerShortcut(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (app.input_runtime.model_picker_draft != null) {
+                // Unreachable through the keyboard (the stash implies the menu
+                // is open); recover a stranded draft rather than overwrite it.
+                debug_trace.logf("input", "model picker draft stashed with menu closed; restoring before reopen", .{});
+                restoreModelPickerDraft(app);
+            }
+            app.input_runtime.model_picker_draft = composer_stash.State.capture(
+                app.input_runtime.composerStashView(),
+            );
+            openModelBrowseCatalog(app) catch |err| {
+                restoreModelPickerDraft(app);
+                return err;
+            };
+        }
+
+        fn restoreModelPickerDraft(app: *App) void {
+            if (app.input_runtime.model_picker_draft) |*draft| {
+                draft.restore(app.alloc, app.input_runtime.composerStashView());
+                app.input_runtime.model_picker_draft = null;
+                app.shell.render_requests.request(.footer);
+            }
+        }
+
+        /// Surfaces that own the keyboard make Ctrl+P a no-op instead of
+        /// borrowing a composer they are already using.
+        fn modelPickerShortcutBlocked(app: *App) bool {
+            if (settingsMenuActive(app) or helpMenuActive(app) or
+                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app)) return true;
+            if (comptime @hasField(App, "auth")) {
+                if (app.auth.pickerView().active) return true;
+            }
+            if (comptime @hasField(App, "terminal")) {
+                if (app.terminal.fullTranscriptScreenActive()) return true;
+            }
+            return false;
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App) !bool {
@@ -2597,6 +2652,24 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             };
             defer app.alloc.free(selected);
+
+            if (app.input_runtime.model_picker_draft != null) {
+                // Opened via Ctrl+P: Enter uses the model as-is (current effort
+                // and fast mode, clamped to the model's capabilities) and hands
+                // the composer back to the draft instead of chaining into the
+                // inline effort and fast stages.
+                try session_commands.Commands(App).selectModelFromPicker(
+                    app,
+                    selected,
+                    app.effort,
+                    app.fast_mode,
+                );
+                app.model_cache.closeMenu();
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                restoreModelPickerDraft(app);
+                return true;
+            }
 
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -4993,7 +5066,7 @@ test "app_input_runtime command skills search owns dollar and model-shaped text"
     try std.testing.expectEqualStrings("/model $", app.skills.menu.query());
 }
 
-test "app_input_runtime command skills query follows history and ctrl-c clear" {
+test "app_input_runtime command skills menu keeps its query on ctrl+p and ctrl-c clear" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -5007,9 +5080,14 @@ test "app_input_runtime command skills query follows history and ctrl-c clear" {
     try app.input_runtime.composer_history.installTextEntries(alloc, &.{"older"});
     app.skills.openMenu();
 
+    // Ctrl+P owns the model picker now; while the skills menu owns the
+    // composer it is a no-op instead of a history recall.
     try feedRoutingBytes(&app, "\x10");
-    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("older", app.skills.menu.query());
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("", app.skills.menu.query());
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
 
     try feedRoutingBytes(&app, "\x03");
     try std.testing.expect(app.skills.menu.active);
@@ -8684,7 +8762,7 @@ test "app_input_runtime composer control aliases move, delete, and preserve proc
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime ctrl+p and ctrl+n navigate prompt history directly" {
+test "app_input_runtime ctrl+n navigates prompt history directly" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -8692,18 +8770,133 @@ test "app_input_runtime ctrl+p and ctrl+n navigate prompt history directly" {
     try app.input_runtime.textReplacementState().replace(alloc, "draft");
     armCtrlCExitForTest(&app.input_runtime, 123);
 
-    try feedRoutingBytes(&app, "\x10");
-    try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
-
-    try feedRoutingBytes(&app, "\x10");
+    // Enter history at the oldest entry, then ctrl+n steps newer and past the
+    // end back to the draft.
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
 
     try feedRoutingBytes(&app, "\x0e");
     try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
 
     try feedRoutingBytes(&app, "\x0e");
     try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+fn setRoutingModelMenuReady(app: *RoutingFakeApp, model_ids: []const []const u8) !void {
+    app.model_cache.menu.load_state = .ready;
+    for (model_ids) |model_id| {
+        const owned_id = try app.alloc.dupe(u8, model_id);
+        errdefer app.alloc.free(owned_id);
+        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
+        try app.model_cache.menu.items.append(app.alloc, .{
+            .id = owned_id,
+            .provider = owned_id[0..provider_end],
+            .capabilities = app.resolvedModelCapabilities(owned_id),
+        });
+    }
+}
+
+test "app_input_runtime ctrl+p opens the model catalog and escape restores the draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "keep this draft");
+    app.input_runtime.edit_state.cursor = 4;
+
+    try feedRoutingBytes(&app, "\x10");
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
+
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "app_input_runtime ctrl+p catalog enter applies the model and restores the draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const model = "anthropic/claude-opus-4.8";
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
+    app.setGatewayControls(model, &efforts, true);
+    try app.input_runtime.textReplacementState().replace(alloc, "draft survives");
+    app.input_runtime.edit_state.cursor = 3;
+
+    try feedRoutingBytes(&app, "\x10");
+    try setRoutingModelMenuReady(&app, &.{model});
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    // The shortcut applies the model directly instead of chaining into the
+    // inline effort and fast stages.
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(picker_state.ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
+    try std.testing.expectEqualStrings("draft survives", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 3), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+}
+
+test "app_input_runtime ctrl+p toggles the model catalog closed" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "toggle draft");
+
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(app.model_cache.menu.active);
+
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("toggle draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+}
+
+test "app_input_runtime ctrl+p model catalog keeps history navigation position" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try primeComposerHistoryForTest(RoutingFakeApp, &app, "draft");
+    try std.testing.expectEqualStrings("history entry", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.composer_history.activeIndex() != null);
+
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
+
+    try std.testing.expectEqualStrings("history entry", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(?usize, 0), app.input_runtime.composer_history.activeIndex());
+
+    // Navigation resumes where it left off: down returns to the pending draft.
+    try feedRoutingBytes(&app, "\x0e");
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime ctrl+p leaves the draft alone when a decision owns input" {
+    const alloc = std.testing.allocator;
+    for ([_]RoutingDecisionKind{ .question, .approval }) |kind| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        try app.input_runtime.textReplacementState().replace(alloc, "undisturbed");
+        try activateRoutingDecision(&app, kind);
+
+        try feedRoutingBytes(&app, "\x10");
+
+        try std.testing.expect(!app.model_cache.menu.active);
+        try std.testing.expectEqualStrings("undisturbed", app.input_runtime.edit_state.input.items);
+        try std.testing.expect(app.input_runtime.model_picker_draft == null);
+    }
 }
 
 test "app_input_runtime plain arrows keep history ownership across recalled slash commands" {
