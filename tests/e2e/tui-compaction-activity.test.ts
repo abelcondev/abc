@@ -208,6 +208,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       counts: () => ({ summaries, ordinary, overflowSent }),
       phase: (value: typeof phase) => { phase = value; },
       lastRequest: () => gateway.requests.at(-1)!.body,
+      requestsContaining: (marker: string) => gateway.requests.map((request) => request.body).filter((body) => body.includes(marker)),
     };
   } catch (error) { await cleanup(false); throw error; }
 }
@@ -308,6 +309,40 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         passed = true;
       } finally { await f.cleanup(passed); }
     }, 120_000);
+  }
+
+  for (const trigger of ["manual", "auto"] as const) {
+    test(`${trigger}: a message submitted during a held compaction waits and runs after with compacted context`, async () => {
+      const f = await fixture(trigger, "success", trigger === "manual");
+      let passed = false;
+      try {
+        const terminal = await f.launch();
+        await terminal.sendText(trigger === "manual" ? "/compact" : "Continue the current turn.");
+        await until(() => f.counts().summaries === 1, "summary request in flight");
+        await terminal.waitForText(ACTIVITY, 10_000);
+        const steer = trigger === "manual" ? "STEER_DURING_COMPACT_7f2a" : "STEER_DURING_AUTOCOMPACT_3b9c";
+        await terminal.sendText(steer);
+        // While the summary is held, the message must neither start its own
+        // turn nor cancel the compaction: no new gateway request arrives and
+        // the activity row stays visible. The resume backlog can delay fresh
+        // transcript cards, so only footer activity is asserted here.
+        await Bun.sleep(1500);
+        expect(f.counts()).toEqual({ summaries: 1, ordinary: f.seedTurns, overflowSent: false });
+        await terminal.waitForText(ACTIVITY, 5000);
+        // Flip phases before releasing so every later ordinary request gets a
+        // fresh FOLLOWUP response; the steer turn can start within milliseconds
+        // of the checkpoint, before a later flip would land.
+        f.phase("followup");
+        f.summaryHold.release(HANDOFF);
+        await until(() => f.durable() > 0, "acknowledged checkpoint");
+        await f.waitForResumeHandoff();
+        await until(() => f.requestsContaining(steer).length > 0, "steer request after compaction");
+        expect(f.requestsContaining(steer)[0]).toContain("INTERNAL_HANDOFF_4e12");
+        await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 20_000);
+        await f.close();
+        passed = true;
+      } finally { await f.cleanup(passed); }
+    }, 90_000);
   }
 
   for (const outcome of ["cancel", "empty", "provider-error"] as const) {

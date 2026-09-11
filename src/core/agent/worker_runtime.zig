@@ -995,6 +995,9 @@ pub const WorkerRuntime = struct {
 
     /// Transfers `prompt` to the active turn when steering is requested and the
     /// turn still accepts guidance. Otherwise it enters the ordinary FIFO.
+    /// A steer interrupts the model stream immediately only when no wait
+    /// boundary is active; a running tool or an in-flight compaction defers
+    /// delivery to the next steering boundary instead of being cancelled.
     fn admitPrompt(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -1025,11 +1028,11 @@ pub const WorkerRuntime = struct {
             !explicitly_cancelled)
         {
             queued.delivery = .{ .active_turn = self.active_turn_id };
-            interrupt_after_admission = !self.hasActiveToolBoundaryLocked();
+            interrupt_after_admission = !self.hasSteeringWaitBoundaryLocked();
         }
         try self.enqueuePromptLocked(alloc, queued);
         if (steer_if_active and self.worker_processing) {
-            debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), interrupt_after_admission });
+            debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} compaction_active={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), self.compactionInFlightLocked(), interrupt_after_admission });
         }
         if (interrupt_after_admission) {
             if (sameTurnSteeringEligible(queued)) {
@@ -1249,16 +1252,17 @@ pub const WorkerRuntime = struct {
     }
 
     /// Removes the newest queued text-only steering prompt that still waits for
-    /// a tool boundary and returns an allocator-owned copy of its text so the
-    /// composer can restore it for editing. Returns null when nothing is safely
-    /// retractable: no active turn, no tool boundary (an immediate steer is
-    /// already committed to its interrupt), a cancel already in flight, or only
-    /// handoff-class steers with images or skill bindings.
+    /// a tool or compaction boundary and returns an allocator-owned copy of its
+    /// text so the composer can restore it for editing. Returns null when
+    /// nothing is safely retractable: no active turn, no wait boundary (an
+    /// immediate steer is already committed to its interrupt), a cancel
+    /// already in flight, or only handoff-class steers with images or skill
+    /// bindings.
     pub fn popQueuedSteerForEdit(self: *WorkerRuntime, alloc: std.mem.Allocator) !?[]u8 {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (!self.worker_processing or self.active_turn_id == 0) return null;
-        if (!self.hasActiveToolBoundaryLocked()) return null;
+        if (!self.hasSteeringWaitBoundaryLocked()) return null;
         if (self.worker_cancel_requested.load(.seq_cst)) return null;
 
         var retractable: ?usize = null;
@@ -1574,6 +1578,24 @@ pub const WorkerRuntime = struct {
         return self.tool_phase_step_id != null or self.active_tool_calls.count() > 0;
     }
 
+    /// True while a context compaction owns the worker: either the compaction
+    /// work item is running, or the active turn is inside a compaction
+    /// transaction. Compaction reports through the activity channel rather
+    /// than the tool/phase event feed, so it is consulted separately.
+    fn compactionInFlightLocked(self: *const WorkerRuntime) bool {
+        if (self.active_context_compaction) return true;
+        if (self.compaction_presentation.snapshot.operation) |operation| return operation.active();
+        return false;
+    }
+
+    /// Steering must wait whenever the active work cannot absorb guidance right
+    /// now: a running tool or tool-producing step, or a compaction in flight.
+    /// Cancelling either would discard in-progress work the user expects to
+    /// finish; the message is delivered at the next boundary instead.
+    fn hasSteeringWaitBoundaryLocked(self: *const WorkerRuntime) bool {
+        return self.hasActiveToolBoundaryLocked() or self.compactionInFlightLocked();
+    }
+
     fn clearActiveToolCallsLocked(self: *WorkerRuntime) void {
         const alloc = self.active_tool_allocator orelse {
             std.debug.assert(self.active_tool_calls.count() == 0);
@@ -1648,7 +1670,7 @@ pub const WorkerRuntime = struct {
             if (prompt.delivery.isSteering()) steering_count += 1;
         }
         var snapshot: SteeringPresentationSnapshot = .{
-            .waits_for_tool = steering_count > 0 and self.hasActiveToolBoundaryLocked(),
+            .waits_for_tool = steering_count > 0 and self.hasSteeringWaitBoundaryLocked(),
         };
         errdefer snapshot.deinit(alloc);
         snapshot.pending_feedback = pending: {
@@ -4382,6 +4404,109 @@ test "interactive prompt admission derives steering from active worker state" {
     const guidance = try expectContinuedSteering(
         try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
     );
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+}
+
+test "interactive prompt during running manual compaction waits without cancelling" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueueContextCompaction(.{
+        .turn_id = 41,
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    });
+    const taken = (try runtime.tryTakeNextWork(alloc)) orelse
+        return error.TestExpectedQueuedWork;
+    defer freeWorkItem(alloc, taken);
+    try std.testing.expectEqual(ContextCompactionStatus.running, runtime.contextCompactionStatus());
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+
+    // The compaction is a wait boundary: no cancel, no immediate interrupt.
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.waits_for_tool);
+
+    // A compaction work item never takes a steering boundary; finishing it
+    // promotes the waiting prompt to a continuation that runs next.
+    runtime.settleCompactionActivity(taken.compact_context.operation_id.?, .{
+        .outcome = .succeeded,
+        .stage = .publication,
+        .publication = .committed,
+    });
+    runtime.finishProcessing();
+    const next = (try runtime.tryTakeNextWork(alloc)) orelse
+        return error.TestExpectedNextPrompt;
+    defer freeWorkItem(alloc, next);
+    try std.testing.expect(next == .prompt);
+    try std.testing.expect(next.prompt.delivery.isContinuation());
+    try std.testing.expectEqualStrings("steer", next.prompt.prompt);
+}
+
+test "interactive prompt during in-turn compaction activity waits without cancelling" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    // In-turn compaction reports through the activity channel, not the tool feed.
+    const operation = runtime.beginCompactionActivity(.automatic, 41);
+    runtime.runCompactionActivity(operation, .summary);
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
+
+    // The next model boundary drains the waiting steer as same-turn guidance.
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .model));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+
+    runtime.settleCompactionActivity(operation, .{
+        .outcome = .succeeded,
+        .stage = .summary,
+        .publication = .committed,
+    });
+    runtime.finishProcessing();
+}
+
+test "interactive prompt after in-turn compaction settled steers immediately" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    const operation = runtime.beginCompactionActivity(.automatic, 41);
+    runtime.runCompactionActivity(operation, .summary);
+    runtime.settleCompactionActivity(operation, .{
+        .outcome = .succeeded,
+        .stage = .summary,
+        .publication = .committed,
+    });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+
+    // No active boundary remains, so immediate-steer semantics are unchanged.
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(?u64, 41), runtime.steering_cancel_turn_id);
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
     defer {
         for (guidance) |text| alloc.free(text);
         alloc.free(guidance);
