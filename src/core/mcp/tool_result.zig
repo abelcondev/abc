@@ -265,11 +265,11 @@ fn write_protocol_diagnostic(
 ) !void {
     try writer.print("MCP protocol error {d}: ", .{code});
     const safe_message = try text_utils.sanitizeModelText(scratch, message);
-    try writer.writeAll(try text_utils.maskSecrets(scratch, safe_message));
+    try writer.writeAll(safe_message);
     if (data_json) |data| {
         const safe_data = try text_utils.sanitizeModelText(scratch, data);
         try writer.writeAll("; data=");
-        try writer.writeAll(try text_utils.maskSecrets(scratch, safe_data));
+        try writer.writeAll(safe_data);
     }
 }
 
@@ -385,8 +385,43 @@ fn write_envelope(
     try writer.writeAll(",\"tool\":");
     try std.json.Stringify.value(tool_name, .{}, writer);
     try writer.writeAll(",\"result\":");
-    try write_masked_json_value(alloc, writer, result);
+    try write_sanitized_json_value(alloc, writer, result);
     try writer.writeByte('}');
+}
+
+/// Sanitize-only projection for MCP tool results delivered to the model.
+fn write_sanitized_json_value(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .null, .bool, .integer, .float, .number_string => try std.json.Stringify.value(value, .{}, writer),
+        .string => |text| {
+            const sanitized = try text_utils.sanitizeModelText(alloc, text);
+            try std.json.Stringify.value(sanitized, .{}, writer);
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try writer.writeByte(',');
+                try write_sanitized_json_value(alloc, writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |object| {
+            try writer.writeByte('{');
+            var it = object.iterator();
+            var index: usize = 0;
+            while (it.next()) |entry| : (index += 1) {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try writer.writeByte(':');
+                try write_sanitized_json_value(alloc, writer, entry.value_ptr.*);
+            }
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn write_masked_json_value(
@@ -443,9 +478,8 @@ fn append_text_strings(
     switch (value) {
         .string => |text| {
             const sanitized = try text_utils.sanitizeModelText(arena, text);
-            const masked = try text_utils.maskSecrets(arena, sanitized);
             if (needs_separator.*) try writer.writeByte('\n');
-            try writer.writeAll(masked);
+            try writer.writeAll(sanitized);
             needs_separator.* = true;
         },
         .array => |array| for (array.items) |item| {
@@ -652,9 +686,10 @@ test "invalid tool responses retain bounded protocol failures" {
     }
 }
 
-test "large tool results stay valid, bounded, and secret-masked" {
+test "large tool results stay valid, bounded, and verbatim" {
     const alloc = std.testing.allocator;
-    const large_text = "TOKEN=secret-value " ++ ("x" ** 1800);
+    const needle = "MY_NOTE_TOKEN=abcdefgh";
+    const large_text = needle ++ ("x" ** 1800);
     const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
     var result = try extract(alloc, .{
         .server_name = "filesystem",
@@ -666,16 +701,8 @@ test "large tool results stay valid, bounded, and secret-masked" {
     defer result.deinit(alloc);
 
     try std.testing.expect(result.model_output.len <= 1024);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=secret-value",
-    ) == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=[redacted]",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, needle) != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "[redacted]") == null);
     try std.testing.expect(std.mem.find(
         u8,
         result.model_output,

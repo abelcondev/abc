@@ -351,7 +351,7 @@ describe("web_fetch Gateway fixture", () => {
   );
 
   test(
-    "invalid credentialed web_fetch persists no URL credentials",
+    "invalid credentialed web_fetch persists the URL verbatim",
     async () => {
       const root = createIsolatedRoot({ webFetchPermission: "allow" });
       const gateway = startFakeGateway([
@@ -384,8 +384,8 @@ describe("web_fetch Gateway fixture", () => {
           "utf8",
         );
         expect(sessionEvents).toContain("web_fetch");
-        expect(sessionEvents).not.toContain("user:pass");
-        expect(sessionEvents).toContain("https://[redacted]@example.com/docs");
+        expect(sessionEvents).toContain("https://user:pass@example.com/docs");
+        expect(sessionEvents).not.toContain("[redacted]");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

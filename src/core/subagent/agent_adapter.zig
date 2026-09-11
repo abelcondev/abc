@@ -857,9 +857,9 @@ fn captureHttpError(
         detail,
     );
     defer context.turn.alloc.free(formatted);
-    const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
-    defer context.turn.alloc.free(redacted);
-    context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    const masked = try execution_memory.maskTextForDisplay(context.turn.alloc, formatted);
+    defer context.turn.alloc.free(masked);
+    context.turn.setFailureDiagnostic("provider_http_error", masked);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {

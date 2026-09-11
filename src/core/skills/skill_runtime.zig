@@ -3120,7 +3120,7 @@ fn renderSkillPrompt(
 
         var description: std.Io.Writer.Allocating = .init(alloc);
         defer description.deinit();
-        const safe_description = try tool_result_limits.prepareRedactedOutput(alloc, skill.description);
+        const safe_description = try tool_result_limits.prepareSanitizedOutput(alloc, skill.description);
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
@@ -4432,18 +4432,17 @@ test "skill catalog locations reject a changed identity mapping" {
     try std.testing.expectError(error.StaleSkillLocation, after.locations.resolve(alloc, location));
 }
 
-test "skill catalog does not expose sensitive descriptions or encoded locations" {
+test "skill catalog keeps secret-bearing descriptions and locations verbatim" {
     const alloc = std.testing.allocator;
     const skills = [_]Skill{
-        .{ .name = "safe", .description = "Release checks. API_KEY=description-secret", .path = "/root/safe", .source = .global_fx },
-        .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret", .source = .global_fx },
+        .{ .name = "safe", .description = "Release checks. API_KEY=description-secret-value", .path = "/root/safe", .source = .global_fx },
+        .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret-value", .source = .global_fx },
     };
     var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "- safe:") != null);
-    try std.testing.expect(std.mem.find(u8, section.text, "description-secret") == null);
-    try std.testing.expect(std.mem.find(u8, section.text, "location-secret") == null);
-    try std.testing.expect(std.mem.find(u8, section.text, "- hidden:") == null);
+    try std.testing.expect(std.mem.find(u8, section.text, "API_KEY=description-secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "- hidden:") != null);
 }
 
 fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {

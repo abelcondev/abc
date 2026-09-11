@@ -1223,13 +1223,14 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\n') == null and
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
-                    return actionable;
+                    return try text_utils.maskSecrets(arena, actionable);
                 }
             }
         }
 
         if (safe_result.len == 0) return detail;
-        const encoded = try text_utils.encodeTerminalSafe(arena, safe_result, 256);
+        const masked = try text_utils.maskSecrets(arena, safe_result);
+        const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
@@ -1239,7 +1240,8 @@ fn failureStatusDetail(
         return null;
     }
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
-    const encoded = try text_utils.encodeTerminalSafe(arena, detail, 256);
+    const masked_detail = try text_utils.maskSecrets(arena, detail);
+    const encoded = try text_utils.encodeTerminalSafe(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
 }
 
