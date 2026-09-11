@@ -5,7 +5,6 @@ const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -1992,45 +1991,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
     };
-}
-
-fn managedExecutionProjection(
-    alloc: std.mem.Allocator,
-    runtime: *managed_execution.Runtime,
-) !terminal_ui_projection.Snapshot {
-    const executions = try runtime.list(alloc);
-    defer {
-        for (executions) |*execution| execution.deinit(alloc);
-        alloc.free(executions);
-    }
-    const rows = try alloc.alloc(terminal_ui_projection.Row, executions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (rows[0..initialized]) |*row| {
-            alloc.free(row.label);
-            alloc.free(row.session_id);
-        }
-        alloc.free(rows);
-    }
-    for (executions, rows) |execution, *row| {
-        const session_id = try alloc.dupe(u8, execution.execution_id);
-        errdefer alloc.free(session_id);
-        row.* = .{
-            .session_id = session_id,
-            .label = try alloc.dupe(u8, execution.command),
-            .lifecycle = switch (execution.state) {
-                .running => .running,
-                .completed => .exited,
-                .stopped => .closed,
-                .lost => .lost,
-            },
-            .attention = .{},
-            .backend = .native,
-            .attachable = execution.backend == .tty,
-        };
-        initialized += 1;
-    }
-    return .{ .alloc = alloc, .rows = rows };
 }
 
 fn renderReasonNames(
@@ -4039,20 +3999,6 @@ noinline fn coordinatorGridContains(grid: vt_emulator.Grid, needle: []const u8) 
         if (std.mem.find(u8, buf.items, needle) != null) return true;
     }
     return false;
-}
-
-noinline fn coordinatorGridOccurrenceCount(grid: vt_emulator.Grid, needle: []const u8) !usize {
-    var row: u16 = 1;
-    var count: usize = 0;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(grid.alloc);
-
-    while (row <= grid.rows) : (row += 1) {
-        buf.clearRetainingCapacity();
-        try grid.rowTextTrimmed(row, &buf);
-        count += std.mem.count(u8, buf.items, needle);
-    }
-    return count;
 }
 
 test "core.app_render_runtime first requested startup frame commits through the ordinary coordinator" {

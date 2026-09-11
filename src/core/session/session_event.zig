@@ -1481,26 +1481,6 @@ fn applyDelta(
     }
 }
 
-pub fn applyEventToState(
-    alloc: Allocator,
-    state: *session_codec.DurableSessionState,
-    event: Event,
-    timestamp_ms: i64,
-) !void {
-    const zero_id = [_]u8{0} ** 16;
-    const envelope = Envelope{
-        .log_generation = zero_id,
-        .seq = 1,
-        .event_id = zero_id,
-        .timestamp_ms = timestamp_ms,
-        .event = event,
-    };
-    try validateEnvelope(envelope);
-    var current: ?session_codec.DurableSessionState = state.*;
-    try applyDelta(alloc, &current, envelope);
-    state.* = current.?;
-}
-
 fn validateEnvelope(envelope: Envelope) !void {
     if (envelope.seq == 0 or envelope.timestamp_ms < 0) return error.InvalidEventFrame;
     switch (envelope.event) {

@@ -4250,28 +4250,6 @@ fn resolveImageSnapshotLocators(
     }
 }
 
-fn deleteSnapshotFilesAddedByMigration(
-    candidate: []const session.HistoryTurn,
-    original: []const session.HistoryTurn,
-) void {
-    for (candidate, original) |candidate_turn, original_turn| {
-        const candidate_images = switch (candidate_turn) {
-            .compacted_summary => &.{},
-            .assistant => |entry| entry.user.images,
-            .interrupted => |entry| entry.user.images,
-        };
-        const original_images = switch (original_turn) {
-            .compacted_summary => &.{},
-            .assistant => |entry| entry.user.images,
-            .interrupted => |entry| entry.user.images,
-        };
-        image_attachments.deleteUnreferencedImageSnapshots(
-            candidate_images,
-            original_images,
-        );
-    }
-}
-
 test "session snapshot locators resolve through their owning store" {
     const alloc = std.testing.allocator;
     var history = try alloc.alloc(session.HistoryTurn, 1);

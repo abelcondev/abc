@@ -2026,7 +2026,6 @@ fn executeSubagentProvider(
 }
 
 fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {}
-fn noopBackgroundReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 const TestCapturedShellInput = struct {
     command: []u8,
