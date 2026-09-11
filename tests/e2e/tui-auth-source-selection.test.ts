@@ -5338,7 +5338,7 @@ test("provider context accounting is independent of image encoding size", async 
         const parts = (request.input ?? request.prompt).flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
         const image = parts.find((part: { type?: string }) => part.type === (provider === "gateway" ? "file" : "input_image"));
         expect(image).toBeDefined();
-        expect(provider === "gateway" ? image.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
+        expect(provider === "gateway" ? image.data.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
         const decision = readFileSync(trace, "utf8");
         expect(decision).toContain("decision=no_op");
         expect(decision).toContain("has_images=true image_baseline=false");
