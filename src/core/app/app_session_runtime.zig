@@ -3699,6 +3699,8 @@ pub fn Runtime(comptime App: type) type {
                     decision.label,
                     &.{},
                 )
+            else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
+                line
             else if (result.status == .success) success: {
                 var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
                 const registry = app.toolAdvertisementSet().registry;

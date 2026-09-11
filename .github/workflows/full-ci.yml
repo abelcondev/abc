@@ -51,7 +51,7 @@ jobs:
         run: ./scripts/check-public-surface.sh
 
       - name: Test signing and release routing
-        run: python3 -m unittest scripts.tests.test_macos_signing -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos -q
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}

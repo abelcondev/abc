@@ -42,7 +42,7 @@ const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
 pub const default_model = "moonshotai/kimi-k3";
-pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
+pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
@@ -1633,7 +1633,7 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
         .team = "team_123",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -1863,7 +1863,7 @@ test "cancelled gateway worker performs zero stream requests" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -1979,7 +1979,7 @@ test "pre-send web search failure stays unbilled" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -2008,7 +2008,7 @@ test "possibly sent web search failure marks billing incomplete" {
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
         .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
@@ -2028,7 +2028,7 @@ test "possibly sent web search failure marks billing incomplete" {
 
 test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("moonshotai/kimi-k3", default_model);
-    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
@@ -2312,7 +2312,7 @@ test "built-in gateway chat url honors loopback override before fallback" {
 }
 
 test "built-in gateway chat url ignores untrusted overrides and falls back" {
-    const fallback = "https://ai-gateway.vercel.sh/v3/ai/language-model";
+    const fallback = "https://ai-gateway.vercel.sh/v4/ai/language-model";
     for ([_][]const u8{
         "https://evil.example/chat",
         "http://evil.example/chat",

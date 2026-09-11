@@ -30,11 +30,52 @@ const Slot = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
     worker: ?*worker_runtime.WorkerRuntime = null,
+    work_id: ?[]const u8 = null,
     route_refs: usize = 0,
+    waiters: usize = 0,
     route_changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
-    completion: enum { running, published, unpublished } = .running,
+    completion: union(enum) { running, published: Observation, unpublished } = .running,
     done: std.Io.Event = .unset,
+};
+
+pub const FeedbackResult = union(enum) {
+    receipt: types.SteeringDelivery,
+    waiting,
+    unavailable,
+    cancelled,
+    conflict,
+    capacity,
+};
+
+const Feedback = struct {
+    child_id: []u8,
+    operation_id: []u8,
+    fingerprint: [32]u8,
+    receipt: worker_runtime.SteeringReceipt = .{},
+    reported: types.SteeringDelivery = .queued,
+
+    fn create(alloc: Allocator, child_id: []const u8, operation_id: []const u8, fingerprint: [32]u8) !*Feedback {
+        const item = try alloc.create(Feedback);
+        errdefer alloc.destroy(item);
+        const child = try alloc.dupe(u8, child_id);
+        errdefer alloc.free(child);
+        const operation = try alloc.dupe(u8, operation_id);
+        item.* = .{ .child_id = child, .operation_id = operation, .fingerprint = fingerprint, .receipt = .{ .operation_id = operation } };
+        return item;
+    }
+
+    fn deinit(self: *Feedback, alloc: Allocator) void {
+        alloc.free(self.child_id);
+        alloc.free(self.operation_id);
+        alloc.destroy(self);
+    }
+};
+
+pub const FeedbackUpdate = struct {
+    child_id: []const u8,
+    operation_id: []const u8,
+    delivery: types.SteeringDelivery,
 };
 
 pub const Owner = struct {
@@ -46,8 +87,110 @@ pub const Owner = struct {
     approvals: *approval_registry.Registry,
     max_history_turns: usize = 8,
     mutex: std.Io.Mutex = .init,
+    waiters_changed: std.Io.Condition = .init,
     slots: std.ArrayList(*Slot) = .empty,
+    feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+
+    fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
+        for (self.feedback.items) |item| {
+            if (!std.mem.eql(u8, item.operation_id, operation_id)) continue;
+            return if (std.mem.eql(u8, &item.fingerprint, &fingerprint))
+                .{ .receipt = item.receipt.state.load(.seq_cst) }
+            else
+                .conflict;
+        }
+        return null;
+    }
+
+    pub fn feedbackReplay(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.feedbackReplayLocked(operation_id, fingerprint);
+    }
+
+    pub fn steer(
+        self: *Owner,
+        child_id: []const u8,
+        work_id: []const u8,
+        operation_id: []const u8,
+        fingerprint: [32]u8,
+        text: []const u8,
+    ) Allocator.Error!FeedbackResult {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return .unavailable;
+        if (self.feedbackReplayLocked(operation_id, fingerprint)) |replay| return replay;
+        var target: ?*Slot = null;
+        for (self.slots.items) |slot| {
+            if (std.mem.eql(u8, slot.child_id, child_id)) {
+                target = slot;
+                break;
+            }
+        }
+        const slot = target orelse {
+            const observation = self.observe(child_id) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => .unavailable,
+            };
+            return if (observation.phase == .running or observation.phase == .awaiting_approval) .unavailable else .waiting;
+        };
+        if (slot.cancel.load(.seq_cst) or slot.shutdown.load(.seq_cst)) return .cancelled;
+        if (slot.completion != .running) return if (slot.completion == .published) .waiting else .unavailable;
+        const worker = slot.worker orelse return .waiting;
+        if (!std.mem.eql(u8, slot.work_id orelse return .waiting, work_id)) return .waiting;
+        if (self.feedback.items.len >= 64) return .capacity;
+        try self.feedback.ensureUnusedCapacity(self.alloc, 1);
+        const item = try Feedback.create(self.alloc, child_id, operation_id, fingerprint);
+        var accepted = false;
+        defer if (!accepted) item.deinit(self.alloc);
+        const prompt = worker_runtime.QueuedPrompt{
+            .prompt = try self.alloc.dupe(u8, text),
+            .images = &.{},
+            .model = &.{},
+            .api_key = &.{},
+            .permission_mode = .ask,
+            .history = &.{},
+            .grants = &.{},
+            .steering_receipt = &item.receipt,
+        };
+        defer if (!accepted) {
+            item.receipt.state.store(.not_applied, .seq_cst);
+            worker_runtime.freeQueuedPrompt(self.alloc, prompt);
+        };
+        accepted = try worker.admitActiveSteering(self.alloc, prompt);
+        if (!accepted) return .waiting;
+        self.feedback.appendAssumeCapacity(item);
+        debug_trace.eventf("subagent", "feedback_queued", .{}, "child_id={s} work_id={s} operation={s}", .{ child_id, work_id, operation_id });
+        return .{ .receipt = .queued };
+    }
+
+    pub fn feedbackUpdates(self: *Owner, arena: Allocator) ![]FeedbackUpdate {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var updates: std.ArrayList(FeedbackUpdate) = .empty;
+        for (self.feedback.items) |item| {
+            const delivery = item.receipt.state.load(.seq_cst);
+            if (delivery == item.reported) continue;
+            try updates.append(arena, .{
+                .child_id = try arena.dupe(u8, item.child_id),
+                .operation_id = try arena.dupe(u8, item.operation_id),
+                .delivery = delivery,
+            });
+        }
+        return updates.toOwnedSlice(arena);
+    }
+
+    pub fn acknowledgeFeedback(self: *Owner, child_id: []const u8, operation_id: []const u8, delivery: types.SteeringDelivery) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.feedback.items) |item| {
+            if (std.mem.eql(u8, item.child_id, child_id) and std.mem.eql(u8, item.operation_id, operation_id)) {
+                if (item.receipt.state.load(.seq_cst) == delivery) item.reported = delivery;
+                return;
+            }
+        }
+    }
 
     pub fn hasRunningWork(self: *Owner) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -68,7 +211,7 @@ pub const Owner = struct {
     }
 
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
-        while (true) {
+        start_attempt: while (true) {
             const finished = blk: {
                 self.mutex.lockUncancelable(io_mod.getIo());
                 defer self.mutex.unlock(io_mod.getIo());
@@ -76,7 +219,19 @@ pub const Owner = struct {
                 for (self.slots.items, 0..) |slot, index| {
                     if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
                     if (slot.completion == .running) return .already_running;
+                    if (slot.waiters != 0) {
+                        self.waiters_changed.waitUncancelable(io_mod.getIo(), &self.mutex);
+                        continue :start_attempt;
+                    }
                     break :blk self.slots.swapRemove(index);
+                }
+                var feedback_index: usize = 0;
+                while (feedback_index < self.feedback.items.len) {
+                    const item = self.feedback.items[feedback_index];
+                    if (std.mem.eql(u8, item.child_id, child_id) and item.receipt.state.load(.seq_cst) != .queued and item.reported == item.receipt.state.load(.seq_cst)) {
+                        _ = self.feedback.swapRemove(feedback_index);
+                        item.deinit(self.alloc);
+                    } else feedback_index += 1;
                 }
                 const slot = try self.alloc.create(Slot);
                 errdefer self.alloc.destroy(slot);
@@ -100,15 +255,38 @@ pub const Owner = struct {
         child_id: []const u8,
         duration: std.Io.Clock.Duration,
     ) WaitError!Observation {
-        const slot = self.findSlot(child_id);
-        if (slot) |active| {
-            active.done.waitTimeout(io_mod.getIo(), .{ .duration = duration }) catch |err| switch (err) {
-                error.Timeout => return self.observe(child_id),
-                error.Canceled => return self.observe(child_id),
-            };
-            try self.reapSlot(active);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        var slot: ?*Slot = null;
+        for (self.slots.items) |candidate| {
+            if (std.mem.eql(u8, candidate.child_id, child_id)) {
+                slot = candidate;
+                break;
+            }
         }
-        return self.observe(child_id);
+        const active = slot orelse {
+            self.mutex.unlock(io_mod.getIo());
+            return self.observe(child_id);
+        };
+        active.waiters += 1;
+        self.mutex.unlock(io_mod.getIo());
+        active.done.waitTimeout(io_mod.getIo(), .{ .duration = duration }) catch |err| switch (err) {
+            error.Timeout, error.Canceled => {},
+        };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        // A finished slot's observation must not follow the registry into a new turn.
+        const unpublished = active.completion == .unpublished;
+        const observation: WaitError!Observation = switch (active.completion) {
+            .published => |completed| completed,
+            .unpublished => error.StateUnavailable,
+            .running => self.observe(child_id),
+        };
+        active.waiters -= 1;
+        self.waiters_changed.broadcast(io_mod.getIo());
+        const reaped = !self.closed and self.takeCompletedSlotLocked(active);
+        self.mutex.unlock(io_mod.getIo());
+        if (reaped) destroySlot(self, active);
+        if (unpublished) return error.StateUnavailable;
+        return observation;
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
@@ -136,6 +314,7 @@ pub const Owner = struct {
                     // Stop approval waits without changing explicit cancellation to interruption.
                     if (candidate.worker) |worker| worker.requestShutdown();
                 }
+                candidate.waiters += 1;
                 break :blk candidate;
             }
             return;
@@ -143,9 +322,16 @@ pub const Owner = struct {
         debug_trace.eventf("subagent", "steering_child_join_started", .{}, "child_id={s}", .{child_id});
         if (slot.thread) |thread| {
             thread.join();
-            slot.thread = null;
         }
-        self.reapSlot(slot) catch |err| debugFailure(child_id, "cancel_join", err);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        slot.thread = null;
+        slot.waiters -= 1;
+        self.waiters_changed.broadcast(io_mod.getIo());
+        const unpublished = slot.completion == .unpublished;
+        const reaped = self.takeCompletedSlotLocked(slot);
+        self.mutex.unlock(io_mod.getIo());
+        if (reaped) destroySlot(self, slot);
+        if (unpublished) debugFailure(child_id, "cancel_join", error.StateUnavailable);
         debug_trace.eventf("subagent", "steering_child_join_finished", .{}, "child_id={s}", .{child_id});
     }
 
@@ -174,41 +360,22 @@ pub const Owner = struct {
         self.mutex.unlock(io_mod.getIo());
 
         for (self.slots.items) |slot| {
-            if (slot.thread) |thread| thread.join();
-            self.alloc.free(slot.child_id);
-            self.alloc.destroy(slot);
+            destroySlot(self, slot);
         }
         self.slots.deinit(self.alloc);
+        for (self.feedback.items) |item| item.deinit(self.alloc);
+        self.feedback.deinit(self.alloc);
         self.* = undefined;
     }
 
-    fn findSlot(self: *Owner, child_id: []const u8) ?*Slot {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.slots.items) |slot| {
-            if (std.mem.eql(u8, slot.child_id, child_id)) return slot;
-        }
-        return null;
-    }
-
-    fn reapSlot(self: *Owner, slot: *Slot) error{StateUnavailable}!void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        var index: ?usize = null;
+    fn takeCompletedSlotLocked(self: *Owner, slot: *Slot) bool {
         for (self.slots.items, 0..) |candidate, candidate_index| {
-            if (candidate == slot and candidate.completion != .running) {
-                index = candidate_index;
-                break;
+            if (candidate == slot and candidate.completion != .running and candidate.waiters == 0) {
+                _ = self.slots.swapRemove(candidate_index);
+                return true;
             }
         }
-        if (index == null) {
-            self.mutex.unlock(io_mod.getIo());
-            return;
-        }
-        _ = self.slots.swapRemove(index.?);
-        const unpublished = slot.completion == .unpublished;
-        self.mutex.unlock(io_mod.getIo());
-        destroySlot(self, slot);
-        if (unpublished) return error.StateUnavailable;
+        return false;
     }
 
     fn observe(self: *Owner, child_id: []const u8) WaitError!Observation {
@@ -249,34 +416,101 @@ pub const Owner = struct {
         work_id: []const u8,
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
-    ) bool {
+    ) ?Observation {
         var lock = self.state_store.acquireLock(self.alloc) catch |err| {
             debugFailure(child_id, "state_lock", err);
-            return false;
+            return null;
         };
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
             debugFailure(child_id, "state_load", err);
-            return false;
+            return null;
         };
         defer registry.deinit(self.alloc);
         registry.finish(self.alloc, child_id, work_id, outcome, failure) catch |err| {
             debugFailure(child_id, "state_finish", err);
-            return false;
+            return null;
         };
         self.state_store.save(self.alloc, registry) catch |err| {
             debugFailure(child_id, "state_save", err);
-            return false;
+            return null;
         };
-        return true;
+        const child = registry.findById(child_id) orelse return null;
+        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
     }
 };
 
 fn destroySlot(owner: *Owner, slot: *Slot) void {
     if (slot.thread) |thread| thread.join();
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
+    owner.mutex.unlock(io_mod.getIo());
     std.debug.assert(slot.route_refs == 0);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
+}
+
+test "child feedback deduplicates operations and bounds queued receipts" {
+    const alloc = std.testing.allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    var owner = Owner{ .alloc = alloc, .sessions = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    const slot = try alloc.create(Slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .worker = &worker, .work_id = "work" };
+    try owner.slots.append(alloc, slot);
+    defer {
+        slot.worker = null;
+        worker.deinit(alloc);
+        owner.deinit();
+    }
+    try std.testing.expect(worker.beginDirectProcessing(7));
+    const fingerprint = [_]u8{1} ** 32;
+    try std.testing.expect((try owner.steer("child", "previous-work", "first", fingerprint, "same text")) == .waiting);
+    try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+    try std.testing.expect(owner.feedbackReplay("first", fingerprint) == null);
+    try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "first", fingerprint, "same text")).receipt);
+    try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "first", fingerprint, "same text")).receipt);
+    try std.testing.expect((try owner.steer("child", "work", "first", [_]u8{2} ** 32, "different")) == .conflict);
+    try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
+    for (1..64) |index| {
+        const id = try std.fmt.allocPrint(alloc, "feedback-{d}", .{index});
+        defer alloc.free(id);
+        try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", id, fingerprint, "same text")).receipt);
+    }
+    try std.testing.expect((try owner.steer("child", "work", "overflow", fingerprint, "same text")) == .capacity);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try worker.takeSteeringBoundaryInto(alloc, arena.allocator(), 7, .model);
+    try std.testing.expectEqual(@as(usize, 64), result.continue_turn.len);
+    try std.testing.expectEqual(types.SteeringDelivery.applied, owner.feedbackReplay("first", fingerprint).?.receipt);
+    try std.testing.expectEqual(@as(usize, 64), (try owner.feedbackUpdates(arena.allocator())).len);
+    owner.acknowledgeFeedback("other-child", "first", .applied);
+    try std.testing.expectEqual(@as(usize, 64), (try owner.feedbackUpdates(arena.allocator())).len);
+    owner.acknowledgeFeedback("child", "first", .applied);
+    try std.testing.expectEqual(@as(usize, 63), (try owner.feedbackUpdates(arena.allocator())).len);
+}
+
+fn checkFeedbackAllocation(alloc: Allocator) !void {
+    var owner = Owner{ .alloc = alloc, .sessions = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    defer owner.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer {
+        for (owner.slots.items) |slot| slot.worker = null;
+        worker.deinit(alloc);
+    }
+    {
+        const slot = try alloc.create(Slot);
+        errdefer alloc.destroy(slot);
+        slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .worker = &worker, .work_id = "work" };
+        errdefer alloc.free(slot.child_id);
+        try owner.slots.append(alloc, slot);
+    }
+    try std.testing.expect(worker.beginDirectProcessing(1));
+    const result = try owner.steer("child", "work", "message", [_]u8{1} ** 32, "feedback");
+    try std.testing.expectEqual(types.SteeringDelivery.queued, result.receipt);
+}
+
+test "child feedback allocation failure preserves ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFeedbackAllocation, .{});
 }
 
 fn slotMain(slot: *Slot) void {
@@ -285,8 +519,8 @@ fn slotMain(slot: *Slot) void {
     // Startup must not inspect the old slot between saved and in-memory completion.
     // Take owner before registry, matching cancellation and approval lock ordering.
     owner.mutex.lockUncancelable(io_mod.getIo());
-    const published = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
-    slot.completion = if (published) .published else .unpublished;
+    const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
+    slot.completion = if (completed) |value| .{ .published = value } else .unpublished;
     slot.done.set(io_mod.getIo());
     owner.mutex.unlock(io_mod.getIo());
     outcome.deinit(owner.alloc);
@@ -336,6 +570,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_fn = Owner.phaseTransition;
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
+    slot.work_id = turn.active_work_id;
     if (slot.cancel.load(.seq_cst)) slot.worker.?.requestShutdown();
     owner.mutex.unlock(io_mod.getIo());
     turn.approval_worker_route = workerRoute(slot);
@@ -480,6 +715,7 @@ fn detachWorker(slot: *Slot) void {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     }
     slot.worker = null;
+    slot.work_id = null;
     owner.mutex.unlock(io_mod.getIo());
 }
 
@@ -642,8 +878,8 @@ test "subagent completion takes the owner lock before the registry lock" {
         try std.testing.expectEqual(false, harness.owner_was_unlocked);
         try std.testing.expect(slot.done.isSet());
         try std.testing.expect(slot.worker == null);
-        const expected: @TypeOf(slot.completion) = if (case.fail_save) .unpublished else .published;
-        try std.testing.expectEqual(expected, slot.completion);
+        const expected: std.meta.Tag(@TypeOf(slot.completion)) = if (case.fail_save) .unpublished else .published;
+        try std.testing.expectEqual(expected, std.meta.activeTag(slot.completion));
         try std.testing.expect(owner.mutex.tryLock());
         owner.mutex.unlock(io_mod.getIo());
         var lock = try owner.state_store.acquireLock(alloc);
@@ -910,12 +1146,80 @@ test "subagent failure to publish completion returns state unavailable instead o
         .completion = .unpublished,
     };
     try owner.slots.append(alloc, slot);
+    const Waiter = struct {
+        owner: *Owner,
+        result: ?WaitError = null,
+        fn run(self: *@This()) void {
+            _ = self.owner.wait("child", .{ .clock = .awake, .raw = .fromSeconds(30) }) catch |err| {
+                self.result = err;
+                return;
+            };
+        }
+    };
+    var waiter = Waiter{ .owner = &owner };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var joined = false;
+    defer if (!joined) {
+        slot.done.set(io_mod.getIo());
+        thread.join();
+    };
+    var pinned = false;
+    for (0..1000) |_| {
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        pinned = slot.waiters == 1;
+        const reaped = if (pinned) owner.takeCompletedSlotLocked(slot) else false;
+        owner.mutex.unlock(io_mod.getIo());
+        try std.testing.expect(!reaped);
+        if (pinned) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(pinned);
     slot.done.set(io_mod.getIo());
-    try std.testing.expectError(error.StateUnavailable, owner.wait("child", .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(1),
-    }));
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?WaitError, error.StateUnavailable), waiter.result);
     try std.testing.expectEqual(@as(usize, 0), owner.slots.items.len);
+}
+
+test "subagent wait returns its completed observation after the registry advances" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("wait-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    const store = child_state.Store{ .sessions = &sessions, .parent_id = "wait-parent" };
+    var registry = try child_state.Registry.init(alloc, "wait-parent");
+    defer registry.deinit(alloc);
+    try registry.appendPersistent(alloc, "child", "reviewer", "", .{ .id = @constCast("old-work"), .message = @constCast("old task"), .created_at_ms = 1 });
+    try registry.finish(alloc, "child", "old-work", .completed, null);
+    _ = try registry.startPersistentWork(alloc, "reviewer", null, .{ .id = @constCast("new-work"), .message = @constCast("new task"), .created_at_ms = 2 });
+    try store.save(alloc, registry);
+    var owner = Owner{ .alloc = alloc, .sessions = &sessions, .state_store = store, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    defer owner.deinit();
+    const slot = try alloc.create(Slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .completion = .{ .published = .{ .phase = .idle, .outcome = .completed } } };
+    try owner.slots.append(alloc, slot);
+    slot.done.set(io_mod.getIo());
+    const observed = try owner.wait("child", .{ .clock = .awake, .raw = .fromMilliseconds(1) });
+    try std.testing.expectEqual(child_state.Phase.idle, observed.phase);
+    try std.testing.expectEqual(@as(?child_state.Outcome, .completed), observed.outcome);
+    const current = try owner.observe("child");
+    try std.testing.expectEqual(child_state.Phase.running, current.phase);
 }
 
 test "worker detach invalidates approval routes before worker deinit" {

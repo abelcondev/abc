@@ -314,6 +314,14 @@ pub const BuildBudget = struct {
     }
 };
 
+/// The language-model route validates reasoning effort against its own tier
+/// names and rejects "max", which the model catalog still advertises for some
+/// models. Map it to the highest accepted tier.
+fn reasoningWireValue(label: []const u8) []const u8 {
+    if (std.mem.eql(u8, label, "max")) return "xhigh";
+    return label;
+}
+
 fn buildGatewayRequestBodyValidated(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
@@ -384,7 +392,7 @@ fn buildGatewayRequestBodyValidated(
 
     if (options.reasoning) |*reasoning| {
         try out.writer.writeAll(",\"reasoning\":");
-        try std.json.Stringify.value(reasoning.label(), .{}, &out.writer);
+        try std.json.Stringify.value(reasoningWireValue(reasoning.label()), .{}, &out.writer);
     }
     try writeProviderOptions(&out.writer, options);
 
@@ -1453,6 +1461,21 @@ test "buildGatewayRequestBodyWithOptions keeps Anthropic default silent and name
     defer named_parsed.deinit();
     try std.testing.expectEqualStrings("future-tier", named_parsed.value.object.get("reasoning").?.string);
     try std.testing.expect(named_parsed.value.object.get("providerOptions") == null);
+}
+
+test "buildGatewayRequestBodyWithOptions maps max effort to the highest accepted tier" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+    };
+
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .reasoning = types.ReasoningEffort.literal("max"),
+    }, .auto);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("xhigh", parsed.value.object.get("reasoning").?.string);
 }
 
 test "required gateway request serializes required tool choice and max output" {

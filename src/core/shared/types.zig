@@ -1035,6 +1035,8 @@ pub const PersistedSteering = struct {
     after_tool_step_count: usize,
 };
 
+pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
+
 pub const FileEvidence = struct {
     path: []u8,
     new_path: ?[]u8 = null,
