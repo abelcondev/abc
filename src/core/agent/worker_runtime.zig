@@ -310,7 +310,7 @@ pub const CommandOutputChunk = struct {
 pub const SteeringPresentationSnapshot = struct {
     messages: [][]u8 = &.{},
     pending_feedback: [][]u8 = &.{},
-    waits_for_tool: bool = false,
+    waits_for_boundary: bool = false,
 
     pub fn deinit(self: *SteeringPresentationSnapshot, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
@@ -1626,7 +1626,7 @@ pub const WorkerRuntime = struct {
             if (prompt.delivery.isSteering()) steering_count += 1;
         }
         var snapshot: SteeringPresentationSnapshot = .{
-            .waits_for_tool = steering_count > 0 and self.hasSteeringWaitBoundaryLocked(),
+            .waits_for_boundary = steering_count > 0 and self.hasSteeringWaitBoundaryLocked(),
         };
         errdefer snapshot.deinit(alloc);
         snapshot.pending_feedback = pending: {
@@ -4329,7 +4329,7 @@ test "interactive prompt during running manual compaction waits without cancelli
     try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
     var snapshot = try runtime.snapshotSteeringPresentation(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.waits_for_tool);
+    try std.testing.expect(snapshot.waits_for_boundary);
 
     // A compaction work item never takes a steering boundary; finishing it
     // promotes the waiting prompt to a continuation that runs next.
@@ -4648,7 +4648,7 @@ test "tool handoff phase holds steering only through its model step" {
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
     var snapshot = try runtime.snapshotSteeringPresentation(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expect(snapshot.waits_for_tool);
+    try std.testing.expect(snapshot.waits_for_boundary);
 
     const guidance = try expectContinuedSteering(
         try runtime.takeSteeringBoundary(alloc, 41, .model),
@@ -4754,7 +4754,7 @@ test "queued steer waiting at a tool boundary pops back for editing" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot.messages.len);
     try std.testing.expectEqualStrings("first steer", snapshot.messages[0]);
-    try std.testing.expect(snapshot.waits_for_tool);
+    try std.testing.expect(snapshot.waits_for_boundary);
 
     const guidance = try expectContinuedSteering(
         try runtime.takeSteeringBoundary(alloc, 41, .model),
@@ -4875,7 +4875,7 @@ test "immediate steering is visible while the provider cutoff settles" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.messages.len);
     try std.testing.expectEqualStrings("first", snapshot.messages[0]);
     try std.testing.expectEqualStrings("second", snapshot.messages[1]);
-    try std.testing.expect(!snapshot.waits_for_tool);
+    try std.testing.expect(!snapshot.waits_for_boundary);
 }
 
 test "steering presentation survives queue to feedback transfer without duplicate input" {
@@ -4954,7 +4954,7 @@ test "tool-blocked steering snapshot owns visible messages in admission order" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.messages.len);
     try std.testing.expectEqualStrings("first", snapshot.messages[0]);
     try std.testing.expectEqualStrings("second", snapshot.messages[1]);
-    try std.testing.expect(snapshot.waits_for_tool);
+    try std.testing.expect(snapshot.waits_for_boundary);
 }
 
 test "late steering keeps admission order when demoted on finish" {

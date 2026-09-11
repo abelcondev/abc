@@ -419,7 +419,7 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     steering_messages: []const []const u8 = &.{},
-    steering_waits_for_tool: bool = false,
+    steering_waits_for_boundary: bool = false,
     fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
@@ -518,11 +518,11 @@ fn steering_unit_width(raw: []const u8) usize {
 pub fn steering_message_layout(
     message: []const u8,
     width: u16,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
     row_limit: u16,
 ) SteeringMessageLayout {
     var layout: SteeringMessageLayout = .{
-        .content_width = if (waits_for_tool) width -| 2 else width,
+        .content_width = if (waits_for_boundary) width -| 2 else width,
     };
     const limit = @min(row_limit, max_steering_message_rows);
     var offset: usize = 0;
@@ -578,13 +578,13 @@ pub fn steering_message_layout(
 
 pub fn steeringBannerRowsForMessages(
     messages: []const []const u8,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
     width: u16,
 ) u16 {
-    if (messages.len == 0 or !waits_for_tool) return 0;
+    if (messages.len == 0 or !waits_for_boundary) return 0;
     var rows: u16 = 0;
     for (messages) |message| {
-        rows +|= steering_message_layout(message, width, waits_for_tool, max_steering_message_rows).row_count;
+        rows +|= steering_message_layout(message, width, waits_for_boundary, max_steering_message_rows).row_count;
     }
     return rows +| steering_composer_gap_rows;
 }
@@ -592,7 +592,7 @@ pub fn steeringBannerRowsForMessages(
 pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
     return steeringBannerRowsForMessages(
         ctx.steering_messages,
-        ctx.steering_waits_for_tool,
+        ctx.steering_waits_for_boundary,
         width,
     );
 }
