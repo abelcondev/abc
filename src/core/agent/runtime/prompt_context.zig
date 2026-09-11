@@ -804,6 +804,13 @@ test "provider request image accounting handles allocation and malformed input f
         "{\"input\":[],\"prompt\":[]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\"}]}]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"escaped\\nimage\"}]}]}",
+        // Prompt-shape file parts must carry the nested v4 data object; every
+        // other shape is rejected rather than mis-measured.
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"AAAA\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"escaped\\nimage\"}}]}]}",
     }) |body| {
         try std.testing.expectError(error.InvalidRequestMeasurement, measureProviderRequest(std.testing.allocator, body, measurement_test_request(true)));
     }
