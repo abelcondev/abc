@@ -1802,7 +1802,7 @@ while :; do :; done
         timeout,
       );
 
-      await active.sendKeys("Escape");
+      await active.sendInterruptEscapePair(timeout);
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
         () => readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
@@ -2030,7 +2030,7 @@ while :; do :; done
         "the below-cap command readiness file",
         timeout,
       );
-      await active.sendKeys("Escape");
+      await active.sendInterruptEscapePair(timeout);
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
         () => existsSync(tracePath) &&
@@ -6517,7 +6517,7 @@ test.skipIf(!tmuxAvailable())(
       const duringStream = await active.capturePane();
       expect(duringStream).not.toContain("updated");
 
-      await active.sendKeys("Escape");
+      await active.sendInterruptEscapePair(TIMEOUT);
       await waitForCondition(() => hold.cancelled, "Escape to cancel the held response");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -6641,7 +6641,7 @@ while :; do sleep 1; done
         "the interrupt command readiness file",
         timeout,
       );
-      await active.sendKeys("Escape");
+      await active.sendInterruptEscapePair(timeout);
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
         () => existsSync(tracePath) &&
@@ -6792,7 +6792,7 @@ test.skipIf(!tmuxAvailable())(
         "the zero-output command readiness file",
         timeout,
       );
-      await active.sendKeys("Escape");
+      await active.sendInterruptEscapePair(timeout);
       await waitForScrollback(active, "Cancelled", timeout);
       await waitForCondition(
         () => existsSync(tracePath) &&

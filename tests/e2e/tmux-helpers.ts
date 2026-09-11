@@ -722,6 +722,26 @@ export class TmuxSession {
     await sleep(100);
   }
 
+  // Interrupt active work: the first Escape arms the interrupt gesture, and a
+  // confirming press within the one-second window cancels. The confirm press
+  // is retried once when a runner stall let the arm expire between presses
+  // (the hint reappearing means the second press re-armed instead of firing).
+  async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
+    await this.sendKeys("Escape");
+    await this.waitForText("esc again to interrupt", hintTimeoutMs);
+    await sleep(150);
+    await this.sendKeys("Escape");
+    await sleep(250);
+    const pane = await this.capturePane();
+    if (
+      pane.includes("esc again to interrupt") ||
+      pane.includes("esc esc interrupt") ||
+      pane.includes("esc esc to interrupt")
+    ) {
+      await this.sendKeys("Escape");
+    }
+  }
+
   sendKeysImmediate(keys: readonly string[]): void {
     execFileSync(
       "tmux",

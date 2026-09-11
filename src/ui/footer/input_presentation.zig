@@ -496,7 +496,7 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
-    const hint_line = if (question_hint) |hint|
+    var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
         "press ctrl+c again to exit"
@@ -507,10 +507,32 @@ pub fn composeHintRow(
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
+    // The armed interrupt hint shrinks through compact variants so narrow
+    // terminals still show the confirming-press cue; when no variant fits
+    // beside the left hint, the cue owns the whole row like ctrl+c does.
+    const esc_interrupt_variants = [_][]const u8{
+        "esc again to interrupt",
+        "esc esc interrupt",
+        "esc esc",
+    };
+    var esc_interrupt_hint: []const u8 = "";
+    if (ctx.esc_interrupt_armed) {
+        const left_width = display_width.visibleWidthIgnoringAnsi(hint_line);
+        for (esc_interrupt_variants) |candidate| {
+            if (width_usize > left_width + display_width.visibleWidth(candidate)) {
+                esc_interrupt_hint = candidate;
+                break;
+            }
+        }
+        if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
+    }
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
-    // composer and needs the same cue.
-    const right_text: []const u8 = if (ctx.esc_clear_armed)
+    // composer and needs the same cue. The armed interrupt indicator outranks
+    // both: it guards an irreversible cancel of active work.
+    const right_text: []const u8 = if (ctx.esc_interrupt_armed)
+        esc_interrupt_hint
+    else if (ctx.esc_clear_armed)
         "esc again to clear"
     else if (question_hint != null)
         ""
@@ -555,7 +577,7 @@ pub fn dangerStatusText(
 ) []const u8 {
     // Transient interaction hints own the whole row: the warning is placed at
     // an absolute column and would overwrite them on narrow terminals.
-    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.ctrl_c_pending) return "";
+    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.esc_interrupt_armed or ctx.ctrl_c_pending) return "";
     if (ctx.danger_status.len > 0 and
         display_width.visibleWidth(ctx.danger_status) <= width)
     {
@@ -1556,6 +1578,39 @@ test "footer suppresses slash rows for streaming model-shaped input" {
     generic_ctx.skills_menu = .{ .items = &skills };
     generic_ctx.stream = .{ .active = true };
     try std.testing.expect(slashCompletionPickerCount(generic_ctx, false, false, false) > 0);
+}
+
+test "compose hint row prioritizes the armed interrupt hint and shrinks it on narrow widths" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var ctx = testRenderContext(&input);
+    ctx.esc_interrupt_armed = true;
+    ctx.esc_clear_armed = true;
+    ctx.danger_status = "danger";
+    ctx.danger_status_compact = "danger";
+
+    var wide = try composeHintRow(alloc, false, ctx, 96);
+    defer wide.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to interrupt") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to clear") == null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "danger") == null);
+
+    // Narrow widths fall back to compact variants instead of dropping the cue.
+    // The test context left hint is "ask · gpt-5.1" (13 columns).
+    var compact = try composeHintRow(alloc, false, ctx, 32);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.items, "esc esc interrupt") != null);
+
+    var narrowest = try composeHintRow(alloc, false, ctx, 18);
+    defer narrowest.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrowest.items, "esc esc to") != null);
+
+    ctx.esc_interrupt_armed = false;
+    var clear_only = try composeHintRow(alloc, false, ctx, 96);
+    defer clear_only.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, clear_only.items, "esc again to clear") != null);
 }
 
 test "compose hint row keeps model in left hint text" {

@@ -4,6 +4,7 @@ const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
+const ui_render = @import("../render.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -345,11 +346,80 @@ fn clipSummary(
     text: []const u8,
     cols: u16,
 ) ![]u8 {
-    if (display_width.visibleWidth(text) <= cols) return try alloc.dupe(u8, text);
+    if (display_width.visibleWidthIgnoringAnsi(text) <= cols) return try alloc.dupe(u8, text);
     if (cols == 0) return try alloc.dupe(u8, "");
     if (cols == 1) return try alloc.dupe(u8, "…");
-    const prefix = display_width.prefixByWidth(text, cols - 1);
-    return try std.fmt.allocPrint(alloc, "{s}…", .{prefix});
+    const prefix = display_width.prefixByWidthIgnoringAnsi(text, cols - 1);
+    const clipped = try std.fmt.allocPrint(alloc, "{s}…", .{prefix});
+    // A cut inside a styled run can leave the final SGR open; close it so the
+    // accent cannot bleed into whatever the terminal paints next.
+    if (std.mem.find(u8, clipped, "\x1b") == null or std.mem.endsWith(u8, clipped, "\x1b[0m"))
+        return clipped;
+    defer alloc.free(clipped);
+    return try std.fmt.allocPrint(alloc, "{s}\x1b[0m", .{clipped});
+}
+
+const StatToken = struct {
+    /// Index of the sign character.
+    start: usize,
+    added: bool,
+};
+
+/// Matches a trailing " +N" or " -N" diff count in a plain status phrase.
+fn trailingStatToken(text: []const u8) ?StatToken {
+    var index = text.len;
+    while (index > 0 and std.ascii.isDigit(text[index - 1])) : (index -= 1) {}
+    if (index == text.len) return null;
+    if (index < 2) return null;
+    const sign = text[index - 1];
+    if (sign != '+' and sign != '-') return null;
+    if (text[index - 2] != ' ') return null;
+    return .{ .start = index - 1, .added = sign == '+' };
+}
+
+/// Re-applies the diff add/remove marker accents to the trailing "+N" / "-N"
+/// counts of a normalized tool status phrase. Normalization strips SGR so
+/// grouped lines stay uniform; the counts keep their green/red so file edits
+/// stay scannable inside collapsed and expanded groups. `ambient_style` is
+/// re-applied between the two counts so the " / " separator keeps the line's
+/// surrounding style. Returns `text` unchanged when no diff count suffix is
+/// present. Caller owns the returned slice.
+fn accentTrailingDiffStats(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    ambient_style: []const u8,
+) ![]u8 {
+    const added_style = ui_render.diff_added_marker_style;
+    const removed_style = ui_render.diff_removed_marker_style;
+    if (added_style.len == 0 and removed_style.len == 0) return try alloc.dupe(u8, text);
+    const reset = "\x1b[0m";
+
+    const last = trailingStatToken(text) orelse return try alloc.dupe(u8, text);
+    if (!last.added and last.start >= 2 and text[last.start - 2] == '/') {
+        const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
+        if (trailingStatToken(before_slash)) |first| {
+            if (first.added) {
+                return try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}{s} / {s}{s}{s}", .{
+                    before_slash[0..first.start],
+                    added_style,
+                    before_slash[first.start..],
+                    reset,
+                    ambient_style,
+                    removed_style,
+                    text[last.start..],
+                    reset,
+                });
+            }
+        }
+    }
+    const style = if (last.added) added_style else removed_style;
+    if (style.len == 0) return try alloc.dupe(u8, text);
+    return try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
+        text[0..last.start],
+        style,
+        text[last.start..],
+        reset,
+    });
 }
 
 fn applySummaryStyle(
@@ -487,9 +557,10 @@ fn formatGroupBlock(
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
         const clipped = try clipSummary(scratch, child, cols);
+        const accented = try accentTrailingDiffStats(scratch, clipped, style.text_style);
         try out.writer.writeByte('\n');
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
-        try out.writer.writeAll(clipped);
+        try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
     }
 
@@ -538,7 +609,8 @@ fn formatExpandedChild(
     } orelse if (detail) |record| record.tool_name else "tool activity";
     const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
     const clipped = try clipSummary(scratch, child, cols);
-    return alloc.dupe(u8, clipped);
+    const accented = try accentTrailingDiffStats(scratch, clipped, "");
+    return alloc.dupe(u8, accented);
 }
 
 fn installExpandedGroup(
@@ -1178,6 +1250,115 @@ test "small minimal tool groups surface canonical action targets" {
             "└ Editing store.zig",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "accentTrailingDiffStats re-applies add and remove marker styles" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const added = try accentTrailingDiffStats(alloc, "Wrote note.txt +143", "");
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("Wrote note.txt [G]+143\x1b[0m", added);
+
+    const removed = try accentTrailingDiffStats(alloc, "Edited main.zig -27", "");
+    defer alloc.free(removed);
+    try std.testing.expectEqualStrings("Edited main.zig [R]-27\x1b[0m", removed);
+
+    const both = try accentTrailingDiffStats(alloc, "Edited main.zig +12 / -3", "[dim]");
+    defer alloc.free(both);
+    try std.testing.expectEqualStrings("Edited main.zig [G]+12\x1b[0m[dim] / [R]-3\x1b[0m", both);
+
+    const plain = try accentTrailingDiffStats(alloc, "Read runtime.zig", "");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("Read runtime.zig", plain);
+
+    const not_a_stat = try accentTrailingDiffStats(alloc, "Wrote notes v2", "");
+    defer alloc.free(not_a_stat);
+    try std.testing.expectEqualStrings("Wrote notes v2", not_a_stat);
+
+    ui_render.diff_added_marker_style = "";
+    ui_render.diff_removed_marker_style = "";
+    const unstyled = try accentTrailingDiffStats(alloc, "Wrote note.txt +143", "");
+    defer alloc.free(unstyled);
+    try std.testing.expectEqualStrings("Wrote note.txt +143", unstyled);
+}
+
+test "collapsed tool group keeps diff count accents" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 1 read · 1 write · 1 edit\n" ++
+            "├ Read runtime.zig\n" ++
+            "├ Wrote note.txt [G]+143\x1b[0m\n" ++
+            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "expanded tool group keeps diff count accents" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+    };
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{
+        .marker_style = "<marker>",
+        .text_style = "<secondary>",
+        .reset_style = "<reset>",
+    }, .{}, null);
+    defer projection.deinit(alloc);
+    const expanded = projection.entry_actions.items[0].override.bytes;
+
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Wrote note.txt [G]+143\x1b[0m") != null);
+}
+
+test "clipSummary clips styled text by visible width and closes open SGR" {
+    const alloc = std.testing.allocator;
+
+    const before_style = try clipSummary(alloc, "├ Wrote a/very/long/path/that/overflows.zig \x1b[32m+143\x1b[0m", 20);
+    defer alloc.free(before_style);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(before_style) <= 20);
+    try std.testing.expect(std.mem.find(u8, before_style, "\x1b") == null);
+
+    const inside_style = try clipSummary(alloc, "├ Wrote x \x1b[32m+143\x1b[0m", 13);
+    defer alloc.free(inside_style);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(inside_style) <= 13);
+    try std.testing.expect(std.mem.endsWith(u8, inside_style, "\x1b[0m"));
 }
 
 test "minimal tool groups keep instruction refresh neutral and denials visible" {

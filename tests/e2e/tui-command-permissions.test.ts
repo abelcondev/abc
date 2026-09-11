@@ -1231,7 +1231,10 @@ describe("effect-aware command permissions", () => {
       expect(full).toContain("FXC110_FAILED_STDERR");
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("3 tool calls", TIMEOUT);
+      await activeSession.waitForPane(
+        pane => pane.includes("3 tool calls") && !pane.includes("full detail · ctrl+o close"),
+        TIMEOUT,
+      );
       expectNoOutputRows(await activeSession.captureFullScrollback());
       await activeSession.resizeWindow(64, 28);
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -2569,7 +2572,7 @@ describe("effect-aware command permissions", () => {
       }
       expect(gateway.classifierRequests).toHaveLength(1);
 
-      await activeSession.sendKeys("Escape");
+      await activeSession.sendInterruptEscapePair(TIMEOUT);
       const cancelDeadline = Date.now() + TIMEOUT;
       while (
         (!existsSync(tracePath) || !readFileSync(tracePath, "utf8").includes("fallback_reason=Cancelled")) &&
