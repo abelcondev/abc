@@ -1146,10 +1146,6 @@ pub fn skillSourceMatchesFilter(source: SkillSource, filter: SkillMenuSourceFilt
     return filter == .all or skillMenuFilterForSource(source) == filter;
 }
 
-pub fn skill_matches_menu_query(skill: Skill, query: []const u8) bool {
-    return skillMatchRank(skill, query) != null;
-}
-
 pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {
     var matching_names: usize = 0;
     for (skills) |skill| {
@@ -1160,10 +1156,6 @@ pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {
     return null;
 }
 
-pub fn skillMenuFilterCount(skills: []const Skill, filter: SkillMenuSourceFilter) usize {
-    return skillMenuFilterQueryCount(skills, filter, "");
-}
-
 pub fn skillMenuFilterQueryCount(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) usize {
     var count: usize = 0;
     var it = SkillMenuView.init(skills, filter, query);
@@ -1171,10 +1163,6 @@ pub fn skillMenuFilterQueryCount(skills: []const Skill, filter: SkillMenuSourceF
         count += 1;
     }
     return count;
-}
-
-pub fn skillMenuActualIndexAt(skills: []const Skill, filter: SkillMenuSourceFilter, display_index: usize) ?usize {
-    return skillMenuActualIndexAtQuery(skills, filter, "", display_index);
 }
 
 pub fn skillMenuActualIndexAtQuery(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8, display_index: usize) ?usize {

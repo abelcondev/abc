@@ -323,7 +323,6 @@ pub const DispatchContext = struct {
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
     model_content_kind_sink: ?*ModelContentKind = null,
     command_result_json_sink: ?*?[]const u8 = null,
-    turn_control_sink: ?*?TurnControl = null,
     result_commit_sink: ?*?result_commit.Token = null,
 };
 
@@ -981,11 +980,6 @@ pub fn reportToolResultMemory(ctx: DispatchContext, memory: core_types.ToolResul
 pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
     const sink = ctx.command_result_json_sink orelse return;
     sink.* = json;
-}
-
-pub fn reportTurnControl(ctx: DispatchContext, control: TurnControl) void {
-    const sink = ctx.turn_control_sink orelse return;
-    sink.* = control;
 }
 
 pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
