@@ -2207,6 +2207,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const effort = types.ReasoningEffort.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        const config = sessions.effortConfigState(state) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is unavailable for the active model",
+            });
+        if (!sessions.effortSupportedBy(config.efforts, effort)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is not available for the active model",
+            });
+        }
+        commitActiveSessionEffort(alloc, session, effort) catch {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session effort",
+            });
+        };
     }
 
     try refreshModelCatalogForOptions(state);
@@ -2230,6 +2257,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (sessions.effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -2318,6 +2349,34 @@ fn commitSessionModel(
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
+}
+
+fn commitActiveSessionEffort(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+) !void {
+    if (host_target.is_wasm and session.writable == null) {
+        const previous = session.effort;
+        session.effort = effort;
+        sessions.commitWasmSession(alloc, session) catch |err| {
+            session.effort = previous;
+            return err;
+        };
+        return;
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .effort = effort } },
+        io_mod.milliTimestamp(),
+    );
+    session.effort = effort;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {

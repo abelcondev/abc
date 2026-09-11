@@ -1861,6 +1861,86 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP config options advertise and apply reasoning effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-effort-");
+      const gateway = startFakeGateway(
+        [finalText("EFFORT_APPLIED")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            context_window: 128_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const sessionId = created.result.sessionId as string;
+
+        const advertised = created.result.configOptions.find((option: any) => option.id === "effort");
+        expect(advertised).toBeDefined();
+        expect(advertised.category).toBe("thought_level");
+        expect(advertised.type).toBe("select");
+        expect(advertised.currentValue).toBe("auto");
+        expect(advertised.options.map((option: any) => option.value)).toEqual(["auto", "low", "high"]);
+
+        const rejected = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "effort", value: "ultra" },
+          4,
+        ) as any;
+        expect(rejected.error).toBeDefined();
+        expect(rejected.error.message).toContain("not available");
+
+        const applied = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "effort", value: "high" },
+          5,
+        ) as any;
+        expect(applied.error).toBeUndefined();
+        expect(applied.result.configOptions.find((option: any) => option.id === "effort").currentValue)
+          .toBe("high");
+
+        const prompt = await runPrompt(client, "Say EFFORT_APPLIED.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests.at(-1)!.body).toContain("\"reasoning\":\"high\"");
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 6);
+        const loaded = await client.request(
+          "session/load",
+          { sessionId, cwd: root.workspace, mcpServers: [] },
+          7,
+        ) as any;
+        expect(loaded.error).toBeUndefined();
+        expect(loaded.result.configOptions.find((option: any) => option.id === "effort").currentValue)
+          .toBe("high");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");

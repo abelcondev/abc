@@ -21,6 +21,7 @@ const project_config = @import("../core/mcp/project_config.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -326,6 +327,10 @@ fn writeNewSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -863,6 +868,10 @@ fn writeLoadSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -1618,6 +1627,82 @@ fn writeModesArray(w: *std.Io.Writer, registry: mode_registry.Registry) !void {
         try w.writeAll("}");
     }
     try w.writeAll("]");
+}
+
+pub const EffortConfigState = struct {
+    efforts: model_capabilities.ReasoningEffortOptions,
+    current: types.ReasoningEffort,
+};
+
+/// Reasoning-effort selector state for the active session, or null when the
+/// active model advertises no effort options (matching the TUI, which hides
+/// the effort picker for those models).
+pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
+    const active = if (state.active_session) |*session| session else return null;
+    const bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        bundle.fallbackModelCapabilities(active.model),
+    );
+    if (capabilities.reasoning_efforts.len == 0) return null;
+    return .{ .efforts = capabilities.reasoning_efforts, .current = active.effort };
+}
+
+pub fn effortSupportedBy(efforts: model_capabilities.ReasoningEffortOptions, effort: types.ReasoningEffort) bool {
+    if (effort == .auto) return true;
+    for (efforts.slice()) |option| {
+        if (option.eql(effort)) return true;
+    }
+    return false;
+}
+
+pub fn writeEffortConfigOption(
+    w: *std.Io.Writer,
+    efforts: model_capabilities.ReasoningEffortOptions,
+    current: types.ReasoningEffort,
+) !void {
+    try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning Effort\",\"description\":\"Controls how much the model thinks before responding\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(current.label(), w);
+    try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"default\"}");
+    for (efforts.slice()) |effort| {
+        try w.writeAll(",{\"value\":");
+        try writeJsonStr(effort.label(), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(effort.displayLabel(), w);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+test "writeEffortConfigOption produces thought_level select with auto first" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    });
+    try writeEffortConfigOption(&out.writer, efforts, .literal("high"));
+    const items = out.writer.buffered();
+    try std.testing.expect(std.mem.find(u8, items, "\"id\":\"effort\"") != null);
+    try std.testing.expect(std.mem.find(u8, items, "\"category\":\"thought_level\"") != null);
+    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"high\"") != null);
+    const auto_index = std.mem.find(u8, items, "\"value\":\"auto\"").?;
+    const low_index = std.mem.find(u8, items, "\"value\":\"low\"").?;
+    try std.testing.expect(auto_index < low_index);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("select", parsed.value.object.get("type").?.string);
+}
+
+test "effortSupportedBy accepts auto and advertised names only" {
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    });
+    try std.testing.expect(effortSupportedBy(efforts, .auto));
+    try std.testing.expect(effortSupportedBy(efforts, .literal("high")));
+    try std.testing.expect(!effortSupportedBy(efforts, .literal("max")));
 }
 
 test "formatIso8601 produces valid format" {
