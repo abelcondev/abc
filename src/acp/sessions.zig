@@ -1664,11 +1664,22 @@ pub fn writeEffortConfigOption(
     try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning Effort\",\"description\":\"Controls how much the model thinks before responding\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"default\"}");
+    var current_listed = current == .auto;
     for (efforts.slice()) |effort| {
+        if (effort.eql(current)) current_listed = true;
         try w.writeAll(",{\"value\":");
         try writeJsonStr(effort.label(), w);
         try w.writeAll(",\"name\":");
         try writeJsonStr(effort.displayLabel(), w);
+        try w.writeAll("}");
+    }
+    // A persisted effort the active model does not advertise still renders, so
+    // the select never shows a value outside its own option list.
+    if (!current_listed) {
+        try w.writeAll(",{\"value\":");
+        try writeJsonStr(current.label(), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(current.displayLabel(), w);
         try w.writeAll("}");
     }
     try w.writeAll("]}");
@@ -1703,6 +1714,21 @@ test "effortSupportedBy accepts auto and advertised names only" {
     try std.testing.expect(effortSupportedBy(efforts, .auto));
     try std.testing.expect(effortSupportedBy(efforts, .literal("high")));
     try std.testing.expect(!effortSupportedBy(efforts, .literal("max")));
+}
+
+test "writeEffortConfigOption appends an unadvertised current effort" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
+        types.ReasoningEffort.literal("low"),
+    });
+    try writeEffortConfigOption(&out.writer, efforts, .literal("max"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const options = parsed.value.object.get("options").?.array;
+    try std.testing.expectEqual(@as(usize, 3), options.items.len);
+    try std.testing.expectEqualStrings("max", options.items[2].object.get("value").?.string);
 }
 
 test "formatIso8601 produces valid format" {

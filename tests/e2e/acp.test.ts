@@ -8819,6 +8819,17 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
 
         const notification = await client.readLine() as any;
         expect(notification.method).toBe("session/update");
+
+        // The fake model advertises no effort levels, so the selector is
+        // omitted and setting effort is rejected.
+        expect(resp.result.configOptions.find((o: any) => o.id === "effort")).toBeUndefined();
+        const rejected = await client.request(
+          "session/set_config_option",
+          { sessionId: resp.result.sessionId, configId: "effort", value: "high" },
+          3,
+        ) as any;
+        expect(rejected.error).toBeDefined();
+        expect(rejected.error.message).toContain("unavailable");
       } finally {
         await client?.close();
         gateway.stop();
