@@ -1489,6 +1489,12 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 22 => {
+                    // The catalog menu borrows the composer as its query box:
+                    // attaching an image there would orphan the payload.
+                    if (modelMenuActive(app)) {
+                        debug_trace.logf("input", "image attach skipped reason=model_menu_active", .{});
+                        return;
+                    }
                     try image_commands.Commands(App).attachClipboard(app);
                 },
                 24 => {
@@ -1580,8 +1586,10 @@ pub fn Runtime(comptime App: type) type {
                     // The composer is lent to the picker: Ctrl+C backs out of
                     // the picker and restores the draft instead of clearing
                     // draft state, which would free the stashed draft's
-                    // pending image payloads.
+                    // pending image payloads. The restore fallback covers a
+                    // stash stranded with the menu already closed.
                     _ = closeModelMenu(app, true);
+                    restoreModelPickerDraft(app);
                     app.shell.render_requests.request(.footer);
                     return;
                 }
@@ -1658,8 +1666,10 @@ pub fn Runtime(comptime App: type) type {
                 if (app.input_runtime.model_picker_draft != null) {
                     // Same borrow rule as Ctrl+C: back out of the picker and
                     // restore the draft instead of exiting with an empty
-                    // (borrowed) composer into the resume handoff.
+                    // (borrowed) composer into the resume handoff. The restore
+                    // fallback covers a stash stranded with the menu closed.
                     _ = closeModelMenu(app, true);
+                    restoreModelPickerDraft(app);
                     app.shell.render_requests.request(.footer);
                     return;
                 }
@@ -8960,6 +8970,43 @@ test "app_input_runtime ctrl+d while the picker borrows the composer closes inst
     try std.testing.expectEqualStrings("keep me", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.model_picker_draft == null);
     try std.testing.expect(!app.should_exit);
+}
+
+test "app_input_runtime ctrl+p catalog enter failure still closes and restores the draft" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "fragile draft");
+
+    try feedRoutingBytes(&app, "\x10");
+    try setRoutingModelMenuReady(&app, &.{"alpha/one"});
+    // The selection copy owns the first allocation; fail the apply itself.
+    failing.fail_index = failing.alloc_index + 1;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100),
+    );
+
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("fragile draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+}
+
+test "app_input_runtime image attach is skipped while the model catalog borrows the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(app.model_cache.menu.active);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expect(app.model_cache.menu.active);
 }
 
 test "app_input_runtime plain arrows keep history ownership across recalled slash commands" {
