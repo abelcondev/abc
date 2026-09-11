@@ -309,13 +309,6 @@ pub fn itemAt(snapshot: Snapshot, category: Category, query: []const u8, display
     return null;
 }
 
-pub fn specFor(id: SettingId) *const Spec {
-    for (&specs) |*spec| {
-        if (spec.id == id) return spec;
-    }
-    unreachable;
-}
-
 pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
     return switch (id) {
         .effort => if (snapshot.reasoning_efforts.len > 0 or !std.ascii.eqlIgnoreCase(snapshot.effort, "default"))

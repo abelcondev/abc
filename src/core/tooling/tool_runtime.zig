@@ -937,7 +937,6 @@ const DispatchMetadata = struct {
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
         ctx.tool_result_memory_sink = &self.tool_result_memory;
         ctx.command_result_json_sink = &self.command_result_json;
-        ctx.turn_control_sink = &self.turn_control;
     }
 };
 
