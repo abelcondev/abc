@@ -36,6 +36,7 @@ function validateGatewayChatUrl(value) {
   if (url.username || url.password || url.hash) {
     throw new TypeError("gatewayChatUrl must not contain credentials or a fragment");
   }
+  if (url.href === "https://ai-gateway.vercel.sh/v4/ai/language-model") return;
   if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
   const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
   if (url.protocol !== "http:" || !loopback || !url.port) {
