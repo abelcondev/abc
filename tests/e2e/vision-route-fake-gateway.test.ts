@@ -118,10 +118,13 @@ function filePartCount(body: string) {
 
 function nativeFileParts(body: string) {
   return promptParts(body).filter(
-    (part): part is Record<string, unknown> & { data: string; mediaType: string } =>
+    (part): part is Record<string, unknown> & { data: { type: string; data: string }; mediaType: string } =>
       part.type === "file" &&
-      typeof part.data === "string" &&
-      typeof part.mediaType === "string",
+      typeof part.mediaType === "string" &&
+      typeof part.data === "object" &&
+      part.data !== null &&
+      (part.data as { type?: unknown }).type === "data" &&
+      typeof (part.data as { data?: unknown }).data === "string",
   );
 }
 
@@ -1157,7 +1160,7 @@ describe("Vision route fake Gateway", () => {
           const parts = nativeFileParts(gateway.chatRequests[0]!.body);
           expect(parts).toHaveLength(1);
           expect(parts[0]!.mediaType).toBe("image/jpeg");
-          expect(parts[0]!.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
+          expect(parts[0]!.data.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
           return;
         }
 
@@ -3168,7 +3171,7 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       expect(gateway.chatRequests).toHaveLength(4);
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);
       expect(parts).toHaveLength(1);
-      expect(createHash("sha256").update(Buffer.from(parts[0]!.data, "base64")).digest("hex")).toBe(digest);
+      expect(createHash("sha256").update(Buffer.from(parts[0]!.data.data, "base64")).digest("hex")).toBe(digest);
       const history = readFileSync(join(sessions, id, "events.jsonl"), "utf8");
       expect(history).toContain(digest);
       expect(readFileSync(snapshot).toString("base64")).toBe(original);
@@ -3219,7 +3222,7 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     await session.sendText("/continue");
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
-    expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data).toBe(original);
+    expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
     writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
     await session.sendText(`/image ${input}`);
     await session.waitForText("attached image:", TIMEOUT);
