@@ -886,7 +886,7 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const source = switch (kind) {
-            .model => blk: {
+            .model, .finalizing => blk: {
                 self.steering_take_count += 1;
                 if (self.steering_take_count != self.steering_take_at) return .none;
                 break :blk self.steering_messages;

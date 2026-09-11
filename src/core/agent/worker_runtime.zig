@@ -74,6 +74,15 @@ pub const PromptDelivery = union(enum) {
 pub const SteeringBoundaryKind = enum {
     model,
     cancelled,
+    finalizing,
+};
+
+const SteeringDelivery = types.SteeringDelivery;
+
+/// Borrowed by the queue. Its owner outlives worker teardown.
+pub const SteeringReceipt = struct {
+    operation_id: []const u8 = "",
+    state: std.atomic.Value(SteeringDelivery) = .init(.queued),
 };
 
 pub const SteeringBoundaryResult = union(enum) {
@@ -85,6 +94,7 @@ pub const SteeringBoundaryResult = union(enum) {
 
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
+    steering_receipt: ?*SteeringReceipt = null,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
     delivery: PromptDelivery = .ordinary,
     prompt: []u8,
@@ -539,6 +549,7 @@ pub const WorkerRuntime = struct {
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
+    direct_steering_closed: bool = false,
     worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set under `worker_mutex` once the active turn publishes its terminal
@@ -893,6 +904,20 @@ pub const WorkerRuntime = struct {
         try self.admitPrompt(alloc, prompt, true);
     }
 
+    /// Takes prompt ownership only on true. Does not cancel an in-flight operation
+    /// or fall back to the ordinary FIFO of an ephemeral direct worker.
+    pub fn admitActiveSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or self.active_turn_id == 0 or
+            self.direct_steering_closed or self.worker_stop_requested or
+            self.worker_cancel_requested.load(.seq_cst)) return false;
+        var queued = prompt;
+        queued.delivery = .{ .active_turn = self.active_turn_id };
+        try self.enqueuePromptLocked(alloc, queued);
+        return true;
+    }
+
     pub fn enqueueContextCompaction(
         self: *WorkerRuntime,
         task: ContextCompactionTask,
@@ -1068,6 +1093,17 @@ pub const WorkerRuntime = struct {
         turn_id: u64,
         kind: SteeringBoundaryKind,
     ) !SteeringBoundaryResult {
+        return self.takeSteeringBoundaryInto(alloc, alloc, turn_id, kind);
+    }
+
+    /// Queue/event storage uses alloc; returned guidance uses result_alloc.
+    pub fn takeSteeringBoundaryInto(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        result_alloc: std.mem.Allocator,
+        turn_id: u64,
+        kind: SteeringBoundaryKind,
+    ) !SteeringBoundaryResult {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
@@ -1079,19 +1115,20 @@ pub const WorkerRuntime = struct {
             .cancelled => {
                 if (!cancel_requested) return .none;
                 if (self.steering_cancel_turn_id != turn_id) return .interrupt;
-                const messages = try self.takeSteeringLocked(alloc, turn_id);
+                const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
                 if (messages.len == 0) return .interrupt;
                 self.steering_cancel_turn_id = null;
                 self.worker_cancel_requested.store(false, .seq_cst);
                 return .{ .continue_turn = messages };
             },
-            .model => {
+            .model, .finalizing => {
                 if (cancel_requested) return .none;
                 for (self.queued_prompts.items) |prompt| {
                     if (prompt.delivery.activeTurnId() == turn_id and
                         !sameTurnSteeringEligible(prompt)) return .handoff;
                 }
-                const messages = try self.takeSteeringLocked(alloc, turn_id);
+                const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
+                if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
                 return if (messages.len == 0)
                     .none
                 else
@@ -1100,7 +1137,7 @@ pub const WorkerRuntime = struct {
         }
     }
 
-    fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
+    fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
@@ -1109,11 +1146,11 @@ pub const WorkerRuntime = struct {
         }
         if (steering_count == 0) return &.{};
 
-        const messages = try alloc.alloc([]u8, steering_count);
+        const messages = try result_alloc.alloc([]u8, steering_count);
         var copied: usize = 0;
         errdefer {
-            for (messages[0..copied]) |text| alloc.free(text);
-            alloc.free(messages);
+            for (messages[0..copied]) |text| result_alloc.free(text);
+            result_alloc.free(messages);
         }
         const events = try alloc.alloc(WorkerEvent, steering_count);
         var event_count: usize = 0;
@@ -1123,15 +1160,17 @@ pub const WorkerRuntime = struct {
         }
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
-            messages[copied] = try alloc.dupe(u8, prompt.prompt);
+            messages[copied] = try result_alloc.dupe(u8, prompt.prompt);
             copied += 1;
-            events[event_count] = .{
-                .append_user_feedback = try alloc.dupe(u8, prompt.prompt),
-            };
-            event_count += 1;
+            if (prompt.steering_receipt == null) {
+                events[event_count] = .{
+                    .append_user_feedback = try alloc.dupe(u8, prompt.prompt),
+                };
+                event_count += 1;
+            }
         }
-        try self.worker_events.ensureUnusedCapacity(alloc, events.len);
-        for (events) |event| self.worker_events.appendAssumeCapacity(event);
+        try self.worker_events.ensureUnusedCapacity(alloc, event_count);
+        for (events[0..event_count]) |event| self.worker_events.appendAssumeCapacity(event);
         alloc.free(events);
 
         var index: usize = 0;
@@ -1141,6 +1180,10 @@ pub const WorkerRuntime = struct {
                 continue;
             }
             const prompt = self.queued_prompts.orderedRemove(index);
+            if (prompt.steering_receipt) |receipt| {
+                receipt.state.store(.applied, .seq_cst);
+                debug_trace.eventf("subagent", "feedback_applied", .{}, "operation={s}", .{receipt.operation_id});
+            }
             freeQueuedPrompt(alloc, prompt);
         }
         if (self.queued_prompts.items.len == 0) {
@@ -1437,6 +1480,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.worker_processing or self.worker_stop_requested) return false;
+        self.direct_steering_closed = false;
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_recovery_pause_requested.store(false, .seq_cst);
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -2730,6 +2774,11 @@ fn appendHistoryTurnProjection(
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
+    if (prompt.steering_receipt) |receipt| {
+        if (receipt.state.cmpxchgStrong(.queued, .not_applied, .seq_cst, .seq_cst) == null) {
+            debug_trace.eventf("subagent", "feedback_not_applied", .{}, "operation={s} reason=queue_discarded", .{receipt.operation_id});
+        }
+    }
     alloc.free(prompt.prompt);
     types.freeImageAttachmentSlice(alloc, prompt.images);
     types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
@@ -4212,6 +4261,63 @@ fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !Qu
 
 fn makeGrant(alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !types.PermissionGrant {
     return .{ .tool_name = try alloc.dupe(u8, tool_name), .target_path = try alloc.dupe(u8, target_path) };
+}
+
+test "direct steering applies at the boundary without cancellation and seals before teardown" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    var prompt = try makePrompt(alloc, "review feedback", "model");
+    prompt.steering_receipt = &receipt;
+    try std.testing.expect(try runtime.admitActiveSteering(alloc, prompt));
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(SteeringDelivery.queued, receipt.state.load(.seq_cst));
+    var output = std.heap.ArenaAllocator.init(alloc);
+    defer output.deinit();
+    const boundary = try runtime.takeSteeringBoundaryInto(alloc, output.allocator(), 41, .finalizing);
+    try std.testing.expectEqualStrings("review feedback", boundary.continue_turn[0]);
+    try std.testing.expectEqual(SteeringDelivery.applied, receipt.state.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+    try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .finalizing)) == .none);
+    const late = try makePrompt(alloc, "too late", "model");
+    defer freeQueuedPrompt(alloc, late);
+    try std.testing.expect(!try runtime.admitActiveSteering(alloc, late));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "direct steering output allocation failure preserves feedback and cancellation discards it" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{};
+    var runtime = WorkerRuntime{};
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    var prompt = try makePrompt(alloc, "must not disappear", "model");
+    prompt.steering_receipt = &receipt;
+    try std.testing.expect(try runtime.admitActiveSteering(alloc, prompt));
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runtime.takeSteeringBoundaryInto(alloc, failing.allocator(), 41, .model));
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    try std.testing.expectEqual(SteeringDelivery.queued, receipt.state.load(.seq_cst));
+    runtime.requestCancel();
+    try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .cancelled)) == .interrupt);
+    runtime.deinit(alloc);
+    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+}
+
+test "direct steering rejects inactive cancelled and full-allocation admission without taking ownership" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    const prompt = try makePrompt(alloc, "feedback", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+    try std.testing.expect(!try runtime.admitActiveSteering(alloc, prompt));
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runtime.admitActiveSteering(failing.allocator(), prompt));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    runtime.requestCancel();
+    try std.testing.expect(!try runtime.admitActiveSteering(alloc, prompt));
 }
 
 fn makePromptWithGrant(alloc: std.mem.Allocator, text: []const u8, model: []const u8, tool_name: []const u8, target_path: []const u8) !QueuedPrompt {

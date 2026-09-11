@@ -1008,7 +1008,9 @@ pub fn finishExecutedToolStatus(
     else
         null;
     const outcome_decision = command_decision orelse terminal_action_decision;
-    const base_line = if (outcome_decision) |decision| blk: {
+    const base_line = if (try tooling_presentation.subagentStatusLine(arena, call, result.model_output)) |line|
+        line
+    else if (outcome_decision) |decision| blk: {
         const base = try hooks.describe_tool_action_denied(
             hooks.ctx,
             arena,
@@ -1022,9 +1024,7 @@ pub fn finishExecutedToolStatus(
         else
             base;
     } else switch (result.status) {
-        .success => if (try tooling_presentation.subagentPendingLine(arena, call, result.model_output)) |line|
-            line
-        else if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
+        .success => if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
             result.model_output
         else
             try hooks.describe_tool_action_completed(
