@@ -20,7 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { fakeGatewaySse, hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -240,6 +240,7 @@ function startImageGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       chatRequests.push({ body, headers: req.headers });
       onChatRequest?.(chatRequests.length - 1, body);
       return responses.shift() ?? new Response("unexpected request", { status: 500 });

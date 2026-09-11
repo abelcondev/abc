@@ -82,6 +82,8 @@ Selected filenames use quoting and escaping when needed for spaces, quotes, back
 
 Use `/resume` to choose a saved conversation. The picker shares its catalog across workspace views and reuses unchanged session summaries between launches. The first catalog build, or recovery from missing cache data, scans saved sessions automatically. Changed sessions are checked again, and closing the picker stops obsolete loading work.
 
+New sessions name themselves from your first prompt. fx sends the opening message to a small provider-side model (GPT-5.6 Luna on Gateway and Codex, Grok 4.5 on Grok) and installs the generated title when it returns; until then the session shows a title derived locally from the prompt. A title you set with `/rename` is never replaced. Turn the behavior off with the `Session titles` option in `/settings`, or set `"session_titles": false` in `~/.fx/settings.json`.
+
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O. Follow-up activity for captured shell commands shows the original command, such as `Observed zig build`, while tool results keep the same execution handle.
 
 When a tool targets a directory with additional project instructions, fx shows `Reading project instructions before continuing:` before the agent decides whether to retry. This refresh does not add a failure or “command not run” count to the tool summary.
