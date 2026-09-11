@@ -1580,20 +1580,23 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// While the picker borrows the composer, destructive global gestures
+        /// back out of the picker and restore the draft instead of acting on
+        /// the empty borrowed composer (clearing draft state would free the
+        /// stashed draft's pending image payloads; exiting would hand off an
+        /// empty composer). The restore fallback covers a stash stranded with
+        /// the menu already closed.
+        fn exitModelPickerShortcutIfActive(app: *App) bool {
+            if (comptime !@hasField(App, "model_cache")) return false;
+            if (app.input_runtime.model_picker_draft == null) return false;
+            _ = closeModelMenu(app, true);
+            restoreModelPickerDraft(app);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn handleSemanticCtrlC(app: *App) !void {
-            if (comptime @hasField(App, "model_cache")) {
-                if (app.input_runtime.model_picker_draft != null) {
-                    // The composer is lent to the picker: Ctrl+C backs out of
-                    // the picker and restores the draft instead of clearing
-                    // draft state, which would free the stashed draft's
-                    // pending image payloads. The restore fallback covers a
-                    // stash stranded with the menu already closed.
-                    _ = closeModelMenu(app, true);
-                    restoreModelPickerDraft(app);
-                    app.shell.render_requests.request(.footer);
-                    return;
-                }
-            }
+            if (exitModelPickerShortcutIfActive(app)) return;
             if (app.stream.active and draftHasState(app)) {
                 clearDraftState(app, "ctrl_c");
                 app.shell.render_requests.request(.footer);
@@ -1662,18 +1665,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn handleSemanticCtrlD(app: *App, max_input_len: usize) !void {
-            if (comptime @hasField(App, "model_cache")) {
-                if (app.input_runtime.model_picker_draft != null) {
-                    // Same borrow rule as Ctrl+C: back out of the picker and
-                    // restore the draft instead of exiting with an empty
-                    // (borrowed) composer into the resume handoff. The restore
-                    // fallback covers a stash stranded with the menu closed.
-                    _ = closeModelMenu(app, true);
-                    restoreModelPickerDraft(app);
-                    app.shell.render_requests.request(.footer);
-                    return;
-                }
-            }
+            if (exitModelPickerShortcutIfActive(app)) return;
             if (app.input_runtime.edit_state.input.items.len > 0) {
                 try routeComposerShortcutAction(app, .delete_forward, max_input_len);
                 return;
@@ -2699,9 +2691,9 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
 
-            app.model_cache.closeMenu();
-            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            // Without a stashed draft the restore inside closeModelMenu is a
+            // no-op, so the /model flow shares the same close policy.
+            _ = closeModelMenu(app, true);
             try completion_rt.beginExactModelSelection(app, selected);
             return true;
         }
