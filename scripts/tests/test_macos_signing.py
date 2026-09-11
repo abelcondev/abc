@@ -233,11 +233,13 @@ else:
         )
         return result, binary, runner_temp, event_log
 
-    def test_explicit_page_size_preserves_the_production_default(self) -> None:
+    def test_selects_native_defaults_and_preserves_explicit_page_sizes(self) -> None:
         for arch, page_size, expected in (
-            ("arm64", None, "4096"),
+            ("arm64", None, "16384"),
             ("x86_64", None, "4096"),
             ("arm64 x86_64", None, "4096"),
+            ("x86_64 arm64", None, "4096"),
+            ("x86_64", "4096", "4096"),
             ("arm64", "4096", "4096"),
             ("arm64", "16384", "16384"),
         ):
@@ -351,6 +353,10 @@ else:
     def test_reports_failing_signing_stage_without_printing_secrets(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
         cases = (
+            (
+                {"FX_SIGNING_TEST_XCRUN_FAIL_COMMAND": "-archs"},
+                "architecture inspection",
+            ),
             (
                 {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "import"},
                 "PKCS#12 import",

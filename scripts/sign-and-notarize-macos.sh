@@ -21,15 +21,16 @@ if [[ $# -gt 2 || ( "${signing_page_size}" != 4096 && "${signing_page_size}" != 
     echo "Signature page size must be 4096 or 16384" >&2
     exit 1
 fi
-if [[ "${signing_page_size}" == 16384 ]]; then
-    if ! binary_archs="$("${xcrun_bin}" lipo -archs "${binary_path}")"; then
-        echo "Apple signing failed during architecture inspection" >&2
-        exit 1
-    fi
-    if [[ "${binary_archs}" != arm64 ]]; then
-        echo "16 KiB signature pages require a thin arm64 binary" >&2
-        exit 1
-    fi
+if ! binary_archs="$("${xcrun_bin}" lipo -archs "${binary_path}")"; then
+    echo "Apple signing failed during architecture inspection" >&2
+    exit 1
+fi
+if [[ $# -eq 1 && "${binary_archs}" == arm64 ]]; then
+    signing_page_size=16384
+fi
+if [[ "${signing_page_size}" == 16384 && "${binary_archs}" != arm64 ]]; then
+    echo "16 KiB signature pages require a thin arm64 binary" >&2
+    exit 1
 fi
 for required_name in \
     APPLE_DEVELOPER_ID_P12_BASE64 \
