@@ -10,6 +10,7 @@ const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const composer_stash = @import("../input/composer_stash.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -1335,6 +1336,13 @@ pub fn Bindings(comptime App: type) type {
                 provider_runtime.supported(App) and
                 @hasDecl(App, "modelCompletions"))
             {
+                // The Ctrl+P catalog owns the borrowed composer while a draft
+                // is stashed; seeding the inline "/model " flow there would
+                // land in the menu's query box and be discarded on close.
+                const InputRuntime = @TypeOf(app.input_runtime);
+                if (comptime @hasField(InputRuntime, "model_picker_draft")) {
+                    if (app.input_runtime.model_picker_draft != null) return;
+                }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }
@@ -2744,6 +2752,29 @@ test "worker bridge binds model picker callback to current completion selection"
         input_completion_runtime.CompletionRuntime(FakeApp).modelPickerIndex(&app, projected[0..projected_count]),
     );
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "worker bridge model picker callback stays out of the borrowed composer" {
+    const current_model = "anthropic/claude-opus-4.8";
+    const completions = [_][]const u8{
+        "provider/model-0",
+        current_model,
+    };
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.model_completion_values = &completions;
+    try app.selected_model.appendSlice(app.alloc, current_model);
+    try app.input_runtime.textReplacementState().replace(app.alloc, "typed draft");
+    app.input_runtime.model_picker_draft = composer_stash.State.capture(
+        app.input_runtime.composerStashView(),
+    );
+    const deps = Bindings(FakeApp).workerEventHandlers(&app);
+
+    try deps.open_model_picker(deps.ctx);
+
+    // The borrowed composer stays empty for the catalog menu's query box.
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
 }
 
 test "workerBridgeAppendText enqueues text without producer-owned gap mutation" {
