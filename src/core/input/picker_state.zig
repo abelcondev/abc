@@ -56,12 +56,6 @@ pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
 pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
 
-pub fn providerPickerPrefix(input: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimStart(u8, input, " \t\r\n");
-    const len = providerPickerPrefixLen(trimmed) orelse return null;
-    return trimmed[0..len];
-}
-
 pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
     query: []const u8,
