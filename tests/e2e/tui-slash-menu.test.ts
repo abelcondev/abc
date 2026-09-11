@@ -857,13 +857,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
       await session.waitForStableComposer();
-      await waitForPaneTitle(session, "fx generate the release notes", 5_000);
+      await waitForPaneTitle(session, "generate the release notes", 5_000);
 
       // A rename replaces the tab title.
       await session.sendText("/rename deploy pipeline fix");
       await session.waitForText("renamed: deploy pipeline fix", 10_000);
       await session.waitForStableComposer();
-      await waitForPaneTitle(session, "fx deploy pipeline fix", 5_000);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
 
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
@@ -899,7 +899,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      await waitForPaneTitle(session, "fx deploy pipeline fix", 5_000);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
       expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
 
       // A fresh session resets the tab to the build and current folder.
