@@ -1675,6 +1675,11 @@ describe("effect-aware command permissions", () => {
       writeFileSync(stderrPath, "");
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
       const gateway = startFakeGateway([
+        gatewayToolCall("subagent", {
+          request: { action: "run", task: "Run the prepared child diagnostic command." },
+        }, "trace_child"),
+        toolCall("printf child-trace-output", {}, "trace_child_command"),
+        finalText("child diagnostic complete"),
         gatewayToolCall("edit_file", {
           path: "duplicate.txt",
           old_string: "same",
@@ -1691,6 +1696,9 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
@@ -1710,10 +1718,16 @@ describe("effect-aware command permissions", () => {
       );
       const report = readFileSync(latestTraceReportPath(root), "utf8");
 
-      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests).toHaveLength(6);
       expect(report).toContain(
-        "last=2 succeeded=0 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+        "last=4 succeeded=2 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
       );
+      const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
+      expect(localCalls).toBeDefined();
+      expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
+      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=edit_file outcome=rejected duration=\d+ms source=parent\n/);
       expect(report).toContain("name=edit_file outcome=rejected");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
