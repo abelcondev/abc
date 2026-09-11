@@ -344,21 +344,6 @@ pub fn loadLibfxStartupState(
     };
 }
 
-pub fn loadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_agent_step_limit: usize,
-) !StartupState {
-    return loadCatalogStartupStateWithAuthMode(
-        alloc,
-        secret_store,
-        default_model,
-        default_agent_step_limit,
-        .local,
-    );
-}
-
 pub fn loadCatalogStartupStateWithAuthMode(
     alloc: Allocator,
     secret_store: host.SecretStore,

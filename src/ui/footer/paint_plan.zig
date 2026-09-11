@@ -1224,10 +1224,6 @@ fn expectRowBackground(row_bytes: []const u8, width: u16, expected_bg: vt_emulat
     }
 }
 
-fn expectRowDefaultBackground(row_bytes: []const u8, width: u16) !void {
-    try expectRowBackground(row_bytes, width, .default);
-}
-
 fn expectFrameRowBackground(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, expected_bg: vt_emulator.Color) !void {
     for (frame.rows.items) |row| {
         if (row.row == row_number) {
