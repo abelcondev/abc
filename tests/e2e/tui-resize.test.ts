@@ -1720,17 +1720,30 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ collapse_tool_calls: true }));
+      const children = ["collapsed-child-one.txt", "collapsed-child-two.txt", "collapsed-child-three.txt"];
+      for (const path of children) writeFileSync(join(workspace, path), "retained tool fixture\n");
       const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
       const encoder = new TextEncoder();
-      const gateway = startDynamicFakeGateway(() => new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            streams.push(controller);
-            controller.enqueue(encoder.encode(": held response\n\n"));
-          },
-        }),
-        { headers: { "content-type": "text/event-stream" } },
-      ));
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway(() => {
+        if (requestIndex++ === 1) return fakeGatewaySse([
+          ...children.map((path, index) => ({
+            type: "tool-call", toolCallId: `retention-read-${index}`,
+            toolName: "read_file", input: JSON.stringify({ path }),
+          })),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streams.push(controller);
+              controller.enqueue(encoder.encode(": held response\n\n"));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
       gateways.push(gateway);
       const send = (turn: number, delta: string) => streams[turn].enqueue(
         encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: `answer-${turn}`, delta })}\n\n`),
@@ -1743,11 +1756,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
         })}\n\ndata: [DONE]\n\n`));
         streams[turn].close();
       };
-      const old = (id: number) => `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
       // Bounded inert destinations consume the real cap without thousands of rows.
-      const tail = (id: number) => Array.from({ length: 14 }, (_, index) =>
-        `[${index === 0 ? `RETAIN_TAIL_${String(id).padStart(4, "0")}` : "."}](https://example.invalid/${"x".repeat(1000)})`
+      const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
+        `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
       ).join("") + "\n\n";
+      // Removing the old response must leave the collapsed group through a retention frame.
+      const old = (id: number) => id === 0
+        ? inertRow("RETAIN_OLD_0000")
+        : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
+      const tail = (id: number) => inertRow(`RETAIN_TAIL_${String(id).padStart(4, "0")}`);
       session = await createResizeSession({
         cmd: FX_BIN, cwd: workspace, width: 168, height: 75,
         isolated: true, remainOnExit: true, minimumHistoryLines: 10_000, stderrPath,
@@ -1778,6 +1795,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
           ...Array.from({ length: tailCount }, (_, id) => `RETAIN_TAIL_${String(id).padStart(4, "0")}`),
         ];
         expect(ids).toEqual(expected);
+        if (tailCount > 0) {
+          expect(full.match(/3 tool calls/g)).toHaveLength(1);
+          for (const path of children) expect(full).not.toContain(path);
+        }
       };
       await session.waitForStableComposer(15_000);
       await session.sendText("First deterministic response.");
@@ -1794,6 +1815,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await assertRows(0);
       await session.sendText("Second deterministic response.");
       await waitStream(2);
+      await session.waitForText("3 tool calls", 10_000);
       send(1, tail(0));
       await session.waitForText("RETAIN_TAIL_0000", 10_000);
       expect(await session.capturePane()).not.toContain("xxxxxxxx");

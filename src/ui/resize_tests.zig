@@ -8632,6 +8632,67 @@ test "assistant retention partial compact group preserves surviving physical chi
     }
 }
 
+fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(60, 12);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    h.shell.collapse_tool_calls = collapsed;
+    const prefix_id = try h.shell.appendRawTranscriptEntry(alloc, "PRUNE\n" ** 20);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+    for ([_][]const u8{ "● CHILD_ONE\n", "● CHILD_TWO\n", "● CHILD_THREE\n" }) |text| {
+        _ = try h.shell.appendRawTranscriptEntryClassified(alloc, text, .tool_status);
+    }
+    for (0..24) |id| {
+        const text = try retentionRow(alloc, id);
+        defer alloc.free(text);
+        _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text);
+        try h.renderTranscriptFrame();
+        try capturePhysicalFrame(&h, &probe);
+    }
+    try expectRetentionRows(&probe, &h, 24);
+    try std.testing.expect(h.shell.transcriptCommitDiagnostic().history_visual_offset > 21);
+    const append = try retentionRow(alloc, 24);
+    defer alloc.free(append);
+    h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + append.len - 1;
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, append);
+    try std.testing.expect(h.shell.entries.items[0].id() != prefix_id);
+    for (0..3) |_| {
+        try h.renderTranscriptFrame();
+        try capturePhysicalFrame(&h, &probe);
+    }
+    try expectRetentionRows(&probe, &h, 25);
+    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
+    for (25..40) |id| {
+        const text = try retentionRow(alloc, id);
+        defer alloc.free(text);
+        _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text);
+        try h.renderTranscriptFrame();
+        try capturePhysicalFrame(&h, &probe);
+    }
+    try expectRetentionRows(&probe, &h, 40);
+    const grid = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(grid);
+    const full = try std.mem.concat(alloc, u8, &.{ probe.history.items, grid });
+    defer alloc.free(full);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "3 tool calls"));
+    for ([_][]const u8{ "CHILD_ONE", "CHILD_TWO", "CHILD_THREE" }) |marker| {
+        try std.testing.expectEqual(@as(usize, if (collapsed) 0 else 1), std.mem.count(u8, full, marker));
+        try std.testing.expectEqual(!collapsed, std.mem.find(u8, h.shell.transcript_commit_state.stable.flow, marker) != null);
+    }
+}
+
+test "assistant retention collapsed tool projection preserves physical rows" {
+    try expectAssistantRetentionPreservesToolProjection(true);
+}
+
+test "assistant retention expanded tool projection preserves physical rows" {
+    try expectAssistantRetentionPreservesToolProjection(false);
+}
+
 fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 60, 12, 4);

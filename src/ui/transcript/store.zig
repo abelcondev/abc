@@ -2015,6 +2015,7 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
+        .collapse_tool_calls = self.collapse_tool_calls,
         .full_transcript = self.full_transcript,
         .replaceable_last_line = self.replaceable_last_line,
         .replaceable_row = self.replaceable_row,
