@@ -282,15 +282,6 @@ pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) 
     return count;
 }
 
-pub fn categoryFilteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
-    if (category == .all) return filteredCount(snapshot, .all, query);
-    var count: usize = 0;
-    for (specs) |spec| {
-        if (spec.category == category and matchesQuery(snapshot, spec, query)) count += 1;
-    }
-    return count;
-}
-
 pub fn itemAt(snapshot: Snapshot, category: Category, query: []const u8, display_index: usize) ?Item {
     var match_index: usize = 0;
     for (specs) |spec| {

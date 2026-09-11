@@ -485,42 +485,6 @@ fn allowDecision(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: to
     return .{ .action = .allow, .reason = "allowed by test" };
 }
 
-fn writeFileArgsJson(alloc: Allocator, path: []const u8, content: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
-    try out.writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(content, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
-}
-
-fn dispatchWriteFileWithTracker(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    path: []const u8,
-    content: []const u8,
-    tracker: *read_tracker.ReadTracker,
-) !tool_dispatch.DispatchResult {
-    const args_json = try writeFileArgsJson(alloc, path, content);
-    defer alloc.free(args_json);
-
-    const registry = tool_dispatch.Registry{ .tools = &.{write_file_dispatch_tool} };
-    return tool_dispatch.dispatchToolCall(.{
-        .allocator = alloc,
-        .permission_mode = .auto,
-        .permission_decider = allowDecision,
-        .workspace_root = workspace_root,
-        .read_tracker = tracker,
-    }, registry, .{
-        .id = "call_2",
-        .name = "write_file",
-        .arguments_json = args_json,
-    });
-}
-
 fn tmpPath(alloc: Allocator, tmp: std.testing.TmpDir, sub_path: []const u8) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, sub_path);
 }

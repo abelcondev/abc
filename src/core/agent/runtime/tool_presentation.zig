@@ -1322,17 +1322,6 @@ fn commandArtifactHandle(
     return owned;
 }
 
-pub fn malformedToolArgumentsResult(arena: Allocator, call: ToolCall) !ToolExecutionResult {
-    return .{
-        .status = .failure,
-        .model_output = if (call.argument_integrity == .non_object_json)
-            try tool_result_errors.nonObjectToolArgumentsJson(arena, call.name)
-        else
-            try tool_result_errors.malformedToolArgumentsJson(arena, call.name),
-        .status_detail = if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments",
-    };
-}
-
 pub fn finishCommittedFileStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,

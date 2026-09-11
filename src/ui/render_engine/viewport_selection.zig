@@ -322,16 +322,6 @@ pub fn hardLineAt(bytes: []const u8, index: usize) []const u8 {
     return "";
 }
 
-pub fn unusedRowsBudget(line_visual_rows: []const u16, start_line: usize, total_lines: usize, visible_rows: u16) u16 {
-    var used: u32 = 0;
-    var line = start_line;
-    while (line < total_lines) : (line += 1) {
-        used += line_visual_rows[line];
-        if (used >= visible_rows) return 0;
-    }
-    return @intCast(@as(u32, visible_rows) - used);
-}
-
 pub fn sumVisualRows(line_visual_rows: []const u16, start_line: usize, end_line: usize) u16 {
     var total: u32 = 0;
     var line = start_line;
