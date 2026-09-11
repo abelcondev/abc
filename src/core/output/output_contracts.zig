@@ -1864,14 +1864,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
     }
 }
 
-fn writeHexBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
-    }
-}
-
 fn writeSessionUserTurnJson(writer: *std.Io.Writer, user: types.UserTurn) !void {
     try writer.writeAll("{\"text\":");
     try std.json.Stringify.value(user.text, .{}, writer);

@@ -881,4 +881,3 @@ fn pushLiveOutputChunk(
         .text = @constCast(text),
     } });
 }
-fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}

@@ -2197,36 +2197,6 @@ fn restoreContextResultBodies(alloc: Allocator, dir: *io_mod.VerifiedDir, histor
     }
 }
 
-fn isCurrentConversationCheckpoint(turn: session.HistoryTurn) bool {
-    return switch (turn) {
-        .compacted_summary => |entry| std.mem.startsWith(
-            u8,
-            entry.summary,
-            types.context_handoff_open,
-        ),
-        else => false,
-    };
-}
-
-fn retainLatestCheckpointHistory(
-    alloc: Allocator,
-    state: *session_codec.DurableSessionState,
-) !void {
-    if (state.history.len == 0 or
-        !isCurrentConversationCheckpoint(state.history[state.history.len - 1]))
-    {
-        return error.InvalidConversationEvent;
-    }
-    const retained = try alloc.alloc(session.HistoryTurn, 1);
-    retained[0] = state.history[state.history.len - 1];
-    for (state.history[0 .. state.history.len - 1]) |turn| {
-        session.freeHistoryTurn(alloc, turn);
-    }
-    alloc.free(state.history);
-    state.history = retained;
-    state.context_history_start = 0;
-}
-
 fn projectConversationSnapshotLocators(
     alloc: Allocator,
     history: []session.HistoryTurn,
