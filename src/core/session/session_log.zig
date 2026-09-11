@@ -637,13 +637,6 @@ fn writeConversationMetadata(
     try io_mod.durableReplaceVerified(alloc, dir, manifest_file, bytes);
 }
 
-fn encodeConversationMetadata(
-    alloc: Allocator,
-    state: session_codec.DurableSessionState,
-) ![]u8 {
-    return encodeConversationMetadataWithTitle(alloc, state, null);
-}
-
 fn encodeConversationMetadataWithTitle(
     alloc: Allocator,
     state: session_codec.DurableSessionState,

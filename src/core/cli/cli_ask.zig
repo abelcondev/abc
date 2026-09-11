@@ -4794,49 +4794,6 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
     return rules;
 }
 
-fn testPermissionRuleSetPair(
-    alloc: Allocator,
-    permission: []const u8,
-    first_pattern: []const u8,
-    first_action: types.PermissionAction,
-    second_pattern: []const u8,
-    second_action: types.PermissionAction,
-) !types.PermissionRuleSet {
-    const entries = [_]struct {
-        pattern: []const u8,
-        action: types.PermissionAction,
-    }{
-        .{ .pattern = first_pattern, .action = first_action },
-        .{ .pattern = second_pattern, .action = second_action },
-    };
-    var rules: types.PermissionRuleSet = .{
-        .rules = try alloc.alloc(types.PermissionRule, entries.len),
-    };
-    errdefer alloc.free(rules.rules);
-    var initialized: usize = 0;
-    errdefer {
-        for (rules.rules[0..initialized]) |rule| {
-            alloc.free(rule.permission);
-            alloc.free(rule.pattern);
-        }
-    }
-
-    for (entries, 0..) |entry, index| {
-        const owned_permission = try alloc.dupe(u8, permission);
-        const owned_pattern = alloc.dupe(u8, entry.pattern) catch |err| {
-            alloc.free(owned_permission);
-            return err;
-        };
-        rules.rules[index] = .{
-            .permission = owned_permission,
-            .pattern = owned_pattern,
-            .action = entry.action,
-        };
-        initialized += 1;
-    }
-    return rules;
-}
-
 test "CLI lifecycle action preserves dynamic MCP availability boundaries" {
     const Fixture = struct {
         calls: usize = 0,

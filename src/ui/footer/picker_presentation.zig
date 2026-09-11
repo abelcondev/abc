@@ -631,11 +631,6 @@ fn composeApiKeyPickerRow(
     return row;
 }
 
-pub fn pickerRowCount(completion_count: usize) u16 {
-    if (completion_count == 0) return 1;
-    return @intCast(@min(completion_count, input_presentation.max_model_picker_rows));
-}
-
 pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
     const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
     const available_rows = terminal_rows -| fixed_rows;

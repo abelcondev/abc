@@ -394,26 +394,6 @@ pub fn encodeRecoveryCheckpoint(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-pub fn decodeRecoveryCheckpoint(
-    alloc: Allocator,
-    bytes: []const u8,
-) !RecoveryCheckpoint {
-    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
-        return error.RecoveryCheckpointTooLarge;
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
-        .max_value_len = max_recovery_checkpoint_bytes,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRecoveryCheckpoint,
-    };
-    defer parsed.deinit();
-    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRecoveryCheckpoint,
-    };
-}
-
 fn validateSessionMetadata(metadata: SessionMetadata) !void {
     if (metadata.schema_version != session_metadata_schema_version) {
         return error.UnsupportedSessionSchema;
