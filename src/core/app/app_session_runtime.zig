@@ -2714,7 +2714,8 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs identify the running build and workspace, not the session.
+        /// Terminal tabs show the session title once one exists; before the
+        /// first prompt they identify the running build and workspace.
         pub fn syncTerminalTitle(app: *App) void {
             if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
@@ -2725,6 +2726,10 @@ pub fn Runtime(comptime App: type) type {
             provider: host_capability.TerminalTitle,
         ) void {
             if (comptime !provider_runtime.supported(App)) return;
+            if (cachedSessionTitle(app)) |title| {
+                provider.set(title);
+                return;
+            }
             const basename = if (comptime @hasField(App, "workspace_root"))
                 std.fs.path.basename(app.workspace_root)
             else
@@ -9810,7 +9815,8 @@ test "renameActiveSession persists the title only in session metadata" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    // The tab shows the renamed title; the title itself lives in session.json.
+    try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
     const loaded = &app.session_persistence.writable.?;
     _ = try loaded.appendEvent(
@@ -10177,7 +10183,7 @@ test "session title generation keeps the derived title when the provider fails" 
     try std.testing.expect(persisted == null);
 }
 
-test "terminal title combines the build version and workspace but ignores session and model changes" {
+test "terminal title shows the session title once cached and falls back to build and workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10208,12 +10214,12 @@ test "terminal title combines the build version and workspace but ignores sessio
         "wire the release notes generator",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("wire the release notes generator", app.terminalTitleLabelText());
 
     app.selected_model.clearRetainingCapacity();
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-5");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("wire the release notes generator", app.terminalTitleLabelText());
 
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
@@ -10239,7 +10245,7 @@ test "cached session title drops control bytes before they reach the terminal" {
         "safe]2;ownedtail",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
 }
 
 test "terminal title uses the workspace basename and handles unnamed roots" {
@@ -10260,7 +10266,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
     }
 }
 
-test "terminal title ignores long session and model context" {
+test "terminal title shows the session title once cached and keeps model context out" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10276,7 +10282,9 @@ test "terminal title ignores long session and model context" {
     try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
     try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
 
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    const expected = "session-" ++ ("title" ** 20);
+    try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
+    try std.testing.expect(std.mem.find(u8, app.terminalTitleLabelText(), "model") == null);
 }
 
 test "failed history delivery rejects the current writer without poisoning a fresh session" {
