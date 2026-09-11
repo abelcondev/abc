@@ -39,7 +39,7 @@ async function page({ key = '', fail = false, stopReason = 'stop', duringFetch }
           return {
             result: Promise.resolve({ stopReason }),
             async *[Symbol.asyncIterator]() {
-              await options.fetch('https://ai-gateway.vercel.sh/v3/ai/language-model', {
+              await options.fetch('https://ai-gateway.vercel.sh/v4/ai/language-model', {
                 method: 'POST', headers: { authorization: `Bearer ${options.apiKey}` },
               })
               yield { type: 'text_delta', delta: 'hello' }
@@ -66,7 +66,7 @@ test('a blank key keeps the free proxy and reuses the conversation', async () =>
   await app.submit()
   assert.equal(app.agents.length, 1)
   assert.equal(app.agents[0].options.apiKey, 'demo')
-  assert.equal(app.calls[0].url, '/api/gateway?path=%2Fv3%2Fai%2Flanguage-model')
+  assert.equal(app.calls[0].url, '/api/gateway?path=%2Fv4%2Fai%2Flanguage-model')
   assert.equal(app.elements['#reply'].value, 'hello')
 })
 
@@ -75,7 +75,7 @@ test('an entered key goes directly to Gateway without touching the proxy', async
   await app.submit()
   assert.equal(app.agents[0].options.apiKey, 'test-user-key')
   assert.equal(app.calls.length, 1)
-  assert.equal(app.calls[0].url, 'https://ai-gateway.vercel.sh/v3/ai/language-model')
+  assert.equal(app.calls[0].url, 'https://ai-gateway.vercel.sh/v4/ai/language-model')
   assert.equal(app.calls[0].init.headers.authorization, 'Bearer test-user-key')
 })
 
@@ -90,15 +90,15 @@ test('changing or clearing a key closes the old conversation and changes the rou
   assert.equal(app.agents[0].closed, true)
   assert.equal(app.agents[1].closed, true)
   assert.equal(app.agents[2].closed, false)
-  assert.equal(app.calls[1].url, 'https://ai-gateway.vercel.sh/v3/ai/language-model')
-  assert.equal(app.calls[2].url, '/api/gateway?path=%2Fv3%2Fai%2Flanguage-model')
+  assert.equal(app.calls[1].url, 'https://ai-gateway.vercel.sh/v4/ai/language-model')
+  assert.equal(app.calls[2].url, '/api/gateway?path=%2Fv4%2Fai%2Flanguage-model')
 })
 
 test('a rejected personal key never falls back to the free proxy', async () => {
   const app = await page({ key: 'invalid-key', fail: true })
   await app.submit()
   assert.equal(app.calls.length, 1)
-  assert.equal(app.calls[0].url, 'https://ai-gateway.vercel.sh/v3/ai/language-model')
+  assert.equal(app.calls[0].url, 'https://ai-gateway.vercel.sh/v4/ai/language-model')
   assert.equal(app.elements['#status'].textContent, 'Invalid key')
   assert.equal(app.elements.button.disabled, false)
   assert.equal(app.elements['#api-key'].disabled, false)

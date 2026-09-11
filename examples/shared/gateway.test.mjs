@@ -51,7 +51,7 @@ test('gateway fixes the model and output limit without forwarding caller credent
     return new Response('stream')
   })
   const prompt = [{ role: 'user', content: [{ type: 'text', text: 'Hi' }] }]
-  const response = await gatewayFetch('https://ai-gateway.vercel.sh/v3/ai/language-model', {
+  const response = await gatewayFetch('https://ai-gateway.vercel.sh/v4/ai/language-model', {
     method: 'POST',
     headers: { authorization: 'Bearer caller-key', 'ai-language-model-id': 'expensive', cookie: 'private', 'ai-language-model-streaming': 'true', 'ai-language-model-specification-version': '4' },
     body: JSON.stringify({ prompt, maxOutputTokens: 50000, providerOptions: { tools: ['search'] } }),
@@ -70,7 +70,7 @@ test('gateway refuses unknown destinations and non-text model inputs before tran
   for (const url of ['https://example.test/', 'https://ai-gateway.vercel.sh/v1/credits']) {
     await assert.rejects(gatewayFetch(url), { status: 404 })
   }
-  await assert.rejects(gatewayFetch('https://ai-gateway.vercel.sh/v3/ai/language-model', {
+  await assert.rejects(gatewayFetch('https://ai-gateway.vercel.sh/v4/ai/language-model', {
     method: 'POST', body: JSON.stringify({ prompt: [{ role: 'user', content: [{ type: 'image', image: 'https://example.test/image' }] }] }),
   }), { status: 400 })
 })

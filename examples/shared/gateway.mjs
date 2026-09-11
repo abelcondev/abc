@@ -45,7 +45,7 @@ export async function gatewayFetch(input, init) {
   const request = new Request(input, init)
   const url = new URL(request.url)
   const catalog = url.pathname === '/coding-agent/v1/models' && request.method === 'GET'
-  const generation = url.pathname === '/v3/ai/language-model' && request.method === 'POST'
+  const generation = url.pathname === '/v4/ai/language-model' && request.method === 'POST'
   if (url.origin !== 'https://ai-gateway.vercel.sh' || url.search || (!catalog && !generation)) {
     fail(404, 'Unknown model endpoint.')
   }
