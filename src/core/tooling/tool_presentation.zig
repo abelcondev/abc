@@ -35,6 +35,7 @@ pub const SubagentActionState = union(enum) {
     active,
     pending,
     completed,
+    feedback: types.SteeringDelivery,
     stopped: []const u8,
 };
 
@@ -69,6 +70,7 @@ pub fn subagentAction(
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     const named = std.mem.eql(u8, action, "message");
     if (!named and !std.mem.eql(u8, action, "run")) return null;
+    if (state == .feedback and !named) return null;
     const raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
     const raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
     const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
@@ -78,8 +80,15 @@ pub fn subagentAction(
         .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
         .pending => try std.fmt.allocPrint(alloc, "{s} still running", .{name.bytes}),
         .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
+        .feedback => |delivery| try std.fmt.allocPrint(alloc, "{s} feedback {s}", .{ name.bytes, switch (delivery) {
+            .queued => "queued",
+            .applied => "applied",
+            .not_applied => "not applied",
+        } }),
         .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
             try std.fmt.allocPrint(alloc, "{s} failed", .{name.bytes})
+        else if (std.mem.eql(u8, reason, "Busy"))
+            try std.fmt.allocPrint(alloc, "{s} busy; message not sent", .{name.bytes})
         else if (std.mem.eql(u8, reason, "Cancelled") or std.mem.eql(u8, reason, "Interrupted"))
             try std.fmt.allocPrint(alloc, "{s} interrupted", .{name.bytes})
         else
@@ -118,7 +127,7 @@ fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return encoded.bytes;
 }
 
-pub fn subagentPendingLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
+pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
     if (!std.mem.eql(u8, call.name, "subagent")) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -126,8 +135,16 @@ pub fn subagentPendingLine(alloc: Allocator, call: ToolCall, output: []const u8)
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
+    if (tool_args.optionalStringArg(parsed.value.object, "delivery")) |value| {
+        const delivery = std.meta.stringToEnum(types.SteeringDelivery, value) orelse return null;
+        const ok = parsed.value.object.get("ok") orelse return null;
+        if (ok != .bool or ok.bool != (delivery != .not_applied)) return null;
+        return formatSubagentPlainAction(alloc, call, .{ .feedback = delivery });
+    }
     const pending = parsed.value.object.get("pending") orelse return null;
     if (pending != .bool or !pending.bool) return null;
+    const ok = parsed.value.object.get("ok") orelse return null;
+    if (ok != .bool or !ok.bool) return null;
     return formatSubagentPlainAction(alloc, call, .pending);
 }
 
@@ -143,16 +160,20 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
     const ok = parsed.value.object.get("ok") orelse return "Failed";
     if (ok != .bool or ok.bool) return "Failed";
     const code = tool_args.optionalStringArg(parsed.value.object, "error_code") orelse return "Failed";
+    if (std.mem.eql(u8, code, "child_busy")) return "Busy";
+    for ([_][]const u8{ "feedback_capacity", "operation_conflict", "override_after_create" }) |rejection| {
+        if (std.mem.eql(u8, code, rejection)) return "Message not sent to";
+    }
     return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
 }
 
 test "subagent pending result does not claim completion" {
     const alloc = std.testing.allocator;
     const call = ToolCall{ .id = "call", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"work\"}" };
-    const line = (try subagentPendingLine(alloc, call, "{\"ok\":true,\"pending\":true}")).?;
+    const line = (try subagentStatusLine(alloc, call, "{\"ok\":true,\"pending\":true}")).?;
     defer alloc.free(line);
     try std.testing.expectEqualStrings("Subagent still running · work", line);
-    try std.testing.expect((try subagentPendingLine(alloc, call, "{\"ok\":true,\"result\":\"done\"}")) == null);
+    try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":true,\"result\":\"done\"}")) == null);
 }
 
 test "subagent rows project request identity state and bounded safe previews" {
@@ -194,6 +215,23 @@ test "subagent failure labels trust structured terminal codes only" {
     for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
         try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
     }
+}
+
+test "subagent receipts describe message delivery rather than child completion" {
+    const alloc = std.testing.allocator;
+    const call: ToolCall = .{ .id = "feedback", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"check this\"}}" };
+    for ([_]struct { output: []const u8, label: []const u8 }{
+        .{ .output = "{\"ok\":true,\"delivery\":\"queued\"}", .label = "reviewer feedback queued · check this" },
+        .{ .output = "{\"ok\":true,\"delivery\":\"applied\"}", .label = "reviewer feedback applied · check this" },
+        .{ .output = "{\"ok\":false,\"delivery\":\"not_applied\"}", .label = "reviewer feedback not applied · check this" },
+    }) |case| {
+        const line = (try subagentStatusLine(alloc, call, case.output)).?;
+        defer alloc.free(line);
+        try std.testing.expectEqualStrings(case.label, line);
+    }
+    try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":false,\"delivery\":\"queued\"}")) == null);
+    try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":false,\"pending\":true}")) == null);
+    try std.testing.expectEqualStrings("Busy", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_busy\"}"));
 }
 
 /// The caller owns the returned plain subagent row.

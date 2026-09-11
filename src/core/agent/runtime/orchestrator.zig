@@ -110,11 +110,15 @@ fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     guidance: []const []const u8,
+    origin: runtime_config.TurnOrigin,
 ) !void {
     for (guidance) |text| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
-            .content = try runtime_execution_memory.steeringMessage(arena, text),
+            .content = if (origin == .subagent)
+                try runtime_execution_memory.parentSteeringMessage(arena, text)
+            else
+                try runtime_execution_memory.steeringMessage(arena, text),
         });
     }
 }
@@ -144,8 +148,10 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
     provider_replay: ?types.ProviderReplay,
+    origin: runtime_config.TurnOrigin,
+    boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
-    const boundary = try take_steering_boundary(deps, arena, turn_id, .model);
+    const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
     const guidance = switch (boundary) {
         .continue_turn => |messages| messages,
         .none, .handoff, .interrupt => return false,
@@ -156,7 +162,7 @@ fn append_pending_steering_after_assistant(
         .content = assistant_text,
         .provider_replay = provider_replay,
     });
-    try append_steering_guidance(arena, within_turn_suffix, guidance);
+    try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
     return true;
 }
 
@@ -179,7 +185,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    try append_steering_guidance(arena, within_turn_suffix, guidance);
+    try append_steering_guidance(arena, within_turn_suffix, guidance, .root);
     return true;
 }
 
@@ -848,10 +854,29 @@ fn project_subagent_result_content(
     try compact.object.put(arena, "ok", ok);
     try compact.object.put(arena, "result", result);
     try compact.object.put(arena, "error_code", error_code);
+    if (object.get("pending")) |pending| {
+        if (pending == .bool and pending.bool) try compact.object.put(arena, "pending", pending);
+    }
+    if (object.get("delivery")) |delivery| {
+        if (delivery == .string and std.meta.stringToEnum(types.SteeringDelivery, delivery.string) != null)
+            try compact.object.put(arena, "delivery", delivery);
+    }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     std.json.Stringify.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+test "subagent result projection retains delivery and pending while removing legacy metadata" {
+    const alloc = std.testing.allocator;
+    const source = "{\"ok\":true,\"result\":\"queued\",\"error_code\":null,\"pending\":true,\"delivery\":\"queued\",\"legacy_worker\":9}";
+    const projected = (try project_subagent_result_content(alloc, source)).?;
+    defer alloc.free(projected);
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
+    defer value.deinit();
+    try std.testing.expect(value.value.object.get("pending").?.bool);
+    try std.testing.expectEqualStrings("queued", value.value.object.get("delivery").?.string);
+    try std.testing.expect(value.value.object.get("legacy_worker") == null);
 }
 
 fn subagent_history_summary(
@@ -6378,6 +6403,7 @@ fn processQueuedPromptLoop(
                 arena,
                 &within_turn_suffix,
                 guidance,
+                config.origin,
             ),
             .none, .interrupt => {},
         }
@@ -8658,6 +8684,8 @@ fn processQueuedPromptLoop(
                     turn_id,
                     history_text,
                     history_replay,
+                    config.origin,
+                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -11373,6 +11401,8 @@ fn processQueuedPromptLoop(
                     turn_id,
                     raw_final,
                     final_provider_replay,
+                    config.origin,
+                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

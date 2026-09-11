@@ -703,7 +703,7 @@ pub fn Bindings(comptime App: type) type {
                     .child_id = result.child_id,
                     .target_session_id = host.root_id,
                     .delivery_id = result.work_id,
-                    .through_sequence = 0,
+                    .through_sequence = result.receipt_sequence,
                     .start_offset = 0,
                     .end_offset = result.body.len,
                     .total_bytes = result.body.len,
@@ -716,7 +716,9 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             const host = app.session_persistence.subagent_host orelse return;
             for (acknowledgements) |ack| {
-                if (std.mem.eql(u8, ack.target_session_id, host.root_id)) host.acknowledgeYielded(ack.child_id, ack.delivery_id);
+                if (std.mem.eql(u8, ack.target_session_id, host.root_id)) {
+                    if (ack.through_sequence != 0) host.acknowledgeFeedback(ack.child_id, ack.delivery_id, ack.through_sequence) else host.acknowledgeYielded(ack.child_id, ack.delivery_id);
+                }
             }
         }
 

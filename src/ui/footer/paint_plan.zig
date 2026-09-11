@@ -592,7 +592,7 @@ fn pushSteeringRows(
         const candidate_rows = render_input.steering_message_layout(
             ctx.steering_messages[candidate],
             width,
-            ctx.steering_waits_for_tool,
+            ctx.steering_waits_for_boundary,
             render_input.max_steering_message_rows,
         ).row_count;
         visible_start = candidate;
@@ -613,7 +613,7 @@ fn pushSteeringRows(
             message,
             width,
             row_limit,
-            ctx.steering_waits_for_tool,
+            ctx.steering_waits_for_boundary,
         );
         defer rows.deinit(alloc);
         for (rows.rows.items) |*row| {
@@ -1471,7 +1471,7 @@ test "steering banner keeps two clean lines and a composer gap in both delivery 
         const messages = [_][]const u8{"FIRST_LINE\nSECOND_LINE\nHIDDEN_END"};
         var ctx = testContext(&input);
         ctx.steering_messages = &messages;
-        ctx.steering_waits_for_tool = waiting;
+        ctx.steering_waits_for_boundary = waiting;
         const planner_input: FooterPlannerInput = .{
             .active_label = null,
             .ctx = ctx,

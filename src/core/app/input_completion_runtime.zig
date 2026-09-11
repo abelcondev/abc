@@ -285,7 +285,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
         }
 
-        /// Pulls the newest queued steering prompt that still waits for a tool
+        /// Pulls the newest queued steering prompt that still waits for a
         /// boundary back into the empty composer for editing. Returns false when
         /// no steer is retractable, leaving history navigation to run unchanged.
         /// An active history episode keeps its stashed draft untouched.
@@ -540,7 +540,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             defer steering.deinit(app.alloc);
             const requested_banner_rows = render_input.steeringBannerRowsForMessages(
                 steering.messages,
-                steering.waits_for_tool,
+                steering.waits_for_boundary,
                 app.shell.layout.cols,
             );
             return .{

@@ -107,6 +107,7 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
+const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 
 test {
     _ = tool_admission;
@@ -250,12 +251,32 @@ pub const Context = struct {
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
+            .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
         }
         return input;
+    }
+
+    fn terminalReviewContext(self: Context) ?terminal_managed_observer.Context {
+        return .{
+            .alloc = self.session_allocator,
+            .lifecycle_allocator = self.session_allocator,
+            .terminal_client = self.terminal_client orelse return null,
+            .managed_runtime = self.managed_executions orelse return null,
+            .owner = self.session_child_capability orelse return null,
+            .durable_session_id = self.lifecycle_scope.session_id orelse return null,
+            .workspace_root = self.workspace_root,
+            .transport_role = switch (self.lifecycle_scope.kind) {
+                .interactive, .subagent => .interactive,
+                .ask => .headless,
+                .acp => .acp,
+            },
+            .max_output_bytes = self.max_command_output_bytes,
+            .cancel_flag = runtimeCancelFlag(self),
+        };
     }
 
     pub fn admissionInputWithLiveAuthority(
@@ -439,6 +460,7 @@ pub fn executeToolCallAuthorized(
             .model_output = "",
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
+            .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
@@ -451,6 +473,7 @@ pub fn executeToolCallAuthorized(
             result,
         ),
         .started_at_ms = started_at_ms,
+        .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
@@ -2469,8 +2492,12 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
 }
 
 test "registered terminal exec preserves invalid execution authority error" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
     var rt = TestRuntime{};
     defer rt.deinit(std.testing.allocator);
+    var ctx = rt.context();
+    ctx.lifecycle_scope = .{ .kind = .subagent, .workspace_root = rt.workspace_root, .subagent_id = 8 };
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2483,7 +2510,7 @@ test "registered terminal exec preserves invalid execution authority error" {
 
     try std.testing.expectError(
         error.InvalidRunCommandExecutionAuthority,
-        executeToolCallAuthorized(rt.context(), .{
+        executeToolCallAuthorized(ctx, .{
             .call_allocator = arena,
             .result_allocator = arena,
             .call = call,
@@ -2493,6 +2520,10 @@ test "registered terminal exec preserves invalid execution authority error" {
             .max_tool_result_bytes = rt.max_tool_result_bytes,
         }),
     );
+    var metrics: [1]diagnostics.ToolCallMetric = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotToolCalls(&metrics));
+    try std.testing.expectEqual(@as(u64, 8), metrics[0].subagent_id);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.runtime_failed, metrics[0].outcome);
 }
 
 test "captured command compatibility bypasses compound commands" {
@@ -2591,6 +2622,7 @@ const TestAutoReview = struct {
             null;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
+            .shell_input => |shell_input| self.exact_arguments_json = shell_input.arguments_json,
             .command => |command| self.exact_command = command.command,
             .file_mutation => |file| {
                 self.file_display_path = file.display_path;
@@ -3580,6 +3612,38 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "tool-call metrics retain caller identity across returned results" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "note.txt", "caller attribution");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var rt = TestRuntime{ .workspace_root = root };
+    defer rt.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const callers = [_]?u64{ null, 3, 7, null };
+    for (callers, 0..) |caller, index| {
+        var ctx = rt.context();
+        ctx.lifecycle_scope = .{ .kind = if (caller == null) .interactive else .subagent, .workspace_root = root, .subagent_id = caller };
+        const result = try executeToolCall(ctx, arena.allocator(), .{
+            .id = "attribution",
+            .name = if (index == 2) "unknown_tool" else "read_file",
+            .arguments_json = "{\"path\":\"note.txt\"}",
+        });
+        try std.testing.expectEqual(if (index == 2) tool_contracts.ToolExecutionStatus.failure else .success, result.status);
+    }
+    var metrics: [4]diagnostics.ToolCallMetric = undefined;
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.snapshotToolCalls(&metrics));
+    for (metrics, callers, 0..) |metric, caller, index| {
+        try std.testing.expectEqual(caller orelse 0, metric.subagent_id);
+        try std.testing.expectEqual(if (index == 2) diagnostics.ToolCallOutcome.tool_failed else .succeeded, metric.outcome);
+    }
 }
 
 test "non-web_fetch tool-call metrics retain bounded args and result" {

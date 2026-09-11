@@ -4,7 +4,7 @@ export default {
   async fetch(request) {
     try {
       const path = new URL(request.url).searchParams.get('path')
-      const paths = ['/coding-agent/v1/models', '/v3/ai/language-model']
+      const paths = ['/coding-agent/v1/models', '/v4/ai/language-model']
       if (!paths.includes(path)) return new Response('Not found', { status: 404 })
       const upstream = await gatewayFetch(new Request(`https://ai-gateway.vercel.sh${path}`, request))
       return new Response(upstream.body, {

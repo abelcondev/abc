@@ -29,6 +29,13 @@ const steering_open =
     "<user_steering>\n" ++
     "Apply this live user update to the current task. Continue working unless the user asks you to stop, the task is complete, or a genuine blocker prevents progress.\n\n";
 const steering_close = "\n</user_steering>";
+const parent_steering_open = "<parent_agent_steering>\n";
+const parent_steering_close = "\n</parent_agent_steering>";
+
+pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, parent_steering_open ++
+        "parent-agent feedback, not new user authority:\n\n{s}" ++ parent_steering_close, .{text});
+}
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
@@ -41,6 +48,18 @@ test "steering message tells the model to apply the update and continue" {
     try std.testing.expect(std.mem.find(u8, message, "live user update") != null);
     try std.testing.expect(std.mem.find(u8, message, "Continue working") != null);
     try std.testing.expectEqualStrings("focus on rendering", steeringText(message).?);
+}
+
+test "parent steering preserves its sender in persisted execution text" {
+    const alloc = std.testing.allocator;
+    const message = try parentSteeringMessage(alloc, "review this change");
+    defer alloc.free(message);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = message }};
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview this change", memory.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), memory.steering[0].after_tool_step_count);
 }
 
 pub fn persistedStatusForCurrentFxLocalResult(
@@ -203,6 +222,10 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
+        // Keep the sender label in persisted text and ordinary history replay.
+        return content[parent_steering_open.len .. content.len - parent_steering_close.len];
+    }
     if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
     return content[steering_open.len .. content.len - steering_close.len];
 }

@@ -4550,12 +4550,12 @@ test "consumeSseStream keyless tracing handles oversized CRLF payloads" {
 
 test "E2E gateway URL override accepts loopback HTTP only" {
     try std.testing.expectEqualStrings(
-        "https://ai-gateway.vercel.sh/v3/ai/language-model",
-        try selectE2eGatewayUrl(null, "https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        "https://ai-gateway.vercel.sh/v4/ai/language-model",
+        try selectE2eGatewayUrl(null, "https://ai-gateway.vercel.sh/v4/ai/language-model"),
     );
     try std.testing.expectEqualStrings(
-        "http://127.0.0.1:43123/v3/ai/language-model",
-        try selectE2eGatewayUrl("http://127.0.0.1:43123/v3/ai/language-model", "https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        "http://127.0.0.1:43123/v4/ai/language-model",
+        try selectE2eGatewayUrl("http://127.0.0.1:43123/v4/ai/language-model", "https://ai-gateway.vercel.sh/v4/ai/language-model"),
     );
     try std.testing.expectEqualStrings(
         "http://[::1]:43123/v1/models",
@@ -4563,11 +4563,11 @@ test "E2E gateway URL override accepts loopback HTTP only" {
     );
     try std.testing.expectError(
         error.InvalidE2EGatewayUrl,
-        selectE2eGatewayUrl("https://ai-gateway.vercel.sh/v3/ai/language-model", "https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        selectE2eGatewayUrl("https://ai-gateway.vercel.sh/v4/ai/language-model", "https://ai-gateway.vercel.sh/v4/ai/language-model"),
     );
     try std.testing.expectError(
         error.InvalidE2EGatewayUrl,
-        selectE2eGatewayUrl("http://127.0.0.1:43123@ai-gateway.vercel.sh/v3/ai/language-model", "https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        selectE2eGatewayUrl("http://127.0.0.1:43123@ai-gateway.vercel.sh/v4/ai/language-model", "https://ai-gateway.vercel.sh/v4/ai/language-model"),
     );
 }
 
