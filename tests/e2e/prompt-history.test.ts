@@ -288,7 +288,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/settings");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);
@@ -303,7 +304,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/quit");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);

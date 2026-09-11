@@ -759,7 +759,9 @@ tmuxTest(
 
     await setupPromptHistory(active);
     await typeLiteral(active, "draft");
-    await active.sendHexBytes(["10"]);
+    await active.sendKeys("Up");
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+    await active.sendKeys("Up");
     await active.waitForPane((pane) => pane.includes("┃ zz-history"), READY_TIMEOUT);
     await active.sendHexBytes(["0e"]);
     await active.waitForPane((pane) => pane.includes("draft"), READY_TIMEOUT);

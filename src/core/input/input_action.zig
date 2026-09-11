@@ -92,6 +92,7 @@ pub const Action = union(enum) {
     toggle_full_transcript,
     toggle_permission_mode,
     open_all_sessions,
+    open_model_picker,
     insert_newline,
     paste_start,
     paste_end,

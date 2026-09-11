@@ -2952,6 +2952,106 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "Ctrl+P opens the model picker and returns the draft untouched",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const selectedModel = "private-team/plain-model";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 200,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-shortcut-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: currentModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("hello draft");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+
+      await session.sendKeys("C-p");
+      let grid = await waitForModelsMenu(session, 2);
+      let pane = grid.join("\n");
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("tab provider");
+      expect(pane).not.toContain("hello draft");
+      expect(hasEmptyComposer(pane)).toBe(true);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello draft") && !current.includes("tab provider"),
+        5_000,
+      );
+      // The cursor is restored with the text: typing lands mid-draft.
+      await session.sendLiteralText("X");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello drXaft"),
+        5_000,
+      );
+
+      // Enter on a filtered row applies the model directly and still returns
+      // the draft instead of seeding the inline /model stages.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("plain");
+      await session.waitForPane(
+        (current) => current.includes(selectedModel) && !current.includes(currentModel),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForText(`● Switched to ${selectedModel}`, 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(true);
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      expect(settings.models?.gateway).toBe(selectedModel);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      // The restored cursor sits mid-draft; clear the whole line before /quit.
+      await session.sendKeys("C-e");
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "model inline catalog keeps shared-prefix ids distinguishable at narrow widths",
     async () => {
       const fixture = createModelsMenuFixture();
