@@ -169,7 +169,7 @@ test.skipIf(!tmuxAvailable())(
 
       await session.sendText("/sound on");
       await session.waitForPane(
-        (pane) => (pane.match(/· sound: on/g)?.length ?? 0) >= 2,
+        (pane) => (pane.match(/\* sound: on/g)?.length ?? 0) >= 2,
         TIMEOUT,
       );
       settings = JSON.parse(readFileSync(settingsPath, "utf8"));
