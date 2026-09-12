@@ -1135,7 +1135,6 @@ const InventoryRefreshTask = struct {
 const ApiKeyExitReason = enum {
     cancel,
     saved,
-    save_failed,
     screen_replacement,
     runtime_deinit,
 };

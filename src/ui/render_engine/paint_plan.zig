@@ -321,7 +321,6 @@ pub const FooterReservationSource = enum {
     footer_layout,
     transient_activity,
     idle_footer_gap,
-    resize_reflow,
 };
 
 pub const FooterPaintResult = struct {
