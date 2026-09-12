@@ -7992,7 +7992,8 @@ test "MCP server instructions are captured from initialize and exposed only when
     try server_transport.parseAndStoreServerInstructions(alloc, &server, init_response);
     try std.testing.expect(server.instructions != null);
     try std.testing.expect(std.mem.find(u8, server.instructions.?, "GitHub issue workflows") != null);
-    try std.testing.expect(std.mem.find(u8, server.instructions.?, "github_pat_1234567890abcdef") == null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "github_pat_1234567890abcdef") != null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "[redacted]") == null);
 
     const tools_response =
         \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object","properties":{}}},{"name":"close_issue","description":"Close issue","inputSchema":{"type":"object","properties":{}}}]}}

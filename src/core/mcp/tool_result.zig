@@ -23,7 +23,7 @@ pub const ExtractOptions = struct {
     legacy_wire: ?elicitation.Wire = null,
 };
 
-/// Parses an MCP response into the bounded, secret-masked model result.
+/// Parses an MCP response into the bounded, sanitized model result.
 /// The caller owns every allocation in the returned result.
 pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.CallResult {
     var outcome = tools_feature.parseCallOutcome(
@@ -169,7 +169,7 @@ pub fn format_protocol_error(
     try raw.writer.writeAll(try text_utils.maskSecrets(arena, safe_message));
     if (protocol_error.data) |data| {
         try raw.writer.writeAll("; data=");
-        try write_masked_json_value(arena, &raw.writer, data);
+        try writeJsonProjection(arena, &raw.writer, data, true);
     }
     return try alloc.dupe(u8, raw.writer.buffered());
 }
@@ -385,27 +385,34 @@ fn write_envelope(
     try writer.writeAll(",\"tool\":");
     try std.json.Stringify.value(tool_name, .{}, writer);
     try writer.writeAll(",\"result\":");
-    try write_sanitized_json_value(alloc, writer, result);
+    try writeJsonProjection(alloc, writer, result, false);
     try writer.writeByte('}');
 }
 
-/// Sanitize-only projection for MCP tool results delivered to the model.
-fn write_sanitized_json_value(
+/// JSON projection for MCP result envelopes. `mask_strings` selects the
+/// display projection (diagnostics); the model envelope uses the
+/// sanitize-only projection.
+fn writeJsonProjection(
     alloc: Allocator,
     writer: *std.Io.Writer,
     value: std.json.Value,
+    comptime mask_strings: bool,
 ) !void {
     switch (value) {
         .null, .bool, .integer, .float, .number_string => try std.json.Stringify.value(value, .{}, writer),
         .string => |text| {
             const sanitized = try text_utils.sanitizeModelText(alloc, text);
-            try std.json.Stringify.value(sanitized, .{}, writer);
+            const projected = if (mask_strings)
+                try text_utils.maskSecrets(alloc, sanitized)
+            else
+                sanitized;
+            try std.json.Stringify.value(projected, .{}, writer);
         },
         .array => |array| {
             try writer.writeByte('[');
             for (array.items, 0..) |item, index| {
                 if (index > 0) try writer.writeByte(',');
-                try write_sanitized_json_value(alloc, writer, item);
+                try writeJsonProjection(alloc, writer, item, mask_strings);
             }
             try writer.writeByte(']');
         },
@@ -417,45 +424,7 @@ fn write_sanitized_json_value(
                 if (index > 0) try writer.writeByte(',');
                 try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
-                try write_sanitized_json_value(alloc, writer, entry.value_ptr.*);
-            }
-            try writer.writeByte('}');
-        },
-    }
-}
-
-fn write_masked_json_value(
-    alloc: Allocator,
-    writer: *std.Io.Writer,
-    value: std.json.Value,
-) !void {
-    switch (value) {
-        .null, .bool, .integer, .float, .number_string => try std.json.Stringify.value(value, .{}, writer),
-        .string => |text| {
-            const sanitized = try text_utils.sanitizeModelText(alloc, text);
-            try std.json.Stringify.value(
-                try text_utils.maskSecrets(alloc, sanitized),
-                .{},
-                writer,
-            );
-        },
-        .array => |array| {
-            try writer.writeByte('[');
-            for (array.items, 0..) |item, index| {
-                if (index > 0) try writer.writeByte(',');
-                try write_masked_json_value(alloc, writer, item);
-            }
-            try writer.writeByte(']');
-        },
-        .object => |object| {
-            try writer.writeByte('{');
-            var it = object.iterator();
-            var index: usize = 0;
-            while (it.next()) |entry| : (index += 1) {
-                if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
-                try writer.writeByte(':');
-                try write_masked_json_value(alloc, writer, entry.value_ptr.*);
+                try writeJsonProjection(alloc, writer, entry.value_ptr.*, mask_strings);
             }
             try writer.writeByte('}');
         },

@@ -39,6 +39,7 @@ const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const agent_execution_memory = @import("../agent/execution_memory.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
@@ -328,6 +329,19 @@ fn requestResumeExit(app: anytype) void {
     const App = @TypeOf(app.*);
     app_session_runtime.Runtime(App).requestResumeHandoff(app);
     app.should_exit = true;
+}
+
+/// Masks a retained MCP protocol diagnostic for terminal command output. The
+/// model-facing protocol-error path stays verbatim; this display boundary is
+/// the only place CLI command output sees the diagnostic. Takes ownership of
+/// `diagnostic` and returns an owned masked copy.
+fn maskedDisplayDiagnostic(alloc: std.mem.Allocator, diagnostic: []u8) ![]u8 {
+    const masked = agent_execution_memory.maskTextForDisplay(alloc, diagnostic) catch |err| {
+        alloc.free(diagnostic);
+        return err;
+    };
+    alloc.free(diagnostic);
+    return masked;
 }
 
 pub fn Handlers(comptime App: type) type {
@@ -1465,7 +1479,7 @@ pub fn Handlers(comptime App: type) type {
                 if (err == error.McpProtocolError) {
                     if (protocol_diagnostic) |diagnostic| {
                         protocol_diagnostic = null;
-                        return diagnostic;
+                        return try maskedDisplayDiagnostic(alloc, diagnostic);
                     }
                 }
                 return err;
@@ -1540,7 +1554,7 @@ pub fn Handlers(comptime App: type) type {
                 if (err == error.McpProtocolError) {
                     if (protocol_diagnostic) |diagnostic| {
                         protocol_diagnostic = null;
-                        return diagnostic;
+                        return try maskedDisplayDiagnostic(alloc, diagnostic);
                     }
                 }
                 return err;

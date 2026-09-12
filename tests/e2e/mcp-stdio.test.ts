@@ -112,6 +112,7 @@ type RootOptions = {
     | "crash_once"
     | "crash_always";
   startupTimeoutMs?: number;
+  protocolErrorMessage?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
   recoveredToolName?: string;
@@ -180,6 +181,7 @@ function createRoot(
             FX_MCP_PID_PATH: join(root, "mcp.pid"),
             FX_MCP_PROTOCOL_VERSION: "2026-07-28",
             FX_MCP_MODE: options.mode ?? "normal",
+            FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
             FX_MCP_INVALIDATION_RELEASE_PATH: invalidationReleasePath,
@@ -3097,6 +3099,42 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(wire);
+    },
+    35_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "MCP resource read command masks secret-shaped protocol diagnostics",
+    async () => {
+      const secretNeedle = ["SERVICE_", "TOKEN=fixture-token-123456"].join("");
+      const root = createRoot("tui-feature-protocol-error-masked", MODERN_FIXTURE, {
+        mode: "feature_protocol_error",
+        protocolErrorMessage: secretNeedle,
+      });
+      gateway = startFakeGateway([fakeGatewayFinalText("unused")], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        stderrPath,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp resource read fixture custom://alpha");
+      await tui.waitForText("MCP protocol error -32602", 15_000);
+      const pane = await tui.capturePane();
+      expect(pane).toContain("[redacted]");
+      expect(pane).not.toContain(secretNeedle);
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
     },
     35_000,
   );

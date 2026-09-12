@@ -1051,7 +1051,7 @@ test "durable execution memory preserves committed file presentation verbatim an
     const calls = [_]ToolCall{.{
         .id = secret_id,
         .name = "write_file",
-        .arguments_json = "{\"path\":\"notes.txt\",\"content\":\"secret\"}}",
+        .arguments_json = "{\"path\":\"notes.txt\",\"content\":\"secret\"}",
     }};
     const messages = [_]types.ChatMessage{
         .{ .role = .assistant, .tool_calls = calls[0..] },
@@ -1086,6 +1086,11 @@ test "durable execution memory preserves committed file presentation verbatim an
     try std.testing.expectEqualStrings(secret_text ++ "\n", presentation.after_content.?);
     try std.testing.expectEqualStrings(result.tool_call_id, presentation.lifecycle_id.?.call_id);
     try std.testing.expectEqualStrings(memory.tool_steps[0].tool_calls[0].id, presentation.lifecycle_id.?.call_id);
+
+    try std.testing.expectEqual(@as(usize, 1), memory.files.len);
+    try std.testing.expectEqualStrings("notes.txt", memory.files[0].path);
+    try std.testing.expectEqual(types.FileEvidenceAction.write, memory.files[0].action);
+    try std.testing.expectEqualStrings(result.tool_call_id, memory.files[0].tool_call_id);
 }
 
 test "file evidence does not parse unknown tool arguments" {
@@ -1396,16 +1401,19 @@ test "normal execution-memory builders produce identical durable projection" {
         chat_memory.tool_steps[0].tool_results[1].permission_feedback.len,
     );
     try std.testing.expectEqualStrings("", chat_memory.tool_steps[1].tool_results[0].output);
-    try std.testing.expect(std.mem.find(
-        u8,
-        chat_memory.tool_steps[0].tool_calls[0].id,
-        "[redacted]",
-    ) == null);
-    try std.testing.expect(std.mem.find(
-        u8,
+    try std.testing.expectEqualStrings(
+        chat_messages[2].content.?,
         chat_memory.tool_steps[0].tool_results[0].output,
-        "[redacted]",
-    ) == null);
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_calls[0].id,
+        chat_memory.tool_steps[0].tool_calls[0].id,
+    ));
+    try std.testing.expectEqualStrings(
+        chat_memory.tool_steps[0].tool_results[0].tool_call_id,
+        chat_memory.tool_steps[0].tool_calls[0].id,
+    );
 }
 
 test "normal execution-memory builders reject missing tool result status identically" {
