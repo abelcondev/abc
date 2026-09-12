@@ -1,8 +1,48 @@
 # fx
 
-## 0.0.8
+## 0.0.9
 
 <!-- release:start -->
+
+**fx can now use a frontier model for steering, then delegate to cheaper models to implement. Subagents keep running while you steer, can have different models and reasoning levels, and take feedback mid-task. We're accomplishing this without any new commands or concepts, just chat with fx.**
+
+### Breaking Changes
+
+- For simplicity, `!` in the composer is just prompt text now. It no longer starts a terminal session. Commands go through the agent and the usual approval flow.
+
+### New Features
+
+- Subagents can use their own model and reasoning effort. Use GPT-6, Astra, or Fable 5.1 to steer, then delegate implementation to Kimi K3.
+- You can send feedback to a running named subagent without interrupting its current tool. The final result still comes back to the parent conversation.
+- New conversations get a short title from the first prompt. Turn generated session titles off in `/settings`.
+- Press `ctrl+p` while writing to open the model picker. Your draft and attached images stay where they are.
+- ACP clients can set reasoning effort on supported models. They can also replay earlier tool calls as structured events.
+- New runnable `libfx` examples for [Node.js](https://fx-demo-node-chat.vercel.app/), [browsers](https://fx-demo-browser-agent.vercel.app/), [Next.js](https://fx-demo-nextjs-agent.vercel.app/), and [Nuxt](https://fx-demo-nuxt-agent.vercel.app/).
+
+### Improvements
+
+- `fx -c` and `fx --continue` now resume the workspace’s remembered conversation without a full session scan.
+- Compaction now shows in the activity row. If you send a message while it's running, it waits, then runs with the compacted context.
+- Assistant Markdown now renders nested emphasis, links, code spans, lists, fenced code blocks, and entities the way GitHub does.
+- `@~`, `@.`, and `@..` open the home directory, workspace, and parent directory. No trailing slash needed. File suggestions also stay put while you browse and refine them.
+- Escape needs a second press within one second to interrupt active work. ctrl+c clears a non-empty composer first; with an empty composer, it interrupts active work, then exits fx on the next press.
+
+### Bug Fixes
+
+- Running subagents keep going if a file lookup fails. Follow-up messages also don't leave named subagents stuck.
+- AI Gateway now applies the reasoning effort you selected on chat requests. Prompts with images no longer fail on the v4 endpoint.
+- Long replies no longer shuffle transcript rows or overwrite the last character on a full-width terminal line.
+- MCP OAuth now works with servers that support PKCE but leave `none` out of their metadata, including Slack MCP.
+
+### Security
+
+- Auto mode now checks which terminal session it's sending input to, including after a resume.
+- Auto mode no longer reuses an earlier safety-review decision when judging a later action.
+- Auto mode no longer raises false cautions when you use a credential with the service it's for, or with a local test process.
+
+<!-- release:end -->
+
+## 0.0.8
 
 **fx is smaller, simpler, and faster. libfx initialization in Node / browser is over 40× faster; fx binary is 7.49% smaller. fx uses a smaller three-action shell, context compaction is optimized per model, and Enter steers active turns instead of queuing follow-ups.**
 
@@ -143,8 +183,6 @@
 - [Stagehand](https://docs.stagehand.dev/v4/integrations/fx)
 - [Supabase](https://supabase.com/docs/guides/ai-tools/mcp)
 - [Upstash](https://upstash.com/docs/agent-resources/clients#fx)
-
-<!-- release:end -->
 
 ## 0.0.7
 
