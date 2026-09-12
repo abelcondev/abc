@@ -125,7 +125,7 @@ fn persistInterruptedTurnWithPresentation(
     if (persisted.*) return;
 
     const durable_active_tool_call = if (active_tool_call) |call|
-        try execution_memory_helpers.dupeRedactedToolCall(
+        try execution_memory_helpers.dupePersistedToolCall(
             std.heap.c_allocator,
             call,
         )

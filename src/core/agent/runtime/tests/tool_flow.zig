@@ -6212,14 +6212,14 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
     }
 }
 
-test "processQueuedPrompt redacts interrupted active tool before history and replay" {
+test "processQueuedPrompt persists interrupted active tool verbatim before history and replay" {
     const alloc = std.testing.allocator;
-    const secret_id = "sk-abcdefghijklmnop";
-    const secret_path = "xoxb-abcdefghijklmnop";
+    const secret_id = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    const secret_path = "/secrets/TOKEN=path-secret-value";
     const calls = [_]ToolCall{toolCall(
         secret_id,
         "read_file",
-        "{\"path\":\"xoxb-abcdefghijklmnop\"}",
+        "{\"path\":\"/secrets/TOKEN=path-secret-value\"}",
     )};
     const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -6236,7 +6236,7 @@ test "processQueuedPrompt redacts interrupted active tool before history and rep
     const persisted_call = interrupted.tool_call.?;
     try std.testing.expect(!std.mem.eql(u8, secret_id, persisted_call.id));
     try std.testing.expect(
-        std.mem.find(u8, persisted_call.arguments_json, secret_path) == null,
+        std.mem.find(u8, persisted_call.arguments_json, secret_path) != null,
     );
 
     const follow_completions = [_]FakeCompletion{.{ .content = "Interrupted." }};
@@ -6257,7 +6257,7 @@ test "processQueuedPrompt redacts interrupted active tool before history and rep
     );
 
     try expectBodyNotContains(&follow_gateway, 0, secret_id);
-    try expectBodyNotContains(&follow_gateway, 0, secret_path);
+    try expectBodyContains(&follow_gateway, 0, secret_path);
     try expectBodyContains(&follow_gateway, 0, persisted_call.id);
 }
 

@@ -2227,7 +2227,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
-  test("capability search ranks natural skill intent and keeps durable model-visible JSON exact after redaction", async () => {
+  test("capability search ranks natural skill intent and keeps durable model-visible JSON exact", async () => {
     const root = createFixtureRoot("skill-search-projection");
     const tracePath = join(root.root, "trace.log");
     const unsafeDirectory = join(
@@ -2332,7 +2332,7 @@ describe("gateway stream lifecycle", () => {
       expect(initialSkills).not.toContain("- mail-helper:");
       expect(projectedSearch?.skills[0]).toEqual({
         name: "mail-helper",
-        description: "Send email messages. API_KEY=[redacted]",
+        description: "Send email messages. API_KEY=runtime-description-secret",
         location: safeDirectory,
       });
       expect(projectedSearch?.counts.skills).toBe(1);
