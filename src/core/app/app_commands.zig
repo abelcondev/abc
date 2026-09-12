@@ -227,7 +227,7 @@ fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const maybe_action = parseWorkspaceCommand(rest) catch {
         try app.writeDomainNotice(.{
-            .topic = "workspace",
+            .topic = "",
             .tone = .@"error",
             .body = "usage: /workspace [add PATH|remove PATH|clear]",
         }, true);
@@ -946,11 +946,12 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn writePermissionManagementUsage(app: *App) !void {
-            try writePermissionManagementNotice(
-                app,
-                .@"error",
-                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
-            );
+            // Usage lines name the command; a topic tag would repeat it.
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
+            }, true);
         }
 
         fn writePermissionManagementNotice(
@@ -1336,7 +1337,7 @@ pub fn Handlers(comptime App: type) type {
             }
             const body = reload_notice orelse command_body;
             try app.writeDomainNotice(.{
-                .topic = "mcp",
+                .topic = noticeTopicForBody("mcp", body),
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
@@ -1727,7 +1728,7 @@ pub fn Handlers(comptime App: type) type {
                     .{ .show = name },
                 ),
                 .notice => |body| try app.writeDomainNotice(.{
-                    .topic = "skills",
+                    .topic = noticeTopicForBody("skills", body),
                     .tone = .neutral,
                     .body = body,
                 }, true),
@@ -1773,6 +1774,11 @@ pub fn Handlers(comptime App: type) type {
             defer result.deinit(app.alloc);
 
             try applySkillsCommandResult(app, &result);
+        }
+
+        /// Usage lines name the command; a topic tag would repeat it.
+        fn noticeTopicForBody(comptime default: []const u8, body: []const u8) []const u8 {
+            return if (std.mem.startsWith(u8, body, "usage:")) "" else default;
         }
 
         fn findSkillForProvider(ctx: *anyopaque, name: []const u8) ?skill_commands.SkillInfo {
@@ -1833,7 +1839,7 @@ pub fn Handlers(comptime App: type) type {
                         try queueSkillsNoticeAfterRefresh(app, notice.text);
                     } else {
                         try app.writeDomainNotice(.{
-                            .topic = "skills",
+                            .topic = noticeTopicForBody("skills", notice.text),
                             .tone = .neutral,
                             .body = notice.text,
                         }, true);
@@ -3425,8 +3431,16 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
     SessionRuntime.renameActiveSession(app, rest) catch |err| {
+        if (err == error.EmptyTitle) {
+            // Usage lines name the command; a topic tag would repeat it.
+            try app.writeDomainNotice(
+                .{ .topic = "", .tone = .@"error", .body = "usage: /rename <title>" },
+                true,
+            );
+            return;
+        }
         const body: []const u8 = switch (err) {
-            error.EmptyTitle => "usage: /rename <title>",
+            error.EmptyTitle => unreachable,
             error.TitleTooLong => "title is too long",
             error.InvalidTitle => "title must be printable text",
             error.NoActiveSession => "no active session to rename",
@@ -3532,7 +3546,7 @@ fn applyStatuslineItem(
 fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
     const item = parseStatuslineItem(rest) orelse {
         try app.writeDomainNotice(.{
-            .topic = "statusline",
+            .topic = "",
             .tone = .@"error",
             .body = "usage: /statusline [context|session|workspace]",
         }, true);
@@ -3580,7 +3594,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .set => |value| value,
         .invalid => {
             try app.writeDomainNotice(.{
-                .topic = "sound",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /sound [on|off|max]",
             }, true);

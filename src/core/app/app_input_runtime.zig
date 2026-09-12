@@ -2786,7 +2786,7 @@ pub fn Runtime(comptime App: type) type {
                 .none => return false,
                 .invalid => {
                     try app.writeDomainNotice(.{
-                        .topic = "model",
+                        .topic = "",
                         .tone = .@"error",
                         .body = "usage: /model <id> <effort> [normal|fast]",
                     }, true);

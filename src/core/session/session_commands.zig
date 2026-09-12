@@ -381,7 +381,7 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .@"error", .body = permissions_usage }, true);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = permissions_usage }, true);
         }
 
         pub fn handleAllowlist(app: *App, rest: []const u8) !void {
@@ -501,7 +501,7 @@ pub fn Commands(comptime App: type) type {
 
         fn writeAllowlistUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "allowlist",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]",
             }, true);
@@ -514,7 +514,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -556,7 +556,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -603,7 +603,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const reset_scope = parseAllowlistResetScope(raw) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist reset [commands|tools|urls|web-fetch-domains|all]",
                 }, true);
@@ -1004,7 +1004,7 @@ pub fn Commands(comptime App: type) type {
 
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "settings",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /settings [startup-scrollback [on|off]]",
             }, true);

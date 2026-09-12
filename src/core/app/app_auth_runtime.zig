@@ -257,9 +257,9 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_catalog.parse(std.mem.trim(u8, target, " \t\r\n")) orelse {
                     try writeAuthNotice(app, .{
-                        .topic = "auth",
+                        .topic = "",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok]",
+                        .body = "usage: /logout [vercel|codex|grok]",
                     });
                     return;
                 };
