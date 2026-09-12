@@ -11,7 +11,7 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent CLI written in Zig: a 7.8 MiB native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
+fx is a coding agent CLI written in Zig: a 6.17 MiB native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
 ## Install
 
@@ -55,7 +55,7 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
-For runnable Node.js, browser, Next.js, and Nuxt applications, see the [libfx examples](examples/README.md).
+The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For runnable Node.js, browser, Next.js, and Nuxt applications, see the [libfx examples](examples/README.md).
 
 ## Extend fx
 
