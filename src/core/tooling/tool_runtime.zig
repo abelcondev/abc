@@ -2438,15 +2438,6 @@ fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"run\",\"command\":");
-    try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
-    return out.toOwnedSlice();
-}
-
 fn executeTestRunCommand(
     ctx: Context,
     arena: Allocator,

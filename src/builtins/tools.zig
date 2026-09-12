@@ -972,22 +972,6 @@ fn schemaProperty(schema: model_tool_schema.ObjectSchema, name: []const u8) ?mod
     return null;
 }
 
-fn schemaEnumValues(property: model_tool_schema.Property) []const []const u8 {
-    const shape = property.shape orelse return &.{};
-    return switch (shape.*) {
-        .enum_values => |values| values,
-        else => &.{},
-    };
-}
-
-fn schemaObject(property: model_tool_schema.Property) ?*const model_tool_schema.ObjectSchema {
-    const shape = property.shape orelse return null;
-    return switch (shape.*) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
 fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     for (names) |name| {
         if (std.mem.eql(u8, name, wanted)) return true;
