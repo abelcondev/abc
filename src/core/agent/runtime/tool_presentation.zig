@@ -2828,3 +2828,42 @@ test "cancelled shell wait names the observation instead of the process" {
         "Stopped waiting for",
     ) != null);
 }
+
+test "failure status detail masks secret-shaped failure output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_fail",
+        .name = "mcp__fixture__echo",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "MY_NOTE_" ++ "TOKEN=abcdefgh";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expect(std.mem.find(u8, detail, "[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, detail, "abcdefgh") == null);
+}
+
+test "failure status detail masks the actionable edit failure reason" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_edit_fail",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "edit_file failed: MY_NOTE_" ++ "TOKEN=abcdefgh";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expectEqualStrings("MY_NOTE_" ++ "TOKEN=[redacted]", detail);
+}
