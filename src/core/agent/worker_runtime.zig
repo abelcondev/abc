@@ -1107,6 +1107,18 @@ pub const WorkerRuntime = struct {
         turn_id: u64,
         kind: SteeringBoundaryKind,
     ) !SteeringBoundaryResult {
+        const result = try self.takeSteeringBoundaryIntoInner(alloc, result_alloc, turn_id, kind);
+        debug_trace.eventf("worker", "steering_boundary_check", .{ .turn_id = turn_id }, "kind={s} outcome={s}", .{ @tagName(kind), @tagName(result) });
+        return result;
+    }
+
+    fn takeSteeringBoundaryIntoInner(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        result_alloc: std.mem.Allocator,
+        turn_id: u64,
+        kind: SteeringBoundaryKind,
+    ) !SteeringBoundaryResult {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
@@ -1464,6 +1476,7 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| {
             if (prompt.delivery.activeTurnId() == finished_turn_id) {
                 prompt.delivery = .continuation;
+                debug_trace.eventf("worker", "steering_deferred_to_next_turn", .{ .turn_id = finished_turn_id }, "queued_turn_id={d} prompt_bytes={d}", .{ prompt.turn_id, prompt.prompt.len });
             }
         }
         self.worker_processing = false;

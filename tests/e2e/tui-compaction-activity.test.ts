@@ -345,6 +345,37 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     }, 90_000);
   }
 
+  test("overflow: a message submitted during held in-turn compaction rides the rebuilt request", async () => {
+    const f = await fixture("overflow", "success");
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("Continue the current turn.");
+      await until(() => f.counts().summaries === 1, "summary request in flight");
+      await terminal.waitForText(ACTIVITY, 10_000);
+      const steer = "STEER_DURING_OVERFLOW_5c1d";
+      await terminal.sendText(steer);
+      // While the summary is held, the message must neither start its own
+      // turn nor cancel the compaction.
+      await Bun.sleep(1500);
+      expect(f.counts()).toEqual({ summaries: 1, ordinary: f.seedTurns + 1, overflowSent: true });
+      await terminal.waitForText(ACTIVITY, 5000);
+      f.summaryHold.release(HANDOFF);
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      // The rebuilt continuation is held by ordinaryHold; the steering must
+      // already ride it, as same-turn guidance, before any reply arrives.
+      await until(() => f.requestsContaining(steer).length > 0, "steering in the rebuilt request");
+      const steered = f.requestsContaining(steer);
+      expect(steered).toHaveLength(1);
+      expect(steered[0]).toContain("<user_steering>");
+      expect(steered[0]).toContain("INTERNAL_HANDOFF_4e12");
+      f.ordinaryHold.release("CURRENT_TURN_OK_OVERFLOW_STEER");
+      await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_OVERFLOW_STEER") && hasEmptyComposer(pane), 20_000);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 90_000);
+
   for (const outcome of ["cancel", "empty", "provider-error"] as const) {
     test(`manual ${outcome}: scoped feedback preserves history and permits later input and reopen`, async () => {
       const f = await fixture("manual", outcome);

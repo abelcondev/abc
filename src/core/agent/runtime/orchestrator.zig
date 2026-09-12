@@ -106,6 +106,70 @@ fn take_steering_boundary(
     return take(deps.ctx, arena, turn_id, kind);
 }
 
+/// A handoff ends the turn so the queued prompt can run as its own turn.
+/// Persist the interruption exactly once and report the finish reason.
+fn finish_steering_handoff(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    completed_tool_names: [][]u8,
+    interrupted_persisted: *bool,
+    step_ctx: TraceContext,
+    within_turn_suffix: []const ChatMessage,
+    stop_state: *CommonStopState,
+    finish_trace: *PromptFinishTrace,
+) !void {
+    try runtime_interruption.persistInterruptedTurnOnce(
+        deps,
+        finalization,
+        job,
+        null,
+        null,
+        completed_tool_names,
+        interrupted_persisted,
+        step_ctx,
+        within_turn_suffix,
+        stop_state.retained_candidate,
+        &stop_state.terminal_materializing,
+    );
+    finish_trace.finish("steering_handoff");
+}
+
+const SteeringBoundaryAction = enum {
+    /// Nothing pending; the caller proceeds with its normal flow.
+    none,
+    /// Guidance was appended to the within-turn suffix; the caller must
+    /// continue the turn so the model receives it.
+    continued,
+    /// The queued prompt cannot join this turn; the caller decides the
+    /// outcome (mid-turn sites finish the turn for a handoff; terminal sites
+    /// finish normally and let the prompt run as the next turn).
+    handoff,
+};
+
+/// Observes one steering boundary and drains any guidance into the
+/// within-turn suffix. Handoff is only classified here; finishing the turn is
+/// the caller's decision.
+fn observe_steering_boundary(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    result_alloc: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    origin: runtime_config.TurnOrigin,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !SteeringBoundaryAction {
+    const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
+    switch (boundary) {
+        .continue_turn => |guidance| {
+            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+            return .continued;
+        },
+        .handoff => return .handoff,
+        .none, .interrupt => return .none,
+    }
+}
+
 fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
@@ -6375,37 +6439,28 @@ fn processQueuedPromptLoop(
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
-        const steering_boundary = try take_steering_boundary(
+        const steering_action = try observe_steering_boundary(
             deps,
+            arena,
             overlay_arena,
+            &within_turn_suffix,
             turn_id,
+            config.origin,
             .model,
         );
-        switch (steering_boundary) {
-            .handoff => {
-                try runtime_interruption.persistInterruptedTurnOnce(
-                    deps,
-                    finalization,
-                    job,
-                    null,
-                    null,
-                    completed_tool_names.items,
-                    &interrupted_persisted,
-                    step_ctx,
-                    within_turn_suffix.items,
-                    stop_state.retained_candidate,
-                    &stop_state.terminal_materializing,
-                );
-                finish_trace.finish("steering_handoff");
-                return;
-            },
-            .continue_turn => |guidance| try append_steering_guidance(
-                arena,
-                &within_turn_suffix,
-                guidance,
-                config.origin,
-            ),
-            .none, .interrupt => {},
+        if (steering_action == .handoff) {
+            try finish_steering_handoff(
+                deps,
+                finalization,
+                job,
+                completed_tool_names.items,
+                &interrupted_persisted,
+                step_ctx,
+                within_turn_suffix.items,
+                stop_state,
+                &finish_trace,
+            );
+            return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (skills.explicit) |section| {
@@ -6996,7 +7051,34 @@ fn processQueuedPromptLoop(
                             installed_compaction = true;
                             break :compact_attempt;
                         }
-                        if (installed_compaction) continue;
+                        if (installed_compaction) {
+                            // A message queued while the compaction ran must ride the
+                            // rebuilt request, not wait for the reply after it.
+                            const post_compaction_action = try observe_steering_boundary(
+                                deps,
+                                arena,
+                                overlay_arena,
+                                &within_turn_suffix,
+                                turn_id,
+                                config.origin,
+                                .model,
+                            );
+                            if (post_compaction_action == .handoff) {
+                                try finish_steering_handoff(
+                                    deps,
+                                    finalization,
+                                    job,
+                                    completed_tool_names.items,
+                                    &interrupted_persisted,
+                                    step_ctx,
+                                    within_turn_suffix.items,
+                                    stop_state,
+                                    &finish_trace,
+                                );
+                                return;
+                            }
+                            continue;
+                        }
                     },
                 }
             }
@@ -8602,6 +8684,21 @@ fn processQueuedPromptLoop(
                 finish_reason.label(),
                 completion.tool_calls.len,
             });
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    assistant_text,
+                    provider_replay,
+                    config.origin,
+                    .finalizing,
+                ))
+            {
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                continue :agent_steps_loop;
+            }
             if (stop_state.retained_candidate != null) {
                 const persisted_text = try runtime_finalization.stopTerminalText(
                     arena,
@@ -11315,6 +11412,23 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                const terminal_action = try observe_steering_boundary(
+                    deps,
+                    arena,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    config.origin,
+                    .finalizing,
+                );
+                switch (terminal_action) {
+                    // The turn is already ending; an ineligible prompt runs as
+                    // the next turn after the normal terminal finish.
+                    .handoff, .none => {},
+                    .continued => continue :agent_steps_loop,
+                }
+            }
             debug_trace.eventf(
                 "agent",
                 "repeated_malformed_tool_arguments",
@@ -11337,6 +11451,21 @@ fn processQueuedPromptLoop(
             return;
         }
         if (terminal_validation_retry.finishBatch()) {
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                const terminal_action = try observe_steering_boundary(
+                    deps,
+                    arena,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    config.origin,
+                    .finalizing,
+                );
+                switch (terminal_action) {
+                    .handoff, .none => {},
+                    .continued => continue :agent_steps_loop,
+                }
+            }
             try deps.push_system_notice(
                 deps.ctx,
                 repeated_terminal_validation_notice,
@@ -11367,6 +11496,21 @@ fn processQueuedPromptLoop(
             return;
         }
         if (shell_execution_failure_retry.finishBatch()) {
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                const terminal_action = try observe_steering_boundary(
+                    deps,
+                    arena,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    config.origin,
+                    .finalizing,
+                );
+                switch (terminal_action) {
+                    .handoff, .none => {},
+                    .continued => continue :agent_steps_loop,
+                }
+            }
             debug_trace.eventf(
                 "agent",
                 "repeated_shell_execution_failure",
