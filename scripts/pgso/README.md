@@ -61,10 +61,12 @@ binary, candidate, assignment, or shard identity mismatch. The aggregate
 command requires all 36 training scenarios, all 53 behavior scenarios, and all
 12 performance gates exactly once before it emits `eligible: true`.
 
-Rerunning a workflow job replaces its previous named artifact, including
-failed evidence. Consumers therefore read the latest result for each shard;
-a failed retry cannot fall back to an earlier pass. Source and artifact hashes
-must still match before aggregation can qualify a release.
+Workflow artifact names include the producing run attempt, so earlier attempts
+remain available. Seed and candidate consumers use the artifact IDs returned
+by their producer jobs. Shard collection selects the newest attempt for each
+shard; a failed or invalid newest result cannot fall back to an earlier pass.
+Source and artifact hashes must still match before aggregation can qualify a
+release. Overwrite applies only to an identical attempt-qualified name.
 
 ## Corpus
 
