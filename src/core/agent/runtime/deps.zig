@@ -141,8 +141,6 @@ pub const ParentTurnDeliveryAck = struct {
     start_offset: u64,
     end_offset: u64,
     total_bytes: u64,
-    discovery_start_offset: ?u64 = null,
-    discovery_next_offset: ?u64 = null,
 };
 
 /// Slices are owned by the allocator passed to `prepare_parent_turn_context`

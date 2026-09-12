@@ -3432,10 +3432,6 @@ const RoutingSubagents = struct {
     active: bool = false,
     main_approval_presented: bool = false,
     handled_keys: usize = 0,
-    handled_raw_keys: usize = 0,
-    handled_actions: usize = 0,
-    last_handled_key: ?u8 = null,
-    last_main_approval_id: ?u64 = null,
     toggle_view_calls: usize = 0,
     manager_paste: core_input_runtime.Runtime = .{},
 

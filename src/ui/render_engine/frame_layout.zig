@@ -58,7 +58,6 @@ pub const TranscriptFlowPreview = struct {
     replaceable_row: u16 = 1,
     tail_kind: ?transcript_blocks.TranscriptBlockKind = null,
     replaceable_active: bool = false,
-    welcome_split_active: bool = false,
     split_prefix_lines: usize = 0,
     split_suffix_start_line: usize = 0,
 };
