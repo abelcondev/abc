@@ -4014,7 +4014,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         .{ .origin = 5, .rows = 80, .post_top = 1 },
     };
     for (cases) |case| {
-        errdefer std.debug.print("resume origin={d} rows={d}\n", .{ case.origin, case.rows });
+        errdefer std.debug.panic("resume origin={d} rows={d}", .{ case.origin, case.rows });
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var file = try tmp.dir.createFile(std.testing.io, "resume-origin.log", .{ .read = true });
