@@ -1596,7 +1596,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
-      expect(capturePaneHistory(session, -1000)).not.toMatch(/[·✓!✗⊘i] help:/);
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] help:/);
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -1700,7 +1700,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           !current.includes("←→ change"),
         5_000,
       );
-      expect(capturePaneHistory(session, -1000)).not.toMatch(/[·✓!✗⊘i] settings:/);
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] settings:/);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(10_000)).toBe(true);
@@ -1813,7 +1813,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
-      expect(pane).not.toMatch(/[·✓!✗⊘i] statusline:/);
+      expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
       await waitForStatuslineValue(settingsPath, "session", true);
 
       await session.sendKeys("Down");
@@ -1835,7 +1835,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/statusline workspace");
-      await session.waitForText("· statusline: workspace: off", 5_000);
+      await session.waitForText("* statusline: workspace: off", 5_000);
       await waitForStatuslineValue(settingsPath, "workspace", false);
       await session.waitForPane(
         (current) => hasEmptyComposer(current) && !current.includes("compact-statusline-workspace"),
@@ -1876,7 +1876,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForUsageMenu(session);
       let pane = grid.join("\n");
       expect(pane).toContain("Tracking has not started");
-      expect(pane).not.toMatch(/^[·✓!✗⊘i] usage/m);
+      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2830,7 +2830,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("/mode");
       await session.sendKeys("Enter");
       await waitForModelsMenu(session, 4);
-      expect(await session.captureFullScrollback()).not.toContain(`· model: ${currentModel}`);
+      expect(await session.captureFullScrollback()).not.toContain(`* model: ${currentModel}`);
       await session.sendKeys("Escape");
       await session.waitForPane(
         (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
@@ -2931,7 +2931,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText(`· Switched to ${selectedModel}`, 5_000);
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
@@ -3030,7 +3030,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       await session.sendKeys("Enter");
-      await session.waitForText(`· Switched to ${selectedModel}`, 5_000);
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
       pane = await session.capturePane();
       expect(composerContains(pane, "hello drXaft")).toBe(true);
       expect(composerContains(pane, "/model")).toBe(false);
@@ -3142,7 +3142,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText(selectedModel, 10_000);
       await session.sendLiteralText(selectedModel);
       await session.sendKeys("Enter");
-      await session.waitForText(`· Switched to ${selectedModel}`, 5_000);
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
 
       const pane = (await session.capturePaneGrid()).join("\n");
       expect(hasEmptyComposer(pane)).toBe(true);

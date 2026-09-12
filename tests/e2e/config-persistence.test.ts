@@ -109,7 +109,7 @@ function migrationSnapshotPath(home: string, field: string): string {
 function clearedPaneWithoutAllowlistRules(pane: string): boolean {
   return (
     hasEmptyComposer(pane) &&
-    !pane.match(/[·✓!✗⊘i] allowlist:/) &&
+    !pane.match(/[*✓!✗⊘i] allowlist:/) &&
     !pane.includes("user *")
   );
 }
@@ -214,15 +214,15 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         expect(beforeModelCommit).not.toHaveProperty("model");
         await session.sendKeys("Enter");
-        await session.waitForText("· Switched to anthropic/claude-opus-4.7", TIMEOUT);
+        await session.waitForText("* Switched to anthropic/claude-opus-4.7", TIMEOUT);
         await session.sendText("/fast");
-        await session.waitForText("· fast: on", TIMEOUT);
+        await session.waitForText("* fast: on", TIMEOUT);
         await session.sendText("/statusline context");
-        await session.waitForText("· statusline: context:", TIMEOUT);
+        await session.waitForText("* statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
-        await session.waitForText("· statusline: session:", TIMEOUT);
+        await session.waitForText("* statusline: session:", TIMEOUT);
         await session.sendText("/statusline workspace");
-        await session.waitForText("· statusline: workspace:", TIMEOUT);
+        await session.waitForText("* statusline: workspace:", TIMEOUT);
         await session.sendText("/settings startup-scrollback off");
         await session.waitForText("startup_scrollback: off", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
@@ -396,13 +396,13 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/allowlist view local");
         await session.waitForText(
-          "· allowlist: local persistent allow rules: (none)",
+          "* allowlist: local persistent allow rules: (none)",
           TIMEOUT,
         );
         await session.sendText("/allowlist view user");
         await session.waitForText("user *", TIMEOUT);
         await session.sendText('/allowlist user remove command "padded *"');
-        await session.waitForText("· allowlist: removed command", TIMEOUT);
+        await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/clear");
         await session.waitForPane(
           clearedPaneWithoutAllowlistRules,
@@ -410,7 +410,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         await session.sendText("/allowlist view effective");
         const inherited = await session.waitForText("user *", TIMEOUT);
-        expect(inherited).toContain("· allowlist: effective persistent allow rules:");
+        expect(inherited).toContain("* allowlist: effective persistent allow rules:");
 
         await session.sendText('/allowlist add command "local-b *"');
         await session.waitForText("(scope=local)", TIMEOUT);
@@ -430,7 +430,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(localEffective).not.toContain("user *");
 
         await session.sendText('/allowlist user remove command "user *"');
-        await session.waitForText("· allowlist: removed command", TIMEOUT);
+        await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -1236,7 +1236,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const pickerPane = await session.waitForText("xai/grok-build-1", TIMEOUT);
         expect(pickerPane).toContain("xai/grok-build-1");
         await session.sendKeys("Enter");
-        await session.waitForText("· Switched to xai/grok-build-1", TIMEOUT);
+        await session.waitForText("* Switched to xai/grok-build-1", TIMEOUT);
         await session.waitForPane(
           (pane) =>
             hasEmptyComposer(pane) &&
@@ -1253,7 +1253,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("grok-build-1");
-        expect(scrollback).toContain("· Switched to xai/grok-build-1");
+        expect(scrollback).toContain("* Switched to xai/grok-build-1");
         expect(gateway.requests).toHaveLength(0);
 
         await session.sendText("/quit");
@@ -1316,7 +1316,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/statusline context");
-        await session.waitForText("· statusline: context: on", TIMEOUT);
+        await session.waitForText("* statusline: context: on", TIMEOUT);
         await session.sendLiteral("/model new-reasoning");
         await session.waitForText("provider/new-reasoning-model", TIMEOUT);
         await session.sendKeys("Enter");
@@ -1324,7 +1324,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(autoEffortPicker).toContain("future-tier");
         expect(autoEffortPicker).toContain("high");
         await session.sendKeys("Enter");
-        await session.waitForText("· Switched to provider/new-reasoning-model", TIMEOUT);
+        await session.waitForText("* Switched to provider/new-reasoning-model", TIMEOUT);
 
         let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("provider/new-reasoning-model");
@@ -1335,8 +1335,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("portable auto complete", TIMEOUT);
         const footer = await session.waitForText("0k/750k 0%", TIMEOUT);
         expect(footer).toContain("new-reasoning-model");
-        expect(footer).not.toMatch(/[·✓!✗⊘i] context:/);
-        expect(await session.captureFullScrollbackEscapes()).not.toMatch(/[·✓!✗⊘i] context:/);
+        expect(footer).not.toMatch(/[*✓!✗⊘i] context:/);
+        expect(await session.captureFullScrollbackEscapes()).not.toMatch(/[*✓!✗⊘i] context:/);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
           "provider/new-reasoning-model",
@@ -1355,7 +1355,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendKeys("Down");
         await session.waitForText("future-tier", TIMEOUT);
         await session.sendKeys("Enter");
-        await session.waitForText("· future-tier", TIMEOUT);
+        await session.waitForText("* future-tier", TIMEOUT);
 
         stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         const persistenceDeadline = Date.now() + TIMEOUT;
@@ -1636,7 +1636,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         ]);
         await Promise.all([
           session.waitForText("startup_scrollback: off", TIMEOUT),
-          secondSession.waitForText("· statusline: context:", TIMEOUT),
+          secondSession.waitForText("* statusline: context:", TIMEOUT),
         ]);
         await Promise.all([
           session.sendText("/quit"),

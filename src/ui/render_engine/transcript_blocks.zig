@@ -1430,20 +1430,6 @@ fn noticeLabelStyle(styles: Styles, tone: types.NoticeTone) []const u8 {
     };
 }
 
-/// Status glyph leading every semantic notice, keyed by tone. Tool activity
-/// owns "●"; notices deliberately use distinct git-style status glyphs so the
-/// two channels never read as the same raw marker.
-fn noticeGlyph(tone: types.NoticeTone) []const u8 {
-    return switch (tone) {
-        .information => "i",
-        .success => "✓",
-        .warning => "!",
-        .@"error" => "✗",
-        .cancelled => "⊘",
-        .neutral => "·",
-    };
-}
-
 fn noticeContinuationIndent(text: []const u8, cursor: usize, cols: u16) usize {
     if (cols <= 2 or cursor >= text.len) return 0;
     const line_start = cursor > 0 and (text[cursor - 1] == '\n' or text[cursor - 1] == '\r');
@@ -1491,7 +1477,7 @@ pub fn renderSemanticNotice(
 ) ![]u8 {
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
-    try logical.appendSlice(alloc, noticeGlyph(notice.tone));
+    try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
     try logical.append(alloc, ' ');
     // An empty topic drops the "topic:" label and renders the body alone.
     if (notice.topic.len > 0) {
@@ -2804,7 +2790,7 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         row_text: []const u8,
         label_fg: u8,
     }{
-        .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "· session: renamed to \"custom models\"", .label_fg = 7 },
+        .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
         .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
         .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
         .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
@@ -2883,7 +2869,7 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expectEqualStrings("· feedback: Open feedback form.", row.items);
+    try std.testing.expectEqualStrings("* feedback: Open feedback form.", row.items);
 
     const link_cell = grid.cellAt(1, 13).?;
     try std.testing.expectEqual(@as(u21, 'O'), link_cell.codepoint);
@@ -2949,10 +2935,10 @@ test "background semantic notices render one topic for launch and failure" {
 test "semantic notice tree branches align with the header while wrapped prose stays indented" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { body: []const u8, cols: u16, expected: []const u8 }{
-        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "· 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
-        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "· Ready\n└ alpha beta\n  gamma" },
-        .{ .body = "alpha └ beta", .cols = 8, .expected = "· alpha\n  └ beta" },
-        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "· Ready\n  ordinary prose" },
+        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "* 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
+        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "* Ready\n└ alpha beta\n  gamma" },
+        .{ .body = "alpha └ beta", .cols = 8, .expected = "* alpha\n  └ beta" },
+        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "* Ready\n  ordinary prose" },
     };
     for (cases) |case| {
         const rendered = try renderSemanticNotice(alloc, .{ .topic = "", .tone = .neutral, .body = case.body }, .{}, case.cols);
@@ -2968,7 +2954,7 @@ test "semantic notice tree branches align with the header while wrapped prose st
     var grid = try vt_emulator.Grid.init(alloc, 40, 4);
     defer grid.deinit();
     try grid.feed(styled);
-    try std.testing.expectEqual(@as(u21, '·'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '*'), grid.cellAt(1, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '├'), grid.cellAt(2, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '└'), grid.cellAt(3, 1).?.codepoint);
 }

@@ -5285,21 +5285,10 @@ const TestApp = struct {
             try std.fmt.allocPrint(
                 self.alloc,
                 "{s} {s}: {s}",
-                .{ sessionTestNoticeGlyph(notice.tone), notice.topic, notice.body },
+                .{ types.noticeGlyph(notice.tone), notice.topic, notice.body },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ sessionTestNoticeGlyph(notice.tone), notice.body }));
-    }
-
-    fn sessionTestNoticeGlyph(tone: types.NoticeTone) []const u8 {
-        return switch (tone) {
-            .information => "i",
-            .success => "✓",
-            .warning => "!",
-            .@"error" => "✗",
-            .cancelled => "⊘",
-            .neutral => "·",
-        };
+            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
     }
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
@@ -7649,7 +7638,7 @@ test "interactive session resume uses the live transition and shared restore pat
     );
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expectEqualStrings("· session resumed: saved prompt", app.notices.items[0]);
+    try std.testing.expectEqualStrings("* session resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
 
     try std.testing.expect(app.session_persistence.subagent_host != null);
@@ -7933,7 +7922,7 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expectEqualStrings("· session resumed: inspect the browser", app.notices.items[0]);
+    try std.testing.expectEqualStrings("* session resumed: inspect the browser", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
 }
 

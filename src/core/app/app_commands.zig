@@ -4796,8 +4796,8 @@ test "skills install groups command notice fragments for entry replay" {
 
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.startsWith(u8, rendered, "· skills: Installing from "));
-    try std.testing.expect(std.mem.find(u8, rendered, "\n\n· skills: Installed: root-skill") != null);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "* skills: Installing from "));
+    try std.testing.expect(std.mem.find(u8, rendered, "\n\n* skills: Installed: root-skill") != null);
     try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
 }
 

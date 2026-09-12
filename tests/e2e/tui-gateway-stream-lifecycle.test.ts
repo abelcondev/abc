@@ -4202,7 +4202,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
       const toolHeader = "● 1 tool call · 1 read";
       const toolMarker = `└ Read ${readFilename}`;
-      const permissionMarker = "· permissions: mode=auto";
+      const permissionMarker = "* permissions: mode=auto";
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";

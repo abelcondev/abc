@@ -42,6 +42,21 @@ pub const SemanticNotice = struct {
     visibility: NoticeVisibility = .compact_and_full,
 };
 
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity
+/// owns "●"; notices deliberately use distinct git-style status glyphs so the
+/// two channels never read as the same raw marker. The neutral marker "*"
+/// avoids the middot, which the footer already uses as a separator.
+pub fn noticeGlyph(tone: NoticeTone) []const u8 {
+    return switch (tone) {
+        .information => "i",
+        .success => "✓",
+        .warning => "!",
+        .@"error" => "✗",
+        .cancelled => "⊘",
+        .neutral => "*",
+    };
+}
+
 /// Returns a duplicate with owned topic and body bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {

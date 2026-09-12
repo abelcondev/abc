@@ -1871,7 +1871,7 @@ tmuxTest(
         await session.sendText("/status");
         await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
         const scrollback = await session.captureFullScrollback();
-        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("· status:"));
+        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("* status:"));
         expect(recoveredStatus).toContain("auth=AI_GATEWAY_API_KEY");
         expect(recoveredStatus).not.toContain("auth_help=");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2254,7 +2254,7 @@ for (const [provider, previousProvider] of [
             await session.sendText("/resume");
             await session.waitForPane((pane) => pane.includes("Sessions") && /\bturns?\b/.test(pane), TIMEOUT);
             await session.sendKeys("Enter");
-            await session.waitForText("· session resumed:", TIMEOUT);
+            await session.waitForText("* session resumed:", TIMEOUT);
           }
           await session.sendText("/model");
           const catalog = await session.waitForPane(
@@ -2956,7 +2956,7 @@ for (const [source, help] of [
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback.slice(scrollback.lastIndexOf("· status:"))).not.toContain("auth_help=");
+    expect(scrollback.slice(scrollback.lastIndexOf("* status:"))).not.toContain("auth_help=");
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -3003,7 +3003,7 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   await session.sendText("/status");
   await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
   const scrollback = await session.captureFullScrollback();
-  const recovered = scrollback.slice(scrollback.lastIndexOf("· status:"));
+  const recovered = scrollback.slice(scrollback.lastIndexOf("* status:"));
   expect(recovered).not.toContain("auth_help=");
   expect(readFileSync(settingsPath, "utf8")).toBe("{broken");
   expect(gateway.requests).toHaveLength(1);
@@ -7279,7 +7279,7 @@ tmuxTest(
     expect(creditsGateway.requests).toEqual([]);
 
     await session.sendText("/credits");
-    await session.waitForText("· credits: balance=42", TIMEOUT);
+    await session.waitForText("* credits: balance=42", TIMEOUT);
 
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",

@@ -414,7 +414,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         5_000,
       );
       expect(pane).toContain("[30 days]");
-      expect(pane).not.toMatch(/^[·✓!✗⊘i] usage/m);
+      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
       expect(pane).toContain("tab scope");
       expect(pane).toContain("r refresh");
       expect(pane).toContain("esc close");

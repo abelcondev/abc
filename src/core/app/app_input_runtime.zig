@@ -4007,25 +4007,14 @@ const RoutingFakeApp = struct {
         self.notice_visibility = notice.visibility;
         const rendered = if (notice.topic.len > 0)
             try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}", .{
-                routingFakeNoticeGlyph(notice.tone),
+                types.noticeGlyph(notice.tone),
                 notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ routingFakeNoticeGlyph(notice.tone), notice.body });
+            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
-    }
-
-    fn routingFakeNoticeGlyph(tone: types.NoticeTone) []const u8 {
-        return switch (tone) {
-            .information => "i",
-            .success => "✓",
-            .warning => "!",
-            .@"error" => "✗",
-            .cancelled => "⊘",
-            .neutral => "·",
-        };
     }
 
     pub fn appendDomainNotice(self: *RoutingFakeApp, notice: types.SemanticNotice) !u32 {
