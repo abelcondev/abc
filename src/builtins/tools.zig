@@ -1,5 +1,4 @@
 const std = @import("std");
-const std_builtin = @import("builtin");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -30,14 +29,6 @@ const skill_impl = @import("../tools/skills/skill.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
-const test_io_mod = if (std_builtin.is_test)
-    @import("../core/shared/io.zig")
-else
-    struct {};
-const test_session_child_store = if (std_builtin.is_test)
-    @import("../core/session/session_child_store.zig")
-else
-    struct {};
 
 const Allocator = std.mem.Allocator;
 

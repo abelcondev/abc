@@ -7,7 +7,6 @@ const render_input = @import("render_input.zig");
 const surface_frame = @import("surface_frame.zig");
 
 pub const approval_once_label = interaction_state.approval_once_label;
-pub const approval_always_file_label = interaction_state.approval_always_file_label;
 pub const approval_deny_label = interaction_state.approval_deny_label;
 
 pub const FileApprovalScreenRowKind = approval_ui.FileApprovalScreenRowKind;

@@ -33,7 +33,6 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const session_codec_mod = @import("../session/session_codec.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_store = @import("../session/session_store.zig");
@@ -78,11 +77,6 @@ else
     struct {};
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
-const agent_test_support = if (builtin.is_test)
-    @import("../agent/runtime/tests/support.zig")
-else
-    struct {};
-
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
 const ChatMessage = types.ChatMessage;
@@ -90,7 +84,6 @@ const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
-const subagent_tool_name = "subagent";
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const SessionRuntime = session_runtime.SessionRuntime;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
