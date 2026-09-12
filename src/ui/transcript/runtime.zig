@@ -8256,6 +8256,7 @@ pub const TranscriptRuntime = struct {
     fn resolveTransitionAppendBase(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        prior_owned_top: u16,
         scroll_facts: TranscriptScrollFacts,
         destructive_invalidation: bool,
         target_flow: []const u8,
@@ -8341,7 +8342,7 @@ pub const TranscriptRuntime = struct {
                     .flow_len = 0,
                     .visual_offset = 0,
                     .visual_rows = 0,
-                    .cursor_row = prepared.projectionArea().top,
+                    .cursor_row = prior_owned_top,
                     .cursor_col = 1,
                 };
             },
@@ -8834,6 +8835,7 @@ pub const TranscriptRuntime = struct {
 
         const append_base = try self.resolveTransitionAppendBase(
             prepared,
+            scroll_plan.prior_owned_top,
             scroll_facts,
             destructive_invalidation,
             target_flow,
@@ -12181,6 +12183,7 @@ test "oversized resume publication starts without a prior committed frame" {
 
     const append_base = (try runtime.resolveTransitionAppendBase(
         &prepared,
+        scroll_plan.prior_owned_top,
         facts,
         false,
         source.bytes,
@@ -13223,7 +13226,7 @@ fn expectHistoryReplayBoundary(target_flow: []const u8, source_pending_wrap: boo
     try std.testing.expect(!transition.document_append.isEmpty());
     try std.testing.expect(!transition.document_append.start_pending_wrap);
     try std.testing.expectEqual(@as(u16, 1), transition.document_append.start_col);
-    const base = (try runtime.resolveTransitionAppendBase(&prepared, facts, false, transition.target_flow, facts.target_visual_offset)).?;
+    const base = (try runtime.resolveTransitionAppendBase(&prepared, scroll_plan.prior_owned_top, facts, false, transition.target_flow, facts.target_visual_offset)).?;
     var boundary = try transcript_painter.prepareTranscriptDocumentAppend(alloc, transition.target_flow, layout.cols, base.flow_len, base.flow_len, false);
     defer boundary.deinit(alloc);
     try std.testing.expectEqual(source_pending_wrap, boundary.start_pending_wrap);
@@ -13331,6 +13334,7 @@ test "history replay starts at committed source top and follows resize eligibili
 
     const append_base = (try runtime.resolveTransitionAppendBase(
         &prepared,
+        runtime.owned_top_row,
         facts,
         false,
         source.bytes,
@@ -13356,6 +13360,7 @@ test "history replay starts at committed source top and follows resize eligibili
     const resize_facts = runtime.planTranscriptScroll(&prepared);
     const resize_append_base = (try runtime.resolveTransitionAppendBase(
         &prepared,
+        scroll_plan.prior_owned_top,
         resize_facts,
         false,
         source.bytes,
