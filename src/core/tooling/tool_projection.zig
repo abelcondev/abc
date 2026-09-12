@@ -628,13 +628,6 @@ fn expectNotContainsName(names: []const []const u8, expected: []const u8) !void 
     }
 }
 
-fn indexOfName(names: []const []const u8, expected: []const u8) !usize {
-    for (names, 0..) |name, index| {
-        if (std.mem.eql(u8, name, expected)) return index;
-    }
-    return error.TestExpectedEqual;
-}
-
 test "provider-executed search follows settled advertisement permission" {
     const cases = [_]struct {
         action: ?types.PermissionAction,

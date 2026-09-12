@@ -547,10 +547,6 @@ fn appendSpacesToBuffer(out: []u8, len: *usize, count: usize) void {
     }
 }
 
-pub fn isPrintableAscii(byte: u8) bool {
-    return byte >= 32 and byte <= 126;
-}
-
 test "input line wraps to the cursor row" {
     var buf: [64]u8 = undefined;
     const view = buildInputLine("abcdefghijklmnopqrstuvwxyz", 26, 16, &buf);

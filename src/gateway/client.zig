@@ -2950,10 +2950,6 @@ fn extractFirstJsonStringValue(args: []const u8) ?[]const u8 {
     return null;
 }
 
-fn isReasoningSseEvent(event_type: []const u8) bool {
-    return std.mem.startsWith(u8, event_type, "reasoning-");
-}
-
 fn finish_reason_label(finish_reason: ?types.ProviderFinishReason) []const u8 {
     return if (finish_reason) |reason| reason.label() else "(none)";
 }

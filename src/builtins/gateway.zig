@@ -1458,10 +1458,6 @@ fn writeParallelDomains(writer: *std.Io.Writer, name: []const u8, domains: []con
     try writer.writeAll("]}");
 }
 
-fn boundedDupe(alloc: Allocator, text: []const u8, max_len: usize) ![]u8 {
-    return try alloc.dupe(u8, text[0..@min(text.len, max_len)]);
-}
-
 fn hasValues(values: ?[]const []const u8) bool {
     return if (values) |actual| actual.len > 0 else false;
 }
