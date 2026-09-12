@@ -1592,7 +1592,7 @@ describe("effect-aware command permissions", () => {
       expect(extractResponses(beforeSlashCommands)).toEqual(responseRows);
 
       await activeSession.sendText("/sound on");
-      await activeSession.waitForText("● Sound: on", TIMEOUT);
+      await activeSession.waitForText("* sound: on", TIMEOUT);
       await activeSession.sendText("/settings");
       await activeSession.waitForText("←→ change", TIMEOUT);
       await activeSession.sendKeys("Escape");
@@ -1604,7 +1604,7 @@ describe("effect-aware command permissions", () => {
 
       const afterSlashCommands = await activeSession.captureFullScrollback();
       expect(extractResponses(afterSlashCommands)).toEqual(responseRows);
-      expect(afterSlashCommands.indexOf("● Sound: on")).toBeGreaterThan(
+      expect(afterSlashCommands.indexOf("* sound: on")).toBeGreaterThan(
         afterSlashCommands.indexOf(responseRows.at(-1)!),
       );
       expect(afterSlashCommands).toContain("Ran printf");
@@ -2917,7 +2917,7 @@ describe("effect-aware command permissions", () => {
         toolCall("touch must-not-exist"),
         finalText("permission resume denial complete"),
       ]);
-      await resumed.session.waitForText("● Session resumed", TIMEOUT);
+      await resumed.session.waitForText("* session resumed", TIMEOUT);
       await resumed.session.waitForText("ask · gpt-5", TIMEOUT);
       await resumed.session.sendText("Create the marker after resuming.");
 
@@ -2937,7 +2937,7 @@ describe("effect-aware command permissions", () => {
 
       const resumedScrollback = await resumed.session.captureFullScrollback();
       expect(resumedScrollback).toContain("permission resume seed complete");
-      expect(resumedScrollback).toContain("● Session resumed");
+      expect(resumedScrollback).toContain("* session resumed");
     },
     90_000,
   );

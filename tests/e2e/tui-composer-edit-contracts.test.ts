@@ -322,7 +322,7 @@ tmuxTest(
     await waitForTraceOrExit(active, "reason=unsafe_suffix");
 
     expect(gateway?.requestCount()).toBe(0);
-    expect(await active.captureFullScrollback()).not.toContain("● Version:");
+    expect(await active.captureFullScrollback()).not.toMatch(/[*✓!✗⊘i] version:/);
     await active.waitForText("PRESERVED_DRAFT", TIMEOUT);
 
     await active.sendKeys("Enter");

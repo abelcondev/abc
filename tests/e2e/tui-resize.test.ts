@@ -2131,7 +2131,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         help: countOccurrences(scrollback, "Run /help for commands"),
         recording: countOccurrences(
           scrollback,
-          "● Recording: visual terminal capture:",
+          "! recording: visual terminal capture:",
         ),
         seed: countOccurrences(scrollback, seedMarker),
       });

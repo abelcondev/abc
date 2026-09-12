@@ -2785,9 +2785,9 @@ pub fn Runtime(comptime App: type) type {
                 .none => return false,
                 .invalid => {
                     try app.writeDomainNotice(.{
-                        .topic = "model",
+                        .topic = "",
                         .tone = .@"error",
-                        .body = "Invalid /model selection. Use /model <id> <effort> [normal|fast].",
+                        .body = "usage: /model <id> <effort> [normal|fast]",
                     }, true);
                 },
                 .selection => |selection| {
@@ -4005,13 +4005,13 @@ const RoutingFakeApp = struct {
         self.notice_tone = notice.tone;
         self.notice_visibility = notice.visibility;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}", .{
-                std.ascii.toUpper(notice.topic[0]),
-                notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}", .{
+                types.noticeGlyph(notice.tone),
+                notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}", .{notice.body});
+            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
