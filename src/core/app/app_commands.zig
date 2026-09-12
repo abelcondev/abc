@@ -229,7 +229,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{
             .topic = "workspace",
             .tone = .@"error",
-            .body = "Use: /workspace [add PATH|remove PATH|clear]",
+            .body = "usage: /workspace [add PATH|remove PATH|clear]",
         }, true);
         return;
     };
@@ -3426,7 +3426,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const SessionRuntime = app_session_runtime.Runtime(App);
     SessionRuntime.renameActiveSession(app, rest) catch |err| {
         const body: []const u8 = switch (err) {
-            error.EmptyTitle => "Use: /rename <title>",
+            error.EmptyTitle => "usage: /rename <title>",
             error.TitleTooLong => "title is too long",
             error.InvalidTitle => "title must be printable text",
             error.NoActiveSession => "no active session to rename",
@@ -3454,7 +3454,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
 
     app.shell.render_requests.request(.footer);
     const title = SessionRuntime.cachedSessionTitle(app) orelse "";
-    const msg = try std.fmt.allocPrint(app.alloc, "renamed: {s}", .{title});
+    const msg = try std.fmt.allocPrint(app.alloc, "renamed to \"{s}\"", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
@@ -3534,7 +3534,7 @@ fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{
             .topic = "statusline",
             .tone = .@"error",
-            .body = "Use: context, session, workspace",
+            .body = "usage: /statusline [context|session|workspace]",
         }, true);
         return;
     };
@@ -3582,7 +3582,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
             try app.writeDomainNotice(.{
                 .topic = "sound",
                 .tone = .@"error",
-                .body = "Use: /sound [on|off|max].",
+                .body = "usage: /sound [on|off|max]",
             }, true);
             return;
         },
@@ -4782,8 +4782,8 @@ test "skills install groups command notice fragments for entry replay" {
 
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.startsWith(u8, rendered, "● Skills: Installing from "));
-    try std.testing.expect(std.mem.find(u8, rendered, "\n\n● Skills: Installed: root-skill") != null);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "· skills: Installing from "));
+    try std.testing.expect(std.mem.find(u8, rendered, "\n\n· skills: Installed: root-skill") != null);
     try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
 }
 
@@ -4861,7 +4861,7 @@ test "skills list reports a bounded discovery warning with an escaped candidate 
     try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "● Skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "! skills: skill discovery warning:") != null);
 }
 
 test "skills show focuses matching menu row without transcript body" {

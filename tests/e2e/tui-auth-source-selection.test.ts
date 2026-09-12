@@ -1258,7 +1258,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       await session.waitForComposer(TIMEOUT);
       const prompt = `STORAGE_RETRY_${provider}`;
       await session.sendText(prompt);
-      await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("Auth:"), TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("auth:"), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
       expect(gateway.requests).toHaveLength(0);
@@ -1871,7 +1871,7 @@ tmuxTest(
         await session.sendText("/status");
         await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
         const scrollback = await session.captureFullScrollback();
-        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("· status:"));
         expect(recoveredStatus).toContain("auth=AI_GATEWAY_API_KEY");
         expect(recoveredStatus).not.toContain("auth_help=");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2254,7 +2254,7 @@ for (const [provider, previousProvider] of [
             await session.sendText("/resume");
             await session.waitForPane((pane) => pane.includes("Sessions") && /\bturns?\b/.test(pane), TIMEOUT);
             await session.sendKeys("Enter");
-            await session.waitForText("● Session resumed:", TIMEOUT);
+            await session.waitForText("· session resumed:", TIMEOUT);
           }
           await session.sendText("/model");
           const catalog = await session.waitForPane(
@@ -2426,9 +2426,9 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Switched to gpt-5.6-sol", TIMEOUT);
     await session.sendText("/fast");
-    await session.waitForText("Fast: off", TIMEOUT);
+    await session.waitForText("fast: off", TIMEOUT);
     await session.sendText("/fast");
-    await session.waitForText("Fast: on", TIMEOUT);
+    await session.waitForText("fast: on", TIMEOUT);
     await session.sendText("Use the Codex subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
     const directRequest = chatgptOauth.requests.find(
@@ -2614,7 +2614,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
     expect(cancelledPane).toContain("■ Cancelled");
-    expect(cancelledPane).not.toContain("System: cancelled");
+    expect(cancelledPane).not.toContain("system: cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2956,7 +2956,7 @@ for (const [source, help] of [
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback.slice(scrollback.lastIndexOf("● Status:"))).not.toContain("auth_help=");
+    expect(scrollback.slice(scrollback.lastIndexOf("· status:"))).not.toContain("auth_help=");
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -3003,7 +3003,7 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   await session.sendText("/status");
   await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
   const scrollback = await session.captureFullScrollback();
-  const recovered = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+  const recovered = scrollback.slice(scrollback.lastIndexOf("· status:"));
   expect(recovered).not.toContain("auth_help=");
   expect(readFileSync(settingsPath, "utf8")).toBe("{broken");
   expect(gateway.requests).toHaveLength(1);
@@ -7279,7 +7279,7 @@ tmuxTest(
     expect(creditsGateway.requests).toEqual([]);
 
     await session.sendText("/credits");
-    await session.waitForText("● Credits: balance=42", TIMEOUT);
+    await session.waitForText("· credits: balance=42", TIMEOUT);
 
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",

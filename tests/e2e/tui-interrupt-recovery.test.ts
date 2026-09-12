@@ -555,7 +555,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(interruptedScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(interruptedScrollback).not.toContain("System: cancelled");
+      expect(interruptedScrollback).not.toContain("system: cancelled");
       expect(interruptedScrollback).not.toContain("Cancelling");
 
       await session.waitForText(FOLLOW_UP_RESPONSE, TIMEOUT);
@@ -572,7 +572,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(finalScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(finalScrollback).not.toContain("System: cancelled");
+      expect(finalScrollback).not.toContain("system: cancelled");
       expect(finalScrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(2);
       expect(held.cancelCount).toBe(1);
@@ -737,7 +737,7 @@ while :; do sleep 1; done
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
       expect(immediateCancellation).toContain("■ Cancelled");
-      expect(immediateCancellation).not.toContain("System: cancelled");
+      expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
         tracePath,
@@ -860,7 +860,7 @@ while :; do sleep 1; done
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
-      expect(scrollback).not.toContain("System: cancelled");
+      expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

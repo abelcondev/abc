@@ -5284,11 +5284,22 @@ const TestApp = struct {
         try self.notices.append(self.alloc, if (notice.topic.len > 0)
             try std.fmt.allocPrint(
                 self.alloc,
-                "● {c}{s}: {s}",
-                .{ std.ascii.toUpper(notice.topic[0]), notice.topic[1..], notice.body },
+                "{s} {s}: {s}",
+                .{ sessionTestNoticeGlyph(notice.tone), notice.topic, notice.body },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}", .{notice.body}));
+            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ sessionTestNoticeGlyph(notice.tone), notice.body }));
+    }
+
+    fn sessionTestNoticeGlyph(tone: types.NoticeTone) []const u8 {
+        return switch (tone) {
+            .information => "i",
+            .success => "✓",
+            .warning => "!",
+            .@"error" => "✗",
+            .cancelled => "⊘",
+            .neutral => "·",
+        };
     }
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
@@ -7290,7 +7301,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "● fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+        "✓ fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -7638,7 +7649,7 @@ test "interactive session resume uses the live transition and shared restore pat
     );
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expectEqualStrings("● Session resumed: saved prompt", app.notices.items[0]);
+    try std.testing.expectEqualStrings("· session resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
 
     try std.testing.expect(app.session_persistence.subagent_host != null);
@@ -7922,7 +7933,7 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expectEqualStrings("● Session resumed: inspect the browser", app.notices.items[0]);
+    try std.testing.expectEqualStrings("· session resumed: inspect the browser", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
 }
 
@@ -7965,7 +7976,7 @@ test "resumeRequestedSession preserves failed partial terminal reason" {
 
     try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "partial response") != null);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● System: failed", app.notices.items[1]);
+    try std.testing.expectEqualStrings("✗ system: failed", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "cancelled") == null);
 }
 

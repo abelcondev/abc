@@ -1295,7 +1295,7 @@ tmuxTest(
     await typeLiteral(active, "/images");
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("● Images: 2 pending"),
+      (pane) => pane.includes("· images: 2 pending"),
       READY_TIMEOUT,
     );
     expect(localGateway.requests).toHaveLength(0);
@@ -1317,7 +1317,7 @@ tmuxTest(
     expect(body).toContain("describe both");
 
     const fullScrollback = await active.captureFullScrollback();
-    expect(fullScrollback).toContain("● Images: 2 pending");
+    expect(fullScrollback).toContain("· images: 2 pending");
     expect(fullScrollback).toContain("Both images received.");
     expect(fullScrollback).not.toContain("ImageContextAdapterFailed");
     expect(fullScrollback.match(/describe both/g) ?? []).toHaveLength(1);
@@ -1552,7 +1552,7 @@ tmuxTest(
     await typeLiteral(active, "/images");
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("● Images: 1 pending") && pane.includes("favicon.png (image/png)"),
+      (pane) => pane.includes("· images: 1 pending") && pane.includes("favicon.png (image/png)"),
       READY_TIMEOUT,
     );
     expect(localGateway.requests).toHaveLength(0);
@@ -1569,7 +1569,7 @@ tmuxTest(
     expect(currentComposer).not.toContain("[Image 1]");
 
     const fullScrollback = await active.captureFullScrollback();
-    expect(fullScrollback).toContain("● Images: 1 pending");
+    expect(fullScrollback).toContain("· images: 1 pending");
     expect(fullScrollback).toContain("favicon.png (image/png)");
     expect(fullScrollback).toContain("cleared pending images");
     expect(fullScrollback).not.toContain("ImageContextAdapterFailed");

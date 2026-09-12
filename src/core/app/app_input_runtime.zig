@@ -2788,7 +2788,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "model",
                         .tone = .@"error",
-                        .body = "Invalid /model selection. Use /model <id> <effort> [normal|fast].",
+                        .body = "usage: /model <id> <effort> [normal|fast]",
                     }, true);
                 },
                 .selection => |selection| {
@@ -4006,15 +4006,26 @@ const RoutingFakeApp = struct {
         self.notice_tone = notice.tone;
         self.notice_visibility = notice.visibility;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}", .{
-                std.ascii.toUpper(notice.topic[0]),
-                notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}", .{
+                routingFakeNoticeGlyph(notice.tone),
+                notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}", .{notice.body});
+            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ routingFakeNoticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
+    }
+
+    fn routingFakeNoticeGlyph(tone: types.NoticeTone) []const u8 {
+        return switch (tone) {
+            .information => "i",
+            .success => "✓",
+            .warning => "!",
+            .@"error" => "✗",
+            .cancelled => "⊘",
+            .neutral => "·",
+        };
     }
 
     pub fn appendDomainNotice(self: *RoutingFakeApp, notice: types.SemanticNotice) !u32 {

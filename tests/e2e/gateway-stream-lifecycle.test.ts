@@ -1634,7 +1634,7 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("project instruction file")).toBeLessThan(
           full.indexOf("skill catalog shortened"),
         );
-        expect(full).toContain("● Context:");
+        expect(full).toContain("! context:");
         expect(full).not.toContain("[context]");
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
@@ -1882,7 +1882,7 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("skill resource")).toBeLessThan(
           full.indexOf("MCP schema"),
         );
-        expect(full).toContain("● Context:");
+        expect(full).toContain("! context:");
         expect(full).not.toContain("[context]");
         await tui.sendKeys("C-o");
         await tui.waitForPane(

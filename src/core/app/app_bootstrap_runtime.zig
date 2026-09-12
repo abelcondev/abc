@@ -621,19 +621,31 @@ const TestApp = struct {
             styles.system_notice_text_style.len > 0 and
             styles.reset_style.len > 0;
         const notice = if (semantic_notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}{s}\n", .{
-                std.ascii.toUpper(semantic_notice.topic[0]),
-                semantic_notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}{s}\n", .{
+                fakeNoticeGlyph(semantic_notice.tone),
+                semantic_notice.topic,
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}{s}\n", .{
+            try std.fmt.allocPrint(self.alloc, "{s} {s}{s}\n", .{
+                fakeNoticeGlyph(semantic_notice.tone),
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             });
         defer self.alloc.free(notice);
         try self.writeTranscriptClassified(notice, record, .subagent_status);
+    }
+
+    fn fakeNoticeGlyph(tone: types.NoticeTone) []const u8 {
+        return switch (tone) {
+            .information => "i",
+            .success => "✓",
+            .warning => "!",
+            .@"error" => "✗",
+            .cancelled => "⊘",
+            .neutral => "·",
+        };
     }
 };
 
@@ -1023,8 +1035,8 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "· skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "· skills: skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
@@ -1039,6 +1051,6 @@ test "app_bootstrap_runtime collapses config diagnostics into one neutral summar
 
     try runBootstrapForTest(&app, &capture);
 
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl+o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "· config: 2 configuration issues (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
 }
