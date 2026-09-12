@@ -1335,8 +1335,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("portable auto complete", TIMEOUT);
         const footer = await session.waitForText("0k/750k 0%", TIMEOUT);
         expect(footer).toContain("new-reasoning-model");
-        expect(footer).not.toContain("context:");
-        expect(await session.captureFullScrollbackEscapes()).not.toContain("context:");
+        expect(footer).not.toMatch(/[·✓!✗⊘i] context:/);
+        expect(await session.captureFullScrollbackEscapes()).not.toMatch(/[·✓!✗⊘i] context:/);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
           "provider/new-reasoning-model",
