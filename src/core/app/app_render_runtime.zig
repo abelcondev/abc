@@ -4001,6 +4001,141 @@ noinline fn coordinatorGridContains(grid: vt_emulator.Grid, needle: []const u8) 
     return false;
 }
 
+test "core.app_render_runtime resume publication preserves the pre-scroll origin through the coordinator" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { origin: u16, rows: u16, post_top: u16 }{
+        .{ .origin = 1, .rows = 3, .post_top = 1 },
+        .{ .origin = 5, .rows = 3, .post_top = 5 },
+        .{ .origin = 5, .rows = 6, .post_top = 4 },
+        .{ .origin = 8, .rows = 6, .post_top = 4 },
+        .{ .origin = 1, .rows = 12, .post_top = 1 },
+        .{ .origin = 5, .rows = 12, .post_top = 1 },
+        .{ .origin = 1, .rows = 80, .post_top = 1 },
+        .{ .origin = 5, .rows = 80, .post_top = 1 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("resume origin={d} rows={d}\n", .{ case.origin, case.rows });
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var file = try tmp.dir.createFile(std.testing.io, "resume-origin.log", .{ .read = true });
+        defer file.close(std.testing.io);
+        var app = try initCoordinatorProjectionTestApp(alloc, file);
+        defer app.deinit();
+        app.terminal_client.source_running = false;
+        try app.shell.initViewport(&app.metrics, case.origin);
+
+        var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &app.shell, 0, 1);
+        defer projection.deinit();
+        var flow: std.ArrayList(u8) = .empty;
+        defer flow.deinit(alloc);
+        for (0..case.rows) |i| {
+            var buf: [32]u8 = undefined;
+            try flow.appendSlice(alloc, try std.fmt.bufPrint(
+                &buf,
+                "{s}ORIGIN_ROW_{d:0>3}",
+                .{ if (i == 0) "" else "\n", i },
+            ));
+        }
+        _ = try projection.appendRawClassified(flow.items, .unknown_raw);
+        try projection.finalize();
+        projection.install(&app.shell);
+        try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
+        var read_offset = try file.length(std.testing.io);
+
+        // Interrupt actual preparation, not the coordinator's synthetic receipt stub.
+        app.terminal_input_runtime.terminal_action_decoder.stage = 2;
+        app.shell.render_requests.request(.first_frame);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try std.testing.expectEqual(read_offset, try file.length(std.testing.io));
+        try std.testing.expectEqual(case.origin, app.shell.owned_top_row);
+        try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
+        try std.testing.expect(app.shell.pending_resume_source != null);
+        try std.testing.expect(app.shell.render_requests.hasPending());
+        app.terminal_input_runtime.resetEscapeDecoder();
+
+        // A unit-test stdin can be closed; suppress that unrelated poll on retries.
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(first);
+        const document_start = std.mem.find(u8, first, "ORIGIN_ROW_000") orelse return error.MissingResumeDocument;
+        var physical = try vt_emulator.Grid.init(alloc, 80, 12);
+        defer physical.deinit();
+        if (case.rows > 9) {
+            var origin_buf: [32]u8 = undefined;
+            const origin = try std.fmt.bufPrint(&origin_buf, "\x1b[{d};1H", .{case.origin});
+            try std.testing.expect(std.mem.find(u8, first[0..document_start], origin) != null);
+        }
+        var first_stats: vt_emulator.FeedStats = .{};
+        try physical.feedWithStats(first, &first_stats);
+        var physical_scroll_rows = first_stats.scroll_rows;
+        try std.testing.expectEqual(case.post_top, app.shell.owned_top_row);
+        try std.testing.expectEqual(case.post_top, app.shell.committed_frame_layout.transcript_area.top);
+
+        const history_rows: u32 = case.rows -| 9;
+        const first_history = @min(history_rows, 64);
+        const diagnostic = app.shell.transcriptCommitDiagnostic();
+        if (history_rows > 64) {
+            try std.testing.expectEqual(first_history, diagnostic.history_visual_offset);
+            try std.testing.expectEqual(history_rows - first_history, diagnostic.remaining_inline_rows);
+        }
+        try std.testing.expectEqual(@as(u16, 0), diagnostic.remaining_unplanned_scroll_rows);
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try physical.rowTextTrimmed(case.post_top, &row);
+        var expected_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
+
+        if (history_rows > 64) {
+            try std.testing.expectEqual(.recovering, diagnostic.state);
+            const receipt = app.shell.transcript_commit_state.recovering;
+            try std.testing.expect(receipt.materialized_flow_len != null);
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+            defer alloc.free(next);
+            // Recovery continues the materialized suffix instead of replaying row zero.
+            try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_000") == null);
+            const suffix_start = std.mem.find(u8, next, "ORIGIN_ROW_") orelse return error.MissingResumeSuffix;
+            var receipt_cursor_buf: [32]u8 = undefined;
+            const receipt_cursor = try std.fmt.bufPrint(&receipt_cursor_buf, "\x1b[{d};{d}H", .{ receipt.cursor_row, receipt.cursor_col });
+            try std.testing.expect(std.mem.find(u8, next[0..suffix_start], receipt_cursor) != null);
+            var next_stats: vt_emulator.FeedStats = .{};
+            try physical.feedWithStats(next, &next_stats);
+            physical_scroll_rows += next_stats.scroll_rows;
+            row.clearRetainingCapacity();
+            try physical.rowTextTrimmed(case.post_top, &row);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);
+            try std.testing.expectEqual(@as(u32, 0), app.shell.transcriptCommitDiagnostic().remaining_inline_rows);
+        }
+        for (0..3) |_| {
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        }
+        try std.testing.expectEqual(.stable, app.shell.transcriptCommitDiagnostic().state);
+        try std.testing.expectEqual(history_rows, app.shell.transcriptCommitDiagnostic().history_visual_offset);
+        try std.testing.expectEqual(history_rows + case.origin - case.post_top, physical_scroll_rows);
+        try std.testing.expect(app.shell.pending_resume_source == null);
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
+
+        const anchor = app.shell.transcript_commit_state.stable;
+        read_offset = try file.length(std.testing.io);
+        try app.shell.writeTranscript(alloc, &app.metrics, "\nAFTER_RESUME", true);
+        app.shell.render_requests.request(.transcript);
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const appended = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(appended);
+        var cursor_buf: [32]u8 = undefined;
+        const append_cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H", .{ anchor.cursor_row, anchor.cursor_col });
+        if (history_rows > 0) {
+            const suffix_start = std.mem.find(u8, appended, "AFTER_RESUME") orelse return error.MissingAppend;
+            try std.testing.expect(std.mem.find(u8, appended[0..suffix_start], append_cursor) != null);
+        }
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "AFTER_RESUME"));
+    }
+}
+
 test "core.app_render_runtime first requested startup frame commits through the ordinary coordinator" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
