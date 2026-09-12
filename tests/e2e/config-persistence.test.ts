@@ -1355,7 +1355,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendKeys("Down");
         await session.waitForText("future-tier", TIMEOUT);
         await session.sendKeys("Enter");
-        await session.waitForText("* future-tier", TIMEOUT);
+        await session.waitForText("· future-tier", TIMEOUT);
 
         stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         const persistenceDeadline = Date.now() + TIMEOUT;
