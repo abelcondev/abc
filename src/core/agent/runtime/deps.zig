@@ -139,7 +139,6 @@ pub const ParentTurnDeliveryAck = struct {
     through_sequence: u64,
     delivery_id: []const u8,
     start_offset: u64,
-    end_offset: u64,
     total_bytes: u64,
 };
 

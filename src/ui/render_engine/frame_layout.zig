@@ -233,7 +233,6 @@ pub const FrameLayout = struct {
             .footer_clean_allowed = options.invalidation.isEmpty(),
             .synchronized_update = options.synchronized_update,
             .cursor_target = options.cursor_target,
-            .footer_reservation_source = .none,
             .bottom_reserved_rows = 0,
             .preserve_scrollback = options.preserve_scrollback,
             .reset_terminal = options.reset_terminal,

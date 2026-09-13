@@ -706,7 +706,6 @@ pub fn Bindings(comptime App: type) type {
                     .delivery_id = result.work_id,
                     .through_sequence = result.receipt_sequence,
                     .start_offset = 0,
-                    .end_offset = result.body.len,
                     .total_bytes = result.body.len,
                 });
             }
