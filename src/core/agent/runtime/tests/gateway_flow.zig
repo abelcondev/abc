@@ -3966,6 +3966,44 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expectEqual(@as(usize, 1), fast_notice_count);
 }
 
+test "processQueuedPrompt emits the fast-unavailable notice once across a multi-step turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"note.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const ReadExecution = struct {
+        fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {
+            return .{ .model_output = "note contents" };
+        }
+    };
+    var override_context: u8 = 0;
+    hooks.tool_execution_override = ToolExecutionOverride{
+        .context = &override_context,
+        .execute_fn = ReadExecution.execute,
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.fast_mode = true;
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    var fast_notice_count: usize = 0;
+    for (hooks.texts.items) |text| {
+        if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), fast_notice_count);
+}
+
 test "processQueuedPrompt persists interruption when capability resolution returns cancellation" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "must not run" }};
