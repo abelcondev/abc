@@ -184,14 +184,20 @@ pub const FailureSnapshot = struct {
 /// proved the credential, repeating that read only adds latency. A stale skip
 /// costs one unauthorized response, which the existing force-refresh replay
 /// already recovers from.
-const request_path_verified_window_ms: i64 = 30_000;
+const request_path_verified_window_ms: u32 = 30_000;
 const source_none: u8 = std.math.maxInt(u8);
-var request_path_verified_ms = std.atomic.Value(i64).init(0);
+// u32 keeps the stamp atomic-loadable on 32-bit wasm; wrapping subtraction
+// keeps window comparisons correct across the ~49 day wrap.
+var request_path_verified_ms = std.atomic.Value(u32).init(0);
 var request_path_verified_source = std.atomic.Value(u8).init(source_none);
+
+fn stampNowMs() u32 {
+    return @truncate(@as(u64, @bitCast(io_mod.milliTimestamp())));
+}
 
 fn noteRequestPathCredentialVerified(source: credentials.Source) void {
     request_path_verified_source.store(@intFromEnum(source), .seq_cst);
-    request_path_verified_ms.store(io_mod.milliTimestamp(), .seq_cst);
+    request_path_verified_ms.store(stampNowMs(), .seq_cst);
 }
 
 /// True when one refreshable source's credential was loaded successfully within
@@ -199,10 +205,9 @@ fn noteRequestPathCredentialVerified(source: credentials.Source) void {
 /// defensive reload; admission and forced refreshes must not consult it.
 pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
     const verified_ms = request_path_verified_ms.load(.seq_cst);
-    if (verified_ms <= 0) return false;
+    if (verified_ms == 0) return false;
     if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
-    const now_ms = io_mod.milliTimestamp();
-    return now_ms >= verified_ms and now_ms - verified_ms < request_path_verified_window_ms;
+    return stampNowMs() -% verified_ms < request_path_verified_window_ms;
 }
 
 fn resetRequestPathCredentialVerification() void {
@@ -5065,6 +5070,6 @@ test "request-path credential verification stamp gates only within the window" {
     try std.testing.expect(requestPathCredentialVerifiedRecently(.fx_login));
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.chatgpt_subscription));
 
-    request_path_verified_ms.store(io_mod.milliTimestamp() - request_path_verified_window_ms - 1, .seq_cst);
+    request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }
