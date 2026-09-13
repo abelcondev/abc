@@ -5281,7 +5281,7 @@ test "parse options preserves model effort and fast overrides" {
     const alloc = std.testing.allocator;
     var options = try parseOptionsWithStdin(alloc, &.{
         "--model",
-        "anthropic/claude-opus-4.8",
+        "provider/override-model",
         "--effort",
         "high",
         "--fast",
@@ -5289,7 +5289,7 @@ test "parse options preserves model effort and fast overrides" {
     }, .tty);
     defer options.deinit(alloc);
 
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.8", options.model_override.?);
+    try std.testing.expectEqualStrings("provider/override-model", options.model_override.?);
     try std.testing.expect(options.effort_override.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqual(@as(?bool, true), options.fast_override);
     try std.testing.expectEqualStrings("hello", options.prompt);
