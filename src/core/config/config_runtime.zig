@@ -257,8 +257,14 @@ pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_r
     return discoverPathsWithOptionalHome(alloc, home_dir, workspace_root);
 }
 
+fn providerEnvOverride() ?[]const u8 {
+    const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
+    return raw;
+}
+
 fn resolve_provider_selection(settings: *Settings) !void {
-    if (io_mod.getenv("FX_PROVIDER")) |raw| {
+    if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
@@ -540,7 +546,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     }
 
     try resolve_provider_selection(&settings);
-    if (io_mod.getenv("FX_PROVIDER") != null) sources.provider = .process_override;
+    if (providerEnvOverride() != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
             const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
@@ -696,7 +702,48 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
     }
 }
 
-fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) !void {
+/// The profile layer parse is atomic: one malformed field discards every
+/// field, including provider routing. When that happens, salvage the provider
+/// routing triple (connections, selection, and per-provider models) in
+/// isolation so a broken sibling (for example a mistyped effort) cannot
+/// silently drop the configured connection and fall back to Gateway. Returns
+/// true when the layer declared provider routing that is now installed;
+/// errors when the routing fields themselves are broken.
+fn salvageProviderRouting(alloc: Allocator, settings: *Settings, value: std.json.Value) error{ OutOfMemory, InvalidProviderRouting }!bool {
+    var routed = false;
+    if (value.object.get("providers")) |raw| {
+        const registry = configured_provider.Registry.parse(alloc, raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidProviderRouting,
+        };
+        if (settings.providers) |*old| old.deinit(alloc);
+        settings.providers = registry;
+        routed = true;
+    }
+    if (value.object.get("provider")) |provider_value| {
+        if (provider_value != .string) return error.InvalidProviderRouting;
+        settings.provider = model_provider.parse(provider_value.string) orelse return error.InvalidProviderRouting;
+        routed = true;
+    }
+    if (value.object.get("models")) |models_value| {
+        if (models_value != .object) return error.InvalidProviderRouting;
+        var iterator = models_value.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider = model_provider.parse(entry.key_ptr.*) orelse return error.InvalidProviderRouting;
+            const model_value = entry.value_ptr.*;
+            if (model_value != .string) return error.InvalidProviderRouting;
+            settings_store.validateModel(model_value.string) catch return error.InvalidProviderRouting;
+            settings.models.putCopy(alloc, provider, model_value.string) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooManyModelPreferences => return error.InvalidProviderRouting,
+            };
+        }
+        routed = true;
+    }
+    return routed;
+}
+
+fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
     for (settings.models.entries.items) |entry| sources.models.set(entry.provider, source) catch |err| switch (err) {
         error.TooManyModelPreferences => debug_trace.logf(
             "config",
@@ -762,7 +809,7 @@ fn mergeDetailedSettingsLayer(
         if (source == .user_workspace) {
             incoming.update_channel = null;
         }
-        try updateConfigSources(state.sources, incoming, source);
+        updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
             switch (permission_source) {
                 .none => {},
@@ -780,7 +827,13 @@ fn mergeDetailedSettingsLayer(
         try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
-        if (diagnostic_layer == .user and value == .object and (value.object.contains("providers") or value.object.contains("provider") or state.settings.provider != null and state.settings.provider.? == .configured)) return err;
+        if (diagnostic_layer == .user and value == .object) {
+            const routed = salvageProviderRouting(alloc, state.settings, value) catch |salvage_err| switch (salvage_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidProviderRouting => return err,
+            };
+            if (routed) state.sources.provider = source;
+        }
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{
             .layer = diagnostic_layer,
@@ -3530,6 +3583,79 @@ test "full model provenance table drops process override bookkeeping without fai
     // The 36th provenance entry was dropped, so the diagnostic reads as the
     // default rather than failing the whole settings load.
     try std.testing.expectEqual(ConfigSource.compiled_default, result.model_source.?);
+}
+
+test "provider routing stays fail-closed only when provider fields are broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\",\"models\":{\"local\":\"local-model\"},\"effort\":42}\n",
+    );
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    // Unrelated malformed fields downgrade to diagnostics; the valid provider
+    // routing triple (connection, selection, model) survives.
+    try std.testing.expect(result.settings.provider.? == .configured);
+    try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
+    try std.testing.expectEqualStrings("local-model", result.settings.models.get(model_provider.parse("local").?).?);
+    var saw_user_diagnostic = false;
+    for (result.diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == .malformed_settings) saw_user_diagnostic = true;
+    }
+    try std.testing.expect(saw_user_diagnostic);
+}
+
+test "broken provider definitions in the profile still fail the load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providers\":{\"local\":{\"protocol\":\"bogus\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\"}\n",
+    );
+
+    try std.testing.expectError(error.InvalidProtocol, loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root));
+}
+
+test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_PROVIDER", "");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.settings.provider == null);
+    try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.provider);
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {
