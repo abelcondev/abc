@@ -144,7 +144,19 @@ manifest.json
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
-The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence retains at most the last 1,048,576 characters from each output stream per command and records the total character counts and truncation status; no environment variables are printed.
+The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence normally retains at most the last 1,048,576 characters from each output stream per command. The candidate symbol census permits 8,388,608 characters and rejects truncated output. Records include total character counts and truncation status; no environment variables are printed.
+
+To compare a qualified PR merge with its exact main parent, dispatch the
+**Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
+and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
+Leave `signed_run` empty. The native macOS arm64 job downloads those immutable
+artifacts without rebuilding them, checks their run/source relationships and
+binary hashes, then measures normal and recovered no-history requests. It runs
+identical-control calibration before paired memory and latency comparisons,
+rejects uncalibrated or resolved-regression results, and retains raw evidence.
+These checks supplement the production PGSO gate; they do not replace it or
+prove performance for every workload. Legacy aggregate names are accepted only
+from a first-attempt run; attempt-qualified names must match the run attempt.
 
 Corpus scenarios inherit only a small operating-system environment allowlist. Credentials, live-test flags, tracing settings, and repository dotenv files are excluded unless a value is explicitly declared in the versioned corpus. The runner temporarily installs the assigned artifact at `zig-out/bin/fx` for E2E compatibility, then restores the prior file (or prior absence) after success, failure, timeout, or cancellation.
 
