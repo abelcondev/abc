@@ -148,6 +148,96 @@ test("fx ask keeps the derived title when the title model output is unusable", a
 
 const SKIP_TMUX = !tmuxAvailable();
 
+function traceTmpDir(root: FixtureRoot): string {
+  const dir = join(root.root, "tmp");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function traceReports(root: FixtureRoot): string[] {
+  return readdirSync(traceTmpDir(root))
+    .filter(name => name.startsWith("fx-trace-") && name.endsWith(".md"))
+    .sort();
+}
+
+async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<string> {
+  const before = new Set(traceReports(root));
+  await tui.sendText("/trace");
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const fresh = traceReports(root).filter(name => !before.has(name));
+    if (fresh.length > 0) {
+      return readFileSync(join(traceTmpDir(root), fresh[fresh.length - 1]), "utf8");
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error("trace report was not written");
+}
+
+test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", async () => {
+  const root = createFixtureRoot("tui-trace", JSON.stringify({ statusLine: { session: true } }));
+  const gateway = startTitleAwareGateway();
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: { ...baseEnv(root, gateway), TMPDIR: traceTmpDir(root) },
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText("refactor the renderer loop to fix the crash");
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+
+    const report = await captureTraceReport(tui, root);
+    expect(report).toContain("## Session Title");
+    expect(report).toContain("setting: true");
+    expect(report).toContain(`title: ${GENERATED_TITLE}`);
+    expect(report).toContain(`generation: status=installed model=${TITLE_MODEL}`);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+  }
+}, 60_000);
+
+test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was generated", async () => {
+  const root = createFixtureRoot("tui-trace-failed");
+  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [fakeGatewayFinalText("\n  \n")],
+  });
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: { ...baseEnv(root, gateway), TMPDIR: traceTmpDir(root) },
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText("refactor the renderer loop to fix the crash");
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+
+    // The title task finishes right after the fake gateway responds, but there
+    // is no visible signal for a failed title, so retry while it is running.
+    const deadline = Date.now() + 20_000;
+    let report = "";
+    while (Date.now() < deadline) {
+      report = await captureTraceReport(tui, root);
+      if (!report.includes("generation: status=running")) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(report).toContain("## Session Title");
+    expect(report).toContain("generation: status=failed model=openai/gpt-5.6-luna reason=unsanitizable");
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+  }
+}, 60_000);
+
 test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
   const root = createFixtureRoot("tui", JSON.stringify({ statusLine: { session: true } }));
   const gateway = startTitleAwareGateway();

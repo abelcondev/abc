@@ -2198,6 +2198,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
+    try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
@@ -2459,6 +2460,7 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
 }
 
 fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    const App = @TypeOf(app.*);
     try writer.writeAll("\n## Problems\n");
     var count: usize = 0;
 
@@ -2477,6 +2479,23 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
         if (entry.completed_tool_names.len > 0) try writer.print(" completed_tools={d}", .{entry.completed_tool_names.len});
         try writer.writeByte('\n');
+    }
+
+    if (comptime @hasField(App, "session_persistence")) {
+        const Persistence = @TypeOf(app.session_persistence);
+        if (comptime @hasField(Persistence, "title_generation")) {
+            const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+            if (comptime @hasField(TitleGeneration, "last")) {
+                const last = &app.session_persistence.title_generation.last;
+                if (last.status == .failed or last.status == .dropped) {
+                    count += 1;
+                    try writer.print("- session title generation {s}", .{@tagName(last.status)});
+                    if (last.reason) |reason| try writer.print(" reason={s}", .{@tagName(reason)});
+                    if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
+                    try writer.writeByte('\n');
+                }
+            }
+        }
     }
 
     var network_buf: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
@@ -2534,6 +2553,48 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     }
 
     if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, or MCP state\n");
+}
+
+/// Renders the retained session title generation outcome so a shared trace can
+/// explain why a session has no generated title even when FX_TRACE was off.
+fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    const App = @TypeOf(app.*);
+    if (comptime !@hasField(App, "session_persistence")) return;
+    const Persistence = @TypeOf(app.session_persistence);
+    if (comptime !@hasField(Persistence, "title_generation")) return;
+    const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+    if (comptime !@hasField(TitleGeneration, "last")) return;
+
+    try writer.writeAll("\n## Session Title\n");
+    if (comptime @hasField(App, "session_title_generation")) {
+        try writer.print("setting: {s}\n", .{boolLabel(app.session_title_generation)});
+    }
+    if (comptime @hasField(App, "session_title")) {
+        if (app.session_title.items.len > 0) {
+            try writer.writeAll("title: ");
+            try writeMaskedInline(writer, alloc, app.session_title.items);
+            try writer.writeByte('\n');
+        } else {
+            try writer.writeAll("title: (none)\n");
+        }
+    }
+    const generation = &app.session_persistence.title_generation;
+    if (generation.task) |task| {
+        try writer.print("generation: status=running model={s}", .{task.model});
+        if (task.started_at_ms > 0) {
+            const elapsed = io_mod.milliTimestamp() - task.started_at_ms;
+            if (elapsed >= 0) try writer.print(" elapsed={d}ms", .{elapsed});
+        }
+        try writer.writeByte('\n');
+        return;
+    }
+    const last = &generation.last;
+    try writer.print("generation: status={s}", .{@tagName(last.status)});
+    if (last.model().len > 0) try writer.print(" model={s}", .{last.model()});
+    if (last.reason) |reason| try writer.print(" reason={s}", .{@tagName(reason)});
+    if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
+    if (last.elapsed_ms >= 0) try writer.print(" elapsed={d}ms", .{last.elapsed_ms});
+    try writer.writeByte('\n');
 }
 
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -4298,6 +4359,50 @@ test "trace auth summary preserves missing and loaded status text" {
         "auth: source=fx login refreshable=true gateway_team=unset\n",
         loaded.written(),
     );
+}
+
+test "trace session title summary reports the retained generation outcome" {
+    const alloc = std.testing.allocator;
+    var app = struct {
+        session_persistence: app_session_runtime.Persistence = .{},
+        session_title: std.ArrayList(u8) = .empty,
+        session_title_generation: bool = true,
+    }{};
+    defer app.session_persistence.deinit(alloc);
+    defer app.session_title.deinit(alloc);
+
+    var idle: std.Io.Writer.Allocating = .init(alloc);
+    defer idle.deinit();
+    try writeSessionTitleSummary(&idle.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "## Session Title\n") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "setting: true") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "title: (none)") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "generation: status=none") != null);
+
+    const generation = &app.session_persistence.title_generation;
+    generation.last.status = .failed;
+    generation.last.reason = .transport_error;
+    generation.last.detail = "ConnectionRefused";
+    generation.last.elapsed_ms = 15001;
+    const model = "openai/gpt-5.6-luna";
+    @memcpy(generation.last.model_buf[0..model.len], model);
+    generation.last.model_len = model.len;
+
+    var failed: std.Io.Writer.Allocating = .init(alloc);
+    defer failed.deinit();
+    try writeSessionTitleSummary(&failed.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, failed.written(), "generation: status=failed model=openai/gpt-5.6-luna reason=transport_error detail=ConnectionRefused elapsed=15001ms") != null);
+
+    generation.last.status = .installed;
+    generation.last.reason = null;
+    generation.last.detail = "";
+    try app.session_title.appendSlice(alloc, "Fix renderer lag");
+
+    var installed: std.Io.Writer.Allocating = .init(alloc);
+    defer installed.deinit();
+    try writeSessionTitleSummary(&installed.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, installed.written(), "title: Fix renderer lag") != null);
+    try std.testing.expect(std.mem.find(u8, installed.written(), "generation: status=installed") != null);
 }
 
 test "trace tool calls preserve outcomes and mask obvious secrets" {

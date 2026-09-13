@@ -940,6 +940,27 @@ const SessionPickerLoad = struct {
 
 const TitleGenerationLoad = struct {
     task: ?*session_title_generation.Task = null,
+    last: LastResult = .{},
+
+    /// Final state of the most recent attempt, retained for diagnostics after
+    /// the task itself is destroyed. `detail` is a static string borrowed from
+    /// the task; the model is copied into a fixed buffer.
+    const LastResult = struct {
+        status: Status = .none,
+        reason: ?session_title_generation.FailureReason = null,
+        detail: []const u8 = "",
+        elapsed_ms: i64 = -1,
+        model_buf: [max_model_bytes]u8 = undefined,
+        model_len: u8 = 0,
+
+        const max_model_bytes = 128;
+
+        pub fn model(self: *const LastResult) []const u8 {
+            return self.model_buf[0..self.model_len];
+        }
+    };
+
+    const Status = enum { none, installed, dropped, failed };
 
     fn deinit(self: *TitleGenerationLoad) void {
         if (self.task) |task| {
@@ -959,6 +980,49 @@ const TitleGenerationLoad = struct {
             old.destroy();
         }
         self.task = task;
+    }
+
+    fn recordSpawnFailure(self: *TitleGenerationLoad, model: []const u8, err: anyerror) void {
+        var last = LastResult{
+            .status = .failed,
+            .reason = .spawn_failed,
+            .detail = @errorName(err),
+            .elapsed_ms = 0,
+        };
+        const model_len: u8 = @intCast(@min(model.len, LastResult.max_model_bytes));
+        @memcpy(last.model_buf[0..model_len], model[0..model_len]);
+        last.model_len = model_len;
+        self.last = last;
+    }
+
+    /// Snapshots a finished task's outcome before the caller destroys it.
+    fn recordFinished(self: *TitleGenerationLoad, task: *session_title_generation.Task) void {
+        var last = LastResult{
+            .status = switch (task.status) {
+                .generated => .installed,
+                .pending, .unavailable => .failed,
+            },
+            .elapsed_ms = if (task.started_at_ms > 0 and task.finished_at_ms >= task.started_at_ms)
+                task.finished_at_ms - task.started_at_ms
+            else
+                -1,
+        };
+        if (task.status == .unavailable) {
+            last.reason = task.failure_reason;
+            last.detail = task.failure_detail;
+        }
+        const model_len: u8 = @intCast(@min(task.model.len, LastResult.max_model_bytes));
+        @memcpy(last.model_buf[0..model_len], task.model[0..model_len]);
+        last.model_len = model_len;
+        self.last = last;
+    }
+
+    /// Marks that a generated title was dropped while being applied.
+    fn recordDropped(self: *TitleGenerationLoad, reason: session_title_generation.FailureReason, detail: []const u8) void {
+        if (self.last.status != .installed) return;
+        self.last.status = .dropped;
+        self.last.reason = reason;
+        self.last.detail = detail;
     }
 
     fn takeCompleted(self: *TitleGenerationLoad) ?*session_title_generation.Task {
@@ -2803,9 +2867,13 @@ pub fn Runtime(comptime App: type) type {
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
                 .stream_provider = app.agentStreamProvider(),
-            }) catch return;
+            }) catch |err| {
+                app.session_persistence.title_generation.recordSpawnFailure(title_model.?, err);
+                return;
+            };
             task.spawn() catch |err| {
                 debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+                app.session_persistence.title_generation.recordSpawnFailure(title_model.?, err);
                 task.destroy();
                 return;
             };
@@ -2821,10 +2889,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session")) return false;
             const task = app.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
+            app.session_persistence.title_generation.recordFinished(task);
             const title = task.takeTitle() orelse return false;
             defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(app) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
+                app.session_persistence.title_generation.recordDropped(.no_active_session, "");
                 return false;
             };
             if (!std.mem.eql(u8, active_id, task.session_id)) {
@@ -2833,6 +2903,7 @@ pub fn Runtime(comptime App: type) type {
                     "event=title_generation_apply result=dropped reason=session_changed session={s} active={s}",
                     .{ task.session_id, active_id },
                 );
+                app.session_persistence.title_generation.recordDropped(.session_changed, "");
                 return false;
             }
             var installed = false;
@@ -2851,14 +2922,19 @@ pub fn Runtime(comptime App: type) type {
                             "event=title_generation_apply result=failed session={s} err={s}",
                             .{ task.session_id, @errorName(err) },
                         );
+                        app.session_persistence.title_generation.recordDropped(.install_failed, @errorName(err));
                         return false;
                     };
+                    if (!installed) {
+                        app.session_persistence.title_generation.recordDropped(.user_title_present, "");
+                    }
                 } else {
                     debug_trace.logf(
                         "session",
                         "event=title_generation_apply result=dropped reason=not_writable session={s}",
                         .{task.session_id},
                     );
+                    app.session_persistence.title_generation.recordDropped(.not_writable, "");
                 }
             }
             if (!installed) return false;
@@ -9988,6 +10064,7 @@ const TitleGenerationFakeApp = struct {
     auth: TitleTestAuth = .{},
     selected_model: std.ArrayList(u8) = .empty,
     stream_content: []const u8 = "Refactor the renderer loop",
+    stream_error: ?anyerror = null,
 
     const TitleTestAuth = struct {
         fn gatewayCredential(_: *const TitleTestAuth) ?@import("../auth/auth_runtime.zig").GatewayCredential {
@@ -10026,6 +10103,7 @@ const TitleGenerationFakeApp = struct {
         const self: *TitleGenerationFakeApp = @ptrCast(@alignCast(raw.?));
         try std.testing.expectEqualStrings("test/title-model", request.model);
         try std.testing.expectEqual(@as(usize, 1), request.messages.len);
+        if (self.stream_error) |err| return err;
         try request.admission.admit();
         return .{ .completed = .{ .completion = .{
             .content = self.stream_content,
@@ -10086,6 +10164,11 @@ test "session title generation installs the model title for a fresh session" {
     const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
     defer if (persisted) |value| alloc.free(value);
     try std.testing.expectEqualStrings("Refactor the renderer loop", persisted.?);
+
+    const last = &app.session_persistence.title_generation.last;
+    try std.testing.expectEqual(.installed, last.status);
+    try std.testing.expectEqualStrings("test/title-model", last.model());
+    try std.testing.expect(last.elapsed_ms >= 0);
 }
 
 test "session title generation never overwrites a user-set title" {
@@ -10180,6 +10263,60 @@ test "session title generation keeps the derived title when the provider fails" 
     const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
     defer if (persisted) |value| alloc.free(value);
     try std.testing.expect(persisted == null);
+
+    const last = &app.session_persistence.title_generation.last;
+    try std.testing.expectEqual(.failed, last.status);
+    try std.testing.expectEqual(session_title_generation.FailureReason.unsanitizable, last.reason.?);
+    try std.testing.expectEqualStrings("test/title-model", last.model());
+}
+
+test "session title generation retains a transport failure for diagnostics" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+    app.stream_error = error.ConnectionRefused;
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
+    try std.testing.expect(app.session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+
+    try std.testing.expect(Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app) == null);
+    const last = &app.session_persistence.title_generation.last;
+    try std.testing.expectEqual(.failed, last.status);
+    try std.testing.expectEqual(session_title_generation.FailureReason.transport_error, last.reason.?);
+    try std.testing.expectEqualStrings("ConnectionRefused", last.detail);
+    try std.testing.expectEqualStrings("test/title-model", last.model());
+    try std.testing.expect(last.elapsed_ms >= 0);
+}
+
+test "title generation load retains spawn failures and apply-time drops" {
+    var load: TitleGenerationLoad = .{};
+    defer load.deinit();
+
+    load.recordSpawnFailure("test/title-model", error.ThreadQuotaExceeded);
+    try std.testing.expectEqual(TitleGenerationLoad.Status.failed, load.last.status);
+    try std.testing.expectEqual(session_title_generation.FailureReason.spawn_failed, load.last.reason.?);
+    try std.testing.expectEqualStrings("ThreadQuotaExceeded", load.last.detail);
+    try std.testing.expectEqualStrings("test/title-model", load.last.model());
+
+    // Apply-time drops only rewrite a successful result.
+    load.recordDropped(.session_changed, "");
+    try std.testing.expectEqual(TitleGenerationLoad.Status.failed, load.last.status);
+
+    load.last.status = .installed;
+    load.recordDropped(.user_title_present, "");
+    try std.testing.expectEqual(TitleGenerationLoad.Status.dropped, load.last.status);
+    try std.testing.expectEqual(session_title_generation.FailureReason.user_title_present, load.last.reason.?);
 }
 
 test "terminal title shows the session title once cached and falls back to build and workspace" {
