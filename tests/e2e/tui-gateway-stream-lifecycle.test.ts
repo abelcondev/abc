@@ -2346,8 +2346,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      await session.waitForText(finalText, TIMEOUT * 2);
-      const scrollback = await session.captureFullScrollback();
+      const scrollback = await waitForScrollback(
+        session,
+        (candidate) => candidate.includes(finalText) && TURN_SUMMARY_WITH_TOKENS.test(candidate),
+        "completed route recovery summary",
+        TIMEOUT * 2,
+      );
 
       expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("System");
@@ -3200,7 +3204,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText(seedPrompt);
-      await session.waitForText(seedReply, TIMEOUT);
+      await waitForScrollback(
+        session,
+        (value) => value.includes(seedReply) && TURN_SUMMARY_WITH_TOKENS.test(value),
+        "completed seed turn before idle submission",
+      );
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
       session.sendKeysImmediate(["Enter"]);

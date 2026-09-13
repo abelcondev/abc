@@ -888,7 +888,12 @@ pub const WorkerRuntime = struct {
         self.worker_events = .empty;
         return .{
             .events = events,
-            .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and self.active_turn_id != 0) self.active_turn_id else null,
+            .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and
+                self.active_turn_id != 0 and
+                self.steering_cancel_turn_id != self.active_turn_id)
+                self.active_turn_id
+            else
+                null,
         };
     }
 
@@ -4572,6 +4577,9 @@ test "explicit interrupt overrides immediate steering cancellation" {
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
     runtime.requestInteractiveCancel();
     try std.testing.expect(runtime.cancellationStopsTurn());
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, 41), batch.cancelled_turn_id);
     var interrupt_snapshot = try runtime.snapshotState(alloc);
     defer interrupt_snapshot.deinit(alloc);
     try std.testing.expect(interrupt_snapshot.cancel_requested);
@@ -5197,6 +5205,58 @@ test "takeEventBatch snapshots cancellation with detached events" {
     try std.testing.expect(batch.events.items[0] == .assistant_presentation);
     try std.testing.expect(batch.events.items[0].assistant_presentation == .text);
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+}
+
+test "takeEventBatch keeps the steering tail live before boundary adoption" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(!runtime.cancellationStopsTurn());
+    try runtime.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("buffered tail") } });
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, null), batch.cancelled_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), batch.events.items.len);
+    try std.testing.expectEqualStrings("buffered tail", batch.events.items[0].assistant_presentation.text);
+
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(?u64, null), batch.cancelled_turn_id);
+    var feedback = runtime.takeEventBatch();
+    defer freeEventList(alloc, &feedback.events);
+    try std.testing.expectEqual(@as(usize, 1), feedback.events.items.len);
+    try std.testing.expectEqualStrings("steer", feedback.events.items[0].append_user_feedback);
+}
+
+test "takeEventBatch requires a matching active steering owner to continue" {
+    const cases = [_]struct { active: u64, owner: ?u64, requested: bool, stopped: ?u64 }{
+        .{ .active = 7, .owner = null, .requested = true, .stopped = 7 },
+        .{ .active = 7, .owner = 6, .requested = true, .stopped = 7 },
+        .{ .active = 7, .owner = 7, .requested = true, .stopped = null },
+        .{ .active = 7, .owner = null, .requested = false, .stopped = null },
+        .{ .active = 0, .owner = null, .requested = true, .stopped = null },
+    };
+    for (cases) |case| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(std.testing.allocator);
+        runtime.active_turn_id = case.active;
+        runtime.steering_cancel_turn_id = case.owner;
+        runtime.worker_cancel_requested.store(case.requested, .seq_cst);
+        var batch = runtime.takeEventBatch();
+        defer freeEventList(std.testing.allocator, &batch.events);
+        try std.testing.expectEqual(case.stopped, batch.cancelled_turn_id);
+    }
 }
 
 test "state snapshot reports completion queued after event batch detach" {
