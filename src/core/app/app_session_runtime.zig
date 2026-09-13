@@ -1850,26 +1850,29 @@ pub fn Runtime(comptime App: type) type {
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
 
+            const resume_workspace_root = if (std.mem.eql(
+                u8,
+                state.origin_workspace_root,
+                state.workspace_root,
+            ))
+                state.workspace_root
+            else
+                "";
+            var historical_labels = HistoricalSessionLabels{ .workspace_root = resume_workspace_root };
+            defer historical_labels.deinit(app.alloc);
+
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
                 defer projection.deinit();
-                const projection_workspace_root = if (std.mem.eql(
-                    u8,
-                    state.origin_workspace_root,
-                    state.workspace_root,
-                ))
-                    state.workspace_root
-                else
-                    "";
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
-                    .workspace_root = projection_workspace_root,
+                    .workspace_root = resume_workspace_root,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
+                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1888,8 +1891,8 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display_title, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history);
-                try writeRecoveryCheckpointToSink(app, &sink, state);
+                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -3439,10 +3442,116 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// Maps historical shell session ids to their launch-command label so a
+        /// resumed transcript can render the same `Observed <command>` text the
+        /// live session showed, after the in-memory execution registry is gone.
+        const HistoricalSessionLabels = struct {
+            workspace_root: []const u8,
+            map: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+            fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
+                var it = self.map.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(entry.key_ptr.*);
+                    alloc.free(entry.value_ptr.*);
+                }
+                self.map.deinit(alloc);
+            }
+        };
+
+        /// Returns the recorded launch-command label for a session-scoped call
+        /// (borrowed from `labels`), or null when the session is unknown.
+        fn historicalSessionTarget(
+            arena: Allocator,
+            labels: *const HistoricalSessionLabels,
+            call: types.ToolCall,
+        ) ?[]const u8 {
+            const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+            const session_id = tool_args.optionalStringArg(args, "session_id") orelse return null;
+            return labels.map.get(session_id);
+        }
+
+        /// Reads the session id out of a persisted shell status payload into
+        /// `buffer`, returning a slice of it. The preview can be truncated
+        /// mid-JSON, so fall back to a bounded scan for the leading
+        /// `"session_id"` field when a full parse fails.
+        fn historicalSessionIdFromOutput(output: []const u8, buffer: *[128]u8) ?[]const u8 {
+            if (copyParsedSessionId(output, buffer)) |session_id| return session_id;
+            const key = "\"session_id\":\"";
+            const start = (std.mem.find(u8, output, key) orelse return null) + key.len;
+            const end = std.mem.findScalarPos(u8, output, start, '"') orelse return null;
+            return copyHistoricalSessionId(output[start..end], buffer);
+        }
+
+        fn copyParsedSessionId(output: []const u8, buffer: *[128]u8) ?[]const u8 {
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                std.heap.c_allocator,
+                output,
+                .{},
+            ) catch return null;
+            defer parsed.deinit();
+            if (parsed.value != .object) return null;
+            const value = parsed.value.object.get("session_id") orelse return null;
+            if (value != .string) return null;
+            return copyHistoricalSessionId(value.string, buffer);
+        }
+
+        fn copyHistoricalSessionId(raw: []const u8, buffer: *[128]u8) ?[]const u8 {
+            if (!validHistoricalSessionId(raw)) return null;
+            @memcpy(buffer[0..raw.len], raw);
+            return buffer[0..raw.len];
+        }
+
+        fn validHistoricalSessionId(session_id: []const u8) bool {
+            if (session_id.len == 0 or session_id.len > 128) return false;
+            for (session_id) |byte| {
+                if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return false;
+            }
+            return true;
+        }
+
+        /// Records the launch command of a completed `run` call whose result
+        /// still owns a live session, so later interact/stop calls naming that
+        /// session render the command instead of the raw session id.
+        fn recordHistoricalSessionLabel(
+            app: *App,
+            labels: *HistoricalSessionLabels,
+            call: types.ToolCall,
+            result: types.PersistedToolResult,
+        ) Allocator.Error!void {
+            var scratch_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer scratch_state.deinit();
+            const scratch = scratch_state.allocator();
+            const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return;
+            const command = tool_args.optionalStringArg(args, "command") orelse return;
+            const output = if (result.output.len > 0)
+                result.output
+            else
+                result.preview orelse return;
+            var session_id_buffer: [128]u8 = undefined;
+            const session_id = historicalSessionIdFromOutput(output, &session_id_buffer) orelse return;
+            const label = (try tooling_presentation.formatHistoricalTerminalDisplayTarget(
+                app.alloc,
+                command,
+                labels.workspace_root,
+            )) orelse return;
+            errdefer app.alloc.free(label);
+            const owned_id = try app.alloc.dupe(u8, session_id);
+            errdefer app.alloc.free(owned_id);
+            const gop = try labels.map.getOrPut(app.alloc, owned_id);
+            if (gop.found_existing) {
+                app.alloc.free(owned_id);
+                app.alloc.free(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = label;
+        }
+
         fn replayResumedHistoryToSink(
             app: *App,
             sink: anytype,
             context_history: []const types.HistoryTurn,
+            labels: *HistoricalSessionLabels,
         ) !void {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 if (app.session_persistence.writable) |*loaded| {
@@ -3450,6 +3559,7 @@ pub fn Runtime(comptime App: type) type {
                         const Visitor = struct {
                             app: *App,
                             sink: @TypeOf(sink),
+                            labels: *HistoricalSessionLabels,
                             has_prior_turns: bool = false,
 
                             pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
@@ -3458,15 +3568,16 @@ pub fn Runtime(comptime App: type) type {
                                     self.sink,
                                     &.{turn},
                                     &self.has_prior_turns,
+                                    self.labels,
                                 );
                             }
                         };
-                        var visitor = Visitor{ .app = app, .sink = sink };
+                        var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
                         return store.visitConversationHistory(app.alloc, loaded.active_id, &visitor);
                     }
                 }
             }
-            return replayHistoryToSink(app, sink, context_history);
+            return replayHistoryToSink(app, sink, context_history, labels);
         }
 
         fn readNativeResumeDisplay(
@@ -3514,6 +3625,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             sink: anytype,
             state: session_codec.DurableSessionState,
+            labels: *HistoricalSessionLabels,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -3525,7 +3637,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             try sink.appendUserTurn(checkpoint.user, has_prior_turns);
-            try writeExecutionHistoryToSink(app, sink, checkpoint.execution);
+            try writeExecutionHistoryToSink(app, sink, checkpoint.execution, labels);
             if (checkpoint.assistant_source.len > 0) {
                 try writeAssistantHistoryMarkdownToSink(
                     app,
@@ -3561,12 +3673,19 @@ pub fn Runtime(comptime App: type) type {
 
         fn replayHistory(app: *App, history: []const types.HistoryTurn) !void {
             var sink = LiveHistorySink(App){ .app = app };
-            return replayHistoryToSink(app, &sink, history);
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
+            return replayHistoryToSink(app, &sink, history, &labels);
         }
 
-        fn replayHistoryToSink(app: *App, sink: anytype, history: []const types.HistoryTurn) !void {
+        fn replayHistoryToSink(
+            app: *App,
+            sink: anytype,
+            history: []const types.HistoryTurn,
+            labels: *HistoricalSessionLabels,
+        ) !void {
             var has_prior_turns = false;
-            return replayHistoryToSinkIncremental(app, sink, history, &has_prior_turns);
+            return replayHistoryToSinkIncremental(app, sink, history, &has_prior_turns, labels);
         }
 
         fn replayHistoryToSinkIncremental(
@@ -3574,6 +3693,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             history: []const types.HistoryTurn,
             has_prior_turns: *bool,
+            labels: *HistoricalSessionLabels,
         ) !void {
             for (history) |turn| {
                 switch (turn) {
@@ -3584,7 +3704,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
-                        try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
@@ -3601,7 +3721,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
-                        try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
@@ -3609,7 +3729,7 @@ pub fn Runtime(comptime App: type) type {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
                         if (entry.cancelled_command) |presentation| {
-                            try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
+                            try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation, labels);
                         }
                         switch (entry.terminal_reason) {
                             .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
@@ -3641,11 +3761,14 @@ pub fn Runtime(comptime App: type) type {
                 .projection = projection,
                 .workspace_root = app.workspace_root,
             };
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
             return replayHistoryToSinkIncremental(
                 app,
                 &sink,
                 history,
                 has_prior_turns,
+                &labels,
             );
         }
 
@@ -3654,13 +3777,14 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             call: types.ToolCall,
             presentation: types.CancelledCommandPresentation,
+            labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
             const action = try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
-                null,
+                historicalSessionTarget(action_arena.allocator(), labels, call),
                 "Cancelled",
                 &.{},
             );
@@ -3681,13 +3805,16 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeExecutionHistory(app: *App, execution: types.ExecutionMemory) !void {
             var sink = LiveHistorySink(App){ .app = app };
-            return writeExecutionHistoryToSink(app, &sink, execution);
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
+            return writeExecutionHistoryToSink(app, &sink, execution, &labels);
         }
 
         fn writeExecutionHistoryToSink(
             app: *App,
             sink: anytype,
             execution: types.ExecutionMemory,
+            labels: *HistoricalSessionLabels,
         ) !void {
             var steering_index: usize = 0;
             for (execution.tool_steps, 0..) |step, step_index| {
@@ -3704,7 +3831,7 @@ pub fn Runtime(comptime App: type) type {
 
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
-                        try writeCompletedToolResult(app, sink, call, result);
+                        try writeCompletedToolResult(app, sink, call, result, labels);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
                         try writeUnreportedToolStatus(app, sink, call);
@@ -3783,6 +3910,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             call: types.ToolCall,
             result: types.PersistedToolResult,
+            labels: *HistoricalSessionLabels,
         ) !void {
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
@@ -3798,6 +3926,7 @@ pub fn Runtime(comptime App: type) type {
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
+            const session_target = historicalSessionTarget(action_arena.allocator(), labels, call);
             const command_decision = if (is_command)
                 try tool_presentation.commandOutcomeDecision(
                     action_arena.allocator(),
@@ -3817,7 +3946,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    null,
+                    session_target,
                     if (context_deferred)
                         types.context_deferred_tool_status_label
                     else
@@ -3828,7 +3957,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    null,
+                    session_target,
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
@@ -3836,7 +3965,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    null,
+                    session_target,
                     decision.label,
                     &.{},
                 )
@@ -3860,13 +3989,13 @@ pub fn Runtime(comptime App: type) type {
                 break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    display_target,
+                    display_target orelse session_target,
                     &.{},
                 );
             } else try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
-                null,
+                session_target,
                 try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                 &.{},
             );
@@ -3894,6 +4023,9 @@ pub fn Runtime(comptime App: type) type {
                 .completed
             else
                 .failed;
+            if (outcome == .completed) {
+                try recordHistoricalSessionLabel(app, labels, call, result);
+            }
             const entry_id = try writeCompletedToolStatus(
                 sink,
                 outcome,
@@ -5419,12 +5551,15 @@ const TestApp = struct {
         try self.replay_events.append(self.alloc, .command_output_summary_flush);
     }
 
-    fn describeToolActionCompletedWithAdvertised(self: *TestApp, arena: Allocator, call: types.ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionCompletedWithAdvertised(self: *TestApp, arena: Allocator, call: types.ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
         if (std.mem.eql(u8, call.name, "run_command")) {
             return arena.dupe(u8, "● Ran pwd");
+        }
+        if (display_target) |target| {
+            return std.fmt.allocPrint(arena, "● Completed {s} {s}", .{ call.name, target });
         }
         return std.fmt.allocPrint(arena, "● Completed {s}", .{call.name});
     }
@@ -6315,6 +6450,182 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+test "execution replay labels shell session interactions with their launch command" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const run_output = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"backend\":\"captured\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"python3 -u - <<'PY'\\nimport time\\nPY\"}",
+    }};
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var observe_calls = [_]types.ToolCall{
+        .{
+            .id = "call_observe",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"\"}",
+        },
+        .{
+            .id = "call_observe_unknown",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-9\",\"chars\":\"\"}",
+        },
+    };
+    var observe_results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_observe"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(run_output),
+            .output_bytes = run_output.len,
+            .stored_output_bytes = run_output.len,
+        },
+        .{
+            .tool_call_id = @constCast("call_observe_unknown"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast("{\"session_id\":\"shell-9\",\"state\":\"running\"}"),
+            .output_bytes = 44,
+            .stored_output_bytes = 44,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = run_calls[0..], .tool_results = run_results[0..] },
+        .{ .tool_calls = observe_calls[0..], .tool_results = observe_results[0..] },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Completed shell python3 -u - <<'PY' import time PY\n",
+        app.completed_tool_statuses.items[1],
+    );
+    // A session with no recorded launch command keeps the raw-id presentation.
+    try std.testing.expectEqualStrings(
+        "● Completed shell\n",
+        app.completed_tool_statuses.items[2],
+    );
+}
+
+test "execution replay recovers session labels from truncated status previews" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 60\"}",
+    }};
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("{\"session_id\":\"shell-3\",\"state\":\"run"),
+        .output_bytes = 34,
+        .stored_output_bytes = 34,
+        .truncated = true,
+    }};
+    var observe_calls = [_]types.ToolCall{.{
+        .id = "call_stop",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"stop\",\"session_id\":\"shell-3\"}",
+    }};
+    var observe_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_stop"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("{\"session_id\":\"shell-3\",\"state\":\"stopped\"}"),
+        .output_bytes = 44,
+        .stored_output_bytes = 44,
+    }};
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = run_calls[0..], .tool_results = run_results[0..] },
+        .{ .tool_calls = observe_calls[0..], .tool_results = observe_results[0..] },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Completed shell sleep 60\n",
+        app.completed_tool_statuses.items[1],
+    );
+}
+
+test "history replay carries shell session labels across turns" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const run_output = "{\"session_id\":\"shell-2\",\"state\":\"running\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"tail -f app.log\"}",
+    }};
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var first_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+    var observe_calls = [_]types.ToolCall{.{
+        .id = "call_observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-2\",\"chars\":\"\"}",
+    }};
+    var observe_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_observe"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var second_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = observe_calls[0..],
+        .tool_results = observe_results[0..],
+    }};
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("watch the log") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = first_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("check it") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = second_steps[0..] },
+        } },
+    };
+
+    try Runtime(TestApp).replayHistory(&app, &history);
+
+    try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Completed shell tail -f app.log\n",
+        app.completed_tool_statuses.items[1],
+    );
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {

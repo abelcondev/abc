@@ -56,6 +56,18 @@ function fakeShellRun(
   });
 }
 
+function fakeShellObserve(callId: string, sessionId: string): Response {
+  return fakeGatewayToolCall(callId, "shell", {
+    request: { action: "interact", session_id: sessionId, chars: "" },
+  });
+}
+
+function fakeShellStop(callId: string, sessionId: string): Response {
+  return fakeGatewayToolCall(callId, "shell", {
+    request: { action: "stop", session_id: sessionId },
+  });
+}
+
 function sessionIdFromHome(home: string): string {
   const sessions = join(home, ".fx", "sessions");
   const ids = readdirSync(sessions, { withFileTypes: true })
@@ -1352,6 +1364,80 @@ printf '${trailingMarker}   '
       expect(replay.stdout).toContain(splitMarker);
       expect(replay.stdout).toContain(trailingMarker);
       expect(replay.stdout).toContain(doneMarker);
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resumed session labels shell interactions with their launch command",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-session-label-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "full-access", permission: {} }),
+    );
+
+    const command = "cat <<'EOF'\nlaunch marker line\nEOF\nsleep 300";
+    const gateway = startFakeGateway([
+      fakeShellRun("call-run", command, { yield_time_ms: 1_000 }),
+      fakeShellObserve("call-observe", "shell-1"),
+      fakeShellStop("call-stop", "shell-1"),
+      fakeGatewayFinalText("SESSION_LABEL_DONE"),
+    ]);
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        stderrPath: join(root, "stderr.log"),
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Run the prepared watcher and stop it.");
+      const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
+      expect(live).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
+      expect(live).toContain("Observed cat <<'EOF'");
+      expect(live).not.toContain("Observed shell-1");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: workspace,
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: join(root, "stderr-resumed.log"),
+        width: 100,
+        height: 30,
+      });
+      const resumed = await waitForScrollback(active, "SESSION_LABEL_DONE");
+      expect(resumed).toContain("Ran cat <<'EOF' launch marker line EOF sleep 300");
+      expect(resumed).toContain("Observed cat <<'EOF'");
+      expect(resumed).toContain("Stopped cat <<'EOF'");
+      expect(resumed).not.toContain("Observed shell-1");
+      expect(resumed).not.toContain("Stopped shell-1");
+      expect(resumedGateway.requests).toHaveLength(0);
     } finally {
       if (active) {
         try {

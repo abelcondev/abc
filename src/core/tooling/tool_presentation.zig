@@ -413,6 +413,17 @@ pub fn formatRunCommandActivity(
     };
 }
 
+/// Formats a session launch command the way the live terminal display target
+/// projection presents it, for replayed history where the live session rows no
+/// longer exist. The caller owns the returned allocation.
+pub fn formatHistoricalTerminalDisplayTarget(
+    alloc: Allocator,
+    command: []const u8,
+    workspace_root: []const u8,
+) !?[]u8 {
+    return formatRunCommandDetailBounded(alloc, command, workspace_root, max_run_command_activity_bytes);
+}
+
 pub fn formatRunCommandDetailBounded(
     alloc: Allocator,
     command: []const u8,
