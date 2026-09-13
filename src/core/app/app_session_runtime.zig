@@ -3323,7 +3323,14 @@ pub fn Runtime(comptime App: type) type {
                         );
                         return;
                     } orelse return;
-                    const reflow = historicalSessionReflow(scratch, self.labels, call) orelse return;
+                    const reflow = historicalSessionReflow(scratch, self.labels, call) orelse {
+                        debug_trace.logf(
+                            "session",
+                            "historical session command unknown entry_id={d}",
+                            .{entry_id},
+                        );
+                        return;
+                    };
                     self.projection.setHistoricalToolCommandMetadata(
                         entry_id,
                         reflow,
@@ -3679,8 +3686,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Records the launch command of a completed `run` call whose result
         /// still owns a live session, so later interact/stop calls naming that
-        /// session render the command instead of the raw session id. The caller
-        /// gates the call shape; this resolves the label.
+        /// session render the command instead of the raw session id. Calls
+        /// without a command argument, or whose result names no session,
+        /// return without recording.
         fn recordHistoricalSessionLabel(
             app: *App,
             labels: *HistoricalSessionLabels,

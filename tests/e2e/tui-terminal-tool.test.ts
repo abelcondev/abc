@@ -682,7 +682,7 @@ test.skipIf(!tmuxAvailable())(
     });
     sessions.push(session);
     await session.waitForText("RESUME_SHELL>", TIMEOUT);
-    await session.sendText(FX_BIN);
+    await session.sendText(`${FX_BIN} 2>${fixture.stderrPath}`);
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
     await session.waitForText("RESUME_WIDTH_DONE", TIMEOUT);
@@ -695,7 +695,7 @@ test.skipIf(!tmuxAvailable())(
       .map((entry) => entry.name);
     expect(fxSessionIds).toHaveLength(1);
 
-    await session.sendText(`${FX_BIN} --resume ${fxSessionIds[0]}`);
+    await session.sendText(`${FX_BIN} --resume ${fxSessionIds[0]} 2>>${fixture.stderrPath}`);
     await session.waitForText("session resumed", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
 
@@ -708,6 +708,7 @@ test.skipIf(!tmuxAvailable())(
     expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
     expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
     expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,
 );
