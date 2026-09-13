@@ -2580,7 +2580,7 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     }
     const generation = &app.session_persistence.title_generation;
     if (generation.task) |task| {
-        try writer.print("generation: status=running model={s}", .{task.model});
+        try writer.print("generation: status=running session={s} model={s}", .{ task.session_id, task.model });
         if (task.started_at_ms > 0) {
             const elapsed = io_mod.milliTimestamp() - task.started_at_ms;
             if (elapsed >= 0) try writer.print(" elapsed={d}ms", .{elapsed});
@@ -2590,6 +2590,7 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     }
     const last = &generation.last;
     try writer.print("generation: status={s}", .{@tagName(last.status)});
+    if (last.sessionId().len > 0) try writer.print(" session={s}", .{last.sessionId()});
     if (last.model().len > 0) try writer.print(" model={s}", .{last.model()});
     if (last.reason) |reason| try writer.print(" reason={s}", .{@tagName(reason)});
     if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
@@ -4387,11 +4388,14 @@ test "trace session title summary reports the retained generation outcome" {
     const model = "openai/gpt-5.6-luna";
     @memcpy(generation.last.model_buf[0..model.len], model);
     generation.last.model_len = model.len;
+    const session_id = "abc123sess";
+    @memcpy(generation.last.session_buf[0..session_id.len], session_id);
+    generation.last.session_len = session_id.len;
 
     var failed: std.Io.Writer.Allocating = .init(alloc);
     defer failed.deinit();
     try writeSessionTitleSummary(&failed.writer, &app, alloc);
-    try std.testing.expect(std.mem.find(u8, failed.written(), "generation: status=failed model=openai/gpt-5.6-luna reason=transport_error detail=ConnectionRefused elapsed=15001ms") != null);
+    try std.testing.expect(std.mem.find(u8, failed.written(), "generation: status=failed session=abc123sess model=openai/gpt-5.6-luna reason=transport_error detail=ConnectionRefused elapsed=15001ms") != null);
 
     generation.last.status = .installed;
     generation.last.reason = null;

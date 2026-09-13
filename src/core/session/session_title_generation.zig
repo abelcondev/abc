@@ -349,6 +349,7 @@ pub const Task = struct {
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
+            self.failure_detail = @errorName(err);
             self.finished_at_ms = io_mod.milliTimestamp();
             debug_trace.logf("session", "event=title_generation result=unavailable session={s} err={s}", .{ self.session_id, @errorName(err) });
             return;

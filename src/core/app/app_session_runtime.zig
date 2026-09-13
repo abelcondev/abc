@@ -944,7 +944,7 @@ const TitleGenerationLoad = struct {
 
     /// Final state of the most recent attempt, retained for diagnostics after
     /// the task itself is destroyed. `detail` is a static string borrowed from
-    /// the task; the model is copied into a fixed buffer.
+    /// the task; the model and session id are copied into fixed buffers.
     const LastResult = struct {
         status: Status = .none,
         reason: ?session_title_generation.FailureReason = null,
@@ -952,11 +952,27 @@ const TitleGenerationLoad = struct {
         elapsed_ms: i64 = -1,
         model_buf: [max_model_bytes]u8 = undefined,
         model_len: u8 = 0,
+        session_buf: [max_session_bytes]u8 = undefined,
+        session_len: u8 = 0,
 
         const max_model_bytes = 128;
+        const max_session_bytes = 64;
 
         pub fn model(self: *const LastResult) []const u8 {
             return self.model_buf[0..self.model_len];
+        }
+
+        pub fn sessionId(self: *const LastResult) []const u8 {
+            return self.session_buf[0..self.session_len];
+        }
+
+        fn copyIds(self: *LastResult, session_id: []const u8, title_model: []const u8) void {
+            const model_len: u8 = @intCast(@min(title_model.len, max_model_bytes));
+            @memcpy(self.model_buf[0..model_len], title_model[0..model_len]);
+            self.model_len = model_len;
+            const session_len: u8 = @intCast(@min(session_id.len, max_session_bytes));
+            @memcpy(self.session_buf[0..session_len], session_id[0..session_len]);
+            self.session_len = session_len;
         }
     };
 
@@ -982,16 +998,14 @@ const TitleGenerationLoad = struct {
         self.task = task;
     }
 
-    fn recordSpawnFailure(self: *TitleGenerationLoad, model: []const u8, err: anyerror) void {
+    fn recordSpawnFailure(self: *TitleGenerationLoad, session_id: []const u8, model: []const u8, err: anyerror) void {
         var last = LastResult{
             .status = .failed,
             .reason = .spawn_failed,
             .detail = @errorName(err),
             .elapsed_ms = 0,
         };
-        const model_len: u8 = @intCast(@min(model.len, LastResult.max_model_bytes));
-        @memcpy(last.model_buf[0..model_len], model[0..model_len]);
-        last.model_len = model_len;
+        last.copyIds(session_id, model);
         self.last = last;
     }
 
@@ -1011,9 +1025,7 @@ const TitleGenerationLoad = struct {
             last.reason = task.failure_reason;
             last.detail = task.failure_detail;
         }
-        const model_len: u8 = @intCast(@min(task.model.len, LastResult.max_model_bytes));
-        @memcpy(last.model_buf[0..model_len], task.model[0..model_len]);
-        last.model_len = model_len;
+        last.copyIds(task.session_id, task.model);
         self.last = last;
     }
 
@@ -2868,12 +2880,12 @@ pub fn Runtime(comptime App: type) type {
                 .credential_source = credential.source,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
-                app.session_persistence.title_generation.recordSpawnFailure(title_model.?, err);
+                app.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
                 return;
             };
             task.spawn() catch |err| {
                 debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
-                app.session_persistence.title_generation.recordSpawnFailure(title_model.?, err);
+                app.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
                 task.destroy();
                 return;
             };
@@ -10168,6 +10180,7 @@ test "session title generation installs the model title for a fresh session" {
     const last = &app.session_persistence.title_generation.last;
     try std.testing.expectEqual(.installed, last.status);
     try std.testing.expectEqualStrings("test/title-model", last.model());
+    try std.testing.expectEqualStrings("title-test", last.sessionId());
     try std.testing.expect(last.elapsed_ms >= 0);
 }
 
@@ -10296,6 +10309,7 @@ test "session title generation retains a transport failure for diagnostics" {
     try std.testing.expectEqual(session_title_generation.FailureReason.transport_error, last.reason.?);
     try std.testing.expectEqualStrings("ConnectionRefused", last.detail);
     try std.testing.expectEqualStrings("test/title-model", last.model());
+    try std.testing.expectEqualStrings("title-test", last.sessionId());
     try std.testing.expect(last.elapsed_ms >= 0);
 }
 
@@ -10303,11 +10317,12 @@ test "title generation load retains spawn failures and apply-time drops" {
     var load: TitleGenerationLoad = .{};
     defer load.deinit();
 
-    load.recordSpawnFailure("test/title-model", error.ThreadQuotaExceeded);
+    load.recordSpawnFailure("sess-123", "test/title-model", error.ThreadQuotaExceeded);
     try std.testing.expectEqual(TitleGenerationLoad.Status.failed, load.last.status);
     try std.testing.expectEqual(session_title_generation.FailureReason.spawn_failed, load.last.reason.?);
     try std.testing.expectEqualStrings("ThreadQuotaExceeded", load.last.detail);
     try std.testing.expectEqualStrings("test/title-model", load.last.model());
+    try std.testing.expectEqualStrings("sess-123", load.last.sessionId());
 
     // Apply-time drops only rewrite a successful result.
     load.recordDropped(.session_changed, "");

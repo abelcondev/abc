@@ -167,7 +167,11 @@ async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<
   while (Date.now() < deadline) {
     const fresh = traceReports(root).filter(name => !before.has(name));
     if (fresh.length > 0) {
-      return readFileSync(join(traceTmpDir(root), fresh[fresh.length - 1]), "utf8");
+      // The filename becomes visible between create and the content write, so
+      // wait for the report's closing section before reading.
+      const path = join(traceTmpDir(root), fresh[fresh.length - 1]);
+      const content = readFileSync(path, "utf8");
+      if (content.includes("## Transcript Timeline")) return content;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
@@ -195,7 +199,8 @@ test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", asyn
     expect(report).toContain("## Session Title");
     expect(report).toContain("setting: true");
     expect(report).toContain(`title: ${GENERATED_TITLE}`);
-    expect(report).toContain(`generation: status=installed model=${TITLE_MODEL}`);
+    expect(report).toContain("generation: status=installed");
+    expect(report).toContain(`model=${TITLE_MODEL}`);
   } finally {
     await tui?.kill();
     gateway.stop();
@@ -231,7 +236,9 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     expect(report).toContain("## Session Title");
-    expect(report).toContain("generation: status=failed model=openai/gpt-5.6-luna reason=unsanitizable");
+    expect(report).toContain("generation: status=failed");
+    expect(report).toContain("model=openai/gpt-5.6-luna");
+    expect(report).toContain("reason=unsanitizable");
   } finally {
     await tui?.kill();
     gateway.stop();
