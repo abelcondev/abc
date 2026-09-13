@@ -1307,6 +1307,124 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask applies --model, --effort, and --fast overrides to the gateway request", async () => {
+    const root = createFixtureRoot("ask-flag-overrides");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("FLAG_OVERRIDES_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            fast_options: [{ type: "toggle" }],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        [
+          "ask", "--json", "--auto", "--no-save",
+          "--model", MODEL,
+          "--effort", "high",
+          "--fast",
+          "Use the flag overrides.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "FLAG_OVERRIDES_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask --model without --fast drops the compiled-default fast mode", async () => {
+    const root = createFixtureRoot("ask-model-override-drops-fast");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("MODEL_ONLY_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "--model", MODEL, "Use the overridden model."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "MODEL_ONLY_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
       const root = createFixtureRoot(`permission-mode-${mode}`);
