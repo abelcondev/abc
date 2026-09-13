@@ -3595,7 +3595,6 @@ fn testPaintPlan(layout: types.Layout, selection: ViewportSelection) paint_plan.
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = null,
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

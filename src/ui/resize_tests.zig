@@ -748,7 +748,6 @@ fn commitTestFrame(
             surface_frame.commitSurfaceFooterFrame(h.alloc, &h.shell, frame, footer_measurement);
         }
         h.shell.shimmer_active = paint_ctx.activity_result.painted;
-        h.shell.shimmer_row = if (paint_ctx.activity_result.painted) paint_ctx.activity_result.row else 1;
         h.shell.shimmer_is_overlay = paint_ctx.activity_result.overlay;
         if (paint_ctx.activity_result.overlay) {
             h.shell.invalidateTranscriptAnchor("test_transcript_activity_overlay_commit");
@@ -817,7 +816,6 @@ fn transcriptOnlyPlan(
             .col = prepared.cursor.cursor_col,
             .visible = true,
         },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = prepared.bottom_reserved_rows,
         .preserve_scrollback = !shell.pending_scroll_compact,
         .reset_terminal = shell.terminal_reset_pending,
@@ -7991,9 +7989,6 @@ test "snapshot paint survives direct-backing mutation after snapshot" {
 
     try h.shell.initViewport(&h.metrics, 5);
     try h.shell.writeTranscript(h.alloc, &h.metrics, "hello world\n", true);
-
-    h.shell.paint_test_mode = .mutate_backing_after_snapshot;
-    defer h.shell.paint_test_mode = .none;
 
     try h.renderTranscriptFrameIfDirty();
     try h.flush();

@@ -505,7 +505,6 @@ pub fn Runtime(comptime App: type) type {
                 .reset_style = ui_render.reset_style,
                 .dim_style = ui_render.dim_style,
                 .red_style = ui_render.red_style,
-                .cancelled_text_style = ui_render.hint_style,
                 .notice_information_style = ui_render.system_notice_label_style,
                 .notice_success_style = ui_render.green_style,
                 .notice_warning_style = ui_render.warning_style,
@@ -1771,7 +1770,6 @@ pub fn Runtime(comptime App: type) type {
                     if (footer_measurement) |*measurement| measurement else null,
                 );
                 presentation_shell.shimmer_active = frame_ctx.activity_result.painted;
-                presentation_shell.shimmer_row = if (frame_ctx.activity_result.painted) frame_ctx.activity_result.row else 1;
                 presentation_shell.shimmer_is_overlay = frame_ctx.activity_result.overlay;
                 if (scroll_plan.remaining_inline_advance_rows > 0) {
                     presentation_shell.markTranscriptDirty();
@@ -2782,7 +2780,6 @@ test "core.app_render_runtime rejects prepared transcript outside final plan ban
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 43, .col = 3, .visible = true },
-        .footer_reservation_source = .transient_activity,
         .bottom_reserved_rows = 2,
         .preserve_scrollback = true,
     };

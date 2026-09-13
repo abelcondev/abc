@@ -34,7 +34,6 @@ pub const Styles = struct {
     reset_style: []const u8 = "",
     dim_style: []const u8 = "",
     red_style: []const u8 = "",
-    cancelled_text_style: []const u8 = "",
     notice_information_style: []const u8 = "",
     notice_success_style: []const u8 = "",
     notice_warning_style: []const u8 = "",

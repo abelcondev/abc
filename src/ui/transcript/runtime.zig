@@ -4014,12 +4014,6 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return transcript_blocks.wrapAssistantText(alloc, text, cols);
 }
 
-pub const PaintTestMode = enum {
-    none,
-    mutate_backing_after_snapshot,
-};
-
-const PaintTestModeField = if (@import("builtin").is_test) PaintTestMode else void;
 const default_max_retained_transcript_bytes: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
@@ -4034,10 +4028,6 @@ pub const PaintTraceState = struct {
     transcript_entries: usize = 0,
     transcript_initialized: bool = false,
     transcript_log_frame: bool = false,
-
-    shimmer_row: ?u16 = null,
-    shimmer_over_footer: bool = false,
-    shimmer_label_hash: u64 = 0,
 
     footer_top: u16 = 0,
     footer_input_base: u16 = 0,
@@ -4358,7 +4348,6 @@ pub const TranscriptRuntime = struct {
     /// visible byte-cache limit.
     max_retained_transcript_bytes: usize = default_max_retained_transcript_bytes,
     painting: bool = false,
-    paint_test_mode: PaintTestModeField = if (@import("builtin").is_test) .none else {},
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
     /// frame on its own.
@@ -4375,7 +4364,6 @@ pub const TranscriptRuntime = struct {
     command_output_display: CommandOutputDisplayState = .{},
     command_output_render: CommandOutputRenderPolicy = .{},
     shimmer_active: bool = false,
-    shimmer_row: u16 = 1,
     shimmer_is_overlay: bool = false,
     paint_trace: PaintTraceState = .{},
     last_visible_transcript_top_row: u16 = 1,
@@ -6724,9 +6712,6 @@ pub const TranscriptRuntime = struct {
     pub fn forgetShimmer(self: *TranscriptRuntime) void {
         self.shimmer_active = false;
         self.shimmer_is_overlay = false;
-        self.paint_trace.shimmer_row = null;
-        self.paint_trace.shimmer_over_footer = false;
-        self.paint_trace.shimmer_label_hash = 0;
     }
 
     pub fn transcriptCommitDiagnostic(self: *const TranscriptRuntime) TranscriptCommitDiagnostic {
@@ -12751,7 +12736,6 @@ test "terminal reset drops stale mid-scrollback footer clear before reanchor" {
         .footer_clean_allowed = false,
         .synchronized_update = false,
         .cursor_target = null,
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -13036,7 +13020,6 @@ test "measured recovery rebases from accepted projection before retiring resize 
             .col = prepared.cursor.cursor_col,
             .visible = true,
         },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -13205,7 +13188,6 @@ fn expectHistoryReplayBoundary(target_flow: []const u8, source_pending_wrap: boo
             .col = prepared.cursor.cursor_col,
             .visible = true,
         },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

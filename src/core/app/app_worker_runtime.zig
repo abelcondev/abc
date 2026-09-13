@@ -1799,23 +1799,8 @@ const FakeSubagents = struct {
     child_shell: FakeShell = .{},
     child_render_requests: render_request.RenderRequestState = .{},
 
-    const ChildPresentationView = struct {
-        chat: struct {
-            busy_value: bool,
-
-            fn busy(self: @This()) bool {
-                return self.busy_value;
-            }
-        },
-    };
-
     fn isViewActive(self: FakeSubagents) bool {
         return self.view_active;
-    }
-
-    fn childPresentationView(self: *FakeSubagents) ?ChildPresentationView {
-        if (!self.view_active) return null;
-        return .{ .chat = .{ .busy_value = self.child_busy } };
     }
 
     fn childConversationRuntime(self: *FakeSubagents) ?*FakeShell {
