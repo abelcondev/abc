@@ -593,6 +593,67 @@ pub fn Bindings(comptime App: type) type {
                                     );
                                 }
                             }
+                        } else if (comptime @hasField(App, "terminal_client") and @hasField(App, "managed_executions")) {
+                            // Terminal-session actions (interact, stop) carry no
+                            // command argument; their status line shows the launch
+                            // command resolved from the session registry, truncated
+                            // to the compact activity bound. Store the reflow-bound
+                            // display so group projection can reclip the phrase to
+                            // the live terminal width like any other command.
+                            if (app.toolRegistry().lookup(started.tool_name)) |spec| {
+                                if (spec.executor_kind == .terminal) {
+                                    const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                                        if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+                                    else
+                                        app.workspace_root;
+                                    const session_call: ToolCall = .{
+                                        .id = started.id.call_id,
+                                        .name = started.tool_name,
+                                        .arguments_json = arguments_json,
+                                    };
+                                    const session_display = tool_presentation.resolveTerminalDisplayTargetBounded(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        workspace_root,
+                                        &app.terminal_client,
+                                        &app.managed_executions,
+                                        session_call,
+                                        tool_presentation.max_run_command_reflow_bytes,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command display unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    defer if (session_display) |bytes| alloc.free(bytes);
+                                    const session_label = tool_presentation.terminalSessionCompletedActionLabel(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        session_call,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command action label unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    if (session_display != null and session_label != null) {
+                                        app.shell.setToolCommandMetadata(
+                                            alloc,
+                                            started.id,
+                                            session_display.?,
+                                            session_label.?,
+                                        ) catch |err| debug_trace.logf(
+                                            "ui_activity",
+                                            "command metadata unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 },
