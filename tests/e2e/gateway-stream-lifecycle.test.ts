@@ -1425,6 +1425,84 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask flag overrides win over resumed session preferences without persisting", async () => {
+    const root = createFixtureRoot("ask-flag-resume");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("RESUME_FLAGS_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            fast_options: [{ type: "toggle" }],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const env = {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_MODEL: undefined,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      };
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Start the saved session."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      expect(sessionId).not.toBe("");
+
+      const overridden = await runFx(
+        [
+          "ask", "--json", "--auto",
+          "--resume-id", sessionId,
+          "--model", MODEL,
+          "--effort", "high",
+          "--no-fast",
+          "Continue with the flag overrides.",
+        ],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(overridden.code).toBe(0);
+      expect(overridden.stderr).toBe("");
+      expect(gateway.requests[1]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const overriddenRequest = JSON.parse(gateway.requests[1]!.body);
+      expect(overriddenRequest).toMatchObject({ reasoning: "high" });
+      expect(overriddenRequest).not.toHaveProperty("providerOptions.gateway.speed");
+
+      const restored = await runFx(
+        ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue without flags."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(restored.code).toBe(0);
+      expect(restored.stderr).toBe("");
+      expect(gateway.requests[2]!.headers.get("ai-language-model-id")).toBe(
+        DEFAULT_MODEL,
+      );
+      const restoredRequest = JSON.parse(gateway.requests[2]!.body);
+      expect(restoredRequest).not.toHaveProperty("reasoning");
+      expect(restoredRequest).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
       const root = createFixtureRoot(`permission-mode-${mode}`);

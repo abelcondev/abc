@@ -3708,8 +3708,9 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             if (i >= args.len) return error.InvalidAskArgs;
             const model = std.mem.trim(u8, args[i], " \t\r\n");
             if (model.len == 0) return error.InvalidAskArgs;
+            const owned_model = try alloc.dupe(u8, model);
             if (opts.model_override) |old| alloc.free(old);
-            opts.model_override = try alloc.dupe(u8, model);
+            opts.model_override = owned_model;
         } else if (std.mem.eql(u8, arg, "--effort")) {
             i += 1;
             if (i >= args.len) return error.InvalidAskArgs;
