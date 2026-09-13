@@ -1364,7 +1364,7 @@ pub const Usage = struct {
 
     /// Stops the background profile-publication drain, joining any live worker.
     /// A later schedule starts a fresh worker.
-    pub fn stopPublicationDrain(self: *Usage) void {
+    fn stopPublicationDrain(self: *Usage) void {
         if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
         self.publication_drain_cancel.store(true, .seq_cst);
         self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
@@ -1749,6 +1749,7 @@ pub const Usage = struct {
         session_started_at_ms: i64,
     ) !void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         try validateSnapshot(source);
 
         var copied = try dupeSnapshotOwned(alloc, source);
