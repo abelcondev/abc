@@ -1382,7 +1382,7 @@ fn isMatchBoundary(path: []const u8, byte_index: usize) bool {
     return previous >= 'a' and previous <= 'z' and current >= 'A' and current <= 'Z';
 }
 
-fn scoreBetter(left: MatchScore, right: MatchScore) bool {
+inline fn scoreBetter(left: MatchScore, right: MatchScore) bool {
     if (left.exact_fit != right.exact_fit) return left.exact_fit;
     if (left.basename_fit != right.basename_fit) return left.basename_fit;
     if (left.boundary_matches != right.boundary_matches) return left.boundary_matches > right.boundary_matches;
@@ -1862,6 +1862,43 @@ test "typed search supports abbreviated subsequences and caller-owned spans" {
         matched_len += bytes.len;
     }
     try std.testing.expectEqualStrings("fiidx", matched_bytes[0..matched_len]);
+}
+
+test "score comparison resolves each priority before less important signals" {
+    const best: MatchScore = .{
+        .exact_fit = true,
+        .basename_fit = true,
+        .boundary_matches = std.math.maxInt(usize),
+        .prefix = true,
+        .first_position = 0,
+        .longest_run = std.math.maxInt(usize),
+        .consecutive_matches = std.math.maxInt(usize),
+        .gaps = 0,
+    };
+    const worst: MatchScore = .{
+        .exact_fit = false,
+        .basename_fit = false,
+        .boundary_matches = 0,
+        .prefix = false,
+        .first_position = std.math.maxInt(usize),
+        .longest_run = 0,
+        .consecutive_matches = 0,
+        .gaps = std.math.maxInt(usize),
+    };
+    const priorities = [_][]const u8{ "exact_fit", "basename_fit", "boundary_matches", "prefix", "first_position", "longest_run", "consecutive_matches", "gaps" };
+    inline for (priorities, 0..) |field, priority| {
+        var left = worst;
+        var right = best;
+        inline for (priorities[0 .. priority + 1]) |earlier| {
+            @field(left, earlier) = @field(best, earlier);
+        }
+        @field(right, field) = @field(worst, field);
+        try std.testing.expect(scoreBetter(left, right));
+        try std.testing.expect(!scoreBetter(right, left));
+        try std.testing.expect(!scoreBetter(left, left));
+    }
+    try std.testing.expect(!scoreBetter(worst, worst));
+    try std.testing.expect(!scoreBetter(best, best));
 }
 
 test "ranking signals follow the accepted descending influence" {
