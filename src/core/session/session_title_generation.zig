@@ -105,12 +105,36 @@ pub const Request = struct {
     timeout_ms: u32 = default_timeout_ms,
 };
 
+/// Why a title generation attempt did not install a generated title. Static
+/// and copyable so runtimes can retain it for diagnostics after the attempt's
+/// resources are gone.
+pub const FailureReason = enum {
+    spawn_failed,
+    cancelled,
+    transport_error,
+    provider_failure,
+    empty_content,
+    unsanitizable,
+    no_active_session,
+    session_changed,
+    not_writable,
+    install_failed,
+    user_title_present,
+};
+
+/// A failed title generation attempt. `detail` carries a static error or
+/// provider failure-kind name; it never owns or outlives its memory.
+pub const Failure = struct {
+    reason: FailureReason,
+    detail: []const u8 = "",
+};
+
 pub const Outcome = union(enum) {
     /// Sanitized title, owned by the caller.
     generated: []u8,
     /// Transport failure, cancellation, or unusable output. The locally
     /// derived title remains in place.
-    unavailable,
+    unavailable: Failure,
 };
 
 /// Runs one bounded title generation call. Effects live here; prompt
@@ -165,11 +189,12 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         alloc,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
         debug_trace.logf("session", "event=title_generation result=unavailable err={s}", .{@errorName(err)});
-        return .unavailable;
+        return .{ .unavailable = .{ .reason = .transport_error, .detail = @errorName(err) } };
     };
     defer result.deinit(alloc);
-    if (request.cancel_flag.load(.seq_cst)) return .unavailable;
+    if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
     const completion = switch (result) {
         .failed => |failure| {
             debug_trace.logf(
@@ -177,16 +202,16 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
                 "event=title_generation result=unavailable failure_kind={s}",
                 .{@tagName(failure.kind)},
             );
-            return .unavailable;
+            return .{ .unavailable = .{ .reason = .provider_failure, .detail = @tagName(failure.kind) } };
         },
         .completed => |completed| completed.completion,
     };
-    const content = completion.content orelse return .unavailable;
+    const content = completion.content orelse return .{ .unavailable = .{ .reason = .empty_content } };
     const sanitized = try sanitizeGeneratedTitle(alloc, content);
     if (sanitized == null) {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=unsanitizable", .{});
     }
-    return if (sanitized) |title| .{ .generated = title } else .unavailable;
+    return if (sanitized) |title| .{ .generated = title } else .{ .unavailable = .{ .reason = .unsanitizable } };
 }
 
 fn ignoreEvent(_: *anyopaque, _: stream_provider.Event) void {}
@@ -196,6 +221,9 @@ fn ignoreEvent(_: *anyopaque, _: stream_provider.Event) void {}
 /// it is safe before `spawn` returns and after completion. All fields are
 /// written before `done` is published and read after it (or after join).
 pub const Task = struct {
+    /// Terminal state of the attempt, readable once `done` is set.
+    pub const Status = enum { pending, generated, unavailable };
+
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -209,6 +237,12 @@ pub const Task = struct {
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
+    started_at_ms: i64 = 0,
+    finished_at_ms: i64 = 0,
+    status: Status = .pending,
+    /// Set when status == .unavailable; both are static and never freed.
+    failure_reason: ?FailureReason = null,
+    failure_detail: []const u8 = "",
 
     pub const Init = struct {
         session_id: []const u8,
@@ -253,6 +287,7 @@ pub const Task = struct {
     }
 
     pub fn spawn(self: *Task) !void {
+        self.started_at_ms = io_mod.milliTimestamp();
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
     }
 
@@ -313,16 +348,25 @@ pub const Task = struct {
             .cancel_flag = &self.cancel_requested,
         }) catch |err| {
             self.failure = err;
+            self.status = .unavailable;
+            self.failure_detail = @errorName(err);
+            self.finished_at_ms = io_mod.milliTimestamp();
             debug_trace.logf("session", "event=title_generation result=unavailable session={s} err={s}", .{ self.session_id, @errorName(err) });
             return;
         };
         switch (outcome) {
             .generated => |title| {
                 self.title = title;
+                self.status = .generated;
                 debug_trace.logf("session", "event=title_generation result=generated session={s}", .{self.session_id});
             },
-            .unavailable => {},
+            .unavailable => |failure| {
+                self.status = .unavailable;
+                self.failure_reason = failure.reason;
+                self.failure_detail = failure.detail;
+            },
         }
+        self.finished_at_ms = io_mod.milliTimestamp();
     }
 };
 
@@ -454,7 +498,8 @@ test "sanitizeGeneratedTitle bounds oversized single-line model output" {
 
 test "run returns unavailable when the provider stream fails" {
     const Failing = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, _: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            try request.admission.admit();
             return .{ .failed = .{ .kind = .rate_limited } };
         }
     };
@@ -466,7 +511,42 @@ test "run returns unavailable when the provider stream fails" {
         .prompt_excerpt = "fix the renderer",
         .cancel_flag = &cancelled,
     });
-    try std.testing.expect(outcome == .unavailable);
+    switch (outcome) {
+        .generated => |title| {
+            std.testing.allocator.free(title);
+            return error.TestExpectedUnavailable;
+        },
+        .unavailable => |failure| {
+            try std.testing.expectEqual(FailureReason.provider_failure, failure.reason);
+            try std.testing.expectEqualStrings("rate_limited", failure.detail);
+        },
+    }
+}
+
+test "run reports a transport error with its error name" {
+    const Failing = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, _: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            return error.ConnectionRefused;
+        }
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const outcome = try run(std.testing.allocator, .{
+        .stream_provider = .{ .stream_fn = Failing.stream },
+        .model = "test/title",
+        .api_key = "key",
+        .prompt_excerpt = "fix the renderer",
+        .cancel_flag = &cancelled,
+    });
+    switch (outcome) {
+        .generated => |title| {
+            std.testing.allocator.free(title);
+            return error.TestExpectedUnavailable;
+        },
+        .unavailable => |failure| {
+            try std.testing.expectEqual(FailureReason.transport_error, failure.reason);
+            try std.testing.expectEqualStrings("ConnectionRefused", failure.detail);
+        },
+    }
 }
 
 test "run sanitizes provider content into a generated title" {
@@ -519,7 +599,40 @@ test "run treats unsanitizable output as unavailable" {
         .prompt_excerpt = "fix the renderer",
         .cancel_flag = &cancelled,
     });
-    try std.testing.expect(outcome == .unavailable);
+    switch (outcome) {
+        .generated => |title| {
+            std.testing.allocator.free(title);
+            return error.TestExpectedUnavailable;
+        },
+        .unavailable => |failure| try std.testing.expectEqual(FailureReason.unsanitizable, failure.reason),
+    }
+}
+
+test "run reports empty provider content" {
+    const Empty = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            try request.admission.admit();
+            return .{ .completed = .{ .completion = .{
+                .content = null,
+                .finish_reason = .stop,
+            }, .ownership = .borrowed } };
+        }
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const outcome = try run(std.testing.allocator, .{
+        .stream_provider = .{ .stream_fn = Empty.stream },
+        .model = "test/title",
+        .api_key = "key",
+        .prompt_excerpt = "fix the renderer",
+        .cancel_flag = &cancelled,
+    });
+    switch (outcome) {
+        .generated => |title| {
+            std.testing.allocator.free(title);
+            return error.TestExpectedUnavailable;
+        },
+        .unavailable => |failure| try std.testing.expectEqual(FailureReason.empty_content, failure.reason),
+    }
 }
 
 test "run honors an already-set cancel flag" {
@@ -536,5 +649,11 @@ test "run honors an already-set cancel flag" {
         .prompt_excerpt = "fix the renderer",
         .cancel_flag = &cancelled,
     });
-    try std.testing.expect(outcome == .unavailable);
+    switch (outcome) {
+        .generated => |title| {
+            std.testing.allocator.free(title);
+            return error.TestExpectedUnavailable;
+        },
+        .unavailable => |failure| try std.testing.expectEqual(FailureReason.cancelled, failure.reason),
+    }
 }
