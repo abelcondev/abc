@@ -2088,6 +2088,10 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         ctx.cfg.gateway_provider.oauth_transport,
         ctx.alloc,
