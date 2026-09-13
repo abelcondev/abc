@@ -406,6 +406,10 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+                debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+                return null;
+            }
             var refreshed = (try auth_runtime.refreshCredentialForAccount(
                 app.auth.oauthTransport(),
                 std.heap.c_allocator,
