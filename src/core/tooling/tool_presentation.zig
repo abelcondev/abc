@@ -413,6 +413,20 @@ pub fn formatRunCommandActivity(
     };
 }
 
+/// Formats a session launch command with the live terminal display target
+/// projection's 120-byte budget, for replayed history where the live session
+/// rows no longer exist. Returns null when `workspace_root` is empty and the
+/// command contains an unresolved absolute path, matching the historical
+/// command display guard; the caller falls back to the raw session id.
+/// The caller owns the returned allocation.
+pub fn formatHistoricalTerminalDisplayTarget(
+    alloc: Allocator,
+    command: []const u8,
+    workspace_root: []const u8,
+) !?[]u8 {
+    return formatRunCommandDetailBounded(alloc, command, workspace_root, max_run_command_activity_bytes);
+}
+
 pub fn formatRunCommandDetailBounded(
     alloc: Allocator,
     command: []const u8,
