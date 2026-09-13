@@ -3958,6 +3958,12 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
+
+    var fast_notice_count: usize = 0;
+    for (hooks.texts.items) |text| {
+        if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), fast_notice_count);
 }
 
 test "processQueuedPrompt persists interruption when capability resolution returns cancellation" {

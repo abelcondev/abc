@@ -6377,6 +6377,7 @@ fn processQueuedPromptLoop(
         checkpoint.fast_mode
     else
         selected_fast_mode;
+    var fast_unavailable_notified = false;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -6800,6 +6801,15 @@ fn processQueuedPromptLoop(
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = true;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            // Fast can silently drop when the model catalog cannot confirm
+            // support (catalog failure) or a restored preference no longer
+            // matches the model. Tell the user once per turn instead of
+            // letting the footer state diverge from the wire.
+            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified) {
+                fast_unavailable_notified = true;
+                try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
+                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
