@@ -3445,6 +3445,9 @@ pub fn Runtime(comptime App: type) type {
         /// Maps historical shell session ids to their launch-command label so a
         /// resumed transcript can render the same `Observed <command>` text the
         /// live session showed, after the in-memory execution registry is gone.
+        /// Session ids restart per process, so a session resumed across epochs
+        /// can contain two runs that both produced `shell-1`; the later record
+        /// wins, matching the most recent epoch's live rendering.
         const HistoricalSessionLabels = struct {
             workspace_root: []const u8,
             map: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -3475,18 +3478,22 @@ pub fn Runtime(comptime App: type) type {
         /// `buffer`, returning a slice of it. The preview can be truncated
         /// mid-JSON, so fall back to a bounded scan for the leading
         /// `"session_id"` field when a full parse fails.
-        fn historicalSessionIdFromOutput(output: []const u8, buffer: *[128]u8) ?[]const u8 {
-            if (copyParsedSessionId(output, buffer)) |session_id| return session_id;
+        fn historicalSessionIdFromOutput(
+            alloc: Allocator,
+            output: []const u8,
+            buffer: *[128]u8,
+        ) ?[]const u8 {
+            if (copyParsedSessionId(alloc, output, buffer)) |session_id| return session_id;
             const key = "\"session_id\":\"";
             const start = (std.mem.find(u8, output, key) orelse return null) + key.len;
             const end = std.mem.findScalarPos(u8, output, start, '"') orelse return null;
             return copyHistoricalSessionId(output[start..end], buffer);
         }
 
-        fn copyParsedSessionId(output: []const u8, buffer: *[128]u8) ?[]const u8 {
+        fn copyParsedSessionId(alloc: Allocator, output: []const u8, buffer: *[128]u8) ?[]const u8 {
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
-                std.heap.c_allocator,
+                alloc,
                 output,
                 .{},
             ) catch return null;
@@ -3511,9 +3518,10 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Records the launch command of a completed `run` call whose result
-        /// still owns a live session, so later interact/stop calls naming that
-        /// session render the command instead of the raw session id.
+        /// Records the launch command of a completed captured-command `run`
+        /// call whose result still owns a live session, so later interact/stop
+        /// calls naming that session render the command instead of the raw
+        /// session id. The caller gates the call shape; this resolves the label.
         fn recordHistoricalSessionLabel(
             app: *App,
             labels: *HistoricalSessionLabels,
@@ -3530,12 +3538,19 @@ pub fn Runtime(comptime App: type) type {
             else
                 result.preview orelse return;
             var session_id_buffer: [128]u8 = undefined;
-            const session_id = historicalSessionIdFromOutput(output, &session_id_buffer) orelse return;
+            const session_id = historicalSessionIdFromOutput(scratch, output, &session_id_buffer) orelse return;
             const label = (try tooling_presentation.formatHistoricalTerminalDisplayTarget(
                 app.alloc,
                 command,
                 labels.workspace_root,
-            )) orelse return;
+            )) orelse {
+                debug_trace.logf(
+                    "session",
+                    "historical session label withheld call_id={s} session_id={s}",
+                    .{ call.id, session_id },
+                );
+                return;
+            };
             errdefer app.alloc.free(label);
             const owned_id = try app.alloc.dupe(u8, session_id);
             errdefer app.alloc.free(owned_id);
@@ -4023,7 +4038,7 @@ pub fn Runtime(comptime App: type) type {
                 .completed
             else
                 .failed;
-            if (outcome == .completed) {
+            if (outcome == .completed and is_command) {
                 try recordHistoricalSessionLabel(app, labels, call, result);
             }
             const entry_id = try writeCompletedToolStatus(

@@ -413,9 +413,12 @@ pub fn formatRunCommandActivity(
     };
 }
 
-/// Formats a session launch command the way the live terminal display target
-/// projection presents it, for replayed history where the live session rows no
-/// longer exist. The caller owns the returned allocation.
+/// Formats a session launch command with the live terminal display target
+/// projection's 120-byte budget, for replayed history where the live session
+/// rows no longer exist. Returns null when `workspace_root` is empty and the
+/// command contains an unresolved absolute path, matching the historical
+/// command display guard; the caller falls back to the raw session id.
+/// The caller owns the returned allocation.
 pub fn formatHistoricalTerminalDisplayTarget(
     alloc: Allocator,
     command: []const u8,
