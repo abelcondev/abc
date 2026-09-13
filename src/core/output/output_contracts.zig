@@ -20,6 +20,10 @@ const workspace_commands = @import("../workspace/workspace_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
+fn providerDisplayName(provider: *const model_provider.ProviderId) []const u8 {
+    return if (provider.* == .configured) provider.label() else provider_catalog.label(provider.*);
+}
+
 fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return permissions.permissionModeLabel(mode);
 }
@@ -491,7 +495,7 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("[status] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[status] model_source={s}\n", .{if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider)});
+            try out.writer.print("[status] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
         if (self.provider_endpoint) |endpoint| try out.writer.print("[status] provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
@@ -545,7 +549,7 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("model_source={s}\n", .{if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider)});
+            try out.writer.print("model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
         if (self.provider_endpoint) |endpoint| try out.writer.print("provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
@@ -593,7 +597,7 @@ pub const StatusSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
         }
         if (self.provider_endpoint) |endpoint| {
             try writer.writeAll(",\"provider_endpoint\":");
@@ -799,7 +803,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print(" - {s} · {s}\n", .{ id, if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider) });
+                try out.writer.print(" - {s} · {s}\n", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }
@@ -827,7 +831,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print("\n - {s} · {s}", .{ id, if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider) });
+                try out.writer.print("\n - {s} · {s}", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
             }
@@ -857,7 +861,7 @@ pub const ModelListSnapshot = struct {
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(id, .{}, &out.writer);
                 try out.writer.writeAll(",\"source\":");
-                try std.json.Stringify.value(if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider), .{}, &out.writer);
+                try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
                 try out.writer.writeByte('}');
             }
         }
@@ -1362,7 +1366,7 @@ pub const DoctorSnapshot = struct {
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[doctor] model_source={s}\n", .{if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider)});
+            try out.writer.print("[doctor] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
         try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -1405,7 +1409,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(if (self.provider == .configured) self.provider.label() else provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);

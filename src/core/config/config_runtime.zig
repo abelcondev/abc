@@ -543,7 +543,14 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     if (io_mod.getenv("FX_PROVIDER") != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            try sources.models.set(model_provider.NameKey.fromProvider(settings.provider orelse .gateway), .process_override);
+            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+            sources.models.set(override_provider, .process_override) catch |err| switch (err) {
+                error.TooManyModelPreferences => debug_trace.logf(
+                    "config",
+                    "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
+                    .{ override_provider.label(), model_preferences.max_preferences },
+                ),
+            };
         }
     }
 
@@ -690,7 +697,13 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 }
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) !void {
-    for (settings.models.entries.items) |entry| try sources.models.set(entry.provider, source);
+    for (settings.models.entries.items) |entry| sources.models.set(entry.provider, source) catch |err| switch (err) {
+        error.TooManyModelPreferences => debug_trace.logf(
+            "config",
+            "dropping model provenance provider={s} source={s}: provenance table holds at most {d} provider names",
+            .{ entry.provider.label(), @tagName(source), model_preferences.max_preferences },
+        ),
+    };
     if (settings.provider != null) sources.provider = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
@@ -3481,6 +3494,42 @@ test "detailed settings report non-empty process model override as winning sourc
     try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
+}
+
+test "full model provenance table drops process override bookkeeping without failing the load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"models\":{");
+    for (0..model_preferences.max_preferences) |i| {
+        if (i > 0) try json.writer.writeByte(',');
+        try json.writer.print("\"p{d}\":\"m{d}\"", .{ i, i });
+    }
+    try json.writer.writeAll("}}\n");
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_MODEL", "process/model");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("m0", result.settings.models.get(model_provider.parse("p0").?).?);
+    // The 36th provenance entry was dropped, so the diagnostic reads as the
+    // default rather than failing the whole settings load.
+    try std.testing.expectEqual(ConfigSource.compiled_default, result.model_source.?);
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {
