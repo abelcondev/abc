@@ -13,7 +13,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
   const root = mkdtempSync(join(tmpdir(), "fx-policy-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
-  const model = "openai/gpt-5";
+  const model = "fixture/compaction";
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
   const originalUser = "Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>" +
     (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) : "");
