@@ -1592,6 +1592,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   }, TIMEOUT);
 
   test("interactive launch flags override model effort and fast mode", async () => {
+    const LAUNCH_MODEL = "provider/launch-model";
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-launch-flags-")));
     const home = join(root, "home");
     const workspacePath = join(root, "workspace");
@@ -1605,7 +1606,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       fakeGatewayFinalText("LAUNCH_FLAGS_OK"),
     ], {
       models: [{
-        id: MODEL,
+        id: LAUNCH_MODEL,
         type: "language",
         tags: ["tool-use", "reasoning"],
         fast_options: [{ type: "toggle" }],
@@ -1615,7 +1616,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     gateway = queuedGateway;
 
     session = await TmuxSession.create({
-      cmd: `${FX_BIN} --model ${MODEL} --effort high --fast`,
+      cmd: `${FX_BIN} --model ${LAUNCH_MODEL} --effort high --fast`,
       cwd: workspace,
       width: 72,
       height: 24,
@@ -1634,14 +1635,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_MODEL: undefined,
       },
     });
-    await session.waitForText("gpt-5.5 · high · ⚡︎", TIMEOUT);
+    await session.waitForText("launch-model · high · ⚡︎", TIMEOUT);
 
     await session.sendText("Prove the launch flags.");
     await session.waitForText("LAUNCH_FLAGS_OK", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
 
     expect(queuedGateway.requests).toHaveLength(1);
-    expect(queuedGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+    expect(queuedGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(LAUNCH_MODEL);
     const request = JSON.parse(queuedGateway.requests[0]!.body);
     expect(request).toMatchObject({
       reasoning: "high",
@@ -1654,7 +1655,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
     await session.kill();
     session = await TmuxSession.create({
-      cmd: `${FX_BIN} --no-fast --model ${MODEL} --resume-last`,
+      cmd: `${FX_BIN} --no-fast --model ${LAUNCH_MODEL} --resume-last`,
       cwd: workspace,
       width: 72,
       height: 24,
@@ -1673,7 +1674,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_MODEL: undefined,
       },
     });
-    const resumed = await session.waitForText("gpt-5.5", TIMEOUT);
+    const resumed = await session.waitForText("launch-model", TIMEOUT);
     expect(resumed).not.toContain("⚡︎");
 
     await session.sendText("Continue without fast.");
@@ -1682,7 +1683,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
     expect(queuedGateway.requests).toHaveLength(2);
     const resumedRequest = JSON.parse(queuedGateway.requests[1]!.body);
-    expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(MODEL);
+    expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(LAUNCH_MODEL);
     expect(resumedRequest).not.toHaveProperty("providerOptions.gateway.speed");
 
     await session.sendText("/quit");
