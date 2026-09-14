@@ -845,6 +845,33 @@ class AcpClient {
   }
 }
 
+test("configured provider ACP preserves reasoning between prompts", async () => {
+  const fixture = createConfiguredProviderFixture(async body => {
+    const response = configuredCompletion(body.model, "reasoned answer");
+    const reasoning = { choices: [{ index: 0, delta: { reasoning: "Consider the request." } }] };
+    return new Response(`data: ${JSON.stringify(reasoning)}\n\n` + await response.text(), { headers: response.headers });
+  });
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    const first = await client.request("session/prompt", { prompt: [{ type: "text", text: "First question" }] }) as any;
+    if (first.error) throw new Error(JSON.stringify(first));
+    expect(first.result.stopReason).toBe("end_turn");
+    const second = await client.request("session/prompt", { prompt: [{ type: "text", text: "Follow up" }] }) as any;
+    if (second.error) throw new Error(JSON.stringify(second));
+    expect(second.result.stopReason).toBe("end_turn");
+    expect(fixture.requests).toHaveLength(2);
+    const assistant = fixture.requests[1].body.messages.find((message: any) => message.role === "assistant");
+    expect(assistant.content).toBe("reasoned answer");
+    expect(assistant.reasoning).toBe("Consider the request.");
+    expect(assistant._tool_call_ids).toBeUndefined();
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
 test.each(["empty", "unrelated"])("configured provider ACP preserves explicit models with %s metadata", async metadata => {
   const fixture = createConfiguredProviderFixture();
   (fixture.settings.providers.local as any).model_metadata = {};

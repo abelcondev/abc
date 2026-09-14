@@ -4,7 +4,98 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 
+async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
+  const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
+  return new Response(prefix + await response.text(), { headers: response.headers });
+}
+
 describe("configured providers", () => {
+  test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      if (calls === 1) return withReasoning(toolCompletion(body.model, "read_file", { path: "note.txt" }), { [field]: "Inspect note first." });
+      return withReasoning(completion(body.model, calls === 2 ? "read complete" : "resumed reply"), { [field]: "Finish answer." });
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const first = await runFx(["ask", "--json", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      expect(saved.output).toBe("read complete");
+      expect(f.requests).toHaveLength(2);
+      const toolTurn = f.requests[1].body.messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length);
+      expect(toolTurn[field]).toBe("Inspect note first.");
+      expect(toolTurn._tool_call_ids).toBeUndefined();
+      expect(f.requests[1].body.messages.at(-1).content).toContain("fixture contents");
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue the saved task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(JSON.parse(resumed.stdout).output).toBe("resumed reply");
+      expect(f.requests).toHaveLength(3);
+      const replayed = f.requests[2].body.messages.filter((message: any) => message.role === "assistant" && message[field] !== undefined);
+      expect(replayed.map((message: any) => message[field])).toEqual(["Inspect note first.", "Finish answer."]);
+      expect(f.requests.every(request => request.authorization === null)).toBe(true);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("reasoning-only completion after silent tools reaches the continuation request", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      if (calls <= 2) return toolCompletion(body.model, "read_file", { path: `note-${calls}.txt` }, `call-${calls}`);
+      if (calls === 3) return withReasoning(completion(body.model, ""), { reasoning_content: "Both files have been read." });
+      return completion(body.model, "The two files were read.");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note-1.txt"), "first contents");
+      writeFileSync(join(f.workspace, "note-2.txt"), "second contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read both notes"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("The two files were read.");
+      expect(f.requests).toHaveLength(4);
+      const messages = f.requests[3].body.messages;
+      expect(messages.at(-1).content).toBe("Summarize what you just did.");
+      expect(messages.at(-2).reasoning_content).toBe("Both files have been read.");
+      expect(messages.at(-2).tool_calls).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("preserves opaque reasoning and tool IDs on resume but never forwards them to another connection", async () => {
+    const firstDetail = { type: "reasoning.text", text: "Inspect the file.", signature: "opaque-signature", format: "anthropic-claude-v1", index: 0 };
+    const secondDetail = { type: "reasoning.encrypted", data: "opaque-encrypted-data", id: "reasoning-1", index: 1 };
+    const callId = "call:opaque/1";
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      if (calls === 1) return withReasoning(toolCompletion(body.model, "read_file", { path: "note.txt" }, callId), { reasoning_details: [firstDetail] }, { reasoning_details: [secondDetail] });
+      return completion(body.model, calls === 2 ? "read complete" : "continued");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const first = await runFx(["ask", "--json", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      expect(saved.output).toBe("read complete");
+      expect(f.requests).toHaveLength(2);
+      const toolTurn = f.requests[1].body.messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length);
+      expect(toolTurn.reasoning_details).toEqual([firstDetail, secondDetail]);
+      expect(toolTurn.tool_calls[0].id).toBe(callId);
+      expect(toolTurn._tool_call_ids).toBeUndefined();
+      expect(f.requests[1].body.messages.at(-1).tool_call_id).toBe(callId);
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue the saved task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests).toHaveLength(3);
+      const restored = f.requests[2].body.messages.find((message: any) => message.reasoning_details);
+      expect(restored.reasoning_details).toEqual([firstDetail, secondDetail]);
+      expect(restored.tool_calls[0].id).toBe(callId);
+      const switched = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue on the other connection"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 20000 });
+      if (switched.code !== 0) throw new Error(switched.stdout + switched.stderr);
+      expect(f.requests).toHaveLength(4);
+      expect(f.requests[3].authorization).toBe(`Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`);
+      expect(f.requests[3].body.messages.every((message: any) => message.reasoning_details === undefined && message.reasoning === undefined && message.reasoning_content === undefined)).toBe(true);
+    } finally { f.close(); }
+  }, 65000);
+
   test("status identifies the configured connection and endpoint without probing it", async () => {
     const f = fixture();
     try {

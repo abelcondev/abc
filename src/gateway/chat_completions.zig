@@ -14,16 +14,16 @@ const review_messages = @import("vercel_protocol.zig");
 const io = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
+const model_provider = @import("../core/config/model_provider.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
-    var identity = @import("../core/config/model_provider.zig").parse(definition.id).?;
-    identity.configured.binding = definition.binding_identity();
     return .{
-        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build },
-        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = identity },
+        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
+        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) },
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
     };
@@ -33,8 +33,64 @@ fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
     return @ptrCast(@alignCast(raw.?));
 }
 
+fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
+    var identity = model_provider.parse(definition.id).?;
+    identity.configured.binding = definition.binding_identity();
+    return identity;
+}
+
 fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition_at(raw).tool_choice_mode });
+    const definition = definition_at(raw);
+    const identity = bound_identity(definition);
+    for (request.messages) |message| if (message.provider_replay) |replay| {
+        if (!replay.matches(.{ .provider = identity, .model = request.model })) {
+            debug_trace.logf("gateway", "provider_replay_omitted reason=source_mismatch", .{});
+            break;
+        }
+    };
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+}
+
+fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+    const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
+    if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
+    return selected;
+}
+
+test "chat completions adapter binds replay to endpoint authority and wires projection" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(alloc);
+    var changed_registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:5678/v1","auth":{"type":"none"}}}
+    );
+    defer changed_registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    const adapter = bundle(definition).agent_stream.?;
+    const replay: types.ProviderReplay = .{
+        .source = .{ .provider = bundle(definition).model_catalog.?.provider_id, .model = "model" },
+        .parts_json = "{\"reasoning_details\":[{\"signature\":\"signed\"}],\"_tool_call_ids\":[]}",
+    };
+    const selected = (try adapter.projectReplay(alloc, replay, &.{}, false, true)).?;
+    try std.testing.expect(selected.parts_json.ptr == replay.parts_json.ptr);
+    try std.testing.expect(try adapter.projectReplay(alloc, replay, &.{}, true, false) == null);
+    const request: streams.RequestData = .{
+        .model = "model",
+        .instructions = &.{.{ .role = .system, .content = "instructions" }},
+        .messages = &.{.{ .role = .assistant, .content = "answer", .provider_replay = replay }},
+        .tool_choice = .auto,
+        .provider_options = .{},
+    };
+    const matching = try adapter.build_request_fn.?(adapter.context, alloc, request);
+    defer alloc.free(matching);
+    try std.testing.expect(std.mem.find(u8, matching, "reasoning_details") != null);
+    const other = bundle(changed_registry.get("local").?).agent_stream.?;
+    const stripped = try other.build_request_fn.?(other.context, alloc, request);
+    defer alloc.free(stripped);
+    try std.testing.expect(std.mem.find(u8, stripped, "reasoning_details") == null);
+    try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {

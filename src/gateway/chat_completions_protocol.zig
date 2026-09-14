@@ -5,12 +5,15 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    /// Borrowed only during serialization; includes the configured authority binding.
+    provider: ?*const model_provider.ProviderId = null,
 };
 
 pub const Error = error{
@@ -21,6 +24,8 @@ pub const Error = error{
     UnsupportedVision,
     UnsupportedResponseFormat,
     UnsupportedReplay,
+    InvalidProviderState,
+    ReplayTooLarge,
     UnsupportedToolProvenance,
     InvalidOutputLimit,
     InvalidToolSelection,
@@ -162,11 +167,11 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     for (request.messages) |message| {
         if (message.images.len != 0) return error.UnsupportedVision;
-        if (message.provider_replay != null) return error.UnsupportedReplay;
+        if (message.provider_replay != null and message.role != .assistant) return error.InvalidProviderState;
         if (message.role != .assistant and message.tool_calls.len != 0) return error.InvalidToolHistory;
         if (message.role != .tool and message.tool_call_id != null) return error.InvalidToolHistory;
         if (message.role != .assistant and message.content == null) return error.InvalidProviderPrompt;
-        if (message.role == .assistant and message.content == null and message.tool_calls.len == 0) return error.InvalidProviderPrompt;
+        if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) return error.InvalidProviderPrompt;
     }
 }
 
@@ -301,12 +306,93 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
     if (pending.count() != 0) return error.InvalidToolHistory;
 }
 
+const reasoning_fields = [_][]const u8{ "reasoning", "reasoning_content" };
+const association_field = "_tool_call_ids";
+
+// The private association list never reaches the wire. Signed/encrypted metadata
+// is indivisible: filtering an associated call must drop the entire sequence.
+fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.json.Value) {
+    if (raw.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
+    try check_json_depth(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProviderState,
+    };
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidProviderState;
+    const fields = parsed.value.object;
+    var metadata_seen = false;
+    var iterator = fields.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (contains_name(&reasoning_fields, key)) {
+            if (value != .string and value != .null) return error.InvalidProviderState;
+            metadata_seen = true;
+        } else if (std.mem.eql(u8, key, "reasoning_details")) {
+            if (value != .null) {
+                if (value != .array) return error.InvalidProviderState;
+                for (value.array.items) |item| if (item != .object) return error.InvalidProviderState;
+            }
+            metadata_seen = true;
+        } else if (std.mem.eql(u8, key, association_field)) {
+            if (value != .array or value.array.items.len > max_selected_tools) return error.InvalidProviderState;
+            for (value.array.items, 0..) |id, index| {
+                if (id != .string or id.string.len == 0 or id.string.len > 256) return error.InvalidProviderState;
+                for (value.array.items[0..index]) |prior| if (std.mem.eql(u8, id.string, prior.string)) return error.InvalidProviderState;
+            }
+        } else return error.InvalidProviderState;
+    }
+    if (!metadata_seen or !fields.contains(association_field)) return error.InvalidProviderState;
+    return parsed;
+}
+
+fn replay_calls_match(fields: std.json.ObjectMap, calls: []const types.ToolCall) bool {
+    const ids = fields.get(association_field).?.array.items;
+    if (ids.len != calls.len) return false;
+    for (ids, calls) |id, call| if (!std.mem.eql(u8, id.string, call.id)) return false;
+    return true;
+}
+
+/// Borrows the whole validated sequence or drops it; never edits opaque blocks.
+pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, _: bool, reasoning: bool) Error!?types.ProviderReplay {
+    const value = replay orelse return null;
+    if (!reasoning) return null;
+    var parsed = try parse_replay(alloc, value.parts_json);
+    defer parsed.deinit();
+    return if (replay_calls_match(parsed.value.object, calls)) value else null;
+}
+
+fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMessage) (Error || std.Io.Writer.Error)!void {
+    const replay = message.provider_replay orelse return;
+    var parsed = try parse_replay(alloc, replay.parts_json);
+    defer parsed.deinit();
+    if (!replay_calls_match(parsed.value.object, message.tool_calls)) return error.InvalidProviderState;
+    var fields = parsed.value.object.iterator();
+    while (fields.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, association_field)) continue;
+        try writer.writeByte(',');
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+        try writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+    }
+}
+
 /// Pure Chat Completions serialization. Caller owns the returned bytes. Model
 /// IDs are opaque: no catalog lookup, prefix inference, or provider defaults.
 /// max_output_tokens deliberately maps to max_tokens, not max_completion_tokens.
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
-pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(request);
+pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
+    try validate_request(input);
+    var projected: ?[]types.ChatMessage = null;
+    if (options.provider) |provider| {
+        projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
+    } else {
+        for (input.messages) |message| if (message.provider_replay != null) return error.UnsupportedReplay;
+    }
+    defer if (projected) |messages| alloc.free(messages);
+    var request = input;
+    request.messages = projected orelse input.messages;
     try validate_history(alloc, request.messages);
     var functions = try select_functions(alloc, request.tools, request.tool_choice);
     defer functions.deinit(alloc);
@@ -319,6 +405,7 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     defer out.deinit();
     write_request(&out.writer, alloc, request, options, functions.items, &projection) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep => |failure| return failure,
         else => return error.InvalidToolSchema,
     };
     return out.toOwnedSlice();
@@ -330,12 +417,15 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var count: usize = 0;
     for ([_][]const types.ChatMessage{ request.instructions, request.messages }) |lane| for (lane) |message| {
+        // Source validation rejects empty assistants; only stripped replay can leave one here.
+        if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
         if (count != 0) try writer.writeByte(',');
         count += 1;
         try writer.writeAll("{\"role\":");
         try std.json.Stringify.value(@tagName(message.role), .{}, writer);
         try writer.writeAll(",\"content\":");
         try std.json.Stringify.value(message.content, .{}, writer);
+        try write_replay(writer, alloc, message);
         if (message.role == .tool) {
             try writer.writeAll(",\"tool_call_id\":");
             try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
@@ -374,13 +464,15 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
         try writer.writeByte(']');
     }
-    if (options.tool_choice_mode == .send) {
-        try writer.writeAll(",\"tool_choice\":");
-        try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
-    }
-    if (request.provider_options.parallel_tool_calls) |parallel| {
-        try writer.writeAll(",\"parallel_tool_calls\":");
-        try std.json.Stringify.value(parallel, .{}, writer);
+    if (functions.len != 0) {
+        if (options.tool_choice_mode == .send) {
+            try writer.writeAll(",\"tool_choice\":");
+            try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+        }
+        if (request.provider_options.parallel_tool_calls) |parallel| {
+            try writer.writeAll(",\"parallel_tool_calls\":");
+            try std.json.Stringify.value(parallel, .{}, writer);
+        }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
     try writer.writeByte('}');
@@ -394,6 +486,17 @@ pub const Limits = struct {
     identity_bytes: usize = 256,
     arguments_bytes: usize = 1024 * 1024,
     content_bytes: usize = 8 * 1024 * 1024,
+    reasoning_bytes: usize = types.ProviderReplay.max_bytes,
+};
+
+const ReasoningPart = struct {
+    presence: enum { absent, null_value, value } = .absent,
+    bytes: std.ArrayList(u8) = .empty,
+};
+
+const Deltas = struct {
+    content: ?[]const u8 = null,
+    reasoning: [2]?[]const u8 = @splat(null),
 };
 
 const Tool = struct {
@@ -422,7 +525,15 @@ pub const Reducer = struct {
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
-    usage_seen: bool = false,
+    usage_total: ?u64 = null,
+    usage_final_fields: packed struct(u3) {
+        input: bool = false,
+        output: bool = false,
+        total: bool = false,
+    } = .{},
+    reasoning: [2]ReasoningPart = @splat(.{}),
+    reasoning_details: ReasoningPart = .{},
+    reasoning_bytes: usize = 0,
     refusal_seen: bool = false,
     finish_reason: ?types.ProviderFinishReason = null,
     phase: enum { receiving, finished, done, closed } = .receiving,
@@ -449,15 +560,17 @@ pub const Reducer = struct {
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.content.deinit(self.alloc);
+        for (&self.reasoning) |*part| part.bytes.deinit(self.alloc);
+        self.reasoning_details.bytes.deinit(self.alloc);
         if (self.generation_id) |id| self.alloc.free(id);
         if (self.response_model) |model| self.alloc.free(model);
         self.* = undefined;
     }
 
-    /// Accepts one already-framed data event. Returns presentation-only content
-    /// borrowed until the next mutation or deinit. JSON-only callers must also
-    /// bound their framing wire; consume_stream does this including comments.
-    pub fn accept(self: *Reducer, data: []const u8, cancelled: bool) Error!?[]const u8 {
+    /// Accepts one already-framed data event. Presentation slices borrow reducer
+    /// storage, not parsed JSON, until the next mutation or deinit. JSON-only
+    /// callers must also bound framing wire; consume_stream includes comments.
+    pub fn accept(self: *Reducer, data: []const u8, cancelled: bool) Error!Deltas {
         errdefer self.phase = .closed;
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed or self.phase == .done) return error.StreamClosed;
@@ -469,10 +582,10 @@ pub const Reducer = struct {
         if (std.mem.eql(u8, data, "[DONE]")) {
             if (self.phase != .finished) return error.IncompleteStream;
             self.phase = .done;
-            return null;
+            return .{};
         }
         try check_json_depth(data);
-        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidChunk,
         };
@@ -487,8 +600,8 @@ pub const Reducer = struct {
         if (choices.len > 1) return error.InvalidChunk;
         if (choices.len == 0) {
             if (self.phase != .finished) return error.InvalidChunk;
-            try self.accept_usage(non_null(root, "usage") orelse return error.InvalidChunk);
-            return null;
+            try self.accept_usage(non_null(root, "usage") orelse return error.InvalidChunk, true);
+            return .{};
         }
         const choice = try object(choices[0]);
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
@@ -504,12 +617,13 @@ pub const Reducer = struct {
                     if (field.value_ptr.* != .null and (field.value_ptr.* != .string or field.value_ptr.string.len != 0)) return error.InconsistentFinishReason;
                 } else return error.InconsistentFinishReason;
             }
-            try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason);
-            return null;
+            try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason, true);
+            return .{};
         }
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
         // These fields carry semantics outside this codec's text/function subset.
-        for ([_][]const u8{ "function_call", "reasoning", "reasoning_content", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        const reasoning_delta = try self.accept_reasoning(delta);
         const content_start = self.content.items.len;
         if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
         if (non_null(delta, "refusal")) |value| {
@@ -517,13 +631,94 @@ pub const Reducer = struct {
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
         if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
-        if (non_null(root, "usage")) |usage| try self.accept_usage(usage);
+        if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
         if (non_null(choice, "finish_reason")) |value| {
             const reason = try string(value);
             self.finish_reason = if (std.mem.eql(u8, reason, "stop")) .stop else if (std.mem.eql(u8, reason, "tool_calls")) .tool_calls else if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "content_filter")) .content_filter else return error.InvalidFinishReason;
             self.phase = .finished;
         }
-        return if (self.content.items.len > content_start) self.content.items[content_start..] else null;
+        return .{
+            .content = if (self.content.items.len > content_start) self.content.items[content_start..] else null,
+            .reasoning = reasoning_delta,
+        };
+    }
+
+    fn accept_reasoning(self: *Reducer, fields: std.json.ObjectMap) Error![2]?[]const u8 {
+        var deltas: [2]?[]const u8 = @splat(null);
+        for (reasoning_fields, &self.reasoning, 0..) |key, *part, index| {
+            const value = fields.get(key) orelse continue;
+            if (value == .null) {
+                if (part.presence == .absent) part.presence = .null_value;
+                continue;
+            }
+            const text = try string(value);
+            const encoded = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+            defer self.alloc.free(encoded);
+            try self.count_reasoning(encoded.len);
+            const start = part.bytes.items.len;
+            try part.bytes.appendSlice(self.alloc, text);
+            part.presence = .value;
+            if (text.len != 0) deltas[index] = part.bytes.items[start..];
+        }
+        if (fields.get("reasoning_details")) |value| {
+            const part = &self.reasoning_details;
+            if (value == .null) {
+                if (part.presence == .absent) part.presence = .null_value;
+            } else {
+                if (value != .array) return error.InvalidChunk;
+                part.presence = .value;
+                for (value.array.items) |item| {
+                    if (item != .object) return error.InvalidChunk;
+                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, item, .{});
+                    defer self.alloc.free(encoded);
+                    try self.count_reasoning(encoded.len + 1);
+                    if (part.bytes.items.len != 0) try part.bytes.append(self.alloc, ',');
+                    try part.bytes.appendSlice(self.alloc, encoded);
+                }
+            }
+        }
+        return deltas;
+    }
+
+    fn count_reasoning(self: *Reducer, bytes: usize) Error!void {
+        const limit = @min(self.limits.reasoning_bytes, types.ProviderReplay.max_bytes);
+        if (bytes > limit - self.reasoning_bytes) return error.ReplayTooLarge;
+        self.reasoning_bytes += bytes;
+    }
+
+    /// Caller owns the bounded replay envelope; accumulators remain reducer-owned.
+    fn reasoning_state(self: *const Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
+        if (self.reasoning[0].presence == .absent and self.reasoning[1].presence == .absent and self.reasoning_details.presence == .absent) return null;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try out.writer.writeByte('{');
+        for (reasoning_fields, self.reasoning) |key, part| {
+            if (part.presence == .absent) continue;
+            try std.json.Stringify.value(key, .{}, &out.writer);
+            try out.writer.writeByte(':');
+            try std.json.Stringify.value(if (part.presence == .value) part.bytes.items else @as(?[]const u8, null), .{}, &out.writer);
+            try out.writer.writeByte(',');
+        }
+        const details = self.reasoning_details;
+        if (details.presence != .absent) {
+            try out.writer.writeAll("\"reasoning_details\":");
+            if (details.presence == .null_value) {
+                try out.writer.writeAll("null");
+            } else {
+                try out.writer.writeByte('[');
+                try out.writer.writeAll(details.bytes.items);
+                try out.writer.writeByte(']');
+            }
+            try out.writer.writeByte(',');
+        }
+        try out.writer.writeAll("\"" ++ association_field ++ "\":[");
+        for (self.tools.items, 0..) |tool, index| {
+            if (index != 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(tool.id.?, .{}, &out.writer);
+        }
+        try out.writer.writeAll("]}");
+        if (out.written().len > @min(self.limits.reasoning_bytes, types.ProviderReplay.max_bytes)) return error.ReplayTooLarge;
+        return try out.toOwnedSlice();
     }
 
     fn accept_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize) Error!void {
@@ -572,23 +767,44 @@ pub const Reducer = struct {
         return false;
     }
 
-    fn accept_usage(self: *Reducer, value: std.json.Value) Error!void {
+    fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
         const fields = try object(value);
-        const usage = types.Usage{
+        const incoming = types.Usage{
             .input_tokens = try token_count(fields, "prompt_tokens"),
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
-        const total = try token_count(fields, "total_tokens");
-        if (total) |tokens| if (usage.input_tokens != null and usage.output_tokens != null) {
-            const sum = std.math.add(u64, usage.input_tokens.?, usage.output_tokens.?) catch return error.InvalidChunk;
-            if (tokens != sum) return error.InvalidChunk;
+        const incoming_total = try token_count(fields, "total_tokens");
+        const usage = types.Usage{
+            .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
+            .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
         };
-        if (self.usage_seen) {
-            if (!std.meta.eql(self.usage, usage)) return error.ConflictingIdentity;
-        } else {
-            self.usage = usage;
-            self.usage_seen = true;
+        const total = incoming_total orelse self.usage_total;
+        var final_fields = self.usage_final_fields;
+        if (final) {
+            final_fields.input = final_fields.input or incoming.input_tokens != null;
+            final_fields.output = final_fields.output or incoming.output_tokens != null;
+            final_fields.total = final_fields.total or incoming_total != null;
         }
+        // Carried progress values are lower bounds, not current or final assertions.
+        if (total) |tokens| {
+            const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
+            const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
+            if (incoming_total != null or final_fields.total) {
+                if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
+            } else if (exact and sum < tokens) return error.InvalidChunk;
+        }
+        for (
+            [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total },
+            [_]?u64{ usage.input_tokens, usage.output_tokens, total },
+            [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total },
+        ) |previous, current, was_final| {
+            if (previous) |prior| {
+                if (current.? < prior or (was_final and current.? != prior)) return error.ConflictingIdentity;
+            }
+        }
+        self.usage = usage;
+        self.usage_total = total;
+        self.usage_final_fields = final_fields;
     }
 
     /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
@@ -615,6 +831,11 @@ pub const Reducer = struct {
             if (!self.known_name(tool.name.items)) return error.InvalidToolName;
             try validate_arguments(self.alloc, tool.arguments.items);
         }
+        const provider_state = self.reasoning_state() catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |failure| return failure,
+        };
+        errdefer if (provider_state) |state| self.alloc.free(state);
         var calls: std.ArrayList(types.ToolCall) = .empty;
         errdefer {
             for (calls.items) |call| {
@@ -644,7 +865,7 @@ pub const Reducer = struct {
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
             .usage = .{ .unavailable = .possibly_billed },
         } };
@@ -664,15 +885,23 @@ fn non_null(fields: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     return if (value == .null) null else value;
 }
 
+fn integer(value: std.json.Value) Error!i64 {
+    // Keep opaque metadata numbers lossless, but retain integer-only counters
+    // and indexes with the same range as the ordinary JSON integer parser.
+    return switch (value) {
+        .integer => value.integer,
+        .number_string => std.fmt.parseInt(i64, value.number_string, 10) catch error.InvalidChunk,
+        else => error.InvalidChunk,
+    };
+}
+
 fn index_value(value: std.json.Value) Error!usize {
-    if (value != .integer) return error.InvalidChunk;
-    return std.math.cast(usize, value.integer) orelse error.InvalidChunk;
+    return std.math.cast(usize, try integer(value)) orelse error.InvalidChunk;
 }
 
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
     const value = non_null(fields, key) orelse return null;
-    if (value != .integer) return error.InvalidChunk;
-    return std.math.cast(u64, value.integer) orelse error.InvalidChunk;
+    return std.math.cast(u64, try integer(value)) orelse error.InvalidChunk;
 }
 
 fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []const u8, limit: usize, failure: Error) Error!void {
@@ -700,7 +929,17 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
             else => return err,
         };
         const chunk = data orelse return error.IncompleteStream;
-        if (try reducer.accept(chunk, cancel_flag.load(.seq_cst))) |text| if (events) |sink| sink.emit(.{ .content_delta = text });
+        const deltas = try reducer.accept(chunk, cancel_flag.load(.seq_cst));
+        if (events) |sink| {
+            for (deltas.reasoning) |delta| if (delta) |text| {
+                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+                sink.emit(.{ .reasoning_delta = text });
+            };
+            if (deltas.content) |text| {
+                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+                sink.emit(.{ .content_delta = text });
+            }
+        }
         if (reducer.phase == .done) return reducer.finish(cancel_flag.load(.seq_cst));
     }
 }
@@ -748,6 +987,665 @@ fn test_finish(reducer: *Reducer, terminal: []const u8) Error!stream_provider.Re
     try test_accept(reducer, terminal);
     try test_accept(reducer, "[DONE]");
     return reducer.finish(false);
+}
+
+test "chat completions reasoning fields survive a completed response" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "reasoning", "reasoning_content" }) |field| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        for ([_][]const u8{ "think ", "carefully" }) |fragment| {
+            const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":\"{s}\"}}}}]}}", .{ field, fragment });
+            defer alloc.free(chunk);
+            try test_accept(&reducer, chunk);
+        }
+        try test_accept(&reducer, test_text);
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+        try std.testing.expect(result.completed.completion.provider_state_json != null);
+        var state = try std.json.parseFromSlice(std.json.Value, alloc, result.completed.completion.provider_state_json.?, .{});
+        defer state.deinit();
+        try std.testing.expectEqualStrings("think carefully", state.value.object.get(field).?.string);
+    }
+}
+
+test "chat completions preserves structured reasoning sequence with opaque signatures" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Inspect the file.\",\"signature\":\"opaque-signature\",\"format\":\"anthropic-claude-v1\",\"index\":0}]}}]}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque-encrypted-data\",\"id\":\"reasoning-1\",\"index\":1}]}}]}");
+    try test_accept(&reducer, test_call);
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.completed.completion.provider_state_json != null);
+    var state = try std.json.parseFromSlice(std.json.Value, alloc, result.completed.completion.provider_state_json.?, .{});
+    defer state.deinit();
+    const details = state.value.object.get("reasoning_details").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), details.len);
+    try std.testing.expectEqualStrings("opaque-signature", details[0].object.get("signature").?.string);
+    try std.testing.expectEqualStrings("opaque-encrypted-data", details[1].object.get("data").?.string);
+    try std.testing.expectEqualStrings("reasoning-1", details[1].object.get("id").?.string);
+}
+
+test "chat completions cumulative usage advances to final counts without double counting" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}");
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    try std.testing.expectEqualStrings("hello world", result.completed.completion.content.?);
+}
+
+test "chat completions reasoning deltas own decoded text and preserve null empty aliases" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":null,\"reasoning_content\":\"\",\"reasoning_details\":null}}]}");
+    const chunk = try alloc.dupe(u8, "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think\\n\",\"reasoning_content\":\"other\\t\",\"content\":\"answer\"}}]}");
+    defer alloc.free(chunk);
+    const deltas = try reducer.accept(chunk, false);
+    @memset(chunk, 'x');
+    try std.testing.expectEqualStrings("think\n", deltas.reasoning[0].?);
+    try std.testing.expectEqualStrings("other\t", deltas.reasoning[1].?);
+    try std.testing.expectEqualStrings("answer", deltas.content.?);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":null,\"reasoning_content\":null}}]}");
+    var result = try test_finish(&reducer, test_stop);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"reasoning\":\"think\\n\",\"reasoning_content\":\"other\\t\",\"reasoning_details\":null,\"_tool_call_ids\":[]}", result.completed.completion.provider_state_json.?);
+}
+
+const test_reasoning = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"inspect\",\"reasoning_content\":\"carefully\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"first\",\"index\":0,\"signature\":\"signed\"}]}}]}";
+const test_reasoning_continuation = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"second\",\"index\":0},{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\",\"extra\":{\"signature\":\"nested\",\"number\":0.12345678901234567890,\"large\":18446744073709551616}}]}}]}";
+
+fn test_provider() model_provider.ProviderId {
+    var provider = model_provider.parse("local").?;
+    provider.configured.binding = @splat(1);
+    return provider;
+}
+
+test "chat completions replay-only assistant supports silent-tool continuation and allocation failures" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const provider = test_provider();
+            var first = try Reducer.init(alloc, test_request(), .{});
+            defer first.deinit();
+            try test_accept(&first, test_reasoning);
+            var completion = try test_finish(&first, test_stop);
+            defer completion.deinit(alloc);
+            try std.testing.expect(completion.completed.completion.content == null);
+            const replay: types.ProviderReplay = .{
+                .source = .{ .provider = provider, .model = test_request().model },
+                .parts_json = completion.completed.completion.provider_state_json.?,
+            };
+            var request = test_request();
+            request.messages = &.{
+                .{ .role = .assistant, .provider_replay = replay },
+                .{ .role = .user, .content = "Summarize what you just did." },
+            };
+            const body = try build_request(alloc, request, .{ .provider = &provider });
+            defer alloc.free(body);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            const messages = parsed.value.object.get("messages").?.array.items;
+            try std.testing.expectEqual(@as(usize, 4), messages.len);
+            try std.testing.expect(messages[2].object.get("content").? == .null);
+            try std.testing.expectEqualStrings("inspect", messages[2].object.get("reasoning").?.string);
+            try std.testing.expect(messages[2].object.get("tool_calls") == null);
+            try std.testing.expect(messages[2].object.get(association_field) == null);
+            try std.testing.expectEqualStrings("Summarize what you just did.", messages[3].object.get("content").?.string);
+            var continuation = try Reducer.init(alloc, request, .{});
+            defer continuation.deinit();
+            try test_accept(&continuation, test_text);
+            var result = try test_finish(&continuation, test_stop);
+            defer result.deinit(alloc);
+            try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+            request.model = "another-model";
+            const stripped = try build_request(alloc, request, .{ .provider = &provider });
+            defer alloc.free(stripped);
+            try std.testing.expect(std.mem.find(u8, stripped, "\"role\":\"assistant\"") == null);
+            try std.testing.expect(request.messages[0].content == null);
+            try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "chat completions stripped replay-only rows are omitted without changing canonical history" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var changed = provider;
+    changed.configured.binding.?[0] ^= 1;
+    const replay: types.ProviderReplay = .{
+        .source = .{ .provider = provider, .model = test_request().model },
+        .parts_json = "{\"reasoning_details\":[{\"signature\":\"signed\"}],\"_tool_call_ids\":[]}",
+    };
+    for ([_]model_provider.ProviderSelection{
+        .{ .provider = changed, .model = replay.source.model },
+        .{ .provider = provider, .model = "another-model" },
+    }) |target| for ([_]bool{ false, true }) |with_instructions| {
+        var request = test_request();
+        request.model = target.model;
+        if (!with_instructions) request.instructions = &.{};
+        request.messages = &.{
+            .{ .role = .assistant, .provider_replay = replay },
+            .{ .role = .assistant, .provider_replay = replay },
+            .{ .role = .user, .content = "Summarize what you just did." },
+        };
+        const body = try build_request(alloc, request, .{ .provider = &target.provider });
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const messages = parsed.value.object.get("messages").?.array.items;
+        try std.testing.expectEqual(request.instructions.len + 1, messages.len);
+        try std.testing.expectEqualStrings("user", messages[messages.len - 1].object.get("role").?.string);
+        try std.testing.expectEqualStrings("Summarize what you just did.", messages[messages.len - 1].object.get("content").?.string);
+        try std.testing.expect(std.mem.find(u8, body, "reasoning_details") == null);
+        try std.testing.expectEqual(@as(usize, 3), request.messages.len);
+        for (request.messages[0..2]) |message| {
+            try std.testing.expect(message.content == null);
+            try std.testing.expect(message.provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
+            try std.testing.expect(message.provider_replay.?.matches(replay.source));
+        }
+    };
+}
+
+test "chat completions replay-only input rejects missing malformed over-limit or unpaired replay" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var request = test_request();
+    request.messages = &.{.{ .role = .assistant }};
+    try std.testing.expectError(error.InvalidProviderPrompt, build_request(alloc, request, .{ .provider = &provider }));
+    try std.testing.expectError(error.InvalidProviderPrompt, Reducer.init(alloc, request, .{}));
+    const oversized = try alloc.alloc(u8, types.ProviderReplay.max_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    for ([_]struct { raw: []const u8, failure: Error }{
+        .{ .raw = "{", .failure = error.InvalidProviderState },
+        .{ .raw = "{}", .failure = error.InvalidProviderState },
+        .{ .raw = "{\"reasoning\":[],\"_tool_call_ids\":[]}", .failure = error.InvalidProviderState },
+        .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[\"missing-call\"]}", .failure = error.InvalidProviderState },
+        .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[],\"role\":\"system\"}", .failure = error.InvalidProviderState },
+        .{ .raw = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
+        .{ .raw = oversized, .failure = error.ReplayTooLarge },
+    }) |case| {
+        request.messages = &.{.{ .role = .assistant, .provider_replay = .{
+            .source = .{ .provider = provider, .model = request.model },
+            .parts_json = case.raw,
+        } }};
+        try std.testing.expectError(case.failure, build_request(alloc, request, .{ .provider = &provider }));
+    }
+}
+
+test "chat completions replay preserves sequence protected IDs affinity and canonical history" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_reasoning);
+    try test_accept(&reducer, test_reasoning_continuation);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"functions/read:0\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const replay: types.ProviderReplay = .{ .source = .{ .provider = provider, .model = test_request().model }, .parts_json = completion.provider_state_json.? };
+    var request = test_request();
+    request.messages = &.{
+        .{ .role = .assistant, .tool_calls = completion.tool_calls, .provider_replay = replay },
+        .{ .role = .tool, .tool_call_id = completion.tool_calls[0].id, .content = "result" },
+    };
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const assistant = messages[2].object;
+    const details = assistant.get("reasoning_details").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), details.len);
+    try std.testing.expectEqualStrings("first", details[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("signed", details[0].object.get("signature").?.string);
+    try std.testing.expectEqualStrings("second", details[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings("nested", details[2].object.get("extra").?.object.get("signature").?.string);
+    try std.testing.expectEqualStrings("functions/read:0", assistant.get("tool_calls").?.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("functions/read:0", messages[3].object.get("tool_call_id").?.string);
+    try std.testing.expect(assistant.get(association_field) == null);
+    try std.testing.expectEqualStrings("inspect", assistant.get("reasoning").?.string);
+    try std.testing.expectEqualStrings("carefully", assistant.get("reasoning_content").?.string);
+    try std.testing.expect(std.mem.find(u8, body, "\"number\":0.12345678901234567890,\"large\":18446744073709551616") != null);
+    var changed = provider;
+    changed.configured.binding.?[0] ^= 1;
+    for ([_]model_provider.ProviderId{ changed, model_provider.parse("local").?, .gateway }) |other| {
+        const stripped = try build_request(alloc, request, .{ .provider = &other });
+        defer alloc.free(stripped);
+        try std.testing.expect(std.mem.find(u8, stripped, "reasoning") == null);
+        try std.testing.expect(std.mem.find(u8, stripped, "fx_") != null);
+    }
+    request.model = "another-model";
+    const stripped = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(stripped);
+    try std.testing.expect(std.mem.find(u8, stripped, "reasoning") == null);
+    try std.testing.expectEqualStrings("functions/read:0", completion.tool_calls[0].id);
+    try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
+}
+
+test "chat completions projection keeps indivisible reasoning only with all associated calls" {
+    const alloc = std.testing.allocator;
+    const calls = [_]types.ToolCall{
+        .{ .id = "vision:0", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "read:1", .name = "read_file", .arguments_json = "{}" },
+    };
+    const replay: types.ProviderReplay = .{ .source = .{ .provider = test_provider(), .model = "model" }, .parts_json = "{\"reasoning_details\":[{\"signature\":\"opaque\"}],\"_tool_call_ids\":[\"vision:0\",\"read:1\"]}" };
+    const retained = (try project_replay(alloc, replay, &calls, false, true)).?;
+    try std.testing.expect(retained.parts_json.ptr == replay.parts_json.ptr);
+    try std.testing.expect(try project_replay(alloc, replay, calls[1..], true, true) == null);
+    try std.testing.expect(try project_replay(alloc, replay, &.{}, true, true) == null);
+    try std.testing.expect(try project_replay(alloc, replay, &calls, true, false) == null);
+    try std.testing.expect(try project_replay(alloc, null, &calls, true, true) == null);
+    const standalone: types.ProviderReplay = .{ .source = replay.source, .parts_json = "{\"reasoning\":\"thinking\",\"_tool_call_ids\":[]}" };
+    try std.testing.expectEqualStrings(standalone.parts_json, (try project_replay(alloc, standalone, &.{}, false, true)).?.parts_json);
+    var filtered = test_request();
+    filtered.model = replay.source.model;
+    filtered.messages = &.{
+        .{ .role = .assistant, .tool_calls = calls[1..], .provider_replay = replay },
+        .{ .role = .tool, .tool_call_id = calls[1].id, .content = "result" },
+    };
+    try std.testing.expectError(error.InvalidProviderState, build_request(alloc, filtered, .{ .provider = &replay.source.provider }));
+}
+
+test "chat completions recovered replay rejects injection malformed associations and depth" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    for ([_][]const u8{
+        "[]",                                                           "{",                                                                       "{}",                                                                  "{\"reasoning\":\"missing association\"}",
+        "{\"reasoning\":[],\"_tool_call_ids\":[]}",                     "{\"reasoning_details\":[\"not an object\"],\"_tool_call_ids\":[]}",       "{\"reasoning_details\":{},\"_tool_call_ids\":[]}",                    "{\"reasoning\":null,\"_tool_call_ids\":[1]}",
+        "{\"reasoning\":null,\"_tool_call_ids\":[\"x\",\"x\"]}",        "{\"reasoning\":null,\"_tool_call_ids\":[\"\"]}",                          "{\"reasoning\":\"one\",\"reasoning\":\"two\",\"_tool_call_ids\":[]}", "{\"reasoning\":null,\"_tool_call_ids\":[],\"role\":\"system\"}",
+        "{\"reasoning\":null,\"_tool_call_ids\":[],\"tool_calls\":[]}", "{\"reasoning\":null,\"_tool_call_ids\":[],\"tool_choice\":\"required\"}",
+    }) |raw| {
+        var request = test_request();
+        const replay: types.ProviderReplay = .{ .source = .{ .provider = provider, .model = request.model }, .parts_json = raw };
+        request.messages = &.{.{ .role = .assistant, .content = "answer", .provider_replay = replay }};
+        try std.testing.expectError(error.InvalidProviderState, build_request(alloc, request, .{ .provider = &provider }));
+        try std.testing.expectError(error.InvalidProviderState, project_replay(alloc, replay, &.{}, true, true));
+    }
+    const deep = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}";
+    try std.testing.expectError(error.JsonTooDeep, parse_replay(alloc, deep));
+    const oversized = try alloc.alloc(u8, types.ProviderReplay.max_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    try std.testing.expectError(error.ReplayTooLarge, parse_replay(alloc, oversized));
+}
+
+test "chat completions replay accepts exactly the byte and nesting limits" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"reasoning\":\"";
+    const suffix = "\",\"_tool_call_ids\":[]}";
+    const raw = try alloc.alloc(u8, types.ProviderReplay.max_bytes);
+    defer alloc.free(raw);
+    @memcpy(raw[0..prefix.len], prefix);
+    @memset(raw[prefix.len .. raw.len - suffix.len], 'r');
+    @memcpy(raw[raw.len - suffix.len ..], suffix);
+    var parsed = try parse_replay(alloc, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(raw.len - prefix.len - suffix.len, parsed.value.object.get("reasoning").?.string.len);
+    const deepest = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 62 ++ "0" ++ "}" ** 62 ++ "],\"_tool_call_ids\":[]}";
+    var nested = try parse_replay(alloc, deepest);
+    defer nested.deinit();
+}
+
+test "chat completions reasoning rejects malformed deltas and enforces aggregate and final bounds" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"reasoning\":{}", "\"reasoning_content\":1", "\"reasoning_details\":{}", "\"reasoning_details\":[null]", "\"reasoning_details\":[[]]" }) |field| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}}}}]}}", .{field});
+        defer alloc.free(chunk);
+        try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
+        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
+    }
+    var baseline = try Reducer.init(alloc, test_request(), .{});
+    defer baseline.deinit();
+    try test_accept(&baseline, test_reasoning);
+    var result = try test_finish(&baseline, test_stop);
+    defer result.deinit(alloc);
+    const size = result.completed.completion.provider_state_json.?.len;
+    for ([_]usize{ size, size - 1 }) |limit| {
+        var reducer = try Reducer.init(alloc, test_request(), .{ .reasoning_bytes = limit });
+        defer reducer.deinit();
+        try test_accept(&reducer, test_reasoning);
+        if (limit == size) {
+            var exact = try test_finish(&reducer, test_stop);
+            defer exact.deinit(alloc);
+        } else try std.testing.expectError(error.ReplayTooLarge, test_finish(&reducer, test_stop));
+    }
+    var bounded = try Reducer.init(alloc, test_request(), .{ .reasoning_bytes = size });
+    defer bounded.deinit();
+    try test_accept(&bounded, test_reasoning);
+    try std.testing.expectError(error.ReplayTooLarge, bounded.accept(test_reasoning, false));
+}
+
+test "chat completions reasoning replay releases all partial allocations" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const provider = test_provider();
+            var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+            defer reducer.deinit();
+            try test_accept(&reducer, test_reasoning);
+            try test_accept(&reducer, test_reasoning_continuation);
+            try test_accept(&reducer, test_call);
+            var result = try test_finish(&reducer, test_tools_finish);
+            defer result.deinit(alloc);
+            const completion = result.completed.completion;
+            var request = test_request();
+            const replay: types.ProviderReplay = .{ .source = .{ .provider = provider, .model = request.model }, .parts_json = completion.provider_state_json.? };
+            request.messages = &.{
+                .{ .role = .assistant, .tool_calls = completion.tool_calls, .provider_replay = replay },
+                .{ .role = .tool, .tool_call_id = completion.tool_calls[0].id, .content = "result" },
+            };
+            const body = try build_request(alloc, request, .{ .provider = &provider });
+            defer alloc.free(body);
+            _ = try project_replay(alloc, replay, completion.tool_calls, false, true);
+            _ = try project_replay(alloc, replay, &.{}, true, true);
+            request.model = "another";
+            const stripped = try build_request(alloc, request, .{ .provider = &provider });
+            defer alloc.free(stripped);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "chat completions reasoning presentation checks cancellation before content from the same event" {
+    const Observer = struct {
+        flag: *std.atomic.Value(bool),
+        cancel_on_reasoning: bool,
+        reasoning_count: usize = 0,
+        content_count: usize = 0,
+        fn emit(raw: *anyopaque, event: stream_provider.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .reasoning_delta => |text| {
+                    std.testing.expectEqualStrings("think\n", text) catch @panic("invalid reasoning presentation");
+                    self.reasoning_count += 1;
+                    if (self.cancel_on_reasoning) self.flag.store(true, .seq_cst);
+                },
+                .content_delta => self.content_count += 1,
+                else => {},
+            }
+        }
+    };
+    const wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think\\n\",\"content\":\"answer\"}}]}\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n";
+    for ([_]bool{ false, true }) |cancel| {
+        var flag = std.atomic.Value(bool).init(false);
+        var observer: Observer = .{ .flag = &flag, .cancel_on_reasoning = cancel };
+        var source = std.Io.Reader.fixed(wire);
+        const sink: stream_provider.EventSink = .{ .context = &observer, .emit_fn = Observer.emit };
+        if (cancel) {
+            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag));
+        } else {
+            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag);
+            defer result.deinit(std.testing.allocator);
+        }
+        try std.testing.expectEqual(@as(usize, 1), observer.reasoning_count);
+        try std.testing.expectEqual(@as(usize, if (cancel) 0 else 1), observer.content_count);
+    }
+}
+
+test "chat completions progress usage can finalize in a trailer but cannot decrease or contradict finals" {
+    const alloc = std.testing.allocator;
+    const progress = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}";
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, progress);
+    try test_accept(&reducer, progress);
+    try test_accept(&reducer, test_stop);
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}");
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    for ([_]struct { usage: []const u8, failure: Error }{
+        .{ .usage = "{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}", .failure = error.ConflictingIdentity },
+        .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}", .failure = error.ConflictingIdentity },
+        .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":11}", .failure = error.InvalidChunk },
+        .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":-1}", .failure = error.InvalidChunk },
+        .{ .usage = "{\"prompt_tokens\":10,\"total_tokens\":9}", .failure = error.InvalidChunk },
+    }) |case| for ([_]bool{ false, true }) |final| {
+        var invalid = try Reducer.init(alloc, test_request(), .{});
+        defer invalid.deinit();
+        try test_accept(&invalid, progress);
+        if (final) try test_accept(&invalid, test_stop);
+        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
+        defer alloc.free(chunk);
+        try std.testing.expectError(case.failure, invalid.accept(chunk, false));
+    };
+    var totals = try Reducer.init(alloc, test_request(), .{});
+    defer totals.deinit();
+    try test_accept(&totals, "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"total_tokens\":10}}");
+    try test_accept(&totals, test_stop);
+    try test_accept(&totals, "{\"choices\":[],\"usage\":{\"total_tokens\":11}}");
+    try std.testing.expectError(error.ConflictingIdentity, totals.accept("{\"choices\":[],\"usage\":{\"total_tokens\":12}}", false));
+}
+
+fn test_usage_snapshot(reducer: *Reducer, usage: []const u8) Error!void {
+    const choices = if (reducer.phase == .finished) "[]" else "[{\"index\":0,\"delta\":{}}]";
+    const chunk = try std.fmt.allocPrint(reducer.alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ choices, usage });
+    defer reducer.alloc.free(chunk);
+    try test_accept(reducer, chunk);
+}
+
+test "chat completions final usage allows optional total metadata in either order" {
+    const alloc = std.testing.allocator;
+    const counts = "{\"prompt_tokens\":10,\"completion_tokens\":3}";
+    const with_total = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}";
+    for ([_]bool{ false, true }) |total_first| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{if (total_first) with_total else counts});
+        defer alloc.free(terminal);
+        try test_accept(&reducer, terminal);
+        try test_usage_snapshot(&reducer, if (total_first) counts else with_total);
+        try test_usage_snapshot(&reducer, "{}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":null,\"completion_tokens\":null,\"total_tokens\":null}");
+        try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    }
+}
+
+test "chat completions partial usage snapshots enrich without erasing known counters" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |final| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        if (final) try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, "{\"total_tokens\":13}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10}");
+        try std.testing.expect(reducer.usage.output_tokens == null);
+        try test_usage_snapshot(&reducer, "{\"completion_tokens\":3}");
+        try test_usage_snapshot(&reducer, "{\"total_tokens\":null}");
+        try std.testing.expectEqual(@as(?u64, 10), reducer.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), reducer.usage.output_tokens);
+        try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+        if (!final) try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, "{}");
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    }
+    var progress = try Reducer.init(alloc, test_request(), .{});
+    defer progress.deinit();
+    try test_usage_snapshot(&progress, "{\"prompt_tokens\":10,\"completion_tokens\":1}");
+    try test_usage_snapshot(&progress, "{\"completion_tokens\":2}");
+    try test_accept(&progress, test_stop);
+    try test_usage_snapshot(&progress, "{\"completion_tokens\":3,\"total_tokens\":13}");
+    try std.testing.expectEqual(@as(?u64, 10), progress.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), progress.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 13), progress.usage_total);
+}
+
+test "chat completions progress with omitted totals reaches enriched final usage" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":2}");
+    try std.testing.expectEqual(@as(?u64, 11), reducer.usage_total);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}");
+    try std.testing.expectEqual(@as(?u64, 11), reducer.usage_total);
+    try test_usage_snapshot(&reducer, "{\"total_tokens\":13}");
+    try test_usage_snapshot(&reducer, "{}");
+    try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    try std.testing.expect(result.completed.completion.billing == null);
+    try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
+}
+
+test "chat completions partial final fields do not freeze carried progress observations" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"prompt_tokens\":10,\"total_tokens\":13}",
+        "{}",
+        "{\"prompt_tokens\":null,\"completion_tokens\":null,\"total_tokens\":null}",
+    }) |initial_final| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+        try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, initial_final);
+        try test_usage_snapshot(&reducer, "{\"completion_tokens\":3}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"total_tokens\":13}");
+        try std.testing.expectEqual(@as(?u64, 10), reducer.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), reducer.usage.output_tokens);
+        try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+        try std.testing.expectError(error.ConflictingIdentity, test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}"));
+    }
+}
+
+test "chat completions final output alone permits later final input enrichment" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, "{\"completion_tokens\":3}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":11,\"total_tokens\":14}");
+    try std.testing.expectEqual(@as(?u64, 11), reducer.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), reducer.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 14), reducer.usage_total);
+    try std.testing.expectError(error.ConflictingIdentity, test_usage_snapshot(&reducer, "{\"prompt_tokens\":12,\"total_tokens\":15}"));
+}
+
+test "chat completions progress totals constrain current assertions rather than stale equality" {
+    const alloc = std.testing.allocator;
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_usage_snapshot(&reducer, "{\"total_tokens\":13}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":14}");
+        try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+        try std.testing.expectEqual(@as(?u64, 14), reducer.usage.input_tokens);
+    }
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+    try test_usage_snapshot(&reducer, "{\"completion_tokens\":2,\"total_tokens\":15}");
+    try std.testing.expectEqual(@as(?u64, 10), reducer.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), reducer.usage.output_tokens);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":13}");
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":13,\"completion_tokens\":2,\"total_tokens\":15}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 13), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), result.completed.completion.usage.output_tokens);
+}
+
+test "chat completions partial usage rejects conflicts against merged observations" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { first: []const u8, next: []const u8, final: bool = false, failure: Error }{
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
+        .{ .first = "{\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":2}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":14}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":14}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":2}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"prompt_tokens\":9223372036854775807}", .next = "{\"completion_tokens\":9223372036854775807,\"total_tokens\":9223372036854775807}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":9}", .failure = error.ConflictingIdentity },
+        .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":2}", .failure = error.ConflictingIdentity },
+        .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":12}", .failure = error.ConflictingIdentity },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":11}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":-1}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"total_tokens\":-1}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":1.5}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"total_tokens\":\"13\"}", .failure = error.InvalidChunk },
+    }) |case| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        if (case.final) try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, case.first);
+        const previous = reducer.usage;
+        const previous_total = reducer.usage_total;
+        const previous_final_fields = reducer.usage_final_fields;
+        try std.testing.expectError(case.failure, test_usage_snapshot(&reducer, case.next));
+        try std.testing.expectEqualDeep(previous, reducer.usage);
+        try std.testing.expectEqual(previous_total, reducer.usage_total);
+        try std.testing.expectEqualDeep(previous_final_fields, reducer.usage_final_fields);
+        try std.testing.expectEqual(.closed, reducer.phase);
+    }
+}
+
+test "chat completions opaque number preservation does not relax index or usage validation" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "-1", "0.0", "1e0", "9223372036854775808", "\"0\"", "null" }) |number| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":{s},\"delta\":{{}}}}]}}", .{number});
+        defer alloc.free(chunk);
+        try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
+    }
+    for ([_][]const u8{ "-1", "0.0", "1e0", "9223372036854775808", "\"0\"" }) |number| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_stop);
+        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[],\"usage\":{{\"completion_tokens\":{s}}}}}", .{number});
+        defer alloc.free(chunk);
+        try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
+    }
+}
+
+test "chat completions omits tool controls when no tools are advertised" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.provider_options.parallel_tool_calls = true;
+    const body = try build_request(alloc, request, .{ .tool_choice_mode = .send });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("tools") == null);
+    try std.testing.expect(parsed.value.object.get("tool_choice") == null);
+    try std.testing.expect(parsed.value.object.get("parallel_tool_calls") == null);
 }
 
 test "chat completions exact text wire preserves instruction order and opaque model" {
@@ -845,10 +1743,11 @@ test "chat completions tool choice controls and deliberate basic option mapping"
         defer parsed.deinit();
         const fields = parsed.value.object;
         try std.testing.expectEqual(choice != .none, fields.get("tools") != null);
-        try std.testing.expectEqual(mode == .send, fields.get("tool_choice") != null);
-        if (mode == .send) try std.testing.expectEqualStrings(@tagName(choice), fields.get("tool_choice").?.string);
+        try std.testing.expectEqual(mode == .send and choice != .none, fields.get("tool_choice") != null);
+        if (mode == .send and choice != .none) try std.testing.expectEqualStrings(@tagName(choice), fields.get("tool_choice").?.string);
         try std.testing.expectEqual(@as(i64, 73), fields.get("max_tokens").?.integer);
-        try std.testing.expect(!fields.get("parallel_tool_calls").?.bool);
+        try std.testing.expectEqual(choice != .none, fields.get("parallel_tool_calls") != null);
+        if (choice != .none) try std.testing.expect(!fields.get("parallel_tool_calls").?.bool);
         try std.testing.expect(fields.get("providerOptions") == null);
         try std.testing.expect(fields.get("max_completion_tokens") == null);
     };
@@ -940,7 +1839,7 @@ test "chat completions accepts matching empty terminal usage choices" {
         try test_accept(&reducer, if (with_tools) test_tools_finish else test_stop);
         const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{if (with_tools) "tool_calls" else "stop"});
         defer alloc.free(trailer);
-        try std.testing.expect((try reducer.accept(trailer, false)) == null);
+        try std.testing.expect((try reducer.accept(trailer, false)).content == null);
         try test_accept(&reducer, "[DONE]");
         var result = try reducer.finish(false);
         defer result.deinit(alloc);
@@ -1095,7 +1994,7 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"web_search\"}]}}]}", .failure = error.InvalidChunk },
-        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}", .failure = error.InvalidChunk },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":{}}}]}", .failure = error.InvalidChunk },
     };
     for (cases) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
