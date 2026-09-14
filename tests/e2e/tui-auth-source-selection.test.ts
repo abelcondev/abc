@@ -1436,10 +1436,29 @@ tmuxTest("grok fast mode sends the priority service tier", async () => {
       ...grok.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
     });
     await session.waitForComposer(TIMEOUT);
+    await session.sendText("Use the default tier.");
+    await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+    const standardRequest = grok.requests.find(
+      (request) => request.path === "/v1/responses" && request.body?.includes("Use the default tier."),
+    );
+    expect(JSON.parse(standardRequest?.body ?? "{}").service_tier).toBeUndefined();
+    // Wait for the model catalog to be ready before toggling fast mode.
+    await session.sendLiteralText("/model");
+    await session.sendKeys("Tab");
+    await session.waitForPane(
+      (pane) => pane.includes("grok-4.6") && pane.includes("grok-4.20"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-c");
+    await session.waitForComposer(TIMEOUT);
     await session.sendText("/fast");
     await session.waitForText("fast: on", TIMEOUT);
     await session.sendText("Use the priority tier.");
-    await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+    await session.waitForPane(
+      (pane) => pane.split("GROK_DIRECT_RESPONSE").length - 1 >= 2,
+      TIMEOUT,
+    );
     const directRequest = grok.requests.find(
       (request) => request.path === "/v1/responses" && request.body?.includes("Use the priority tier."),
     );
