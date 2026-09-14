@@ -554,6 +554,79 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "session command statuses reclip to the live width instead of the activity cap",
+  async () => {
+    const fixture = createFixture("fx-shell-session-width-");
+    const launchCommand = `echo ${"f".repeat(100)} >/dev/null; sleep 60`;
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_width_run", "shell", {
+        request: {
+          action: "run",
+          command: launchCommand,
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_width_observe", "shell", {
+          request: { action: "interact", session_id: sessionId, chars: "" },
+        });
+      },
+      (body) => {
+        const id = sessionId || findSessionId(JSON.parse(body)) || "";
+        return fakeGatewayToolCall("shell_width_stop", "shell", {
+          request: { action: "stop", session_id: id },
+        });
+      },
+      fakeGatewayFinalText("WIDTH_FLOW_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TRACE_LOG: fixture.tracePath,
+        FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+        FX_TERMINAL_HOST_IDLE_MS: "500",
+      },
+      width: 160,
+      height: 32,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run and observe the session.");
+    await session.waitForText("WIDTH_FLOW_DONE", TIMEOUT);
+    await Bun.sleep(300);
+
+    // The 126-column activity cap used to freeze these phrases with trailing
+    // marks; at 160 columns the full launch command fits and must render
+    // without an ellipsis for captured runs, tty runs, and session actions.
+    const grid = await session.capturePaneGrid();
+    const row = (prefix: string) =>
+      grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
+    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
+    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "shell TTY writes advance one runtime-owned cursor without duplicate output",
   async () => {
     const fixture = createFixture("fx-shell-tty-cursor-");
