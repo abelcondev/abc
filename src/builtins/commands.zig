@@ -343,6 +343,18 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Ignore saved additional directories",
     },
     .{
+        .usage = "--model <id>",
+        .description = "Override the model for an interactive session",
+    },
+    .{
+        .usage = "--effort <level>",
+        .description = "Override the reasoning effort for an interactive session",
+    },
+    .{
+        .usage = "--fast, --no-fast",
+        .description = "Turn Fast mode on or off for an interactive session",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the remembered workspace session",
     },

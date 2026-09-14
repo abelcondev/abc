@@ -665,6 +665,11 @@ const App = struct {
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
+            .{
+                .model = launch.modifiers.model_override,
+                .effort = launch.modifiers.effort_override,
+                .fast = launch.modifiers.fast_override,
+            },
         );
         errdefer app.deinit();
         try WorkspaceAppRuntime.applyLaunch(
@@ -3645,6 +3650,17 @@ test "early threaded io is resolved after global launch args" {
     try std.testing.expect(needsEarlyThreadedIo(&.{
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "login"),
+    }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{
+        @as([:0]const u8, "--model"),
+        @as([:0]const u8, "provider/model"),
+        @as([:0]const u8, "--fast"),
+        @as([:0]const u8, "status"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--effort=high"),
+        @as([:0]const u8, "--no-fast"),
+        @as([:0]const u8, "ask"),
     }));
 }
 

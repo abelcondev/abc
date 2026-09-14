@@ -50,6 +50,8 @@ fn BootstrapDeps(comptime App: type) type {
             types.ReasoningEffort,
             bool,
             bool,
+            ?types.ReasoningEffort,
+            ?bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const LoadSkillsFn = *const fn (
@@ -75,6 +77,12 @@ fn BootstrapDeps(comptime App: type) type {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        pub const LaunchOverrides = struct {
+            model: ?[]const u8 = null,
+            effort: ?types.ReasoningEffort = null,
+            fast: ?bool = null,
+        };
+
         pub fn bootstrap(
             app: *App,
             footer_rows: u16,
@@ -82,6 +90,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             capability_providers: CapabilityProviders,
+            launch_overrides: LaunchOverrides,
         ) !void {
             try bootstrapWithDeps(
                 app,
@@ -90,6 +99,7 @@ pub fn Runtime(comptime App: type) type {
                 default_agent_step_limit,
                 resize_handler,
                 defaultDeps(capability_providers),
+                launch_overrides,
             );
         }
 
@@ -131,6 +141,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            effort_process_override: ?types.ReasoningEffort,
+            fast_process_override: ?bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -141,6 +153,8 @@ pub fn Runtime(comptime App: type) type {
                 effort,
                 fast_mode,
                 fast_mode_model_bound,
+                effort_process_override,
+                fast_process_override,
             );
         }
 
@@ -171,6 +185,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             deps: BootstrapDeps(App),
+            launch_overrides: LaunchOverrides,
         ) !void {
             errdefer app.deinit();
 
@@ -196,6 +211,10 @@ pub fn Runtime(comptime App: type) type {
                 .fx_version = App.app_version,
             });
             defer startup.deinit(app.alloc);
+
+            if (launch_overrides.model) |model| {
+                try startup.applyLaunchModelOverride(app.alloc, model);
+            }
 
             app.workspace_root = startup.takeWorkspaceRoot();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
@@ -264,15 +283,22 @@ pub fn Runtime(comptime App: type) type {
                 try provider_runtime.replaceModel(app, selected_model);
             }
             const active_model = provider_runtime.model(app);
+            // Per-launch --effort/--fast flags shape runtime state only; the
+            // configured and stored preferences keep their pre-flag values.
+            const persisted_effort = startup.effort;
+            const persisted_fast_mode = startup.fast_mode;
+            startup.applyLaunchTurnOverrides(launch_overrides.effort, launch_overrides.fast);
             try deps.configure_session_preferences(
                 app,
                 startup.provider,
                 startup.configured_model,
                 startup.model_source,
                 active_model,
-                startup.effort,
-                startup.fast_mode,
+                persisted_effort,
+                persisted_fast_mode,
                 startup.fast_mode_model_bound,
+                launch_overrides.effort,
+                launch_overrides.fast,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -488,6 +514,8 @@ const TestCapture = struct {
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
+    effort_process_override: ?types.ReasoningEffort = null,
+    fast_process_override: ?bool = null,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -784,6 +812,8 @@ fn configureSessionPreferencesForTest(
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
+    effort_process_override: ?types.ReasoningEffort,
+    fast_process_override: ?bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -806,6 +836,8 @@ fn configureSessionPreferencesForTest(
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
+    capture.effort_process_override = effort_process_override;
+    capture.fast_process_override = fast_process_override;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -848,10 +880,76 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         24,
         resizeHandlerForTest,
         testDeps(),
+        .{},
+    );
+}
+
+fn runBootstrapWithOverridesForTest(app: *TestApp, capture: *TestCapture, overrides: Runtime(TestApp).LaunchOverrides) !void {
+    active_capture = capture;
+    active_app_for_pointer_check = app;
+    defer {
+        active_capture = null;
+        active_app_for_pointer_check = null;
+    }
+
+    try Runtime(TestApp).bootstrapWithDeps(
+        app,
+        4,
+        "default-model",
+        24,
+        resizeHandlerForTest,
+        testDeps(),
+        overrides,
     );
 }
 
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
+
+test "app_bootstrap_runtime applies interactive launch flag overrides" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .model = "launch-model",
+        .effort = types.ReasoningEffort.literal("low"),
+        .fast = true,
+    });
+
+    try std.testing.expectEqualStrings("launch-model", capture.runtimeModel());
+    try std.testing.expectEqualStrings("launch-model", app.selected_model.items);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
+    // Stored preferences keep the configured values; the flags stay per-launch.
+    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(!capture.configured_fast_mode);
+    // --fast binds to the launch model so the footer indicator reflects it.
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
+    // The process overrides carry the flag values so a resume re-applies them.
+    try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
+}
+
+test "app_bootstrap_runtime model override drops compiled-default fast mode" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .model = "other-model",
+    });
+
+    try std.testing.expectEqualStrings("other-model", capture.runtimeModel());
+    try std.testing.expectEqualStrings("other-model", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expect(!capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), capture.effort_process_override);
+    try std.testing.expectEqual(@as(?bool, null), capture.fast_process_override);
+}
 
 test "app_bootstrap_runtime transfers startup state and starts a fresh session" {
     const alloc = std.testing.allocator;

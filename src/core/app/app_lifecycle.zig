@@ -214,6 +214,33 @@ pub const StartupState = struct {
         return value;
     }
 
+    /// Applies an interactive launch `--model` override. Like FX_MODEL, it
+    /// marks a process override and drops compiled-default fast mode; an
+    /// explicit --fast restores fast separately in applyLaunchTurnOverrides.
+    pub fn applyLaunchModelOverride(self: *StartupState, alloc: Allocator, model: []const u8) !void {
+        const owned = try alloc.dupe(u8, model);
+        if (self.selected_model.len > 0) alloc.free(self.selected_model);
+        self.selected_model = owned;
+        self.model_source = .process_override;
+        if (self.fast_mode_source == .compiled_default) {
+            self.fast_mode = false;
+            self.fast_mode_model_bound = false;
+        }
+    }
+
+    /// Applies the per-launch `--effort`/`--fast` overrides after session
+    /// preferences are configured, so the flags shape runtime state without
+    /// rewriting what the workspace or session stored.
+    pub fn applyLaunchTurnOverrides(self: *StartupState, effort: ?types.ReasoningEffort, fast: ?bool) void {
+        if (effort) |value| self.effort = value;
+        if (fast) |value| {
+            self.fast_mode = value;
+            // An explicit --fast is bound to the launch model selection so the
+            // footer indicator reflects it; --no-fast clears the binding.
+            self.fast_mode_model_bound = value;
+        }
+    }
+
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
