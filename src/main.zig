@@ -3651,6 +3651,17 @@ test "early threaded io is resolved after global launch args" {
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "login"),
     }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{
+        @as([:0]const u8, "--model"),
+        @as([:0]const u8, "provider/model"),
+        @as([:0]const u8, "--fast"),
+        @as([:0]const u8, "status"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--effort=high"),
+        @as([:0]const u8, "--no-fast"),
+        @as([:0]const u8, "ask"),
+    }));
 }
 
 test "full entry config commands also use early threaded io" {
