@@ -2404,7 +2404,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         .slice(cancellationAttempt.endIndex + 1, cleanupAttempt.beginIndex)
         .join("\n");
       expect(cleanupTrace).toMatch(
-        /transcript_anchor_structured_rewrite_preserve .*reason=lifecycle_pin_cleanup/,
+        /transcript_source_publication_rebased .*reason=lifecycle_pin_cleanup/,
+      );
+      expect(cleanupTrace).toMatch(
+        /transcript_retention_rebase state=stable history=(\d+)->\1 view=(\d+)->\2/,
       );
       await active.waitForPane((pane) => {
         const lastLine = pane.trimEnd().split("\n").at(-1)?.trim() ?? "";
