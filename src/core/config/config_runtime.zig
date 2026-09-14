@@ -703,44 +703,40 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 }
 
 /// The profile layer parse is atomic: one malformed field discards every
-/// field, including provider routing. When that happens, salvage the provider
-/// routing triple (connections, selection, and per-provider models) in
-/// isolation so a broken sibling (for example a mistyped effort) cannot
-/// silently drop the configured connection and fall back to Gateway. Returns
-/// true when the layer declared provider routing that is now installed;
-/// errors when the routing fields themselves are broken.
-fn salvageProviderRouting(alloc: Allocator, settings: *Settings, value: std.json.Value) error{ OutOfMemory, InvalidProviderRouting }!bool {
-    var routed = false;
-    if (value.object.get("providers")) |raw| {
-        const registry = configured_provider.Registry.parse(alloc, raw) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidProviderRouting,
-        };
+/// field, including provider routing. When that happens, re-parse only the
+/// provider routing triple (connections, selection, per-provider models)
+/// through the same layer-scoped parser so a broken sibling (for example a
+/// mistyped effort) cannot silently drop the configured connection and fall
+/// back to Gateway. The layer scope is identical to normal parsing, so
+/// workspace override provider definitions stay ignored here too. Returns
+/// true when the layer declared routing that is now installed; errors when
+/// the routing fields themselves are broken.
+fn salvageProviderRouting(alloc: Allocator, settings: *Settings, value: std.json.Value, layer: SettingsLayer) error{ OutOfMemory, InvalidProviderRouting }!bool {
+    var routing_only: std.json.ObjectMap = .empty;
+    defer routing_only.deinit(alloc);
+    var declared = false;
+    for ([_][]const u8{ "provider", "providers", "models" }) |key| {
+        const field = value.object.get(key) orelse continue;
+        routing_only.put(alloc, key, field) catch return error.OutOfMemory;
+        declared = true;
+    }
+    if (!declared) return false;
+    var salvaged = parseSettingsValueForLayer(alloc, .{ .object = routing_only }, layer, false, false) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProviderRouting,
+    };
+    defer salvaged.deinit(alloc);
+    if (salvaged.providers) |registry| {
         if (settings.providers) |*old| old.deinit(alloc);
         settings.providers = registry;
-        routed = true;
+        salvaged.providers = null;
     }
-    if (value.object.get("provider")) |provider_value| {
-        if (provider_value != .string) return error.InvalidProviderRouting;
-        settings.provider = model_provider.parse(provider_value.string) orelse return error.InvalidProviderRouting;
-        routed = true;
-    }
-    if (value.object.get("models")) |models_value| {
-        if (models_value != .object) return error.InvalidProviderRouting;
-        var iterator = models_value.object.iterator();
-        while (iterator.next()) |entry| {
-            const provider = model_provider.parse(entry.key_ptr.*) orelse return error.InvalidProviderRouting;
-            const model_value = entry.value_ptr.*;
-            if (model_value != .string) return error.InvalidProviderRouting;
-            settings_store.validateModel(model_value.string) catch return error.InvalidProviderRouting;
-            settings.models.putCopy(alloc, provider, model_value.string) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.TooManyModelPreferences => return error.InvalidProviderRouting,
-            };
-        }
-        routed = true;
-    }
-    return routed;
+    if (salvaged.provider) |provider| settings.provider = provider;
+    settings.models.mergeOwnedFrom(alloc, &salvaged.models) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TooManyModelPreferences => return error.InvalidProviderRouting,
+    };
+    return true;
 }
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
@@ -828,7 +824,7 @@ fn mergeDetailedSettingsLayer(
     } else |err| {
         if (err == error.OutOfMemory) return err;
         if (diagnostic_layer == .user and value == .object) {
-            const routed = salvageProviderRouting(alloc, state.settings, value) catch |salvage_err| switch (salvage_err) {
+            const routed = salvageProviderRouting(alloc, state.settings, value, if (source == .user_workspace) .profile_workspace else settings_layer) catch |salvage_err| switch (salvage_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidProviderRouting => return err,
             };
@@ -3633,6 +3629,72 @@ test "broken provider definitions in the profile still fail the load" {
     );
 
     try std.testing.expectError(error.InvalidProtocol, loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root));
+}
+
+test "workspace provider definitions stay ignored when a sibling workspace field fails to parse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.print(
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"local-model\"}},\"workspaces\":{{\"{s}\":{{\"providers\":{{\"shadow\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11435/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"effort\":42}}}}}}\n",
+        .{workspace_root},
+    );
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    // Recovery follows the same layer scope as normal parsing: workspace
+    // override provider definitions are ignored, so the global connection
+    // survives the malformed sibling field.
+    try std.testing.expect(result.settings.provider.? == .configured);
+    try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", result.settings.providers.?.get("local").?.base_url);
+    try std.testing.expect(result.settings.providers.?.get("shadow") == null);
+    var saw_user_diagnostic = false;
+    for (result.diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == .malformed_settings) saw_user_diagnostic = true;
+    }
+    try std.testing.expect(saw_user_diagnostic);
+}
+
+test "ignored workspace provider definitions with broken protocols stay inert during recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.print(
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"local-model\"}},\"workspaces\":{{\"{s}\":{{\"providers\":{{\"shadow\":{{\"protocol\":\"bogus\",\"base_url\":\"http://localhost:11435/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"effort\":42}}}}}}\n",
+        .{workspace_root},
+    );
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", result.settings.providers.?.get("local").?.base_url);
+    try std.testing.expect(result.settings.providers.?.get("shadow") == null);
 }
 
 test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {

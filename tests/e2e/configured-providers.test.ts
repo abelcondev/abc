@@ -432,6 +432,45 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("ignored workspace provider definitions stay inert when a sibling workspace field is malformed", async () => {
+    const f = fixture();
+    try {
+      (f.settings as any).workspaces = {
+        [f.workspace]: {
+          providers: { shadow: { protocol: "openai-chat-completions", base_url: "http://127.0.0.1:1/v1", auth: { type: "none" } } },
+          effort: 42,
+        },
+      };
+      f.save();
+      const result = await runFx(["status", "--json"], { cwd: f.workspace, env: f.env });
+      expect(result.code).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.model_source).toBe("local");
+      expect(status.provider_endpoint).toBe(f.settings.providers.local.base_url);
+      expect(status.connected_providers).toContain("local");
+      expect(status.connected_providers).not.toContain("shadow");
+      expect(result.stderr).toContain("malformed_settings");
+    } finally { f.close(); }
+  });
+
+  test("ignored workspace provider definitions with broken protocols stay inert during recovery", async () => {
+    const f = fixture();
+    try {
+      (f.settings as any).workspaces = {
+        [f.workspace]: {
+          providers: { shadow: { protocol: "bogus", base_url: "http://127.0.0.1:1/v1", auth: { type: "none" } } },
+          effort: 42,
+        },
+      };
+      f.save();
+      const result = await runFx(["status", "--json"], { cwd: f.workspace, env: f.env });
+      expect(result.code).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.provider_endpoint).toBe(f.settings.providers.local.base_url);
+      expect(result.stderr).toContain("malformed_settings");
+    } finally { f.close(); }
+  });
+
   test("unknown connections and missing keys fail without a Gateway fallback", async () => {
     const f = fixture();
     try {
