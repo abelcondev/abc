@@ -4934,7 +4934,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
