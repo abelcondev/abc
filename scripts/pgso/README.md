@@ -146,11 +146,18 @@ Generated binaries, bitcode, objects, profiles, caches, measurements, and logs a
 
 The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence normally retains at most the last 1,048,576 characters from each output stream per command. The candidate symbol census permits 8,388,608 characters and rejects truncated output. Records include total character counts and truncation status; no environment variables are printed.
 
-To compare a qualified PR merge with its exact main parent, dispatch the
+To compare a qualified PR merge with its exact main parent, or a qualified
+manual branch head with its exact main ancestor, dispatch the
 **Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
 and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
 The main control may come from the dedicated PGSO workflow or the Release
 workflow that invokes it. Both artifacts must have completed qualification.
+The candidate must come from the dedicated PGSO workflow. For source-only PRs,
+run that workflow manually on the PR branch. Its manifest source must match the
+run head, and GitHub's immutable SHA comparison must prove that exact control
+is both the base and merge base, with no behind commits and a complete nonempty
+ahead commit list ending at the candidate. Missing or truncated ancestry is
+rejected. The manual candidate branch cannot be `main`.
 Leave `signed_run` empty. The native macOS arm64 job downloads those immutable
 artifacts without rebuilding them, checks their run/source relationships and
 binary hashes, then measures normal and recovered no-history requests. It runs

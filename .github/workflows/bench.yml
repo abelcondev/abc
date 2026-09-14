@@ -289,6 +289,15 @@ jobs:
             [[ "$source_sha" =~ ^[a-f0-9]{40}$ ]]
             gh api "repos/$GITHUB_REPOSITORY/git/commits/$source_sha" > "$FX_PGSO_COMPARE_INPUT/$lane-source.json"
           done
+          if jq -e '.event == "workflow_dispatch"' "$FX_PGSO_COMPARE_INPUT/candidate-run.json" > /dev/null; then
+            control_sha=$(jq -er .sha "$FX_PGSO_COMPARE_INPUT/control-source.json")
+            candidate_sha=$(jq -er .sha "$FX_PGSO_COMPARE_INPUT/candidate-source.json")
+            gh api "repos/$GITHUB_REPOSITORY/compare/$control_sha...$candidate_sha" --jq '
+              {status, ahead_by, behind_by, total_commits,
+               base_commit: {sha: .base_commit.sha}, merge_base_commit: {sha: .merge_base_commit.sha},
+               commits: [.commits[] | {sha}]}
+            ' > "$FX_PGSO_COMPARE_INPUT/candidate-ancestry.json"
+          fi
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:

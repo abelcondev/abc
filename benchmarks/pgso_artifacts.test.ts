@@ -64,6 +64,10 @@ type Provenance = {
     head_repository: { id: number; full_name: string };
   };
   source: { sha: string; parents: Array<{ sha: string }> };
+  ancestry?: {
+    status: string; ahead_by: number; behind_by: number; total_commits: number;
+    base_commit: { sha: string }; merge_base_commit: { sha: string }; commits: Array<{ sha: string }>;
+  };
   manifest: {
     stage: string; status: string; eligible: boolean;
     evidence: {
@@ -116,6 +120,7 @@ function loadInputs(): Inputs {
   const read = (path: string) => JSON.parse(readFileSync(join(root, path), "utf8"));
   const load = (label: string): Provenance => ({ artifact: read(`${label}-artifact.json`), run: read(`${label}-run.json`), source: read(`${label}-source.json`), manifest: read(`${label}/manifest.json`) });
   const control = load("control"), candidate = load("candidate");
+  if (candidate.run.event === "workflow_dispatch") candidate.ancestry = read("candidate-ancestry.json");
   validateProvenance(control, candidate);
   mkdirSync(output, { recursive: true });
   const binaries = { control: "", candidate: "" };
@@ -289,8 +294,18 @@ function validateProvenance(control: Provenance, candidate: Provenance): void {
     requireValue(Number.isSafeInteger(binary.size.size_bytes) && binary.size.size_bytes >= 32 && binary.size.size_bytes <= 16 * 1024 * 1024, "invalid candidate size");
   }
   requireValue(control.run.head_branch === "main" && control.run.head_sha === control.source.sha, "control is not exact main");
-  requireValue(candidate.run.event === "pull_request" && candidate.source.parents.length === 2, "candidate is not a PR merge");
-  requireValue(candidate.source.parents[0].sha === control.source.sha && candidate.source.parents[1].sha === candidate.run.head_sha, "candidate merge parents do not match control and PR head");
+  if (candidate.run.event === "workflow_dispatch") {
+    requireValue(typeof candidate.run.head_branch === "string" && candidate.run.head_branch.length > 0 && candidate.run.head_branch !== "main" && candidate.source.sha === candidate.run.head_sha, "candidate is not an exact manual branch head");
+    const ancestry = candidate.ancestry;
+    requireValue(ancestry?.status === "ahead" && ancestry.behind_by === 0 && Number.isSafeInteger(ancestry.ahead_by) && ancestry.ahead_by > 0, "candidate ancestry is not strictly ahead");
+    requireValue(ancestry.base_commit?.sha === control.source.sha && ancestry.merge_base_commit?.sha === control.source.sha, "candidate ancestry does not match exact control");
+    requireValue(ancestry.total_commits === ancestry.ahead_by && Array.isArray(ancestry.commits) && ancestry.commits.length === ancestry.ahead_by, "candidate ancestry is incomplete");
+    requireValue(ancestry.commits.every((commit) => typeof commit?.sha === "string" && /^[a-f0-9]{40}$/.test(commit.sha) && commit.sha !== control.source.sha), "invalid candidate ancestry commit");
+    requireValue(new Set(ancestry.commits.map((commit) => commit.sha)).size === ancestry.commits.length && ancestry.commits.at(-1)!.sha === candidate.source.sha, "candidate ancestry does not end at exact head");
+  } else {
+    requireValue(candidate.run.event === "pull_request" && candidate.source.parents.length === 2, "candidate is not a PR merge");
+    requireValue(candidate.source.parents[0].sha === control.source.sha && candidate.source.parents[1].sha === candidate.run.head_sha, "candidate merge parents do not match control and PR head");
+  }
   for (const field of ["target", "host_arch", "zig_version", "llvm_version"] as const) {
     requireValue(control.manifest.evidence.identity[field] === candidate.manifest.evidence.identity[field], `different ${field}`);
   }
@@ -373,6 +388,83 @@ test("PGSO provenance requires qualified exact main and merge inputs", () => {
     mutate(pair);
     expect(() => validateProvenance(...pair)).toThrow();
   }
+});
+
+function manualProvenanceFixture() {
+  const [control, candidate] = provenanceFixture();
+  candidate.run.event = "workflow_dispatch";
+  candidate.source = { sha: candidate.run.head_sha, parents: [{ sha: "f".repeat(40) }] };
+  candidate.manifest.evidence.identity.source_sha = candidate.source.sha;
+  candidate.artifact.name = `pgso-evidence-macos-arm64-${candidate.source.sha}-attempt-1`;
+  return [control, Object.assign(candidate, { ancestry: {
+    status: "ahead", ahead_by: 2, behind_by: 0, total_commits: 2,
+    base_commit: { sha: control.source.sha }, merge_base_commit: { sha: control.source.sha },
+    commits: [{ sha: "f".repeat(40) }, { sha: candidate.source.sha }],
+  } })] as const;
+}
+
+test("PGSO provenance accepts qualified manual branch heads with exact control ancestry", () => {
+  const pair = manualProvenanceFixture();
+  expect(() => validateProvenance(...pair)).not.toThrow();
+  pair[0].run.path = ".github/workflows/release.yml";
+  expect(() => validateProvenance(...pair)).not.toThrow();
+});
+
+test("PGSO provenance rejects unproven manual branch heads without weakening qualification", () => {
+  const valid = manualProvenanceFixture();
+  const mutations: Array<(pair: typeof valid) => void> = [
+    (pair) => { Object.assign(pair[1], { ancestry: undefined }); },
+    (pair) => { Object.assign(pair[1], { ancestry: null }); },
+    (pair) => { Object.assign(pair[1], { ancestry: {} }); },
+    (pair) => { pair[1].ancestry.status = "diverged"; },
+    (pair) => { pair[1].ancestry.behind_by = 1; },
+    (pair) => { Object.assign(pair[1].ancestry, { behind_by: "0" }); },
+    (pair) => { pair[1].ancestry.ahead_by = 0; },
+    (pair) => { pair[1].ancestry.ahead_by = -1; },
+    (pair) => { pair[1].ancestry.ahead_by = 1.5; },
+    (pair) => { Object.assign(pair[1].ancestry, { ahead_by: "2" }); },
+    (pair) => { pair[1].ancestry.total_commits = 3; },
+    (pair) => { Object.assign(pair[1].ancestry, { total_commits: undefined }); },
+    (pair) => { pair[1].ancestry.base_commit.sha = "d".repeat(40); },
+    (pair) => { pair[1].ancestry.merge_base_commit.sha = "d".repeat(40); },
+    (pair) => { Object.assign(pair[1].ancestry, { base_commit: null }); },
+    (pair) => { Object.assign(pair[1].ancestry, { merge_base_commit: {} }); },
+    (pair) => { Object.assign(pair[1].ancestry, { commits: null }); },
+    (pair) => { pair[1].ancestry.commits = []; },
+    (pair) => { pair[1].ancestry.commits.pop(); },
+    (pair) => { pair[1].ancestry.commits.shift(); },
+    (pair) => { pair[1].ancestry.commits[0].sha = "invalid"; },
+    (pair) => { Object.assign(pair[1].ancestry.commits, { 0: null }); },
+    (pair) => { pair[1].ancestry.commits[0].sha = pair[1].source.sha; },
+    (pair) => { pair[1].ancestry.commits[0].sha = pair[0].source.sha; },
+    (pair) => { pair[1].ancestry.commits.reverse(); },
+    (pair) => { pair[1].run.event = "push"; },
+    (pair) => { pair[1].run.head_branch = "main"; },
+    (pair) => { pair[1].run.head_branch = ""; },
+    (pair) => { pair[1].run.head_sha = "d".repeat(40); pair[1].artifact.workflow_run.head_sha = pair[1].run.head_sha; },
+    (pair) => { pair[1].run.path = ".github/workflows/release.yml"; },
+    (pair) => { pair[1].run.status = "in_progress"; },
+    (pair) => { pair[1].run.conclusion = "failure"; },
+    (pair) => { pair[1].manifest.stage = "train"; },
+    (pair) => { pair[1].manifest.status = "failed"; },
+    (pair) => { pair[1].manifest.eligible = false; },
+    (pair) => { pair[1].run.head_repository.full_name = "foreign/repository"; },
+    (pair) => { pair[1].run.run_attempt++; },
+    (pair) => { pair[1].manifest.evidence.artifacts.candidate.signature_valid = false; },
+    (pair) => { pair[1].manifest.evidence.identity.zig_version = "0.17.0"; },
+  ];
+  for (const mutate of mutations) {
+    const pair = structuredClone(valid);
+    mutate(pair);
+    expect(() => validateProvenance(...pair)).toThrow();
+  }
+});
+
+test("PGSO manual ancestry cannot bypass PR merge parent validation", () => {
+  const pair = provenanceFixture();
+  Object.assign(pair[1], { ancestry: manualProvenanceFixture()[1].ancestry });
+  pair[1].source.parents[0].sha = "f".repeat(40);
+  expect(() => validateProvenance(...pair)).toThrow("candidate merge parents do not match control and PR head");
 });
 
 test("paired confidence detects calibration errors and resolved regressions", () => {
