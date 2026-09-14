@@ -58,6 +58,7 @@ VERIFICATION_E2E_TESTS = (
     "oauth-keychain-migration.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-compaction-activity.test.ts",
+    "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-cost.test.ts",
     "tui-decision-prompts.test.ts",
@@ -367,7 +368,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(54, len(corpus.candidate_scenarios))
+        self.assertEqual(55, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
