@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_output_runtime = @import("command_output_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const sort_utils = @import("../../core/shared/sort_utils.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
@@ -244,15 +245,11 @@ pub const RetentionIdentity = struct {
             const ref = hardLineRefAt(hard_lines, prefix.len, index);
             visual_rows += visualRowsForLine((TranscriptRef{ .ref = ref }).resolve(.{ .bytes = prefix }), cols);
             if (index >= line_count) continue;
-            switch (identity.lines[index]) {
-                .entry => |entry| {
-                    owner = entry.entry_id;
-                    const span = try spans.getOrPut(alloc, entry.entry_id);
-                    const end = if (index + 1 < hard_lines.starts.len) hard_lines.starts[index + 1] else prefix.len;
-                    if (!span.found_existing) span.value_ptr.* = .{ .start = hard_lines.starts[index], .end = end, .publication_end = visual_rows } else span.value_ptr.end = end;
-                },
-                .block_separator, .boundary_blank => {},
-                .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => owner = null,
+            owner = publication_owner(owner, identity.lines[index]);
+            if (identity.lines[index] == .entry) {
+                const span = try spans.getOrPut(alloc, identity.lines[index].entry.entry_id);
+                const end = if (index + 1 < hard_lines.starts.len) hard_lines.starts[index + 1] else prefix.len;
+                if (!span.found_existing) span.value_ptr.* = .{ .start = hard_lines.starts[index], .end = end, .publication_end = visual_rows } else span.value_ptr.end = end;
             }
             if (owner) |id| if (spans.getPtr(id)) |span| {
                 span.publication_end = visual_rows;
@@ -473,6 +470,17 @@ pub fn prepareRetentionSource(self: anytype, alloc: Allocator) !TranscriptPrepar
     return source;
 }
 
+/// Entry projections own their following separators and boundary blanks;
+/// other provenance ends publication ownership. Folded command output's optional
+/// entry ID identifies its summary, not a retained conversation projection.
+pub fn publication_owner(previous: ?u32, line: transcript_blocks.LineProvenance) ?u32 {
+    return switch (line) {
+        .entry => |entry| entry.entry_id,
+        .block_separator, .boundary_blank => previous,
+        .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => null,
+    };
+}
+
 fn publicationReleaseFloor(alloc: Allocator, source: *const TranscriptPreparationSource) !u32 {
     if (source.publication_entries.len == 0 or source.transcript_visual_row_offsets.len == 0) return 0;
     var ends: std.AutoHashMapUnmanaged(u32, u32) = .empty;
@@ -480,11 +488,7 @@ fn publicationReleaseFloor(alloc: Allocator, source: *const TranscriptPreparatio
     for (source.publication_entries) |id| try ends.put(alloc, id, 0);
     var owner: ?u32 = null;
     for (source.line_provenance, 0..) |line, index| {
-        switch (line) {
-            .entry => |entry| owner = entry.entry_id,
-            .block_separator, .boundary_blank => {},
-            .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => owner = null,
-        }
+        owner = publication_owner(owner, line);
         if (owner) |id| {
             if (ends.getPtr(id)) |end| end.* = source.transcript_visual_row_offsets[index + 1];
         }
@@ -612,7 +616,7 @@ pub fn preservePublicationEntries(
         try edits.append(alloc, .{ .at = publicationGapStart(next, at), .end = at, .old = old, .old_end_byte = old_end_byte, .following_new_entry = at == first_new and at < next.hard_line_starts.len });
     }
     if (edits.items.len == 0) return;
-    std.mem.sort(Edit, edits.items, {}, Edit.less);
+    sort_utils.sort(Edit, edits.items, {}, Edit.less);
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(alloc);
     var provenance: std.ArrayList(transcript_blocks.LineProvenance) = .empty;

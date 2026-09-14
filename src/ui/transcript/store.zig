@@ -3420,11 +3420,7 @@ pub fn settleTranscriptPublication(self: anytype, alloc: Allocator, checkpoint: 
     var owner: ?u32 = null;
     const history = self.transcriptCommitDiagnostic().history_visual_offset;
     for (before.line_provenance, 0..) |line, index| {
-        switch (line) {
-            .entry => |entry| owner = entry.entry_id,
-            .block_separator, .boundary_blank => {},
-            .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => owner = null,
-        }
+        owner = source_preparation.publication_owner(owner, line);
         if (before.transcript_visual_row_offsets[index + 1] <= history) continue;
         if (owner) |id| _ = released.remove(id);
     }
@@ -3593,11 +3589,7 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
     defer publication_entries.deinit(alloc);
     var publication_owner: ?u32 = null;
     for (before.line_provenance, 0..) |line, index| {
-        switch (line) {
-            .entry => |entry| publication_owner = entry.entry_id,
-            .block_separator, .boundary_blank => {},
-            .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => publication_owner = null,
-        }
+        publication_owner = source_preparation.publication_owner(publication_owner, line);
         if (before.transcript_visual_row_offsets[index + 1] <= history) continue;
         if (publication_owner) |id| {
             if (retiring.remove(id)) try publication_entries.append(alloc, id);

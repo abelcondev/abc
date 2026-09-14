@@ -6935,11 +6935,7 @@ pub const TranscriptRuntime = struct {
         if (identity.publication_entries.len == 0) return result;
         var owner: ?u32 = null;
         for (mapping.before.line_provenance, 0..) |line, index| {
-            switch (line) {
-                .entry => |entry| owner = entry.entry_id,
-                .block_separator, .boundary_blank => {},
-                .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => owner = null,
-            }
+            owner = source_preparation.publication_owner(owner, line);
             if (mapping.before.transcript_visual_row_offsets[index + 1] <= history) continue;
             if (owner) |id| {
                 if (std.mem.findScalar(u32, identity.publication_entries, id) != null) result = @min(result, mapping.visual(@max(history, mapping.before.transcript_visual_row_offsets[index])));
