@@ -92,6 +92,9 @@ const RecordIndex = struct {
     boundary: u64 = 0,
     tail_sample: [tail_sample_bytes]u8 = undefined,
     tail_sample_len: usize = 0,
+    /// Times a tail absorb extended the index; tests use it to prove the
+    /// incremental path ran instead of a full re-parse.
+    incremental_absorbs: usize = 0,
 
     fn deinit(self: *RecordIndex, alloc: Allocator) void {
         for (self.facts.items) |*fact| fact.deinit(alloc);
@@ -227,16 +230,6 @@ fn absorbBytes(index: *RecordIndex, alloc: Allocator, bytes: []const u8) !void {
         var record = try parseRecord(alloc, line);
         defer record.deinit(alloc);
         try absorbRecord(index, alloc, record);
-    }
-}
-
-/// Absorbs one freshly appended event. Event strings are borrowed; the index
-/// dupes what it keeps.
-fn absorbEvent(index: *RecordIndex, alloc: Allocator, event: usage_report.ProfileEvent) !void {
-    switch (event) {
-        .generation => |fact| try absorbRecord(index, alloc, .{ .generation = fact }),
-        .pending => |marker| try absorbRecord(index, alloc, .{ .pending = marker }),
-        .incident => |incident| try absorbRecord(index, alloc, .{ .incident = incident }),
     }
 }
 
@@ -434,7 +427,7 @@ pub const Store = struct {
             }
         }
         if (self.index) |*index| {
-            if (boundary == index.boundary) return index;
+            if (boundary == index.boundary and verifyTailSample(index, file)) return index;
             if (boundary > index.boundary and self.tryAbsorbTail(alloc, index, file, boundary)) {
                 return index;
             }
@@ -480,6 +473,7 @@ pub const Store = struct {
         absorbBytes(index, alloc, bytes) catch return false;
         index.boundary = boundary;
         index.captureTailSample(bytes);
+        index.incremental_absorbs += 1;
         return true;
     }
 
@@ -994,6 +988,11 @@ fn classifyEvent(
         .pending => |marker| classifyPending(index, marker),
         .incident => |incident| blk: {
             if (index.incidents.items.len >= max_file_incidents) {
+                debug_trace.logf(
+                    "session",
+                    "usage profile incident dropped reason=cap limit={d}",
+                    .{max_file_incidents},
+                );
                 break :blk .{ .outcome = .duplicate, .write = false };
             }
             for (index.incidents.items) |existing| {
@@ -1707,6 +1706,23 @@ test "profile usage compaction eligibility requires expired records" {
         &index,
         now_ms,
     ));
+    // A resolved pending marker alone must not trigger an after-append rewrite.
+    var resolved_marker = usage_report.PendingMarker{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .observed_at_ms = now_ms - 1000,
+    };
+    loaded.pending = (&resolved_marker)[0..1];
+    loaded.record_count += 1;
+    index.deinit(alloc);
+    index = try testIndexFromLoaded(alloc, loaded);
+    try std.testing.expect(!shouldCompactAfterAppend(
+        compaction_threshold_bytes + 1,
+        &index,
+        now_ms,
+        now_ms,
+        false,
+    ));
+    loaded.pending = &.{};
     loaded.facts[0].created_at_ms = now_ms - std.time.ms_per_day * 36;
     index.deinit(alloc);
     index = try testIndexFromLoaded(alloc, loaded);
@@ -1899,8 +1915,9 @@ test "profile usage store merges foreign appends incrementally" {
     try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
     try std.testing.expectEqual(AppendOutcome.appended, try second.appendFact(alloc, fact_two));
     // The first store's index is stale here; the duplicate verdict must come
-    // from the incrementally absorbed tail, not a full re-parse shortcut.
+    // from the incrementally absorbed tail.
     try std.testing.expectEqual(AppendOutcome.duplicate, try first.appendFact(alloc, fact_one));
+    try std.testing.expectEqual(@as(usize, 1), first.index.?.incremental_absorbs);
     try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_three));
 
     var loaded = try first.load(alloc);
@@ -1940,4 +1957,45 @@ test "profile usage store caps incident records in the ledger file" {
     var loaded = try store.load(alloc);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(max_file_incidents, loaded.incidents.len);
+}
+
+test "profile usage store fully re-parses after a foreign replace fools the length check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var first = try Store.initFromHome(alloc, home);
+    defer first.deinit(alloc);
+
+    var fact_one = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact_one.deinit(alloc);
+    var fact_two = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer fact_two.deinit(alloc);
+
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
+    const absorbs_before = first.index.?.incremental_absorbs;
+
+    // A foreign process compacts and then appends, growing the file while
+    // replacing the bytes the resident index parsed.
+    var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
+    defer profile.close(io_mod.getIo());
+    var contents: std.Io.Writer.Allocating = .init(alloc);
+    defer contents.deinit();
+    try writeCoverage(&contents.writer, 1);
+    try writeGeneration(&contents.writer, fact_two);
+    try writeGeneration(&contents.writer, fact_two);
+    var file = try profile.createFile(io_mod.getIo(), usage_file, .{
+        .permissions = private_file_permissions,
+        .truncate = true,
+    });
+    try file.writeStreamingAll(io_mod.getIo(), contents.written());
+    file.close(io_mod.getIo());
+
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
+    try std.testing.expectEqual(absorbs_before, first.index.?.incremental_absorbs);
+
+    var loaded = try first.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loaded.facts.len);
 }
