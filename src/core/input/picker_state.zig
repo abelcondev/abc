@@ -119,22 +119,13 @@ pub const State = struct {
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
 
-    pub fn initInto(storage: *State) void {
-        file_completion_state.State.initInto(&storage.file_completion);
-        storage.reset_fields();
-    }
-
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
-        self.reset_fields();
-    }
-
-    fn reset_fields(self: *State) void {
         inline for (std.meta.fields(State)) |field| {
-            // The child's owner initializes or resets it before these fields.
+            // The child's owner already restored its defaults.
             if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
             @field(self.*, field.name) = field.defaultValue().?;
         }
