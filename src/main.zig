@@ -666,6 +666,7 @@ const App = struct {
                 .terminal_title = app.terminalTitle(),
             },
             .{
+                .provider = launch.modifiers.provider_override,
                 .model = launch.modifiers.model_override,
                 .effort = launch.modifiers.effort_override,
                 .fast = launch.modifiers.fast_override,
@@ -3659,6 +3660,15 @@ test "early threaded io is resolved after global launch args" {
         @as([:0]const u8, "provider/model"),
         @as([:0]const u8, "--fast"),
         @as([:0]const u8, "status"),
+    }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{
+        @as([:0]const u8, "--provider"),
+        @as([:0]const u8, "grok"),
+        @as([:0]const u8, "login"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--provider=grok"),
+        @as([:0]const u8, "ask"),
     }));
     try std.testing.expect(needsFullEntryConfig(&.{
         @as([:0]const u8, "--effort=high"),

@@ -124,6 +124,7 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    provider_override: ?model_provider.ProviderId = null,
     model_override: ?[]u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
@@ -141,7 +142,8 @@ pub const LaunchModifiers = struct {
     }
 
     pub fn hasModelOverrides(self: LaunchModifiers) bool {
-        return self.model_override != null or self.effort_override != null or self.fast_override != null;
+        return self.provider_override != null or self.model_override != null or
+            self.effort_override != null or self.fast_override != null;
     }
 };
 
@@ -315,7 +317,7 @@ const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode, ?model_provider.ProviderId) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
@@ -368,6 +370,7 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var provider_override: ?model_provider.ProviderId = null;
     var model_override: ?[]u8 = null;
     errdefer if (model_override) |model| alloc.free(model);
     var effort_override: ?types.ReasoningEffort = null;
@@ -393,6 +396,14 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            index += 1;
+            if (index >= args.len) return error.MissingProviderValue;
+            provider_override = model_provider.parse(args[index]) orelse
+                return error.InvalidProviderValue;
+        } else if (std.mem.startsWith(u8, arg, "--provider=")) {
+            provider_override = model_provider.parse(arg["--provider=".len..]) orelse
+                return error.InvalidProviderValue;
         } else if (std.mem.eql(u8, arg, "--model")) {
             index += 1;
             if (index >= args.len) return error.MissingModelValue;
@@ -435,6 +446,7 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .provider_override = provider_override,
             .model_override = model_override,
             .effort_override = effort_override,
             .fast_override = fast_override,
@@ -456,6 +468,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or
             std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--model") or
             std.mem.eql(u8, arg, "--effort"))
         {
@@ -463,6 +476,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--provider=") and
             !std.mem.startsWith(u8, arg, "--model=") and
             !std.mem.startsWith(u8, arg, "--effort=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
@@ -961,7 +975,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--model <id>] [--effort <level>] [--fast|--no-fast] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1337,6 +1351,7 @@ fn runNonInteractiveWithDeps(
                     cfg.default_model,
                     cfg.default_agent_step_limit,
                     cfg.auth_mode,
+                    null,
                 )
             else
                 try deps.load_startup_state(
@@ -3309,7 +3324,7 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
 fn writeModelModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --model, --effort, and --fast apply to interactive sessions; for one-shot runs pass them after `fx ask`\n",
+        "fx: --provider, --model, --effort, and --fast apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
     );
 }
 
@@ -3321,6 +3336,8 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingEffortValue => "--effort requires a value",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
         error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
+        error.MissingProviderValue => "--provider requires a provider name",
+        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
         else => null,
     };
 }
@@ -3899,8 +3916,10 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
-test "global launch modifiers own model effort and fast overrides before the command" {
+test "global launch modifiers own provider model effort and fast overrides before the command" {
     var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--provider"),
+        @constCast("grok"),
         @constCast("--model"),
         @constCast("provider/launch-model"),
         @constCast("--effort=high"),
@@ -3910,6 +3929,7 @@ test "global launch modifiers own model effort and fast overrides before the com
     });
     defer parsed.deinit(std.testing.allocator);
 
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, .grok), parsed.modifiers.provider_override);
     try std.testing.expectEqualStrings("provider/launch-model", parsed.modifiers.model_override.?);
     try std.testing.expect(parsed.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
@@ -3934,7 +3954,27 @@ test "global launch modifiers own model effort and fast overrides before the com
     try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
 }
 
+test "global launch modifiers accept configured provider names" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--provider"),
+        @constCast("my-llm"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    const provider = parsed.modifiers.provider_override.?;
+    try std.testing.expect(provider == .configured);
+    try std.testing.expectEqualStrings("my-llm", provider.label());
+}
+
 test "global model overrides fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingProviderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider")}),
+    );
+    try std.testing.expectError(
+        error.InvalidProviderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider"), @constCast("bogus name") }),
+    );
     try std.testing.expectError(
         error.MissingModelValue,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model")}),

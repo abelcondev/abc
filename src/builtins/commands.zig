@@ -343,6 +343,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Ignore saved additional directories",
     },
     .{
+        .usage = "--provider <name>",
+        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+    },
+    .{
         .usage = "--model <id>",
         .description = "Override the model for an interactive session",
     },
