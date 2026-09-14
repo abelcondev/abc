@@ -634,6 +634,9 @@ fn reprojectTruncatedCommandPhrase(
     if (!std.mem.endsWith(u8, phrase, "...")) return null;
     const command = record.command_display orelse return null;
     const action = record.command_action_label orelse return null;
+    // The stored pair must match the phrase it replaces: a record carrying a
+    // mismatched label would rewrite an unrelated row.
+    if (!std.mem.startsWith(u8, phrase, action)) return null;
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
@@ -1743,6 +1746,33 @@ test "expanded group children reproject stored commands at the current width" {
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.endsWith(u8, narrow.entry_actions.items[0].override.bytes, "…"));
     try std.testing.expect(std.mem.find(u8, narrow.entry_actions.items[0].override.bytes, "...") == null);
+}
+
+test "command reprojection rejects a phrase that does not start with the stored action label" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Observed"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var projection = try build(alloc, &entries, &details, 240);
+    defer projection.deinit(alloc);
+    // The frozen phrase stays untouched when the stored label does not lead it.
+    try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "Observed") == null);
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {
