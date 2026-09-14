@@ -16,7 +16,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
   const model = "fixture/compaction";
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
   const originalUser = "Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>" +
-    (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) : "");
+    (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) + "USER_REFERENCE_END" : "");
   const assistant = "VERIFIED_VALUE=73\n" + Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") + "PENDING_CHECK=transport-resume\n";
   let phase = "seed", summaryCalls = 0, fallback = false;
   const bodies: string[] = [];
@@ -48,9 +48,11 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
-  async function ask(args: string[], label: string) {
+  async function ask(args: string[], label: string, prompt?: string) {
     const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
-    const child = Bun.spawn([binary, "ask", "--json", ...args], { cwd, env, stdin: "ignore", stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
+    const input = join(root, `${label}.input`);
+    if (prompt !== undefined) writeFileSync(input, prompt);
+    const child = Bun.spawn([binary, "ask", "--json", ...args], { cwd, env, stdin: prompt === undefined ? "ignore" : Bun.file(input), stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
     const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
     try {
       expect(await child.exited).toBe(0);
@@ -60,8 +62,11 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
   }
   let passed = false;
   try {
-    const seed = await ask([originalUser], "seed");
+    const seed = await ask([], "seed", originalUser);
     expect(summaryCalls).toBe(0);
+    const seededRequest = JSON.parse(bodies[0]!);
+    const seededUser = seededRequest.prompt.findLast((message: { role: string }) => message.role === "user");
+    expect(seededUser.content[0].text).toBe(originalUser);
     const sessionDir = join(home, ".fx/sessions", seed.session_id), log = join(sessionDir, "events.jsonl"), before = readFileSync(log);
     phase = "continue";
     const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
