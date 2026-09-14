@@ -50,8 +50,8 @@ fn BootstrapDeps(comptime App: type) type {
             types.ReasoningEffort,
             bool,
             bool,
-            bool,
-            bool,
+            ?types.ReasoningEffort,
+            ?bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const LoadSkillsFn = *const fn (
@@ -141,8 +141,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
-            effort_process_override: bool,
-            fast_process_override: bool,
+            effort_process_override: ?types.ReasoningEffort,
+            fast_process_override: ?bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -297,8 +297,8 @@ pub fn Runtime(comptime App: type) type {
                 persisted_effort,
                 persisted_fast_mode,
                 startup.fast_mode_model_bound,
-                launch_overrides.effort != null,
-                launch_overrides.fast != null,
+                launch_overrides.effort,
+                launch_overrides.fast,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -514,8 +514,8 @@ const TestCapture = struct {
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
-    effort_process_override: bool = false,
-    fast_process_override: bool = false,
+    effort_process_override: ?types.ReasoningEffort = null,
+    fast_process_override: ?bool = null,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -812,8 +812,8 @@ fn configureSessionPreferencesForTest(
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
-    effort_process_override: bool,
-    fast_process_override: bool,
+    effort_process_override: ?types.ReasoningEffort,
+    fast_process_override: ?bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -927,8 +927,9 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
     // --fast binds to the launch model so the footer indicator reflects it.
     try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
-    try std.testing.expect(capture.effort_process_override);
-    try std.testing.expect(capture.fast_process_override);
+    // The process overrides carry the flag values so a resume re-applies them.
+    try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
 }
 
 test "app_bootstrap_runtime model override drops compiled-default fast mode" {
@@ -946,8 +947,8 @@ test "app_bootstrap_runtime model override drops compiled-default fast mode" {
     try std.testing.expect(!app.fast_mode);
     try std.testing.expect(!capture.configured_fast_mode);
     try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expect(!capture.effort_process_override);
-    try std.testing.expect(!capture.fast_process_override);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), capture.effort_process_override);
+    try std.testing.expectEqual(@as(?bool, null), capture.fast_process_override);
 }
 
 test "app_bootstrap_runtime transfers startup state and starts a fresh session" {

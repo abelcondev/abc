@@ -1604,6 +1604,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
     const queuedGateway = startFakeGateway([
       fakeGatewayFinalText("LAUNCH_FLAGS_OK"),
+      fakeGatewayFinalText("RESUME_FLAGS_OK"),
     ], {
       models: [{
         id: LAUNCH_MODEL,
@@ -1654,8 +1655,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
 
     await session.kill();
+    // The first launch stored the configured model with Fast mode off; the
+    // resume leg's flags must win over those stored preferences for this launch.
     session = await TmuxSession.create({
-      cmd: `${FX_BIN} --no-fast --model ${LAUNCH_MODEL} --resume-last`,
+      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume-last`,
       cwd: workspace,
       width: 72,
       height: 24,
@@ -1674,17 +1677,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_MODEL: undefined,
       },
     });
-    const resumed = await session.waitForText("launch-model", TIMEOUT);
-    expect(resumed).not.toContain("⚡︎");
+    await session.waitForText("launch-model · low · ⚡︎", TIMEOUT);
 
-    await session.sendText("Continue without fast.");
-    await session.waitForText("LAUNCH_FLAGS_OK", TIMEOUT);
+    await session.sendText("Continue with the resume flags.");
+    await session.waitForText("RESUME_FLAGS_OK", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
 
     expect(queuedGateway.requests).toHaveLength(2);
     const resumedRequest = JSON.parse(queuedGateway.requests[1]!.body);
     expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(LAUNCH_MODEL);
-    expect(resumedRequest).not.toHaveProperty("providerOptions.gateway.speed");
+    expect(resumedRequest).toMatchObject({
+      reasoning: "low",
+      providerOptions: { gateway: { speed: "fast" } },
+    });
 
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

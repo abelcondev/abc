@@ -398,13 +398,15 @@ fn parseGlobalLaunchArgs(
             if (index >= args.len) return error.MissingModelValue;
             const model = std.mem.trim(u8, args[index], " \t\r\n");
             if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
             if (model_override) |old| alloc.free(old);
-            model_override = try alloc.dupe(u8, model);
+            model_override = owned_model;
         } else if (std.mem.startsWith(u8, arg, "--model=")) {
             const model = std.mem.trim(u8, arg["--model=".len..], " \t\r\n");
             if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
             if (model_override) |old| alloc.free(old);
-            model_override = try alloc.dupe(u8, model);
+            model_override = owned_model;
         } else if (std.mem.eql(u8, arg, "--effort")) {
             index += 1;
             if (index >= args.len) return error.MissingEffortValue;
@@ -452,12 +454,20 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--effort"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--model=") and
+            !std.mem.startsWith(u8, arg, "--effort=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--fast") and
+            !std.mem.eql(u8, arg, "--no-fast"))
         {
             return args[index..];
         }

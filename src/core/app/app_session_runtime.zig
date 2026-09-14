@@ -1313,8 +1313,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
-            effort_process_override: bool,
-            fast_process_override: bool,
+            effort_process_override: ?types.ReasoningEffort,
+            fast_process_override: ?bool,
         ) !void {
             try replacePreferences(
                 app.alloc,
@@ -1340,10 +1340,8 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
-            app.session_persistence.process_effort_override =
-                if (effort_process_override) effort else null;
-            app.session_persistence.process_fast_override =
-                if (fast_process_override) fast_mode else null;
+            app.session_persistence.process_effort_override = effort_process_override;
+            app.session_persistence.process_fast_override = fast_process_override;
         }
 
         pub fn initializePersistence(
@@ -5867,8 +5865,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .auto,
         false,
         true,
-        false,
-        false,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
@@ -5957,8 +5955,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .auto,
             false,
             true,
-            false,
-            false,
+            null,
+            null,
         );
         app.session_persistence.js_host_store = fake.store();
         app.requested_resume = .last;
@@ -5989,8 +5987,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .auto,
         false,
         true,
-        false,
-        false,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .pick;
@@ -6017,8 +6015,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .auto,
         false,
         true,
-        false,
-        false,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6087,8 +6085,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         .auto,
         false,
         true,
-        false,
-        false,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6185,8 +6183,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         types.ReasoningEffort.literal("high"),
         true,
         true,
-        false,
-        false,
+        null,
+        null,
     );
 }
 
@@ -7644,8 +7642,8 @@ test "upgrade resume restores active session with the installed version notice" 
         types.ReasoningEffort.literal("high"),
         true,
         false,
-        false,
-        false,
+        null,
+        null,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
@@ -9343,8 +9341,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         types.ReasoningEffort.literal("high"),
         true,
         true,
-        false,
-        false,
+        null,
+        null,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
