@@ -538,6 +538,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
+    catalog_unavailable: bool = false,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -793,6 +794,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
+            .model_catalog_unavailable = catalogUnavailable,
             .take_steering_boundary = if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
@@ -833,6 +835,11 @@ pub const FakeAgentRuntimeDeps = struct {
     fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         return self.root_permission_mode.?;
+    }
+
+    fn catalogUnavailable(raw: *anyopaque) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.catalog_unavailable;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {

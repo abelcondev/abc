@@ -3959,6 +3959,31 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
 
+    // A reachable catalog that simply lacks fast metadata stays quiet; the
+    // notice is reserved for a catalog that failed outright.
+    var fast_notice_count: usize = 0;
+    for (hooks.texts.items) |text| {
+        if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), fast_notice_count);
+}
+
+test "processQueuedPrompt notifies once when fast mode drops on a failed catalog" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_unavailable = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.fast_mode = true;
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
     var fast_notice_count: usize = 0;
     for (hooks.texts.items) |text| {
         if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
@@ -3976,6 +4001,7 @@ test "processQueuedPrompt emits the fast-unavailable notice once across a multi-
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_unavailable = true;
     defer hooks.deinit();
     const ReadExecution = struct {
         fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {

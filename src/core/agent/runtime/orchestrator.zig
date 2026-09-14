@@ -6801,11 +6801,13 @@ fn processQueuedPromptLoop(
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = true;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
-            // Fast can silently drop when the model catalog cannot confirm
-            // support (catalog failure) or a restored preference no longer
-            // matches the model. Tell the user once per turn instead of
-            // letting the footer state diverge from the wire.
-            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified) {
+            // Fast drops silently when the catalog cannot confirm support.
+            // Tell the user once per turn, but only when the catalog itself is
+            // known to be down; a reachable catalog that simply lacks fast
+            // metadata for the model stays quiet.
+            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
+                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
+            {
                 fast_unavailable_notified = true;
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });

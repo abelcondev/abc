@@ -248,6 +248,10 @@ pub const AgentRuntimeDeps = struct {
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
+    /// Reports that the model catalog is known to be failed or unreachable, so
+    /// capability drops are provenance-attributed instead of silent. Null means
+    /// the host cannot tell, and capability drops stay quiet.
+    model_catalog_unavailable: ?*const fn (ctx: *anyopaque) bool = null,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,
     record_tool_call_rejected: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,

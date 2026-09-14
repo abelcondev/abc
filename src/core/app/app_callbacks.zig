@@ -360,6 +360,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
+                .model_catalog_unavailable = agentModelCatalogUnavailable,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .report_usage = agentReportUsage,
@@ -843,6 +844,14 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
                 try app.appendStaticContextMessage(arena, project_context, messages);
             }
+        }
+
+        fn agentModelCatalogUnavailable(ctx: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "isModelCacheFailed")) {
+                return app.isModelCacheFailed();
+            }
+            return false;
         }
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
