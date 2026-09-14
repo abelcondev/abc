@@ -1537,7 +1537,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
-        if (io_mod.getenv("FX_PROVIDER") != null) {
+        if (config_runtime.providerEnvOverride() != null) {
             ctx.provider = startup.provider;
             ctx.model = startup.selected_model;
         }

@@ -1822,7 +1822,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = startup.provider;
-    state.process_provider_override = io_mod.getenv("FX_PROVIDER") != null;
+    state.process_provider_override = config_runtime.providerEnvOverride() != null;
     state.configured_providers.deinit(alloc);
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};

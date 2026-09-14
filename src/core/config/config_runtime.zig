@@ -257,7 +257,7 @@ pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_r
     return discoverPathsWithOptionalHome(alloc, home_dir, workspace_root);
 }
 
-fn providerEnvOverride() ?[]const u8 {
+pub fn providerEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
     return raw;
@@ -711,21 +711,21 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 /// workspace override provider definitions stay ignored here too. Returns
 /// true when the layer declared routing that is now installed; errors when
 /// the routing fields themselves are broken.
-fn salvageProviderRouting(alloc: Allocator, settings: *Settings, value: std.json.Value, layer: SettingsLayer) error{ OutOfMemory, InvalidProviderRouting }!bool {
+fn salvageProviderRouting(alloc: Allocator, settings: *Settings, sources: *ConfigSources, value: std.json.Value, layer: SettingsLayer, source: ConfigSource) error{ OutOfMemory, InvalidProviderRouting }!bool {
     var routing_only: std.json.ObjectMap = .empty;
     defer routing_only.deinit(alloc);
-    var declared = false;
     for ([_][]const u8{ "provider", "providers", "models" }) |key| {
         const field = value.object.get(key) orelse continue;
         routing_only.put(alloc, key, field) catch return error.OutOfMemory;
-        declared = true;
     }
-    if (!declared) return false;
+    if (routing_only.count() == 0) return false;
     var salvaged = parseSettingsValueForLayer(alloc, .{ .object = routing_only }, layer, false, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidProviderRouting,
     };
     defer salvaged.deinit(alloc);
+    if (salvaged.provider == null and salvaged.providers == null and salvaged.models.isEmpty()) return false;
+    updateConfigSources(sources, salvaged, source);
     if (salvaged.providers) |registry| {
         if (settings.providers) |*old| old.deinit(alloc);
         settings.providers = registry;
@@ -824,11 +824,10 @@ fn mergeDetailedSettingsLayer(
     } else |err| {
         if (err == error.OutOfMemory) return err;
         if (diagnostic_layer == .user and value == .object) {
-            const routed = salvageProviderRouting(alloc, state.settings, value, if (source == .user_workspace) .profile_workspace else settings_layer) catch |salvage_err| switch (salvage_err) {
+            _ = salvageProviderRouting(alloc, state.settings, state.sources, value, if (source == .user_workspace) .profile_workspace else settings_layer, source) catch |salvage_err| switch (salvage_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidProviderRouting => return err,
             };
-            if (routed) state.sources.provider = source;
         }
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{

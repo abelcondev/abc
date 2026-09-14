@@ -4716,7 +4716,7 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.workspace_preferences,
                 preferences,
             );
-            if (io_mod.getenv("FX_PROVIDER") != null) {
+            if (config_runtime.providerEnvOverride() != null) {
                 var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
                 defer settings.deinit(app.alloc);
                 const selected = settings.provider orelse return error.InvalidProviderValue;
