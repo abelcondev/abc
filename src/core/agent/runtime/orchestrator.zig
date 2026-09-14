@@ -3596,6 +3596,7 @@ fn restoredRecoveryCause(
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
+        .compaction_prepared => .compaction_prepared,
         .authentication => .authentication,
         .request_limit_reached => .request_limit_reached,
     };
@@ -3760,6 +3761,7 @@ fn checkpointCause(
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
+        .compaction_prepared => .compaction_prepared,
         .authentication => .authentication,
         .request_limit_reached => .request_limit_reached,
         .content_filter => .provider_unavailable,
@@ -3875,6 +3877,45 @@ fn persistRecoveryCheckpoint(
             @tagName(strategy orelse .retry_request),
         },
     );
+}
+
+fn persist_compaction_source(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    arena: Allocator,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    tool_evidence: model_response_recovery.ToolEvidence,
+    trace_ctx: TraceContext,
+) !void {
+    const effect = deps.recovery_checkpoint orelse return;
+    const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
+    try effect.set(deps.ctx, .{
+        .turn_id = job.turn_id,
+        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .assistant_source = @constCast(""),
+        .execution = try finalization.compacted_execution.project(arena, execution),
+        .cause = .compaction_prepared,
+        .action = if (tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
+        .tool_state = checkpointToolState(tool_evidence),
+        .authority = .{
+            .provider = job.provider,
+            .model = @constCast(route_model),
+            .credential_source = job.credential_source,
+            .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
+        },
+        .requested_fast_mode = requested_fast_mode,
+        .fast_mode = fast_mode,
+        .max_provider_attempts = attempt_limit,
+        .consumed_provider_attempts = consumed_attempts,
+        .outstanding_reservation = false,
+    });
+    debug_trace.eventf("context_compaction", "source_checkpointed", trace_ctx, "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
@@ -4348,6 +4389,7 @@ fn auto_retry_status(
             .provider_unavailable => .provider_unavailable,
             .rate_limited => .rate_limited,
             .system_resumed => .system_resumed,
+            .compaction_prepared => .compaction_prepared,
             .authentication => .authentication,
             .request_limit_reached => .request_limit_reached,
             .content_filter => null,
@@ -5560,9 +5602,9 @@ pub fn prepareRetainedCompactionWindow(
         .estimated_tokens = 0,
     } else runtime_prompt_context.selectRecentContext(
         combined.items,
-        options.target orelse runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
+        @min(@as(usize, 16000), options.target orelse runtime_prompt_context.recentContextTarget(capabilities, source_tokens)),
         runtime_prompt_context.usableInputTokens(capabilities),
-        .{ .provider = provider_selection },
+        .{ .provider = provider_selection, .reject_oversized_tool_step = true },
     );
     var cut = selection.cut;
     if (active) |turn| {
@@ -5788,8 +5830,6 @@ pub fn compactContextTransaction(
     const plan = runtime_prompt_context.planCompaction(plan_input);
     const accepted_tokens = plan.accepted_handoff_tokens orelse
         return error.ContextCapacityExceeded;
-    const generation_tokens = plan.generation_tokens orelse
-        return error.ContextCapacityExceeded;
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
         return error.ContextCompactionUnavailable;
     }
@@ -5798,10 +5838,6 @@ pub fn compactContextTransaction(
         deps.ctx,
         compaction_model,
     );
-    const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
-        @min(generation_tokens, @as(usize, @intCast(limit)))
-    else
-        generation_tokens;
 
     try runtime_context_compaction.promoteMessageResults(
         alloc,
@@ -5827,18 +5863,14 @@ pub fn compactContextTransaction(
             .retry_count = request.retry_count,
             .cancel_flag = request.cancel_flag,
             .accepted_tokens = accepted_tokens,
-            .generation_tokens = compactor_generation_tokens,
-            .compactor_input_tokens = runtime_prompt_context.usableInputTokensForGeneration(
-                compactor_capabilities,
-                @min(compactor_generation_tokens, accepted_tokens),
-            ),
-            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
-                compactor_capabilities,
-                .auto,
-                false,
-            ),
+            .max_output_tokens = request.continuation.request.max_output_tokens,
+            .deadline = if (request.continuation.request.budget) |budget| budget.deadline else null,
+            .compactor_input_tokens = runtime_prompt_context.usableInputTokens(compactor_capabilities),
+            .provider_options = request.continuation.request.provider_options,
             .usage = deps.usage,
             .usage_allocator = deps.usage_allocator,
+            .policy = if (request.result_storage == .unavailable) .legacy else .assistant_first,
+            .result_storage = request.result_storage,
             .trace_ctx = request.trace_ctx,
         },
     );
@@ -6858,7 +6890,7 @@ fn processQueuedPromptLoop(
                     "context_compaction",
                     "decision",
                     step_ctx,
-                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
+                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
                         request_cost.serialized_bytes,
@@ -6871,7 +6903,7 @@ fn processQueuedPromptLoop(
                         projection_plan.high_water_tokens,
                         projection_plan.session_target_tokens,
                         projection_plan.accepted_handoff_tokens,
-                        projection_plan.generation_tokens,
+                        request_data.max_output_tokens,
                     },
                 );
                 switch (projection_plan.decision) {
@@ -6896,11 +6928,12 @@ fn processQueuedPromptLoop(
                                 job.history.len,
                             );
                             const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
-                            const active_prefix: ?types.AssistantHistoryTurn = if (within_turn_suffix.items.len > compacted_suffix_len) .{
+                            // The pending user is source too, even before the first tool.
+                            const active_prefix: ?types.AssistantHistoryTurn = .{
                                 .user = .{ .text = job.prompt, .images = job.images },
                                 .assistant = @constCast(""),
                                 .execution = prefix_execution,
-                            } else null;
+                            };
                             const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
                                 .user = .{ .text = job.prompt, .images = job.images },
                                 .assistant = @constCast(""),
@@ -6908,7 +6941,7 @@ fn processQueuedPromptLoop(
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
-                                    if (retention_target == 0 or request_cost.estimated_input_tokens <= (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
+                                    if (retention_target == 0) return error.ContextCapacityExceeded;
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -6970,6 +7003,7 @@ fn processQueuedPromptLoop(
                             const next_compaction_history_tail = window.retained_messages;
                             const next_compaction_count = compaction_count + 1;
                             const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
+                            try persist_compaction_source(deps, finalization, arena, job, within_turn_suffix.items, gateway_model, selected_fast_mode, route_fast_mode, semantic_limit, semantic_attempt, preserved_tool_evidence, step_ctx);
                             var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                             const transaction_result = compactContextTransaction(arena, deps, .{
                                 .trigger = compaction_trigger,

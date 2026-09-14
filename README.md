@@ -43,6 +43,12 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+### Long conversations
+
+fx automatically compacts context at 80% of the selected model's usable input capacity. Run `/compact` to compact earlier. In saved sessions, older assistant work is summarized while original user text stays unchanged and chronological when it fits. If necessary, older user messages are summarized too, without a capacity question.
+
+Recent complete tool exchanges stay in context within a budget; older available results remain accessible through stored handles. Compaction uses the model's normal input/output limits and settings, validates the finished context, and switches only after the checkpoint is committed. Failed or cancelled compaction keeps the previous committed context. A saved session can resume from that checkpoint and later saved work.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

@@ -1276,6 +1276,24 @@ fn openConversationWritableSession(
         null,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
+    if (state.recovery_checkpoint) |checkpoint| {
+        if (checkpoint.cause == .compaction_prepared) {
+            // This checkpoint records completed source, not permission to run
+            // captured work. Make it ordinary interrupted history before a new
+            // prompt can replace the recovery slot. Sequence binding makes a
+            // crash after this append safe even if sidecar cleanup did not run.
+            const timestamp = io_mod.milliTimestamp();
+            try conversation_writer.appendHistoryTurn(alloc, timestamp, checkpoint.interruptedTurn());
+            writeConversationRecoveryState(alloc, &writable.dir, null, conversation_writer.last_seq) catch |err| {
+                debug_trace.logf("session", "compaction source committed but recovery cleanup failed err={s}", .{@errorName(err)});
+            };
+            var restored = (try load_conversation_state_at_boundary(alloc, &writable.dir, writable.session_id, null, null, null)) orelse return error.InvalidSessionMetadata;
+            restored.updated_at_ms = timestamp;
+            state.deinit(alloc);
+            state = restored;
+            debug_trace.logf("session", "event=compaction_source_restored session={s} through_seq={d}", .{ writable.session_id, conversation_writer.last_seq });
+        }
+    }
     const active_id = try alloc.dupe(u8, writable.session_id);
     errdefer alloc.free(active_id);
     const generation = randomIdentifier();

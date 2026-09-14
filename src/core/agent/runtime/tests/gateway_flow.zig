@@ -2773,6 +2773,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     }};
     const completions = [_]FakeCompletion{
         .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
+        .{ .content = "The earlier assistant work is summarized." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2787,16 +2788,19 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    // The two older messages exceed the model's normal 16k input allowance.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":");
-    try expectBodyContains(&gateway, 1, "context_handoff");
-    try expectBodyNotContains(&gateway, 1, old_marker);
-    try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
-    try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
+    for (0..2) |index| {
+        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_USER");
+        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_ASSISTANT");
+        try expectBodyContains(&gateway, index, "\"maxOutputTokens\":16000");
+    }
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, old_marker);
+    try expectBodyContains(&gateway, 2, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 2, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 2, "\"maxOutputTokens\":16000");
 }
 
 test "processQueuedPrompt compacts with the selected working model" {
@@ -3541,7 +3545,7 @@ test "cancelled automatic compaction is retried by the next prompt" {
     try std.testing.expectEqualStrings("AUTOMATIC_COMPACTION_FOLLOW_UP_OK", hooks.finish_assistant_text.?);
 }
 
-test "retained context automatic compaction continues with the exact recent parallel exchange" {
+test "retained context automatic compaction archives oversized parallel results intact" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3585,23 +3589,25 @@ test "retained context automatic compaction continues with the exact recent para
     const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
     const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
-    try std.testing.expect(continued_tokens > context_window / 4);
-    try std.testing.expect(continued_tokens < context_window);
+    // Oversized exchanges use original backing rather than bypassing the recent budget.
+    try std.testing.expect(continued_tokens < context_window / 4);
     try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
-    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_A");
-    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 1, "RECENT_EXACT_A");
+    try expectBodyContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 1, "Original result handle:");
     try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyContains(&gateway, 2, "retained-a");
-    try expectBodyContains(&gateway, 2, "retained-b");
-    try expectBodyContains(&gateway, 2, "a" ** 13_000);
-    try expectBodyContains(&gateway, 2, "b" ** 13_000);
+    try expectBodyContains(&gateway, 2, "Original source archives:");
+    try expectBodyNotContains(&gateway, 2, "a" ** 13_000);
+    try expectBodyNotContains(&gateway, 2, "b" ** 13_000);
     try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     const completed = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
-    try std.testing.expectEqual(@as(usize, 1), completed.execution.tool_steps.len);
-    try std.testing.expectEqual(@as(usize, 2), completed.execution.tool_steps[0].tool_results.len);
-    try std.testing.expectEqualStrings(result_a, completed.execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings(result_b, completed.execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqual(@as(usize, 0), completed.execution.tool_steps.len);
+    const saved = hooks.compaction_prefixes.items[0].?.assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings(result_a, saved.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(result_b, saved.tool_steps[0].tool_results[1].output);
     for (gateway.request_models.items) |requested_model| try std.testing.expectEqualStrings(model, requested_model);
 }
 
@@ -3769,9 +3775,9 @@ test "interruption after automatic compaction retains the recent and new executi
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
     const interrupted = hooks.history_turns.items[1].interrupted;
-    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.tool_steps.len);
-    try std.testing.expectEqualStrings("before-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
-    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[1].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("x" ** (10 * 1024), hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqual(@as(usize, 2), interrupted.execution.files.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
@@ -3823,8 +3829,9 @@ test "context overflow after automatic compaction retries with new execution" {
     try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings("Recovered after a second compaction.", hooks.finish_assistant_text.?);
     const finished = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
-    try std.testing.expectEqual(@as(usize, 1), finished.execution.tool_steps.len);
-    try std.testing.expectEqualStrings("after-checkpoint", finished.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 0), finished.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", hooks.compaction_prefixes.items[1].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("later result", hooks.compaction_prefixes.items[1].?.assistant.execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqual(@as(usize, 2), finished.execution.files.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.compaction_prefixes.items.len);
