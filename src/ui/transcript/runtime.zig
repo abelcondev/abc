@@ -7944,6 +7944,7 @@ pub const TranscriptRuntime = struct {
         destructive_invalidation: bool,
         activity_overlay_active: bool,
     ) ?RetainedTranscriptBody {
+        if (!anchor.flow_materialized) return null;
         return render_engine.frame_retention.stableRetainedTranscriptBody(.{
             .full_transcript_active = self.fullTranscriptActive(),
             .committed_layout_id = anchor.layout_id,

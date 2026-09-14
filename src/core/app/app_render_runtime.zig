@@ -4148,6 +4148,63 @@ test "core.app_render_runtime consolidation rebases before publishing followup r
     try std.testing.expectEqualStrings(text, quiet);
 }
 
+test "core.app_render_runtime paints a rebased terminal status after cancellation pin cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "cancel-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 100, .rows = 30, .content_bottom = 26, .divider_top_row = 27, .input_row = 28, .divider_bottom_row = 29, .hint_row = 30 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 100, 30);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    const id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_mcp" };
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "mcp_fixture_echo",
+        .activity_kind = .command,
+    } });
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(try app.shell.presentActiveToolCancellation(alloc));
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const cancelled = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(cancelled);
+    try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled mcp_fixture_echo") == null);
+
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled mcp_fixture_echo" },
+    } });
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .interrupted,
+    } });
+    try app.shell.finishLifecycleBatch(alloc);
+    try std.testing.expect(!app.shell.transcript_commit_state.stable.flow_materialized);
+    try std.testing.expectEqual(offset, try file.length(std.testing.io));
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const finished = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(finished);
+    try std.testing.expect(std.mem.find(u8, finished, "Cancelled mcp_fixture_echo") != null);
+    try std.testing.expect(app.shell.transcript_commit_state.stable.flow_materialized);
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(finished, quiet);
+}
+
 test "core.app_render_runtime rebased notice preserves the pin and publishes the finished result" {
     try checkRebasedNoticePublication(80, 12);
     try checkRebasedNoticePublication(24, 10);
