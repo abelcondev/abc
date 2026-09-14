@@ -272,7 +272,9 @@ function validateProvenance(control: Provenance, candidate: Provenance): void {
     requireValue(Number.isSafeInteger(artifact.id) && artifact.id > 0 && artifact.expired === false, "invalid artifact ID or expired artifact");
     requireValue([run.id, run.repository.id, run.head_repository.id].every((id) => Number.isSafeInteger(id) && id > 0), "invalid source run identity");
     requireValue(/^[a-f0-9]{40}$/.test(run.head_sha), "invalid source run head");
-    requireValue(run.path === ".github/workflows/pgso-macos-arm64.yml" && run.status === "completed" && run.conclusion === "success", "source run did not pass PGSO");
+    const releaseControl = value === control && run.path === ".github/workflows/release.yml" &&
+      run.head_branch === "main" && (run.event === "push" || run.event === "workflow_dispatch");
+    requireValue((run.path === ".github/workflows/pgso-macos-arm64.yml" || releaseControl) && run.status === "completed" && run.conclusion === "success", "source run did not pass PGSO");
     requireValue(run.repository.full_name === "vercel-labs/fx" && run.head_repository.full_name === "vercel-labs/fx", "foreign repository");
     requireValue(artifact.workflow_run.repository_id === run.repository.id && artifact.workflow_run.head_repository_id === run.head_repository.id, "artifact repository mismatch");
     requireValue(artifact.workflow_run.id === run.id && artifact.workflow_run.head_sha === run.head_sha, "artifact run mismatch");
@@ -383,6 +385,31 @@ test("paired confidence detects calibration errors and resolved regressions", ()
   expect(() => pairedInterval([], [], "mean")).toThrow();
   expect(() => pairedInterval(control, control.slice(1), "mean")).toThrow();
   expect(() => pairedInterval(control, control.map(() => NaN), "mean")).toThrow();
+});
+
+test("PGSO provenance accepts qualified main controls from the release pipeline", () => {
+  const valid = provenanceFixture();
+  valid[0].run.path = ".github/workflows/release.yml";
+  valid[0].run.event = "push";
+  expect(() => validateProvenance(...valid)).not.toThrow();
+  valid[0].run.event = "workflow_dispatch";
+  expect(() => validateProvenance(...valid)).not.toThrow();
+  const mutations: Array<(pair: [Provenance, Provenance]) => void> = [
+    (pair) => { pair[0].run.event = "pull_request"; },
+    (pair) => { pair[0].run.event = "workflow_run"; },
+    (pair) => { pair[0].run.head_branch = "feature"; },
+    (pair) => { pair[0].run.path = ".github/workflows/dev-release.yml"; },
+    (pair) => { pair[0].run.conclusion = "failure"; },
+    (pair) => { pair[0].manifest.eligible = false; },
+    (pair) => { pair[0].artifact.workflow_run.id++; },
+    (pair) => { pair[1].source.parents[0].sha = "f".repeat(40); },
+    (pair) => { pair[1].run.path = ".github/workflows/release.yml"; },
+  ];
+  for (const mutate of mutations) {
+    const pair = structuredClone(valid);
+    mutate(pair);
+    expect(() => validateProvenance(...pair)).toThrow();
+  }
 });
 
 test("paired confidence verdict rejects biased calibration and slower candidates", () => {

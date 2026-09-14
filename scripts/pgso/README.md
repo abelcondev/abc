@@ -149,6 +149,8 @@ The driver also streams operational progress to the invoking terminal or GitHub 
 To compare a qualified PR merge with its exact main parent, dispatch the
 **Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
 and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
+The main control may come from the dedicated PGSO workflow or the Release
+workflow that invokes it. Both artifacts must have completed qualification.
 Leave `signed_run` empty. The native macOS arm64 job downloads those immutable
 artifacts without rebuilding them, checks their run/source relationships and
 binary hashes, then measures normal and recovered no-history requests. It runs

@@ -252,9 +252,11 @@ jobs:
             run_id=$(jq -er .workflow_run.id "$FX_PGSO_COMPARE_INPUT/$lane-artifact.json")
             [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$FX_PGSO_COMPARE_INPUT/$lane-run.json"
-            jq -e --arg repo "$GITHUB_REPOSITORY" '
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg lane "$lane" '
               .status == "completed" and .conclusion == "success" and
-              .path == ".github/workflows/pgso-macos-arm64.yml" and
+              (.path == ".github/workflows/pgso-macos-arm64.yml" or
+                ($lane == "control" and .path == ".github/workflows/release.yml" and
+                  .head_branch == "main" and (.event == "push" or .event == "workflow_dispatch"))) and
               .repository.full_name == $repo and .head_repository.full_name == $repo
             ' "$FX_PGSO_COMPARE_INPUT/$lane-run.json"
             echo "${lane}_run=$run_id" >> "$GITHUB_OUTPUT"
