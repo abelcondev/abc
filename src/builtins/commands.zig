@@ -29,12 +29,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--full-access", .description = "Disable fx permission checks" },
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
+            .{ .flag = "--model <id>", .description = "Override the model for this request" },
+            .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
+            .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
+            .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
             json_option,
