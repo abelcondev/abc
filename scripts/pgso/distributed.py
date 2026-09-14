@@ -983,13 +983,15 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
         corpus,
         log_dir,
     )
-    if arguments.kind == "startup":
+    hyperfine: pathlib.Path | None = None
+    if arguments.kind in ("startup", "heavy"):
         hyperfine = _require_version(
             arguments.hyperfine,
             f"hyperfine {REQUIRED_HYPERFINE_VERSION}",
             "Hyperfine",
             log_dir / "hyperfine-version.json",
         )
+    if arguments.kind == "startup":
         results = measure_startup(
             repo_root=REPO_ROOT,
             control_binary=candidate_paths.control_binary,
@@ -1014,6 +1016,7 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
             timeout_s=arguments.timeout_seconds,
             workload_names=(arguments.name,),
             prebuilt_pairs=benchmark_pairs,
+            hyperfine_binary=hyperfine,
         )
         phase = "heavy"
     if len(results) != 1:
