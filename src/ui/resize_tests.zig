@@ -3758,6 +3758,20 @@ test "structured command-output rewrite materializes committed transcript scroll
     try expectGridContains(&h, "assistant table row 17");
     try expectGridContains(&h, "assistant table row 24");
     try std.testing.expectEqualStrings("", probe.history.items);
+    const observed_before = try captureTrimmedGrid(&h, h.alloc);
+    defer h.alloc.free(observed_before);
+    var observed_old: [24]bool = undefined;
+    for (&observed_old, 1..) |*observed, index| {
+        var buffer: [48]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&buffer, "assistant table row {d}\n", .{index});
+        const count = std.mem.count(u8, observed_before, marker);
+        try std.testing.expect(count <= 1);
+        observed.* = count == 1;
+    }
+    var old_committed = (try h.shell.prepareCommittedRetentionSource(h.alloc)).?;
+    defer old_committed.deinit(h.alloc);
+    const old_boundary = old_committed.byteAtVisualOffset(h.shell.transcriptCommitDiagnostic().history_visual_offset);
+    const bytes_before_mutation = try h.file.length(std.testing.io);
 
     var follow_up: std.Io.Writer.Allocating = .init(h.alloc);
     defer follow_up.deinit();
@@ -3787,68 +3801,113 @@ test "structured command-output rewrite materializes committed transcript scroll
         "SYSTEM OUTPUT 02",
     ) == null);
 
-    // Every old entry was pruned. The committed intersection is empty, not
-    // the new mutation's cache; none of the follow-up is physical history yet.
+    // Retention removed the recorded entry, not its unexported publication.
     try std.testing.expect(h.shell.lookupAssistantSegments(first_assistant_id) == null);
     const rebased = h.shell.transcript_commit_state.stable;
-    try std.testing.expectEqualStrings("", rebased.flow);
-    try std.testing.expectEqual(@as(usize, 0), rebased.retention_identity.lines.len);
-    try std.testing.expectEqual(@as(u32, 0), rebased.history_visual_offset);
-    try std.testing.expectEqual(@as(u32, 0), rebased.visual_offset);
-    try std.testing.expect(!rebased.flow_materialized);
-
-    try h.renderTranscriptFrame();
-    try captureRetentionFrame(&h, &probe);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    const held_diagnostic = h.shell.transcriptCommitDiagnostic();
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.recovering,
-        held_diagnostic.state,
-    );
-    try std.testing.expectEqual(@as(u32, 0), held_diagnostic.history_visual_offset);
-    try std.testing.expectEqual(@as(u32, 56), held_diagnostic.remaining_inline_rows);
-    try expectGridContains(&h, "const retained_boundary = true;");
-    try expectGridContains(&h, "follow-up retained row 4");
+    try std.testing.expect(std.mem.findScalar(u32, rebased.retention_identity.publication_entries, first_assistant_id) != null);
+    try std.testing.expect(std.mem.find(u8, rebased.flow, "follow-up retained row") == null);
+    try std.testing.expect(std.mem.find(u8, rebased.flow, "const retained_boundary") == null);
+    var held_source = (try h.shell.prepareCommittedRetentionSource(h.alloc)).?;
+    defer held_source.deinit(h.alloc);
+    try std.testing.expectEqualStrings(old_committed.bytes[old_boundary..], held_source.bytes[held_source.byteAtVisualOffset(rebased.history_visual_offset)..]);
+    try std.testing.expectEqual(bytes_before_mutation, try h.file.length(std.testing.io));
     try std.testing.expectEqualStrings("", probe.history.items);
 
-    // The first frame stages a source-backed endpoint. The second publishes
-    // its remaining rows instead of accepting the entire cache as history.
-    try h.renderTranscriptFrame();
-    try captureRetentionFrame(&h, &probe);
-    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
-    try std.testing.expectEqual(@as(u16, 56), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(
-        h.last_frame.planned_scroll_rows,
-        h.last_frame.committed_scroll_rows,
-    );
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    switch (h.shell.transcript_commit_state) {
-        .stable => |anchor| try std.testing.expect(!anchor.normal_buffer_recovery_pending),
-        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    var seen_follow_up = [_]bool{false} ** 60;
+    var accepted_rows: usize = 0;
+    for (0..8) |_| {
+        // Settlement may translate coordinates only for rows already exported.
+        var source = try h.shell.prepareTranscriptSource(h.alloc, null);
+        source.deinit(h.alloc);
+        const before_history = h.shell.transcriptCommitDiagnostic().history_visual_offset;
+        const before_exported = std.mem.count(u8, probe.history.items, "\n");
+        try h.renderTranscriptFrame();
+        try captureRetentionFrame(&h, &probe);
+        try std.testing.expectEqual(render_engine.terminal_diff.ShadowCommitState.committed, h.last_frame.shadow_state);
+        try std.testing.expectEqual(h.last_frame.planned_scroll_rows, h.last_frame.committed_scroll_rows);
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+        const exported = std.mem.count(u8, probe.history.items, "\n") - before_exported;
+        try std.testing.expectEqual(@as(usize, h.last_frame.committed_scroll_rows), exported);
+        try std.testing.expectEqual(@as(u32, h.last_frame.committed_scroll_rows), h.shell.transcriptCommitDiagnostic().history_visual_offset - before_history);
+        accepted_rows += exported;
+
+        const frame_grid = try captureTrimmedGrid(&h, h.alloc);
+        defer h.alloc.free(frame_grid);
+        const frame_text = try std.mem.concat(h.alloc, u8, &.{ probe.history.items, frame_grid });
+        defer h.alloc.free(frame_text);
+        var old_position: usize = 0;
+        for (observed_old, 1..) |observed, index| {
+            var buffer: [48]u8 = undefined;
+            const marker = try std.fmt.bufPrint(&buffer, "assistant table row {d}\n", .{index});
+            try std.testing.expectEqual(@as(usize, @intFromBool(observed)), std.mem.count(u8, frame_text, marker));
+            if (observed) {
+                const position = std.mem.find(u8, frame_text, marker).?;
+                try std.testing.expect(position >= old_position);
+                old_position = position + marker.len;
+            }
+        }
+        const published_prefix = switch (h.shell.transcript_commit_state) {
+            .stable => |anchor| if (anchor.flow_materialized) anchor.flow else &.{},
+            .recovering => |receipt| receipt.flow[0 .. receipt.materialized_flow_len orelse 0],
+            .invalid => return error.TestExpectedCommittedSource,
+        };
+        for (&seen_follow_up, 1..) |*seen, index| {
+            var buffer: [48]u8 = undefined;
+            const marker = try std.fmt.bufPrint(&buffer, "follow-up retained row {d}\n", .{index});
+            const count = std.mem.count(u8, frame_text, marker);
+            try std.testing.expect(count <= 1);
+            if (seen.* or std.mem.find(u8, published_prefix, marker) != null) try std.testing.expectEqual(@as(usize, 1), count);
+            seen.* = seen.* or count == 1;
+        }
+        if (std.mem.findScalar(bool, &seen_follow_up, false) == null and h.shell.transcript_commit_state == .stable and
+            !h.shell.transcript_commit_state.stable.normal_buffer_recovery_pending and !h.shell.transcript_commit_state.stable.history_catchup_pending) break;
     }
+    const old_row_count = std.mem.count(bool, &observed_old, &.{true});
+    try std.testing.expect(accepted_rows >= old_row_count + seen_follow_up.len - h.shell.layout.content_bottom);
+    try std.testing.expectEqual(accepted_rows, std.mem.count(u8, probe.history.items, "\n"));
+    try std.testing.expect(std.mem.findScalar(bool, &seen_follow_up, false) == null);
     try expectGridContains(&h, "follow-up retained row 60");
-    try std.testing.expectEqual(@as(usize, 56), std.mem.count(u8, probe.history.items, "\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "const retained_boundary = true;"));
     const grid = try captureTrimmedGrid(&h, h.alloc);
     defer h.alloc.free(grid);
     const physical = try std.mem.concat(h.alloc, u8, &.{ probe.history.items, grid });
     defer h.alloc.free(physical);
-    var previous: usize = 0;
+    var previous = std.mem.find(u8, physical, "assistant table row 24\n").?;
+    const boundary = std.mem.find(u8, physical, "const retained_boundary = true;").?;
+    try std.testing.expect(boundary > previous);
+    previous = boundary;
     for (1..61) |index| {
         var buffer: [48]u8 = undefined;
         const marker = try std.fmt.bufPrint(&buffer, "follow-up retained row {d}\n", .{index});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, physical, marker));
         const position = std.mem.find(u8, physical, marker).?;
         try std.testing.expect(position > previous);
-        previous = position;
+        if (index > 1) try std.testing.expectEqualStrings("  ", physical[previous..position]);
+        previous = position + marker.len;
+    }
+    for (18..25) |index| {
+        var first: [48]u8 = undefined;
+        var second: [48]u8 = undefined;
+        const prior_marker = try std.fmt.bufPrint(&first, "assistant table row {d}\n", .{index - 1});
+        const marker = try std.fmt.bufPrint(&second, "assistant table row {d}\n", .{index});
+        const old_start = std.mem.find(u8, observed_before, prior_marker).? + prior_marker.len;
+        const old_end = std.mem.find(u8, observed_before, marker).?;
+        const start = std.mem.find(u8, physical, prior_marker).? + prior_marker.len;
+        const end = std.mem.find(u8, physical, marker).?;
+        try std.testing.expectEqualStrings(observed_before[old_start..old_end], physical[start..end]);
     }
     const published = try h.alloc.dupe(u8, probe.history.items);
     defer h.alloc.free(published);
     try h.renderTranscriptFrame();
     try captureRetentionFrame(&h, &probe);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqualStrings(published, probe.history.items);
+    const quiet_grid = try captureTrimmedGrid(&h, h.alloc);
+    defer h.alloc.free(quiet_grid);
+    try std.testing.expectEqualStrings(grid, quiet_grid);
+    try std.testing.expect(std.mem.findScalar(u32, h.shell.committedRetentionIdentity().?.publication_entries, first_assistant_id) == null);
 }
 
 fn applyCompletedReadForGroupFinalityResizeTest(
@@ -8532,15 +8591,22 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     var probe = try PhysicalHistoryProbe.init(12, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, "abcdefghijkl" ** 10);
+    const retired_id = try h.shell.appendRawTranscriptEntry(alloc, "abcdefghijkl" ** 10);
     _ = try h.shell.appendRawTranscriptEntry(alloc, "KEEP00000001KEEP00000002KEEP00000003");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     const old_history = h.shell.transcriptCommitDiagnostic().history_visual_offset;
     try std.testing.expect(old_history > 0 and old_history < 10);
+    const before_grid = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(before_grid);
+    const before_full = try std.mem.concat(alloc, u8, &.{ probe.history.items, before_grid });
+    defer alloc.free(before_full);
+    const published_old_rows = std.mem.count(u8, before_full, "abcdefghijkl");
+    try std.testing.expect(published_old_rows > 0);
     h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + "tail\n".len - 1;
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "tail\n");
-    try std.testing.expectEqual(@as(u32, 0), h.shell.transcriptCommitDiagnostic().history_visual_offset);
+    try std.testing.expectEqual(old_history, h.shell.transcriptCommitDiagnostic().history_visual_offset);
+    try std.testing.expect(std.mem.findScalar(u32, h.shell.committedRetentionIdentity().?.publication_entries, retired_id) != null);
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
@@ -8556,6 +8622,8 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     for ([_][]const u8{ "KEEP00000001", "KEEP00000002", "KEEP00000003" }) |marker| {
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, marker));
     }
+    try std.testing.expectEqual(published_old_rows, std.mem.count(u8, full, "abcdefghijkl"));
+    try std.testing.expect(std.mem.findScalar(u32, h.shell.committedRetentionIdentity().?.publication_entries, retired_id) == null);
 }
 
 test "assistant retention partial compact group preserves surviving physical children" {

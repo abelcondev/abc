@@ -1855,6 +1855,292 @@ describe.skipIf(SKIP)("tui: resize", () => {
     120_000,
   );
 
+  for (const { label, pressure, viewerCols } of [
+    { label: "no-prune control", pressure: false, viewerCols: 0 },
+    { label: "pressure", pressure: true, viewerCols: 0 },
+    { label: "pressure with Ctrl+O", pressure: true, viewerCols: 80 },
+    { label: "pressure with Ctrl+O resize 80 to 100", pressure: true, viewerCols: 100 },
+  ]) {
+    test(
+      `command retention preserves native paragraphs at default cap (${label})`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-retention-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const tracePath = join(root, "trace.log");
+        const stderrPath = join(root, "stderr.log");
+        const tapePath = join(root, "terminal.fxtape");
+        const releasePath = join(workspace, "release");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace);
+        writeFileSync(join(home, ".fx", "settings.json"), "{}");
+        writeFileSync(stderrPath, "");
+        // Keep geometry and logical rows identical; only the old retained payload differs.
+        writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
+        writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
+        writeFileSync(join(workspace, "probe.sh"), [
+          "printf started > started",
+          "while [ ! -f release ]; do sleep 0.05; done",
+          "cat new.txt",
+          "printf finished > finished",
+          "",
+        ].join("\n"));
+        const oldLabels = Array.from({ length: 10 }, (_, index) =>
+          `RETENTION_OLD_${String(index).padStart(2, "0")}`
+        );
+        const oldParagraphs = [
+          "1. First result remains visible.",
+          "Second result retains its own paragraph.",
+          "Third result follows one blank separator.",
+          "Fourth result ends the first section.",
+          "Artifacts: prepared output remains available.",
+          "Artifact details retain their original row.",
+          "Checks: command output finished successfully.",
+          "Check details remain separate from artifacts.",
+          "Summary: all earlier results are preserved.",
+          "Summary details close the old response.",
+        ].map((text, index) => `${oldLabels[index]} ${text}`);
+        const laterLabels = Array.from({ length: 24 }, (_, index) =>
+          `RETENTION_LATER_${String(index).padStart(2, "0")}`
+        );
+        const oldResponse = oldParagraphs.join("\n\n");
+        const laterResponse = laterLabels.join("\n\n") + "\n\nRETENTION_FINISHED";
+        let requestCount = 0;
+        const gateway = startDynamicFakeGateway((body) => {
+          requestCount++;
+          writeFileSync(join(root, `request-${requestCount}.json`), body);
+          if (requestCount === 1 || requestCount === 3) return fakeGatewaySse([
+            {
+              type: "tool-call", toolCallId: `retention-${requestCount}`, toolName: "shell",
+              input: { request: {
+                action: "run", command: requestCount === 1 ? "cat old.txt" : "sh probe.sh",
+                profile: "clean", yield_time_ms: 30_000,
+              } },
+            },
+            ...(requestCount === 3 ? [{
+              type: "tool-call", toolCallId: "retention-second-admission", toolName: "shell",
+              input: { request: {
+                action: "run", command: "printf finished > sibling-finished; printf 'small sibling output\\n'",
+                profile: "clean", yield_time_ms: 30_000,
+              } },
+            }] : []),
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+          return fakeGatewayFinalText(requestCount === 2 ? oldResponse : laterResponse);
+        });
+        gateways.push(gateway);
+        const env = {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home,
+          AI_GATEWAY_API_KEY: "synthetic-command-retention", VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_MODEL: FAKE_GATEWAY_MODEL, FX_MAX_AGENT_STEPS: "4",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1",
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_SCOPES: "transcript_retention,command_output,scroll,frame_plan,frame_commit,tool,ui_activity" +
+            (viewerCols ? ",full_transcript,full_transcript_cache,resize" : ""),
+          FX_TRACE_LOG: tracePath, FX_RECORD: tapePath, FX_RECORD_INPUT: "1",
+        };
+        const failures: Error[] = [];
+        const checks: Record<string, string> = {};
+        const check = (name: string, assertion: () => void) => {
+          try {
+            assertion();
+            checks[name] = "PASS";
+          } catch (error) {
+            checks[name] = String(error);
+            failures.push(new Error(`${name}: ${String(error)}`));
+          }
+        };
+        const capture = async (name: string) => {
+          const full = await session!.captureFullScrollback();
+          writeFileSync(join(root, `${name}.full.txt`), full);
+          writeFileSync(join(root, `${name}.ansi`), await session!.captureFullScrollbackEscapes());
+          return full;
+        };
+        const expectHistory = (full: string, later: boolean) => {
+          const labels = later ? [...oldLabels, ...laterLabels] : oldLabels;
+          const found = [...full.matchAll(/RETENTION_(?:OLD|LATER)_\d{2}/g)].map(match => match[0]);
+          expect(found).toEqual(labels);
+          for (const label of labels) expect(countOccurrences(full, label)).toBe(1);
+          const lines = full.split("\n").map(line => line.trim());
+          for (const line of lines) {
+            expect((line.match(/RETENTION_(?:OLD|LATER)_\d{2}/g) ?? []).length).toBeLessThanOrEqual(1);
+          }
+          const paragraphs = later ? [...oldParagraphs, ...laterLabels] : oldParagraphs;
+          for (let index = 0; index < labels.length; index++) {
+            expect(lines.filter(line => line.includes(labels[index]!))).toEqual([paragraphs[index]!]);
+          }
+          // Trim cell padding, never newlines: missing or added spacers must fail too.
+          const normalized = lines.join("\n");
+          for (let index = 1; index < oldParagraphs.length; index++) {
+            expect(normalized).toContain(`${oldParagraphs[index - 1]}\n\n${oldParagraphs[index]}`);
+          }
+          if (later) expect(normalized).toContain(laterResponse);
+        };
+        let passed = false;
+        try {
+          session = await createResizeSession({
+            cmd: quoteShellPath(FX_BIN), cwd: workspace, env,
+            isolated: true, remainOnExit: true, width: 80, height: 32,
+            minimumHistoryLines: 20_000, stderrPath,
+          });
+          await session.waitForStableComposer(15_000);
+          await session.sendText("Produce the old command output and labeled response.");
+          await session.waitForText(oldLabels.at(-1)!, TIMEOUT);
+          await session.waitForStableComposer(15_000);
+          const seeded = await capture("seeded");
+          check("seeded history", () => expectHistory(seeded, false));
+          check("seed stays below default cap", () => {
+            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+          });
+
+          await session.sendText("Run the new prepared output, then the later response.");
+          const deadline = Date.now() + 15_000;
+          while (!existsSync(join(workspace, "started"))) {
+            expect(session.paneStatus().dead).toBe(false);
+            expect(Date.now()).toBeLessThan(deadline);
+            await Bun.sleep(25);
+          }
+          await capture("before-output");
+          const fullFooter = "full detail · ctrl+o close";
+          if (viewerCols) {
+            await session.sendHexBytes(["0f"]);
+            await session.waitForText(fullFooter, TIMEOUT);
+            await capture("viewer-open-before-output");
+            check("viewer admitted before first retirement", () => {
+              expect(existsSync(releasePath)).toBe(false);
+              expect(existsSync(join(workspace, "finished"))).toBe(false);
+              expect(requestCount).toBe(3);
+              expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+            });
+          }
+          const traceOffset = readFileSync(tracePath, "utf8").length;
+          writeFileSync(releasePath, "go");
+          if (viewerCols) {
+            const sessionsRoot = join(home, ".fx", "sessions");
+            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
+              .filter(entry => entry.isDirectory()).map(entry => entry.name);
+            expect(ids).toHaveLength(1);
+            const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
+            // The main composer and text tail are hidden. Wait for the actual saved
+            // assistant and its following completion record, not a viewer repaint.
+            await session.waitForPane((pane) => {
+              expect(session!.paneStatus().dead).toBe(false);
+              expect(pane).toContain(fullFooter);
+              const text = readFileSync(eventsPath, "utf8");
+              // A concurrent append may end mid-record; only parse terminated lines.
+              const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
+              const assistantIndex = records.findIndex(record =>
+                record.event.assistant?.text === laterResponse
+              );
+              const completed = assistantIndex >= 0 && records.slice(assistantIndex + 1)
+                .some(record => record.event.turn_completed !== undefined);
+              return completed && requestCount === 4 &&
+                existsSync(join(workspace, "finished")) &&
+                existsSync(join(workspace, "sibling-finished")) &&
+                /pruned (?:command output|entry)/.test(readFileSync(tracePath, "utf8").slice(traceOffset));
+            }, TIMEOUT);
+            checks["viewer turn completed and pruned before close"] = "PASS";
+            writeFileSync(join(root, "viewer-completed.events.jsonl"), readFileSync(eventsPath));
+            const viewerTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
+            writeFileSync(join(root, "viewer-completed.trace.log"), viewerTrace);
+            await capture("viewer-completed-before-close");
+            check("retirement completed while viewer owns screen", () => {
+              expect(viewerTrace).toMatch(/pruned (?:command output|entry)/);
+              expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
+              expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
+              expect(gateway.requests).toHaveLength(4);
+            });
+            if (viewerCols !== 80) {
+              const resizeOffset = readFileSync(tracePath, "utf8").length;
+              await session.resizeWindow(viewerCols, 32, 0);
+              await session.waitForPane((pane) => {
+                expect(session!.paneStatus().dead).toBe(false);
+                return pane.includes(fullFooter) && readFileSync(tracePath, "utf8")
+                  .slice(resizeOffset).includes(`[full_transcript_cache] window cols=${viewerCols} `);
+              }, TIMEOUT);
+              expect(session.paneSize()).toEqual({ cols: viewerCols, rows: 32 });
+              await capture("viewer-resized-before-close");
+            }
+            expect(await session.capturePane()).toContain(fullFooter);
+            await session.sendKeys("Escape");
+            await session.waitForPane(pane => !pane.includes(fullFooter) && hasEmptyComposer(pane), TIMEOUT);
+            expect(session.paneSize()).toEqual({ cols: viewerCols, rows: 32 });
+          }
+          await session.waitForText("RETENTION_FINISHED", TIMEOUT);
+          await session.waitForStableComposer(15_000);
+          const afterOutput = await capture("after-output");
+          const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
+          writeFileSync(join(root, "output-trace.log"), boundary);
+          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
+          // not a particular frame reason; coordinator tests own those exact boundaries.
+          check("retention boundary", () => {
+            const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
+            if (pressure) expect(prunes.length).toBeGreaterThan(0);
+            else expect(prunes).toHaveLength(0);
+          });
+          check("commands finished", () => {
+            expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
+            expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
+            expect(requestCount).toBe(4);
+            expect(gateway.requests).toHaveLength(4);
+          });
+          check("native history after output", () => expectHistory(afterOutput, true));
+          await session.sendText("/status");
+          await session.waitForText("agent_step_limit=", 10_000);
+          await session.waitForStableComposer(10_000);
+          const afterStatus = await capture("after-status");
+          check("native history after status", () => expectHistory(afterStatus, true));
+          if (!pressure) check("control never prunes", () => {
+            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+          });
+          await session.sendText("/quit");
+          await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+          check("clean exit", () => {
+            expect(session!.paneStatus()).toEqual({ dead: true, status: 0 });
+            expectEmptyStderr(stderrPath);
+          });
+          check("persisted assistant paragraphs", () => {
+            const sessionsRoot = join(home, ".fx", "sessions");
+            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
+              .filter(entry => entry.isDirectory()).map(entry => entry.name);
+            expect(ids).toHaveLength(1);
+            const events = readFileSync(join(sessionsRoot, ids[0]!, "events.jsonl"), "utf8")
+              .trim().split("\n").map(line => JSON.parse(line));
+            const responses = events.filter(record => record.event.assistant !== undefined)
+              .map(record => record.event.assistant.text);
+            expect(responses).toEqual([oldResponse, laterResponse]);
+          });
+          check("recording replay", () => {
+            const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--json"], {
+              cwd: workspace, env: { ...env, FX_RECORD: undefined, FX_TRACE_LOG: undefined },
+            });
+            writeFileSync(join(root, "replay.json"), replay.stdout);
+            writeFileSync(join(root, "replay.stderr"), replay.stderr);
+            expect(replay.exitCode).toBe(0);
+            expect(replay.stderr.toString()).toBe("");
+            const summary = JSON.parse(replay.stdout.toString());
+            expect(summary.frame_count).toBeGreaterThan(0);
+            expect(summary.stdout_bytes).toBeGreaterThan(0);
+            if (viewerCols) expect(summary.resize_count).toBe(viewerCols === 80 ? 0 : 1);
+          });
+          if (failures.length) throw new AggregateError(failures, "Command retention checks failed");
+          passed = true;
+        } finally {
+          writeFileSync(releasePath, "cleanup");
+          if (session) await capture("last");
+          writeFileSync(join(root, "checks.json"), JSON.stringify({ pressure, viewerCols, requestCount, checks }, null, 2));
+          if (passed && !KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
+          else console.error(`command retention evidence retained: ${root}`);
+        }
+      },
+      120_000,
+    );
+  }
+
   test(
     "structured retention keeps native scrollback complete before resize",
     async () => {
