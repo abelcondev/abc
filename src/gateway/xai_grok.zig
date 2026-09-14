@@ -101,6 +101,9 @@ pub fn buildRequest(
         try std.json.Stringify.value(effort.label(), .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
+    // xAI exposes Fast mode as its priority service tier; the subscription
+    // proxy accepts the parameter endpoint-wide, independent of the model.
+    if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
     return out.toOwnedSlice();
@@ -532,8 +535,21 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
+}
+
+test "xAI Grok fast requests use the priority service tier" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "grok-4.20",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{ .fast = true },
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
 }
 
 test "xAI Grok standard requests omit the priority service tier" {
