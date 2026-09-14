@@ -621,7 +621,7 @@ class PgsoQualificationTests(unittest.TestCase):
         for round_index, command in enumerate(hyperfine_calls):
             self.assertEqual("1", command[command.index("--runs") + 1])
             self.assertEqual(
-                "10",
+                "0",
                 command[command.index("--warmup") + 1],
             )
             self.assertEqual(

@@ -1014,7 +1014,7 @@ def _measure_microbenchmark(
             "--style",
             "none",
             "--warmup",
-            str(STARTUP_WARMUP_RUNS),
+            "0",
             "--runs",
             "1",
             "--export-json",
