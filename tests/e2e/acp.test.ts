@@ -6624,6 +6624,8 @@ describe("acp: model-independent", () => {
       const resp = await client.readLine() as any;
       expect(resp.error).toBeDefined();
       expect(resp.error.code).toBe(-32700);
+      client.endStdin();
+      expect(await client.waitForExit()).toBe(0);
       expect(client.stderr).toBe("");
     },
     TIMEOUT,
