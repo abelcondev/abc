@@ -1,8 +1,31 @@
 # fx
 
-## 0.0.9
+## 0.0.10
 
 <!-- release:start -->
+
+**fx now completes turns up to 1.6× faster and starts model requests up to 2.5× faster.**
+
+### Improvements
+
+- Speed gains vary with session length and usage. Longer sessions improve the most.
+- Shell failures now give the model clearer recovery guidance.
+- `/trace` now provides better diagnostics for session-title issues.
+- System notices have a cleaner visual treatment.
+
+### Bug Fixes
+
+- Resume recovery now restores shell activity more reliably.
+- Scrollback retention is more reliable when resuming long conversations.
+- Resolved questions and answers now render cleanly across terminal widths.
+
+### Security
+
+- MCP errors now have stronger secret protection.
+
+<!-- release:end -->
+
+## 0.0.9
 
 **fx can now use a frontier model for steering, then delegate to cheaper models to implement. Subagents keep running while you steer, can have different models and reasoning levels, and take feedback mid-task. We're accomplishing this without any new commands or concepts, just chat with fx.**
 
@@ -39,8 +62,6 @@
 - Auto mode now checks which terminal session it's sending input to, including after a resume.
 - Auto mode no longer reuses an earlier safety-review decision when judging a later action.
 - Auto mode no longer raises false cautions when you use a credential with the service it's for, or with a local test process.
-
-<!-- release:end -->
 
 ## 0.0.8
 
