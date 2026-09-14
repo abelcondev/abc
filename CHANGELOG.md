@@ -8,7 +8,7 @@
 
 ### Improvements
 
-- Gains vary with session length and usage. Longer sessions improve the most.
+- Speed gains vary with session length and usage. Longer sessions improve the most.
 - Shell failures now give the model clearer recovery guidance.
 - `/trace` now provides better diagnostics for session-title issues.
 - System notices have a cleaner visual treatment.
