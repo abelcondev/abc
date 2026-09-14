@@ -4553,7 +4553,7 @@ tmuxTest(
         if (Date.now() >= catalogDeadline) throw new Error("Grok catalog did not load");
         await Bun.sleep(25);
       }
-      await session.sendText("/model grok-4.6 xhigh");
+      await session.sendText("/model grok-4.6 xhigh normal");
       await session.waitForText("Switched to grok-4.6", TIMEOUT);
       await session.sendText("Use the selected effort.");
       await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
