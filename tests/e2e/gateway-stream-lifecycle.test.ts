@@ -1503,6 +1503,51 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask with fast mode enabled warns once and runs standard speed when the model catalog fails", async () => {
+    const root = createFixtureRoot("fast-catalog-failure");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ fast_mode: true }),
+    );
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("STANDARD_SPEED_COMPLETE"),
+      {
+        models: () => new Response("catalog unavailable", { status: 500 }),
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run without the catalog."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "STANDARD_SPEED_COMPLETE",
+      );
+      expect(result.stderr).toContain("Fast mode is unavailable");
+      expect(
+        result.stderr.match(/Fast mode is unavailable/g),
+      ).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(1);
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
       const root = createFixtureRoot(`permission-mode-${mode}`);
