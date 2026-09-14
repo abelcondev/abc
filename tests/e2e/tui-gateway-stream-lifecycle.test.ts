@@ -1591,6 +1591,105 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT);
 
+  test("interactive launch flags override model effort and fast mode", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-launch-flags-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    const workspace = realpathSync(workspacePath);
+
+    const queuedGateway = startFakeGateway([
+      fakeGatewayFinalText("LAUNCH_FLAGS_OK"),
+    ], {
+      models: [{
+        id: MODEL,
+        type: "language",
+        tags: ["tool-use", "reasoning"],
+        fast_options: [{ type: "toggle" }],
+        reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+      }],
+    });
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --model ${MODEL} --effort high --fast`,
+      cwd: workspace,
+      width: 72,
+      height: 24,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-launch-flags-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: undefined,
+      },
+    });
+    await session.waitForText("gpt-5.5 · high · ⚡︎", TIMEOUT);
+
+    await session.sendText("Prove the launch flags.");
+    await session.waitForText("LAUNCH_FLAGS_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    expect(queuedGateway.requests).toHaveLength(1);
+    expect(queuedGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+    const request = JSON.parse(queuedGateway.requests[0]!.body);
+    expect(request).toMatchObject({
+      reasoning: "high",
+      providerOptions: { gateway: { speed: "fast" } },
+    });
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    await session.kill();
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --no-fast --model ${MODEL} --resume-last`,
+      cwd: workspace,
+      width: 72,
+      height: 24,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-launch-flags-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: undefined,
+      },
+    });
+    const resumed = await session.waitForText("gpt-5.5", TIMEOUT);
+    expect(resumed).not.toContain("⚡︎");
+
+    await session.sendText("Continue without fast.");
+    await session.waitForText("LAUNCH_FLAGS_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    expect(queuedGateway.requests).toHaveLength(2);
+    const resumedRequest = JSON.parse(queuedGateway.requests[1]!.body);
+    expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(MODEL);
+    expect(resumedRequest).not.toHaveProperty("providerOptions.gateway.speed");
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test(
     "clear response language mismatch never reaches TUI scrollback",
     async () => {

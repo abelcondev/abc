@@ -665,6 +665,11 @@ const App = struct {
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
+            .{
+                .model = launch.modifiers.model_override,
+                .effort = launch.modifiers.effort_override,
+                .fast = launch.modifiers.fast_override,
+            },
         );
         errdefer app.deinit();
         try WorkspaceAppRuntime.applyLaunch(

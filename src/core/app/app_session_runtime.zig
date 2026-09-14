@@ -1152,6 +1152,8 @@ pub const Persistence = struct {
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
+    process_effort_override: ?types.ReasoningEffort = null,
+    process_fast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
@@ -1167,7 +1169,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 21) {
+            if (std.meta.fields(Persistence).len != 23) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1183,6 +1185,8 @@ pub const Persistence = struct {
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
+        storage.process_effort_override = null;
+        storage.process_fast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
@@ -1309,6 +1313,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            effort_process_override: bool,
+            fast_process_override: bool,
         ) !void {
             try replacePreferences(
                 app.alloc,
@@ -1334,6 +1340,10 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
+            app.session_persistence.process_effort_override =
+                if (effort_process_override) effort else null;
+            app.session_persistence.process_fast_override =
+                if (fast_process_override) fast_mode else null;
         }
 
         pub fn initializePersistence(
@@ -4958,11 +4968,18 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            app.effort = preferences.effort;
-            app.fast_mode = preferences.fast_mode;
-            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
-            app.worker.syncQueuedPromptEffort(preferences.effort);
-            app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+            // Launch flags (fx --effort/--fast) win over the resumed session's
+            // stored preferences for this launch, without rewriting them.
+            const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
+            const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
+            app.effort = effective_effort;
+            app.fast_mode = effective_fast_mode;
+            app.session_persistence.fast_mode_model_bound = if (app.session_persistence.process_fast_override != null)
+                effective_fast_mode
+            else
+                fast_mode_model_bound;
+            app.worker.syncQueuedPromptEffort(effective_effort);
+            app.worker.syncQueuedPromptFastMode(effective_fast_mode);
         }
 
         pub fn fastModeModelBound(app: *const App) bool {
@@ -5850,6 +5867,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .auto,
         false,
         true,
+        false,
+        false,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
@@ -5938,6 +5957,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .auto,
             false,
             true,
+            false,
+            false,
         );
         app.session_persistence.js_host_store = fake.store();
         app.requested_resume = .last;
@@ -5968,6 +5989,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .auto,
         false,
         true,
+        false,
+        false,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .pick;
@@ -5994,6 +6017,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .auto,
         false,
         true,
+        false,
+        false,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6062,6 +6087,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         .auto,
         false,
         true,
+        false,
+        false,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6158,6 +6185,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        false,
+        false,
     );
 }
 
@@ -7614,6 +7643,8 @@ test "upgrade resume restores active session with the installed version notice" 
         "env/model",
         types.ReasoningEffort.literal("high"),
         true,
+        false,
+        false,
         false,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
@@ -9312,6 +9343,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        false,
+        false,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
