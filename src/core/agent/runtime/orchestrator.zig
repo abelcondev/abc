@@ -5933,6 +5933,13 @@ pub fn compactContextTransaction(
     var stage: compaction_activity.Stage = .preparation;
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
+        debug_trace.eventf(
+            "context_compaction",
+            "transaction_failed",
+            request.trace_ctx,
+            "stage={s} trigger={s} err={s}",
+            .{ @tagName(stage), @tagName(request.trigger), @errorName(err) },
+        );
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = request.trace_ctx.turn_id, .err = err };
@@ -5946,16 +5953,54 @@ pub fn compactContextTransaction(
         .source_tokens = request.source_tokens,
         .newest_exchange_tokens = request.newest_exchange_tokens,
     };
-    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) {
+    const initial_plan = runtime_prompt_context.planCompaction(plan_input);
+    if (initial_plan.decision == .no_op) {
+        debug_trace.eventf(
+            "context_compaction",
+            "skipped_no_op",
+            request.trace_ctx,
+            "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                initial_plan.usable_input_tokens,
+                initial_plan.high_water_tokens,
+            },
+        );
         if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
         return null;
     }
     const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
     plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
     const plan = runtime_prompt_context.planCompaction(plan_input);
-    const accepted_tokens = plan.accepted_handoff_tokens orelse
+    const accepted_tokens = plan.accepted_handoff_tokens orelse {
+        debug_trace.eventf(
+            "context_compaction",
+            "capacity_exceeded_at_plan",
+            request.trace_ctx,
+            "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                fixed_cost.estimated_input_tokens,
+                request.newest_exchange_tokens,
+                plan.usable_input_tokens,
+                plan.high_water_tokens,
+                plan.session_target_tokens,
+            },
+        );
         return error.ContextCapacityExceeded;
+    };
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
+        debug_trace.eventf(
+            "context_compaction",
+            "credential_unauthorized",
+            request.trace_ctx,
+            "trigger={s} provider={s} credential_source={s}",
+            .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
+        );
         return error.ContextCompactionUnavailable;
     }
     const compaction_model = request.continuation.request.model;
@@ -6005,6 +6050,19 @@ pub fn compactContextTransaction(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
+        debug_trace.eventf(
+            "context_compaction",
+            "candidate_over_capacity",
+            request.trace_ctx,
+            "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
+            .{
+                @tagName(request.trigger),
+                candidate_cost.estimated_input_tokens,
+                fixed_cost.estimated_input_tokens,
+                accepted_tokens,
+                compacted.handoff.len,
+            },
+        );
         return error.ContextCapacityExceeded;
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -6015,6 +6073,19 @@ pub fn compactContextTransaction(
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
     }, request.active_prefix, request.retained_from);
+    debug_trace.eventf(
+        "context_compaction",
+        "committed",
+        request.trace_ctx,
+        "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
+        .{
+            @tagName(request.trigger),
+            request.removed_turn_count,
+            request.compaction_count,
+            compacted.handoff.len,
+            accepted_tokens,
+        },
+    );
     // A successful acknowledgement wins even if cancellation arrived during publication.
     if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{
         .outcome = .succeeded,
@@ -7016,10 +7087,12 @@ fn processQueuedPromptLoop(
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
+                        debug_trace.eventf("context_compaction", "overflow_without_compaction", step_ctx, "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
+                                debug_trace.eventf("context_compaction", "no_compactable_context", step_ctx, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -7049,7 +7122,11 @@ fn processQueuedPromptLoop(
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
-                                    if (retention_target == 0) return error.ContextCapacityExceeded;
+                                    if (retention_target == 0) {
+                                        debug_trace.eventf("context_compaction", "retention_exhausted", step_ctx, "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        return error.ContextCapacityExceeded;
+                                    }
+                                    debug_trace.eventf("context_compaction", "retention_forced_zero", step_ctx, "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -7222,6 +7299,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
+                debug_trace.eventf("context_compaction", "overflow_recovery_incomplete", step_ctx, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();

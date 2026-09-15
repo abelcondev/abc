@@ -132,6 +132,14 @@ pub fn compact(
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
+        var stage: []const u8 = "plan";
+        errdefer |err| debug_trace.eventf(
+            "context_compaction",
+            "failed",
+            request.trace_ctx,
+            "stage={s} capacity_attempt={d} model={s} err={s}",
+            .{ stage, capacity_attempt, request.model, @errorName(err) },
+        );
         const compactable = source_messages;
         const policy: ?compaction_policy.Prepared = if (request.policy == .assistant_first)
             try compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens, summary_reserve_tokens)
@@ -192,14 +200,7 @@ pub fn compact(
                 .{ source_messages.len, compactable.len, fixed_handoff_tokens },
             );
         }
-        errdefer |err| debug_trace.eventf(
-            "context_compaction",
-            "failed",
-            request.trace_ctx,
-            "model={s} err={s}",
-            .{ request.model, @errorName(err) },
-        );
-
+        stage = "summarize";
         const summaries = try scratch.alloc([]const u8, ranges.len);
         var total_usage: types.ToolUsage = .{};
         for (ranges, 0..) |range, index| {
@@ -217,6 +218,7 @@ pub fn compact(
             addUsage(&total_usage, call.usage);
         }
 
+        stage = "finish";
         const handoff = if (policy) |prepared| try compaction_policy.finish(alloc, scratch, prepared, summaries, request.result_storage) else try compaction_state.renderHandoff(alloc, summaries);
         errdefer alloc.free(handoff);
         runtime_prompt_context.validateCompactionHandoff(
@@ -390,7 +392,10 @@ fn runSummaryCall(
         } };
     var usage: types.ToolUsage = .{};
     for (0..2) |attempt| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (request.cancel_flag.load(.seq_cst)) {
+            debug_trace.eventf("context_compaction", "summary_cancelled", request.trace_ctx, "phase=pre_stream attempt={d}", .{attempt});
+            return error.Cancelled;
+        }
         var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
         defer capture.deinit();
         var delivery = runtime_gateway_step.DeliveryCertainty.init();
@@ -424,34 +429,79 @@ fn runSummaryCall(
             request.usage_allocator,
         );
         defer streamed.deinit(alloc);
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (request.cancel_flag.load(.seq_cst)) {
+            debug_trace.eventf("context_compaction", "summary_cancelled", request.trace_ctx, "phase=post_stream attempt={d}", .{attempt});
+            return error.Cancelled;
+        }
         const completion = switch (streamed) {
-            .failed => return error.ContextCompactionUnavailable,
+            .failed => |failure| {
+                debug_trace.eventf(
+                    "context_compaction",
+                    "summary_transport_failed",
+                    request.trace_ctx,
+                    "model={s} attempt={d} kind={s} detail={s}",
+                    .{ request.model, attempt, @tagName(failure.kind), debug_trace.preview(failure.detail orelse "", 240) },
+                );
+                return error.ContextCompactionUnavailable;
+            },
             .completed => |completed| completed.completion,
         };
         addUsage(&usage, .{
             .input_tokens = completion.usage.input_tokens orelse 0,
             .output_tokens = completion.usage.output_tokens orelse 0,
         });
-        if (completion.finish_reason != .stop) return error.IncompleteCompactionHandoff;
+        if (completion.finish_reason != .stop) {
+            debug_trace.eventf(
+                "context_compaction",
+                "summary_incomplete",
+                request.trace_ctx,
+                "model={s} attempt={d} finish_reason={s} content_bytes={d}",
+                .{ request.model, attempt, if (completion.finish_reason) |reason| @tagName(reason) else "missing", capture.text.items.len },
+            );
+            return error.IncompleteCompactionHandoff;
+        }
         if (capture.failed) return error.OutOfMemory;
         if (!capture.saw_content) {
             if (completion.content) |content| try capture.append(content);
         }
         if (capture.saw_tool_call or completion.tool_calls.len > 0) {
+            debug_trace.eventf(
+                "context_compaction",
+                "summary_tool_call_rejected",
+                request.trace_ctx,
+                "model={s} attempt={d} streamed_tool_call={} tool_calls={d}",
+                .{ request.model, attempt, capture.saw_tool_call, completion.tool_calls.len },
+            );
             return error.CompactionToolCallRejected;
         }
         if (capture.observed_bytes > capture.text.items.len) {
+            debug_trace.eventf(
+                "context_compaction",
+                "summary_truncated",
+                request.trace_ctx,
+                "model={s} attempt={d} observed_bytes={d} captured_bytes={d} limit_bytes={d}",
+                .{ request.model, attempt, capture.observed_bytes, capture.text.items.len, max_bytes },
+            );
             return error.CompactionHandoffTooLarge;
         }
         const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
-        if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidCompactionHandoff;
+        if (!std.unicode.utf8ValidateSlice(trimmed)) {
+            debug_trace.eventf(
+                "context_compaction",
+                "summary_invalid_utf8",
+                request.trace_ctx,
+                "model={s} attempt={d} captured_bytes={d}",
+                .{ request.model, attempt, trimmed.len },
+            );
+            return error.InvalidCompactionHandoff;
+        }
         if (trimmed.len == 0) {
             if (attempt == 0) debug_trace.eventf("context_compaction", "empty_summary_retry", request.trace_ctx, "attempt=2 model={s}", .{request.model});
             continue;
         }
         return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
     }
+    debug_trace.eventf("context_compaction", "summary_empty_exhausted", request.trace_ctx, "model={s}", .{request.model});
     return error.InvalidCompactionHandoff;
 }
 
