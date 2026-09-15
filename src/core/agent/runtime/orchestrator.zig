@@ -5991,12 +5991,11 @@ pub fn compactContextTransaction(
     var stage: compaction_activity.Stage = .preparation;
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
-        diagnostics.traceCompactionFailure(
-            request.trace_ctx,
-            "transaction_failed",
-            "stage={s} trigger={s} err={s}",
-            .{ @tagName(stage), @tagName(request.trigger), @errorName(err) },
-        );
+        if (err == error.Cancelled) {
+            diagnostics.traceCompactionEvent(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        } else {
+            diagnostics.traceCompactionFailure(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        }
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = request.trace_ctx.turn_id, .err = err };
@@ -7115,7 +7114,8 @@ fn processQueuedPromptLoop(
                     else
                         0,
                 });
-                diagnostics.traceCompactionEvent(
+                diagnostics.traceCompactionEventIf(
+                    projection_plan.decision != .no_op,
                     step_ctx,
                     "decision",
                     "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",

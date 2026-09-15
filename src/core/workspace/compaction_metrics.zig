@@ -2,7 +2,9 @@
 //! /trace report. Records the same events that the `context_compaction`
 //! debug-trace scope emits so compaction decisions and failure reasons stay
 //! visible even when FX_TRACE is off. Callers supply internal counters, stage
-//! and enum names only, never user prompts or tool payloads.
+//! and enum names only, never user prompts or tool payloads; the one bounded
+//! provider error detail is secret-masked and control-byte neutralized at the
+//! capture site before it reaches the ring.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 

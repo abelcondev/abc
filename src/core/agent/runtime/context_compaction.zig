@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const result_store = @import("../../session/result_store.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -134,12 +135,13 @@ pub fn compact(
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
         var stage: []const u8 = "plan";
-        errdefer |err| diagnostics.traceCompactionFailure(
-            request.trace_ctx,
-            "failed",
-            "stage={s} capacity_attempt={d} model={s} err={s}",
-            .{ stage, capacity_attempt, request.model, @errorName(err) },
-        );
+        errdefer |err| {
+            if (err == error.Cancelled) {
+                diagnostics.traceCompactionEvent(request.trace_ctx, "failed", "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
+            } else {
+                diagnostics.traceCompactionFailure(request.trace_ctx, "failed", "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
+            }
+        }
         const compactable = source_messages;
         const policy: ?compaction_policy.Prepared = if (request.policy == .assistant_first)
             try compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens, summary_reserve_tokens)
@@ -432,11 +434,17 @@ fn runSummaryCall(
         }
         const completion = switch (streamed) {
             .failed => |failure| {
+                // Provider error bodies are third-party text: mask secrets and
+                // neutralize control bytes before the detail reaches the ring or
+                // the shareable /trace report.
+                const masked_detail = try text_utils.maskSecrets(alloc, failure.detail orelse "");
+                var detail_buf: [512]u8 = undefined;
+                const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked_detail), 240);
                 diagnostics.traceCompactionFailure(
                     request.trace_ctx,
                     "summary_transport_failed",
                     "model={s} attempt={d} kind={s} detail={s}",
-                    .{ request.model, attempt, @tagName(failure.kind), debug_trace.preview(failure.detail orelse "", 240) },
+                    .{ request.model, attempt, @tagName(failure.kind), safe_detail },
                 );
                 return error.ContextCompactionUnavailable;
             },

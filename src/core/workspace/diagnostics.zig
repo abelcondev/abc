@@ -38,6 +38,14 @@ pub fn traceCompactionFailure(ctx: debug_trace.TraceContext, comptime name: []co
     debug_trace.eventf(compaction_trace_scope, name, ctx, fmt, args);
 }
 
+/// Records a high-cadence compaction evaluation only when it changed the
+/// outcome; routine no-op evaluations still reach the debug-trace log but do
+/// not evict rarer events from the bounded ring.
+pub fn traceCompactionEventIf(record: bool, ctx: debug_trace.TraceContext, comptime name: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (record) compaction_metrics.record(name, ctx.turn_id, ctx.step_id, ctx.subagent_id, false, fmt, args);
+    debug_trace.eventf(compaction_trace_scope, name, ctx, fmt, args);
+}
+
 /// Records a free-form compaction note (no turn context available at the
 /// call site) and forwards it to the debug-trace log unchanged.
 pub fn traceCompactionLog(failed: bool, comptime fmt: []const u8, args: anytype) void {

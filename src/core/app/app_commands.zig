@@ -2596,7 +2596,11 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
     for (buf[0..total]) |event| {
         if (event.failed) failed += 1;
     }
-    try writer.print("last={d} failed={d} (always recorded; does not require FX_TRACE)\n", .{ total, failed });
+    try writer.print("last={d} failed={d}", .{ total, failed });
+    // Events evicted by the bounded ring are reported, not silently dropped.
+    const overwritten = buf[0].sequence -| 1;
+    if (overwritten > 0) try writer.print(" overwritten_before={d}", .{overwritten});
+    try writer.writeAll(" (always recorded; does not require FX_TRACE)\n");
 
     const start = if (total > trace_compaction_max_events) total - trace_compaction_max_events else 0;
     if (start > 0) try writer.print("... ({d} older events omitted)\n", .{start});
@@ -4410,6 +4414,15 @@ test "trace compaction summary renders recorded events without file tracing" {
     try std.testing.expect(std.mem.find(u8, out.written(), "last=2 failed=1 (always recorded; does not require FX_TRACE)\n") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "event=decision turn_id=10 step_id=176 decision=compact estimated_tokens=279466\n") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "event=retention_exhausted turn_id=10 failed estimated_tokens=59000\n") != null);
+
+    diagnostics.resetForTest();
+    for (0..diagnostics.compaction_ring_capacity + 3) |index| {
+        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, "decision", "decision=compact index={d}", .{index});
+    }
+    var wrapped: std.Io.Writer.Allocating = .init(alloc);
+    defer wrapped.deinit();
+    try writeCompactionSummary(&wrapped.writer, alloc);
+    try std.testing.expect(std.mem.find(u8, wrapped.written(), "overwritten_before=3") != null);
 }
 
 test "trace report file uses private randomized markdown path" {

@@ -74,7 +74,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     if (summary) {
       summaries++;
       if (phase === "attempt" && outcome === "provider-error") {
-        return Response.json({ error: { message: "Synthetic summary rejection" } }, { status: 400 });
+        return Response.json({ error: { message: "Synthetic summary rejection for Bearer abcdef0123456789xyz" } }, { status: 400 });
       }
       if (phase === "attempt" && summaries === 1) return summaryHold.response;
       // Each chunk/retry needs a fresh Response, not a consumed held body.
@@ -523,6 +523,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(report).toContain("## Context Compaction\n");
       expect(report).toMatch(/last=\d+ failed=[1-9]\d* \(always recorded; does not require FX_TRACE\)/);
       expect(report).toContain("event=summary_transport_failed");
+      // Provider error text is secret-masked before it reaches the report.
+      expect(report).toContain("[redacted]");
+      expect(report).not.toContain("abcdef0123456789xyz");
       expect(report).toContain("event=transaction_failed");
       expect(report).toContain("event=provider_start");
       expect(report).toContain("event=provider_completed");
