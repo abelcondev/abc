@@ -55,6 +55,7 @@ TRAINING_E2E_TESTS = (
 
 VERIFICATION_E2E_TESTS = (
     "auto-mode-reliability.test.ts",
+    "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-compaction-activity.test.ts",

@@ -3644,7 +3644,7 @@ fn recoverySelectionChanged(
     selected_model: []const u8,
     selected_fast_mode: bool,
 ) bool {
-    return checkpoint.authority.provider != selected_provider or !std.mem.eql(
+    return !checkpoint.authority.provider.same_authority(selected_provider) or !std.mem.eql(
         u8,
         checkpoint.authority.model,
         selected_model,
@@ -4252,6 +4252,131 @@ noinline fn clearAutoRetryStatusIfNeeded(
 ) !void {
     if (!recovery_active) return;
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
+}
+
+noinline fn clear_deferred_retry_status(deps: *const AgentRuntimeDeps) void {
+    clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
+        debug_trace.logf(
+            "agent",
+            "failed to clear due retry status err={s}",
+            .{@errorName(clear_err)},
+        );
+    };
+}
+
+noinline fn settle_deferred_tool_starts(
+    deps: *const AgentRuntimeDeps,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    turn_id: u64,
+    cancel_flag: *const std.atomic.Value(bool),
+) void {
+    const settlement = if (cancel_flag.load(.seq_cst))
+        stream_ctx.provisional_statuses.finishTrackedCancelled(
+            deps,
+            stream_ctx.alloc,
+            arena,
+            turn_id,
+        )
+    else
+        stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
+            deps,
+            stream_ctx.alloc,
+            arena,
+            turn_id,
+            &.{},
+        );
+    settlement catch |err| {
+        debug_trace.logf(
+            "agent",
+            "failed to settle interrupted tool starts err={s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
+test "deferred retry cleanup clears status and contains sink errors" {
+    const support = @import("tests/support.zig");
+    var normal = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer normal.deinit();
+    const deps = normal.deps();
+    clear_deferred_retry_status(&deps);
+    try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
+    defer failed.deinit();
+    const failed_deps = failed.deps();
+    clear_deferred_retry_status(&failed_deps);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), failed.route_recovery_clear_count);
+}
+
+test "deferred tool cleanup preserves interruption and cancellation outcomes" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 71, .alloc = alloc };
+    defer stream_ctx.deinit();
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "local", "read_file", .read, "Reading", "fixture.txt", null);
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "remote", "exa_search", .read, "Searching", null, null);
+    var cancelled = std.atomic.Value(bool).init(false);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) == null);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "remote", .name = "exa_search", .arguments_json = "{}" }) != null);
+    cancelled.store(true, .seq_cst);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
+    var local_count: usize = 0;
+    var remote_count: usize = 0;
+    for (fake.lifecycle_events.items) |event| {
+        if (event != .terminal) continue;
+        if (std.mem.eql(u8, event.terminal.id.call_id, "local")) {
+            try std.testing.expectEqual(.failed, event.terminal.outcome.kind);
+            local_count += 1;
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "remote")) {
+            try std.testing.expectEqual(.cancelled, event.terminal.outcome.kind);
+            remote_count += 1;
+        } else return error.UnexpectedTerminalIdentity;
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_count);
+    try std.testing.expectEqual(@as(usize, 1), remote_count);
+}
+
+test "deferred tool cleanup contains publication failure and preserves tracking" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        calls: usize = 0,
+        failed_terminal: bool = false,
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.failed_terminal = event == .terminal and event.terminal.outcome.kind == .failed;
+            return error.TestCleanupSinkFailed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var deps = fake.deps();
+    var sink = Sink{};
+    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 73, .alloc = alloc };
+    defer stream_ctx.deinit();
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
+    deps.ctx = &sink;
+    deps.push_tool_lifecycle = Sink.push;
+    var cancelled = std.atomic.Value(bool).init(false);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 73, &cancelled);
+    try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    try std.testing.expect(sink.failed_terminal);
+    try std.testing.expectEqual(@as(usize, 0), stream_ctx.provisional_statuses.terminal_ids.items.len);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) != null);
 }
 
 fn pushTerminalAutoRetryStatusIfNeeded(
@@ -5697,7 +5822,7 @@ pub fn prepareManualCompactionContinuation(
         0,
     );
     var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
-    provider_options.prompt_caching = true;
+    provider_options.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
     return .{
         .request = .{
             .model = model,
@@ -6409,6 +6534,7 @@ fn processQueuedPromptLoop(
         checkpoint.fast_mode
     else
         selected_fast_mode;
+    var fast_unavailable_notified = false;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -6431,15 +6557,7 @@ fn processQueuedPromptLoop(
         .transport_interrupted;
     var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
     var pending_auto_retry_status: ?types.RouteRecoveryStatus = null;
-    errdefer if (pending_auto_retry_status != null) {
-        clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
-            debug_trace.logf(
-                "agent",
-                "failed to clear due retry status err={s}",
-                .{@errorName(clear_err)},
-            );
-        };
-    };
+    errdefer if (pending_auto_retry_status != null) clear_deferred_retry_status(deps);
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -6576,28 +6694,7 @@ fn processQueuedPromptLoop(
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
-                const settlement = if (config.cancel_flag.load(.seq_cst))
-                    stream_ctx.provisional_statuses.finishTrackedCancelled(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                    )
-                else
-                    stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                        &.{},
-                    );
-                settlement catch |err| {
-                    debug_trace.logf(
-                        "agent",
-                        "failed to settle interrupted tool starts err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
             }
         }
 
@@ -6830,8 +6927,19 @@ fn processQueuedPromptLoop(
             const request_messages = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support == .native, config.max_tool_result_bytes);
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
-            provider_opts.prompt_caching = true;
+            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            // Fast drops silently when the catalog cannot confirm support.
+            // Tell the user once per turn, but only when the catalog itself is
+            // known to be down; a reachable catalog that simply lacks fast
+            // metadata for the model stays quiet.
+            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
+                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
+            {
+                fast_unavailable_notified = true;
+                try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
+                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)

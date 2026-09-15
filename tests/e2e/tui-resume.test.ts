@@ -4835,6 +4835,9 @@ test.skipIf(!tmuxAvailable())(
       await seedTransientDraft("STALE_SESSION_DRAFT_RESUME");
       await active.sendText("/resume");
       await waitForSessionPicker(active);
+      await active.waitForPane((pane) =>
+        pane.includes("Save a session for transient input reset.") && SESSION_PICKER_META_RE.test(pane),
+      TIMEOUT);
       await active.sendKeys("Enter");
       await waitForSessionPickerClosed(active);
       await proveReset("SESSION_INPUT_RESET_RESUME_OK", 2);
@@ -7323,17 +7326,17 @@ for (const inspectDetails of [false, true]) {
         expect(readFileSync(join(workspace, "receipt.txt"), "utf8")).toBe("RECEIVED\n");
         expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("AFTER\n");
         expect(readFileSync(join(workspace, "ledger.txt"), "utf8")).toBe(ledger);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
-        expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
-          .toEqual({ turn_id: 2, call_id: "write-receipt" });
-        expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
         expect(gateway.requests).toHaveLength(9);
         expect(active.isPaneAlive()).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await active.sendText("/quit");
         await waitForCondition(() => active!.paneStatus().dead, "session exit", TIMEOUT);
         expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
+        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
+        expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
+        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+          .toEqual({ turn_id: 2, call_id: "write-receipt" });
+        expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
       } finally {
         if (active) await active.kill();
         gateway.stop();

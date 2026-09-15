@@ -330,6 +330,9 @@ const AskOptions = struct {
     prompt: []u8,
     resume_target: ?ResumeTarget = null,
     permission_override: ?PermissionMode = null,
+    model_override: ?[]u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
@@ -349,6 +352,7 @@ const AskOptions = struct {
         for (self.images.items) |image| types.freeImageAttachment(alloc, image);
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
+        if (self.model_override) |m| alloc.free(m);
     }
 };
 
@@ -462,6 +466,9 @@ const RunOptions = struct {
     resume_target: ?ResumeTarget = null,
     color_enabled: bool = true,
     continue_recovery: bool = false,
+    model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
     deps: RunDeps,
 };
 
@@ -1289,6 +1296,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .resume_target = options.resume_target,
         .color_enabled = !options.no_color,
         .continue_recovery = options.continue_recovery,
+        .model_override = options.model_override,
+        .effort_override = options.effort_override,
+        .fast_override = options.fast_override,
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1418,7 +1428,8 @@ fn missingCredentialResult(
     };
 }
 
-fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
+fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, initial_cfg: Config, options: RunOptions) !PromptRunResult {
+    var cfg = initial_cfg;
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
 
@@ -1441,6 +1452,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    cfg.provider_set.definitions = startup.configured_providers.definitions;
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1535,6 +1547,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
+        if (config_runtime.providerEnvOverride() != null) {
+            ctx.provider = startup.provider;
+            ctx.model = startup.selected_model;
+        }
         if (startup.model_source == .process_override) {
             ctx.model = startup.selected_model;
         } else if (ctx.requested_resume != null) {
@@ -1542,6 +1558,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             ctx.model = owned_resumed_model.?;
         }
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    }
+
+    // Ask flags are per-run overrides: they win over startup and resumed
+    // session preferences but are never persisted into session preferences.
+    if (options.model_override) |model| {
+        ctx.model = model;
+    }
+    if (options.effort_override) |effort| {
+        ctx.effort = effort;
+    }
+    if (options.fast_override) |fast| {
+        ctx.fast_mode = fast;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.fast_mode_source == .compiled_default)
+    {
+        // Default fast mode applies to the compiled default model only; an
+        // explicit model override drops it unless --fast restores it.
+        ctx.fast_mode = false;
     }
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
@@ -1582,7 +1616,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     } else {
         const startup_matches_final_model = if (startup.credential) |credential|
-            model_provider.authorizesCredential(ctx.provider, credential.source)
+            startup.provider.same_authority(ctx.provider) and model_provider.authorizesCredential(ctx.provider, credential.source)
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
@@ -2067,12 +2101,18 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
     };
+}
+
+fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.capability_resolver.state == .failed;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2088,6 +2128,10 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         ctx.cfg.gateway_provider.oauth_transport,
         ctx.alloc,
@@ -3675,6 +3719,24 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--full-access") or std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            const model = std.mem.trim(u8, args[i], " \t\r\n");
+            if (model.len == 0) return error.InvalidAskArgs;
+            const owned_model = try alloc.dupe(u8, model);
+            if (opts.model_override) |old| alloc.free(old);
+            opts.model_override = owned_model;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.effort_override = types.ReasoningEffort.parse(args[i]) orelse
+                return error.InvalidAskArgs;
+        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
+            const enabled = std.mem.eql(u8, arg, "--fast");
+            if (opts.fast_override != null and opts.fast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.fast_override = enabled;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
             if (opts.resume_target != null) return error.InvalidAskArgs;
             const exact_id = std.mem.eql(u8, arg, "--resume-id");
@@ -5229,6 +5291,54 @@ test "parse options preserves full access aliases after the delimiter as prompt 
         try std.testing.expectEqual(@as(?PermissionMode, case.mode), options.permission_override);
         try std.testing.expectEqualStrings("--full-access --yolo --auto", options.prompt);
     }
+}
+
+test "parse options preserves model effort and fast overrides" {
+    const alloc = std.testing.allocator;
+    var options = try parseOptionsWithStdin(alloc, &.{
+        "--model",
+        "provider/override-model",
+        "--effort",
+        "high",
+        "--fast",
+        "hello",
+    }, .tty);
+    defer options.deinit(alloc);
+
+    try std.testing.expectEqualStrings("provider/override-model", options.model_override.?);
+    try std.testing.expect(options.effort_override.?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?bool, true), options.fast_override);
+    try std.testing.expectEqualStrings("hello", options.prompt);
+
+    var off = try parseOptionsWithStdin(alloc, &.{ "--no-fast", "hello" }, .tty);
+    defer off.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), off.fast_override);
+
+    var defaulted = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), defaulted.model_override);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), defaulted.effort_override);
+    try std.testing.expectEqual(@as(?bool, null), defaulted.fast_override);
+
+    var last_model = try parseOptionsWithStdin(alloc, &.{ "--model", "first/model", "--model", "second/model", "hello" }, .tty);
+    defer last_model.deinit(alloc);
+    try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
+}
+
+test "parse options rejects invalid model effort and fast flag forms" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--model"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--model", "  ", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--effort"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--effort", "not an effort", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--fast", "--no-fast", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--no-fast", "--fast", "hello" }, .tty));
+
+    var literal = try parseOptionsWithStdin(alloc, &.{ "--", "--model", "--fast" }, .tty);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), literal.model_override);
+    try std.testing.expectEqual(@as(?bool, null), literal.fast_override);
+    try std.testing.expectEqualStrings("--model --fast", literal.prompt);
 }
 
 test "headless yolo warning reaches stderr before acknowledgment persistence" {

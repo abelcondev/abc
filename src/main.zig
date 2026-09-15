@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.9";
+pub const version = "0.0.10";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -665,6 +665,11 @@ const App = struct {
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
+            .{
+                .model = launch.modifiers.model_override,
+                .effort = launch.modifiers.effort_override,
+                .fast = launch.modifiers.fast_override,
+            },
         );
         errdefer app.deinit();
         try WorkspaceAppRuntime.applyLaunch(
@@ -879,9 +884,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
-        self.provider_selection.deinit();
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
+        self.provider_selection.deinit();
         if (self.requested_resume) |*target| {
             target.deinit(self.alloc);
             self.requested_resume = null;
@@ -1969,10 +1974,12 @@ const App = struct {
             .permission_reviewer;
     }
 
-    pub fn providerSet(_: *const App) provider_set.Set {
+    pub fn providerSet(self: *const App) provider_set.Set {
+        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
+                    .gateway_prompt_caching = true,
                     .vision_fallback = host_profile.tools,
                 },
                 .presentation = provider_catalog.find(.gateway),
@@ -1987,6 +1994,7 @@ const App = struct {
             });
         }
         var providers = builtin_providers.native;
+        providers.definitions = self.provider_selection.definitions.definitions;
         if (comptime !host_profile.tools) {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
@@ -2080,7 +2088,7 @@ const App = struct {
             if (comptime host_target.is_wasm)
                 js_host_model_catalog.provider
             else
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
             builtin_gateway.models_path,
         );
     }
@@ -2097,7 +2105,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -3646,6 +3654,17 @@ test "early threaded io is resolved after global launch args" {
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "login"),
     }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{
+        @as([:0]const u8, "--model"),
+        @as([:0]const u8, "provider/model"),
+        @as([:0]const u8, "--fast"),
+        @as([:0]const u8, "status"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--effort=high"),
+        @as([:0]const u8, "--no-fast"),
+        @as([:0]const u8, "ask"),
+    }));
 }
 
 test "full entry config commands also use early threaded io" {
@@ -4173,6 +4192,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
+    _ = @import("core/config/configured_provider.zig");
+    _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
@@ -4256,6 +4277,8 @@ test {
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
+    _ = @import("core/gateway/model_catalog.zig");
+    _ = @import("gateway/chat_completions.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

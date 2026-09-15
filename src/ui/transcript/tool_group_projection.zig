@@ -619,16 +619,24 @@ fn formatGroupBlock(
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
+/// Substitutes the stored full command for a settled status phrase that was
+/// truncated to the compact activity bound at generation time. Records carry
+/// the full display whenever the command is known — captured runs, tty runs,
+/// and terminal-session actions — so the phrase can be reclipped to the live
+/// terminal width instead of keeping the frozen "..." marker.
 fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
     detail: ?*const ToolDetailRecord,
 ) !?[]const u8 {
     const record = detail orelse return null;
-    if (!record.isCapturedCommand() or record.outcome != .completed) return null;
+    if (record.outcome != .completed) return null;
     if (!std.mem.endsWith(u8, phrase, "...")) return null;
     const command = record.command_display orelse return null;
     const action = record.command_action_label orelse return null;
+    // The stored pair must match the phrase it replaces: a record carrying a
+    // mismatched label would rewrite an unrelated row.
+    if (!std.mem.startsWith(u8, phrase, action)) return null;
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
@@ -642,10 +650,15 @@ fn formatExpandedChild(
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const phrase = switch (entry) {
+    const raw_phrase = switch (entry) {
         .raw_bytes => |raw| try normalizeStatusPhrase(scratch, raw.bytes),
         else => null,
     } orelse if (detail) |record| record.tool_name else "tool activity";
+    const phrase = try reprojectTruncatedCommandPhrase(
+        scratch,
+        raw_phrase,
+        detail,
+    ) orelse raw_phrase;
     const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
     const clipped = try clipSummary(scratch, child, cols);
     const accented = if (entryShowsDiffStats(detail))
@@ -1634,6 +1647,132 @@ test "minimal completed command rows reproject stored arguments at the current w
         "● 1 tool call · 1 command\n└ Installed skill " ++ command,
         compatibility.entry_actions.items[0].override.bytes,
     );
+}
+
+test "completed session and tty command rows reproject stored commands at the current width" {
+    const alloc = std.testing.allocator;
+    const tty_command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const observe_command = "npm run " ++ ("dev-server-" ** 12);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+        .{ .raw_bytes = .{
+            .id = 2,
+            .bytes = "● Observed\x1b[0m \x1b[38;5;245mnpm run dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-s...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    // tty runs and terminal-session observations are not captured commands;
+    // their full display arrives only through stored command metadata.
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = false,
+            .activity_kind = .command,
+            .command_display = @constCast(tty_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .captured_command = false,
+            .activity_kind = .command,
+            .command_display = @constCast(observe_command),
+            .command_action_label = @constCast("Observed"),
+            .outcome = .completed,
+        },
+    };
+
+    var narrow = try build(alloc, &entries, &details, 80);
+    defer narrow.deinit(alloc);
+    const narrow_rows = narrow.entry_actions.items[0].override.bytes;
+    var narrow_lines = std.mem.splitScalar(u8, narrow_rows, '\n');
+    _ = narrow_lines.next(); // group header
+    const narrow_tty = narrow_lines.next().?;
+    const narrow_observe = narrow_lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran bun run pipeline-stage-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…"));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed npm run dev-server-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));
+    // Reprojection replaces the frozen ASCII marker before reclipping.
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
+
+    var wide = try build(alloc, &entries, &details, 400);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 2 commands\n" ++
+            "├ Ran " ++ tty_command ++ "\n" ++
+            "└ Observed " ++ observe_command,
+        wide.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "expanded group children reproject stored commands at the current width" {
+    const alloc = std.testing.allocator;
+    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = false,
+        .activity_kind = .command,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Ran"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, .{}, null);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        wide.entry_actions.items[0].override.bytes,
+    );
+
+    var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, .{}, null);
+    defer narrow.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, narrow.entry_actions.items[0].override.bytes, "…"));
+    try std.testing.expect(std.mem.find(u8, narrow.entry_actions.items[0].override.bytes, "...") == null);
+}
+
+test "command reprojection rejects a phrase that does not start with the stored action label" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Observed"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var projection = try build(alloc, &entries, &details, 240);
+    defer projection.deinit(alloc);
+    // The frozen phrase stays untouched when the stored label does not lead it.
+    try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "Observed") == null);
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {

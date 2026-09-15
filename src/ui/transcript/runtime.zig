@@ -335,6 +335,7 @@ fn recoveryAppendPrefixMatches(
 }
 
 pub const TranscriptScrollFacts = struct {
+    publication_hold: enum { none, restore, finality } = .none,
     source_visual_offset: u32 = 0,
     target_visual_offset: u32 = 0,
     resize_reflow_rows: u16 = 0,
@@ -442,6 +443,8 @@ pub const TranscriptTransition = struct {
     recovery_projection_deferred: bool = false,
     body_disposition: TranscriptBodyDisposition = .paint,
     target_flow: []u8,
+    // Painter borrows outlive sealing when the receipt keeps only a prefix.
+    presentation_flow: []u8 = &.{},
     target_flow_owned: bool = true,
     retention_identity: source_preparation.RetentionIdentity = .{},
     borrows_full_page: bool = false,
@@ -477,6 +480,7 @@ pub const TranscriptTransition = struct {
     pub fn deinit(self: *TranscriptTransition, alloc: Allocator) void {
         self.retention_identity.deinit(alloc);
         if (self.target_flow_owned and self.target_flow.len > 0) alloc.free(self.target_flow);
+        alloc.free(self.presentation_flow);
         if (self.presentation_resume_bytes.len > 0) alloc.free(self.presentation_resume_bytes);
         if (self.document_append_bytes.len > 0) {
             alloc.free(self.document_append_bytes);
@@ -4228,6 +4232,7 @@ test "render diagnostic commit skips unchanged same-row paints" {
 
 pub const TranscriptRuntime = struct {
     stdout_file: std.Io.File = std.Io.File.stdout(),
+    test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
     layout: Layout = undefined,
@@ -4282,6 +4287,7 @@ pub const TranscriptRuntime = struct {
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
     transcript_commit_state: TranscriptCommitState = .invalid,
+    publication_projection_invalid: bool = false,
     /// True while the terminal reports zero, unreadable, or too-small
     /// dimensions after the first committed frame. Normal painters stay
     /// idle until a valid resize clears this flag.
@@ -4317,6 +4323,8 @@ pub const TranscriptRuntime = struct {
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
     entries: std.ArrayList(TranscriptEntry) = .empty,
+    /// Borrowed only by a detached store transaction; never installed on the live runtime.
+    retention_prefix_trims: ?*std.ArrayList(transcript_store.RetentionPrefixTrim) = null,
     lifecycle_state: activity_runtime.ToolActivityState = .{},
     worker_status: worker_status.State = .none,
     /// Core-owned producer state and policy for native-history release.
@@ -6238,6 +6246,7 @@ pub const TranscriptRuntime = struct {
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
+        self.markTranscriptContentDirtyFrom(entry_id);
         if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;
     }
@@ -6834,6 +6843,32 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn invalidateTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
+        if (self.committedRetentionIdentity()) |identity| {
+            if (identity.publication_entries.len > 0 or (self.fullTranscriptActive() and identity.lines.len > 0)) {
+                switch (self.transcript_commit_state) {
+                    .stable => |*anchor| {
+                        anchor.flow_materialized = false;
+                        anchor.normal_buffer_recovery_pending = true;
+                        anchor.history_catchup_pending = true;
+                    },
+                    .recovering => |*receipt| {
+                        receipt.projection_rebase_pending = true;
+                        receipt.materialized_flow_len = null;
+                        receipt.presentation_valid = false;
+                    },
+                    .invalid => unreachable,
+                }
+                self.publication_projection_invalid = true;
+                debug_trace.logf("scroll", "transcript_publication_invalidation_deferred reason={s}", .{reason});
+                self.markTranscriptDirty();
+                return;
+            }
+        }
+        self.resetTranscriptAnchor(reason);
+    }
+
+    pub fn resetTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
+        self.publication_projection_invalid = false;
         const diagnostic = self.transcriptCommitDiagnostic();
         if (diagnostic.state != .invalid) {
             diagnostics.recordRenderEvent(
@@ -6868,6 +6903,11 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn prepareCommittedRetentionSource(self: *const TranscriptRuntime, alloc: Allocator) !?TranscriptPreparationSource {
+        return self.prepareCommittedRetentionSourceInterruptible(alloc, null);
+    }
+
+    pub fn prepareCommittedRetentionSourceInterruptible(self: *const TranscriptRuntime, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !?TranscriptPreparationSource {
+        try build_checkpoint.poll(checkpoint);
         const cols = self.retentionSourceCols() orelse return null;
         const flow = switch (self.transcript_commit_state) {
             .invalid => return null,
@@ -6875,20 +6915,34 @@ pub const TranscriptRuntime = struct {
             .recovering => |receipt| receipt.flow,
         };
         const identity = self.committedRetentionIdentity().?;
-        var source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, flow), cols, null);
+        var source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, flow), cols, checkpoint);
         errdefer source.deinit(alloc);
         source.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, identity.lines);
+        source.publication_entries = try alloc.dupe(u32, identity.publication_entries);
         return source;
     }
 
     pub fn retentionSourceCols(self: *const TranscriptRuntime) ?u16 {
-        if (self.fullTranscriptActive()) return null;
         const cols = switch (self.transcript_commit_state) {
             .invalid => return null,
-            .stable => self.committed_frame_layout.terminal_cols,
+            .stable => if (self.fullTranscriptActive() and self.full_transcript_open_cols > 0) self.full_transcript_open_cols else self.committed_frame_layout.terminal_cols,
             .recovering => |receipt| receipt.attempt_cols,
         };
         return if (cols == 0) null else cols;
+    }
+
+    fn retainedHistoryOffset(mapping: source_preparation.RetentionRebase, identity: source_preparation.RetentionIdentity, history: u32) u32 {
+        var result = mapping.visual(history);
+        if (identity.publication_entries.len == 0) return result;
+        var owner: ?u32 = null;
+        for (mapping.before.line_provenance, 0..) |line, index| {
+            owner = source_preparation.publication_owner(owner, line);
+            if (mapping.before.transcript_visual_row_offsets[index + 1] <= history) continue;
+            if (owner) |id| {
+                if (std.mem.findScalar(u32, identity.publication_entries, id) != null) result = @min(result, mapping.visual(@max(history, mapping.before.transcript_visual_row_offsets[index])));
+            }
+        }
+        return result;
     }
 
     /// Rebase source-relative state before publishing a retention mutation.
@@ -6912,7 +6966,8 @@ pub const TranscriptRuntime = struct {
             .invalid => unreachable,
             .stable => |*anchor| {
                 const old_start = mapping.before.byteAtVisualOffset(anchor.history_visual_offset);
-                const new_start = mapping.retained.byteAtVisualOffset(mapping.visual(anchor.history_visual_offset));
+                const mapped_history = retainedHistoryOffset(mapping, retained_identity, anchor.history_visual_offset);
+                const new_start = mapping.retained.byteAtVisualOffset(mapped_history);
                 anchor.flow_materialized = anchor.flow_materialized and std.mem.eql(u8, mapping.before.bytes[old_start..], mapping.retained.bytes[new_start..]);
                 if (!anchor.flow_materialized) anchor.normal_buffer_recovery_pending = true;
                 alloc.free(anchor.flow);
@@ -6920,7 +6975,7 @@ pub const TranscriptRuntime = struct {
                 anchor.retention_identity.deinit(alloc);
                 anchor.retention_identity = identity;
                 anchor.visual_offset = mapping.visual(anchor.visual_offset);
-                anchor.history_visual_offset = mapping.visual(anchor.history_visual_offset);
+                anchor.history_visual_offset = mapped_history;
                 anchor.total_visual_rows = mapping.visual(anchor.total_visual_rows);
                 anchor.selection = rebaseRetentionSelection(anchor.selection, mapping);
                 anchor.measured_history_origin = rebaseRetentionHistoryOrigin(anchor.measured_history_origin, mapping);
@@ -6948,7 +7003,7 @@ pub const TranscriptRuntime = struct {
                 receipt.materialized_visual_rows = @intCast(mapping.visual(receipt.materialized_visual_offset +| receipt.materialized_visual_rows) -|
                     mapping.visual(receipt.materialized_visual_offset));
                 receipt.accepted_visual_offset = mapping.visual(receipt.accepted_visual_offset);
-                receipt.accepted_history_visual_offset = mapping.visual(receipt.accepted_history_visual_offset);
+                receipt.accepted_history_visual_offset = retainedHistoryOffset(mapping, retained_identity, receipt.accepted_history_visual_offset);
                 receipt.attempt_visual_offset = mapping.visual(receipt.attempt_visual_offset);
                 receipt.attempt_total_visual_rows = mapping.visual(receipt.attempt_total_visual_rows);
                 receipt.materialized_visual_offset = mapping.visual(receipt.materialized_visual_offset);
@@ -7024,6 +7079,13 @@ pub const TranscriptRuntime = struct {
         reason: []const u8,
         mode: transcript_store.TranscriptSourceRewriteMode,
     ) void {
+        if (!force_rebase and mode == .preserve_same_epoch) {
+            if (self.committedRetentionIdentity()) |identity| {
+                // Source preparation includes these already-published projections
+                // until a receipt releases them; the recorded store does not.
+                if (identity.publication_entries.len > 0) return;
+            }
+        }
         switch (self.transcript_commit_state) {
             .invalid => {},
             .stable => |*anchor| {
@@ -7280,6 +7342,28 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn planTranscriptScrollForFrame(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        footer_reservation_changed: bool,
+        replay_displaced_footer_history: bool,
+    ) TranscriptScrollFacts {
+        var facts = self.planTranscriptScrollForFrameUnfiltered(prepared, footer_reservation_changed, replay_displaced_footer_history);
+        if (self.committedRetentionIdentity()) |identity| {
+            const restore_projection = self.publication_projection_invalid or self.committed_frame_layout.terminal_cols != self.layout.cols or
+                self.committed_frame_layout.terminal_rows != self.layout.rows or facts.recovery_rebase or facts.recovery_projection_deferred;
+            if (identity.publication_entries.len > 0 and (restore_projection or facts.finality_hold) and !self.terminal_reset_pending) {
+                facts.publication_hold = if (restore_projection) .restore else .finality;
+                if (restore_projection) {
+                    facts.semantic_rows = 0;
+                    facts.semantic_progress_rows = 0;
+                    facts.planned_rows = self.plannedTranscriptRows(prepared, facts.source_visual_offset, facts.resize_reflow_rows, 0, 0);
+                }
+            }
+        }
+        return facts;
+    }
+
+    fn planTranscriptScrollForFrameUnfiltered(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
         footer_reservation_changed: bool,
@@ -7857,6 +7941,7 @@ pub const TranscriptRuntime = struct {
         destructive_invalidation: bool,
         activity_overlay_active: bool,
     ) ?RetainedTranscriptBody {
+        if (!anchor.flow_materialized) return null;
         return render_engine.frame_retention.stableRetainedTranscriptBody(.{
             .full_transcript_active = self.fullTranscriptActive(),
             .committed_layout_id = anchor.layout_id,
@@ -8093,7 +8178,7 @@ pub const TranscriptRuntime = struct {
                 );
                 target.normal_buffer_recovery_pending =
                     receipt.normal_buffer_recovery_pending;
-                if (recoveringCanAdvanceSemanticProgress(scroll_facts)) {
+                if (scroll_facts.publication_hold == .none and recoveringCanAdvanceSemanticProgress(scroll_facts)) {
                     target.visual_offset =
                         scroll_facts.source_visual_offset +
                         accepted_semantic_progress_rows;
@@ -8136,6 +8221,12 @@ pub const TranscriptRuntime = struct {
                     accepted_semantic_progress_rows,
                 );
             },
+        }
+        if (scroll_facts.publication_hold != .none) {
+            try target.stagePreparedProjection(alloc, self.layout, prepared, projection_area, target.history_visual_offset);
+            target.source_endpoint_visual_offset = target.history_visual_offset;
+            target.history_catchup_pending = scroll_facts.target_visual_offset > target.history_visual_offset;
+            target.normal_buffer_recovery_pending = scroll_facts.publication_hold == .restore and target.history_catchup_pending;
         }
         if (target.measured_history_origin == null and
             !prepared.measured_history_origin_consumed and
@@ -8296,6 +8387,22 @@ pub const TranscriptRuntime = struct {
                 }
             },
             .recovering => |receipt| {
+                if (receipt.retention_identity.publication_entries.len > 0 and
+                    self.committed_frame_layout.terminal_cols == self.layout.cols and
+                    self.committed_frame_layout.terminal_rows == self.layout.rows and
+                    !self.terminal_reset_pending)
+                {
+                    if (compatibleHistoryReplayRange(prepared, self.layout.cols, target_flow, receipt.flow, receipt.accepted_history_visual_offset, target_history_visual_offset)) |replay| {
+                        return .{
+                            .flow_len = replay.flow_start,
+                            .history_replay = replay,
+                            .visual_offset = receipt.accepted_history_visual_offset,
+                            .visual_rows = projectionVisualRowsInArea(receipt.attempt_total_visual_rows, receipt.accepted_history_visual_offset, self.committed_frame_layout.transcript_area),
+                            .cursor_row = self.committed_frame_layout.transcript_area.top,
+                            .cursor_col = 1,
+                        };
+                    }
+                }
                 if (scroll_facts.recovery_progress_compatible and
                     scroll_facts.recovery_tracks_semantic_progress and
                     !scroll_facts.recovery_rebase and
@@ -8794,7 +8901,9 @@ pub const TranscriptRuntime = struct {
         var retention_identity = try source_preparation.RetentionIdentity.capture(self, alloc, source);
         errdefer retention_identity.deinit(alloc);
 
-        const target_flow = source.bytes;
+        var target_flow = source.bytes;
+        var presentation_flow: []u8 = &.{};
+        errdefer alloc.free(presentation_flow);
         if (!borrows_source) source.bytes = &.{};
         errdefer if (!borrows_source and target_flow.len > 0) alloc.free(target_flow);
 
@@ -9033,7 +9142,7 @@ pub const TranscriptRuntime = struct {
         target.history_visual_offset = planned_history.visual_offset;
         target.normal_buffer_recovery_pending =
             planned_history.normal_buffer_recovery_pending;
-        const materialized = resolveMaterializedEndpoint(
+        var materialized = resolveMaterializedEndpoint(
             target,
             source_endpoint_cursor_row,
             source_endpoint_cursor_col,
@@ -9042,6 +9151,18 @@ pub const TranscriptRuntime = struct {
             target_flow.len,
             target_layout.transcript_area,
         );
+        if (!borrows_source and target.projection_staged and retention_identity.publication_entries.len > 0) {
+            const prefix_end = @max(target.staged_flow_end orelse target_flow.len, source.publication_owned_end);
+            if (prefix_end < target_flow.len) {
+                const prefix = try alloc.dupe(u8, target_flow[0..prefix_end]);
+                errdefer alloc.free(prefix);
+                target.total_visual_rows = try retention_identity.retainPrefix(alloc, self.entries.items, prefix, self.layout.cols);
+                presentation_flow = target_flow;
+                target_flow = prefix;
+                if (materialized.flow_len) |len| materialized.flow_len = @min(len, prefix_end);
+                materialized.visual_rows = @intCast(@min(materialized.visual_rows, target.total_visual_rows -| materialized.visual_offset));
+            }
+        }
         if (!scroll_facts.source_compatible or scroll_facts.geometry_rebase or
             scroll_facts.recovery_rebase or scroll_plan.terminal_scroll_rows > 0 or plan.reset_terminal)
         {
@@ -9071,6 +9192,7 @@ pub const TranscriptRuntime = struct {
             .recovery_projection_deferred = scroll_facts.recovery_projection_deferred,
             .body_disposition = target.body_disposition,
             .target_flow = target_flow,
+            .presentation_flow = presentation_flow,
             .retention_identity = retention_identity,
             .target_flow_owned = !borrows_source,
             .borrows_full_page = borrows_full_page,
@@ -9226,6 +9348,7 @@ pub const TranscriptRuntime = struct {
             return;
         }
 
+        self.publication_projection_invalid = !result.is_committed() and transition.retention_identity.publication_entries.len > 0;
         const borrowed_resume_source = if (!transition.target_flow_owned)
             if (self.pending_resume_source) |*source|
                 if (transition.target_flow.len == 0 or
@@ -9285,7 +9408,9 @@ pub const TranscriptRuntime = struct {
                 .total_visual_rows = transition.total_visual_rows,
                 .flow = stable_flow,
                 .retention_identity = transition.retention_identity,
-                .flow_materialized = if (!retained_body) true else switch (previous_state) {
+                .flow_materialized = if (!retained_body)
+                    (transition.retention_identity.publication_entries.len == 0 or transition.materialized.flow_len == stable_flow.len)
+                else switch (previous_state) {
                     .stable => |anchor| anchor.flow_materialized,
                     .invalid, .recovering => false,
                 },
@@ -9296,7 +9421,8 @@ pub const TranscriptRuntime = struct {
                 .layout_id = transition.target_layout.layout_id,
                 .measured_history_origin = commit.committed_measured_history_origin,
                 .row_provenance = transition.row_provenance,
-                .normal_buffer_recovery_pending = transition.normal_buffer_recovery_pending,
+                .normal_buffer_recovery_pending = transition.normal_buffer_recovery_pending and
+                    (transition.retention_identity.publication_entries.len == 0 or transition.history_catchup_pending or transition.history_visual_offset < transition.visual_offset),
                 .history_catchup_pending = transition.history_catchup_pending,
             } };
             transition.row_provenance = &.{};
@@ -9364,7 +9490,9 @@ pub const TranscriptRuntime = struct {
                     transition.cursor_col,
                 },
             );
-            if (transition.normal_buffer_recovery_pending) {
+            if (transition.normal_buffer_recovery_pending or
+                (commit.accepted.semantic_rows > 0 and if (self.committedRetentionIdentity()) |identity| identity.publication_entries.len > 0 else false))
+            {
                 self.markTranscriptDirty();
             }
         } else {
@@ -9794,6 +9922,9 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn frameSink(self: *TranscriptRuntime) render_engine.terminal_diff.FrameSink {
+        if (comptime @import("builtin").is_test) {
+            if (self.test_frame_sink) |sink| return sink;
+        }
         return transcript_io.frameSinkFrom(@ptrCast(self), writeFrameSink);
     }
 
@@ -9836,6 +9967,7 @@ pub const TranscriptRuntime = struct {
         alloc: Allocator,
         tracked_entry_id: ?u32,
     ) !TranscriptPreparationSource {
+        _ = try transcript_store.settleTranscriptPublication(self, alloc, null);
         if (self.pending_resume_source) |*source| {
             return source.clone(alloc);
         }
@@ -9898,6 +10030,7 @@ pub const TranscriptRuntime = struct {
         alloc: Allocator,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !TranscriptPreparationSource {
+        _ = try transcript_store.settleTranscriptPublication(self, alloc, checkpoint);
         if (self.pending_resume_source != null) {
             return self.prepareTranscriptSource(alloc, null);
         }
@@ -9939,6 +10072,7 @@ pub const TranscriptRuntime = struct {
         omitted_entry_id: ?u32,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !TranscriptPreparationSource {
+        _ = try transcript_store.settleTranscriptPublication(self, alloc, checkpoint);
         return source_preparation.prepareTranscriptSourceInterruptible(
             self,
             alloc,
@@ -11374,7 +11508,7 @@ fn resolveTranscriptRecoveryCommit(
     commit: TranscriptTransitionCommit,
 ) TranscriptRecoveryCommit {
     const source_offset = switch (runtime.transcript_commit_state) {
-        .stable => |anchor| anchor.visual_offset,
+        .stable => |anchor| committedProjectionVisualOffset(anchor),
         .recovering => |receipt| receipt.accepted_visual_offset,
         .invalid => 0,
     };

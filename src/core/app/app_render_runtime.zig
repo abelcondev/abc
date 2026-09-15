@@ -3998,6 +3998,673 @@ noinline fn coordinatorGridContains(grid: vt_emulator.Grid, needle: []const u8) 
     return false;
 }
 
+fn feedRewritePublicationFrame(
+    alloc: std.mem.Allocator,
+    physical: *vt_emulator.Grid,
+    exported: *std.ArrayList(u8),
+    bytes: []const u8,
+) !void {
+    var rows: std.ArrayList(u8) = .empty;
+    defer rows.deinit(alloc);
+    const starts = try alloc.alloc(usize, @as(usize, physical.rows) + 1);
+    defer alloc.free(starts);
+    for (bytes) |byte| {
+        rows.clearRetainingCapacity();
+        for (0..physical.rows) |index| {
+            starts[index] = rows.items.len;
+            try physical.rowTextTrimmed(@intCast(index + 1), &rows);
+            try rows.append(alloc, '\n');
+        }
+        starts[physical.rows] = rows.items.len;
+        const normal_buffer = physical.saved_normal_screen == null;
+        var stats: vt_emulator.FeedStats = .{};
+        try physical.feedWithStats(&.{byte}, &stats);
+        if (normal_buffer and stats.scroll_rows > 0) {
+            try exported.appendSlice(alloc, rows.items[0..starts[@min(stats.scroll_rows, physical.rows)]]);
+            try exported.appendNTimes(alloc, '\n', stats.scroll_rows -| physical.rows);
+        }
+    }
+}
+
+fn publicationLineCount(text: []const u8, label: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " \r"), label)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn rewritePublicationText(alloc: std.mem.Allocator, physical: *vt_emulator.Grid, exported: []const u8) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try text.appendSlice(alloc, exported);
+    for (0..physical.rows) |index| {
+        try physical.rowTextTrimmed(@intCast(index + 1), &text);
+        try text.append(alloc, '\n');
+    }
+    return text.toOwnedSlice(alloc);
+}
+
+fn flushRebasedPublicationFrame(app: *CoordinatorTestApp, file: std.Io.File, physical: *vt_emulator.Grid, history: *std.ArrayList(u8), offset: *u64) !u32 {
+    const before = app.shell.transcriptCommitDiagnostic().history_visual_offset;
+    const rows_before = std.mem.count(u8, history.items, "\n");
+    app.shell.render_requests.request(.transcript);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(app);
+    const bytes = try readCoordinatorFrameBytes(app.alloc, file, offset);
+    defer app.alloc.free(bytes);
+    try feedRewritePublicationFrame(app.alloc, physical, history, bytes);
+    const accepted = app.shell.transcriptCommitDiagnostic().history_visual_offset - before;
+    try std.testing.expectEqual(@as(usize, accepted), std.mem.count(u8, history.items, "\n") - rows_before);
+    return accepted;
+}
+
+test "core.app_render_runtime consolidation rebases before publishing followup rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "consolidation-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = try initCoordinatorProjectionTestApp(alloc, file);
+    defer app.deinit();
+    app.terminal_client.source_running = false;
+    var physical = try vt_emulator.Grid.init(alloc, 80, 12);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    var prompt_text = "CONSOLIDATION_PROMPT".*;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = &prompt_text, .images = &.{} }, false, &.{});
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    var ids: [18]u32 = undefined;
+    for (&ids, 0..) |*id, index| {
+        var line: [48]u8 = undefined;
+        id.* = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "CONSOLIDATION_OUTPUT_{d:0>2}\n", .{index}));
+        _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    }
+    var old_text: std.Io.Writer.Allocating = .init(alloc);
+    defer old_text.deinit();
+    for (0..24) |index| try old_text.writer.print("{d}. OLD_TABLE_{d:0>2}\n", .{ index + 1, index });
+    _ = try app.shell.streamAssistantChunk(alloc, &app.metrics, old_text.written());
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, "CONSOLIDATION_PROMPT"));
+    const old_history = try alloc.dupe(u8, history.items);
+    defer alloc.free(old_history);
+    const before_mutation = try file.length(std.testing.io);
+    for (ids) |id| {
+        const index = for (app.shell.entries.items, 0..) |entry, index| {
+            if (entry.id() == id) break index;
+        } else return error.MissingConsolidationEntry;
+        var removed = app.shell.entries.orderedRemove(index);
+        removed.deinit(alloc);
+    }
+    const summary = try alloc.dupe(u8, "COMPACT_COMMAND_SUMMARY\n");
+    _ = try app.shell.appendRawBytesEntryClassified(alloc, summary, .unknown_raw);
+    try app.shell.rebuildTranscriptCacheAfterStructuredRewrite(alloc, "command output consolidation");
+    try app.shell.writeTranscriptClassified(alloc, &app.metrics, "PERMISSION_ACCEPTED\n", true, .subagent_status);
+    try std.testing.expectEqual(before_mutation, try file.length(std.testing.io));
+    try std.testing.expectEqualStrings(old_history, history.items);
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript_commit_state.stable.flow, "CONSOLIDATION_PROMPT") != null);
+    var followup: std.Io.Writer.Allocating = .init(alloc);
+    defer followup.deinit();
+    for (0..60) |index| try followup.writer.print("{d}. FOLLOWUP_TABLE_{d:0>2}\n", .{ index + 1, index });
+    _ = try app.shell.streamAssistantChunk(alloc, &app.metrics, followup.written());
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript_commit_state.stable.flow, "FOLLOWUP_TABLE_") == null);
+    var released: u32 = 0;
+    for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(released > 0);
+    try std.testing.expect(std.mem.startsWith(u8, history.items, old_history));
+    const text = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "CONSOLIDATION_PROMPT"));
+    var previous = std.mem.find(u8, text, "CONSOLIDATION_PROMPT").?;
+    for (0..18) |index| {
+        var label_buffer: [48]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buffer, "CONSOLIDATION_OUTPUT_{d:0>2}", .{index});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
+        const at = std.mem.find(u8, text, label).?;
+        try std.testing.expect(at > previous);
+        previous = at;
+    }
+    for (0..84) |index| {
+        var label_buffer: [48]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buffer, "{s}_TABLE_{d:0>2}", .{ if (index < 24) "OLD" else "FOLLOWUP", if (index < 24) index else index - 24 });
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
+        const at = std.mem.find(u8, text, label).?;
+        try std.testing.expect(at > previous);
+        if ((index > 0 and index < 24) or index > 24) try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text[previous..at], "\n"));
+        previous = at + label.len;
+    }
+    try std.testing.expect(std.mem.find(u8, text, "OLD_TABLE_23").? < std.mem.find(u8, text, "COMPACT_COMMAND_SUMMARY").?);
+    try std.testing.expect(std.mem.find(u8, text, "COMPACT_COMMAND_SUMMARY").? < std.mem.find(u8, text, "PERMISSION_ACCEPTED").?);
+    try std.testing.expect(std.mem.find(u8, text, "PERMISSION_ACCEPTED").? < std.mem.find(u8, text, "FOLLOWUP_TABLE_00").?);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "COMPACT_COMMAND_SUMMARY"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "PERMISSION_ACCEPTED"));
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(text, quiet);
+}
+
+test "core.app_render_runtime paints a rebased terminal status after cancellation pin cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "cancel-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 100, .rows = 30, .content_bottom = 26, .divider_top_row = 27, .input_row = 28, .divider_bottom_row = 29, .hint_row = 30 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 100, 30);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    const id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_mcp" };
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "mcp_fixture_echo",
+        .activity_kind = .command,
+    } });
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(try app.shell.presentActiveToolCancellation(alloc));
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const cancelled = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(cancelled);
+    try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "Cancelled mcp_fixture_echo") == null);
+
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled mcp_fixture_echo" },
+    } });
+    _ = try app.shell.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .interrupted,
+    } });
+    try app.shell.finishLifecycleBatch(alloc);
+    try std.testing.expect(!app.shell.transcript_commit_state.stable.flow_materialized);
+    try std.testing.expectEqual(offset, try file.length(std.testing.io));
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const finished = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(finished);
+    try std.testing.expect(std.mem.find(u8, finished, "Cancelled mcp_fixture_echo") != null);
+    try std.testing.expect(app.shell.transcript_commit_state.stable.flow_materialized);
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(finished, quiet);
+}
+
+test "core.app_render_runtime rebased notice preserves the pin and publishes the finished result" {
+    try checkRebasedNoticePublication(80, 12);
+    try checkRebasedNoticePublication(24, 10);
+}
+
+fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "notice-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = cols, .rows = rows, .content_bottom = rows - 4, .divider_top_row = rows - 3, .input_row = rows - 2, .divider_bottom_row = rows - 1, .hint_row = rows } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, cols, rows);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    if (cols == 24) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
+    for (0..4) |index| {
+        var line: [48]u8 = undefined;
+        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "NOTICE_HISTORY_{d:0>2}\n", .{index}));
+        _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    }
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const notice_id = try app.shell.appendReplaceableSemanticNotice(alloc, .{
+        .topic = "feedback",
+        .tone = .neutral,
+        .body = "Preparing feedback report while external work is blocking",
+    });
+    for (0..6) |index| {
+        var line: [48]u8 = undefined;
+        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "NOTICE_LATER_{d:0>2}\n", .{index}));
+    }
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const held = app.shell.transcriptCommitDiagnostic().history_visual_offset;
+    var pinned = try app.shell.prepareTranscriptSource(alloc, null);
+    defer pinned.deinit(alloc);
+    try std.testing.expect(pinned.finality.mutation_pin_start != null);
+    const blocked_history = try alloc.dupe(u8, history.items);
+    defer alloc.free(blocked_history);
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+        try std.testing.expectEqual(held, app.shell.transcriptCommitDiagnostic().history_visual_offset);
+        try std.testing.expectEqualStrings(blocked_history, history.items);
+        try std.testing.expect(std.mem.find(u8, history.items, "Preparing") == null);
+        try std.testing.expect(std.mem.find(u8, history.items, "NOTICE_LATER_") == null);
+    }
+    const before_replacement = try file.length(std.testing.io);
+    try std.testing.expect(try app.shell.replaceSemanticNotice(alloc, notice_id, .{
+        .topic = "feedback",
+        .tone = .success,
+        .body = "Feedback report ready",
+    }));
+    try std.testing.expectEqual(before_replacement, try file.length(std.testing.io));
+    try std.testing.expectEqualStrings(blocked_history, history.items);
+    var finished = try app.shell.prepareTranscriptSource(alloc, null);
+    defer finished.deinit(alloc);
+    try std.testing.expect(finished.finality.mutation_pin_start == null);
+    var released: u32 = 0;
+    for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(released > 0);
+    const text = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(text);
+    var previous: usize = 0;
+    for (0..10) |index| {
+        var label_buffer: [48]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buffer, "NOTICE_{s}_{d:0>2}", .{ if (index < 4) "HISTORY" else "LATER", if (index < 4) index else index - 4 });
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
+        const at = std.mem.find(u8, text, label).?;
+        try std.testing.expect(at >= previous);
+        previous = at + label.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Feedback"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "report ready"));
+    try std.testing.expect(std.mem.find(u8, text, "Preparing") == null);
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(text, quiet);
+}
+
+const RewritePublicationCase = enum { command_retention, status_retention, status_shrink, removed_conversation };
+
+const PublicationRetry = struct {
+    accepted_bytes: ?usize = null,
+    mutate_before_frame: bool = false,
+    mutate_before_retry: bool = false,
+    resize_cols: ?u16 = null,
+    drain: bool = false,
+    drain_frames: usize = 24,
+    update_status: bool = false,
+    invalidate: bool = false,
+    cancel: bool = false,
+    viewer: bool = false,
+    utf8: bool = false,
+    reset: enum { none, clear, session_resume } = .none,
+};
+
+const PublicationFaultSink = struct {
+    file: std.Io.File,
+    remaining: usize,
+    calls: usize = 0,
+    failed: bool = false,
+    fn write(ctx: *anyopaque, _: *types.Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const count = if (self.failed) bytes.len else @min(self.remaining, bytes.len);
+        var written: usize = 0;
+        while (written < count) {
+            const n = self.file.writeStreaming(std.testing.io, &.{}, &.{bytes[written..count]}, 1) catch return .{ .partial = .{ .accepted_bytes = written, .err = error.WriteFailed } };
+            if (n == 0) break;
+            written += n;
+        }
+        if (!self.failed) self.remaining -= written;
+        if (written == bytes.len) return .complete;
+        self.failed = true;
+        return .{ .partial = .{ .accepted_bytes = written, .err = error.WriteFailed } };
+    }
+};
+
+fn checkRewritePublicationThroughCoordinator(case: RewritePublicationCase) !void {
+    return checkRewritePublicationRetry(case, .{});
+}
+
+fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: PublicationRetry) !void {
+    const store = @import("../../ui/transcript/store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "rewrite-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    const rows: u16 = if (retry.utf8) 18 else 16;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .rows = rows, .cols = 80, .content_bottom = rows - 4, .divider_top_row = rows - 3, .input_row = rows - 2, .divider_bottom_row = rows - 1, .hint_row = rows } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    const prefix_id = try app.shell.appendRawTranscriptEntryClassified(alloc, ("\x1b[0m" ** 256) ++ ("prefix padding\n" ** 2), .subagent_status);
+    const text = "1. earlier context\n2. earlier context\n3. earlier context\n4. earlier context\n5. RW_OLD_00\n6. RW_OLD_01\n7. RW_OLD_02\n8. RW_OLD_03\n9. RW_OLD_04\n10. RW_OLD_05\n\n";
+    const assistant_id = try app.shell.streamAssistantChunk(alloc, &app.metrics, if (retry.utf8) text ++ ("界é" ** 48) ++ "\n\nRW_ARTIFACTS\n" else text ++ "RW_ARTIFACTS\n");
+    const status_id = if (retry.cancel) blk: {
+        const id: types.ToolLifecycleId = .{ .turn_id = 41, .call_id = "publication-cancel" };
+        _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
+        break :blk app.shell.toolActivityRecord(id).?.entry_id;
+    } else try store.appendPinnedToolStatusAtomic(&app.shell, alloc, "phase one\nphase two\nphase three\n");
+    const status_bytes = for (app.shell.entries.items) |entry| {
+        if (entry.id() == status_id) break entry.raw_bytes.bytes.len;
+    } else unreachable;
+    var physical = try vt_emulator.Grid.init(alloc, 80, rows);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var exported: std.ArrayList(u8) = .empty;
+    defer exported.deinit(alloc);
+    var read_offset: u64 = 0;
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    app.shell.render_requests.request(.first_frame);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &exported, first);
+    var initial_screen: std.ArrayList(u8) = .empty;
+    defer initial_screen.deinit(alloc);
+    try physical.snapshot(&initial_screen);
+    for (0..6) |index| {
+        var label_buffer: [32]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buffer, "RW_OLD_{d:0>2}", .{index});
+        const initial_count = std.mem.count(u8, exported.items, label) + std.mem.count(u8, initial_screen.items, label);
+        if (initial_count != 1) std.debug.print("initial {s} {s} count={d}\nexported:\n{s}\nscreen:\n{s}\n", .{ @tagName(case), label, initial_count, exported.items, initial_screen.items });
+        try std.testing.expectEqual(@as(usize, 1), initial_count);
+    }
+    const before_text = try rewritePublicationText(alloc, &physical, exported.items);
+    defer alloc.free(before_text);
+    const before_gap_start = std.mem.find(u8, before_text, "RW_OLD_05").? + "RW_OLD_05".len;
+    const gap_anchor = if (retry.utf8) "界" else "RW_ARTIFACTS";
+    if (retry.utf8) {
+        try std.testing.expectEqual(@as(usize, 48), std.mem.count(u8, before_text, "界"));
+        try std.testing.expectEqual(@as(usize, 48), std.mem.count(u8, before_text, "é"));
+        var wrapped_rows: usize = 0;
+        var lines = std.mem.splitScalar(u8, before_text, '\n');
+        while (lines.next()) |line| if (std.mem.find(u8, line, "界") != null) {
+            wrapped_rows += 1;
+        };
+        try std.testing.expect(wrapped_rows > 1);
+    }
+    const before_gap_end = std.mem.find(u8, before_text, gap_anchor).?;
+    const before_gap = before_text[before_gap_start..before_gap_end];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, before_gap, "\n"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, exported.items, "RW_OLD_00"));
+    try std.testing.expectEqual(.stable, app.shell.transcriptCommitDiagnostic().state);
+    try std.testing.expect(app.shell.transcriptCommitDiagnostic().history_visual_offset > 0);
+    if (retry.viewer) {
+        try std.testing.expectEqual(@as(usize, 0), app.shell.committedRetentionIdentity().?.publication_entries.len);
+        try app_lifecycle.openFullTranscript(alloc, &app.terminal, &app.shell, &app.metrics);
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const opened = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(opened);
+        try feedRewritePublicationFrame(alloc, &physical, &exported, opened);
+        try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+        try std.testing.expect(physical.saved_normal_screen != null);
+    }
+    if (case != .status_shrink) app.shell.max_retained_transcript_bytes = store.retainedStructuredBytes(&app.shell);
+    switch (case) {
+        .command_retention => try app.shell.writeCommandOutputChunk(alloc, &app.metrics, .{}, .stdout, "NEW_COMMAND_OUTPUT\n", true),
+        .status_retention => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase replacement\nsecond phase\nthird phase\nfourth phase\nfifth phase\n")),
+        .status_shrink => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "ok\n")),
+        .removed_conversation => {
+            app.shell.max_retained_transcript_bytes = status_bytes + "NEW_NOTICE\n".len;
+            if (retry.viewer) {
+                try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "viewer status replacement\n"));
+            } else {
+                _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "NEW_NOTICE\n", .unknown_raw);
+            }
+        },
+    }
+    const prefix_survives = for (app.shell.entries.items) |entry| {
+        if (entry.id() == prefix_id) break true;
+    } else false;
+    try std.testing.expectEqual(case == .status_shrink, prefix_survives);
+    try std.testing.expectEqual(case != .removed_conversation, app.shell.lookupAssistantSegments(assistant_id) != null);
+    if (case == .status_retention) {
+        app.stream.active = true;
+        app.stream.phase = .running;
+    }
+    if (retry.viewer) {
+        try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+        try std.testing.expect(std.mem.findScalar(u32, app.shell.committedRetentionIdentity().?.publication_entries, assistant_id) != null);
+        if (retry.resize_cols) |cols| {
+            try physical.resize(cols, physical.rows);
+            app.shell.layout.cols = cols;
+            app.shell.render_requests.request(.resize);
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        }
+        try app_lifecycle.closeFullTranscript(alloc, &app.terminal, &app.shell, &app.metrics);
+        const closed = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(closed);
+        try feedRewritePublicationFrame(alloc, &physical, &exported, closed);
+        try std.testing.expect(physical.saved_normal_screen == null);
+    }
+    if (retry.invalidate) {
+        app.shell.invalidateTranscriptAnchor("external_projection_damage");
+        try std.testing.expect(app.shell.committedRetentionIdentity().?.publication_entries.len > 0);
+        try app.shell.recordFrameInvalidation(.{ .reason = .external_clear, .top = app.shell.owned_top_row, .bottom = app.shell.layout.content_bottom });
+        try physical.feed("\x1b[2J");
+    }
+    if (retry.reset != .none) {
+        try std.testing.expect(app.shell.committedRetentionIdentity().?.publication_entries.len > 0);
+        if (retry.reset == .clear) {
+            app.shell.clearTranscript(alloc);
+            try app.shell.writeTranscript(alloc, &app.metrics, "RESET_SENTINEL\n", true);
+        } else {
+            var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &app.shell, 0, 1);
+            defer projection.deinit();
+            _ = try projection.appendRawClassified("RESET_SENTINEL\n", .unknown_raw);
+            try projection.finalize();
+            projection.install(&app.shell);
+        }
+        try std.testing.expect(app.shell.committedRetentionIdentity() == null);
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const frame = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(frame);
+        try feedRewritePublicationFrame(alloc, &physical, &exported, frame);
+        try std.testing.expect(try coordinatorGridContains(physical, "RESET_SENTINEL"));
+        try std.testing.expect(!try coordinatorGridContains(physical, "RW_OLD_00"));
+        return;
+    }
+    const publication_bound = app.shell.transcriptCommitDiagnostic().source_bytes + app.shell.max_retained_transcript_bytes;
+    if (retry.update_status) {
+        try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase new\nphase two\nphase end\n"));
+        try std.testing.expectEqualStrings("phase new\nphase two\nphase end", store.toolStatusEntryLabel(&app.shell, status_id).?);
+        try std.testing.expect(std.mem.findScalar(u32, app.shell.committedRetentionIdentity().?.publication_entries, status_id) == null);
+    }
+    if (retry.mutate_before_frame) {
+        const held_bytes = app.shell.transcriptCommitDiagnostic().source_bytes;
+        for (0..32) |_| {
+            _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "P2\n", .unknown_raw);
+            var committed = (try app.shell.prepareCommittedRetentionSource(alloc)).?;
+            defer committed.deinit(alloc);
+            try std.testing.expect(std.mem.find(u8, committed.bytes, "P2") == null);
+            try std.testing.expectEqual(held_bytes, committed.bytes.len);
+            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
+        }
+    }
+    if (retry.accepted_bytes) |cut| {
+        const before_attempt = app.shell.transcriptCommitDiagnostic();
+        const exported_before_attempt = exported.items.len;
+        var sink = PublicationFaultSink{ .file = file, .remaining = cut };
+        app.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PublicationFaultSink.write };
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        Runtime(CoordinatorTestApp).flushRequestedFrame(&app) catch |err| {
+            if (err != error.WriteFailed and err != error.DocumentAppendInterrupted) return err;
+        };
+        app.shell.test_frame_sink = null;
+        try std.testing.expect(sink.calls > 0 and sink.failed);
+        const partial = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(partial);
+        try feedRewritePublicationFrame(alloc, &physical, &exported, partial);
+        if (cut == 0) try std.testing.expectEqual(before_attempt.history_visual_offset, app.shell.transcriptCommitDiagnostic().history_visual_offset);
+        if (cut >= 64) {
+            try std.testing.expect(app.shell.transcriptCommitDiagnostic().history_visual_offset > before_attempt.history_visual_offset);
+            try std.testing.expect(exported.items.len > exported_before_attempt);
+        }
+        if (retry.cancel) {
+            app.worker.cancel_requested = true;
+            app.stream.active = false;
+            _ = try app.shell.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 41, .outcome = .interrupted } });
+            try std.testing.expectEqual(.terminal, app.shell.toolActivityRecord(.{ .turn_id = 41, .call_id = "publication-cancel" }).?.phase);
+            try app.shell.finishLifecycleBatch(alloc);
+            try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
+        }
+        if (retry.mutate_before_retry) _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "P3\n", .unknown_raw);
+        if (cut == 0 and retry.mutate_before_retry) {
+            var committed = (try app.shell.prepareCommittedRetentionSource(alloc)).?;
+            defer committed.deinit(alloc);
+            try std.testing.expect(std.mem.find(u8, committed.bytes, "NEW_NOTICE") == null);
+        }
+    }
+    if (retry.resize_cols) |cols| {
+        try physical.resize(cols, physical.rows);
+        app.shell.layout.cols = cols;
+        app.shell.render_requests.request(.resize);
+    }
+    for (0..8) |_| {
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+        defer alloc.free(next);
+        try feedRewritePublicationFrame(alloc, &physical, &exported, next);
+        if (app.shell.transcript_commit_state == .stable and
+            !app.shell.transcript_commit_state.stable.normal_buffer_recovery_pending and
+            !app.shell.transcript_commit_state.stable.history_catchup_pending) break;
+    }
+    if (retry.drain) {
+        const seen = try alloc.alloc(bool, retry.drain_frames);
+        defer alloc.free(seen);
+        @memset(seen, false);
+        for (0..retry.drain_frames) |index| {
+            var buffer: [32]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buffer, "N{d}\n", .{index});
+            _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, line, .unknown_raw);
+            app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+            defer alloc.free(next);
+            try feedRewritePublicationFrame(alloc, &physical, &exported, next);
+            const visible = try rewritePublicationText(alloc, &physical, exported.items);
+            defer alloc.free(visible);
+            for (0..index + 1) |prior| {
+                var label_buffer: [32]u8 = undefined;
+                const label = try std.fmt.bufPrint(&label_buffer, "N{d}", .{prior});
+                const count = publicationLineCount(visible, label);
+                if (seen[prior] or count > 0) {
+                    try std.testing.expectEqual(@as(usize, 1), count);
+                    seen[prior] = true;
+                }
+            }
+            try std.testing.expect(app.shell.transcriptCommitDiagnostic().source_bytes <= publication_bound);
+            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
+        }
+        try std.testing.expect(std.mem.findScalar(bool, seen, true) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, exported.items, "RW_ARTIFACTS"));
+        try std.testing.expect(std.mem.find(u8, exported.items, "phase one") == null);
+        try std.testing.expect(std.mem.findScalar(u32, app.shell.committedRetentionIdentity().?.publication_entries, assistant_id) == null);
+    }
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    try physical.snapshot(&screen);
+    for (0..6) |index| {
+        var label_buffer: [32]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buffer, "RW_OLD_{d:0>2}", .{index});
+        const count = std.mem.count(u8, exported.items, label) + std.mem.count(u8, screen.items, label);
+        if (count != 1) std.debug.print("rewrite publication {s}: {s} count={d} cut={?d} resize={?d}\nexported:\n{s}\nscreen:\n{s}\n", .{ @tagName(case), label, count, retry.accepted_bytes, retry.resize_cols, exported.items, screen.items });
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, exported.items, "RW_ARTIFACTS") + std.mem.count(u8, screen.items, "RW_ARTIFACTS"));
+    const after_text = try rewritePublicationText(alloc, &physical, exported.items);
+    defer alloc.free(after_text);
+    const after_gap_start = std.mem.find(u8, after_text, "RW_OLD_05").? + "RW_OLD_05".len;
+    const after_gap_end = std.mem.find(u8, after_text, gap_anchor).?;
+    try std.testing.expectEqualStrings(before_gap, after_text[after_gap_start..after_gap_end]);
+    if (retry.utf8) {
+        try std.testing.expectEqual(@as(usize, 48), std.mem.count(u8, after_text, "界"));
+        try std.testing.expectEqual(@as(usize, 48), std.mem.count(u8, after_text, "é"));
+        const before_end = std.mem.findLast(u8, before_text, "é").? + "é".len;
+        const after_end = std.mem.findLast(u8, after_text, "é").? + "é".len;
+        try std.testing.expectEqualStrings(before_text[before_end..std.mem.find(u8, before_text, "RW_ARTIFACTS").?], after_text[after_end..std.mem.find(u8, after_text, "RW_ARTIFACTS").?]);
+    }
+}
+
+test "rewrite publication command retention preserves finalized rows through coordinator" {
+    try checkRewritePublicationThroughCoordinator(.command_retention);
+}
+
+test "rewrite publication lifecycle retention preserves finalized rows through coordinator" {
+    try checkRewritePublicationThroughCoordinator(.status_retention);
+}
+
+test "rewrite publication lifecycle shrink without pruning preserves finalized rows through coordinator" {
+    try checkRewritePublicationThroughCoordinator(.status_shrink);
+}
+
+test "rewrite publication exports pruned finalized conversation rows before replacement" {
+    try checkRewritePublicationThroughCoordinator(.removed_conversation);
+}
+
+test "rewrite publication retains finalized rows across mutations before the next frame" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .mutate_before_frame = true, .drain = true });
+}
+
+test "rewrite publication retries accepted prefixes without duplicating finalized rows" {
+    for ([_]usize{ 0, 1, 16, 64, 128, 256 }) |cut| {
+        errdefer std.debug.print("publication cut={d}\n", .{cut});
+        try checkRewritePublicationRetry(.removed_conversation, .{ .accepted_bytes = cut, .mutate_before_retry = true, .drain = true });
+    }
+}
+
+test "rewrite publication pending rows survive width changes" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .resize_cols = 60, .drain = true });
+    try checkRewritePublicationRetry(.removed_conversation, .{ .accepted_bytes = 64, .mutate_before_retry = true, .resize_cols = 100, .drain = true });
+}
+
+test "rewrite publication cancellation follows accepted export without losing finalized rows" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .cancel = true, .accepted_bytes = 64, .mutate_before_retry = true, .drain = true });
+}
+
+test "rewrite publication first retirement survives the full transcript owner" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .viewer = true, .drain = true });
+    try checkRewritePublicationRetry(.removed_conversation, .{ .viewer = true, .resize_cols = 100, .drain = true });
+}
+
+test "rewrite publication preserves wrapped UTF8 through pending resize" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .utf8 = true, .resize_cols = 40, .drain = true });
+}
+
+test "rewrite publication survives generic projection invalidation" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .invalidate = true, .drain = true });
+}
+
+test "rewrite publication remains bounded while status stays mutable" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .update_status = true, .drain = true, .drain_frames = 96 });
+}
+
+test "rewrite publication does not delay explicit clear or resume" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .reset = .clear });
+    try checkRewritePublicationRetry(.removed_conversation, .{ .reset = .session_resume });
+}
+
 test "core.app_render_runtime resume publication preserves the pre-scroll origin through the coordinator" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { origin: u16, rows: u16, post_top: u16 }{

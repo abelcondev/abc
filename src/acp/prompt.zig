@@ -1424,6 +1424,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .usage = &session.session_rt.usage,
@@ -1489,6 +1490,11 @@ fn persistUsageCheckpoint(
         writable.active_id,
         recovery_checkpoint,
     );
+}
+
+fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.state.capability_resolver.state == .failed;
 }
 
 fn resolveModelCapabilities(

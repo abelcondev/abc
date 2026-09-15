@@ -59,6 +59,8 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const mcp_access = @import("../mcp/access_policy.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const resume_projection = @import("../../ui/transcript/resume_projection.zig");
+const question_ui = @import("../../ui/footer/question_ui.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
@@ -1152,6 +1154,8 @@ pub const Persistence = struct {
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
+    process_effort_override: ?types.ReasoningEffort = null,
+    process_fast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
@@ -1167,7 +1171,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 21) {
+            if (std.meta.fields(Persistence).len != 23) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1183,6 +1187,8 @@ pub const Persistence = struct {
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
+        storage.process_effort_override = null;
+        storage.process_fast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
@@ -1309,6 +1315,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            effort_process_override: ?types.ReasoningEffort,
+            fast_process_override: ?bool,
         ) !void {
             try replacePreferences(
                 app.alloc,
@@ -1334,6 +1342,8 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
+            app.session_persistence.process_effort_override = effort_process_override;
+            app.session_persistence.process_fast_override = fast_process_override;
         }
 
         pub fn initializePersistence(
@@ -1945,6 +1955,7 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                     .workspace_root = resume_workspace_root,
+                    .labels = &historical_labels,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
@@ -3293,11 +3304,50 @@ pub fn Runtime(comptime App: type) type {
                 app: *App,
                 projection: *Projection,
                 workspace_root: []const u8,
+                labels: *const HistoricalSessionLabels,
 
                 const Self = @This();
 
                 fn activityKind(self: *Self, call: types.ToolCall) types.ToolActivityKind {
                     return self.app.historicalToolActivityKind(call);
+                }
+
+                /// Terminal-session actions (interact, stop) carry no command
+                /// argument; restore their full launch command from the recorded
+                /// session label so resumed rows reclip to the live width.
+                fn attachSessionCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    var scratch_state = std.heap.ArenaAllocator.init(self.projection.alloc);
+                    defer scratch_state.deinit();
+                    const scratch = scratch_state.allocator();
+                    const label = tooling_presentation.terminalSessionCompletedActionLabel(
+                        scratch,
+                        self.app.toolRegistry(),
+                        call,
+                    ) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "historical session action label unavailable entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        return;
+                    } orelse return;
+                    const reflow = historicalSessionReflow(scratch, self.labels, call) orelse {
+                        debug_trace.logf(
+                            "session",
+                            "historical session command unknown entry_id={d}",
+                            .{entry_id},
+                        );
+                        return;
+                    };
+                    self.projection.setHistoricalToolCommandMetadata(
+                        entry_id,
+                        reflow,
+                        label,
+                    ) catch |err| debug_trace.logf(
+                        "session",
+                        "historical session command metadata unavailable entry_id={d} err={s}",
+                        .{ entry_id, @errorName(err) },
+                    );
                 }
 
                 fn attachCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
@@ -3311,8 +3361,14 @@ pub fn Runtime(comptime App: type) type {
                     };
                     defer parsed.deinit();
                     if (parsed.value != .object) return;
-                    const command_value = parsed.value.object.get("command") orelse return;
-                    if (command_value != .string) return;
+                    const command_value = parsed.value.object.get("command") orelse {
+                        try self.attachSessionCommandDisplay(entry_id, call);
+                        return;
+                    };
+                    if (command_value != .string) {
+                        try self.attachSessionCommandDisplay(entry_id, call);
+                        return;
+                    }
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
@@ -3537,14 +3593,23 @@ pub fn Runtime(comptime App: type) type {
         /// can contain two runs that both produced `shell-1`; the later record
         /// wins, matching the most recent epoch's live rendering.
         const HistoricalSessionLabels = struct {
+            const Label = struct {
+                /// Compact-bound text baked into frozen status lines.
+                label: []const u8,
+                /// Reflow-bound command stored as tool detail metadata so group
+                /// projection can reclip resumed rows to the live terminal width.
+                reflow: ?[]const u8,
+            };
+
             workspace_root: []const u8,
-            map: std.StringHashMapUnmanaged([]const u8) = .empty,
+            map: std.StringHashMapUnmanaged(Label) = .empty,
 
             fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
                 var it = self.map.iterator();
                 while (it.next()) |entry| {
                     alloc.free(entry.key_ptr.*);
-                    alloc.free(entry.value_ptr.*);
+                    alloc.free(entry.value_ptr.label);
+                    if (entry.value_ptr.reflow) |value| alloc.free(value);
                 }
                 self.map.deinit(alloc);
             }
@@ -3557,6 +3622,27 @@ pub fn Runtime(comptime App: type) type {
             labels: *const HistoricalSessionLabels,
             call: types.ToolCall,
         ) ?[]const u8 {
+            const entry = historicalSessionLabelEntry(arena, labels, call) orelse return null;
+            return entry.label;
+        }
+
+        /// Returns the recorded reflow-bound launch command for a
+        /// session-scoped call (borrowed from `labels`), or null when the
+        /// session is unknown or no full display was recorded.
+        fn historicalSessionReflow(
+            arena: Allocator,
+            labels: *const HistoricalSessionLabels,
+            call: types.ToolCall,
+        ) ?[]const u8 {
+            const entry = historicalSessionLabelEntry(arena, labels, call) orelse return null;
+            return entry.reflow;
+        }
+
+        fn historicalSessionLabelEntry(
+            arena: Allocator,
+            labels: *const HistoricalSessionLabels,
+            call: types.ToolCall,
+        ) ?HistoricalSessionLabels.Label {
             const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
             const session_id = tool_args.optionalStringArg(args, "session_id") orelse return null;
             return labels.map.get(session_id);
@@ -3606,10 +3692,11 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Records the launch command of a completed captured-command `run`
-        /// call whose result still owns a live session, so later interact/stop
-        /// calls naming that session render the command instead of the raw
-        /// session id. The caller gates the call shape; this resolves the label.
+        /// Records the launch command of a completed `run` call whose result
+        /// still owns a live session, so later interact/stop calls naming that
+        /// session render the command instead of the raw session id. Calls
+        /// without a command argument, or whose result names no session,
+        /// return without recording.
         fn recordHistoricalSessionLabel(
             app: *App,
             labels: *HistoricalSessionLabels,
@@ -3640,14 +3727,22 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             errdefer app.alloc.free(label);
+            const reflow: ?[]const u8 = (try tooling_presentation.formatRunCommandDetailBounded(
+                app.alloc,
+                command,
+                labels.workspace_root,
+                tooling_presentation.max_run_command_reflow_bytes,
+            )) orelse null;
+            errdefer if (reflow) |value| app.alloc.free(value);
             const owned_id = try app.alloc.dupe(u8, session_id);
             errdefer app.alloc.free(owned_id);
             const gop = try labels.map.getOrPut(app.alloc, owned_id);
             if (gop.found_existing) {
                 app.alloc.free(owned_id);
-                app.alloc.free(gop.value_ptr.*);
+                app.alloc.free(gop.value_ptr.label);
+                if (gop.value_ptr.reflow) |value| app.alloc.free(value);
             }
-            gop.value_ptr.* = label;
+            gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
         fn replayResumedHistoryToSink(
@@ -3859,13 +3954,14 @@ pub fn Runtime(comptime App: type) type {
             history: []const types.HistoryTurn,
             has_prior_turns: *bool,
         ) !void {
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
                 .workspace_root = app.workspace_root,
+                .labels = &labels,
             };
-            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
-            defer labels.deinit(app.alloc);
             return replayHistoryToSinkIncremental(
                 app,
                 &sink,
@@ -4126,7 +4222,9 @@ pub fn Runtime(comptime App: type) type {
                 .completed
             else
                 .failed;
-            if (outcome == .completed and is_command) {
+            // tty runs are not captured commands but still own a live session
+            // with a launch command worth recording for later session rows.
+            if (outcome == .completed and (is_command or std.mem.eql(u8, call.name, "shell"))) {
                 try recordHistoricalSessionLabel(app, labels, call, result);
             }
             const entry_id = try writeCompletedToolStatus(
@@ -4950,7 +5048,17 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.workspace_preferences,
                 preferences,
             );
-            try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
+            if (config_runtime.providerEnvOverride() != null) {
+                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                defer settings.deinit(app.alloc);
+                const selected = settings.provider orelse return error.InvalidProviderValue;
+                const model = settings.models.get(selected) orelse fallback: {
+                    const seeded = app.session_persistence.workspace_preferences orelse return error.ConfiguredModelNotSelected;
+                    if (!seeded.provider.eql(selected)) return error.ConfiguredModelNotSelected;
+                    break :fallback seeded.model;
+                };
+                try provider_runtime.replaceSelection(app, selected, model);
+            } else try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
             }
@@ -4958,11 +5066,18 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            app.effort = preferences.effort;
-            app.fast_mode = preferences.fast_mode;
-            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
-            app.worker.syncQueuedPromptEffort(preferences.effort);
-            app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+            // Launch flags (fx --effort/--fast) win over the resumed session's
+            // stored preferences for this launch, without rewriting them.
+            const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
+            const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
+            app.effort = effective_effort;
+            app.fast_mode = effective_fast_mode;
+            app.session_persistence.fast_mode_model_bound = if (app.session_persistence.process_fast_override != null)
+                effective_fast_mode
+            else
+                fast_mode_model_bound;
+            app.worker.syncQueuedPromptEffort(effective_effort);
+            app.worker.syncQueuedPromptFastMode(effective_fast_mode);
         }
 
         pub fn fastModeModelBound(app: *const App) bool {
@@ -5074,7 +5189,7 @@ fn restoredFastModeModelBound(
 ) bool {
     if (!current_bound) return false;
     const current = configured orelse return false;
-    return current.provider == restored.provider and
+    return current.provider.same_authority(restored.provider) and
         std.mem.eql(u8, current.model, restored.model) and
         current.fast_mode == restored.fast_mode;
 }
@@ -5426,6 +5541,22 @@ const TestApp = struct {
 
     fn toolAdvertisementSet(_: *const TestApp) tool_set_contract.ToolSet {
         return builtin_tools.advertisement_set;
+    }
+
+    fn toolRegistry(_: *const TestApp) tool_dispatch.Registry {
+        return builtin_tools.advertisement_set.registry;
+    }
+
+    fn historicalToolActivityKind(self: *TestApp, call: types.ToolCall) types.ToolActivityKind {
+        return tool_dispatch.toolActivityKindForCall(self.alloc, builtin_tools.advertisement_set.registry, call);
+    }
+
+    fn prepareHistoricalQuestionResolution(self: *TestApp, answers: []const types.QuestionAnswer) ![]u8 {
+        return question_ui.composeResolvedQuestionAnswers(
+            self.alloc,
+            answers,
+            self.shell.layout.cols,
+        );
     }
 
     fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
@@ -5850,6 +5981,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .auto,
         false,
         true,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
@@ -5938,6 +6071,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .auto,
             false,
             true,
+            null,
+            null,
         );
         app.session_persistence.js_host_store = fake.store();
         app.requested_resume = .last;
@@ -5968,6 +6103,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .auto,
         false,
         true,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .pick;
@@ -5994,6 +6131,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .auto,
         false,
         true,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6062,6 +6201,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         .auto,
         false,
         true,
+        null,
+        null,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -6158,6 +6299,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        null,
+        null,
     );
 }
 
@@ -6729,6 +6872,163 @@ test "history replay carries shell session labels across turns" {
         "● Completed shell tail -f app.log\n",
         app.completed_tool_statuses.items[1],
     );
+}
+
+test "execution replay records session labels for tty-launched sessions" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const run_output = "{\"session_id\":\"shell-3\",\"state\":\"running\",\"backend\":\"tty\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"npm run dev\",\"tty\":true}",
+    }};
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var first_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+    var observe_calls = [_]types.ToolCall{.{
+        .id = "call_observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"chars\":\"\"}",
+    }};
+    var observe_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_observe"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var second_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = observe_calls[0..],
+        .tool_results = observe_results[0..],
+    }};
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("start the server") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = first_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("check it") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = second_steps[0..] },
+        } },
+    };
+
+    try Runtime(TestApp).replayHistory(&app, &history);
+
+    // A tty-launched session is recorded the same way, so the observe row
+    // renders the launch command instead of the raw session id.
+    try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Completed shell npm run dev\n",
+        app.completed_tool_statuses.items[1],
+    );
+}
+
+test "resume projection stores reflow metadata for session action rows" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .workspace_root = app.workspace_root,
+        .labels = &labels,
+    };
+
+    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var first_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+    var observe_calls = [_]types.ToolCall{
+        .{
+            .id = "call_observe",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-4\",\"chars\":\"\"}",
+        },
+        .{
+            .id = "call_observe_unknown",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-9\",\"chars\":\"\"}",
+        },
+    };
+    var observe_results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_observe"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(run_output),
+            .output_bytes = run_output.len,
+            .stored_output_bytes = run_output.len,
+        },
+        .{
+            .tool_call_id = @constCast("call_observe_unknown"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast("{\"session_id\":\"shell-9\",\"state\":\"running\"}"),
+            .output_bytes = 44,
+            .stored_output_bytes = 44,
+        },
+    };
+    var second_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = observe_calls[0..],
+        .tool_results = observe_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = first_steps[0..] }, &labels);
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = second_steps[0..] }, &labels);
+
+    var observed_metadata = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const action = detail.command_action_label orelse continue;
+        if (std.mem.eql(u8, action, "Observed")) {
+            try std.testing.expectEqualStrings(command, detail.command_display.?);
+            observed_metadata = true;
+        }
+    }
+    try std.testing.expect(observed_metadata);
+
+    // The unknown session keeps its raw-id presentation and stores nothing.
+    for (projection.runtime.tool_details.items) |*detail| {
+        const display = detail.command_display orelse continue;
+        try std.testing.expect(std.mem.find(u8, display, "shell-9") == null);
+    }
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {
@@ -7615,6 +7915,8 @@ test "upgrade resume restores active session with the installed version notice" 
         types.ReasoningEffort.literal("high"),
         true,
         false,
+        null,
+        null,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
@@ -9312,6 +9614,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        null,
+        null,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);

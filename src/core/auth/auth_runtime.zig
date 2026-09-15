@@ -178,6 +178,43 @@ pub const FailureSnapshot = struct {
     }
 };
 
+/// Process-local proof that a request-path credential load succeeded recently.
+/// The request path's defensive `.if_needed` reload reads the OS secret store
+/// (tens of milliseconds on macOS); when admission or an earlier step just
+/// proved the credential, repeating that read only adds latency. A stale skip
+/// costs one unauthorized response, which the existing force-refresh replay
+/// already recovers from.
+const request_path_verified_window_ms: u32 = 30_000;
+const source_none: u8 = std.math.maxInt(u8);
+// u32 keeps the stamp atomic-loadable on 32-bit wasm; wrapping subtraction
+// keeps window comparisons correct across the ~49 day wrap.
+var request_path_verified_ms = std.atomic.Value(u32).init(0);
+var request_path_verified_source = std.atomic.Value(u8).init(source_none);
+
+fn stampNowMs() u32 {
+    return @truncate(@as(u64, @bitCast(io_mod.milliTimestamp())));
+}
+
+fn noteRequestPathCredentialVerified(source: credentials.Source) void {
+    request_path_verified_source.store(@intFromEnum(source), .seq_cst);
+    request_path_verified_ms.store(stampNowMs(), .seq_cst);
+}
+
+/// True when one refreshable source's credential was loaded successfully within
+/// the skip window. Request-path callers use this to bypass a redundant
+/// defensive reload; admission and forced refreshes must not consult it.
+pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
+    const verified_ms = request_path_verified_ms.load(.seq_cst);
+    if (verified_ms == 0) return false;
+    if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
+    return stampNowMs() -% verified_ms < request_path_verified_window_ms;
+}
+
+fn resetRequestPathCredentialVerification() void {
+    request_path_verified_ms.store(0, .seq_cst);
+    request_path_verified_source.store(source_none, .seq_cst);
+}
+
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.
 pub fn refreshCredentialForAccount(
@@ -208,6 +245,7 @@ pub fn refreshCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
+    noteRequestPathCredentialVerified(source);
     return credential;
 }
 
@@ -301,7 +339,7 @@ fn prepareResolvedCredential(
     };
     resolution.credential = null;
 
-    const blocked = credential.token.len == 0 or
+    const blocked = (credential.token.len == 0 and !(provider == .configured and credential.source == .configured)) or
         !model_provider.authorizesCredential(provider, credential.source) or
         credential.needsRefreshAt(now_ms) or
         (credential.source == .fx_login and
@@ -314,6 +352,9 @@ fn prepareResolvedCredential(
     if (blocked) {
         credential.deinit(alloc);
         return null;
+    }
+    if (credentials.sourceRefreshable(credential.source)) {
+        noteRequestPathCredentialVerified(credential.source);
     }
     return credential;
 }
@@ -1155,7 +1196,7 @@ pub const Choice = union(enum) {
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
-                .provider => |other_provider| provider == other_provider,
+                .provider => |other_provider| provider.eql(other_provider),
                 .source, .action, .team => false,
             },
             .source => |source| switch (other) {
@@ -1297,7 +1338,7 @@ pub const PickerView = struct {
 
     pub fn choiceDescription(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| if (provider == self.active_provider) "current" else "available",
+            .provider => |provider| if (provider.eql(self.active_provider)) "current" else "available",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
                 .connections => "",
@@ -1446,6 +1487,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
+            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
     }
 
@@ -1522,8 +1564,8 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
         resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
@@ -2710,7 +2752,7 @@ pub const Runtime = struct {
         preferred: ?credentials.Source,
     ) Allocator.Error!ProviderCredentialSelection {
         if (self.auth_mode == .host_managed or
-            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+            (provider != .configured and model_provider.authorizesCredential(provider, self.credentialSource()))) return .unchanged;
 
         var resolution = credentials.resolveForProvider(
             alloc,
@@ -5017,4 +5059,18 @@ test "manual code visibility cannot toggle without provider capability" {
     try std.testing.expect(!runtime.toggleSignInCodeEntry());
     try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
     try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "request-path credential verification stamp gates only within the window" {
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+
+    noteRequestPathCredentialVerified(.fx_login);
+    try std.testing.expect(requestPathCredentialVerifiedRecently(.fx_login));
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.chatgpt_subscription));
+
+    request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }

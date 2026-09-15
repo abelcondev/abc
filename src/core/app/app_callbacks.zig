@@ -360,6 +360,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
+                .model_catalog_unavailable = agentModelCatalogUnavailable,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .report_usage = agentReportUsage,
@@ -406,6 +407,10 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+                debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+                return null;
+            }
             var refreshed = (try auth_runtime.refreshCredentialForAccount(
                 app.auth.oauthTransport(),
                 std.heap.c_allocator,
@@ -593,6 +598,67 @@ pub fn Bindings(comptime App: type) type {
                                     );
                                 }
                             }
+                        } else if (comptime @hasField(App, "terminal_client") and @hasField(App, "managed_executions")) {
+                            // Terminal-session actions (interact, stop) carry no
+                            // command argument; their status line shows the launch
+                            // command resolved from the session registry, truncated
+                            // to the compact activity bound. Store the reflow-bound
+                            // display so group projection can reclip the phrase to
+                            // the live terminal width like any other command.
+                            if (app.toolRegistry().lookup(started.tool_name)) |spec| {
+                                if (spec.executor_kind == .terminal) {
+                                    const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                                        if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+                                    else
+                                        app.workspace_root;
+                                    const session_call: ToolCall = .{
+                                        .id = started.id.call_id,
+                                        .name = started.tool_name,
+                                        .arguments_json = arguments_json,
+                                    };
+                                    const session_display = tool_presentation.resolveTerminalDisplayTargetBounded(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        workspace_root,
+                                        &app.terminal_client,
+                                        &app.managed_executions,
+                                        session_call,
+                                        tool_presentation.max_run_command_reflow_bytes,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command display unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    defer if (session_display) |bytes| alloc.free(bytes);
+                                    const session_label = tool_presentation.terminalSessionCompletedActionLabel(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        session_call,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command action label unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    if (session_display != null and session_label != null) {
+                                        app.shell.setToolCommandMetadata(
+                                            alloc,
+                                            started.id,
+                                            session_display.?,
+                                            session_label.?,
+                                        ) catch |err| debug_trace.logf(
+                                            "ui_activity",
+                                            "command metadata unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -778,6 +844,14 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
                 try app.appendStaticContextMessage(arena, project_context, messages);
             }
+        }
+
+        fn agentModelCatalogUnavailable(ctx: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "isModelCacheFailed")) {
+                return app.isModelCacheFailed();
+            }
+            return false;
         }
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
@@ -1173,6 +1247,7 @@ pub fn Bindings(comptime App: type) type {
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
                             .host_managed => credentials.host_managed_auth_message,
+                            .configured => "Check the configured provider auth environment variable.",
                         },
                     },
                 )

@@ -124,16 +124,24 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    model_override: ?[]u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        if (self.model_override) |model| alloc.free(model);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasModelOverrides(self: LaunchModifiers) bool {
+        return self.model_override != null or self.effort_override != null or self.fast_override != null;
     }
 };
 
@@ -360,6 +368,10 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var model_override: ?[]u8 = null;
+    errdefer if (model_override) |model| alloc.free(model);
+    var effort_override: ?types.ReasoningEffort = null;
+    var fast_override: ?bool = null;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -381,6 +393,33 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            index += 1;
+            if (index >= args.len) return error.MissingModelValue;
+            const model = std.mem.trim(u8, args[index], " \t\r\n");
+            if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
+            if (model_override) |old| alloc.free(old);
+            model_override = owned_model;
+        } else if (std.mem.startsWith(u8, arg, "--model=")) {
+            const model = std.mem.trim(u8, arg["--model=".len..], " \t\r\n");
+            if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
+            if (model_override) |old| alloc.free(old);
+            model_override = owned_model;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            index += 1;
+            if (index >= args.len) return error.MissingEffortValue;
+            effort_override = types.ReasoningEffort.parse(args[index]) orelse
+                return error.InvalidEffortValue;
+        } else if (std.mem.startsWith(u8, arg, "--effort=")) {
+            effort_override = types.ReasoningEffort.parse(arg["--effort=".len..]) orelse
+                return error.InvalidEffortValue;
+        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
+            const enabled = std.mem.eql(u8, arg, "--fast");
+            if (fast_override != null and fast_override.? != enabled)
+                return error.ConflictingFastFlags;
+            fast_override = enabled;
         } else {
             break;
         }
@@ -396,6 +435,9 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .model_override = model_override,
+            .effort_override = effort_override,
+            .fast_override = fast_override,
         },
     };
 }
@@ -412,12 +454,20 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--effort"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--model=") and
+            !std.mem.startsWith(u8, arg, "--effort=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--fast") and
+            !std.mem.eql(u8, arg, "--no-fast"))
         {
             return args[index..];
         }
@@ -695,6 +745,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
 }
 
@@ -732,6 +783,26 @@ fn activateProviderSelectionFallible(
     };
     defer settings.deinit(alloc);
 
+    if (target == .configured) {
+        const bound = try target.bind(settings.providers orelse .{});
+        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = bound,
+            .model_preference = .{ .provider = bound, .model = selected_model },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        defer alloc.free(message);
+        if (caller == .provider_command) try writeStdout(deps, message);
+        return true;
+    }
     const preferred_source = exact_source orelse settings.credential_source;
     var prepared_credential = if (cfg.auth_mode == .host_managed)
         null
@@ -745,7 +816,7 @@ fn activateProviderSelectionFallible(
         );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
-    const already_selected = (settings.provider orelse .gateway) == target;
+    const already_selected = (settings.provider orelse @as(model_provider.ProviderId, .gateway)).eql(target);
     if (caller == .provider_command and already_selected and
         (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
@@ -753,6 +824,7 @@ fn activateProviderSelectionFallible(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .configured => "Configured provider is already selected.\n",
         });
         return true;
     }
@@ -786,6 +858,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .configured => "configure the provider auth environment variable first",
             },
         );
         return false;
@@ -795,6 +868,7 @@ fn activateProviderSelectionFallible(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .configured => "Configured model catalog is unavailable",
         });
         return false;
     };
@@ -861,13 +935,14 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .configured => "Provider set to configured connection.\n",
         });
     }
     return true;
@@ -886,7 +961,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--model <id>] [--effort <level>] [--fast|--no-fast] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -917,6 +992,11 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
+        return .handled_failure;
+    }
+
+    if (global_args.modifiers.hasModelOverrides()) {
+        try writeModelModifierUsage(deps);
         return .handled_failure;
     }
 
@@ -1012,6 +1092,7 @@ fn runNonInteractiveWithDeps(
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
+                .configured => "Configured providers use settings.json authentication.\n",
             });
             return .handled_success;
         },
@@ -1150,11 +1231,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <name>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1207,6 +1288,7 @@ fn runNonInteractiveWithDeps(
                 .revision = cfg.revision,
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
+            snapshot.provider_endpoint = startup.provider_endpoint;
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1268,11 +1350,14 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+            var available_providers = cfg.provider_set;
+            available_providers.definitions = startup.configured_providers.definitions;
+            const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -3221,10 +3306,21 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeModelModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --model, --effort, and --fast apply to interactive sessions; for one-shot runs pass them after `fx ask`\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingModelValue => "--model requires a model id",
+        error.MissingEffortValue => "--effort requires a value",
+        error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
+        error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
         else => null,
     };
 }
@@ -3801,6 +3897,68 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "global launch modifiers own model effort and fast overrides before the command" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--model"),
+        @constCast("provider/launch-model"),
+        @constCast("--effort=high"),
+        @constCast("--fast"),
+        @constCast("--add-dir"),
+        @constCast("/tmp/shared"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("provider/launch-model", parsed.modifiers.model_override.?);
+    try std.testing.expect(parsed.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
+    try std.testing.expect(parsed.modifiers.hasModelOverrides());
+    try std.testing.expectEqual(@as(usize, 1), parsed.modifiers.additional_directories.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
+
+    var spaced = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--model= provider/spaced "),
+        @constCast("--effort"),
+        @constCast("low"),
+        @constCast("--no-fast"),
+    });
+    defer spaced.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/spaced", spaced.modifiers.model_override.?);
+    try std.testing.expect(spaced.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(@as(?bool, false), spaced.modifiers.fast_override);
+
+    var untouched = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("ask"), @constCast("--fast") });
+    defer untouched.deinit(std.testing.allocator);
+    try std.testing.expect(!untouched.modifiers.hasModelOverrides());
+    try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
+}
+
+test "global model overrides fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingModelValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model")}),
+    );
+    try std.testing.expectError(
+        error.MissingModelValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model=")}),
+    );
+    try std.testing.expectError(
+        error.MissingEffortValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort")}),
+    );
+    try std.testing.expectError(
+        error.InvalidEffortValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort=not an effort")}),
+    );
+    try std.testing.expectError(
+        error.ConflictingFastFlags,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--fast"), @constCast("--no-fast") }),
+    );
+    try std.testing.expectError(
+        error.ConflictingFastFlags,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-fast"), @constCast("--fast") }),
+    );
 }
 
 test "additional directory flags fail closed when malformed" {

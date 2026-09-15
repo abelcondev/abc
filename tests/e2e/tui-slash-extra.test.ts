@@ -268,7 +268,10 @@ describe.skipIf(!tmuxAvailable())("tui: active session transitions", () => {
         await session.waitForComposer(10_000);
 
         await session.sendText("start an active turn");
-        await session.waitForText("Thinking", 10_000);
+        await session.waitForPane(
+          (pane) => pane.includes("Thinking") && gateway.requests.length === 1,
+          10_000,
+        );
         await session.sendText("/clear");
         await session.waitForComposer(10_000);
 
