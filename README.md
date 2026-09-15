@@ -43,6 +43,10 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+### Automatic tool review
+
+In auto mode, a valid structured safety decision remains usable when the reviewer adds commentary. If the response has no valid decision, fx retries the review once within its original 30-second deadline. A safety caution is never retried for approval. If review still fails, the action stays unexecuted and the agent can continue with other tools.
+
 ### Long conversations
 
 fx automatically compacts context at 80% of the selected model's usable input capacity. Run `/compact` to compact earlier. In saved sessions, older assistant work is summarized while original user text stays unchanged and chronological when it fits. If necessary, older user messages are summarized too, without a capacity question.

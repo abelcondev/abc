@@ -313,6 +313,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,
+        error.RequiredToolMissing => return .{ .completion = .{ .completion = .{} } },
         else => return .permanent_failure,
     };
     errdefer result.deinit(alloc);
