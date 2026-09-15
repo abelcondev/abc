@@ -1545,7 +1545,9 @@ test "processQueuedPrompt preserves local failures when the filtered provider ba
         2,
         &.{ "image_unavailable", "vision_unavailable" },
     );
-    try std.testing.expectEqual(@as(usize, 0), hooks.interactive_notices.items.len);
+    const filtered_outage_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(filtered_outage_notices);
+    try std.testing.expectEqual(@as(usize, 0), filtered_outage_notices.len);
     try expectBodyNotContains(&gateway, 2, "\"toolChoice\":{\"type\":\"required\"}");
     try std.testing.expectEqualStrings("Final filtered-outage answer", hooks.finish_assistant_text.?);
 }
@@ -1824,10 +1826,12 @@ test "processQueuedPrompt reports exact Vision outage tip and permits normal rec
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("google/gemini-2.5-flash", gateway.request_models.items[1]);
-    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    const vision_tip_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(vision_tip_notices);
+    try std.testing.expectEqual(@as(usize, 1), vision_tip_notices.len);
     try std.testing.expectEqualStrings(
         "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
-        hooks.interactive_notices.items[0].body,
+        vision_tip_notices[0].body,
     );
     try expectBodyContains(&gateway, 2, "None of the requested images were read");
     try expectBodyNotContains(&gateway, 2, image_path);
@@ -1876,7 +1880,9 @@ test "processQueuedPrompt classifies empty successful Vision provider response a
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 2), countVisionProviderCalls(&gateway));
-    try std.testing.expectEqual(@as(usize, 0), hooks.interactive_notices.items.len);
+    const rejected_prefill_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(rejected_prefill_notices);
+    try std.testing.expectEqual(@as(usize, 0), rejected_prefill_notices.len);
     try expectBodyContains(&gateway, 3, "provider_response_invalid");
     try expectBodyNotContains(&gateway, 3, "Vision is unavailable right now");
     try expectBodyNotContains(&gateway, 3, "None of the requested images were read");
@@ -2286,7 +2292,9 @@ test "processQueuedPrompt keeps one Vision permission decision across an interna
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_index);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.execution_count);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.result_count);
-    try std.testing.expectEqual(@as(usize, 0), hooks.interactive_notices.items.len);
+    const retried_evidence_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(retried_evidence_notices);
+    try std.testing.expectEqual(@as(usize, 0), retried_evidence_notices.len);
     try expectBodyContains(&gateway, 3, "retried evidence");
     try expectBodyNotContains(&gateway, 3, "provider_response_invalid");
     try expectBodyNotContains(&gateway, 3, image_path);
@@ -4697,8 +4705,11 @@ test "explicit skill loads publish one interactive summary without extra tool ca
     var job = fixture.job();
     job.prompt = @constCast("Use $requested-workflow.");
     try runFakePrompt(&gateway, &hooks, config, job);
-    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
-    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", hooks.interactive_notices.items[0].body);
+    // Explicit skill load summaries carry an empty topic; filter network records out.
+    const skill_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(skill_notices);
+    try std.testing.expectEqual(@as(usize, 1), skill_notices.len);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill requested-workflow", skill_notices[0].body);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "REQUESTED_SKILL_CONTENT");
     try expectBodyNotContains(&gateway, 0, "1 requested skill loaded");
@@ -4714,15 +4725,64 @@ test "explicit skill loads publish one interactive summary without extra tool ca
 
     hooks.enable_interactive_notices = false;
     try runFakePrompt(&gateway, &hooks, config, job);
-    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    const skill_notices_after_disabled = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(skill_notices_after_disabled);
+    try std.testing.expectEqual(@as(usize, 1), skill_notices_after_disabled.len);
     try std.testing.expectEqualStrings(gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
 
     hooks.enable_interactive_notices = true;
     try runFakePrompt(&gateway, &hooks, config, job);
-    try std.testing.expectEqual(@as(usize, 2), hooks.interactive_notices.items.len);
+    const skill_notices_final = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(skill_notices_final);
+    try std.testing.expectEqual(@as(usize, 2), skill_notices_final.len);
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+}
+
+test "processQueuedPrompt publishes a full-only network record per settled provider request" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{.{ .content = "Plain answer" }});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_interactive_notices = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    const network_records = try hooks.interactiveNoticesWithTopic(alloc, "network");
+    defer alloc.free(network_records);
+    try std.testing.expectEqual(@as(usize, 1), network_records.len);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, network_records[0].visibility);
+    try std.testing.expectEqual(types.NoticeTone.neutral, network_records[0].tone);
+    try std.testing.expect(std.mem.find(u8, network_records[0].body, "provider: gateway") != null);
+    try std.testing.expect(std.mem.find(u8, network_records[0].body, "model: ") != null);
+    try std.testing.expect(std.mem.find(u8, network_records[0].body, "finish: stop") != null);
+}
+
+test "processQueuedPrompt records provider failures in the network record" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .status = .service_unavailable, .retry_after_seconds = 4 },
+        .{ .content = "Recovered answer" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_interactive_notices = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    const network_records = try hooks.interactiveNoticesWithTopic(alloc, "network");
+    defer alloc.free(network_records);
+    try std.testing.expect(network_records.len >= 2);
+    try std.testing.expectEqual(types.NoticeTone.warning, network_records[0].tone);
+    try std.testing.expect(std.mem.find(u8, network_records[0].body, "failed: unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, network_records[0].body, "retry after: 4s") != null);
+    try std.testing.expect(std.mem.find(u8, network_records[1].body, "finish: stop") != null);
+    try std.testing.expectEqualStrings("Recovered answer", hooks.finish_assistant_text.?);
 }
 
 test "unchanged skill catalog keeps its request prefix across user turns" {

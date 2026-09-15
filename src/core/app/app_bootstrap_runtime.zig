@@ -17,6 +17,7 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_health = @import("../mcp/health.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -31,6 +32,76 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const SessionAssemblyMcpServer = struct {
+    name: []const u8,
+    connection: []const u8,
+    tools: ?usize,
+};
+
+pub const SessionAssemblyFacts = struct {
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    system_prompt_bytes: ?usize,
+    tool_names: []const []const u8,
+    skill_count: usize,
+    mcp_servers: []const SessionAssemblyMcpServer,
+};
+
+const session_tool_name_preview_max = 8;
+const session_mcp_server_preview_max = 10;
+
+/// Pure formatter for the full-only session assembly record. Facts in,
+/// bounded body text out; no I/O, no app state.
+pub fn writeSessionAssemblyBody(
+    writer: *std.Io.Writer,
+    facts: SessionAssemblyFacts,
+) !void {
+    try writer.print("provider: {s} · model: {s} · effort: {s}\n", .{
+        facts.provider,
+        facts.model,
+        facts.effort,
+    });
+    if (facts.system_prompt_bytes) |bytes| {
+        try writer.print("system prompt: ready · {d} bytes\n", .{bytes});
+    }
+    try writer.print("tools: {d} advertised", .{facts.tool_names.len});
+    if (facts.tool_names.len > 0) {
+        try writer.writeAll(" (");
+        const shown = @min(facts.tool_names.len, session_tool_name_preview_max);
+        for (facts.tool_names[0..shown], 0..) |name, index| {
+            if (index > 0) try writer.writeAll(", ");
+            try writer.writeAll(name);
+        }
+        if (facts.tool_names.len > shown) {
+            try writer.print(", +{d} more", .{facts.tool_names.len - shown});
+        }
+        try writer.writeAll(")");
+    }
+    try writer.writeByte('\n');
+    try writer.print("skills: {d} in catalog\n", .{facts.skill_count});
+    if (facts.mcp_servers.len == 0) {
+        try writer.writeAll("mcp: none");
+        return;
+    }
+    try writer.print("mcp: {d} server{s}: ", .{
+        facts.mcp_servers.len,
+        if (facts.mcp_servers.len == 1) "" else "s",
+    });
+    const shown = @min(facts.mcp_servers.len, session_mcp_server_preview_max);
+    for (facts.mcp_servers[0..shown], 0..) |server, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writer.writeAll(server.name);
+        try writer.writeAll(" (");
+        try writer.writeAll(server.connection);
+        if (server.tools) |tools| try writer.print(", {d} tools", .{tools});
+        try writer.writeAll(")");
+    }
+    if (facts.mcp_servers.len > shown) {
+        try writer.print(", +{d} more", .{facts.mcp_servers.len - shown});
+    }
+}
 
 pub const CapabilityProviders = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
@@ -180,6 +251,72 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
+        }
+
+        /// Writes one full-only record describing what this session assembled:
+        /// provider/model/effort, system prompt size, advertised tools, skill
+        /// catalog size, and MCP server states. Live-session only; resume does
+        /// not replay it, matching other full-only startup detail.
+        fn writeSessionAssemblyNotice(app: *App, provider_label: []const u8) !void {
+            var mcp_servers: std.ArrayList(SessionAssemblyMcpServer) = .empty;
+            // Names are duped: the health snapshot is released with its lease
+            // at the end of the acquire block, before the body is rendered.
+            defer {
+                for (mcp_servers.items) |server| app.alloc.free(server.name);
+                mcp_servers.deinit(app.alloc);
+            }
+            if (comptime @hasDecl(App, "acquireMcpRuntime")) {
+                if (app.acquireMcpRuntime()) |lease_value| {
+                    var lease = lease_value;
+                    defer lease.deinit();
+                    const captured_at_ms: u64 = @intCast(@max(shared_io.milliTimestamp(), 0));
+                    var snapshot: ?mcp_health.Snapshot = lease.runtime.snapshotHealth(app.alloc, captured_at_ms) catch |err| blk: {
+                        debug_trace.logf("bootstrap", "session assembly mcp snapshot failed err={s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    defer if (snapshot) |*value| value.deinit(app.alloc);
+                    if (snapshot) |*value| {
+                        for (value.servers) |server| {
+                            const name = try app.alloc.dupe(u8, server.configured_name);
+                            errdefer app.alloc.free(name);
+                            try mcp_servers.append(app.alloc, .{
+                                .name = name,
+                                .connection = @tagName(server.connection),
+                                .tools = server.counts.tools,
+                            });
+                        }
+                    }
+                }
+            }
+            const system_prompt_bytes: ?usize = if (comptime @hasDecl(App, "promptPolicy"))
+                app.promptPolicy().system_prompt.len
+            else
+                null;
+            const tool_names: []const []const u8 = if (comptime @hasDecl(App, "toolAdvertisementSet"))
+                app.toolAdvertisementSet().order
+            else
+                &.{};
+            const effort_label: []const u8 = if (comptime @hasField(App, "effort"))
+                app.effort.label()
+            else
+                "auto";
+            var body: std.Io.Writer.Allocating = .init(app.alloc);
+            defer body.deinit();
+            try writeSessionAssemblyBody(&body.writer, .{
+                .provider = provider_label,
+                .model = provider_runtime.model(app),
+                .effort = effort_label,
+                .system_prompt_bytes = system_prompt_bytes,
+                .tool_names = tool_names,
+                .skill_count = app.skills.items.len,
+                .mcp_servers = mcp_servers.items,
+            });
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = body.written(),
+                .visibility = .full_only,
+            }, true);
         }
 
         fn bootstrapWithDeps(
@@ -390,6 +527,9 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
                     try app.presentProjectMcpPrompt();
                 }
+                // Fresh sessions only: on resume the transcript must stay
+                // empty until the deferred session load replays history.
+                try writeSessionAssemblyNotice(app, startup.provider.label());
             }
             if (app.skills.diagnostics.len > 0) {
                 var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1017,13 +1157,14 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
     const events = capture.eventSlice();
-    try std.testing.expectEqual(@as(usize, 6), events.len);
+    try std.testing.expectEqual(@as(usize, 7), events.len);
     try std.testing.expectEqualStrings("load_mcp", events[0]);
     try std.testing.expectEqualStrings("load_skills", events[1]);
     try std.testing.expectEqualStrings("welcome", events[2]);
-    try std.testing.expectEqualStrings("begin_fresh", events[3]);
-    try std.testing.expectEqualStrings("enable_stores", events[4]);
-    try std.testing.expectEqualStrings("title", events[5]);
+    try std.testing.expectEqualStrings("welcome", events[3]);
+    try std.testing.expectEqualStrings("begin_fresh", events[4]);
+    try std.testing.expectEqualStrings("enable_stores", events[5]);
+    try std.testing.expectEqualStrings("title", events[6]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
     try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
@@ -1048,7 +1189,14 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.workspace_identity.enabled);
     try std.testing.expectEqualStrings("/skills", app.skills.dir);
-    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
+    try std.testing.expectEqualStrings(
+        "welcome\n" ++
+            "* session: provider: gateway · model: model-x · effort: high\n" ++
+            "tools: 0 advertised\n" ++
+            "skills: 0 in catalog\n" ++
+            "mcp: none [full-only]\n",
+        app.transcript.items,
+    );
     try std.testing.expect(app.transcript_recorded);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
     try std.testing.expect(app.begin_fresh_called);
@@ -1169,4 +1317,85 @@ test "app_bootstrap_runtime collapses config diagnostics into one neutral summar
 
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "* config: 2 configuration issues (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
+}
+
+test "writeSessionAssemblyBody renders bounded facts" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    const tool_names = [_][]const u8{ "read_file", "edit_file", "run_command" };
+    const mcp_servers = [_]SessionAssemblyMcpServer{
+        .{ .name = "linear", .connection = "ready", .tools = 12 },
+        .{ .name = "slack", .connection = "connecting", .tools = null },
+    };
+    try writeSessionAssemblyBody(&body.writer, .{
+        .provider = "gateway",
+        .model = "kimi-k3",
+        .effort = "high",
+        .system_prompt_bytes = 12345,
+        .tool_names = &tool_names,
+        .skill_count = 7,
+        .mcp_servers = &mcp_servers,
+    });
+    try std.testing.expectEqualStrings(
+        "provider: gateway · model: kimi-k3 · effort: high\n" ++
+            "system prompt: ready · 12345 bytes\n" ++
+            "tools: 3 advertised (read_file, edit_file, run_command)\n" ++
+            "skills: 7 in catalog\n" ++
+            "mcp: 2 servers: linear (ready, 12 tools), slack (connecting)",
+        body.written(),
+    );
+}
+
+test "writeSessionAssemblyBody caps long tool and server lists" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var tool_names: [12][]const u8 = undefined;
+    for (&tool_names, 0..) |*name, index| {
+        name.* = try std.fmt.allocPrint(alloc, "tool_{d}", .{index});
+    }
+    defer for (&tool_names) |*name| alloc.free(name.*);
+    try writeSessionAssemblyBody(&body.writer, .{
+        .provider = "gateway",
+        .model = "m",
+        .effort = "auto",
+        .system_prompt_bytes = null,
+        .tool_names = &tool_names,
+        .skill_count = 0,
+        .mcp_servers = &.{},
+    });
+    try std.testing.expect(std.mem.find(u8, body.written(), "system prompt") == null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "+4 more") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "mcp: none") != null);
+}
+
+test "app_bootstrap_runtime records a full-only session assembly notice" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "* session: provider:",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "model: model-x",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "skills: 0 in catalog",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "mcp: none [full-only]\n",
+    ) != null);
 }

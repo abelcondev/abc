@@ -2315,7 +2315,9 @@ test "vision OOM propagates through assembled orchestrator without a tool result
     try std.testing.expectEqual(@as(usize, 0), hooks.history_propagation_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.inner_usages.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.interactive_notices.items.len);
+    const oom_notices = try hooks.interactiveNoticesExcept(alloc, "network");
+    defer alloc.free(oom_notices);
+    try std.testing.expectEqual(@as(usize, 0), oom_notices.len);
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings(
         "anthropic/claude-opus-4.6",

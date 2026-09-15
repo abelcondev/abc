@@ -1748,6 +1748,34 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.interactive_notices.append(self.alloc, owned);
     }
 
+    /// Borrowed views of captured interactive notices that match the topic.
+    /// The slice is caller-owned; the notices stay owned by the fixture.
+    pub fn interactiveNoticesWithTopic(
+        self: *const FakeAgentRuntimeDeps,
+        alloc: Allocator,
+        topic: []const u8,
+    ) ![]types.SemanticNotice {
+        var matching: std.ArrayList(types.SemanticNotice) = .empty;
+        errdefer matching.deinit(alloc);
+        for (self.interactive_notices.items) |notice| {
+            if (std.mem.eql(u8, notice.topic, topic)) try matching.append(alloc, notice);
+        }
+        return matching.toOwnedSlice(alloc);
+    }
+
+    pub fn interactiveNoticesExcept(
+        self: *const FakeAgentRuntimeDeps,
+        alloc: Allocator,
+        excluded_topic: []const u8,
+    ) ![]types.SemanticNotice {
+        var matching: std.ArrayList(types.SemanticNotice) = .empty;
+        errdefer matching.deinit(alloc);
+        for (self.interactive_notices.items) |notice| {
+            if (!std.mem.eql(u8, notice.topic, excluded_topic)) try matching.append(alloc, notice);
+        }
+        return matching.toOwnedSlice(alloc);
+    }
+
     fn contextNotice(raw: *anyopaque, text: []const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));

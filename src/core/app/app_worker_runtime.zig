@@ -88,6 +88,53 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
+/// Writes one full-only transcript record for an admitted route recovery
+/// transition. The footer status is transient; this preserves retry and
+/// failure history in the ctrl+o full transcript.
+fn recordRouteRecoveryNotice(
+    handlers: WorkerEventHandlers,
+    status: types.RouteRecoveryStatus,
+) !void {
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    try writeRouteRecoveryBody(&body.writer, status);
+    try handlers.semantic_notice(handlers.ctx, .{
+        .topic = "recovery",
+        .tone = routeRecoveryNoticeTone(status),
+        .body = body.written(),
+        .visibility = .full_only,
+    });
+}
+
+fn routeRecoveryNoticeTone(status: types.RouteRecoveryStatus) types.NoticeTone {
+    return switch (status.tone()) {
+        .warning => .warning,
+        .success => .success,
+        .danger => .@"error",
+    };
+}
+
+/// Pure formatter for the recovery record body: footer label, then the
+/// structured facts the label cannot carry.
+pub fn writeRouteRecoveryBody(
+    writer: *std.Io.Writer,
+    status: types.RouteRecoveryStatus,
+) !void {
+    var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try writer.writeAll(status.label(&label_buf));
+    try writer.print("\nkind: {s}", .{@tagName(status.kind)});
+    if (status.cause) |cause| try writer.print(" · cause: {s}", .{@tagName(cause)});
+    if (status.attempt_limit > 0) {
+        try writer.print(" · attempt: {d}/{d}", .{ status.reportedAttempt(), status.attempt_limit });
+    }
+    if (status.delay_seconds > 0) {
+        try writer.print(" · retry delay: {d}s", .{status.delay_seconds});
+    }
+    if (status.diagnostic) |diagnostic| {
+        try writer.print(" · diagnostic: {s}", .{diagnostic.view()});
+    }
+}
+
 test "shutdown settles queued and pacer-owned finishes exactly once" {
     const session_runtime = @import("../session/session.zig");
     const session_store = @import("../session/session_store.zig");
@@ -1075,6 +1122,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
                         app.shell.render_requests.request(.footer);
+                        try recordRouteRecoveryNotice(handlers, status);
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
@@ -2756,6 +2804,127 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
+}
+
+const RouteRecoveryNoticeCapture = struct {
+    app: *FakeApp,
+    notices: std.ArrayList(CapturedNotice) = .empty,
+
+    const CapturedNotice = struct {
+        topic: []u8,
+        body: []u8,
+        tone: types.NoticeTone,
+        visibility: types.NoticeVisibility,
+    };
+
+    fn deinit(self: *RouteRecoveryNoticeCapture) void {
+        for (self.notices.items) |captured| {
+            self.app.alloc.free(captured.topic);
+            self.app.alloc.free(captured.body);
+        }
+        self.notices.deinit(self.app.alloc);
+    }
+
+    fn notice(raw: *anyopaque, semantic_notice: types.SemanticNotice) !void {
+        const self: *RouteRecoveryNoticeCapture = @ptrCast(@alignCast(raw));
+        try self.notices.append(self.app.alloc, .{
+            .topic = try self.app.alloc.dupe(u8, semantic_notice.topic),
+            .body = try self.app.alloc.dupe(u8, semantic_notice.body),
+            .tone = semantic_notice.tone,
+            .visibility = semantic_notice.visibility,
+        });
+    }
+
+    fn handlers(self: *RouteRecoveryNoticeCapture) WorkerEventHandlers {
+        var bridge = NoopBridge.handlers(self.app);
+        bridge.ctx = @ptrCast(self);
+        bridge.semantic_notice = notice;
+        return bridge;
+    }
+};
+
+test "core.app_worker_runtime records admitted route recovery as a full-only notice" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = RouteRecoveryNoticeCapture{ .app = &app };
+    defer capture.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+        .cause = .rate_limited,
+        .delay_seconds = 4,
+    } });
+    try Runtime(FakeApp).tick(&app, capture.handlers());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
+    const notice = capture.notices.items[0];
+    try std.testing.expectEqualStrings("recovery", notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
+    try std.testing.expect(std.mem.find(u8, notice.body, "retrying request") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "kind: auto_retry") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "cause: rate_limited") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "attempt: 1/3") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "retry delay: 4s") != null);
+}
+
+test "core.app_worker_runtime records recovered route status with success tone" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = RouteRecoveryNoticeCapture{ .app = &app };
+    defer capture.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 2,
+        .attempt_limit = 3,
+    } });
+    try Runtime(FakeApp).tick(&app, capture.handlers());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
+    const notice = capture.notices.items[0];
+    try std.testing.expectEqual(types.NoticeTone.success, notice.tone);
+    try std.testing.expect(std.mem.find(u8, notice.body, "recovered") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "attempt: 2/3") != null);
+}
+
+test "core.app_worker_runtime skips the recovery record for statuses dropped by cancellation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = RouteRecoveryNoticeCapture{ .app = &app };
+    defer capture.deinit();
+
+    app.worker.processing = true;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.stream.active = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+    } });
+    try Runtime(FakeApp).tick(&app, capture.handlers());
+    try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
+}
+
+test "writeRouteRecoveryBody omits absent facts" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    try writeRouteRecoveryBody(&body.writer, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 3,
+        .attempt_limit = 3,
+        .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
+    });
+
+    try std.testing.expect(std.mem.find(u8, body.written(), "kind: terminal_provider_error") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "attempt: 3/3") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "diagnostic: TestProviderSerializationFailed") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "cause:") == null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "retry delay:") == null);
 }
 
 test "core.app_worker_runtime projects API status text as sticky status row" {
