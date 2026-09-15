@@ -37,7 +37,9 @@ def main():
     home, workspace = root / "home", root / "workspace"
     (home / ".fx").mkdir(parents=True, mode=0o700)
     workspace.mkdir()
-    (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0}))
+    # Background title generation would consume one fixture response and shift
+    # the step accounting, so the fixture profile keeps titles off.
+    (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0, "session_titles": False}))
     count = 0
     request_bytes = 0
 
