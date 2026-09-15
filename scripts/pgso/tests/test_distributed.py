@@ -132,30 +132,6 @@ def scenario(name: str, timeout_seconds: float) -> Scenario:
 
 
 class WorkflowContractTests(unittest.TestCase):
-    def test_only_candidate_build_uses_the_xlarge_runner(self) -> None:
-        repo_root = pathlib.Path(__file__).resolve().parents[3]
-        workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()
-        candidate_job = workflow.split("\n  candidate:\n", 1)[1].split(
-            "\n  behavior:\n", 1
-        )[0]
-        self.assertIn("    runs-on: macos-15-xlarge\n", candidate_job)
-        self.assertEqual(1, workflow.count("    runs-on: macos-15-xlarge\n"))
-
-        for job, following in (
-            ("seed", "train"),
-            ("train", "candidate"),
-            ("behavior", "startup"),
-            ("startup", "heavy"),
-            ("heavy", "aggregate"),
-        ):
-            with self.subTest(job=job):
-                job_body = workflow.split(f"\n  {job}:\n", 1)[1].split(
-                    f"\n  {following}:\n", 1
-                )[0]
-                self.assertIn("    runs-on: macos-15\n", job_body)
-        aggregate_job = workflow.split("\n  aggregate:\n", 1)[1]
-        self.assertIn("    runs-on: macos-15\n", aggregate_job)
-
     def test_producer_uploads_scope_overwrite_to_the_run_attempt(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()

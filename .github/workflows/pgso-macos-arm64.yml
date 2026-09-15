@@ -167,7 +167,7 @@ jobs:
   candidate:
     name: Merge profiles and build candidate
     needs: [seed, train]
-    runs-on: macos-15-xlarge
+    runs-on: macos-15
     timeout-minutes: 60
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}

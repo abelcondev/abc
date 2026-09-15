@@ -12,6 +12,9 @@ from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
     FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
+    IR_OUTLINER_FLAGS,
+    OUTLINE_CLEANUP_FLAGS,
+    OUTLINE_PARTITIONS,
     PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
     ArtifactSpec,
@@ -19,6 +22,7 @@ from scripts.pgso.pipeline import (
     MacosLinkContract,
     PipelinePaths,
     apply_profile,
+    cleanup_outlined_ir_argv,
     candidate_object_argv,
     candidate_link_argv,
     candidate_runtime_probe_argv,
@@ -29,9 +33,11 @@ from scripts.pgso.pipeline import (
     instrumentation_argv,
     instrumented_run_argv,
     instrumented_link_argv,
+    link_outlined_ir_argv,
     link_candidate,
     merge_profile_batch,
     parse_compiler_runtime,
+    outline_ir_argv,
     profile_use_argv,
     reject_profile_outputs,
     validate_archive_unchanged,
@@ -39,6 +45,7 @@ from scripts.pgso.pipeline import (
     validate_candidate_metadata,
     validate_candidate_size,
     validate_profile_section_alignment,
+    split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
 )
@@ -148,6 +155,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "llvm_nm": tool_root / "llvm-nm",
+            "llvm_link": tool_root / "llvm-link",
+            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
             "apple_ld": tool_root / "ld",
             "apple_ld_version": "1167.5",
@@ -170,7 +179,7 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def write_executable(self, name: str, body: str) -> pathlib.Path:
         path = self.root / name
-        path.write_text(f"#!/usr/bin/python3\n{body}\n")
+        path.write_text(f"#!/usr/bin/env python3\n{body}\n")
         path.chmod(0o755)
         return path
 
@@ -191,10 +200,19 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=600000",
-                "-passes=default<O2>,mergefunc,iroutliner",
+                "-passes=default<O2>,mergefunc",
             ),
             USE_FLAGS,
         )
+        self.assertEqual(("-passes=iroutliner",), IR_OUTLINER_FLAGS)
+        self.assertEqual(
+            (
+                "-passes=internalize,constmerge,globaldce,mergefunc,verify",
+                "-internalize-public-api-list=main,_mh_execute_header",
+            ),
+            OUTLINE_CLEANUP_FLAGS,
+        )
+        self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
             (
                 "--disable-vp",
@@ -229,7 +247,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 f"-profile-file={self.paths.merged_profile}",
                 str(self.paths.bitcode),
                 "-o",
-                str(self.paths.profile_use_bitcode),
+                str(self.paths.profile_use_base_bitcode),
             ),
             profile_use_argv(self.toolchain, self.paths),
         )
@@ -257,6 +275,53 @@ class PgsoPipelineTests(unittest.TestCase):
                 mapped_profile,
             )[len(USE_FLAGS) + 1],
         )
+        self.assertEqual(
+            (
+                str(self.toolchain.llvm_split),
+                "-j",
+                "2",
+                "-o",
+                str(self.paths.outline_split_prefix),
+                str(self.paths.profile_use_base_bitcode),
+            ),
+            split_ir_argv(self.toolchain, self.paths),
+        )
+        for index, (split, outlined) in enumerate(
+            zip(self.paths.outline_split_bitcodes, self.paths.outlined_bitcodes)
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    (
+                        str(self.toolchain.opt),
+                        *IR_OUTLINER_FLAGS,
+                        str(split),
+                        "-o",
+                        str(outlined),
+                    ),
+                    outline_ir_argv(self.toolchain, split, outlined),
+                )
+        self.assertEqual(
+            (
+                str(self.toolchain.llvm_link),
+                *map(str, self.paths.outlined_bitcodes),
+                "-o",
+                str(self.paths.linked_outlined_bitcode),
+            ),
+            link_outlined_ir_argv(self.toolchain, self.paths),
+        )
+        self.assertEqual(
+            (
+                str(self.toolchain.opt),
+                *OUTLINE_CLEANUP_FLAGS,
+                str(self.paths.linked_outlined_bitcode),
+                "-o",
+                str(self.paths.profile_use_bitcode),
+            ),
+            cleanup_outlined_ir_argv(self.toolchain, self.paths),
+        )
+        split_command = split_ir_argv(self.toolchain, self.paths)
+        self.assertNotIn("--round-robin", split_command)
+        self.assertNotIn("--preserve-locals", split_command)
         self.assertEqual(
             (str(self.paths.instrumented_binary), "help"),
             instrumented_run_argv(self.paths, ("help",)),
@@ -604,6 +669,73 @@ output.write_bytes(b'merged profile')""",
                 self.paths,
                 "0" * 64,
             )
+
+    def test_fx_profile_use_outlines_two_name_hashed_partitions_in_sequence(self) -> None:
+        actions = self.root / "profile-actions"
+        opt = self.write_executable(
+            "profile-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+        )
+        split = self.write_executable(
+            "llvm-split",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('split ' + ' '.join(sys.argv[1:]) + '\\n')
+prefix = sys.argv[sys.argv.index('-o') + 1]
+pathlib.Path(prefix + '0').write_bytes(b'part zero')
+pathlib.Path(prefix + '1').write_bytes(b'part one')""",
+        )
+        link = self.write_executable(
+            "llvm-link",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'linked')""",
+        )
+        nm = self.write_executable(
+            "public-nm",
+            f"""import pathlib
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('nm\\n')
+print('__mh_execute_header W ---------------- 0')
+print('_main T ---------------- 0')""",
+        )
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            opt=opt,
+            llvm_split=split,
+            llvm_link=link,
+            llvm_nm=nm,
+        )
+        self.paths.bitcode.write_bytes(b"same bitcode")
+        self.paths.merged_profile.write_bytes(b"profile")
+
+        result = apply_profile(
+            toolchain,
+            self.paths,
+            sha256_file(self.paths.bitcode),
+        )
+
+        self.assertEqual(self.paths.profile_use_bitcode, result)
+        self.assertEqual(b"bitcode", result.read_bytes())
+        lines = actions.read_text().splitlines()
+        self.assertEqual(8, len(lines))
+        self.assertIn("-passes=default<O2>,mergefunc", lines[0])
+        self.assertNotIn("iroutliner", lines[0])
+        self.assertEqual("nm", lines[1])
+        self.assertTrue(lines[2].startswith("split -j 2 -o "))
+        self.assertIn("-passes=iroutliner", lines[3])
+        self.assertIn(str(self.paths.outline_split_bitcodes[0]), lines[3])
+        self.assertIn("-passes=iroutliner", lines[4])
+        self.assertIn(str(self.paths.outline_split_bitcodes[1]), lines[4])
+        self.assertTrue(lines[5].startswith("link "))
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
+        self.assertEqual("nm", lines[7])
+        self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
+        self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
 
     def test_profile_use_rejects_optimizer_warnings(self) -> None:
         opt = self.write_executable(
