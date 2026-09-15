@@ -179,7 +179,7 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def write_executable(self, name: str, body: str) -> pathlib.Path:
         path = self.root / name
-        path.write_text(f"#!/usr/bin/env python3\n{body}\n")
+        path.write_text(f"#!/usr/bin/python3\n{body}\n")
         path.chmod(0o755)
         return path
 
