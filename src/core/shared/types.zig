@@ -607,6 +607,7 @@ pub const RouteRecoveryStatus = struct {
                 .system_resumed => "Mac woke from sleep",
                 .authentication => "Authentication expired",
                 .request_limit_reached => "Provider request limit reached",
+                .compaction_prepared => "Compaction prepared",
             } else "Response failed";
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
