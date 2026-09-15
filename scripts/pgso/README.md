@@ -75,6 +75,9 @@ balanced modules. Each module is outlined sequentially before the modules are
 relinked and their original private linkage is restored. This keeps the IR
 outliner's suffix-tree memory below the standard runner limit without changing
 the training corpus, benchmark candidates, or performance measurement hardware.
+Generated IR helpers are kept in one dense linker cluster ordered by their
+hottest profiled caller so outlining does not scatter startup code across cold
+pages.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow

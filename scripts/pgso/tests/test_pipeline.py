@@ -38,6 +38,7 @@ from scripts.pgso.pipeline import (
     merge_profile_batch,
     parse_compiler_runtime,
     outline_ir_argv,
+    order_outlined_ir_helpers,
     profile_use_argv,
     reject_profile_outputs,
     validate_archive_unchanged,
@@ -66,6 +67,60 @@ class PgsoPipelineTests(unittest.TestCase):
     def test_temporal_order_preserves_symbol_names_with_spaces(self) -> None:
         ordered, _ = map_temporal_symbols("# Ordered 1 functions\nname with spaces\n", "l_name with spaces t 0 0\n")
         self.assertEqual(("l_name with spaces",), ordered)
+
+    def test_outlined_helpers_follow_profile_rank_in_one_dense_cluster(self) -> None:
+        ir = self.root / "outlined.ll"
+        ir.write_text(
+            "define private void @hot() {\n"
+            "  call void @outlined_ir_func_2()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @\"cold path\"() {\n"
+            "  call void @outlined_ir_func_1()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @outlined_ir_func_2() {\n"
+            "  call void @outlined_ir_func_0()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @outlined_ir_func_0() { ret void }\n"
+            "define internal void @outlined_ir_func_1() { ret void }\n"
+            "define internal void @outlined_ir_func_3() { ret void }\n"
+        )
+        symbols = (
+            "_hot T 10 0\n"
+            "l_cold path t 20 0\n"
+            "_outlined_ir_func_0 t 30 0\n"
+            "_outlined_ir_func_1 t 40 0\n"
+            "_outlined_ir_func_2 t 50 0\n"
+            "_outlined_ir_func_3 t 60 0\n"
+            "_ordinary t 70 0\n"
+        )
+
+        ordered, evidence = order_outlined_ir_helpers(
+            ("_hot", "l_cold path"),
+            symbols,
+            ir,
+        )
+
+        self.assertEqual(
+            (
+                "_hot",
+                "l_cold path",
+                "_outlined_ir_func_0",
+                "_outlined_ir_func_2",
+                "_outlined_ir_func_1",
+                "_outlined_ir_func_3",
+            ),
+            ordered,
+        )
+        self.assertEqual(
+            {
+                "outlined_helpers": 4,
+                "profile_ranked_outlined_helpers": 3,
+            },
+            evidence,
+        )
 
     def test_temporal_order_rejects_ambiguous_empty_or_malformed_input(self) -> None:
         for order, symbols in (

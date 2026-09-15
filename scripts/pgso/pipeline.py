@@ -522,21 +522,7 @@ def temporal_candidate_link_argv(
     )
 
 
-def map_temporal_symbols(
-    order_text: str,
-    symbol_text: str,
-) -> tuple[tuple[str, ...], dict[str, object]]:
-    count = re.findall(r"(?m)^# Ordered (\d+) functions$", order_text)
-    names = tuple(
-        line.strip() for line in order_text.splitlines()
-        if line.strip() and not line.startswith("#")
-    )
-    if (
-        len(count) != 1
-        or int(count[0]) != len(names)
-        or len(set(names)) != len(names)
-    ):
-        raise PgsoError("invalid temporal function order")
+def _candidate_text_symbols(symbol_text: str) -> dict[str, int]:
     symbols: dict[str, int] = {}
     for line in symbol_text.splitlines():
         if not line.strip():
@@ -553,6 +539,25 @@ def map_temporal_symbols(
         if name in symbols and symbols[name] != value:
             raise PgsoError(f"ambiguous candidate text symbol: {name}")
         symbols[name] = value
+    return symbols
+
+
+def map_temporal_symbols(
+    order_text: str,
+    symbol_text: str,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    count = re.findall(r"(?m)^# Ordered (\d+) functions$", order_text)
+    names = tuple(
+        line.strip() for line in order_text.splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    if (
+        len(count) != 1
+        or int(count[0]) != len(names)
+        or len(set(names)) != len(names)
+    ):
+        raise PgsoError("invalid temporal function order")
+    symbols = _candidate_text_symbols(symbol_text)
     ordered: list[str] = []
     addresses: set[int] = set()
     bindings: list[dict[str, object]] = []
@@ -586,6 +591,103 @@ def map_temporal_symbols(
         "profile_functions": len(names),
         "bindings": bindings,
         "unmapped_symbols": unmapped,
+    }
+
+
+_LLVM_FUNCTION_NAME = re.compile(
+    r'@("(?:[^"\\]|\\[0-9a-fA-F]{2})*"|[A-Za-z$._][A-Za-z$._0-9]*)\('
+)
+_OUTLINED_IR_SYMBOL = re.compile(
+    r"_outlined_ir_func_[0-9]+(?:\.[0-9]+)?"
+)
+_OUTLINED_IR_CALL = re.compile(
+    r"@(outlined_ir_func_[0-9]+(?:\.[0-9]+)?)\("
+)
+
+
+def _decode_llvm_identifier(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    raw = value[1:-1]
+    decoded = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] == "\\":
+            decoded.append(int(raw[index + 1:index + 3], 16))
+            index += 3
+        else:
+            decoded.extend(raw[index].encode())
+            index += 1
+    try:
+        return decoded.decode()
+    except UnicodeDecodeError as error:
+        raise PgsoError("invalid UTF-8 in LLVM function name") from error
+
+
+def order_outlined_ir_helpers(
+    ordered: Sequence[str],
+    symbol_text: str,
+    ir_path: pathlib.Path,
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    symbols = _candidate_text_symbols(symbol_text)
+    helpers = {
+        name for name in symbols if _OUTLINED_IR_SYMBOL.fullmatch(name)
+    }
+    calls: dict[str, list[str]] = {}
+    current: str | None = None
+    with ir_path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if line.startswith("define "):
+                match = _LLVM_FUNCTION_NAME.search(line)
+                if match is None:
+                    raise PgsoError("invalid LLVM function definition")
+                name = _decode_llvm_identifier(match.group(1))
+                candidates = tuple(
+                    value
+                    for value in ("_" + name, "l_" + name)
+                    if value in symbols
+                )
+                locations = {symbols[value] for value in candidates}
+                if len(locations) > 1:
+                    raise PgsoError(f"ambiguous candidate text symbol: {name}")
+                current = candidates[0] if candidates else None
+                continue
+            if line.rstrip("\n") == "}":
+                current = None
+                continue
+            if current is None:
+                continue
+            for name in _OUTLINED_IR_CALL.findall(line):
+                helper = "_" + name
+                if helper not in helpers:
+                    continue
+                targets = calls.setdefault(current, [])
+                if helper not in targets:
+                    targets.append(helper)
+
+    ranks: dict[str, int] = {}
+    for rank, symbol in enumerate(ordered):
+        pending = [symbol]
+        while pending:
+            for helper in calls.get(pending.pop(), ()):
+                previous = ranks.get(helper)
+                if previous is None or rank < previous:
+                    ranks[helper] = rank
+                    pending.append(helper)
+
+    result = list(ordered)
+    addresses = {symbols[name] for name in ordered}
+    for helper in sorted(
+        helpers,
+        key=lambda name: (ranks.get(name, len(ordered)), symbols[name], name),
+    ):
+        address = symbols[helper]
+        if address not in addresses:
+            result.append(helper)
+            addresses.add(address)
+    return tuple(result), {
+        "outlined_helpers": len(helpers),
+        "profile_ranked_outlined_helpers": len(ranks),
     }
 
 
@@ -1223,6 +1325,12 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     ordered, mapping = map_temporal_symbols(
         order_path.read_text(encoding="utf-8"), symbols.stdout,
     )
+    ordered, outlined_layout = order_outlined_ir_helpers(
+        ordered,
+        symbols.stdout,
+        paths.profile_use_ir,
+    )
+    mapping.update(outlined_layout)
     mapped_order = paths.logs / "candidate-order.txt"
     mapped_order.write_text(
         "".join(f"{paths.profile_use_object.name}:{name}\n" for name in ordered),
