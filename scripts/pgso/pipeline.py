@@ -1026,7 +1026,7 @@ def _defined_external_symbols(
     toolchain: Toolchain,
     bitcode: pathlib.Path,
     log_path: pathlib.Path,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, str], ...]:
     result = run_checked(
         (
             str(toolchain.llvm_nm),
@@ -1044,7 +1044,7 @@ def _defined_external_symbols(
     )
     if result.stdout_truncated:
         raise PgsoError("public symbol output exceeded the bounded capture limit")
-    symbols: list[str] = []
+    symbols: list[tuple[str, str]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
@@ -1054,8 +1054,8 @@ def _defined_external_symbols(
         )
         if match is None:
             raise PgsoError("invalid public symbol output")
-        symbols.append(match.group(1))
-    if len(symbols) != len(set(symbols)):
+        symbols.append((match.group(1), match.group(2)))
+    if len(symbols) != len({name for name, _ in symbols}):
         raise PgsoError("duplicate public symbols in profile-use bitcode")
     return tuple(sorted(symbols))
 
