@@ -201,6 +201,12 @@ class PgsoCliTests(unittest.TestCase):
         def write_profile_use_ir(_toolchain, paths, _sha):
             paths.profile_use_ir.write_text("ir\n", encoding="utf-8")
 
+        def link_candidate(_toolchain, paths):
+            (paths.logs / "candidate-layout.json").write_text(
+                json.dumps({"linker": "test"}),
+                encoding="utf-8",
+            )
+
         def capture_heavy(**kwargs):
             heavy_kwargs.append(kwargs)
             return ()
@@ -228,7 +234,7 @@ class PgsoCliTests(unittest.TestCase):
             _profile_summary=mock.Mock(return_value={}),
             build_profile_linked_benchmarks=mock.Mock(return_value=linked),
             apply_profile=mock.Mock(side_effect=write_profile_use_ir),
-            link_candidate=mock.Mock(),
+            link_candidate=mock.Mock(side_effect=link_candidate),
             relink_profile_linked_benchmarks=mock.Mock(return_value=linked),
             verify_candidate=mock.Mock(return_value=candidate),
             profile_linked_benchmark_evidence=mock.Mock(return_value={}),
