@@ -43,7 +43,15 @@ class PgsoToolchainTests(unittest.TestCase):
   env) printf '%s' {shlex.quote(zig_env)} ;;
   *) exit 2 ;;
 esac""")
-        for name in ("opt", "llc", "llvm-profdata", "llvm-ar", "llvm-nm"):
+        for name in (
+            "opt",
+            "llc",
+            "llvm-profdata",
+            "llvm-ar",
+            "llvm-nm",
+            "llvm-link",
+            "llvm-split",
+        ):
             self.write_llvm_tool(name)
         self.write_clang()
         for name in ("strip", "codesign", "otool"):
@@ -106,6 +114,14 @@ esac"""
         )
         self.assertEqual((self.llvm_bin / "llvm-ar").resolve(), toolchain.llvm_ar)
         self.assertEqual((self.llvm_bin / "llvm-nm").resolve(), toolchain.llvm_nm)
+        self.assertEqual(
+            (self.llvm_bin / "llvm-link").resolve(),
+            toolchain.llvm_link,
+        )
+        self.assertEqual(
+            (self.llvm_bin / "llvm-split").resolve(),
+            toolchain.llvm_split,
+        )
         self.assertEqual((self.llvm_bin / "clang").resolve(), toolchain.clang)
         self.assertEqual((self.system_bin / "strip").resolve(), toolchain.strip)
         self.assertEqual(
