@@ -318,9 +318,10 @@ async function startFx(
   envOverrides: Record<string, string | undefined> = {},
   cwd?: string,
   resumeId?: string,
+  launchArgs: string[] = [],
 ): Promise<TmuxSession> {
   return TmuxSession.create({
-    cmd: resumeId ? `${FX_BIN} --resume '${resumeId}'` : FX_BIN,
+    cmd: [FX_BIN, ...launchArgs, ...(resumeId ? ["--resume", `'${resumeId}'`] : [])].join(" "),
     cwd,
     env: {
       HOME: testHome,
@@ -4568,6 +4569,49 @@ tmuxTest(
       expect(body.reasoning?.effort).toBe("xhigh");
       expect(await session.capturePane()).toContain("/500k");
       expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "fx --provider grok overrides the configured provider for the launch",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-launch-provider-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "gateway", models: { grok: "grok-4.20" } }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(
+        home,
+        stderrPath,
+        gateway,
+        undefined,
+        undefined,
+        { FX_MODEL: undefined, ...grok.env },
+        undefined,
+        undefined,
+        ["--provider", "grok"],
+      );
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("PROVIDER_FLAG_PROBE");
+      await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+
+      const grokResponse = grok.requests.find((request) => request.path === "/v1/responses");
+      expect(grokResponse).toBeDefined();
+      expect(gateway.requests.filter((request) => request.path.includes("responses"))).toHaveLength(0);
+      expect(JSON.parse(grokResponse!.body ?? "{}")).toMatchObject({ model: "grok-4.20" });
+      // The flag stays launch-scoped: the configured provider is untouched.
+      expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"provider":"gateway"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();

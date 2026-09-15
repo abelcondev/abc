@@ -295,6 +295,8 @@ pub const BootstrapConfig = struct {
     auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
+    /// Interactive launch `--provider` override; null keeps the configured provider.
+    provider_override: ?model_provider.ProviderId = null,
 };
 
 pub fn loadStartupState(
@@ -323,12 +325,12 @@ pub fn loadStartupStateWithAuthMode(
     auth_mode: credentials.AuthMode,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -348,6 +350,7 @@ pub fn loadEmbeddedStartupState(
         default_agent_step_limit,
         .local,
         home_dir,
+        null,
         null,
     );
 }
@@ -382,9 +385,10 @@ pub fn loadCatalogStartupStateWithAuthMode(
     default_model: []const u8,
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override);
 }
 
 pub fn loadStartupStatus(
@@ -417,7 +421,7 @@ pub fn loadStartupStatusWithAuthMode(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const configured_selection = try configuredProviderSelection(default_model, settings);
+    const configured_selection = try configuredProviderSelection(default_model, settings, null);
     const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
@@ -471,7 +475,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -486,6 +490,7 @@ fn loadStartupStateFromOwnedWorkspace(
     auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
+    provider_override: ?model_provider.ProviderId,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -522,12 +527,21 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    const configured_selection = try configuredProviderSelection(default_model, settings);
+    // A launch --provider override must bind configured provider names against
+    // the registry just like the settings and FX_PROVIDER paths do.
+    const bound_override = if (provider_override) |override|
+        try override.bind(settings.providers orelse .{})
+    else
+        null;
+    const configured_selection = try configuredProviderSelection(default_model, settings, bound_override);
     state.provider = configured_selection.provider;
     state.configured_providers = settings.providers orelse .{};
     settings.providers = null;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
-    state.model_source = detailed.model_source orelse .compiled_default;
+    state.model_source = if (bound_override) |override|
+        detailed.sources.models.get(model_provider.NameKey.fromProvider(override))
+    else
+        detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
@@ -631,6 +645,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.default_model,
         cfg.default_agent_step_limit,
         cfg.auth_mode,
+        cfg.provider_override,
     );
     errdefer state.deinit(cfg.alloc);
 
@@ -1180,8 +1195,9 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
 fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
+    provider_override: ?model_provider.ProviderId,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = provider_override orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
@@ -1202,7 +1218,7 @@ test "startup provider chooses only its provider-scoped model" {
     defer gateway_settings.deinit(std.testing.allocator);
     try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
     try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const gateway = try configuredProviderSelection("default/model", &gateway_settings);
+    const gateway = try configuredProviderSelection("default/model", &gateway_settings, null);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
     try std.testing.expectEqualStrings("gateway/model", gateway.model);
 
@@ -1210,22 +1226,34 @@ test "startup provider chooses only its provider-scoped model" {
     defer codex_settings.deinit(std.testing.allocator);
     try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
     try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const codex = try configuredProviderSelection("default/model", &codex_settings);
+    const codex = try configuredProviderSelection("default/model", &codex_settings, null);
     try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
     try std.testing.expectEqualStrings("gpt-model", codex.model);
 
     const missing_codex = config_runtime.Settings{ .provider = .codex };
     try std.testing.expectError(
         error.CodexModelNotSelected,
-        configuredProviderSelection("default/model", &missing_codex),
+        configuredProviderSelection("default/model", &missing_codex, null),
     );
 
     var grok_settings = config_runtime.Settings{ .provider = .grok };
     defer grok_settings.deinit(std.testing.allocator);
     try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
-    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    const grok = try configuredProviderSelection("default/model", &grok_settings, null);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    // A launch --provider override selects that provider and its saved model.
+    try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
+    const overridden = try configuredProviderSelection("default/model", &gateway_settings, .grok);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
+    try std.testing.expectEqualStrings("grok-model", overridden.model);
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        configuredProviderSelection("default/model", &grok_settings, .codex),
+    );
+    const overridden_gateway = try configuredProviderSelection("default/model", &codex_settings, .gateway);
+    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

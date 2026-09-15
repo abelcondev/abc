@@ -52,6 +52,7 @@ fn BootstrapDeps(comptime App: type) type {
             bool,
             ?types.ReasoningEffort,
             ?bool,
+            ?model_provider.ProviderId,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const LoadSkillsFn = *const fn (
@@ -78,6 +79,7 @@ fn BootstrapDeps(comptime App: type) type {
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub const LaunchOverrides = struct {
+            provider: ?model_provider.ProviderId = null,
             model: ?[]const u8 = null,
             effort: ?types.ReasoningEffort = null,
             fast: ?bool = null,
@@ -143,6 +145,7 @@ pub fn Runtime(comptime App: type) type {
             fast_mode_model_bound: bool,
             effort_process_override: ?types.ReasoningEffort,
             fast_process_override: ?bool,
+            provider_process_override: ?model_provider.ProviderId,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -155,6 +158,7 @@ pub fn Runtime(comptime App: type) type {
                 fast_mode_model_bound,
                 effort_process_override,
                 fast_process_override,
+                provider_process_override,
             );
         }
 
@@ -209,6 +213,7 @@ pub fn Runtime(comptime App: type) type {
                     .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
+                .provider_override = launch_overrides.provider,
             });
             defer startup.deinit(app.alloc);
 
@@ -302,6 +307,7 @@ pub fn Runtime(comptime App: type) type {
                 startup.fast_mode_model_bound,
                 launch_overrides.effort,
                 launch_overrides.fast,
+                launch_overrides.provider,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -519,6 +525,7 @@ const TestCapture = struct {
     configured_fast_mode_model_bound: bool = false,
     effort_process_override: ?types.ReasoningEffort = null,
     fast_process_override: ?bool = null,
+    provider_process_override: ?model_provider.ProviderId = null,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -817,6 +824,7 @@ fn configureSessionPreferencesForTest(
     fast_mode_model_bound: bool,
     effort_process_override: ?types.ReasoningEffort,
     fast_process_override: ?bool,
+    provider_process_override: ?model_provider.ProviderId,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -841,6 +849,7 @@ fn configureSessionPreferencesForTest(
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
     capture.effort_process_override = effort_process_override;
     capture.fast_process_override = fast_process_override;
+    capture.provider_process_override = provider_process_override;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -933,6 +942,23 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
     // The process overrides carry the flag values so a resume re-applies them.
     try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
     try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, null), capture.provider_process_override);
+}
+
+test "app_bootstrap_runtime launch provider override marks the provider for resume" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .provider = .grok,
+    });
+
+    try std.testing.expectEqual(
+        @as(?model_provider.ProviderId, .grok),
+        capture.provider_process_override,
+    );
 }
 
 test "app_bootstrap_runtime model override drops compiled-default fast mode" {
