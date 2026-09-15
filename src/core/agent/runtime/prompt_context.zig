@@ -16,7 +16,6 @@ const compaction_target_denominator: usize = 10;
 const compaction_recent_denominator: usize = 20;
 const compaction_soft_ceiling_denominator: usize = 4;
 const compaction_source_reduction_denominator: usize = 8;
-const compaction_generation_multiplier: usize = 4;
 
 pub const CompactionTrigger = enum {
     automatic,
@@ -43,7 +42,6 @@ pub const CompactionPlan = struct {
     high_water_tokens: ?usize,
     session_target_tokens: ?usize,
     accepted_handoff_tokens: ?usize,
-    generation_tokens: ?usize,
 };
 
 pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
@@ -66,7 +64,6 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = null,
-        .generation_tokens = null,
     };
 
     const source_target = @max(
@@ -90,21 +87,14 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = null,
-        .generation_tokens = null,
     };
     const accepted = @min(total_target, request_ceiling - input.protected_tokens);
-    const requested_generation = accepted *| compaction_generation_multiplier;
-    const generation = if (input.capabilities.max_output_tokens) |limit|
-        @min(requested_generation, @as(usize, @intCast(limit)))
-    else
-        requested_generation;
     return .{
         .decision = .compact,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = accepted,
-        .generation_tokens = generation,
     };
 }
 
@@ -121,6 +111,7 @@ pub const RetainedContext = struct {
 /// Selects complete execution steps. Payloads are measured, never shortened.
 pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize, options: struct {
     provider: ?model_provider.ProviderSelection = null,
+    reject_oversized_tool_step: bool = false,
 }) RetainedContext {
     var raw_count = session_runtime.rawHistoryTurnCount(history);
     var selected = types.ContextHistoryCut{ .turns = raw_count };
@@ -180,6 +171,7 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_ca
                 cost +|= textTokens(execution.steering[next_steering].text);
                 if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
             }
+            if (!selected_any and options.reject_oversized_tool_step and cost > target) break :history_scan;
             if (input_capacity) |capacity| {
                 if (!selected_any and cost >= capacity) break :history_scan;
             }
@@ -430,14 +422,6 @@ pub fn usableInputTokens(
         if (output_tokens < context_tokens) return context_tokens - output_tokens;
     }
     return context_tokens;
-}
-
-pub fn usableInputTokensForGeneration(
-    capabilities: model_capabilities.Capabilities,
-    generation_tokens: usize,
-) ?usize {
-    const context_window = capabilities.context_window orelse return null;
-    return @as(usize, @intCast(context_window)) -| generation_tokens;
 }
 
 pub const ProviderPrompt = struct {
@@ -816,18 +800,18 @@ test "provider request image accounting handles allocation and malformed input f
     }
 }
 
-test "compactor input budget reserves the requested generation" {
+test "compactor input budget follows normal model capacity" {
     try std.testing.expectEqual(
         @as(?usize, 296_816),
-        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 203_184),
+        usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 203_184 }),
     );
     try std.testing.expectEqual(
-        @as(?usize, 0),
-        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 500_000),
+        @as(?usize, 500_000),
+        usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 500_000 }),
     );
     try std.testing.expectEqual(
         @as(?usize, null),
-        usableInputTokensForGeneration(.{}, 1),
+        usableInputTokens(.{}),
     );
 }
 
@@ -860,7 +844,6 @@ test "compaction v2 triggers automatic work at eighty percent and targets ten pe
     try std.testing.expectEqual(@as(?usize, 640), at_boundary.high_water_tokens);
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.session_target_tokens);
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), at_boundary.generation_tokens);
 
     const protected_prompt = planCompaction(.{
         .trigger = .automatic,
@@ -966,7 +949,6 @@ test "manual compaction shares the budget and stops after a smaller source" {
     });
     try std.testing.expectEqual(CompactionDecision.compact, plan.decision);
     try std.testing.expectEqual(@as(?usize, 80), plan.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), plan.generation_tokens);
 
     const empty = planCompaction(.{
         .trigger = .manual,

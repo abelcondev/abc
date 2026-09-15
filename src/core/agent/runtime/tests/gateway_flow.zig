@@ -2773,6 +2773,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     }};
     const completions = [_]FakeCompletion{
         .{ .content = "Continue from the compacted history. NEW_HISTORY_USER received NEW_HISTORY_ASSISTANT." },
+        .{ .content = "The earlier assistant work is summarized." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2787,16 +2788,19 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    // The two older messages exceed the model's normal 16k input allowance.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
-    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":");
-    try expectBodyContains(&gateway, 1, "context_handoff");
-    try expectBodyNotContains(&gateway, 1, old_marker);
-    try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
-    try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
+    for (0..2) |index| {
+        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_USER");
+        try expectBodyNotContains(&gateway, index, "NEW_HISTORY_ASSISTANT");
+        try expectBodyContains(&gateway, index, "\"maxOutputTokens\":16000");
+    }
+    try expectBodyContains(&gateway, 2, "context_handoff");
+    try expectBodyNotContains(&gateway, 2, old_marker);
+    try expectBodyContains(&gateway, 2, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 2, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 2, "\"maxOutputTokens\":16000");
 }
 
 test "processQueuedPrompt compacts with the selected working model" {
@@ -2849,7 +2853,8 @@ test "processQueuedPrompt compacts with the selected working model" {
             .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
         }};
         const completions = [_]FakeCompletion{
-            .{ .content = "Continue from the compacted conversation." },
+            .{ .content = "The earlier user request is preserved." },
+            .{ .content = "The earlier assistant work is summarized." },
             .{ .content = "Done" },
         };
         var gateway = FakeGateway.init(alloc, &completions);
@@ -2866,9 +2871,9 @@ test "processQueuedPrompt compacts with the selected working model" {
 
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[0]);
-        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[1]);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+        for (gateway.request_models.items) |model| try std.testing.expectEqualStrings(case.working_model, model);
+        try std.testing.expectEqualStrings("Done", hooks.finish_assistant_text.?);
     }
 
     const unavailable_capabilities = [_]ModelCapabilityOverride{.{
@@ -3541,7 +3546,7 @@ test "cancelled automatic compaction is retried by the next prompt" {
     try std.testing.expectEqualStrings("AUTOMATIC_COMPACTION_FOLLOW_UP_OK", hooks.finish_assistant_text.?);
 }
 
-test "retained context automatic compaction continues with the exact recent parallel exchange" {
+test "retained context automatic compaction archives oversized parallel results intact" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3585,23 +3590,25 @@ test "retained context automatic compaction continues with the exact recent para
     const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
     const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
-    try std.testing.expect(continued_tokens > context_window / 4);
-    try std.testing.expect(continued_tokens < context_window);
+    // Oversized exchanges use original backing rather than bypassing the recent budget.
+    try std.testing.expect(continued_tokens < context_window / 4);
     try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
-    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_A");
-    try expectBodyNotContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 1, "RECENT_EXACT_A");
+    try expectBodyContains(&gateway, 1, "RECENT_EXACT_B");
+    try expectBodyContains(&gateway, 1, "Original result handle:");
     try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyContains(&gateway, 2, "retained-a");
-    try expectBodyContains(&gateway, 2, "retained-b");
-    try expectBodyContains(&gateway, 2, "a" ** 13_000);
-    try expectBodyContains(&gateway, 2, "b" ** 13_000);
+    try expectBodyContains(&gateway, 2, "Original source archives:");
+    try expectBodyNotContains(&gateway, 2, "a" ** 13_000);
+    try expectBodyNotContains(&gateway, 2, "b" ** 13_000);
     try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     const completed = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
-    try std.testing.expectEqual(@as(usize, 1), completed.execution.tool_steps.len);
-    try std.testing.expectEqual(@as(usize, 2), completed.execution.tool_steps[0].tool_results.len);
-    try std.testing.expectEqualStrings(result_a, completed.execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings(result_b, completed.execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqual(@as(usize, 0), completed.execution.tool_steps.len);
+    const saved = hooks.compaction_prefixes.items[0].?.assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings(result_a, saved.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(result_b, saved.tool_steps[0].tool_results[1].output);
     for (gateway.request_models.items) |requested_model| try std.testing.expectEqualStrings(model, requested_model);
 }
 
@@ -3663,10 +3670,14 @@ test "retained context compaction preserves recovered historical replay" {
     try std.testing.expectEqualStrings(state, steps[0].provider_replay.?.parts_json);
 }
 
-test "processQueuedPrompt does not compact away its only recent exchange" {
+test "compaction summarizes an oversized only recent exchange without repeating it" {
     const alloc = std.testing.allocator;
+    const original_result = "RECENT_ONLY\n" ++ ("r" ** 10_000);
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "The user requested a read of large.txt." },
+        .{ .content = "The read completed with RECENT_ONLY." },
+        .{ .content = "The remaining output contains repeated reference bytes." },
         .{ .content = "Completed from the observed result." },
     });
     defer gateway.deinit();
@@ -3676,17 +3687,24 @@ test "processQueuedPrompt does not compact away its only recent exchange" {
     const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000 } }};
     hooks.available_capability_overrides = &capabilities;
     hooks.permission_decisions = &.{.once};
-    hooks.exec_plans = &.{.{ .result = .{ .model_output = "RECENT_ONLY\n" ++ ("r" ** 10_000) } }};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = original_result } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(model);
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 1, "r" ** 10_000);
-    try expectBodyNotContains(&gateway, 1, "context_handoff");
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    for (1..4) |index| try expectBodyContains(&gateway, index, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 4, "RECENT_ONLY");
+    try expectBodyNotContains(&gateway, 4, "r" ** 10_000);
+    try expectBodyContains(&gateway, 4, "context_handoff");
+    try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+    try std.testing.expectEqual(@as(usize, 1), hooks.compaction_prefixes.items.len);
+    const saved = hooks.compaction_prefixes.items[0].?.assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqualStrings(original_result, saved.tool_steps[0].tool_results[0].output);
 }
 
 test "automatic compaction summarizes a newest exchange larger than the input window" {
@@ -3769,9 +3787,9 @@ test "interruption after automatic compaction retains the recent and new executi
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
     const interrupted = hooks.history_turns.items[1].interrupted;
-    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.tool_steps.len);
-    try std.testing.expectEqualStrings("before-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
-    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[1].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("x" ** (10 * 1024), hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqual(@as(usize, 2), interrupted.execution.files.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
@@ -3823,8 +3841,9 @@ test "context overflow after automatic compaction retries with new execution" {
     try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings("Recovered after a second compaction.", hooks.finish_assistant_text.?);
     const finished = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
-    try std.testing.expectEqual(@as(usize, 1), finished.execution.tool_steps.len);
-    try std.testing.expectEqualStrings("after-checkpoint", finished.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(@as(usize, 0), finished.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("after-checkpoint", hooks.compaction_prefixes.items[1].?.assistant.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("later result", hooks.compaction_prefixes.items[1].?.assistant.execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqual(@as(usize, 2), finished.execution.files.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.compaction_prefixes.items.len);

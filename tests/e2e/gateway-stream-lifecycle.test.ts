@@ -5938,8 +5938,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       ordinary++;
       if (ordinary === 6) {
         expect(body).toContain("context_handoff");
-        expect(body).toContain("LARGE_REASONING_5");
-        expect(body).not.toContain("LARGE_REASONING_1");
+        expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        expect(body).not.toContain("LARGE_REASONING_");
       }
       if (ordinary <= 6) return fakeGatewaySse([
         { type: "reasoning-start", id: `reasoning-${ordinary}` },
@@ -5947,7 +5947,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         { type: "tool-call", toolCallId: `read-${ordinary}`, toolName: "read_file", input: { path: "sentinel.txt" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]);
-      if (ordinary === 7) return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      if (ordinary === 7) {
+        expect(body).toContain("LARGE_REASONING_6");
+        expect(toolResultOutput(body, "read-6")).toContain("REPLAY_RESULT_SENTINEL");
+        return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      }
       if (ordinary === 8) return fakeGatewaySse([
         { type: "reasoning-start", id: "recent-reasoning" },
         { type: "reasoning-end", id: "recent-reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "RECENT_REASONING_SIGNATURE" } } },
@@ -6337,7 +6341,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).toContain("context_handoff");
+        expect(secondCompactText).toContain("PREVIOUS_DERIVED_SUMMARY (not original user text)");
+        expect(secondCompactText).toContain("Continue the compacted session.");
+        expect(secondCompactText).not.toContain("context_handoff");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -7067,7 +7073,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("HTTP 413 after a local tool fails capacity without replaying the tool", async () => {
+  test("HTTP 413 during compaction preserves the completed local tool without replay", async () => {
     const root = createFixtureRoot("prompt-too-long-no-tool-replay");
     const tracePath = join(root.root, "trace.log");
     const sideEffectPath = join(root.workspace, "tool-side-effect.log");
@@ -7102,12 +7108,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("ContextCapacityExceeded");
+      expect(serializedError).toContain("ContextCompactionUnavailable");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(3);
+      const summaryRequest = JSON.parse(gateway.requests[2]!.body);
+      expect(summaryRequest.tools).toEqual([]);
+      expect(summaryRequest.toolChoice).toEqual({ type: "none" });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

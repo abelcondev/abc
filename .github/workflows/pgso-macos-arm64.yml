@@ -397,6 +397,12 @@ jobs:
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench" \
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench"
 
+      - name: Setup pinned Hyperfine
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          hyperfine: "true"
+
       - name: Measure immutable profile-linked benchmark pair
         run: |
           python3 -m scripts.pgso.distributed measure \
@@ -404,6 +410,7 @@ jobs:
             --name "${{ matrix.name }}" \
             --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
             --output-dir "$RUNNER_TEMP/fx-pgso-heavy-${{ matrix.name }}" \
+            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
             --samples 50
 
       - name: Upload heavy-workload evidence
