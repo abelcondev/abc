@@ -542,6 +542,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                 selector: linked.pair
                 for selector, linked in linked_benchmarks.items()
             },
+            hyperfine_binary=hyperfine,
         )
         recorder.stage(
             stage,
