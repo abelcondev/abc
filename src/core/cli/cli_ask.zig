@@ -1428,7 +1428,8 @@ fn missingCredentialResult(
     };
 }
 
-fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
+fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, initial_cfg: Config, options: RunOptions) !PromptRunResult {
+    var cfg = initial_cfg;
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
 
@@ -1451,6 +1452,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    cfg.provider_set.definitions = startup.configured_providers.definitions;
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1545,6 +1547,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
+        if (config_runtime.providerEnvOverride() != null) {
+            ctx.provider = startup.provider;
+            ctx.model = startup.selected_model;
+        }
         if (startup.model_source == .process_override) {
             ctx.model = startup.selected_model;
         } else if (ctx.requested_resume != null) {
@@ -1610,7 +1616,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     } else {
         const startup_matches_final_model = if (startup.credential) |credential|
-            model_provider.authorizesCredential(ctx.provider, credential.source)
+            startup.provider.same_authority(ctx.provider) and model_provider.authorizesCredential(ctx.provider, credential.source)
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
