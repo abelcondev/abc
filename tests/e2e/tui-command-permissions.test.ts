@@ -22,6 +22,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
+  fakeGatewaySerializedToolCall,
   fakeGatewayTitleDefault,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
@@ -2457,7 +2458,7 @@ describe("effect-aware command permissions", () => {
           finalText("Reviewer unavailable handled normally."),
         ],
         {
-          classifierResponses: [finalText("invalid")],
+          classifierResponses: [finalText("invalid"), finalText("invalid")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -2487,7 +2488,7 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(5);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
       expect(
         trace.match(/decision=unavailable fallback_reason=completion_text/g),
@@ -3262,8 +3263,77 @@ describe("effect-aware command permissions", () => {
     TIMEOUT,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "TUI review response commentary permits the exact config edit and later turns",
+    async () => {
+      const root = createIsolatedRoot();
+      const target = join(root.root, "ghostty-config");
+      const before = "macos-titlebar-style = tabs\n";
+      const after = "macos-titlebar-style = native\n";
+      writeFileSync(target, before);
+      const gateway = startFakeGateway([
+        gatewayToolCall("edit_file", { path: target, old_string: before, new_string: after }, "titlebar_edit"),
+        finalText("Native titlebar set."),
+        finalText("The next turn works."),
+      ], {
+        classifierResponses: [fakeGatewaySerializedToolCall(
+          "review", "permission_decision", '{"decision":"clear"}',
+          "This is a benign local config edit.",
+        )],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN, cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "auto" }),
+        stderrPath, width: 120, height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Change the titlebar to native.");
+      await activeSession.waitForText("Native titlebar set.", TIMEOUT);
+      expect(readFileSync(target, "utf8")).toBe(after);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1].body).not.toContain("tool_review_held");
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).toContain("Edited");
+      expect(scrollback).not.toContain("Review unavailable");
+      expect(scrollback).not.toContain(COMMAND_APPROVAL_PROMPT);
+      await activeSession.sendText("Confirm the next turn.");
+      await activeSession.waitForText("The next turn works.", TIMEOUT);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+    }, TIMEOUT,
+  );
+
   test(
-    "fx ask does not retry a malformed classifier completion and safely replans",
+    "fx ask review response recovery executes only once after malformed text",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "recovered-action.txt");
+      const gateway = startFakeGateway([
+        toolCall(`printf 'one\\n' >> ${JSON.stringify(marker)}`),
+        (body) => {
+          expect(body).not.toContain("tool_review_held");
+          return finalText("Recovered action completed.");
+        },
+      ], { classifierResponses: [finalText("This looks safe."), permissionDecision("clear")] });
+      const result = await runFx(["ask", "--json", "--quiet", "--no-save", "--auto", "Run the requested action once."], {
+        cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Recovered action completed.");
+      expect(readFileSync(marker, "utf8")).toBe("one\n");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.classifierRequests[0].body).toBe(gateway.classifierRequests[1].body);
+    }, TIMEOUT,
+  );
+
+  test(
+    "fx ask safely replans after bounded malformed classifier recovery",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-malformed-must-not-run.txt");
@@ -3279,7 +3349,7 @@ describe("effect-aware command permissions", () => {
           finalText("classifier recovery complete"),
         ],
         {
-          classifierResponses: [finalText("accept")],
+          classifierResponses: [finalText("accept"), finalText("accept")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -3299,9 +3369,9 @@ describe("effect-aware command permissions", () => {
       expect(result.code).toBe(0);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain("fallback_reason=completion_text");
@@ -3311,7 +3381,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask returns one malformed classifier completion to the agent without execution",
+    "fx ask returns persistent malformed classifier output without execution",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-must-not-exist.txt");
@@ -3322,10 +3392,11 @@ describe("effect-aware command permissions", () => {
           (body) => {
             expect(body).toContain("review_unavailable");
             expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
+            expect(body).toContain("Safety reviewer returned an invalid response; action held");
             return finalText("classifier fallback handled");
           },
         ],
-        { classifierResponses: [finalText("accept")] },
+        { classifierResponses: [finalText("accept"), finalText("accept")] },
       );
       const tracePath = join(root.root, "trace.log");
 
@@ -3345,9 +3416,9 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("classifier fallback handled");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain("fallback_reason=completion_text");
