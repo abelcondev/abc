@@ -1507,14 +1507,15 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP reports a paused recovery and continues it only on explicit metadata",
+    "ACP recovers an interrupted response autonomously within one prompt",
     async () => {
       const root = createIsolatedRoot("fx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
       const replacementText = `${partialText} ACP recovery completed.`;
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
-        ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
+        retryAfterUnavailable(0),
+        retryAfterUnavailable(0),
         finalText(replacementText),
       ]);
       try {
@@ -1524,38 +1525,27 @@ describe("acp: model-independent", () => {
         });
         await startCodeSession(client);
 
-        const paused = await runPrompt(
+        // The turn retries on its own: no pause, no explicit continuation.
+        const result = await runPrompt(
           client,
           "Preserve this ACP prompt through recovery.",
           TIMEOUT,
         );
-        expect(paused.promptResult.result.stopReason).toBe("refused");
-        expect(gateway.requests).toHaveLength(10);
-        const pausedUpdates = JSON.stringify(paused.messages);
-        expect(pausedUpdates).toContain("modelResponseRecovery");
-        expect(pausedUpdates).toContain('"state":"paused"');
-        expect(pausedUpdates).toContain('"durable":true');
-        expect(pausedUpdates).toContain(
-          "HTTP 503 · provider temporarily unavailable",
-        );
-        expect(pausedUpdates).toContain(partialText);
-
-        const resumed = await continueRecovery(client, TIMEOUT);
-        expect(resumed.promptResult.error).toBeUndefined();
-        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(11);
-        const resumedUpdates = JSON.stringify(resumed.messages);
-        expect(resumedUpdates).toContain('"state":"recovered"');
-        expect(resumedUpdates).not.toContain("provider temporarily unavailable");
-        expect(gateway.requests[10]!.body).toContain(
-          "Preserve this ACP prompt through recovery.",
-        );
-        const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
-        expectRestartedAcpResponse(paused.messages, resumed.messages, partialText, replacementText);
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        const allUpdates = JSON.stringify(result.messages);
+        expect(allUpdates).not.toContain('"state":"paused"');
+        // The partial streamed once, then the full replacement (which carries
+        // the partial as its prefix) streamed once.
         expect(occurrenceCount(allUpdates, partialText)).toBe(2);
         expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
-        expect(gateway.requests[10]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
+        // In-turn retries never inject a synthetic restart message and never
+        // parrot the partial back to the model.
+        expect(gateway.requests[3]!.body).toContain(
+          "Preserve this ACP prompt through recovery.",
+        );
+        expect(gateway.requests[3]!.body).not.toContain(partialText);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -2170,7 +2160,9 @@ describe("acp: model-independent", () => {
           path: "recovery-fixture.txt",
         }),
         partialEofResponse(partialText),
-        ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
+        // Two 503s before the simulated process death, two more inside the
+        // continued turn, then success.
+        ...Array.from({ length: 4 }, () => retryAfterUnavailable(0)),
         finalText(replacementText),
       ]);
       try {
@@ -2179,13 +2171,20 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         const sessionId = await startCodeSession(client);
-        const paused = await runPrompt(
+        // The turn recovers autonomously now, so simulate the process dying
+        // mid-recovery: fire the prompt, wait for the retry loop to reach its
+        // second backoff (four requests), then drop the connection.
+        const promptPromise = runPrompt(
           client,
           "Preserve this ACP prompt across a process restart.",
           TIMEOUT,
         );
-        expect(paused.promptResult.result.stopReason).toBe("refused");
-        expect(gateway.requests).toHaveLength(11);
+        promptPromise.catch(() => {});
+        const killDeadline = Date.now() + TIMEOUT;
+        while (gateway.requests.length < 4 && Date.now() < killDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(gateway.requests).toHaveLength(4);
 
         await client.close();
         client = await AcpClient.create({
@@ -2224,8 +2223,10 @@ describe("acp: model-independent", () => {
         const resumed = await continueRecovery(client, TIMEOUT, sessionId);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(12);
-        expect(gateway.requests[11]!.body).toContain(toolEvidence);
+        // Four requests before the kill, then the continued turn works through
+        // the remaining 503s into the scripted success.
+        expect(gateway.requests).toHaveLength(7);
+        expect(gateway.requests[6]!.body).toContain(toolEvidence);
         const restartedUpdates = JSON.stringify([
           ...loadMessages,
           ...resumed.messages,
@@ -2233,8 +2234,8 @@ describe("acp: model-independent", () => {
         expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
         expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
-        expect(gateway.requests[11]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
+        expect(gateway.requests[6]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[6]!.body)).toContain("Restart that response");
 
         await client.close();
         client = await AcpClient.create({
