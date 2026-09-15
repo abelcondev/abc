@@ -561,19 +561,64 @@ const SessionPickerCatalogCache = struct {
         source: *subagent_resume_admission.ActionableSessionCatalog,
         active_id: ?[]const u8,
     ) !void {
+        return self.installAt(source, active_id, io_mod.nanoTimestamp());
+    }
+
+    /// Same content as install but stamped stale, so the picker shows it
+    /// immediately while still scheduling a background revalidation scan.
+    fn installStale(
+        self: *SessionPickerCatalogCache,
+        source: *subagent_resume_admission.ActionableSessionCatalog,
+        active_id: ?[]const u8,
+    ) !void {
+        return self.installAt(source, active_id, 0);
+    }
+
+    fn installAt(
+        self: *SessionPickerCatalogCache,
+        source: *subagent_resume_admission.ActionableSessionCatalog,
+        active_id: ?[]const u8,
+        loaded_at_ns: i128,
+    ) !void {
         const alloc = std.heap.c_allocator;
         const owned_active_id = if (active_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (owned_active_id) |id| alloc.free(id);
         self.deinit();
         self.* = .{
             .ready = true,
-            .loaded_at_ns = io_mod.nanoTimestamp(),
+            .loaded_at_ns = loaded_at_ns,
             .active_id = owned_active_id,
             .catalog = source.*,
         };
         source.* = .{};
     }
 };
+
+/// Publishes the persisted picker catalog as a stale in-memory catalog so a
+/// cold picker open can paint immediately instead of waiting for the full
+/// session scan. Rows are unvalidated against current on-disk state; the
+/// background scan replaces them, and canonical admission re-checks any
+/// selection.
+fn installStaleDiskCatalog(
+    store: *const session_store.Store,
+    cache: *SessionPickerCatalogCache,
+    active_id: ?[]const u8,
+) !void {
+    const sessions = store.canonical_root.sessions orelse return;
+    var loaded = try session_catalog_cache.Loaded.load(std.heap.c_allocator, sessions, null);
+    defer loaded.deinit(std.heap.c_allocator);
+    // Without a persisted catalog there is nothing to paint early; keep the
+    // loading state until the background scan lands.
+    if (loaded.parsed == null) return;
+    var summaries = try loaded.cloneVisibleSummaries(std.heap.c_allocator, active_id);
+    errdefer {
+        for (summaries.items) |*summary| summary.deinit(std.heap.c_allocator);
+        summaries.deinit(std.heap.c_allocator);
+    }
+    var catalog: subagent_resume_admission.ActionableSessionCatalog = .{ .summaries = summaries };
+    session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
+    try cache.installStale(&catalog, active_id);
+}
 
 fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -2043,6 +2088,15 @@ pub fn Runtime(comptime App: type) type {
             const matching = loader.matchingInitialGeneration(active_id);
             if (matching != previous_generation) loader.cancelGeneration(previous_generation);
             const cache = &app.session_persistence.session_picker_cache;
+            if (!cache.matches(active_id)) {
+                installStaleDiskCatalog(store, cache, active_id) catch |err| {
+                    debug_trace.logf(
+                        "core",
+                        "session picker disk catalog unavailable err={s}",
+                        .{@errorName(err)},
+                    );
+                };
+            }
             var cache_visible = false;
             if (cache.matches(active_id)) {
                 try applySessionPickerCatalogPage(
@@ -9988,6 +10042,68 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     try Runtime(TestApp).pollSessionPicker(&app);
     try std.testing.expectEqual(SessionPickerScope.current_workspace, picker.scope);
     try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
+}
+
+test "session picker cold open paints the persisted catalog before revalidation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const active_id = app.session_persistence.writable.?.active_id;
+
+    const store = app.session_persistence.store.?;
+    const history = [_]session_runtime.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    for ([_][]const u8{ "old-saved", "new-saved" }, 0..) |id, index| {
+        const durable = session_codec.DurableSessionState{
+            .id = @constCast(id),
+            .origin_workspace_root = paths.workspace,
+            .workspace_root = paths.workspace,
+            .created_at_ms = 1,
+            .updated_at_ms = @intCast(index + 1),
+            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+            .history = @constCast(&history),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+            .subagent_child = false,
+        };
+        var writable = try store.startWritableSession(alloc, durable);
+        writable.deinit(alloc);
+    }
+    // Publish the on-disk picker catalog, then drop the in-memory copy so the
+    // next open is cold, as in a freshly launched process.
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var built = try subagent_resume_admission.listActionableCatalog(store, alloc, active_id, &stopped, &writer);
+    defer built.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), built.summaries.items.len);
+    app.session_persistence.session_picker_cache.deinit();
+
+    try Runtime(TestApp).openSessionPicker(&app);
+    const picker = &app.session_persistence.session_picker;
+    // The stale disk rows paint immediately, newest first, and the background
+    // revalidation scan is still scheduled because the catalog is not fresh.
+    try std.testing.expectEqual(.ready, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 2), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("new-saved", picker.summaries.items[0].id);
+    try std.testing.expect(!app.session_persistence.session_picker_cache.isFresh());
+    try std.testing.expect(app.session_persistence.session_picker_load.task != null);
 }
 
 test "session picker current mode filters workspace and all mode includes every workspace" {
