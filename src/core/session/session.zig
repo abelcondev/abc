@@ -3098,7 +3098,7 @@ pub fn appendExecutionMemoryChatMessages(
                 }
             }
             if (steering.text.len > 0) {
-                try messages.append(alloc, .{ .role = .user, .content = steering.text });
+                try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
             }
             steering_index += 1;
         }
@@ -3143,7 +3143,7 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         if (steering.text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = steering.text });
+        try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
     }
 }
 
@@ -3178,17 +3178,18 @@ fn appendHistoryChatMessagesImpl(
                 try messages.append(alloc, .{
                     .role = .user,
                     .content = text,
+                    .context_origin = .handoff,
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);

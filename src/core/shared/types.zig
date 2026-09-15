@@ -319,6 +319,7 @@ pub const ModelRecoveryCause = enum {
     system_resumed,
     authentication,
     request_limit_reached,
+    compaction_prepared,
 };
 
 pub const ModelRecoveryAction = enum {
@@ -360,6 +361,7 @@ pub const ModelFailureDiagnostic = struct {
             .system_resumed => "SystemResumed",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
+            .compaction_prepared => "CompactionPrepared",
         };
     }
 
@@ -536,6 +538,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication refreshed",
             .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Resuming saved compaction",
         };
         const action_value = self.action orelse .retrying_request;
         const action = switch (action_value) {
@@ -685,6 +688,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication expired",
             .request_limit_reached => unreachable,
+            .compaction_prepared => "Saved compaction",
         };
         return self.pausedCauseLabel(buf, name);
     }
@@ -1301,6 +1305,8 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    // Source provenance for compaction, never permission authority.
+    context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
 };
 
