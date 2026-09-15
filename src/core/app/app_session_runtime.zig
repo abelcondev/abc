@@ -3900,25 +3900,11 @@ pub fn Runtime(comptime App: type) type {
             // the compaction flow, not a turn waiting to run; it gets no recovery
             // notice and no automatic continuation.
             if (checkpoint.cause != .compaction_prepared) {
-                const recovery_notice = if (checkpoint.tool_state == .uncertain)
-                    try std.fmt.allocPrint(
-                        app.alloc,
-                        "model response recovery paused at attempt {d}/{d} and continues automatically; inspect the uncertain tool state if anything looks wrong",
-                        .{
-                            checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                            checkpoint.max_provider_attempts,
-                        },
-                    )
+                // No attempt counts: there is no budget to count against.
+                const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
+                    "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
                 else
-                    try std.fmt.allocPrint(
-                        app.alloc,
-                        "model response recovery paused at attempt {d}/{d} and continues automatically",
-                        .{
-                            checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                            checkpoint.max_provider_attempts,
-                        },
-                    );
-                defer app.alloc.free(recovery_notice);
+                    "model response recovery paused and continues automatically";
                 try sink.appendNotice(.{
                     .topic = "recovery",
                     .tone = .warning,
@@ -8169,7 +8155,8 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         app.assistant_text.items,
     );
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "attempt 2/10") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "paused and continues automatically") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "attempt") == null);
 }
 
 test "resumeRequestedSession releases the writer when the startup replay anchor fails" {
