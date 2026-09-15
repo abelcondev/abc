@@ -1570,6 +1570,78 @@ pub const WebFetchArtifactState = union(enum) {
     unavailable: anyerror,
 };
 
+const shell_id_key_raw = "\"session_id\":\"shell-";
+const shell_id_key_escaped = "\\\"session_id\\\":\\\"shell-";
+
+/// Collect every shell execution id referenced by restored history turns into
+/// `out` (deduplicated; slices borrow from the turns, so history must outlive
+/// the list). Matches both raw and JSON-escaped tool result envelopes.
+pub fn collectReferencedShellIds(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    out: *std.ArrayList([]const u8),
+) !void {
+    for (history) |turn| {
+        switch (turn) {
+            .assistant => |entry| {
+                if (entry.provider_replay) |replay|
+                    try collectShellIdsFromText(alloc, replay.parts_json, out);
+                try collectShellIdsFromExecution(alloc, entry.execution, out);
+            },
+            .interrupted => |entry| {
+                if (entry.tool_call) |call| {
+                    try collectShellIdsFromText(alloc, call.arguments_json, out);
+                    if (call.provider_result) |result|
+                        try collectShellIdsFromText(alloc, result, out);
+                }
+                try collectShellIdsFromExecution(alloc, entry.execution, out);
+            },
+            .compacted_summary => {},
+        }
+    }
+}
+
+fn collectShellIdsFromExecution(
+    alloc: Allocator,
+    execution: core_types.ExecutionMemory,
+    out: *std.ArrayList([]const u8),
+) !void {
+    for (execution.tool_steps) |step| {
+        for (step.tool_calls) |call| {
+            try collectShellIdsFromText(alloc, call.arguments_json, out);
+            if (call.provider_result) |result|
+                try collectShellIdsFromText(alloc, result, out);
+        }
+        for (step.tool_results) |result| {
+            if (result.preview) |preview|
+                try collectShellIdsFromText(alloc, preview, out);
+        }
+        if (step.provider_replay) |replay|
+            try collectShellIdsFromText(alloc, replay.parts_json, out);
+    }
+}
+
+fn collectShellIdsFromText(alloc: Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    try collectShellIdsWithKey(alloc, text, shell_id_key_raw, out);
+    try collectShellIdsWithKey(alloc, text, shell_id_key_escaped, out);
+}
+
+fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var from: usize = 0;
+    while (std.mem.find(u8, text[from..], key)) |rel| {
+        const at = from + rel;
+        from = at + key.len;
+        const id_start = at + key.len - "shell-".len;
+        var id_end = id_start + "shell-".len;
+        while (id_end < text.len and std.ascii.isDigit(text[id_end])) id_end += 1;
+        if (id_end == id_start + "shell-".len) continue;
+        const id = text[id_start..id_end];
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, id)) break;
+        } else try out.append(alloc, id);
+    }
+}
+
 pub const SessionRuntime = struct {
     agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -1587,6 +1659,10 @@ pub const SessionRuntime = struct {
     /// provenance. It is never persisted; accepted checkpoints move the model
     /// window beyond it.
     unversioned_history_len: usize = 0,
+    /// True when restored history references shell execution handles that this
+    /// process does not own. Resume seams set it once after restore, before the
+    /// first agent turn of the resumed session, so no lock is required.
+    has_stale_shell_handles: bool = false,
 
     pub fn init(
         max_history_turns: usize,
@@ -1658,6 +1734,7 @@ pub const SessionRuntime = struct {
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(ConversationLanguage.default());
+        self.has_stale_shell_handles = false;
     }
 
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
@@ -1667,6 +1744,7 @@ pub const SessionRuntime = struct {
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(language);
+        self.has_stale_shell_handles = false;
 
         for (history) |turn| {
             try self.appendHistoryEntry(alloc, turn);
@@ -4762,6 +4840,108 @@ test "SessionRuntime.restore replaces history, updates language, and preserves e
     try std.testing.expectEqualStrings("reply three", runtime.agent.history.items[2].assistant.assistant);
     try std.testing.expect(runtime.agent.history.items[0].assistant.user.text.ptr != restore_history[0].assistant.user.text.ptr);
     try std.testing.expect(runtime.agent.history.items[2].assistant.assistant.ptr != restore_history[2].assistant.assistant.ptr);
+}
+
+test "collectReferencedShellIds extracts raw and escaped envelopes from restored history" {
+    const alloc = std.testing.allocator;
+
+    var replay_turn = try makeAssistantTurn(alloc, "restart the server", "starting it");
+    replay_turn.assistant.provider_replay = .{
+        .source = .{ .provider = .gateway, .model = try alloc.dupe(u8, "test") },
+        .parts_json = try alloc.dupe(
+            u8,
+            "[{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":\\\"shell-3\\\",\\\"state\\\":\\\"running\\\"}\"}," ++
+                "{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":\\\"shell-3\\\"}\"}," ++
+                "{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":null}\"}]",
+        ),
+    };
+    const tool_turn: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = try alloc.dupe(u8, "stop it") },
+        .tool_call = .{
+            .id = try alloc.dupe(u8, "call-1"),
+            .name = try alloc.dupe(u8, "shell"),
+            .arguments_json = try alloc.dupe(u8, "{\"action\":\"stop\",\"session_id\":\"shell-7\"}"),
+        },
+    } };
+    const summary_turn: HistoryTurn = .{ .compacted_summary = .{
+        .summary = try alloc.dupe(u8, "prose mentioning shell-9 without an envelope"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    const history = [_]HistoryTurn{ replay_turn, tool_turn, summary_turn };
+    defer {
+        for (history) |turn| freeHistoryTurn(alloc, turn);
+    }
+
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+    try std.testing.expectEqualStrings("shell-3", ids.items[0]);
+    try std.testing.expectEqualStrings("shell-7", ids.items[1]);
+}
+
+test "collectReferencedShellIds scans persisted tool step previews" {
+    const alloc = std.testing.allocator;
+    var turn = try makeAssistantTurn(alloc, "check the watcher", "still running");
+    defer freeHistoryTurn(alloc, turn);
+
+    const envelope = "{\"session_id\":\"shell-4\",\"state\":\"running\"}";
+    const results = try alloc.alloc(core_types.PersistedToolResult, 1);
+    results[0] = .{
+        .tool_call_id = try alloc.dupe(u8, "call-1"),
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .status = .success,
+        .output = try alloc.dupe(u8, envelope),
+        .output_bytes = envelope.len,
+        .stored_output_bytes = envelope.len,
+        .preview = try alloc.dupe(u8, envelope),
+    };
+    const steps = try alloc.alloc(core_types.ToolExecutionStep, 1);
+    steps[0] = .{ .tool_results = results };
+    turn.assistant.execution = .{ .tool_steps = steps };
+
+    const history = [_]HistoryTurn{turn};
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqualStrings("shell-4", ids.items[0]);
+}
+
+test "collectReferencedShellIds yields nothing for shell-free history" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{try makeAssistantTurn(alloc, "hello", "hi")};
+    defer {
+        for (history) |turn| freeHistoryTurn(alloc, turn);
+    }
+
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 0), ids.items.len);
+}
+
+test "SessionRuntime restore and reset clear stale shell handle state" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    runtime.has_stale_shell_handles = true;
+
+    const restore_history = [_]HistoryTurn{try makeAssistantTurn(alloc, "one", "reply one")};
+    defer {
+        for (restore_history) |turn| freeHistoryTurn(alloc, turn);
+    }
+    try runtime.restore(alloc, ConversationLanguage.literal("en"), &restore_history);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    runtime.has_stale_shell_handles = true;
+    runtime.reset(alloc);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
 }
 
 test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
