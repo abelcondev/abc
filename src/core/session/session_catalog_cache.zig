@@ -833,7 +833,7 @@ test "catalog fingerprint binds authority fence display sidecar and missing even
         defer std.testing.allocator.free(path);
         const absent = (try fingerprint(tmp.dir, "session")).?;
         var file = try tmp.dir.createFile(std.testing.io, path, .{});
-        file.writeStreamingAll(std.testing.io, "{}\n") catch unreachable;
+        try file.writeStreamingAll(std.testing.io, "{}\n");
         file.close(std.testing.io);
         const present = (try fingerprint(tmp.dir, "session")).?;
         try std.testing.expect(!std.mem.eql(u8, &absent, &present));
