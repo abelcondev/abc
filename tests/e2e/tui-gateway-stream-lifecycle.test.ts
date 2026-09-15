@@ -2580,8 +2580,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(root!, "workspace", "after.txt"), "after\n");
 
       await session!.sendText("Read both fixture files across recovery.");
+      // Exact-equality polling races the burst at the end of the retry chain
+      // (requests 11-13 can land inside one poll interval), so wait for the
+      // chain to pass the tenth failure instead.
       await waitForCondition(
-        () => queuedGateway.requests.length === 11,
+        () => queuedGateway.requests.length >= 11,
         "autonomous retries after the confirmed tool",
       );
       await session!.waitForText(finalText, TIMEOUT);
