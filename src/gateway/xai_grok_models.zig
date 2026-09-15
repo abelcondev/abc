@@ -333,6 +333,9 @@ fn parseCatalog(
             .has_tool_use = true,
             .has_reasoning = supports_reasoning,
             .reasoning_efforts = reasoning_efforts,
+            // xAI accepts service_tier "priority" endpoint-wide on the
+            // subscription proxy, so every catalog model offers Fast mode.
+            .supports_fast_mode = true,
             .has_vision = has_vision,
             .has_file_input = has_vision,
             .has_implicit_caching = true,
@@ -461,6 +464,7 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expectEqualStrings("medium", first.reasoning_efforts.items[1].label());
     try std.testing.expect(first.has_vision);
     try std.testing.expect(first.has_file_input);
+    try std.testing.expect(first.supports_fast_mode);
 
     const second = catalog.items[1];
     try std.testing.expectEqualStrings("current-b", second.id);

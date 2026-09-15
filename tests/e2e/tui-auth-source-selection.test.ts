@@ -1421,6 +1421,55 @@ for (const gatewayState of ["absent", "rejected"] as const) {
   }, 60_000);
 }
 
+tmuxTest("grok fast mode sends the priority service tier", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-fast-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([], { models: () => [] });
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      provider: "grok", models: { grok: "grok-4.6" },
+    }), { mode: 0o600 });
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+      ...grok.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Use the default tier.");
+    await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+    const standardRequest = grok.requests.find(
+      (request) => request.path === "/v1/responses" && request.body?.includes("Use the default tier."),
+    );
+    expect(JSON.parse(standardRequest?.body ?? "{}").service_tier).toBeUndefined();
+    // Wait for the model catalog to be ready before toggling fast mode.
+    await session.sendLiteralText("/model");
+    await session.sendKeys("Tab");
+    await session.waitForPane(
+      (pane) => pane.includes("grok-4.6") && pane.includes("grok-4.20"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-c");
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/fast");
+    await session.waitForText("fast: on", TIMEOUT);
+    await session.sendText("Use the priority tier.");
+    await session.waitForPane(
+      (pane) => pane.split("GROK_DIRECT_RESPONSE").length - 1 >= 2,
+      TIMEOUT,
+    );
+    const directRequest = grok.requests.find(
+      (request) => request.path === "/v1/responses" && request.body?.includes("Use the priority tier."),
+    );
+    expect(directRequest).toBeDefined();
+    expect(JSON.parse(directRequest?.body ?? "{}").service_tier).toBe("priority");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    grok.stop();
+  }
+}, 60_000);
+
 for (const otherProvider of ["codex", "grok"] as const) {
   tmuxTest(`default logout preserves ${otherProvider} when active fx login becomes unreadable`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-logout-active-unreadable-"));
@@ -4504,7 +4553,7 @@ tmuxTest(
         if (Date.now() >= catalogDeadline) throw new Error("Grok catalog did not load");
         await Bun.sleep(25);
       }
-      await session.sendText("/model grok-4.6 xhigh");
+      await session.sendText("/model grok-4.6 xhigh normal");
       await session.waitForText("Switched to grok-4.6", TIMEOUT);
       await session.sendText("Use the selected effort.");
       await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
