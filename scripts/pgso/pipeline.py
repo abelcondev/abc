@@ -27,15 +27,15 @@ GENERATION_FLAGS = (
     "-passes=default<O2>",
 )
 
-# The IR outliner holds a suffix tree over the whole fx module and peaked at
-# 7.4 GiB, above the 7 GB macOS arm64 runner; without it the same profile-use
-# pass peaks at 1.4 GiB and the linked candidate still meets the size gate.
+# The IR outliner holds a suffix tree over the whole fx module and peaks above
+# the standard macOS arm64 runner's memory. The candidate coordinator runs on
+# the 14 GB xlarge runner; measurement stays on standard runners.
 USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=600000",
-    "-passes=default<O2>,mergefunc",
+    "-passes=default<O2>,mergefunc,iroutliner",
 )
 
 BENCHMARK_USE_FLAGS = (

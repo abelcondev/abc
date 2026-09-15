@@ -69,6 +69,12 @@ non-overlapping candidate assignments. The six startup and six heavy-workload
 comparisons run on twelve fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
+The candidate coordinator uses the 14 GB arm64 macOS xlarge runner so LLVM can
+run whole-module IR outlining without exceeding memory. Seed creation,
+training, behavior verification, and every performance comparison remain on
+standard `macos-15` runners; the larger build machine therefore does not become
+the performance measurement environment.
+
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow
 phase interfaces: `train-shard`, `candidate`, `behavior-shard`, `measure`, and
