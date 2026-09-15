@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
 
@@ -826,9 +827,11 @@ const ConnectedRequestWatch = struct {
 
     phase: std.atomic.Value(Phase) = .init(.sending),
     response_head_deadline: std.Io.Clock.Timestamp = undefined,
-    /// Last byte progress in the streaming phase (awake clock, ns). Written by
-    /// the consume loop, read by the watcher thread.
-    last_progress_ns: std.atomic.Value(i128) = .init(0),
+    /// Last byte progress in the streaming phase (awake clock, ms). Written by
+    /// the consume loop, read by the watcher thread. wasm32-safe via the
+    /// project's portable atomic wrapper (wide atomics do not exist there);
+    /// millisecond precision is ample for second-scale stall thresholds.
+    last_progress_ms: atomic_value.Value(i64) = .init(0),
     /// Set once when a patient head-wait passes the configured threshold; the
     /// wait itself continues until data, a dead socket, cancel, or resume.
     head_wait_exceeded: std.atomic.Value(bool) = .init(false),
@@ -919,10 +922,7 @@ const ConnectedRequestWatch = struct {
     }
 
     fn markStreamProgress(self: *ConnectedRequestWatch) void {
-        self.last_progress_ns.store(
-            std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.toNanoseconds(),
-            .seq_cst,
-        );
+        self.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
     }
 
     /// Positive-evidence stall: the head arrived, then the stream went silent
@@ -933,9 +933,9 @@ const ConnectedRequestWatch = struct {
         now: std.Io.Clock.Timestamp,
     ) bool {
         if (self.phase.load(.seq_cst) != .streaming) return false;
-        const last = self.last_progress_ns.load(.seq_cst);
+        const last = self.last_progress_ms.load(.seq_cst);
         if (last == 0) return false;
-        const elapsed = now.raw.toNanoseconds() - last;
+        const elapsed = now.raw.toNanoseconds() - last * std.time.ns_per_ms;
         return elapsed >= @as(i128, self.timing.stall_timeout_ms) * std.time.ns_per_ms;
     }
 
