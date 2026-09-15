@@ -4542,6 +4542,15 @@ fn auto_retry_status(
     };
 }
 
+/// The status row must not change shape between the wait and the in-flight
+/// beat: when the countdown segment vanished, right-aligned footer content
+/// shifted with it. Mirror exactly what the wait row displayed (the segment
+/// appears only when the wait rendered one); the next failure or the
+/// recovered status replaces it.
+fn inFlightDelaySeconds(delay_ns: u64) u64 {
+    return delay_ns / std.time.ns_per_s;
+}
+
 fn pushAutoRetryStatus(
     deps: *const AgentRuntimeDeps,
     failed_attempt: usize,
@@ -7609,7 +7618,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         failure_cause,
                         recovery_decision.strategy,
-                        0,
+                        inFlightDelaySeconds(recovery_decision.delay_ns),
                         null,
                         failure_diagnostic,
                     );
@@ -8096,7 +8105,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );
@@ -8474,7 +8483,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );

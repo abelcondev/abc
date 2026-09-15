@@ -2328,16 +2328,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 2,
         "silent-head retry request",
       );
-      // While the retry is in flight the status keeps the retry wording but no
-      // longer carries an attempt counter.
+      // While the retry is in flight the countdown segment stays visible
+      // (frozen at the elapsed wait) instead of vanishing; a disappearing
+      // segment dragged right-aligned footer content around.
       await session.waitForPane(
-        (pane) =>
-          pane.includes("retrying request") && !pane.includes("retrying request in"),
+        (pane) => pane.includes("retrying request in 4s"),
         TIMEOUT,
       );
 
       const inFlightPane = await session.capturePane();
-      expect(inFlightPane).toContain("retrying request");
+      expect(inFlightPane).toContain("retrying request in 4s");
       expect(inFlightPane).not.toContain("attempt 2/10");
       expect(inFlightPane).not.toContain("retrying request in 1s");
 
