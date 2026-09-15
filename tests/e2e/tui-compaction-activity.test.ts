@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -119,7 +119,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       return JSON.parse(stdout);
     } finally { clearTimeout(timer); }
   }
-  async function launch(withoutCredential = false) {
+  async function launch(withoutCredential = false, withTraceLog = true) {
     const tape = join(root, `terminal-${++launchIndex}.fxtape`);
     const stderr = join(root, `terminal-${launchIndex}.stderr`);
     tapes.push(tape);
@@ -129,6 +129,10 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       FX_TRACE_SCOPES: "input,worker,session,scroll,agent,gateway,compaction",
     };
     if (withoutCredential) delete terminalEnv.AI_GATEWAY_API_KEY;
+    if (!withTraceLog) {
+      delete terminalEnv.FX_TRACE_LOG;
+      delete terminalEnv.FX_TRACE_SCOPES;
+    }
     // Do not inherit provider overrides, credentials, shell startup or dotenv state.
     const command = `/usr/bin/env -i ${Object.entries(terminalEnv).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
     terminal = await TmuxSession.create({
@@ -487,6 +491,48 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       } finally { await f.cleanup(passed); }
     }, 60_000);
   }
+
+  test("manual failure then success: /trace records compaction decisions and failures without FX_TRACE", async () => {
+    const f = await fixture("manual", "provider-error");
+    let passed = false;
+    try {
+      const terminal = await f.launch(false, false);
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Compaction failed. Try /compact again.", 15_000);
+      expect(f.durable()).toBe(0);
+      f.phase("followup");
+      await terminal.sendText("/compact");
+      await until(() => f.durable() === 1, "checkpoint after recovery compact");
+      await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+
+      const before = new Set(readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md")));
+      let report = "";
+      await terminal.sendText("/trace");
+      await until(() => {
+        const fresh = readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md") && !before.has(name));
+        if (fresh.length === 0) return false;
+        const content = readFileSync(join(f.root, fresh[fresh.length - 1]), "utf8");
+        if (!content.includes("## Transcript Timeline")) return false;
+        report = content;
+        return true;
+      }, "trace report", 15_000);
+
+      // No FX_TRACE_LOG was configured, so the opt-in trace tail is absent while
+      // the always-on compaction section still carries the full story.
+      expect(report).not.toContain("## Trace Tail");
+      expect(report).toContain("## Context Compaction\n");
+      expect(report).toMatch(/last=\d+ failed=[1-9]\d* \(always recorded; does not require FX_TRACE\)/);
+      expect(report).toContain("event=summary_transport_failed");
+      expect(report).toContain("event=transaction_failed");
+      expect(report).toContain("event=provider_start");
+      expect(report).toContain("event=provider_completed");
+      expect(report).toContain("event=committed");
+      const problems = report.split("## Problems")[1]?.split("##")[0] ?? "";
+      expect(problems).toContain("- context compaction");
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
 
   test("missing credentials keep compaction feedback local without hiding ordinary auth errors", async () => {
     const f = await fixture("manual");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const result_store = @import("../../session/result_store.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -133,10 +134,9 @@ pub fn compact(
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
         var stage: []const u8 = "plan";
-        errdefer |err| debug_trace.eventf(
-            "context_compaction",
-            "failed",
+        errdefer |err| diagnostics.traceCompactionFailure(
             request.trace_ctx,
+            "failed",
             "stage={s} capacity_attempt={d} model={s} err={s}",
             .{ stage, capacity_attempt, request.model, @errorName(err) },
         );
@@ -145,7 +145,7 @@ pub fn compact(
             try compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens, summary_reserve_tokens)
         else
             null;
-        if (policy) |prepared| debug_trace.eventf("context_compaction", "policy_selected", request.trace_ctx, "retained_users={d} summarized_users={d} fixed_tokens={d} source_messages={d}", .{ prepared.users.len, prepared.summarized_users, prepared.fixed_tokens, prepared.messages.len });
+        if (policy) |prepared| diagnostics.traceCompactionEvent(request.trace_ctx, "policy_selected", "retained_users={d} summarized_users={d} fixed_tokens={d} source_messages={d}", .{ prepared.users.len, prepared.summarized_users, prepared.fixed_tokens, prepared.messages.len });
 
         const semantic_messages = if (policy) |prepared| prepared.messages else try compaction_state.projectSemanticMessages(scratch, compactable);
         defer if (policy == null and semantic_messages.len > 0) scratch.free(semantic_messages);
@@ -178,10 +178,9 @@ pub fn compact(
         }
 
         if (ranges.len > 0) {
-            debug_trace.eventf(
-                "context_compaction",
-                "provider_start",
+            diagnostics.traceCompactionEvent(
                 request.trace_ctx,
+                "provider_start",
                 "model={s} source_messages={d} chunks={d} fixed_handoff_tokens={d} summary_budget_tokens={d}",
                 .{
                     request.model,
@@ -192,10 +191,9 @@ pub fn compact(
                 },
             );
         } else {
-            debug_trace.eventf(
-                "context_compaction",
-                "summary_skipped",
+            diagnostics.traceCompactionEvent(
                 request.trace_ctx,
+                "summary_skipped",
                 "reason=no_semantic_source source_messages={d} compactable_messages={d} fixed_handoff_tokens={d}",
                 .{ source_messages.len, compactable.len, fixed_handoff_tokens },
             );
@@ -229,7 +227,7 @@ pub fn compact(
                 if (policy) |prepared| {
                     const reserve = prepared.summary_reserve(handoff);
                     if (prepared.users.len > 0 and reserve < request.accepted_tokens) {
-                        debug_trace.eventf("context_compaction", "user_capacity_retry", request.trace_ctx, "retained_users={d} summary_reserve_tokens={d}", .{ prepared.users.len, reserve });
+                        diagnostics.traceCompactionEvent(request.trace_ctx, "user_capacity_retry", "retained_users={d} summary_reserve_tokens={d}", .{ prepared.users.len, reserve });
                         summary_reserve_tokens = reserve;
                         alloc.free(handoff);
                         continue;
@@ -239,10 +237,9 @@ pub fn compact(
             return @as(@TypeOf(err)!Result, err);
         };
         if (ranges.len > 0) {
-            debug_trace.eventf(
-                "context_compaction",
-                "provider_completed",
+            diagnostics.traceCompactionEvent(
                 request.trace_ctx,
+                "provider_completed",
                 "model={s} chunks={d} handoff_bytes={d} input_tokens={d} output_tokens={d}",
                 .{
                     request.model,
@@ -393,7 +390,7 @@ fn runSummaryCall(
     var usage: types.ToolUsage = .{};
     for (0..2) |attempt| {
         if (request.cancel_flag.load(.seq_cst)) {
-            debug_trace.eventf("context_compaction", "summary_cancelled", request.trace_ctx, "phase=pre_stream attempt={d}", .{attempt});
+            diagnostics.traceCompactionEvent(request.trace_ctx, "summary_cancelled", "phase=pre_stream attempt={d}", .{attempt});
             return error.Cancelled;
         }
         var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
@@ -430,15 +427,14 @@ fn runSummaryCall(
         );
         defer streamed.deinit(alloc);
         if (request.cancel_flag.load(.seq_cst)) {
-            debug_trace.eventf("context_compaction", "summary_cancelled", request.trace_ctx, "phase=post_stream attempt={d}", .{attempt});
+            diagnostics.traceCompactionEvent(request.trace_ctx, "summary_cancelled", "phase=post_stream attempt={d}", .{attempt});
             return error.Cancelled;
         }
         const completion = switch (streamed) {
             .failed => |failure| {
-                debug_trace.eventf(
-                    "context_compaction",
-                    "summary_transport_failed",
+                diagnostics.traceCompactionFailure(
                     request.trace_ctx,
+                    "summary_transport_failed",
                     "model={s} attempt={d} kind={s} detail={s}",
                     .{ request.model, attempt, @tagName(failure.kind), debug_trace.preview(failure.detail orelse "", 240) },
                 );
@@ -451,10 +447,9 @@ fn runSummaryCall(
             .output_tokens = completion.usage.output_tokens orelse 0,
         });
         if (completion.finish_reason != .stop) {
-            debug_trace.eventf(
-                "context_compaction",
-                "summary_incomplete",
+            diagnostics.traceCompactionFailure(
                 request.trace_ctx,
+                "summary_incomplete",
                 "model={s} attempt={d} finish_reason={s} content_bytes={d}",
                 .{ request.model, attempt, if (completion.finish_reason) |reason| @tagName(reason) else "missing", capture.text.items.len },
             );
@@ -465,20 +460,18 @@ fn runSummaryCall(
             if (completion.content) |content| try capture.append(content);
         }
         if (capture.saw_tool_call or completion.tool_calls.len > 0) {
-            debug_trace.eventf(
-                "context_compaction",
-                "summary_tool_call_rejected",
+            diagnostics.traceCompactionFailure(
                 request.trace_ctx,
+                "summary_tool_call_rejected",
                 "model={s} attempt={d} streamed_tool_call={} tool_calls={d}",
                 .{ request.model, attempt, capture.saw_tool_call, completion.tool_calls.len },
             );
             return error.CompactionToolCallRejected;
         }
         if (capture.observed_bytes > capture.text.items.len) {
-            debug_trace.eventf(
-                "context_compaction",
-                "summary_truncated",
+            diagnostics.traceCompactionFailure(
                 request.trace_ctx,
+                "summary_truncated",
                 "model={s} attempt={d} observed_bytes={d} captured_bytes={d} limit_bytes={d}",
                 .{ request.model, attempt, capture.observed_bytes, capture.text.items.len, max_bytes },
             );
@@ -486,22 +479,21 @@ fn runSummaryCall(
         }
         const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
         if (!std.unicode.utf8ValidateSlice(trimmed)) {
-            debug_trace.eventf(
-                "context_compaction",
-                "summary_invalid_utf8",
+            diagnostics.traceCompactionFailure(
                 request.trace_ctx,
+                "summary_invalid_utf8",
                 "model={s} attempt={d} captured_bytes={d}",
                 .{ request.model, attempt, trimmed.len },
             );
             return error.InvalidCompactionHandoff;
         }
         if (trimmed.len == 0) {
-            if (attempt == 0) debug_trace.eventf("context_compaction", "empty_summary_retry", request.trace_ctx, "attempt=2 model={s}", .{request.model});
+            if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, "empty_summary_retry", "attempt=2 model={s}", .{request.model});
             continue;
         }
         return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
     }
-    debug_trace.eventf("context_compaction", "summary_empty_exhausted", request.trace_ctx, "model={s}", .{request.model});
+    diagnostics.traceCompactionFailure(request.trace_ctx, "summary_empty_exhausted", "model={s}", .{request.model});
     return error.InvalidCompactionHandoff;
 }
 

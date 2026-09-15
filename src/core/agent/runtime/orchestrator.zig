@@ -13,6 +13,7 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -3919,7 +3920,7 @@ fn persist_compaction_source(
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = false,
     });
-    debug_trace.eventf("context_compaction", "source_checkpointed", trace_ctx, "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
+    diagnostics.traceCompactionEvent(trace_ctx, "source_checkpointed", "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
@@ -5758,7 +5759,7 @@ pub const RetainedCompactionWindow = struct {
         });
         if (plan.accepted_handoff_tokens != null) return false;
         target.* = if (self.retained_tokens <= self.newest_exchange_tokens) 0 else target.* / 2;
-        debug_trace.logf("context_compaction", "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
+        diagnostics.traceCompactionLog(false, "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
         return true;
     }
 };
@@ -5990,10 +5991,9 @@ pub fn compactContextTransaction(
     var stage: compaction_activity.Stage = .preparation;
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
-        debug_trace.eventf(
-            "context_compaction",
-            "transaction_failed",
+        diagnostics.traceCompactionFailure(
             request.trace_ctx,
+            "transaction_failed",
             "stage={s} trigger={s} err={s}",
             .{ @tagName(stage), @tagName(request.trigger), @errorName(err) },
         );
@@ -6012,10 +6012,9 @@ pub fn compactContextTransaction(
     };
     const initial_plan = runtime_prompt_context.planCompaction(plan_input);
     if (initial_plan.decision == .no_op) {
-        debug_trace.eventf(
-            "context_compaction",
-            "skipped_no_op",
+        diagnostics.traceCompactionEvent(
             request.trace_ctx,
+            "skipped_no_op",
             "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6032,10 +6031,9 @@ pub fn compactContextTransaction(
     plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
     const plan = runtime_prompt_context.planCompaction(plan_input);
     const accepted_tokens = plan.accepted_handoff_tokens orelse {
-        debug_trace.eventf(
-            "context_compaction",
-            "capacity_exceeded_at_plan",
+        diagnostics.traceCompactionFailure(
             request.trace_ctx,
+            "capacity_exceeded_at_plan",
             "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6051,10 +6049,9 @@ pub fn compactContextTransaction(
         return error.ContextCapacityExceeded;
     };
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
-        debug_trace.eventf(
-            "context_compaction",
-            "credential_unauthorized",
+        diagnostics.traceCompactionFailure(
             request.trace_ctx,
+            "credential_unauthorized",
             "trigger={s} provider={s} credential_source={s}",
             .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
         );
@@ -6107,10 +6104,9 @@ pub fn compactContextTransaction(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
-        debug_trace.eventf(
-            "context_compaction",
-            "candidate_over_capacity",
+        diagnostics.traceCompactionEvent(
             request.trace_ctx,
+            "candidate_over_capacity",
             "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
             .{
                 @tagName(request.trigger),
@@ -6130,10 +6126,9 @@ pub fn compactContextTransaction(
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
     }, request.active_prefix, request.retained_from);
-    debug_trace.eventf(
-        "context_compaction",
-        "committed",
+    diagnostics.traceCompactionEvent(
         request.trace_ctx,
+        "committed",
         "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
         .{
             @tagName(request.trigger),
@@ -7120,10 +7115,9 @@ fn processQueuedPromptLoop(
                     else
                         0,
                 });
-                debug_trace.eventf(
-                    "context_compaction",
-                    "decision",
+                diagnostics.traceCompactionEvent(
                     step_ctx,
+                    "decision",
                     "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
@@ -7142,12 +7136,12 @@ fn processQueuedPromptLoop(
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
-                        debug_trace.eventf("context_compaction", "overflow_without_compaction", step_ctx, "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
+                        diagnostics.traceCompactionFailure(step_ctx, "overflow_without_compaction", "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
-                                debug_trace.eventf("context_compaction", "no_compactable_context", step_ctx, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
+                                diagnostics.traceCompactionFailure(step_ctx, "no_compactable_context", "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -7178,10 +7172,10 @@ fn processQueuedPromptLoop(
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
                                     if (retention_target == 0) {
-                                        debug_trace.eventf("context_compaction", "retention_exhausted", step_ctx, "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        diagnostics.traceCompactionFailure(step_ctx, "retention_exhausted", "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
                                         return error.ContextCapacityExceeded;
                                     }
-                                    debug_trace.eventf("context_compaction", "retention_forced_zero", step_ctx, "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
+                                    diagnostics.traceCompactionFailure(step_ctx, "retention_forced_zero", "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -7310,10 +7304,9 @@ fn processQueuedPromptLoop(
                             if (context_overflow_recovery == .pending) {
                                 context_overflow_recovery = .used;
                             }
-                            debug_trace.eventf(
-                                "context_compaction",
-                                "installed",
+                            diagnostics.traceCompactionEvent(
                                 step_ctx,
+                                "installed",
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
@@ -7354,7 +7347,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
-                debug_trace.eventf("context_compaction", "overflow_recovery_incomplete", step_ctx, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
+                diagnostics.traceCompactionFailure(step_ctx, "overflow_recovery_incomplete", "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
@@ -7905,10 +7898,9 @@ fn processQueuedPromptLoop(
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
-                    debug_trace.eventf(
-                        "context_compaction",
-                        "provider_overflow_recovery",
+                    diagnostics.traceCompactionEvent(
                         step_ctx,
+                        "provider_overflow_recovery",
                         "model={s} request_bytes={d} estimated_tokens={d}",
                         .{
                             gateway_model,
