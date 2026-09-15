@@ -2155,38 +2155,39 @@ describe("acp: model-independent", () => {
       const partialText = "ACP_RESTART_PARTIAL_SENTINEL";
       const replacementText = "ACP_RESTART_FINAL_SENTINEL";
       writeFileSync(join(root.workspace, "recovery-fixture.txt"), `${toolEvidence}\n`);
+      const held = heldFakeGatewayFinalText();
       const gateway = startFakeGateway([
         fakeGatewayToolCall("recovery_read_1", "read_file", {
           path: "recovery-fixture.txt",
         }),
         partialEofResponse(partialText),
-        // Two 503s before the simulated process death, two more inside the
-        // continued turn, then success.
-        ...Array.from({ length: 4 }, () => retryAfterUnavailable(0)),
+        // The retry parks on this held request; the process dies while it is
+        // in flight.
+        held.response,
         finalText(replacementText),
       ]);
+      const proc = nodeSpawn(FX_BIN, ["acp"], {
+        cwd: root.workspace,
+        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
       try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
+        client = new AcpClient(proc);
         const sessionId = await startCodeSession(client);
-        // The turn recovers autonomously now, so simulate the process dying
-        // mid-recovery: fire the prompt, wait for the retry loop to reach its
-        // second backoff (four requests), then drop the connection.
-        const promptPromise = runPrompt(
+        sendPrompt(
           client,
+          40,
           "Preserve this ACP prompt across a process restart.",
+        );
+        await waitForCondition(
+          "held in-flight retry request",
+          () => gateway.requests.length === 3,
           TIMEOUT,
         );
-        promptPromise.catch(() => {});
-        const killDeadline = Date.now() + TIMEOUT;
-        while (gateway.requests.length < 4 && Date.now() < killDeadline) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-        expect(gateway.requests).toHaveLength(4);
-
-        await client.close();
+        const exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+        expect(proc.signalCode).toBe("SIGKILL");
         client = await AcpClient.create({
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
@@ -2223,10 +2224,10 @@ describe("acp: model-independent", () => {
         const resumed = await continueRecovery(client, TIMEOUT, sessionId);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        // Four requests before the kill, then the continued turn works through
-        // the remaining 503s into the scripted success.
-        expect(gateway.requests).toHaveLength(7);
-        expect(gateway.requests[6]!.body).toContain(toolEvidence);
+        // Three requests before the kill; the continued turn's retry consumes
+        // the scripted success.
+        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.requests[3]!.body).toContain(toolEvidence);
         const restartedUpdates = JSON.stringify([
           ...loadMessages,
           ...resumed.messages,
@@ -2234,8 +2235,8 @@ describe("acp: model-independent", () => {
         expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
         expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
-        expect(gateway.requests[6]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[6]!.body)).toContain("Restart that response");
+        expect(gateway.requests[3]!.body).not.toContain(partialText);
+        expect(acpLatestPromptText(gateway.requests[3]!.body)).toContain("Restart that response");
 
         await client.close();
         client = await AcpClient.create({
@@ -2268,6 +2269,7 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        held.dispose();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
