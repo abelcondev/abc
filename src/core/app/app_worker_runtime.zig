@@ -1172,8 +1172,19 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.error_text(handlers.ctx, notice);
                     },
                     .restore_failed_prompt => |prompt| {
-                        try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
-                        app.shell.render_requests.request(.footer);
+                        // Never clobber a draft the user typed while the doomed
+                        // turn was still retrying; only an empty composer gets
+                        // the failed prompt back.
+                        if (app.input_runtime.edit_state.input.items.len == 0) {
+                            try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
+                            app.shell.render_requests.request(.footer);
+                        } else {
+                            debug_trace.logf(
+                                "worker",
+                                "event=restore_failed_prompt_skipped reason=composer_occupied",
+                                .{},
+                            );
+                        }
                     },
                 }
             }
