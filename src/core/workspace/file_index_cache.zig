@@ -191,7 +191,9 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
     try out.writer.writeAll(&digest);
     try out.writer.writeAll(payload.written());
 
-    var dir = try std.Io.Dir.openDirAbsolute(zio, dir_path, .{ .follow_symlinks = false });
+    // `.iterate` matters on Linux: without it the descriptor is O_PATH and
+    // the directory fsync inside durableReplaceVerified fails with EBADF.
+    var dir = try std.Io.Dir.openDirAbsolute(zio, dir_path, .{ .follow_symlinks = false, .iterate = true });
     defer dir.close(zio);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
     try io_mod.durableReplaceVerified(alloc, &verified, std.fs.path.basename(path), out.written());
@@ -241,4 +243,5 @@ test "file index cache round trips and rejects tampering" {
     // An empty scan deletes the persisted index rather than serving ghosts.
     try saveTo(alloc, home, &roots, &.{});
     try std.testing.expect((try loadFrom(alloc, home, &roots)) == null);
+    std.debug.print("cache test end\n", .{});
 }
