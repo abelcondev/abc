@@ -1435,11 +1435,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         defer if (request.shared_pool == null) local_client.deinit();
         if (request.shared_pool) |pool| {
-            const io = io_mod.getIo();
-            pool.client.connection_pool.mutex.lockUncancelable(io);
-            const free_connections = pool.client.connection_pool.free_len;
-            pool.client.connection_pool.mutex.unlock(io);
-            debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, free_connections });
+            debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, pool.freeConnectionCount() });
         }
 
         if (setup_epoch == null) {
@@ -1583,7 +1579,10 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
 
         if (active_connected_watch) |watch| {
-            if (watch.arm_response_head()) |err| return @as(anyerror!StreamResult, err);
+            if (watch.arm_response_head()) |err| {
+                markPooledConnectionClosing(&req, request);
+                return @as(anyerror!StreamResult, err);
+            }
         }
         debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
         var response = req.receiveHead(&.{}) catch |err| {

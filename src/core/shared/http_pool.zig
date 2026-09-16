@@ -62,6 +62,15 @@ pub const HttpPool = struct {
         self.last_activity_ms.store(io_mod.milliTimestamp(), .release);
     }
 
+    /// Free-connection count for observability; owns the std-pool locking so
+    /// callers never touch connection_pool internals.
+    pub fn freeConnectionCount(self: *HttpPool) usize {
+        const io = io_mod.getIo();
+        self.client.connection_pool.mutex.lockUncancelable(io);
+        defer self.client.connection_pool.mutex.unlock(io);
+        return self.client.connection_pool.free_len;
+    }
+
     /// Establishes one connection to the URL's origin and parks it in the
     /// pool. Best-effort: failures are traced, never propagated.
     fn warm(self: *HttpPool, url: []const u8) void {
@@ -204,4 +213,25 @@ test "warmAsync is a no-op in test builds" {
     defer _ = pool.deinit();
     pool.warmAsync("https://127.0.0.1:1/unreachable");
     try std.testing.expect(!pool.warm_started.load(.acquire));
+}
+
+test "drain evicts a real parked connection past the TTL" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    // The listen backlog completes the connect without any server accept.
+    pool.warm(url);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    pool.ttl_ms = 0; // every parked connection is stale immediately
+    pool.last_activity_ms.store(io_mod.milliTimestamp() - 1000, .release);
+    _ = pool.clientFor(url);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
 }
