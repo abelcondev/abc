@@ -148,6 +148,16 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
     if (roots.len == 0) return;
     const path = try cachePath(alloc, home, roots);
     defer alloc.free(path);
+    if (candidates.len == 0) {
+        // An empty index paints nothing, so never create one. If a prior scan
+        // persisted entries and the workspace is now empty, drop the stale
+        // file instead of serving ghosts.
+        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        return;
+    }
     const zio = io_mod.getIo();
     const dir_path = std.fs.path.dirname(path) orelse return;
     try io_mod.makeDirRecursive(dir_path);
@@ -227,4 +237,8 @@ test "file index cache round trips and rejects tampering" {
     var empty = (try loadFrom(alloc, home, &roots)).?;
     defer empty.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), empty.candidates.len);
+
+    // An empty scan deletes the persisted index rather than serving ghosts.
+    try saveTo(alloc, home, &roots, &.{});
+    try std.testing.expect((try loadFrom(alloc, home, &roots)) == null);
 }
