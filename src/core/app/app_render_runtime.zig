@@ -153,6 +153,10 @@ const PendingCardProjection = struct {
     paint_row_count: u16,
     leading_advance_rows: u16,
 
+    fn overlaps_flow_endpoint(self: PendingCardProjection, cursor_col: u16) bool {
+        return self.leading_advance_rows == 0 and cursor_col > 1;
+    }
+
     fn deinit(self: *PendingCardProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.bytes);
         self.* = undefined;
@@ -1621,7 +1625,11 @@ pub fn Runtime(comptime App: type) type {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
-            var pending_paint_ctx = if (pending_card) |card|
+            const pending_preview_deferred = pending_submission_card and if (prepared_transcript) |prepared|
+                pending_card.?.overlaps_flow_endpoint(prepared.cursor.cursor_col)
+            else
+                false;
+            var pending_paint_ctx = if (pending_preview_deferred) null else if (pending_card) |card|
                 PendingCardPaintContext.init(
                     card,
                     footer_frame.paint.transcript_band,
@@ -1785,7 +1793,9 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
+                // The committed pending UI permits adoption even when its preview
+                // would overwrite the flow endpoint. Adoption writes the real card.
+                .pending_prompt_presented = pending_submission_card and (pending_paint_ctx != null or pending_preview_deferred),
                 .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
                     footer_measurement != null and footer_measurement.?.show_picker and
                     footer_measurement.?.picker_kind == .file and footer_measurement.?.picker_rows > 0)
@@ -2543,6 +2553,135 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     for ([_]u16{ 1, 2 }) |cols| {
         shell.layout.cols = cols;
         try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
+    }
+}
+
+test "pending prompt at an occupied band bottom preserves the summary through adoption" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-paste.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 168, .rows = 75, .content_bottom = 71, .divider_top_row = 72, .input_row = 73, .divider_bottom_row = 74, .hint_row = 75 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 168, 75);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 235, .unknown_raw);
+    const summary = "  10m 31s (↑177 ↓21k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, history.items, "↑177"));
+    const initial = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(initial);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, initial, summary));
+
+    const last_line = "- evidence gaps that could still change the design.";
+    const prompt = ("PASTE_BODY\n" ** 383) ++ last_line;
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    const preview_summary_count = std.mem.count(u8, preview, summary);
+    const preview_card_count = std.mem.count(u8, preview, last_line);
+    const preview_row = app.shell.transcript_commit_state.stable.cursor_row;
+    const preview_col = app.shell.transcript_commit_state.stable.cursor_col;
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    const scroll = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    errdefer std.debug.print("pending paste preview cursor={d},{d} summary={d} card_tail={d}; adoption scroll={d} summary={d} tail_prefix={d} full_tail={d}\n", .{
+        preview_row,                           preview_col, preview_summary_count, preview_card_count, scroll,
+        std.mem.count(u8, adopted, summary),
+        std.mem.count(u8, adopted, "┃ - evidence gaps"),
+        std.mem.count(u8, adopted, last_line),
+    });
+    try std.testing.expect(scroll > preview_row);
+    try std.testing.expectEqual(@as(usize, 1), preview_summary_count);
+    try std.testing.expectEqual(@as(usize, 0), preview_card_count);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, "┃ - evidence gaps"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, last_line));
+    try std.testing.expectEqual(@as(usize, 0), publicationLineCount(adopted, "┃ - evidence gaps tha"));
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "FOLLOWUP\n" ** 80, .unknown_raw);
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, last_line));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, "┃ - evidence gaps"));
+    const finished = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(finished);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, finished, last_line));
+    try std.testing.expect(std.mem.find(u8, finished, summary).? < std.mem.find(u8, finished, last_line).?);
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(finished, quiet);
+}
+
+test "pending prompt preview preserves blank bottom rows and canonical leading space" {
+    const alloc = std.testing.allocator;
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        submission: @import("input_submit_runtime.zig").State,
+    };
+    var app = TestApp{
+        .alloc = alloc,
+        .submission = .{ .pending = .{ .draft = .{
+            .turn_id = 1,
+            .prompt = try alloc.dupe(u8, "line\n" ** 30),
+            .images = &.{},
+            .skill_display_spans = &.{},
+        } } },
+    };
+    defer app.submission.pending.?.deinit(alloc);
+    const cases = [_]struct { row: u16, col: u16, advance: u16, deferred: bool }{
+        .{ .row = 20, .col = 1, .advance = 0, .deferred = false },
+        .{ .row = 8, .col = 47, .advance = 2, .deferred = false },
+        .{ .row = 19, .col = 47, .advance = 1, .deferred = false },
+        .{ .row = 20, .col = 47, .advance = 0, .deferred = true },
+        .{ .row = 24, .col = 47, .advance = 0, .deferred = true },
+    };
+    for (cases) |case| {
+        var shell = transcript_runtime.TranscriptRuntime{
+            .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
+            .cursor_row = case.row,
+            .cursor_col = case.col,
+        };
+        defer shell.deinit(alloc);
+        var card = (try buildPendingCardProjection(TestApp, &app, &shell, null)).?;
+        defer card.deinit(alloc);
+        try std.testing.expectEqual(case.advance, card.leading_advance_rows);
+        try std.testing.expectEqual(case.deferred, card.overlaps_flow_endpoint(case.col));
+        if (case.deferred) continue;
+        const context = PendingCardPaintContext.init(card, .{ .top = 1, .bottom = 20, .owner = .transcript }, case.row, false).?;
+        try std.testing.expectEqual(case.row + case.advance, context.row);
+        try std.testing.expect(context.max_rows > 0);
     }
 }
 
@@ -3410,12 +3549,19 @@ const CoordinatorTestApp = struct {
     terminal_client: CoordinatorTestTerminalClient = .{},
     file_completion_values: []const file_index.SearchResult = &.{},
     file_completion_calls: usize = 0,
+    submission: @import("input_submit_runtime.zig").State = .{},
+    pending_frame_commits: usize = 0,
+
+    pub fn notePendingFrameCommitted(self: *CoordinatorTestApp) void {
+        self.pending_frame_commits += 1;
+    }
 
     pub fn slashRegistry(_: *const CoordinatorTestApp) command_specs.SlashRegistry {
         return coordinator_test_slash_registry;
     }
 
     fn deinit(self: *CoordinatorTestApp) void {
+        if (self.submission.pending) |*pending| pending.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
