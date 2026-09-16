@@ -1577,7 +1577,7 @@ const shell_id_key_escaped = "\\\"session_id\\\":\\\"shell-";
 /// Collect every shell execution id referenced by restored history turns into
 /// `out` (deduplicated; slices borrow from the turns, so history must outlive
 /// the list). Matches both raw and JSON-escaped tool result envelopes.
-pub fn collectReferencedShellIds(
+fn collectReferencedShellIds(
     alloc: Allocator,
     history: []const HistoryTurn,
     out: *std.ArrayList([]const u8),
