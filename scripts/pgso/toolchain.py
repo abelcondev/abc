@@ -93,6 +93,8 @@ class Toolchain:
     llvm_profdata: pathlib.Path
     llvm_ar: pathlib.Path
     llvm_nm: pathlib.Path
+    llvm_link: pathlib.Path
+    llvm_split: pathlib.Path
     clang: pathlib.Path
     apple_ld: pathlib.Path
     apple_ld_version: str
@@ -138,7 +140,16 @@ class Toolchain:
             raise PgsoError(f"LLVM bin root does not exist: {llvm_root}")
 
         llvm_tools: dict[str, pathlib.Path] = {}
-        for name in ("opt", "llc", "llvm-profdata", "llvm-ar", "llvm-nm", "clang"):
+        for name in (
+            "opt",
+            "llc",
+            "llvm-profdata",
+            "llvm-ar",
+            "llvm-nm",
+            "llvm-link",
+            "llvm-split",
+            "clang",
+        ):
             candidate = llvm_root / name
             if not candidate.is_file() or not os.access(candidate, os.X_OK):
                 raise PgsoError(f"missing executable: {name}")
@@ -210,6 +221,8 @@ class Toolchain:
             llvm_profdata=llvm_tools["llvm-profdata"],
             llvm_ar=llvm_tools["llvm-ar"],
             llvm_nm=llvm_tools["llvm-nm"],
+            llvm_link=llvm_tools["llvm-link"],
+            llvm_split=llvm_tools["llvm-split"],
             clang=llvm_tools["clang"],
             apple_ld=apple_ld,
             apple_ld_version=apple_ld_version,

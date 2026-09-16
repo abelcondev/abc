@@ -2140,6 +2140,10 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    // The durable checkpoint references the prompt's captured image bytes, so
+    // the prompt's deinit must not delete them. A failed turn never reaches
+    // the success-path retain, making this the only retain on that path.
+    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
 fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
@@ -2154,7 +2158,6 @@ fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
         .{ .recovery_checkpoint_cleared = .{} },
         io_mod.milliTimestamp(),
     );
-    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
 /// Stores grants on the active ACP session without persisting them.

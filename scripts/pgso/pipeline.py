@@ -27,15 +27,25 @@ GENERATION_FLAGS = (
     "-passes=default<O2>",
 )
 
-# The IR outliner holds a suffix tree over the whole fx module and peaked at
-# 7.4 GiB, above the 7 GB macOS arm64 runner; without it the same profile-use
-# pass peaks at 1.4 GiB and the linked candidate still meets the size gate.
+# Apply the profile before partitioning so every part inherits the accepted
+# whole-program optimization and profile metadata.
 USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=600000",
     "-passes=default<O2>,mergefunc",
+)
+
+OUTLINE_PARTITIONS = 2
+
+IR_OUTLINER_FLAGS = (
+    "-passes=iroutliner",
+)
+
+OUTLINE_CLEANUP_FLAGS = (
+    "-passes=internalize,constmerge,globaldce,mergefunc,verify",
+    "-internalize-public-api-list=main,_mh_execute_header",
 )
 
 BENCHMARK_USE_FLAGS = (
@@ -120,6 +130,9 @@ class PipelinePaths:
     raw_profile_pattern: pathlib.Path
     merged_profile: pathlib.Path
     candidate: pathlib.Path
+    profile_use_base_bitcode: pathlib.Path
+    outline_split_prefix: pathlib.Path
+    linked_outlined_bitcode: pathlib.Path
     profile_use_bitcode: pathlib.Path
     profile_use_ir: pathlib.Path
     profile_use_object: pathlib.Path
@@ -218,6 +231,9 @@ class PipelinePaths:
             raw_profile_pattern=raw_profiles / "train-%m-%p-%c.profraw",
             merged_profile=profiles / "merged.profdata",
             candidate=candidate,
+            profile_use_base_bitcode=candidate / f"{binary_name}.profile-use.bc",
+            outline_split_prefix=candidate / f"{binary_name}.split.",
+            linked_outlined_bitcode=candidate / f"{binary_name}.outlined.bc",
             profile_use_bitcode=candidate / bitcode_name,
             profile_use_ir=candidate / f"{binary_name}.ll",
             profile_use_object=candidate / f"{binary_name}.o",
@@ -229,6 +245,20 @@ class PipelinePaths:
             ir_cache=ir_cache,
             global_cache=global_cache,
             logs=logs,
+        )
+
+    @property
+    def outline_split_bitcodes(self) -> tuple[pathlib.Path, ...]:
+        return tuple(
+            pathlib.Path(f"{self.outline_split_prefix}{index}")
+            for index in range(OUTLINE_PARTITIONS)
+        )
+
+    @property
+    def outlined_bitcodes(self) -> tuple[pathlib.Path, ...]:
+        return tuple(
+            self.candidate / f"{self.binary_name}.outlined.{index}.bc"
+            for index in range(OUTLINE_PARTITIONS)
         )
 
 
@@ -331,11 +361,69 @@ def profile_use_argv(
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
     flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    output = (
+        paths.profile_use_base_bitcode
+        if paths.selector == "fx"
+        else paths.profile_use_bitcode
+    )
     return (
         str(toolchain.opt),
         *flags,
         f"-profile-file={profile}",
         str(paths.bitcode),
+        "-o",
+        str(output),
+    )
+
+
+def split_ir_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.llvm_split),
+        "-j",
+        str(OUTLINE_PARTITIONS),
+        "-o",
+        str(paths.outline_split_prefix),
+        str(paths.profile_use_base_bitcode),
+    )
+
+
+def outline_ir_argv(
+    toolchain: Toolchain,
+    source: pathlib.Path,
+    output: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.opt),
+        *IR_OUTLINER_FLAGS,
+        str(source),
+        "-o",
+        str(output),
+    )
+
+
+def link_outlined_ir_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.llvm_link),
+        *map(str, paths.outlined_bitcodes),
+        "-o",
+        str(paths.linked_outlined_bitcode),
+    )
+
+
+def cleanup_outlined_ir_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.opt),
+        *OUTLINE_CLEANUP_FLAGS,
+        str(paths.linked_outlined_bitcode),
         "-o",
         str(paths.profile_use_bitcode),
     )
@@ -434,21 +522,7 @@ def temporal_candidate_link_argv(
     )
 
 
-def map_temporal_symbols(
-    order_text: str,
-    symbol_text: str,
-) -> tuple[tuple[str, ...], dict[str, object]]:
-    count = re.findall(r"(?m)^# Ordered (\d+) functions$", order_text)
-    names = tuple(
-        line.strip() for line in order_text.splitlines()
-        if line.strip() and not line.startswith("#")
-    )
-    if (
-        len(count) != 1
-        or int(count[0]) != len(names)
-        or len(set(names)) != len(names)
-    ):
-        raise PgsoError("invalid temporal function order")
+def _candidate_text_symbols(symbol_text: str) -> dict[str, int]:
     symbols: dict[str, int] = {}
     for line in symbol_text.splitlines():
         if not line.strip():
@@ -465,6 +539,25 @@ def map_temporal_symbols(
         if name in symbols and symbols[name] != value:
             raise PgsoError(f"ambiguous candidate text symbol: {name}")
         symbols[name] = value
+    return symbols
+
+
+def map_temporal_symbols(
+    order_text: str,
+    symbol_text: str,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    count = re.findall(r"(?m)^# Ordered (\d+) functions$", order_text)
+    names = tuple(
+        line.strip() for line in order_text.splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    if (
+        len(count) != 1
+        or int(count[0]) != len(names)
+        or len(set(names)) != len(names)
+    ):
+        raise PgsoError("invalid temporal function order")
+    symbols = _candidate_text_symbols(symbol_text)
     ordered: list[str] = []
     addresses: set[int] = set()
     bindings: list[dict[str, object]] = []
@@ -498,6 +591,103 @@ def map_temporal_symbols(
         "profile_functions": len(names),
         "bindings": bindings,
         "unmapped_symbols": unmapped,
+    }
+
+
+_LLVM_FUNCTION_NAME = re.compile(
+    r'@("(?:[^"\\]|\\[0-9a-fA-F]{2})*"|[A-Za-z$._][A-Za-z$._0-9]*)\('
+)
+_OUTLINED_IR_SYMBOL = re.compile(
+    r"_outlined_ir_func_[0-9]+(?:\.[0-9]+)?"
+)
+_OUTLINED_IR_CALL = re.compile(
+    r"@(outlined_ir_func_[0-9]+(?:\.[0-9]+)?)\("
+)
+
+
+def _decode_llvm_identifier(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    raw = value[1:-1]
+    decoded = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] == "\\":
+            decoded.append(int(raw[index + 1:index + 3], 16))
+            index += 3
+        else:
+            decoded.extend(raw[index].encode())
+            index += 1
+    try:
+        return decoded.decode()
+    except UnicodeDecodeError as error:
+        raise PgsoError("invalid UTF-8 in LLVM function name") from error
+
+
+def order_outlined_ir_helpers(
+    ordered: Sequence[str],
+    symbol_text: str,
+    ir_path: pathlib.Path,
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    symbols = _candidate_text_symbols(symbol_text)
+    helpers = {
+        name for name in symbols if _OUTLINED_IR_SYMBOL.fullmatch(name)
+    }
+    calls: dict[str, list[str]] = {}
+    current: str | None = None
+    with ir_path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if line.startswith("define "):
+                match = _LLVM_FUNCTION_NAME.search(line)
+                if match is None:
+                    raise PgsoError("invalid LLVM function definition")
+                name = _decode_llvm_identifier(match.group(1))
+                candidates = tuple(
+                    value
+                    for value in ("_" + name, "l_" + name)
+                    if value in symbols
+                )
+                locations = {symbols[value] for value in candidates}
+                if len(locations) > 1:
+                    raise PgsoError(f"ambiguous candidate text symbol: {name}")
+                current = candidates[0] if candidates else None
+                continue
+            if line.rstrip("\n") == "}":
+                current = None
+                continue
+            if current is None:
+                continue
+            for name in _OUTLINED_IR_CALL.findall(line):
+                helper = "_" + name
+                if helper not in helpers:
+                    continue
+                targets = calls.setdefault(current, [])
+                if helper not in targets:
+                    targets.append(helper)
+
+    ranks: dict[str, int] = {}
+    for rank, symbol in enumerate(ordered):
+        pending = [symbol]
+        while pending:
+            for helper in calls.get(pending.pop(), ()):
+                previous = ranks.get(helper)
+                if previous is None or rank < previous:
+                    ranks[helper] = rank
+                    pending.append(helper)
+
+    result = list(ordered)
+    addresses = {symbols[name] for name in ordered}
+    for helper in sorted(
+        helpers,
+        key=lambda name: (ranks.get(name, len(ordered)), symbols[name], name),
+    ):
+        address = symbols[helper]
+        if address not in addresses:
+            result.append(helper)
+            addresses.add(address)
+    return tuple(result), {
+        "outlined_helpers": len(helpers),
+        "profile_ranked_outlined_helpers": len(ranks),
     }
 
 
@@ -934,6 +1124,44 @@ def merge_profile_batch(
     return len(raw_profiles)
 
 
+def _defined_external_symbols(
+    toolchain: Toolchain,
+    bitcode: pathlib.Path,
+    log_path: pathlib.Path,
+) -> tuple[tuple[str, str], ...]:
+    result = run_checked(
+        (
+            str(toolchain.llvm_nm),
+            "--defined-only",
+            "--extern-only",
+            "--format=posix",
+            "--radix=x",
+            str(bitcode),
+        ),
+        cwd=bitcode.parent,
+        env=os.environ.copy(),
+        timeout_s=120,
+        log_path=log_path,
+        require_empty_stderr=True,
+    )
+    if result.stdout_truncated:
+        raise PgsoError("public symbol output exceeded the bounded capture limit")
+    symbols: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(
+            r"(.+) ([A-Za-z?]) ([0-9a-fA-F-]+) ([0-9a-fA-F-]+)",
+            line,
+        )
+        if match is None:
+            raise PgsoError("invalid public symbol output")
+        symbols.append((match.group(1), match.group(2)))
+    if len(symbols) != len({name for name, _ in symbols}):
+        raise PgsoError("duplicate public symbols in profile-use bitcode")
+    return tuple(sorted(symbols))
+
+
 def apply_profile(
     toolchain: Toolchain,
     paths: PipelinePaths,
@@ -952,7 +1180,69 @@ def apply_profile(
         log_path=paths.logs / "profile-use.json",
         require_empty_stderr=True,
     )
+    if paths.selector != "fx":
+        _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+        return paths.profile_use_bitcode
+
+    _require_nonempty_file(
+        paths.profile_use_base_bitcode,
+        "whole-program profile-use bitcode",
+    )
+    original_symbols = _defined_external_symbols(
+        toolchain,
+        paths.profile_use_base_bitcode,
+        paths.logs / "public-symbols-before.json",
+    )
+    run_checked(
+        split_ir_argv(toolchain, paths),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "split-profile-use.json",
+        require_empty_stderr=True,
+    )
+    for split in paths.outline_split_bitcodes:
+        _require_nonempty_file(split, "profile-use IR partition")
+    for index, (split, outlined) in enumerate(
+        zip(paths.outline_split_bitcodes, paths.outlined_bitcodes)
+    ):
+        run_checked(
+            outline_ir_argv(toolchain, split, outlined),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"outline-profile-use-{index}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(outlined, "outlined IR partition")
+    run_checked(
+        link_outlined_ir_argv(toolchain, paths),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "link-outlined-ir.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(paths.linked_outlined_bitcode, "linked outlined bitcode")
+    run_checked(
+        cleanup_outlined_ir_argv(toolchain, paths),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "cleanup-outlined-ir.json",
+        require_empty_stderr=True,
+    )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    outlined_symbols = _defined_external_symbols(
+        toolchain,
+        paths.profile_use_bitcode,
+        paths.logs / "public-symbols-after.json",
+    )
+    if outlined_symbols != original_symbols:
+        raise PgsoError(
+            "partitioned outlining changed the public symbol surface: "
+            f"before={original_symbols}, after={outlined_symbols}"
+        )
     return paths.profile_use_bitcode
 
 
@@ -1035,6 +1325,12 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     ordered, mapping = map_temporal_symbols(
         order_path.read_text(encoding="utf-8"), symbols.stdout,
     )
+    ordered, outlined_layout = order_outlined_ir_helpers(
+        ordered,
+        symbols.stdout,
+        paths.profile_use_ir,
+    )
+    mapping.update(outlined_layout)
     mapped_order = paths.logs / "candidate-order.txt"
     mapped_order.write_text(
         "".join(f"{paths.profile_use_object.name}:{name}\n" for name in ordered),

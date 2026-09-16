@@ -3,6 +3,7 @@ const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -634,7 +635,7 @@ pub const WorkerRuntime = struct {
     fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
         const op = self.compaction_presentation.snapshot.operation orelse return;
         if (op.turn_id != turn_id or !op.active()) return;
-        debug_trace.logf("context_compaction", "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        diagnostics.traceCompactionLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
         var feedback = compaction_activity.failure(
             if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
             op.stage(),

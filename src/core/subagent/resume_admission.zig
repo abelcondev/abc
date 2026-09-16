@@ -90,9 +90,18 @@ const CatalogWorker = struct {
             const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
-            var cacheable = candidate.storage == .conversation;
+            // Every storage class can reuse a cached row once the fingerprint
+            // binds its classification inputs, with one exception: stale
+            // schema_v3 sessions belong to the legacy ranking cache, which
+            // stores one row per id in the same file. Publishing a picker row
+            // for one would supersede its ranking row and thrash both caches.
+            var cacheable = candidate.storage != .schema_v3 or candidate.projection_state != .stale;
             const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
+                // A missing file (typically a legacy session without an event
+                // log) is itself fingerprinted state, so the exclusion is as
+                // stable as the directory stats and can be cached.
+                error.FileNotFound => true,
                 else => blk: {
                     cacheable = false;
                     break :blk true;
@@ -476,6 +485,42 @@ test "actionable catalog preserves discovery and child visibility" {
     var read_only = try session_store.Store.initReadOnlyFromHome(alloc, home, workspace);
     defer read_only.deinit(alloc);
     try std.testing.expect((try catalog_cache.Writer.init(read_only)) == null);
+}
+
+test "actionable catalog caches legacy sessions without event logs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/legacy-old");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    // Oldest persisted format: a schema v2 snapshot with no event log.
+    const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    defer alloc.free(manifest);
+    var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
+    try file.writeStreamingAll(std.testing.io, manifest);
+    file.close(std.testing.io);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // Legacy sessions stay excluded from the picker, but the exclusion must
+    // land in the cache so later scans reuse it instead of reparsing.
+    try std.testing.expectEqual(@as(usize, 0), catalog.summaries.items.len);
+    var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(saved.contains("legacy-old"));
+    var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), again.summaries.items.len);
 }
 
 test "managed child marker is hidden from external access" {

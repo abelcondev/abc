@@ -77,6 +77,39 @@ jobs:
           path: ${{ runner.temp }}/tui-performance.json
           if-no-files-found: warn
 
+  long-turn-memory:
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Long-turn memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run long-turn memory benchmark
+        run: python3 benchmarks/long_turn_memory.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/long-turn-memory --steps 500 --limit-mib 1024 --timeout 480
+
+      - name: Enforce memory budget
+        run: jq -e '.completed == true and (.peak_rss_kib < 524288)' ${{ runner.temp }}/long-turn-memory/measurements.json
+
+      - name: Upload long-turn memory evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-turn-memory-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/long-turn-memory/measurements.json
+            ${{ runner.temp }}/long-turn-memory/stderr.log
+            ${{ runner.temp }}/long-turn-memory/stdout.json
+          if-no-files-found: warn
+
   libfx-ttft:
     if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime

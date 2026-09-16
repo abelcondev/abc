@@ -13,6 +13,7 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -3820,7 +3821,6 @@ noinline fn pausedRequiredAction(
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -3836,6 +3836,11 @@ fn persistRecoveryCheckpoint(
     trace_ctx: TraceContext,
 ) !void {
     const effect = deps.recovery_checkpoint orelse return;
+    // Every sink copies or serializes the borrowed checkpoint synchronously.
+    // Retaining these full-history reconstructions in the turn arena is quadratic.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
     const execution = try runtime_execution_memory.buildExecutionMemory(
         arena,
         current_turn_messages,
@@ -3920,11 +3925,66 @@ fn persist_compaction_source(
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = false,
     });
-    debug_trace.eventf("context_compaction", "source_checkpointed", trace_ctx, "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
+    diagnostics.traceCompactionEvent(trace_ctx, "source_checkpointed", "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
     return std.meta.activeTag(result) == .completed;
+}
+
+test "recovery checkpoints do not accumulate temporary history copies in the turn arena" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        checkpoint: ?session_codec.RecoveryCheckpoint = null,
+        fail: bool = false,
+
+        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.CheckpointWriteFailed;
+            const next = try checkpoint.dupe(std.testing.allocator);
+            if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
+            self.checkpoint = next;
+        }
+
+        fn clear(_: *anyopaque) !void {}
+    };
+    var sink: Sink = .{};
+    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = &sink;
+    deps.recovery_checkpoint = .{ .set = Sink.set, .clear = Sink.clear };
+    var fixture: support.PromptFixture = .{};
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    const alloc = turn.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    for (0..1000) |step_index| {
+        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const calls = try alloc.alloc(ToolCall, 1);
+        calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
+        try messages.appendSlice(alloc, &.{
+            .{ .role = .assistant, .tool_calls = calls },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+        });
+        const retained_bytes = turn.queryCapacity();
+        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
+        try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+        try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
+        try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
+    }
+    sink.fail = true;
+    const retained_bytes = turn.queryCapacity();
+    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
+    try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
 }
 
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
@@ -5777,7 +5837,7 @@ pub const RetainedCompactionWindow = struct {
         });
         if (plan.accepted_handoff_tokens != null) return false;
         target.* = if (self.retained_tokens <= self.newest_exchange_tokens) 0 else target.* / 2;
-        debug_trace.logf("context_compaction", "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
+        diagnostics.traceCompactionLog(false, "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
         return true;
     }
 };
@@ -6009,6 +6069,11 @@ pub fn compactContextTransaction(
     var stage: compaction_activity.Stage = .preparation;
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
+        if (err == error.Cancelled) {
+            diagnostics.traceCompactionEvent(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        } else {
+            diagnostics.traceCompactionFailure(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        }
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = request.trace_ctx.turn_id, .err = err };
@@ -6022,16 +6087,51 @@ pub fn compactContextTransaction(
         .source_tokens = request.source_tokens,
         .newest_exchange_tokens = request.newest_exchange_tokens,
     };
-    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) {
+    const initial_plan = runtime_prompt_context.planCompaction(plan_input);
+    if (initial_plan.decision == .no_op) {
+        diagnostics.traceCompactionEvent(
+            request.trace_ctx,
+            "skipped_no_op",
+            "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                initial_plan.usable_input_tokens,
+                initial_plan.high_water_tokens,
+            },
+        );
         if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
         return null;
     }
     const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
     plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
     const plan = runtime_prompt_context.planCompaction(plan_input);
-    const accepted_tokens = plan.accepted_handoff_tokens orelse
+    const accepted_tokens = plan.accepted_handoff_tokens orelse {
+        diagnostics.traceCompactionFailure(
+            request.trace_ctx,
+            "capacity_exceeded_at_plan",
+            "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                fixed_cost.estimated_input_tokens,
+                request.newest_exchange_tokens,
+                plan.usable_input_tokens,
+                plan.high_water_tokens,
+                plan.session_target_tokens,
+            },
+        );
         return error.ContextCapacityExceeded;
+    };
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
+        diagnostics.traceCompactionFailure(
+            request.trace_ctx,
+            "credential_unauthorized",
+            "trigger={s} provider={s} credential_source={s}",
+            .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
+        );
         return error.ContextCompactionUnavailable;
     }
     const compaction_model = request.continuation.request.model;
@@ -6081,6 +6181,18 @@ pub fn compactContextTransaction(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
+        diagnostics.traceCompactionEvent(
+            request.trace_ctx,
+            "candidate_over_capacity",
+            "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
+            .{
+                @tagName(request.trigger),
+                candidate_cost.estimated_input_tokens,
+                fixed_cost.estimated_input_tokens,
+                accepted_tokens,
+                compacted.handoff.len,
+            },
+        );
         return error.ContextCapacityExceeded;
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -6091,6 +6203,18 @@ pub fn compactContextTransaction(
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
     }, request.active_prefix, request.retained_from);
+    diagnostics.traceCompactionEvent(
+        request.trace_ctx,
+        "committed",
+        "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
+        .{
+            @tagName(request.trigger),
+            request.removed_turn_count,
+            request.compaction_count,
+            compacted.handoff.len,
+            accepted_tokens,
+        },
+    );
     // A successful acknowledgement wins even if cancellation arrived during publication.
     if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{
         .outcome = .succeeded,
@@ -6792,7 +6916,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7045,10 +7168,10 @@ fn processQueuedPromptLoop(
                     else
                         0,
                 });
-                debug_trace.eventf(
-                    "context_compaction",
-                    "decision",
+                diagnostics.traceCompactionEventIf(
+                    projection_plan.decision != .no_op,
                     step_ctx,
+                    "decision",
                     "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
@@ -7067,10 +7190,12 @@ fn processQueuedPromptLoop(
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
+                        diagnostics.traceCompactionFailure(step_ctx, "overflow_without_compaction", "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
+                                diagnostics.traceCompactionFailure(step_ctx, "no_compactable_context", "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -7100,7 +7225,11 @@ fn processQueuedPromptLoop(
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
-                                    if (retention_target == 0) return error.ContextCapacityExceeded;
+                                    if (retention_target == 0) {
+                                        diagnostics.traceCompactionFailure(step_ctx, "retention_exhausted", "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        return error.ContextCapacityExceeded;
+                                    }
+                                    diagnostics.traceCompactionFailure(step_ctx, "retention_forced_zero", "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -7229,10 +7358,9 @@ fn processQueuedPromptLoop(
                             if (context_overflow_recovery == .pending) {
                                 context_overflow_recovery = .used;
                             }
-                            debug_trace.eventf(
-                                "context_compaction",
-                                "installed",
+                            diagnostics.traceCompactionEvent(
                                 step_ctx,
+                                "installed",
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
@@ -7273,6 +7401,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
+                diagnostics.traceCompactionFailure(step_ctx, "overflow_recovery_incomplete", "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
@@ -7283,7 +7412,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7382,7 +7510,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -7503,7 +7630,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7542,7 +7668,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -7844,7 +7969,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7888,10 +8012,9 @@ fn processQueuedPromptLoop(
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
-                    debug_trace.eventf(
-                        "context_compaction",
-                        "provider_overflow_recovery",
+                    diagnostics.traceCompactionEvent(
                         step_ctx,
+                        "provider_overflow_recovery",
                         "model={s} request_bytes={d} estimated_tokens={d}",
                         .{
                             gateway_model,
@@ -7937,7 +8060,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(response_completion.content orelse ""),
@@ -8041,7 +8163,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -8096,7 +8217,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             stream_ctx.interruption_source_or(""),
@@ -8420,7 +8540,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         partial_assistant,
@@ -8475,7 +8594,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             partial_assistant,

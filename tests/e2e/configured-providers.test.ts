@@ -338,6 +338,42 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
+  test.each(["clear", "caution", "missing", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
+    let marker = "";
+    let reviews = 0;
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) {
+        reviews++;
+        if (reviews === 1 || (outcome === "missing" && reviews === 2)) {
+          if (outcome === "refused" || outcome === "truncated" || outcome === "incomplete") {
+            const chunks = [
+              { id: "review", model: body.model, choices: [{ index: 0, delta: outcome === "refused" ? { refusal: "Cannot review this." } : { content: "Incomplete review." }, finish_reason: null }] },
+              { id: "review", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: outcome === "truncated" ? "length" : "stop" }] },
+            ];
+            return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("") + (outcome === "incomplete" ? "" : "data: [DONE]\n\n"), { headers: { "content-type": "text/event-stream" } });
+          }
+          return completion(body.model, "The action looks safe.");
+        }
+        return toolCompletion(body.model, "permission_decision", { decision: outcome === "caution" ? "caution" : "clear" });
+      }
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
+      return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'from pathlib import Path; p=Path(${JSON.stringify(marker)}); p.write_text(p.read_text()+"one\\n")'` } });
+    });
+    try {
+      marker = join(f.workspace, "review-effects.txt");
+      writeFileSync(marker, "");
+      f.settings.permission_mode = "auto";
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(readFileSync(marker, "utf8")).toBe(outcome === "clear" ? "one\n" : "");
+      expect(reviews).toBe(["clear", "caution", "missing"].includes(outcome) ? 2 : 1);
+      const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
+      expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
+    } finally { f.close(); }
+  }, 20000);
+
   test.each(["caution", "invalid"])("%s custom permission reviews never authorize execution", async decision => {
     let marker = "";
     const f = fixture(body => {

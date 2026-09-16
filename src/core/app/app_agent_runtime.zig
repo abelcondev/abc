@@ -291,6 +291,9 @@ pub fn Runtime(comptime App: type) type {
                 .mcp_call_feature = if (comptime runtime_profile.allows(App, .mcp)) callMcpFeature else null,
                 .mcp_progress_ctx = @ptrCast(app),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
+                .tool_progress_ctx = @ptrCast(app),
+                .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
+                .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(app),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
             };
@@ -888,6 +891,7 @@ pub fn Runtime(comptime App: type) type {
                     appAccessScope(app),
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .stale_shell_handles = app.session.has_stale_shell_handles,
             }, arena, messages);
         }
 
