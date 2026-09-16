@@ -4001,6 +4001,7 @@ fn writeNetworkRecordBody(
             if (completed.completion.generation_id) |generation_id| {
                 try writer.print(" · generation: {s}", .{generation_id});
             }
+            try writeUsageTokens(writer, completed.completion.usage);
         },
         .failed => |*failure| {
             try writer.print("failed: {s}", .{@tagName(failure.kind)});
@@ -4008,6 +4009,26 @@ fn writeNetworkRecordBody(
                 try writer.print(" · retry after: {d}s", .{seconds});
             }
         },
+    }
+}
+
+/// Appends the token-usage line when the completion reports any token counts.
+/// Reported values render exactly, including zero; absent fields are omitted.
+fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
+    const fields = .{
+        .{ "in", usage.input_tokens },
+        .{ "out", usage.output_tokens },
+        .{ "cache-read", usage.cache_read_tokens },
+        .{ "cache-write", usage.cache_write_tokens },
+        .{ "reasoning", usage.reasoning_tokens },
+    };
+    var wrote_any = false;
+    inline for (fields) |field| {
+        if (field[1]) |count| {
+            try writer.writeAll(if (wrote_any) " · " else "\ntokens: ");
+            wrote_any = true;
+            try writer.print("{d} {s}", .{ count, field[0] });
+        }
     }
 }
 
@@ -12228,10 +12249,15 @@ test "writeNetworkRecordBody renders completed and failed outcomes" {
     var completed: runtime_gateway_step.StreamResult = .{ .completed = .{ .completion = .{
         .finish_reason = .stop,
         .generation_id = "gen_test_123",
+        .usage = .{
+            .input_tokens = 1240,
+            .output_tokens = 56,
+            .cache_read_tokens = 900,
+        },
     } } };
     try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
     try std.testing.expectEqualStrings(
-        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123",
+        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read",
         body.written(),
     );
 

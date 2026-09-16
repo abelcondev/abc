@@ -938,6 +938,7 @@ tmuxTest(
     expect(top).toContain("tools:");
     expect(top).toContain("network: provider:");
     expect(top).toContain("finish: stop");
+    expect(top).toContain("tokens: 3 in · 5 out");
     await active.sendKeys("C-o");
     await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
