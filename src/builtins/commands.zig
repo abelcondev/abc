@@ -19,6 +19,7 @@ pub const SlashRegistry = command_specs.SlashRegistry;
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
 
 pub const top_level_specs = [_]TopLevelSpec{
+    command_specs.slack_install_spec,
     .{
         .kind = .help,
         .token = "help",
@@ -321,6 +322,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
+        .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
