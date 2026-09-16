@@ -2049,15 +2049,19 @@ pub fn Runtime(comptime App: type) type {
 
         /// Warms the session catalog in the background right after interactive
         /// startup, so the first picker open can paint from memory instead of
-        /// waiting for a scan. A picker opened while the preload is in flight
-        /// adopts that scan as its own; the completed scan lands in the
-        /// in-memory catalog cache through the ordinary poll path.
+        /// waiting for a scan. Runs only when a persisted catalog exists — a
+        /// profile that has never listed sessions has nothing worth warming,
+        /// and picker-free flows like --continue must not pay for discovery.
+        /// A picker opened while the preload is in flight adopts that scan as
+        /// its own; the completed scan lands in the in-memory catalog cache
+        /// through the ordinary poll path.
         pub fn preloadSessionCatalog(app: *App) void {
             const persistence = &app.session_persistence;
             if (persistence.session_picker.active) return;
             const loader = &persistence.session_picker_load;
             if (loader.task != null or loader.pending != null) return;
             const store = if (persistence.store) |*value| value else return;
+            if (!session_catalog_cache.catalogFileExists(store.canonical_root.sessions)) return;
             const active_id = if (persistence.writable) |*loaded| loaded.active_id else null;
             const cache = &persistence.session_picker_cache;
             if (cache.matches(active_id) and cache.isFresh()) return;
@@ -10157,6 +10161,21 @@ test "session catalog preload feeds the picker open without a second scan" {
     } }};
     try writeSessionFixture(alloc, app.session_persistence.store.?, "preloaded-session", &history, 0);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // The preload only runs for picker-known profiles: seed the persisted
+    // catalog once, as a previous picker open would.
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
 
     Runtime(TestApp).preloadSessionCatalog(&app);
     const loader = &app.session_persistence.session_picker_load;
@@ -10171,7 +10190,10 @@ test "session catalog preload feeds the picker open without a second scan" {
         app.session_persistence.session_picker.generation,
     );
 
-    try waitForSessionPickerLoad(&app);
+    // The picker may already read ready from the persisted catalog, so drain
+    // the loader rather than the load state: the preload is installed into the
+    // in-memory catalog only through the poll path.
+    try waitForSessionPickerPrewarm(&app);
     const picker = &app.session_persistence.session_picker;
     try std.testing.expectEqual(.ready, picker.load_state);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
@@ -10208,6 +10230,25 @@ test "session catalog preload is best-effort and never duplicates an in-flight s
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // A profile that has never listed sessions has no catalog to warm; the
+    // preload stays off until one exists.
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
+
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
+
     Runtime(TestApp).preloadSessionCatalog(&app);
     const loader = &app.session_persistence.session_picker_load;
     const first = loader.task orelse return error.TestExpectedEqual;
