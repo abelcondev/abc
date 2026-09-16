@@ -1490,26 +1490,31 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       await session.sendKeys("C-o");
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
-      for (let page = 0; page < 20; page += 1) {
+      // Page to the tail of the second diff; the page count varies with
+      // session and network record height at the top of the transcript.
+      let fullSecond = await session.capturePane();
+      for (let page = 0; page < 24 && !fullSecond.includes("CTRL_O_SECOND_060"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);
+        await Bun.sleep(50);
+        fullSecond = await session.capturePane();
       }
-      await session.waitForText("CTRL_O_SECOND_060", TIMEOUT);
-      const fullSecond = await session.capturePane();
       expect(fullSecond).toContain("CTRL_O_SECOND_060");
       expect(fullSecond).not.toContain("omitted");
       expect(fullSecond).not.toContain('"content":"CTRL_O_SECOND');
-
-      for (let page = 0; page < 2; page += 1) {
+      let fullFirst = await session.capturePane();
+      for (let page = 0; page < 20 && !fullFirst.includes("CTRL_O_FIRST_120"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+        fullFirst = await session.capturePane();
       }
-      await session.waitForText("CTRL_O_FIRST_120", TIMEOUT);
-      const fullFirst = await session.capturePane();
       expect(fullFirst).toContain("CTRL_O_FIRST_120");
       expect(fullFirst).not.toContain("omitted");
       expect(fullFirst).not.toContain('"content":"CTRL_O_FIRST');
-
-      for (let page = 0; page < 20; page += 1) {
+      let fullHead = await session.capturePane();
+      for (let page = 0; page < 20 && !fullHead.includes("CTRL_O_FIRST_001"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+        fullHead = await session.capturePane();
       }
       await session.waitForText("CTRL_O_FIRST_001", TIMEOUT);
 
