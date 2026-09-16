@@ -47,6 +47,8 @@ Inside the shell, run `/help` to browse interactive commands.
 
 In auto mode, a valid structured safety decision remains usable when the reviewer adds commentary. If the response has no valid decision, fx retries the review once within its original 30-second deadline. A safety caution is never retried for approval. If review still fails, the action stays unexecuted and the agent can continue with other tools.
 
+By default, reviews are answered by a language model through your configured connection. Setting `FX_REVIEW_MODEL=typesafeai/jev` routes each review to TypeSafe's System One API instead, which returns a typed decision with calibrated probabilities and a confidence score. This requires a `TYPESAFE_API_KEY` in the environment; without it, actions that need review stay unexecuted rather than falling back silently. The review policy, the action under review, and the hold-or-authorize behavior are identical either way.
+
 ### Long conversations
 
 fx automatically compacts context at 80% of the selected model's usable input capacity. Run `/compact` to compact earlier. In saved sessions, older assistant work is summarized while original user text stays unchanged and chronological when it fits. If necessary, older user messages are summarized too, without a capacity question.

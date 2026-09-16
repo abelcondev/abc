@@ -7,6 +7,7 @@ const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const credential_authority = @import("../../core/auth/credential_authority.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
+const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -49,6 +50,13 @@ fn reviewGateway(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
+    // FX_REVIEW_MODEL=typesafeai/jev selects the TypeSafe System One reviewer.
+    // Every composition site selects this provider, so the override covers
+    // interactive, ask, and subagent reviews uniformly.
+    if (typesafe_permission_reviewer.envSelected()) {
+        debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
+        return typesafe_permission_reviewer.review(null, alloc, input, request);
+    }
     return reviewGatewayConfig(.{
         .api_key = if (input.credential_source == .host_managed) null else input.credential,
         .credential_source = input.credential_source,
