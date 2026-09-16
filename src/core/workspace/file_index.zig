@@ -2524,9 +2524,13 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     defer base_dir.deleteTree(zio, base_rel) catch {};
     try base_dir.createDirPath(zio, work_rel);
 
-    const home = try io_mod.realpathAlloc(alloc, try std.fs.path.join(alloc, &.{ base, "home" }));
+    const home_joined = try std.fs.path.join(alloc, &.{ base, "home" });
+    defer alloc.free(home_joined);
+    const work_joined = try std.fs.path.join(alloc, &.{ base, "work" });
+    defer alloc.free(work_joined);
+    const home = try io_mod.realpathAlloc(alloc, home_joined);
     defer alloc.free(home);
-    const root = try io_mod.realpathAlloc(alloc, try std.fs.path.join(alloc, &.{ base, "work" }));
+    const root = try io_mod.realpathAlloc(alloc, work_joined);
     defer alloc.free(root);
 
     var work_dir = try std.Io.Dir.openDirAbsolute(zio, root, .{});
@@ -2577,7 +2581,9 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     const scanned_count = first.count();
     try std.testing.expectEqual(@as(usize, 1), adoptions);
     try std.testing.expect(scanned_count >= 2);
-    try std.testing.expect((try file_index_cache.loadFrom(alloc, home, &roots)) != null);
+    var cached = (try file_index_cache.loadFrom(alloc, home, &roots)).?;
+    defer cached.deinit(alloc);
+    try std.testing.expect(cached.candidates.len > 0);
 
     // The tree changes between launches.
     {
