@@ -1954,22 +1954,22 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Record whether restored history references shell execution handles
-        /// this process does not own. Picker resumes share the registry with
-        /// executions started by this process, so registry membership, not the
-        /// resume itself, decides staleness.
-        fn updateStaleShellHandles(app: *App, history: []const session_runtime.HistoryTurn) !void {
+        /// this process does not own. Registry membership, not the resume
+        /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
+        fn updateStaleShellHandles(app: *App, history: []const session_runtime.HistoryTurn) void {
             if (comptime !@hasField(App, "managed_executions")) return;
-            var ids: std.ArrayList([]const u8) = .empty;
-            defer ids.deinit(app.alloc);
-            try session_runtime.collectReferencedShellIds(app.alloc, history, &ids);
-            var stale = false;
-            for (ids.items) |id| {
-                if (app.managed_executions.stateFor(id) == null) {
-                    stale = true;
-                    break;
-                }
-            }
-            app.session.has_stale_shell_handles = stale;
+            app.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+                app.alloc,
+                history,
+                &app.managed_executions,
+            ) catch |err| blk: {
+                debug_trace.logf(
+                    "session",
+                    "event=stale_shell_handle_scan outcome=skipped err={s}",
+                    .{@errorName(err)},
+                );
+                break :blk false;
+            };
         }
 
         fn hydrateResumedSession(
@@ -1992,13 +1992,7 @@ pub fn Runtime(comptime App: type) type {
                 state.history,
                 state.permission_state,
             );
-            updateStaleShellHandles(app, state.history) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=stale_shell_handle_scan outcome=skipped err={s}",
-                    .{@errorName(err)},
-                );
-            };
+            updateStaleShellHandles(app, state.history);
             if (state.usage) |usage| {
                 try app.session.usage.restore(
                     app.alloc,

@@ -2978,7 +2978,7 @@ fn permissionModeContext(permission_mode: types.PermissionMode) []const u8 {
 }
 
 const stale_shell_handles_context =
-    "Runtime context: fx restarted since this session was last active. Every background shell session from before the restart was terminated, and earlier shell session_id handles no longer exist. Start fresh shell sessions instead of stopping or interacting with earlier ones.";
+    "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
 
 fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const turn_context = try buildTurnContextFragmentForHost(

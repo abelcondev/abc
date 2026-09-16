@@ -15,6 +15,7 @@ const command_replay_store = @import("command_replay_store.zig");
 pub const session_usage = @import("session_usage.zig");
 pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
 
@@ -1621,6 +1622,24 @@ fn collectShellIdsFromExecution(
     }
 }
 
+/// True when restored history references shell execution handles that `exec`
+/// does not own. Registry membership, not the resume event, decides staleness:
+/// in-process resumes share the registry with executions started by this
+/// process, so those handles stay valid and stay quiet.
+pub fn detectStaleShellHandles(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    exec: *managed_execution.Runtime,
+) !bool {
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, history, &ids);
+    for (ids.items) |id| {
+        if (exec.stateFor(id) == null) return true;
+    }
+    return false;
+}
+
 fn collectShellIdsFromText(alloc: Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
     try collectShellIdsWithKey(alloc, text, shell_id_key_raw, out);
     try collectShellIdsWithKey(alloc, text, shell_id_key_escaped, out);
@@ -1633,7 +1652,12 @@ fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, o
         from = at + key.len;
         const id_start = at + key.len - "shell-".len;
         var id_end = id_start + "shell-".len;
-        while (id_end < text.len and std.ascii.isDigit(text[id_end])) id_end += 1;
+        // Counter ids are digits; interactive terminal ids are base64url. Both
+        // share the charset checked by validHistoricalSessionId.
+        while (id_end < text.len) : (id_end += 1) {
+            const byte = text[id_end];
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') break;
+        }
         if (id_end == id_start + "shell-".len) continue;
         const id = text[id_start..id_end];
         for (out.items) |existing| {
@@ -4861,6 +4885,7 @@ test "collectReferencedShellIds extracts raw and escaped envelopes from restored
             .id = try alloc.dupe(u8, "call-1"),
             .name = try alloc.dupe(u8, "shell"),
             .arguments_json = try alloc.dupe(u8, "{\"action\":\"stop\",\"session_id\":\"shell-7\"}"),
+            .provider_result = try alloc.dupe(u8, "{\"session_id\":\"shell-X9ab_cd-12\",\"state\":\"running\"}"),
         },
     } };
     const summary_turn: HistoryTurn = .{ .compacted_summary = .{
@@ -4877,9 +4902,10 @@ test "collectReferencedShellIds extracts raw and escaped envelopes from restored
     defer ids.deinit(alloc);
     try collectReferencedShellIds(alloc, &history, &ids);
 
-    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), ids.items.len);
     try std.testing.expectEqualStrings("shell-3", ids.items[0]);
     try std.testing.expectEqualStrings("shell-7", ids.items[1]);
+    try std.testing.expectEqualStrings("shell-X9ab_cd-12", ids.items[2]);
 }
 
 test "collectReferencedShellIds scans persisted tool step previews" {

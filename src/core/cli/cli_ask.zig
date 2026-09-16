@@ -836,21 +836,21 @@ const AskContext = struct {
     }
 
     /// Record whether restored history references shell execution handles this
-    /// process does not own. `fx ask --resume` always runs in a fresh process,
-    /// so any referenced handle is stale; the registry check keeps the rule
-    /// identical to the interactive seams.
-    fn updateStaleShellHandles(self: *AskContext, history: []const session_runtime.HistoryTurn) !void {
-        var ids: std.ArrayList([]const u8) = .empty;
-        defer ids.deinit(self.alloc);
-        try session_runtime.collectReferencedShellIds(self.alloc, history, &ids);
-        var stale = false;
-        for (ids.items) |id| {
-            if (self.managed_executions.stateFor(id) == null) {
-                stale = true;
-                break;
-            }
-        }
-        self.session.has_stale_shell_handles = stale;
+    /// process does not own. Registry membership, not the resume itself,
+    /// decides staleness (see session_runtime.detectStaleShellHandles).
+    fn updateStaleShellHandles(self: *AskContext, history: []const session_runtime.HistoryTurn) void {
+        self.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+            self.alloc,
+            history,
+            &self.managed_executions,
+        ) catch |err| blk: {
+            debug_trace.logf(
+                "session",
+                "event=stale_shell_handle_scan outcome=skipped err={s}",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
     }
 
     fn initializeSessionStores(self: *AskContext) !void {
@@ -898,13 +898,7 @@ const AskContext = struct {
                 writable.state.history,
                 writable.state.permission_state,
             );
-            updateStaleShellHandles(self, writable.state.history) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=stale_shell_handle_scan outcome=skipped err={s}",
-                    .{@errorName(err)},
-                );
-            };
+            updateStaleShellHandles(self, writable.state.history);
             writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
