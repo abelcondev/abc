@@ -3252,6 +3252,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.sendText("Call the MRTR MCP fixture.");
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await tui.sendKeys("1");
+      await tui.waitForText("Current values:", 20_000);
+      await tui.sendKeys("1");
       await tui.waitForText("MRTR TUI boundary complete.", 20_000);
 
       expect(activeGateway.requests).toHaveLength(3);
@@ -3289,7 +3291,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     ] }, input: "2", value: "connect" },
   ]) {
     test.skipIf(!tmuxAvailable())(
-      `the TUI submits a compact MCP ${scenario.name} without a second confirmation`,
+      `the TUI ${scenario.name === "input" ? "reviews a short MCP input" : "submits a compact MCP choice without a second confirmation"}`,
       async () => {
         const root = createRoot(`tui-compact-${scenario.name}`, MODERN_FIXTURE, {
           mode: "mrtr_input_required",
@@ -3307,11 +3309,18 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         await tui.sendText("Call the compact MCP fixture.");
         await tui.waitForText("MCP server fixture requests answer", 20_000);
         const form = await tui.capturePane();
-        expect(form).toContain("Decline");
-        expect(form).toContain("Cancel");
+        if (scenario.name === "choice") {
+          expect(form).toContain("Decline");
+          expect(form).toContain("Cancel");
+        }
         expect(form).not.toContain("Current values:");
-        if (scenario.name === "input") await tui.sendText(scenario.input);
-        else await tui.sendKeys(scenario.input);
+        if (scenario.name === "input") {
+          await tui.sendText(scenario.input);
+          await tui.waitForText("Current values:", 20_000);
+          expect(readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call"))
+            .toHaveLength(1);
+          await tui.sendKeys("1");
+        } else await tui.sendKeys(scenario.input);
         await tui.waitForText("Compact form accepted.", 20_000);
         const wire = readWire(root.wireLogPath);
         const calls = wire.filter((entry) => entry.message.method === "tools/call");
@@ -3528,6 +3537,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await Bun.sleep(6_000);
       await tui.sendKeys("1");
+      await tui.waitForText("Current values:", 20_000);
+      await tui.sendKeys("1");
       await tui.waitForText("MRTR timeout complete.", 20_000);
 
       expect(activeGateway.requests[2]?.body).toContain("continued after elicitation");
@@ -3625,8 +3636,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.sendText("Read the MRTR resource and prompt.");
       await tui.waitForText("MCP server fixture requests detail", 20_000);
       await tui.sendText("resource-detail");
+      await tui.waitForText('- detail: "resource-detail"', 20_000);
+      await tui.sendKeys("1");
       await tui.waitForText("Reason: Choose prompt detail", 20_000);
       await tui.sendText("prompt-detail");
+      await tui.waitForText('- detail: "prompt-detail"', 20_000);
+      await tui.sendKeys("1");
       await tui.waitForText("Feature MRTR continuations complete.", 20_000);
 
       const wire = readWire(root.wireLogPath);

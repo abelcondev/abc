@@ -1488,6 +1488,8 @@ describe("modern MCP Streamable HTTP", () => {
       await tui.sendText("Call the HTTP MCP fixture.");
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await tui.sendKeys("1");
+      await tui.waitForText("Current values:", 20_000);
+      await tui.sendKeys("1");
       await tui.waitForText("HTTP form elicitation complete.", 20_000);
 
       const calls = fixture.requests.filter((entry) =>

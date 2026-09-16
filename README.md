@@ -63,11 +63,10 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
 
-In the interactive shell, simple MCP forms combine input and submission in one prompt.
-A single-choice field with up to three options, a boolean, or a single-line input
-of up to 80 characters submits directly. You can decline, cancel, use a displayed
-default, or skip an optional field. Longer inputs and more complex forms include
-a separate review step.
+In the interactive shell, MCP forms with a single select-one field and up to three
+options combine selection and submission in one prompt. You can decline, cancel,
+use a displayed default, or skip an optional field. Text inputs, numbers, booleans,
+and all other forms include a separate review step.
 
 ## Documentation
 
