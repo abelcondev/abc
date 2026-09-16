@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
@@ -1146,6 +1147,10 @@ pub const StreamRequest = struct {
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// Long-lived pooled HTTP client owned by the provider runtime. When set,
+    /// requests reuse pooled keep-alive connections instead of dialing per
+    /// attempt. Borrowed; must outlive every in-flight stream.
+    shared_pool: ?*http_pool.HttpPool = null,
 };
 
 pub fn streamGatewayCompletion(
@@ -1412,8 +1417,21 @@ fn streamGatewayCompletionCoreWithOptions(
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
+        var local_client: std.http.Client = undefined;
+        const client: *std.http.Client = if (request.shared_pool) |pool|
+            pool.clientFor(request_url)
+        else blk: {
+            local_client = .{ .allocator = alloc, .io = io_mod.getIo() };
+            break :blk &local_client;
+        };
+        defer if (request.shared_pool == null) local_client.deinit();
+        if (request.shared_pool) |pool| {
+            const io = io_mod.getIo();
+            pool.client.connection_pool.mutex.lockUncancelable(io);
+            const free_connections = pool.client.connection_pool.free_len;
+            pool.client.connection_pool.mutex.unlock(io);
+            debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, free_connections });
+        }
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
@@ -1428,10 +1446,10 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
-        var req = openGatewayRequestBounded(&client, uri, .{
+        var req = openGatewayRequestBounded(client, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
-            .keep_alive = false,
+            .keep_alive = request.shared_pool != null,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1579,6 +1597,7 @@ fn streamGatewayCompletionCoreWithOptions(
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
         debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
+        if (request.shared_pool) |pool| pool.noteActivity();
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
         if (response.head.status != .ok) {
@@ -1640,6 +1659,23 @@ fn streamGatewayCompletionCoreWithOptions(
                 err,
             ));
         };
+        if (request.shared_pool != null) {
+            // SSE consumption stops at the terminal event, which can leave
+            // the HTTP body unread; std's Request.deinit marks body-ful
+            // requests closing unless the body drains to the end. Drain so a
+            // cleanly finished stream returns its connection to the pool.
+            const drain_started = io_mod.milliTimestamp();
+            if (body_reader.discardRemaining()) |drained_bytes| {
+                debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=ok bytes={d} elapsed_ms={d}", .{ attempt + 1, drained_bytes, io_mod.milliTimestamp() - drain_started });
+                // The connection returns to the pool NOW, at stream end —
+                // the receiveHead stamp can be a whole stream old, and the
+                // TTL invariant requires last_activity to track the freshest
+                // return, so stamp only on a clean return.
+                request.shared_pool.?.noteActivity();
+            } else |err| {
+                debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=error err={s}", .{ attempt + 1, @errorName(err) });
+            }
+        }
         if (active_connected_watch) |watch| {
             if (watch.finish()) |err| {
                 deinitGatewayCompletion(alloc, &completion);
@@ -2173,6 +2209,13 @@ test "production response head wait accepts slow headers and still expires" {
 
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
     return selectE2eGatewayUrl(io_mod.getenv(env_name), default_url);
+}
+
+/// Chat URL exactly as the request path resolves it, including the E2E
+/// loopback override. Invalid overrides fall back to the default so launch
+/// warming never fails on configuration.
+pub fn resolveChatUrlForWarmup(default_url: []const u8) []const u8 {
+    return resolveE2eGatewayUrl(e2e_gateway_chat_url_env, default_url) catch default_url;
 }
 
 fn selectE2eGatewayUrl(override_url: ?[]const u8, default_url: []const u8) ![]const u8 {
@@ -6682,6 +6725,7 @@ const RequestOpenProbe = struct {
     attempts: usize = 0,
     tls_failure_attempt: ?usize = null,
     delays_ms: [3]i64 = .{ 0, 0, 0 },
+    keep_alive_seen: ?bool = null,
 
     fn requestOpenOverride(self: *@This()) RequestOpenOverride {
         return .{ .ctx = @ptrCast(self), .run = open };
@@ -6697,6 +6741,7 @@ const RequestOpenProbe = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         const attempt_index = self.attempts;
         self.attempts += 1;
+        self.keep_alive_seen = options.keep_alive;
         if (attempt_index < self.delays_ms.len) {
             const delay_ms = self.delays_ms[attempt_index];
             if (delay_ms > 0) {
@@ -6893,6 +6938,85 @@ test "transport-owned TLS setup retries before send" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), probe.attempts);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "shared pool requests keep-alive and never pools server-closed connections" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var probe = RequestOpenProbe{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .request_open_override = probe.requestOpenOverride() },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    try std.testing.expectEqual(true, probe.keep_alive_seen orelse false);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    // The fixture answers with Connection: close; the pool must not retain it.
+    const pool_inner = &pool.client.connection_pool;
+    const zio = io_mod.getIo();
+    pool_inner.mutex.lockUncancelable(zio);
+    const free_len = pool_inner.free_len;
+    pool_inner.mutex.unlock(zio);
+    try std.testing.expectEqual(@as(usize, 0), free_len);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "unpooled requests keep close semantics" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .request_open_override = probe.requestOpenOverride() },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    try std.testing.expectEqual(false, probe.keep_alive_seen orelse true);
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
