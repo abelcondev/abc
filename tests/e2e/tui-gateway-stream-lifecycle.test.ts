@@ -2184,13 +2184,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return fakeGatewayToolCall("list_1", "glob_files", { pattern: "*", path: "." });
         }
         if (responseIndex >= 2 && responseIndex <= 11) {
+          // A 1s hint keeps the ten-failure chain inside the test budget now
+          // that a zero hint falls back to real backoff.
           return new Response(
             JSON.stringify({ error: { message: "route temporarily unavailable" } }),
             {
               status: 503,
               headers: {
                 "content-type": "application/json",
-                "retry-after": "0",
+                "retry-after": "1",
               },
             },
           );
