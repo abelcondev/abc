@@ -7273,7 +7273,11 @@ test "drain waits for a delayed terminal chunk without failing the request" {
     const elapsed = io_mod.milliTimestamp() - started;
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     try std.testing.expect(elapsed >= 450); // fixture holds the terminal chunk for 500 ms
-    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+    try std.testing.expect(elapsed < 15_000);
+    // No pool assertion here: under extreme CI runner load the fixture's
+    // sliced hold can stretch past the drain budget, which by design forfeits
+    // reuse of that connection. Pooling after a normal drain is covered
+    // deterministically by the keep-alive reuse test.
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
