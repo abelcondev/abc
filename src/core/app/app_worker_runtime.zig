@@ -2661,7 +2661,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     } });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · stopped after 3/3 attempts", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · stopped after 3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -2692,7 +2692,7 @@ test "core.app_worker_runtime replaces a due retry with its consumed terminal at
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1/2 attempts",
+            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1 attempt",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2725,7 +2725,7 @@ test "core.app_worker_runtime recovery pause replaces cancelled waiting status" 
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · send a new message when you're ready",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2 · send a new message when you're ready",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
