@@ -4684,6 +4684,14 @@ fn finishRecoveryStalled(
         .required_action = .surface_stall,
         .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
     });
+    // A stall-stopped turn is terminally dead: without clearing the durable
+    // checkpoint, the next resume would auto-continue it and re-spend attempts
+    // on a turn the UI already called stopped.
+    if (deps.recovery_checkpoint) |effect| {
+        effect.clear(deps.ctx) catch |err| {
+            debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
+        };
+    }
     try finalization.finish(.failed, null, null);
     finish_trace.finish("recovery_stalled");
 }
@@ -4710,13 +4718,6 @@ fn restorePromptAfterTerminalFailure(
     job: QueuedPrompt,
     config: Config,
 ) void {
-    // A turn that ends stopped must not resurrect on resume: terminate the
-    // durable recovery checkpoint alongside it. Pauses keep theirs.
-    if (deps.recovery_checkpoint) |effect| {
-        effect.clear(deps.ctx) catch |err| {
-            debug_trace.logf("agent", "recovery checkpoint clear on terminal stop failed err={s}", .{@errorName(err)});
-        };
-    }
     if (config.origin != .root) return;
     if (job.recovery_checkpoint != null) return;
     const restore = deps.restore_failed_prompt orelse return;
