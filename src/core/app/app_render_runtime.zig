@@ -52,6 +52,7 @@ const command_output_runtime = @import("../../ui/transcript/command_output_runti
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const shared_theme = @import("../shared/theme.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const user_message_card = @import("../../ui/assistant/user_message_card.zig");
 
@@ -492,7 +493,21 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             app.pacer.rethemeInlineCode(light);
-            ui_render.initTheme(light, rgb);
+            if (ui_render.explicitThemeName()) |name| {
+                // Custom themes re-resolve on live flips: sibling swap or
+                // builtin fallback, same rule as startup.
+                const custom = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
+                    debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
+                    break :blk null;
+                };
+                if (custom) |resolved| {
+                    ui_render.applyTheme(resolved, rgb);
+                } else {
+                    ui_render.initTheme(light, rgb);
+                }
+            } else {
+                ui_render.initTheme(light, rgb);
+            }
             app.shell.setCommandOutputRenderPolicy(shellStyles());
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);

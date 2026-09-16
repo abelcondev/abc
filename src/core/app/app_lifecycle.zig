@@ -9,6 +9,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -677,12 +678,26 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // surface against it and records the accepted terminal state.
     try cfg.shell.enableShadowVt(cfg.alloc);
 
-    ui_render.setTruecolorSupport(ui_render.truecolorSupportedForValues(
+    const truecolor = ui_render.truecolorSupportedForValues(
         io_mod.getenv("COLORTERM"),
         io_mod.getenv("TERM_PROGRAM"),
-    ));
-    const theme = ui_render.detectTheme(cfg.alloc, cfg.terminal);
-    ui_render.initTheme(theme.light, theme.rgb);
+    );
+    ui_render.setTruecolorSupport(truecolor);
+    const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
+    var custom_theme: ?shared_theme.Theme = null;
+    if (ui_render.explicitThemeName()) |name| {
+        custom_theme = shared_theme.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
+            debug_trace.logf("theme", "custom_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
+            break :blk null;
+        };
+    }
+    if (custom_theme) |resolved| {
+        ui_render.applyTheme(resolved, detected.rgb);
+    } else {
+        ui_render.initTheme(detected.light, detected.rgb);
+    }
+    // Custom themes keep live monitoring: terminal mode flips re-resolve the
+    // theme pair. Only an explicit light/dark pin locks updates out.
     state.theme_monitor_enabled = ui_render.explicitThemeOverride() == null;
 
     const cursor = cfg.terminal.queryCursorPosition() catch blk: {

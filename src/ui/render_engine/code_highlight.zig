@@ -1,4 +1,5 @@
 const std = @import("std");
+const shared_theme = @import("../../core/shared/theme.zig");
 const languages = @import("code_highlight_languages.zig");
 
 const Allocator = std.mem.Allocator;
@@ -10,28 +11,16 @@ pub const Theme = enum {
     light,
 };
 
-const Palette = struct {
-    keyword_style: []const u8,
-    string_style: []const u8,
-    number_style: []const u8,
-    comment_style: []const u8,
-};
+const Palette = shared_theme.SyntaxPalette;
 
-const dark_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;252m",
-    .string_style = "\x1b[38;5;250m",
-    .number_style = "\x1b[38;5;250m",
-    .comment_style = "\x1b[38;5;245m",
-};
-
-const light_palette: Palette = .{
-    .keyword_style = "\x1b[38;5;238m",
-    .string_style = "\x1b[38;5;241m",
-    .number_style = "\x1b[38;5;241m",
-    .comment_style = "\x1b[38;5;243m",
-};
+const dark_palette: Palette = shared_theme.fx_dark.syntax;
+const light_palette: Palette = shared_theme.fx_light.syntax;
 
 fn paletteForTheme(theme: Theme) Palette {
+    const active = shared_theme.current();
+    // When the requested variant matches the active theme, custom themes
+    // contribute their syntax palette; otherwise render the builtin variant.
+    if (active.light == (theme == .light)) return active.syntax;
     return switch (theme) {
         .dark => dark_palette,
         .light => light_palette,

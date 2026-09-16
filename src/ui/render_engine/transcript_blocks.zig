@@ -1005,7 +1005,7 @@ const CodeStyle = struct {
 
     fn applySequence(self: *CodeStyle, sequence: []const u8) void {
         if (sequence.len < 4 or sequence[0] != 0x1b or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') return;
-        if (std.mem.startsWith(u8, sequence, "\x1b[38;5;")) {
+        if (std.mem.startsWith(u8, sequence, "\x1b[38;5;") or std.mem.startsWith(u8, sequence, "\x1b[38;2;")) {
             self.foreground = sequence;
         } else if (std.mem.eql(u8, sequence, "\x1b[39m") or std.mem.eql(u8, sequence, "\x1b[0m")) {
             self.foreground = null;
