@@ -120,6 +120,10 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
 
+## Documentation
+
+Read the [fx documentation](https://fx.sh/docs) for sessions, models, permissions, configuration, and the full CLI and slash command references.
+
 ## Slack workspace installation
 
 Run `fx slack install` to install the fx bot in the configured Vercel Slack
@@ -136,10 +140,6 @@ installation again. This workspace operation is separate from each employee's
 existing MCP user authorization. Bot installation does not establish whether
 Slack will display a hoverable “Sent using @fx” attribution; that requires a
 live message test.
-
-## Documentation
-
-Read the [fx documentation](https://fx.sh/docs) for sessions, models, permissions, configuration, and the full CLI and slash command references.
 
 ## Build from source
 
