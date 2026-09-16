@@ -658,7 +658,6 @@ pub const Runtime = struct {
                 .idle, .finished, .interrupted => {},
             }
             var result = try self.completeManagedResult(alloc, child_id, work_id, observation);
-            errdefer alloc.free(result.body);
             if (status.sink != null) attachStatusPresentation(alloc, &result, status.current(observation.metrics));
             self.removeYielded(child_id, work_id);
             return result;
@@ -879,7 +878,8 @@ pub const Runtime = struct {
             defer state.deinit(alloc);
             model = try alloc.dupe(u8, state.preferences.model);
             effort = state.preferences.effort;
-        } else |_| {
+        } else |err| {
+            debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
             model = try alloc.dupe(u8, fallback.model);
             effort = fallback.effort;
         }
