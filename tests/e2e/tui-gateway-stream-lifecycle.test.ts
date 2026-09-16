@@ -1545,7 +1545,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           'data: {"type":"tool-input-delta","id":"interrupted-read","delta":"{\\"path\\":\\"notes"}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         ),
-        ...Array.from({ length: 9 }, () => () => retryAfterUnavailable(0)),
+        ...Array.from({ length: 9 }, () => () => retryAfterUnavailable(1)),
         () => fakeGatewayFinalText("AFTER_NETWORK_RECOVERY"),
         () => fakeGatewayFinalText("LATER_PROMPT_OK"),
       ],
@@ -2408,7 +2408,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-recovery-continue-",
         [
-          ...Array.from({ length: 10 }, () => retryAfterUnavailable(0)),
+          ...Array.from({ length: 10 }, () => retryAfterUnavailable(1)),
           () => heldGatewayResponse(continued, [], [
             { type: "text-delta", id: "answer_1", delta: finalText },
             { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
@@ -2571,7 +2571,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-tool-lifecycle-",
         [
           fakeGatewayToolCall("read_before_pause", "read_file", { path: "before.txt" }),
-          ...Array.from({ length: 10 }, () => retryAfterUnavailable(0)),
+          ...Array.from({ length: 10 }, () => retryAfterUnavailable(1)),
           fakeGatewayToolCall("read_after_pause", "read_file", { path: "after.txt" }),
           fakeGatewayFinalText(finalText),
         ],
@@ -2607,7 +2607,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const finalText = "Fast identity recovery completed.";
       const responses: FakeGatewayResponse[] = [];
       for (let index = 0; index < 10; index += 1) {
-        responses.push(retryAfterUnavailable(0));
+        responses.push(retryAfterUnavailable(1));
       }
       responses.push(fakeGatewayFinalText(finalText));
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
@@ -2782,7 +2782,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-partial-continue-",
         [
           partialEofResponse(partialText),
-          ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
+          ...Array.from({ length: 9 }, () => retryAfterUnavailable(1)),
           fakeGatewayFinalText(finalText),
         ],
       );

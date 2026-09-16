@@ -1407,6 +1407,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .recovery_checkpoint = if (session.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
@@ -2138,6 +2139,20 @@ fn setRecoveryCheckpoint(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
+    );
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
     );
     if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }

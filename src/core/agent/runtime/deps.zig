@@ -34,6 +34,9 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+    /// Terminally dead turns clear the durable checkpoint so a later resume
+    /// cannot resurrect a turn the product already called stopped.
+    clear: *const fn (ctx: *anyopaque) anyerror!void,
 };
 
 /// Presentation only. Called outside history publication's worker critical section.

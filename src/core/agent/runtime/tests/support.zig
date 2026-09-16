@@ -665,6 +665,7 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_clears: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     pause_on_auto_retry_attempt: ?usize = null,
@@ -779,6 +780,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             } else null,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -807,6 +809,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .usage = self.usage,
             .usage_allocator = self.alloc,
         };
+    }
+
+    fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_checkpoint_clears += 1;
     }
 
     fn setRecoveryCheckpoint(

@@ -2085,6 +2085,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
@@ -3023,6 +3024,19 @@ fn setRecoveryCheckpoint(
         now_ms,
     );
     ctx.prompt_snapshot_committed = true;
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
+    );
 }
 
 fn flushAskSessionUsage(

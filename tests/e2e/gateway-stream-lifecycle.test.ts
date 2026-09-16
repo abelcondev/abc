@@ -9010,7 +9010,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");
     const responses = [
-      ...Array.from({ length: 12 }, () => unavailableResponse("0")),
+      ...Array.from({ length: 12 }, () => unavailableResponse("1")),
       fakeGatewayFinalText("Recovered beyond the old budget."),
     ];
     const gateway = startGateway(() =>

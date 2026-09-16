@@ -334,6 +334,7 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.writable != null)
                         .{
                             .set = agentSetRecoveryCheckpoint,
+                            .clear = agentClearRecoveryCheckpoint,
                         }
                     else
                         null
@@ -1115,6 +1116,11 @@ pub fn Bindings(comptime App: type) type {
         ) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
+        }
+
+        fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
         }
 
         fn agentPersistUsageCheckpoint(

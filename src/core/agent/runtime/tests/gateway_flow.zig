@@ -7057,6 +7057,30 @@ test "processQueuedPrompt stops replay-safe ReadFailed when identical failures s
     try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
 }
 
+test "processQueuedPrompt stall stop terminates the durable checkpoint" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .stream_error = error.ReadFailed },
+        .{ .stream_error = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // A turn the UI calls stopped is stopped on disk too: without the clear,
+    // a later resume resurrects it and re-spends attempts (and the restored
+    // composer prompt is gone by then).
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+}
+
 test "processQueuedPrompt replaces retry status after a different stream error" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{

@@ -4710,6 +4710,13 @@ fn restorePromptAfterTerminalFailure(
     job: QueuedPrompt,
     config: Config,
 ) void {
+    // A turn that ends stopped must not resurrect on resume: terminate the
+    // durable recovery checkpoint alongside it. Pauses keep theirs.
+    if (deps.recovery_checkpoint) |effect| {
+        effect.clear(deps.ctx) catch |err| {
+            debug_trace.logf("agent", "recovery checkpoint clear on terminal stop failed err={s}", .{@errorName(err)});
+        };
+    }
     if (config.origin != .root) return;
     if (job.recovery_checkpoint != null) return;
     const restore = deps.restore_failed_prompt orelse return;
@@ -7413,7 +7420,7 @@ fn processQueuedPromptLoop(
                     pending_auto_retry_status = null;
                     return;
                 }
-                const failure_progress = stream_ctx.raw_text.items.len;
+                const failure_progress = stream_ctx.streamed_output_bytes;
                 if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
                 const had_previous_progress = recovery_last_progress != null;
                 if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
@@ -7446,10 +7453,13 @@ fn processQueuedPromptLoop(
                         ),
                         .cancelled = cancel_requested,
                         .progress = progress_evidence,
-                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started|
-                            @intCast((io_mod.milliTimestamp() - started) * std.time.ns_per_ms)
-                        else
-                            null,
+                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started| blk: {
+                            // Wall-clock deltas can go negative under NTP
+                            // correction; a backward step reads as zero
+                            // elapsed, never a trap.
+                            const delta_ms = io_mod.milliTimestamp() - started;
+                            break :blk if (delta_ms <= 0) 0 else @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+                        } else null,
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
@@ -7463,11 +7473,7 @@ fn processQueuedPromptLoop(
                     };
                 }
                 // Connectivity waits and liveness probes reserve no provider
-                // attempt (they transmit nothing billable) but still continue
-                // the turn automatically.
-                const will_auto_retry = recovery_decision.reserve_provider_attempt or
-                    recovery_decision.strategy == .wait_for_connectivity or
-                    recovery_decision.strategy == .probe_liveness;
+                const will_auto_retry = recovery_decision.autoRecovers();
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -7606,6 +7612,16 @@ fn processQueuedPromptLoop(
                             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                         }
                         continue :agent_steps_loop;
+                    }
+                    // User-cancelled during recovery: the checkpoint dies with
+                    // the turn, or the next resume would resurrect a turn the
+                    // user explicitly stopped.
+                    if (recovery_strategy != null) {
+                        if (deps.recovery_checkpoint) |effect| {
+                            effect.clear(deps.ctx) catch |clear_err| {
+                                debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(clear_err)});
+                            };
+                        }
                     }
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
@@ -7996,7 +8012,15 @@ fn processQueuedPromptLoop(
                 );
                 // HTTP-status failures (5xx, 429) carry no stream progress, so
                 // they are exempt from the no-progress detector and keep
-                // retrying patiently.
+                // retrying patiently. The billable retry window still applies:
+                // past it, the cadence throttles instead of hammering.
+                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                const recovery_elapsed_ns: u64 = blk: {
+                    const started = recovery_started_at_ms.?;
+                    const delta_ms = io_mod.milliTimestamp() - started;
+                    if (delta_ms <= 0) break :blk 0;
+                    break :blk @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+                };
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -8010,6 +8034,7 @@ fn processQueuedPromptLoop(
                     ),
                     .retry_after_seconds = failure.retry_after_seconds,
                     .cancelled = config.cancel_flag.load(.seq_cst),
+                    .recovery_elapsed_ns = recovery_elapsed_ns,
                 });
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
@@ -8328,7 +8353,7 @@ fn processQueuedPromptLoop(
                 // Interrupted streams and provider-error completions carry
                 // progress evidence; bare HTTP status failures (5xx, 429) and
                 // gateway timeout metadata are exempt from the stall detector.
-                const failure_progress = partial_assistant.len;
+                const failure_progress = stream_ctx.streamed_output_bytes;
                 const track_progress = cause == .response_interrupted or
                     (attempt_disposition == .provider_failure and cause == .provider_unavailable);
                 if (track_progress) {
@@ -8359,10 +8384,13 @@ fn processQueuedPromptLoop(
                             .stalled
                         else
                             .unknown,
-                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started|
-                            @intCast((io_mod.milliTimestamp() - started) * std.time.ns_per_ms)
-                        else
-                            null,
+                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started| blk: {
+                            // Wall-clock deltas can go negative under NTP
+                            // correction; a backward step reads as zero
+                            // elapsed, never a trap.
+                            const delta_ms = io_mod.milliTimestamp() - started;
+                            break :blk if (delta_ms <= 0) 0 else @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+                        } else null,
                     });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
@@ -8440,9 +8468,7 @@ fn processQueuedPromptLoop(
                     restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
-                const decision_auto_recovers = decision.reserve_provider_attempt or
-                    decision.strategy == .wait_for_connectivity or
-                    decision.strategy == .probe_liveness;
+                const decision_auto_recovers = decision.autoRecovers();
                 if (decision_auto_recovers) {
                     if (route_changed and decision.reserve_provider_attempt) {
                         try persistRecoveryCheckpoint(

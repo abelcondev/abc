@@ -416,6 +416,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = .{
             .set = setRecoveryCheckpoint,
+            .clear = clearRecoveryCheckpoint,
         },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
@@ -905,6 +906,11 @@ fn setRecoveryCheckpoint(
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
+}
+
+fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.clearRecoveryCheckpoint(io_mod.milliTimestamp());
 }
 
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {

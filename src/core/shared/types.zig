@@ -392,7 +392,7 @@ pub const ModelFailureDiagnostic = struct {
     /// User-facing phrasing for machine error names. Provider-supplied text
     /// passes through unchanged; only known transport error identifiers are
     /// translated. Raw names stay available in trace logs.
-    pub fn humanText(self: *const ModelFailureDiagnostic) []const u8 {
+    fn humanText(self: *const ModelFailureDiagnostic) []const u8 {
         const raw = self.view();
         const pairs = .{
             .{ "ReadFailed", "connection dropped" },

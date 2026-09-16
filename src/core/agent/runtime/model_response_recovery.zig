@@ -5,8 +5,8 @@ pub const max_retry_after_seconds: u64 = 30;
 /// Past this much total recovery time, billable retries throttle to once a
 /// minute and the UI shows a patient "still trying" state instead of attempt
 /// counters. The turn never dies from transient failure.
-pub const billable_retry_window_ns: u64 = 15 * 60 * std.time.ns_per_s;
-pub const throttled_retry_delay_ns: u64 = 60 * std.time.ns_per_s;
+const billable_retry_window_ns: u64 = 15 * 60 * std.time.ns_per_s;
+const throttled_retry_delay_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FailureCause = enum {
     /// The network path is provably down (connection refused, unreachable,
@@ -73,7 +73,9 @@ pub const RetryPacingState = union(enum) {
         cause: FailureCause,
         retry_after_seconds: ?u64,
     ) RetryPacingState {
-        if (retry_after_seconds != null) return .idle;
+        // A zero or missing server hint carries no useful information; a
+        // failing endpoint saying "retry instantly" must not disable backoff.
+        if (retry_after_seconds != null and retry_after_seconds.? > 0) return .idle;
         return switch (self) {
             .idle => .{ .implicit = .{ .cause = cause, .attempt = 1 } },
             .implicit => |previous| if (previous.cause == cause)
@@ -136,6 +138,15 @@ pub const Decision = struct {
     /// True once recovery runs longer than the billable window: delays floor at
     /// one minute so billable retransmission throttles without the turn dying.
     throttled: bool = false,
+
+    /// The turn keeps working without asking anyone. Probes and connectivity
+    /// waits transmit nothing, so they recover without spending the attempt
+    /// budget; ordinary retries reserve one.
+    pub fn autoRecovers(self: Decision) bool {
+        return self.reserve_provider_attempt or
+            self.strategy == .wait_for_connectivity or
+            self.strategy == .probe_liveness;
+    }
 };
 
 /// Pure model-response policy. It describes the next effect but never sleeps,
@@ -221,6 +232,10 @@ pub noinline fn decide(evidence: Evidence) Decision {
     );
     const throttled = evidence.recovery_elapsed_ns orelse 0 > billable_retry_window_ns;
     const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
+        if (seconds == 0) break :blk switch (next_pacing) {
+            .idle => unreachable,
+            .implicit => |pacing| retryDelayNs(pacing.attempt),
+        };
         const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
         break :blk bounded_seconds * std.time.ns_per_s;
     } else if (throttled)
@@ -241,7 +256,7 @@ pub noinline fn decide(evidence: Evidence) Decision {
 /// Connectivity probe cadence after `attempt` consecutive connectivity
 /// failures: 1 s, 2 s, then 5 s flat. Probes transmit nothing, so the cadence
 /// exists to keep the UI calm and the loop cheap, not to protect a provider.
-pub fn connectivityProbeDelayNs(attempt: usize) u64 {
+fn connectivityProbeDelayNs(attempt: usize) u64 {
     if (attempt <= 1) return std.time.ns_per_s;
     if (attempt == 2) return 2 * std.time.ns_per_s;
     return 5 * std.time.ns_per_s;
@@ -271,6 +286,14 @@ pub fn shouldDisableFastRoute(
     replay_safe: bool,
 ) bool {
     return fast_mode and cause == .provider_unavailable and replay_safe;
+}
+
+test "fast fallback is limited to replay safe provider outages" {
+    try std.testing.expect(shouldDisableFastRoute(true, .provider_unavailable, true));
+    try std.testing.expect(!shouldDisableFastRoute(false, .provider_unavailable, true));
+    try std.testing.expect(!shouldDisableFastRoute(true, .provider_unavailable, false));
+    try std.testing.expect(!shouldDisableFastRoute(true, .rate_limited, true));
+    try std.testing.expect(!shouldDisableFastRoute(true, .transport_interrupted, true));
 }
 
 test "model response recovery policy is deterministic and never pauses transient failure" {
@@ -528,14 +551,37 @@ test "implicit retry pacing is independent from the shared attempt budget" {
         provider_failure.delay_ns,
     );
 
-    const explicitly_timed = decide(.{
+    // A zero server hint carries no timing information: implicit pacing keeps
+    // backing off instead of an instant retry. An endpoint failing with
+    // retry-after: 0 must not produce a zero-delay request flood.
+    const zero_hinted = decide(.{
         .cause = .provider_unavailable,
         .delivery = .possibly_sent,
         .attempts = .{ .consumed = 9 },
         .pacing = provider_failure.next_pacing,
         .retry_after_seconds = 0,
     });
-    try std.testing.expectEqual(@as(u64, 0), explicitly_timed.delay_ns);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), zero_hinted.delay_ns);
+    try std.testing.expect(std.meta.activeTag(zero_hinted.next_pacing) == .implicit);
+
+    const zero_hinted_again = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 10 },
+        .pacing = zero_hinted.next_pacing,
+        .retry_after_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), zero_hinted_again.delay_ns);
+
+    // A positive server hint still wins and resets pacing, as before.
+    const explicitly_timed = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 11 },
+        .pacing = zero_hinted_again.next_pacing,
+        .retry_after_seconds = 4,
+    });
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_s), explicitly_timed.delay_ns);
     try std.testing.expectEqual(RetryPacingState.idle, explicitly_timed.next_pacing);
 }
 

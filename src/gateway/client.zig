@@ -832,9 +832,6 @@ const ConnectedRequestWatch = struct {
     /// project's portable atomic wrapper (wide atomics do not exist there);
     /// millisecond precision is ample for second-scale stall thresholds.
     last_progress_ms: atomic_value.Value(i64) = .init(0),
-    /// Set once when a patient head-wait passes the configured threshold; the
-    /// wait itself continues until data, a dead socket, cancel, or resume.
-    head_wait_exceeded: std.atomic.Value(bool) = .init(false),
     timing: ResponseHeadTiming,
 
     fn init(timing: ResponseHeadTiming) ConnectedRequestWatch {
@@ -922,7 +919,10 @@ const ConnectedRequestWatch = struct {
     }
 
     fn markStreamProgress(self: *ConnectedRequestWatch) void {
-        self.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
+        // Both writer and reader use the monotonic awake clock; mixing in the
+        // wall clock would make the elapsed subtraction permanently negative.
+        const now_ns = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.toNanoseconds();
+        self.last_progress_ms.store(@intCast(@divFloor(now_ns, std.time.ns_per_ms)), .seq_cst);
     }
 
     /// Positive-evidence stall: the head arrived, then the stream went silent
@@ -935,8 +935,9 @@ const ConnectedRequestWatch = struct {
         if (self.phase.load(.seq_cst) != .streaming) return false;
         const last = self.last_progress_ms.load(.seq_cst);
         if (last == 0) return false;
-        const elapsed = now.raw.toNanoseconds() - last * std.time.ns_per_ms;
-        return elapsed >= @as(i128, self.timing.stall_timeout_ms) * std.time.ns_per_ms;
+        const now_ms: i64 = @intCast(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms));
+        const elapsed = now_ms - last;
+        return elapsed >= self.timing.stall_timeout_ms;
     }
 
     fn win_stall_timeout(self: *ConnectedRequestWatch) bool {
@@ -953,12 +954,10 @@ const ConnectedRequestWatch = struct {
         now: std.Io.Clock.Timestamp,
     ) bool {
         if (self.timing.patient) {
-            // Patient head-wait never aborts. Mark the threshold once so the
-            // UI can say so; the wait ends only with data, a dead socket,
-            // cancel, or system resume.
+            // Patient head-wait never aborts. The wait ends only with data,
+            // a dead socket, cancel, or system resume.
             if (self.phase.load(.seq_cst) != .awaiting_head) return false;
             if (std.Io.Clock.Timestamp.compare(now, .lt, self.response_head_deadline)) return false;
-            self.head_wait_exceeded.store(true, .seq_cst);
             return false;
         }
         if (self.phase.load(.seq_cst) != .awaiting_head) return false;
@@ -1226,9 +1225,6 @@ pub const StreamRequest = struct {
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
-    /// Overrides the model-class default stall watchdog threshold (ms) for the
-    /// streaming path. Null uses `defaultStallTimeoutMs(model)`.
-    stall_timeout_ms: ?i64 = null,
 };
 
 pub fn streamGatewayCompletion(
@@ -1449,8 +1445,7 @@ fn streamGatewayCompletionCore(
                 // silence alone never aborts a sent request. Mid-stream stalls
                 // still get positive-evidence detection via the stall watchdog.
                 .patient = true,
-                .stall_timeout_ms = request.stall_timeout_ms orelse
-                    defaultStallTimeoutMs(request.model),
+                .stall_timeout_ms = defaultStallTimeoutMs(request.model),
             },
         },
     );
@@ -1459,7 +1454,7 @@ fn streamGatewayCompletionCore(
 /// Mid-stream stall patience by model class. Long-thinking models routinely
 /// produce multi-minute gaps between reasoning events, so their threshold is
 /// an order of magnitude wider than the default one-minute stall window.
-pub fn defaultStallTimeoutMs(model: []const u8) i64 {
+fn defaultStallTimeoutMs(model: []const u8) i64 {
     const thinking_markers = [_][]const u8{ "-pro", "thinking", "o3", "o4", "opus", "-r1" };
     for (thinking_markers) |marker| {
         if (std.mem.find(u8, model, marker) != null) return 600_000;
@@ -2270,6 +2265,27 @@ test "connected request watch disarms timeout at response head" {
     try std.testing.expect(watch.commit_response_head() == null);
     try std.testing.expect(!watch.win_response_head_timeout());
     try std.testing.expect(watch.finish() == null);
+}
+
+test "stream stall watchdog fires with production clocks" {
+    var watch = ConnectedRequestWatch.init(.{ .stall_timeout_ms = 50 });
+    // t0 precedes the progress mark, so elapsed never exceeds the synthetic
+    // gap regardless of millisecond-boundary rounding.
+    const t0 = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expect(watch.arm_response_head() == null);
+    try std.testing.expect(watch.commit_response_head() == null);
+    const before_expiry = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = t0.raw.addDuration(.fromMilliseconds(1)),
+    };
+    try std.testing.expect(!watch.stream_stall_expired(before_expiry));
+    const past_expiry = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = t0.raw.addDuration(.fromMilliseconds(100)),
+    };
+    try std.testing.expect(watch.stream_stall_expired(past_expiry));
+    try std.testing.expect(watch.win_stall_timeout());
+    try std.testing.expectEqual(error.StreamStalled, watch.finish().?);
 }
 
 test "production response head wait accepts slow headers and still expires" {

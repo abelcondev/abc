@@ -2448,6 +2448,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn clearRecoveryCheckpoint(app: *App) !void {
+            if (comptime !@hasField(App, "session_persistence")) {
+                return error.SessionPersistenceUnavailable;
+            }
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            if (loaded.state.recovery_checkpoint == null) return;
+            _ = try loaded.appendEvent(
+                app.alloc,
+                .{ .recovery_checkpoint_cleared = .{} },
+                io_mod.milliTimestamp(),
+            );
+        }
+
         pub fn snapshotRecoveryCheckpoint(
             app: *App,
             alloc: Allocator,
