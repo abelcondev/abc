@@ -2049,9 +2049,8 @@ pub fn Runtime(comptime App: type) type {
 
         /// Warms the session catalog in the background right after interactive
         /// startup, so the first picker open can paint from memory instead of
-        /// waiting for a scan. Runs only when a persisted catalog exists — a
-        /// profile that has never listed sessions has nothing worth warming,
-        /// and picker-free flows like --continue must not pay for discovery.
+        /// waiting for a scan. Runs only when a persisted catalog exists: a
+        /// profile that has never listed sessions has nothing worth warming.
         /// A picker opened while the preload is in flight adopts that scan as
         /// its own; the completed scan lands in the in-memory catalog cache
         /// through the ordinary poll path.
