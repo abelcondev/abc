@@ -243,5 +243,4 @@ test "file index cache round trips and rejects tampering" {
     // An empty scan deletes the persisted index rather than serving ghosts.
     try saveTo(alloc, home, &roots, &.{});
     try std.testing.expect((try loadFrom(alloc, home, &roots)) == null);
-    std.debug.print("cache test end\n", .{});
 }
