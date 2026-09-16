@@ -88,17 +88,14 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
-/// Writes one full-only transcript record for an admitted route recovery
-/// transition. The footer status is transient; this preserves retry and
-/// failure history in the ctrl+o full transcript.
-fn recordRouteRecoveryNotice(
-    handlers: WorkerEventHandlers,
-    status: types.RouteRecoveryStatus,
-) !void {
+/// Writes one full-detail record for an admitted route recovery transition.
+/// The footer status is transient; this preserves retry and failure history
+/// in the ctrl+o full transcript's detail section.
+fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try writeRouteRecoveryBody(&body.writer, status);
-    try handlers.semantic_notice(handlers.ctx, .{
+    try app.shell.appendFullDetailRecord(app.alloc, .{
         .topic = "recovery",
         .tone = routeRecoveryNoticeTone(status),
         .body = body.written(),
@@ -389,6 +386,7 @@ pub fn Runtime(comptime App: type) type {
                 .assistant_presentation,
                 .open_model_picker,
                 .semantic_notice,
+                .full_detail_record,
                 .command_output,
                 .turn_token_update,
                 .turn_phase_update,
@@ -1114,6 +1112,9 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
+                    .full_detail_record => |notice| {
+                        try app.shell.appendFullDetailRecord(app.alloc, notice);
+                    },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
@@ -1122,7 +1123,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
                         app.shell.render_requests.request(.footer);
-                        try recordRouteRecoveryNotice(handlers, status);
+                        try recordRouteRecoveryNotice(app, status);
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
@@ -1719,6 +1720,10 @@ const FakeShell = struct {
     fn appendRawTranscriptEntry(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8) !u32 {
         try self.raw_entries.append(alloc, try alloc.dupe(u8, line));
         return @intCast(self.raw_entries.items.len);
+    }
+
+    fn appendFullDetailRecord(self: *FakeShell, alloc: std.mem.Allocator, notice: types.SemanticNotice) !void {
+        return self.lifecycle.appendFullDetailRecord(alloc, notice);
     }
 
     fn appendRawTranscriptEntryClassified(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8, class: transcript_runtime.RawEntryClass) !u32 {
@@ -2806,48 +2811,9 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
-const RouteRecoveryNoticeCapture = struct {
-    app: *FakeApp,
-    notices: std.ArrayList(CapturedNotice) = .empty,
-
-    const CapturedNotice = struct {
-        topic: []u8,
-        body: []u8,
-        tone: types.NoticeTone,
-        visibility: types.NoticeVisibility,
-    };
-
-    fn deinit(self: *RouteRecoveryNoticeCapture) void {
-        for (self.notices.items) |captured| {
-            self.app.alloc.free(captured.topic);
-            self.app.alloc.free(captured.body);
-        }
-        self.notices.deinit(self.app.alloc);
-    }
-
-    fn notice(raw: *anyopaque, semantic_notice: types.SemanticNotice) !void {
-        const self: *RouteRecoveryNoticeCapture = @ptrCast(@alignCast(raw));
-        try self.notices.append(self.app.alloc, .{
-            .topic = try self.app.alloc.dupe(u8, semantic_notice.topic),
-            .body = try self.app.alloc.dupe(u8, semantic_notice.body),
-            .tone = semantic_notice.tone,
-            .visibility = semantic_notice.visibility,
-        });
-    }
-
-    fn handlers(self: *RouteRecoveryNoticeCapture) WorkerEventHandlers {
-        var bridge = NoopBridge.handlers(self.app);
-        bridge.ctx = @ptrCast(self);
-        bridge.semantic_notice = notice;
-        return bridge;
-    }
-};
-
-test "core.app_worker_runtime records admitted route recovery as a full-only notice" {
+test "core.app_worker_runtime records admitted route recovery as a full-detail record" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    var capture = RouteRecoveryNoticeCapture{ .app = &app };
-    defer capture.deinit();
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .auto_retry,
@@ -2856,45 +2822,43 @@ test "core.app_worker_runtime records admitted route recovery as a full-only not
         .cause = .rate_limited,
         .delay_seconds = 4,
     } });
-    try Runtime(FakeApp).tick(&app, capture.handlers());
+    try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    const notice = capture.notices.items[0];
-    try std.testing.expectEqualStrings("recovery", notice.topic);
-    try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
-    try std.testing.expect(std.mem.find(u8, notice.body, "retrying request") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "kind: auto_retry") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "cause: rate_limited") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "attempt: 1/3") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "retry delay: 4s") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
+    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
+    try std.testing.expectEqualStrings("recovery", record.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, record.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
+    try std.testing.expect(std.mem.find(u8, record.body, "retrying request") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "kind: auto_retry") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 1/3") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "retry delay: 4s") != null);
+    // The record stays out of the transcript entry store.
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
 }
 
 test "core.app_worker_runtime records recovered route status with success tone" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    var capture = RouteRecoveryNoticeCapture{ .app = &app };
-    defer capture.deinit();
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .auto_recovered,
         .succeeded_attempt = 2,
         .attempt_limit = 3,
     } });
-    try Runtime(FakeApp).tick(&app, capture.handlers());
+    try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    const notice = capture.notices.items[0];
-    try std.testing.expectEqual(types.NoticeTone.success, notice.tone);
-    try std.testing.expect(std.mem.find(u8, notice.body, "recovered") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "attempt: 2/3") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
+    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
+    try std.testing.expectEqual(types.NoticeTone.success, record.tone);
+    try std.testing.expect(std.mem.find(u8, record.body, "recovered") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2/3") != null);
 }
 
 test "core.app_worker_runtime skips the recovery record for statuses dropped by cancellation" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    var capture = RouteRecoveryNoticeCapture{ .app = &app };
-    defer capture.deinit();
 
     app.worker.processing = true;
     app.worker.worker_cancel_requested.store(true, .seq_cst);
@@ -2904,8 +2868,8 @@ test "core.app_worker_runtime skips the recovery record for statuses dropped by 
         .failed_attempt = 1,
         .attempt_limit = 3,
     } });
-    try Runtime(FakeApp).tick(&app, capture.handlers());
-    try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
+    try tickNoop(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
 }
 
 test "writeRouteRecoveryBody omits absent facts" {

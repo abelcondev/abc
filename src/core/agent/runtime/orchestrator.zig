@@ -4011,9 +4011,9 @@ fn writeNetworkRecordBody(
     }
 }
 
-/// Publishes one full-only transcript record per settled provider request so
-/// the ctrl+o full transcript carries network call outcomes that the footer
-/// only shows transiently. Publication failure never fails the turn.
+/// Publishes one full-detail record per settled provider request so the
+/// ctrl+o full transcript carries network call outcomes that the footer only
+/// shows transiently. Publication failure never fails the turn.
 fn pushNetworkRecord(
     deps: *const AgentRuntimeDeps,
     provider: model_provider.ProviderId,
@@ -4021,7 +4021,6 @@ fn pushNetworkRecord(
     started_ms: i64,
     result: *const runtime_gateway_step.StreamResult,
 ) void {
-    const push = deps.push_interactive_notice orelse return;
     const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
@@ -4029,12 +4028,19 @@ fn pushNetworkRecord(
         debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
         return;
     };
-    push(deps.ctx, .{
+    // The event channel owns its payload: dupe before transfer, free on
+    // publication failure.
+    const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
         .topic = "network",
         .tone = if (streamSucceeded(result.*)) .neutral else .warning,
         .body = body.written(),
         .visibility = .full_only,
     }) catch |err| {
+        debug_trace.logf("agent", "network record allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
+        types.freeSemanticNotice(std.heap.c_allocator, owned);
         debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
     };
 }

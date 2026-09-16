@@ -574,6 +574,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
+    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -687,6 +688,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.system_notices);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
+        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
+        self.full_detail_records.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -1632,6 +1635,12 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         switch (event) {
+            .full_detail_record => |notice| {
+                const owned = try types.dupeSemanticNotice(self.alloc, notice);
+                errdefer types.freeSemanticNotice(self.alloc, owned);
+                try self.full_detail_records.append(self.alloc, owned);
+                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            },
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1746,34 +1755,6 @@ pub const FakeAgentRuntimeDeps = struct {
         errdefer types.freeSemanticNotice(self.alloc, owned);
         try self.record("interactive_notice:{s}:{s}", .{ notice.topic, notice.body });
         try self.interactive_notices.append(self.alloc, owned);
-    }
-
-    /// Borrowed views of captured interactive notices that match the topic.
-    /// The slice is caller-owned; the notices stay owned by the fixture.
-    pub fn interactiveNoticesWithTopic(
-        self: *const FakeAgentRuntimeDeps,
-        alloc: Allocator,
-        topic: []const u8,
-    ) ![]types.SemanticNotice {
-        var matching: std.ArrayList(types.SemanticNotice) = .empty;
-        errdefer matching.deinit(alloc);
-        for (self.interactive_notices.items) |notice| {
-            if (std.mem.eql(u8, notice.topic, topic)) try matching.append(alloc, notice);
-        }
-        return matching.toOwnedSlice(alloc);
-    }
-
-    pub fn interactiveNoticesExcept(
-        self: *const FakeAgentRuntimeDeps,
-        alloc: Allocator,
-        excluded_topic: []const u8,
-    ) ![]types.SemanticNotice {
-        var matching: std.ArrayList(types.SemanticNotice) = .empty;
-        errdefer matching.deinit(alloc);
-        for (self.interactive_notices.items) |notice| {
-            if (!std.mem.eql(u8, notice.topic, excluded_topic)) try matching.append(alloc, notice);
-        }
-        return matching.toOwnedSlice(alloc);
     }
 
     fn contextNotice(raw: *anyopaque, text: []const u8) !void {
