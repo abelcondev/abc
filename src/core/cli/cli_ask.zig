@@ -24,6 +24,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const http_pool = @import("../shared/http_pool.zig");
+const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
@@ -1472,6 +1474,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     defer startup.deinit(alloc);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
+    // Bind gateway chat traffic to a per-process connection pool and warm one
+    // connection in the background while the rest of startup continues.
+    var gateway_pool: ?*http_pool.HttpPool = null;
+    defer if (gateway_pool) |pool| {
+        if (pool.deinit() == .destroyed) alloc.destroy(pool);
+    };
+    if (io_mod.getenv("FX_BENCH") == null and startup.provider == .gateway) {
+        if (alloc.create(http_pool.HttpPool)) |pool| {
+            pool.* = http_pool.HttpPool.init(alloc);
+            gateway_pool = pool;
+            if (cfg.provider_set.gateway.agent_stream) |stream| {
+                var stamped = stream;
+                stamped.context = pool;
+                cfg.provider_set.gateway.agent_stream = stamped;
+            }
+            pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
+        } else |_| {}
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
