@@ -185,6 +185,19 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
+    // A stalled exchange (identical failure, identical progress, repeatedly) is
+    // a broken response, not a flaky network. Stop instead of restarting the
+    // same failure forever. Scoped to stream evidence: bare status failures
+    // (5xx) carry no progress information and keep retrying patiently. Checked
+    // before the silence probe: repeated hangs at the same byte offset are not
+    // ambiguous, so probing them forever would defeat the stall detector.
+    if (evidence.progress == .stalled) {
+        return .{
+            .strategy = .stop,
+            .required_action = .surface_stall,
+        };
+    }
+
     // Silence is never a retry trigger. Probe the liveness channel first, on a
     // paced cadence so a provider that always times out cannot hot-loop.
     if (evidence.cause == .provider_stream_timeout) {
@@ -204,17 +217,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
-    // A stalled exchange (identical failure, identical progress, repeatedly) is
-    // a broken response, not a flaky network. Stop instead of restarting the
-    // same failure forever. Scoped to stream evidence: bare status failures
-    // (5xx) carry no progress information and keep retrying patiently.
-    if (evidence.progress == .stalled) {
-        return .{
-            .strategy = .stop,
-            .required_action = .surface_stall,
-        };
-    }
-
     const strategy: Strategy = if (evidence.delivery == .definitely_unsent)
         .retry_request
     else switch (evidence.tool) {
@@ -231,13 +233,17 @@ pub noinline fn decide(evidence: Evidence) Decision {
         evidence.retry_after_seconds,
     );
     const throttled = evidence.recovery_elapsed_ns orelse 0 > billable_retry_window_ns;
+    // A positive server hint bounds the wait from below, but never below the
+    // throttled floor: a misbehaving endpoint retrying "in 1s" forever must
+    // not defeat the billable-spend throttle.
     const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
         if (seconds == 0) break :blk switch (next_pacing) {
             .idle => unreachable,
             .implicit => |pacing| retryDelayNs(pacing.attempt),
         };
         const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
-        break :blk bounded_seconds * std.time.ns_per_s;
+        const hinted_ns = bounded_seconds * std.time.ns_per_s;
+        break :blk if (throttled) @max(hinted_ns, throttled_retry_delay_ns) else hinted_ns;
     } else if (throttled)
         throttled_retry_delay_ns
     else switch (next_pacing) {
@@ -435,6 +441,14 @@ test "stalled progress stops instead of restarting forever" {
     var advancing_evidence = stalled_evidence;
     advancing_evidence.progress = .advancing;
     try std.testing.expectEqual(Strategy.retry_request, decide(advancing_evidence).strategy);
+
+    // A stream that times out repeatedly at the same byte offset is stalled,
+    // not merely silent: stop instead of probing liveness forever.
+    var stalled_timeout = stalled_evidence;
+    stalled_timeout.cause = .provider_stream_timeout;
+    const stopped = decide(stalled_timeout);
+    try std.testing.expectEqual(Strategy.stop, stopped.strategy);
+    try std.testing.expectEqual(RequiredAction.surface_stall, stopped.required_action);
 }
 
 test "retry after and cancellation override automatic recovery" {
@@ -514,6 +528,15 @@ test "billable retries throttle past the recovery window without dying" {
     try std.testing.expect(throttled.throttled);
     try std.testing.expectEqual(throttled_retry_delay_ns, throttled.delay_ns);
     try std.testing.expectEqual(Strategy.retry_request, throttled.strategy);
+
+    // A positive Retry-After hint bounds the wait from below but never below
+    // the throttled floor: a misbehaving endpoint saying "in 1s" forever must
+    // not pin the turn at 60 billable requests per minute.
+    var hinted = past_window;
+    hinted.retry_after_seconds = 1;
+    const hinted_throttled = decide(hinted);
+    try std.testing.expect(hinted_throttled.throttled);
+    try std.testing.expectEqual(throttled_retry_delay_ns, hinted_throttled.delay_ns);
 }
 
 test "implicit retry pacing is independent from the shared attempt budget" {
