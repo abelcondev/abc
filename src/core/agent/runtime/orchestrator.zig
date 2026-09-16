@@ -6634,6 +6634,8 @@ fn processQueuedPromptLoop(
     defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
     defer shell_execution_failure_retry.deinit(arena);
+    var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -9619,7 +9621,9 @@ fn processQueuedPromptLoop(
             silent_tool_steps += 1;
         }
 
-        var step_batch = runtime_tool_batch.StepBatchState{};
+        var step_batch = runtime_tool_batch.StepBatchState{
+            .identical_failure_escalation = &identical_failure_escalation,
+        };
         terminal_validation_retry.beginBatch();
         shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
@@ -9886,6 +9890,7 @@ fn processQueuedPromptLoop(
                             .status = .failure,
                             .model_output = failure_output,
                             .status_detail = "preflight failed",
+                            .failure_kind = .preflight,
                         };
                         precomputed_results[group_index] = failure;
                         continue;
@@ -10064,13 +10069,24 @@ fn processQueuedPromptLoop(
                 ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity != .valid) continue;
-                    try runtime_tool_admission.recordRejectedToolCall(
-                        deps,
-                        arena,
-                        parallel_call,
-                        execution.model_output,
-                        null,
-                    );
+                    // Results that failed the tool's own preflight/content
+                    // checks are tool failures, not permission rejections.
+                    switch (execution.failure_kind) {
+                        .preflight, .apply => try runtime_tool_admission.recordFailedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                        .none, .denied => try runtime_tool_admission.recordRejectedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                    }
                 }
                 const cancelled_call = try runtime_tool_batch.assembleParallelToolResults(
                     arena,
@@ -11030,6 +11046,7 @@ fn processQueuedPromptLoop(
                     .status = .failure,
                     .model_output = failure_output,
                     .status_detail = "preflight failed",
+                    .failure_kind = .preflight,
                 };
                 const prepared_failure = try runtime_execution_memory.prepareToolModelOutput(
                     arena,
@@ -11061,7 +11078,9 @@ fn processQueuedPromptLoop(
                     prepared_failure.memory,
                     .{ .increment_error = true },
                 );
-                try runtime_tool_admission.recordRejectedToolCall(
+                // A permission-stage tool_failure ran the tool's preflight
+                // content checks and failed them; record a tool failure.
+                try runtime_tool_admission.recordFailedToolCall(
                     deps,
                     arena,
                     tool_call,

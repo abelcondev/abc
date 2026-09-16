@@ -462,10 +462,7 @@ pub fn executeToolCallAuthorized(
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(
-            uses_file_mutation_contract,
-            result,
-        ),
+        .outcome = classifyReturnedToolCallOutcome(result),
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
     });
@@ -484,18 +481,27 @@ fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
 }
 
 fn classifyReturnedToolCallOutcome(
-    uses_file_mutation_contract: bool,
     result: ToolExecutionResult,
 ) diagnostics.ToolCallOutcome {
     if (result.status == .success) return .succeeded;
     if (result.command_result_json != null) return .command_failed;
-    if (uses_file_mutation_contract) return .rejected;
-    return .tool_failed;
+    // Only an explicit denial records a rejection. An authorized execution
+    // that failed — with or without a declared kind — is a tool failure, so
+    // a producer that forgets to declare a kind cannot silently masquerade
+    // as a rejection in diagnostics.
+    return switch (result.failure_kind) {
+        .denied => .rejected,
+        .none, .preflight, .apply => .tool_failed,
+    };
 }
 
 test "returned tool results retain diagnostic outcome identity" {
     const success = ToolExecutionResult{ .model_output = "ok" };
-    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const rejection = ToolExecutionResult{
+        .model_output = "rejected",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
     const command_failure = ToolExecutionResult{
         .model_output = "exit 7",
         .status = .failure,
@@ -505,19 +511,19 @@ test "returned tool results retain diagnostic outcome identity" {
 
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.succeeded,
-        classifyReturnedToolCallOutcome(false, success),
+        classifyReturnedToolCallOutcome(success),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
-        classifyReturnedToolCallOutcome(true, rejection),
+        classifyReturnedToolCallOutcome(rejection),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.command_failed,
-        classifyReturnedToolCallOutcome(false, command_failure),
+        classifyReturnedToolCallOutcome(command_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.tool_failed,
-        classifyReturnedToolCallOutcome(false, tool_failure),
+        classifyReturnedToolCallOutcome(tool_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
@@ -530,6 +536,47 @@ test "returned tool results retain diagnostic outcome identity" {
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.runtime_failed,
         classifyToolExecutionError(error.Unexpected),
+    );
+}
+
+test "executed file mutation failures classify as tool failures, not rejections" {
+    const preflight_failure = ToolExecutionResult{
+        .model_output = "edit_file failed: old_string not found in file",
+        .status = .failure,
+        .failure_kind = .preflight,
+    };
+    const apply_failure = ToolExecutionResult{
+        .model_output = "file mutation rejected because the file changed after preview; make a new tool call for a fresh preview",
+        .status = .failure,
+        .failure_kind = .apply,
+    };
+    const denied_failure = ToolExecutionResult{
+        .model_output = "file mutation execution requires prepared approval",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
+    const undeclared_failure = ToolExecutionResult{
+        .model_output = "some producer forgot its kind",
+        .status = .failure,
+    };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(preflight_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(apply_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(denied_failure),
+    );
+    // A producer that does not declare a kind is still a tool failure; only
+    // explicit denials record rejections.
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(undeclared_failure),
     );
 }
 

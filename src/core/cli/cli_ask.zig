@@ -2143,6 +2143,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
+        .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
@@ -2765,6 +2766,29 @@ fn recordToolCallRejected(
         },
         .rejected,
         "rejected",
+    );
+}
+
+fn recordToolCallFailed(
+    raw_ctx: *anyopaque,
+    _: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.output_mode.capturesJson()) return;
+    appendToolCallRecordBestEffort(
+        ctx,
+        call,
+        "error",
+        .{
+            .status = .failure,
+            .model_output = model_output,
+            .command_result_json = command_result_json,
+        },
+        .tool_failed,
+        "tool_failed",
     );
 }
 
