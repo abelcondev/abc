@@ -88,8 +88,11 @@ pub const SgrState = struct {
     }
 
     /// Serialize open codes for the currently-active attributes into `buf`.
-    /// Returns the number of bytes written. Worst case is five 4-byte
-    /// attribute opens plus a themed truecolor code-foreground open.
+    /// Returns the number of bytes written. The caller sizes `buf` for five
+    /// 4-byte attribute opens plus the active code-foreground open (the theme
+    /// builder bounds slot escapes); an oversized open is truncated by the
+    /// bounds check, degrading restore to pre-fix behavior rather than
+    /// corrupting the frame.
     pub fn writeOpens(self: SgrState, buf: []u8) usize {
         var n: usize = 0;
         const append = struct {

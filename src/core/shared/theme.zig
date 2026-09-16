@@ -802,6 +802,9 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.user_card_accent_style);
     try std.testing.expectEqualStrings("\x1b[38;5;247m", fx_light.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.task_completed_open);
+    // Tool text stays the pre-theme gray in both variants (parity guard).
+    try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_light.tool_stdout_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_light.tool_stderr_style);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;5;243m", fx_light.syntax.comment_style);
 
