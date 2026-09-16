@@ -503,6 +503,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -701,6 +702,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -802,6 +804,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
             .usage = self.usage,
             .usage_allocator = self.alloc,
@@ -1583,6 +1586,12 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.rejected_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
         try self.record("rejected:{s}", .{call.name});
+    }
+
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
     }
 
     fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {

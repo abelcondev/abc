@@ -364,6 +364,7 @@ pub fn Bindings(comptime App: type) type {
                 .model_catalog_unavailable = agentModelCatalogUnavailable,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
+                .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .usage_allocator = app.alloc,
@@ -1016,6 +1017,23 @@ pub fn Bindings(comptime App: type) type {
                 .arguments_json = call.arguments_json,
                 .model_output = model_output,
                 .outcome = .rejected,
+                .started_at_ms = io_mod.milliTimestamp(),
+            });
+        }
+
+        fn agentRecordToolCallFailed(
+            ctx: *anyopaque,
+            _: Allocator,
+            call: ToolCall,
+            model_output: []const u8,
+            _: ?[]const u8,
+        ) !void {
+            _ = ctx;
+            diagnostics.recordToolCallResult(.{
+                .name = call.name,
+                .arguments_json = call.arguments_json,
+                .model_output = model_output,
+                .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
             });
         }
