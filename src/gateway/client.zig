@@ -730,6 +730,15 @@ fn isRetryableConnectionSetupError(err: anyerror) bool {
     return err == error.TlsInitializationFailed or isRetryableGatewayError(err);
 }
 
+/// std.http.Client does not mark a connection closing when the body write or
+/// flush fails, so deinit would release a poisoned connection (with possibly
+/// buffered unsent bytes) back to the pool. Mark it ourselves so a send
+/// failure can never hand a dirty connection to the next borrower.
+fn markPooledConnectionClosing(req: *std.http.Client.Request, request: StreamRequest) void {
+    if (request.shared_pool == null) return;
+    if (req.connection) |conn| conn.closing = true;
+}
+
 const ConnectionSetupTiming = struct {
     timeout_ms: i64 = gateway_connection_setup_timeout_ms,
 };
@@ -1532,6 +1541,7 @@ fn streamGatewayCompletionCoreWithOptions(
         if (request.delivery) |delivery| delivery.markPossiblySent();
         var body_writer = req.sendBodyUnflushed(&send_buf) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1541,6 +1551,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.writer.writeAll(payload) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1550,6 +1561,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.end() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1559,6 +1571,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         req.connection.?.flush() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1597,7 +1610,6 @@ fn streamGatewayCompletionCoreWithOptions(
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
         debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
-        if (request.shared_pool) |pool| pool.noteActivity();
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
         if (response.head.status != .ok) {

@@ -682,7 +682,7 @@ const App = struct {
             app.provider_selection.ensureGatewayHttpPool();
             if (app.provider_selection.selection().provider == .gateway) {
                 if (app.provider_selection.gateway_http_pool) |pool| {
-                    pool.warmAsync(builtin_gateway.agentChatUrl());
+                    pool.warmAsync(gateway_client.resolveChatUrlForWarmup(builtin_gateway.agentChatUrl()));
                 }
             }
         }

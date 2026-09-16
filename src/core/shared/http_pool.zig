@@ -11,7 +11,7 @@ const io_mod = @import("io.zig");
 /// Ownership: created once per process by the provider runtime, borrowed by
 /// request paths. All methods are safe to call from concurrent request
 /// threads (the underlying std pool is internally mutex-guarded).
-pub const default_ttl_ms: i64 = 30_000;
+const default_ttl_ms: i64 = 30_000;
 
 pub const HttpPool = struct {
     client: std.http.Client,
@@ -64,7 +64,7 @@ pub const HttpPool = struct {
 
     /// Establishes one connection to the URL's origin and parks it in the
     /// pool. Best-effort: failures are traced, never propagated.
-    pub fn warm(self: *HttpPool, url: []const u8) void {
+    fn warm(self: *HttpPool, url: []const u8) void {
         const io = io_mod.getIo();
         const uri = std.Uri.parse(url) catch return;
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
