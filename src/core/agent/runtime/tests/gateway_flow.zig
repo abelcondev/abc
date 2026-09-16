@@ -5872,7 +5872,9 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
     try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
-    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request");
+    // The in-flight republication mirrors the wait row's delay segment so the
+    // status row never changes shape mid-cycle.
+    try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
 }
 
