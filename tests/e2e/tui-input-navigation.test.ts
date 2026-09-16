@@ -913,6 +913,39 @@ tmuxTest(
 );
 
 tmuxTest(
+  "ctrl+o opens with a session assembly record and per-request network record",
+  async () => {
+    const active = await startFx(80, 24, true, false, 1);
+    await active.sendText("hello");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+
+    // The records never appear in the inline transcript.
+    const inline = await active.capturePane();
+    expect(inline).not.toContain("session: provider:");
+    expect(inline).not.toContain("network: provider:");
+
+    await active.sendKeys("C-o");
+    await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
+    // The records block sits at the top of the full transcript.
+    let top = await active.capturePane();
+    for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
+      await active.sendKeys("PPage");
+      await Bun.sleep(50);
+      top = await active.capturePane();
+    }
+    expect(top).toContain("session: provider:");
+    expect(top).toContain("system prompt: ready");
+    expect(top).toContain("tools:");
+    expect(top).toContain("network: provider:");
+    expect(top).toContain("finish: stop");
+    await active.sendKeys("C-o");
+    await active.waitForComposer(READY_TIMEOUT);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "delivered Command and Shift+Option keys edit the composer",
   async () => {
     const active = await startFx(60, 24);

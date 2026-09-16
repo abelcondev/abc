@@ -35,7 +35,7 @@ const types = @import("../../core/shared/types.zig");
 /// recovery transition) shown only in the ctrl+o full transcript. Kept out of
 /// the transcript entry store so inline rendering, retention, replay, and
 /// resume never observe it.
-pub const FullDetailRecord = struct {
+const FullDetailRecord = struct {
     notice: types.SemanticNotice,
     created_at_ms: i64,
 
@@ -48,7 +48,7 @@ pub const FullDetailRecord = struct {
 /// Synthetic full-detail records share entry id 0: the store never issues 0,
 /// and the id orders below every real entry, which keeps row-ordered
 /// bookmark lookups consistent with the records' position at the top.
-pub const full_detail_record_entry_id: u32 = 0;
+const full_detail_record_entry_id: u32 = 0;
 
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const captured_command = @import("../../core/tooling/captured_command.zig");
@@ -4832,9 +4832,8 @@ pub const TranscriptRuntime = struct {
 
     /// Prepends the live full-detail records (session assembly, network,
     /// recovery) to the first page of a full-transcript source as synthetic
-    /// notice entries. Synthetic ids sit above the real id space and the
-    /// records never enter the store, so paging, retention, and resume keep
-    /// their existing contracts.
+    /// notice entries. Records never enter the store, so paging, retention,
+    /// and resume keep their existing contracts.
     fn prependFullDetailRecords(
         self: *const TranscriptRuntime,
         alloc: Allocator,
@@ -13762,4 +13761,54 @@ test "changed stored result retires stale full transcript geometry" {
         try std.testing.expect(try runtime.pollFullTranscriptPageLoad());
         try std.testing.expect(runtime.full_transcript_installed_page == null);
     }
+}
+
+test "prependFullDetailRecords injects records only into the first page" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.appendFullDetailRecord(alloc, .{
+        .topic = "session",
+        .tone = .neutral,
+        .body = "provider: test",
+    });
+
+    const request: full_transcript_page.Request = .{ .content_revision = 1, .cols = 80, .anchor = .tail };
+    var source = full_transcript_worker.Source{ .request = request, .range = .{ .start = 0, .end = 0 }, .styles = .{} };
+    defer source.deinit(alloc);
+    try runtime.prependFullDetailRecords(alloc, &source);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    const notice = source.entries.items[0].semantic_notice;
+    try std.testing.expectEqual(@as(u32, 0), notice.id);
+    try std.testing.expectEqualStrings("session", notice.topic);
+    try std.testing.expectEqualStrings("provider: test", notice.body);
+
+    var later = full_transcript_worker.Source{ .request = request, .range = .{ .start = 1, .end = 1 }, .styles = .{} };
+    defer later.deinit(alloc);
+    try runtime.prependFullDetailRecords(alloc, &later);
+    try std.testing.expectEqual(@as(usize, 0), later.entries.items.len);
+}
+
+test "prependFullDetailRecords keeps the welcome banner first" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.appendFullDetailRecord(alloc, .{
+        .topic = "network",
+        .tone = .neutral,
+        .body = "finish: stop",
+    });
+
+    const request: full_transcript_page.Request = .{ .content_revision = 1, .cols = 80, .anchor = .tail };
+    var source = full_transcript_worker.Source{ .request = request, .range = .{ .start = 0, .end = 1 }, .styles = .{} };
+    defer source.deinit(alloc);
+    try source.entries.append(alloc, .{ .raw_bytes = .{
+        .id = 1,
+        .bytes = try alloc.dupe(u8, "banner"),
+        .class = .welcome,
+    } });
+    try runtime.prependFullDetailRecords(alloc, &source);
+    try std.testing.expectEqual(@as(usize, 2), source.entries.items.len);
+    try std.testing.expect(source.entries.items[0] == .raw_bytes);
+    try std.testing.expect(source.entries.items[1] == .semantic_notice);
 }

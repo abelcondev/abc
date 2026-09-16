@@ -33,13 +33,13 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const SessionAssemblyMcpServer = struct {
+const SessionAssemblyMcpServer = struct {
     name: []const u8,
     connection: []const u8,
     tools: ?usize,
 };
 
-pub const SessionAssemblyFacts = struct {
+const SessionAssemblyFacts = struct {
     provider: []const u8,
     model: []const u8,
     effort: []const u8,
@@ -54,7 +54,7 @@ const session_mcp_server_preview_max = 10;
 
 /// Pure formatter for the full-only session assembly record. Facts in,
 /// bounded body text out; no I/O, no app state.
-pub fn writeSessionAssemblyBody(
+fn writeSessionAssemblyBody(
     writer: *std.Io.Writer,
     facts: SessionAssemblyFacts,
 ) !void {

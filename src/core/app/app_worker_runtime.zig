@@ -113,7 +113,7 @@ fn routeRecoveryNoticeTone(status: types.RouteRecoveryStatus) types.NoticeTone {
 
 /// Pure formatter for the recovery record body: footer label, then the
 /// structured facts the label cannot carry.
-pub fn writeRouteRecoveryBody(
+fn writeRouteRecoveryBody(
     writer: *std.Io.Writer,
     status: types.RouteRecoveryStatus,
 ) !void {
