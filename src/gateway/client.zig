@@ -6989,12 +6989,7 @@ test "shared pool requests keep-alive and never pools server-closed connections"
     try std.testing.expectEqual(true, probe.keep_alive_seen orelse false);
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     // The fixture answers with Connection: close; the pool must not retain it.
-    const pool_inner = &pool.client.connection_pool;
-    const zio = io_mod.getIo();
-    pool_inner.mutex.lockUncancelable(zio);
-    const free_len = pool_inner.free_len;
-    pool_inner.mutex.unlock(zio);
-    try std.testing.expectEqual(@as(usize, 0), free_len);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
