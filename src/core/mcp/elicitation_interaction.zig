@@ -56,6 +56,7 @@ pub const Options = struct {
     browser: Browser,
     capabilities: elicitation.Capabilities,
     max_form_attempts: usize = 8,
+    compact_forms: bool = false,
 };
 
 const Response = struct {
@@ -167,6 +168,7 @@ const FieldValue = struct {
 
 const FieldAnswer = union(enum) {
     cancelled,
+    declined,
     value: ?[]u8,
 };
 
@@ -194,6 +196,11 @@ fn answerForm(
         .{},
     );
     defer form.deinit(alloc);
+    const compact = options.compact_forms and form.fields.len == 1 and switch (form.fields[0].kind) {
+        .single_select => form.fields[0].choices.len <= 3,
+        .string, .number, .integer, .boolean => true,
+        .multi_select => false,
+    };
 
     const values = try alloc.alloc(FieldValue, form.fields.len);
     for (form.fields, values) |field, *value| {
@@ -218,6 +225,7 @@ fn answerForm(
                 deadline_ms,
                 cancel_flag,
                 options.questioner,
+                compact,
             ) catch |err| switch (err) {
                 error.InvalidAnswer => {
                     invalid = true;
@@ -226,6 +234,7 @@ fn answerForm(
                 else => return err,
             };
             const value = switch (answer) {
+                .declined => return alloc.dupe(u8, "{\"action\":\"decline\"}"),
                 .cancelled => {
                     cancelled = true;
                     break;
@@ -265,6 +274,10 @@ fn answerForm(
             },
         };
         std.debug.assert(action == .accept);
+        if (compact and try isSmallFormValue(alloc, form.fields[0], values[0].json)) {
+            response_owned = false;
+            return response;
+        }
 
         const review_question = try buildReviewQuestion(
             alloc,
@@ -313,7 +326,11 @@ fn answerField(
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
+    compact: bool,
 ) Error!FieldAnswer {
+    if (compact and !current.answered) {
+        return answerCompactField(alloc, server_name, request_message, field, deadline_ms, cancel_flag, questioner);
+    }
     if (current.answered) {
         const keep = try askToKeepCurrentValue(
             alloc,
@@ -482,6 +499,107 @@ fn answerField(
         else => return err,
     };
     return .{ .value = result };
+}
+
+// These local actions never share a namespace with server-supplied values.
+const CompactAction = union(enum) {
+    value: ?[]const u8,
+    decline,
+    cancel,
+};
+
+fn answerCompactField(
+    alloc: Allocator,
+    server_name: []const u8,
+    message: []const u8,
+    field: elicitation.Field,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!FieldAnswer {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const display_name = try terminalSafeAlloc(temp, field.displayName());
+    const description = try terminalSafeAlloc(temp, field.description orelse "");
+    const question = try std.fmt.allocPrint(
+        temp,
+        "MCP server {s} requests {s}{s}\n{s}\nReason: {s}\nEnter submits this value. Long or multiline input gets a review step.",
+        .{ server_name, display_name, if (field.required) " (required)" else " (optional)", description, message },
+    );
+    var choices: std.ArrayList(types.QuestionOption) = .empty;
+    var actions: std.ArrayList(CompactAction) = .empty;
+    switch (field.kind) {
+        .single_select => for (field.choices, 0..) |choice, index| {
+            try choices.append(temp, .{
+                .label = try choiceLabelAlloc(temp, index, choice.title),
+                .description = if (choice.description) |desc| try terminalSafeAlloc(temp, desc) else null,
+            });
+            try actions.append(temp, .{ .value = try stringifyString(temp, choice.value) });
+        },
+        .boolean => {
+            try choices.appendSlice(temp, &.{ .{ .label = "True" }, .{ .label = "False" } });
+            try actions.appendSlice(temp, &.{ .{ .value = "true" }, .{ .value = "false" } });
+        },
+        .string, .number, .integer => {},
+        .multi_select => unreachable,
+    }
+    if (field.default_json) |default| {
+        try choices.append(temp, .{ .label = "Use default", .description = try terminalSafeAlloc(temp, default) });
+        try actions.append(temp, .{ .value = default });
+    }
+    if (!field.required) {
+        try choices.append(temp, .{ .label = "Skip", .description = "Submit without this optional field" });
+        try actions.append(temp, .{ .value = null });
+    }
+    try choices.appendSlice(temp, &.{ .{ .label = "Decline" }, .{ .label = "Cancel" } });
+    try actions.appendSlice(temp, &.{ .decline, .cancel });
+    const is_input = field.kind == .string or field.kind == .number or field.kind == .integer;
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = question,
+        .options = choices.items,
+        .submission = if (is_input) .input else .choice,
+    }};
+    const answers = try questioner.ask(temp, &entries, deadline_ms, cancel_flag) orelse return .cancelled;
+    if (answers.len != 1) return error.InvalidAnswer;
+    const parsed = std.json.parseFromSlice(struct {
+        option: ?usize = null,
+        value: ?[]const u8 = null,
+    }, temp, answers[0], .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidAnswer;
+    const answer = parsed.value;
+    if ((answer.option != null) == (answer.value != null)) return error.InvalidAnswer;
+    const json: ?[]const u8 = if (answer.option) |index| blk: {
+        if (index >= actions.items.len) return error.InvalidAnswer;
+        break :blk switch (actions.items[index]) {
+            .decline => return .declined,
+            .cancel => return .cancelled,
+            .value => |value| value,
+        };
+    } else if (is_input) switch (field.kind) {
+        .string => try stringifyString(temp, answer.value.?),
+        .number, .integer => try validateNumberAnswer(temp, answer.value.?),
+        else => unreachable,
+    } else return error.InvalidAnswer;
+    if (json) |value| {
+        elicitation.validateFieldJson(temp, field, value, .{}) catch |err| switch (err) {
+            error.InvalidResponse => return error.InvalidAnswer,
+            else => return err,
+        };
+        return .{ .value = try alloc.dupe(u8, value) };
+    }
+    return .{ .value = null };
+}
+
+fn isSmallFormValue(alloc: Allocator, field: elicitation.Field, json: ?[]const u8) Error!bool {
+    const value = json orelse return true;
+    if (field.kind == .single_select or field.kind == .boolean) return true;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidAnswer;
+    defer parsed.deinit();
+    const text = if (parsed.value == .string) parsed.value.string else value;
+    if (std.mem.findScalar(u8, text, '\n') != null or std.mem.findScalar(u8, text, '\r') != null) return false;
+    const count = std.unicode.utf8CountCodepoints(text) catch return false;
+    return count <= 80;
 }
 
 const KeepCurrentDecision = enum { keep, edit, cancelled };
@@ -954,6 +1072,7 @@ test "interaction review shows every validated current value before submission" 
         .questioner = fixture.questioner(),
         .browser = fixture.browser(),
         .capabilities = .{ .form = true, .url = true },
+        .compact_forms = true,
     });
     defer alloc.free(response);
     try std.testing.expectEqualStrings(
@@ -1317,6 +1436,86 @@ test "form interaction owns every accepted response allocation" {
         checkAcceptedFormAllocationFailures,
         .{},
     );
+}
+
+test "compact form submits literal input or declines without a review" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { answer: []const u8, expected: []const u8 }{
+        .{ .answer = "{\"value\":\"Decline\"}", .expected = "{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"Decline\"}}}" },
+        .{ .answer = "{\"option\":0}", .expected = "{\"form\":{\"action\":\"decline\"}}" },
+        .{ .answer = "{\"option\":1}", .expected = "{\"form\":{\"action\":\"cancel\"}}" },
+    }) |case| {
+        var fixture = Fixture{ .answers = &.{case.answer} };
+        const response = try respond(alloc, Fixture.origin(), .{
+            .input_requests_json =
+            \\{"form":{"method":"elicitation/create","params":{"message":"Name","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}}
+            ,
+        }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+        defer alloc.free(response);
+        try std.testing.expectEqualStrings(case.expected, response);
+        try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
+        try std.testing.expect(!fixture.review_contained_values);
+    }
+}
+
+test "compact form defaults skip and choice labels preserve exact values" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { answer: []const u8, content: []const u8 }{
+        .{ .answer = "{\"option\":0}", .content = "{\"name\":\"a\"}" },
+        .{ .answer = "{\"option\":1}", .content = "{\"name\":\"b\"}" },
+        .{ .answer = "{\"option\":2}", .content = "{\"name\":\"c\"}" },
+        .{ .answer = "{\"option\":3}", .content = "{\"name\":\"b\"}" },
+        .{ .answer = "{\"option\":4}", .content = "{}" },
+    }) |case| {
+        var fixture = Fixture{ .answers = &.{case.answer} };
+        const response = try respond(alloc, Fixture.origin(), .{
+            .input_requests_json =
+            \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","default":"b","oneOf":[{"const":"a","title":"Decline"},{"const":"b","title":"Cancel"},{"const":"c","title":"Decline"}]}}}}}}
+            ,
+        }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+        defer alloc.free(response);
+        const expected = try std.fmt.allocPrint(alloc, "{{\"form\":{{\"action\":\"accept\",\"content\":{s}}}}}", .{case.content});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, response);
+        try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
+    }
+}
+
+test "compact form validates before submission and reviews long input" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{ "{\"value\":\"x\"}", "Edit", "{\"value\":\"long\\ninput\"}", "Submit" } };
+    const response = try respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Name","requestedSchema":{"type":"object","properties":{"name":{"type":"string","minLength":3}},"required":["name"]}}}}
+        ,
+    }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"long\\ninput\"}}}", response);
+    try std.testing.expect(fixture.review_contained_values);
+    try std.testing.expectEqual(@as(usize, 4), fixture.answer_index);
+    var form = try elicitation.parseFormSchema(alloc, .modern_mcp,
+        \\{"type":"object","properties":{"value":{"type":"string"}}}
+    , .{});
+    defer form.deinit(alloc);
+    const short = try stringifyString(alloc, &(@as([80]u8, @splat('a'))));
+    defer alloc.free(short);
+    const long = try stringifyString(alloc, &(@as([81]u8, @splat('a'))));
+    defer alloc.free(long);
+    try std.testing.expect(try isSmallFormValue(alloc, form.fields[0], short));
+    try std.testing.expect(!try isSmallFormValue(alloc, form.fields[0], long));
+}
+
+test "compact form keeps review for four choices" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{ "[1] a", "Submit" } };
+    const response = try respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","enum":["a","b","c","d"]}},"required":["name"]}}}}
+        ,
+    }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"a\"}}}", response);
+    try std.testing.expect(fixture.review_contained_values);
 }
 
 const Fixture = struct {

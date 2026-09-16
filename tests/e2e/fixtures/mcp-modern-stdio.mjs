@@ -23,6 +23,7 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -629,7 +630,10 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = mode === "mrtr_url_required"
+        const params = compactField ? {
+          message: "Choose the next step",
+          requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
+        } : mode === "mrtr_url_required"
           ? {
               mode: "url",
               message: "Authorize in the external browser",
