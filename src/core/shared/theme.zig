@@ -253,12 +253,65 @@ fn writeColorParam(writer: *std.Io.Writer, prefix: []const u8, rgb: Rgb, truecol
     }
 }
 
+/// True when an SGR open sets the given parameter ("1" bold, "3" italic, "48"
+/// background), parsed from the parameter list rather than substring matched.
+/// Handles slots built from multiple concatenated SGR escapes.
+pub fn sgrHasParam(open: []const u8, param: []const u8) bool {
+    var rest = open;
+    while (std.mem.find(u8, rest, "\x1b[")) |start| {
+        const after = rest[start + 2 ..];
+        const end = std.mem.findScalar(u8, after, 'm') orelse return false;
+        var it = std.mem.splitScalar(u8, after[0..end], ';');
+        var skip: usize = 0;
+        while (it.next()) |part| {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            if (std.mem.eql(u8, part, "38") or std.mem.eql(u8, part, "48")) {
+                if (std.mem.eql(u8, part, param)) return true;
+                // Color introducer: 5;n consumes one parameter, 2;r;g;b three.
+                // Skipping keeps RGB triples from reading as bold/italic.
+                const mode = it.next() orelse break;
+                if (std.mem.eql(u8, mode, "2")) {
+                    skip = 3;
+                } else if (std.mem.eql(u8, mode, "5")) {
+                    skip = 1;
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, part, param)) return true;
+        }
+        rest = after[end + 1 ..];
+    }
+    return false;
+}
+
+/// The closing sequence that fully neutralizes an SGR open: always resets the
+/// foreground, and resets background, bold, and italic only when the open set
+/// them. Builtin fg-only slots keep their historical one-escape close.
+pub fn closingFor(open: []const u8) []const u8 {
+    const has_bg = sgrHasParam(open, "48");
+    const has_bold = sgrHasParam(open, "1");
+    const has_italic = sgrHasParam(open, "3");
+    if (has_bg) {
+        if (has_bold and has_italic) return "\x1b[39m\x1b[49m\x1b[22m\x1b[23m";
+        if (has_bold) return "\x1b[39m\x1b[49m\x1b[22m";
+        if (has_italic) return "\x1b[39m\x1b[49m\x1b[23m";
+        return "\x1b[39m\x1b[49m";
+    }
+    if (has_bold and has_italic) return "\x1b[39m\x1b[22m\x1b[23m";
+    if (has_bold) return "\x1b[39m\x1b[22m";
+    if (has_italic) return "\x1b[39m\x1b[23m";
+    return "\x1b[39m";
+}
+
 /// Renders a slot style as one SGR escape. Caller owns the returned slice.
 fn slotEscapeChecked(alloc: std.mem.Allocator, spec: SlotSpec, truecolor: bool) ParseError![]u8 {
     return slotEscape(alloc, spec, truecolor) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Allocating writers only fail on allocation; writes cannot fail.
-        error.WriteFailed => error.InvalidTheme,
+        // Writer.Allocating reports allocation failure as WriteFailed in 0.16.
+        error.WriteFailed => error.OutOfMemory,
     };
 }
 
@@ -660,8 +713,13 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
     if (theme.light == terminal_light) return theme;
     if (siblingName(alloc, name, terminal_light) catch null) |sibling| {
         if (loadNamed(alloc, sibling, options)) |swapped| {
-            debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
-            return swapped;
+            if (swapped.light == terminal_light) {
+                debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
+                return swapped;
+            }
+            // A sibling whose declared variant also mismatches is a user file
+            // error; fall through to the builtin rather than trusting it.
+            debug_trace.logf("theme", "theme_sibling_variant_mismatch name={s}", .{sibling});
         } else |err| {
             debug_trace.logf("theme", "theme_sibling_load_failed name={s} err={s}", .{ sibling, @errorName(err) });
         }
@@ -941,4 +999,31 @@ test "siblingName maps variant suffixes for terminal-mode swaps" {
     try std.testing.expect((try siblingName(alloc, "cursor-dark", false)) == null);
     try std.testing.expect((try siblingName(alloc, "monokai", true)) == null);
     try std.testing.expect((try siblingName(alloc, "-dark", true)) == null);
+}
+
+test "sgrHasParam parses the parameter list exactly" {
+    try std.testing.expect(sgrHasParam("\x1b[38;5;245m", "38"));
+    try std.testing.expect(sgrHasParam("\x1b[1;38;2;1;2;3m", "38"));
+    try std.testing.expect(sgrHasParam("\x1b[1;38;2;1;2;3m", "1"));
+    try std.testing.expect(sgrHasParam("\x1b[3;48;5;240m", "48"));
+    try std.testing.expect(sgrHasParam("\x1b[3;48;5;240m", "3"));
+    // No prefix or substring confusion, and RGB triples are not attributes.
+    try std.testing.expect(!sgrHasParam("\x1b[3;38;2;1;2;3m", "1"));
+    try std.testing.expect(!sgrHasParam("\x1b[38;2;1;2;3m", "3"));
+    try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "3"));
+    try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "8"));
+    try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "48"));
+    try std.testing.expect(!sgrHasParam("\x1b[39m", "38"));
+    try std.testing.expect(!sgrHasParam("plain", "38"));
+    try std.testing.expect(!sgrHasParam("\x1b[38;5;245", "38"));
+}
+
+test "closingFor resets exactly what the open set" {
+    try std.testing.expectEqualStrings("\x1b[39m", closingFor(fx_dark.hint_style));
+    try std.testing.expectEqualStrings("\x1b[39m", closingFor(fx_dark.inline_code_open));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[22m", closingFor(fx_dark.tag_style));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[23m", closingFor("\x1b[3;38;2;1;2;3m"));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[22m\x1b[23m", closingFor("\x1b[1;3;38;2;1;2;3m"));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor(fx_dark.approval_button_active_style));
+    try std.testing.expectEqualStrings("\x1b[39m\x1b[49m", closingFor(fx_dark.approval_button_inactive_style));
 }
