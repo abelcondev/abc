@@ -458,3 +458,59 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
     60_000,
   );
 });
+
+describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
+  test(
+    "FX_THEME loads a VS Code theme file from ~/.fx/themes",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "themes", "e2e-accent.json"),
+        JSON.stringify({
+          name: "E2E Accent",
+          colors: { "editor.foreground": "#FF0000" },
+        }),
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+            FX_THEME: "e2e-accent",
+            COLORFGBG: "15;0",
+            COLORTERM: undefined,
+            TERM_PROGRAM: "Apple_Terminal",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        const pane = await session.waitForComposer(10_000);
+        expect(pane).toContain("Run /help for commands");
+        const escapes = await session.capturePaneEscapes();
+        // editor.foreground #FF0000 quantizes to xterm-256 color 196 without
+        // truecolor (Apple_Terminal), and themes the hint text at startup.
+        expect(escapes).toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});

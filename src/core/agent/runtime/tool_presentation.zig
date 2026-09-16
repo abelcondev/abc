@@ -3,6 +3,7 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
+const shared_theme = @import("../../shared/theme.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -727,7 +728,7 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ action_label, value });
+        return std.fmt.bufPrint(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().dim_style, value });
     }
     return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
 }

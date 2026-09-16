@@ -120,6 +120,46 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
 
+## Themes
+
+fx ships with built-in `fx-dark` and `fx-light` themes and follows your terminal's light or dark mode automatically. Set `FX_THEME=light` or `FX_THEME=dark` to pin a variant.
+
+Custom themes load from `~/.fx/themes/<name>.json` with `FX_THEME=<name>`:
+
+```bash
+FX_THEME=cursor-dark fx
+```
+
+A pinned theme follows your terminal's detected light or dark mode when a sibling variant exists: with `FX_THEME=cursor-dark` on a light terminal, fx loads `cursor-light` instead when `~/.fx/themes/cursor-light.json` is present (the `-dark`/`-light` or `_dark`/`_light` suffix convention). Without a sibling file, fx falls back to the built-in theme matching your terminal rather than washing out on the wrong background.
+
+Theme files accept the VS Code theme format (`colors` plus `tokenColors`), so editor themes such as Cursor Dark or GitHub Dark work directly:
+
+```json
+{
+  "name": "My Theme",
+  "colors": { "editor.background": "#181818", "editor.foreground": "#F0F0F0" },
+  "tokenColors": [
+    { "scope": "keyword", "settings": { "foreground": "#82D2CE" } }
+  ]
+}
+```
+
+The native fx schema addresses individual slots, and any slot you omit inherits the built-in defaults:
+
+```json
+{
+  "name": "My Theme",
+  "type": "dark",
+  "colors": {
+    "divider": "#3a3a3a",
+    "approval_button_active": { "fg": "#191c22", "bg": "#81A1C1", "bold": true }
+  },
+  "syntax": { "keyword": "#82D2CE", "comment": { "fg": "#6A9955", "italic": true } }
+}
+```
+
+Colors are hex values. They render in truecolor when the terminal supports it and quantize to the nearest xterm-256 color otherwise.
+
 ## Documentation
 
 Read the [fx documentation](https://fx.sh/docs) for sessions, models, permissions, configuration, and the full CLI and slash command references.

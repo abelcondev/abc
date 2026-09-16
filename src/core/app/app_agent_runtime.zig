@@ -6,6 +6,7 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const shared_theme = @import("../shared/theme.zig");
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
@@ -1430,7 +1431,7 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ label, value });
+    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().dim_style, value });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
