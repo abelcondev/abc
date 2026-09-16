@@ -4773,6 +4773,38 @@ fn pushUnsafeNoRetryStatus(
 /// A turn that can never recover hands the user's prompt back to the composer
 /// so nothing typed is lost. Only genuine user turns restore: resumed recovery
 /// jobs and subagent turns keep their own state.
+// A user cancel during a recovery episode kills the durable checkpoint with
+// the turn; otherwise the next resume would auto-continue a turn the user
+// explicitly stopped.
+fn clearRecoveryCheckpointOnUserCancel(
+    deps: *const AgentRuntimeDeps,
+    recovery_strategy: ?model_response_recovery.Strategy,
+) void {
+    if (recovery_strategy == null) return;
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
+    };
+}
+
+// Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
+// negative under NTP correction; a backward step reads as zero elapsed,
+// never a trap.
+fn recoveryElapsedNs(recovery_started_at_ms: ?i64) ?u64 {
+    const started = recovery_started_at_ms orelse return null;
+    const delta_ms = io_mod.milliTimestamp() - started;
+    if (delta_ms <= 0) return 0;
+    return @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+}
+
+test "recoveryElapsedNs clamps backward wall-clock steps" {
+    try std.testing.expectEqual(@as(?u64, null), recoveryElapsedNs(null));
+    try std.testing.expectEqual(@as(?u64, 0), recoveryElapsedNs(io_mod.milliTimestamp() + 60_000));
+    const elapsed = recoveryElapsedNs(io_mod.milliTimestamp() - 2_000).?;
+    try std.testing.expect(elapsed >= 1_500 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed <= 3_000 * std.time.ns_per_ms);
+}
+
 fn restorePromptAfterTerminalFailure(
     deps: *const AgentRuntimeDeps,
     job: QueuedPrompt,
@@ -7581,13 +7613,7 @@ fn processQueuedPromptLoop(
                         ),
                         .cancelled = cancel_requested,
                         .progress = progress_evidence,
-                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started| blk: {
-                            // Wall-clock deltas can go negative under NTP
-                            // correction; a backward step reads as zero
-                            // elapsed, never a trap.
-                            const delta_ms = io_mod.milliTimestamp() - started;
-                            break :blk if (delta_ms <= 0) 0 else @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
-                        } else null,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
@@ -7600,7 +7626,6 @@ fn processQueuedPromptLoop(
                         .required_action = .inspect_uncertain_tool,
                     };
                 }
-                // Connectivity waits and liveness probes reserve no provider
                 const will_auto_retry = recovery_decision.autoRecovers();
                 debug_trace.eventf(
                     "gateway",
@@ -7739,16 +7764,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    // User-cancelled during recovery: the checkpoint dies with
-                    // the turn, or the next resume would resurrect a turn the
-                    // user explicitly stopped.
-                    if (recovery_strategy != null) {
-                        if (deps.recovery_checkpoint) |effect| {
-                            effect.clear(deps.ctx) catch |clear_err| {
-                                debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(clear_err)});
-                            };
-                        }
-                    }
+                    clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -8138,12 +8154,7 @@ fn processQueuedPromptLoop(
                 // retrying patiently. The billable retry window still applies:
                 // past it, the cadence throttles instead of hammering.
                 if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
-                const recovery_elapsed_ns: u64 = blk: {
-                    const started = recovery_started_at_ms.?;
-                    const delta_ms = io_mod.milliTimestamp() - started;
-                    if (delta_ms <= 0) break :blk 0;
-                    break :blk @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
-                };
+                const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -8302,6 +8313,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8505,13 +8517,7 @@ fn processQueuedPromptLoop(
                             .stalled
                         else
                             .unknown,
-                        .recovery_elapsed_ns = if (recovery_started_at_ms) |started| blk: {
-                            // Wall-clock deltas can go negative under NTP
-                            // correction; a backward step reads as zero
-                            // elapsed, never a trap.
-                            const delta_ms = io_mod.milliTimestamp() - started;
-                            break :blk if (delta_ms <= 0) 0 else @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
-                        } else null,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
@@ -8681,6 +8687,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;

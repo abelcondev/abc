@@ -2349,14 +2349,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const inFlightPane = await session.capturePane();
       expect(inFlightPane).toContain("retrying request in 4s");
-      expect(inFlightPane).not.toContain("attempt 2/10");
+      expect(inFlightPane).not.toContain("attempt 2/");
       expect(inFlightPane).not.toContain("retrying request in 1s");
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
       expect(narrowPane).toContain("⚠ Provider unavailable");
       expect(narrowPane).toContain("retrying request");
-      expect(narrowPane).not.toContain("attempt 2/10");
+      expect(narrowPane).not.toContain("attempt 2/");
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
@@ -2842,6 +2842,43 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (pane) => composerContains(pane, prompt),
         TIMEOUT,
       );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "stall stop keeps a draft typed during recovery instead of restoring the failed prompt",
+    async () => {
+      const prompt = "Recover the stalled response while I type.";
+      const draft = "my unsent draft from the retry window";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-stall-keeps-draft-",
+        Array.from({ length: 3 }, () => () =>
+          new Response("", {
+            headers: { "content-type": "text/event-stream" },
+          })),
+      );
+
+      await session!.sendText(prompt);
+      // Occupy the composer while the doomed turn is still retrying; the
+      // stall-stop prompt restore must never clobber an in-progress draft.
+      await session!.sendLiteral(draft);
+      await waitForScrollback(
+        session!,
+        (value) => /kept failing at the same\s+point · stopped/.test(value),
+        "no-progress stall stop",
+      );
+      expect(queuedGateway.requests).toHaveLength(3);
+      // Give a wrongful restore a beat to clobber the draft before asserting.
+      await Bun.sleep(500);
+      // The transcript echo also starts with the composer glyph, so only the
+      // LAST composer line is the live input buffer.
+      const pane = await session!.capturePane();
+      const composerLines = pane.split("\n").filter((line) => isComposerLine(line));
+      const liveComposer = composerLines[composerLines.length - 1] ?? "";
+      expect(liveComposer.includes(draft)).toBe(true);
+      expect(liveComposer.includes(prompt)).toBe(false);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,

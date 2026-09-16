@@ -53,10 +53,6 @@ pub const Progress = enum {
 pub const AttemptState = struct {
     consumed: usize,
     limit: usize = default_max_provider_attempts,
-
-    pub fn remaining(self: AttemptState) usize {
-        return self.limit -| self.consumed;
-    }
 };
 
 /// Ephemeral backoff state. AttemptState remains the durable diagnostic budget;
