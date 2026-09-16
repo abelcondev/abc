@@ -30,6 +30,26 @@ const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
+
+/// One timestamped full-detail record (session assembly, network call,
+/// recovery transition) shown only in the ctrl+o full transcript. Kept out of
+/// the transcript entry store so inline rendering, retention, replay, and
+/// resume never observe it.
+const FullDetailRecord = struct {
+    notice: types.SemanticNotice,
+    created_at_ms: i64,
+
+    pub fn deinit(self: *FullDetailRecord, alloc: Allocator) void {
+        types.freeSemanticNotice(alloc, self.notice);
+        self.* = undefined;
+    }
+};
+
+/// Synthetic full-detail records share entry id 0: the store never issues 0,
+/// and the id orders below every real entry, which keeps row-ordered
+/// bookmark lookups consistent with the records' position at the top.
+const full_detail_record_entry_id: u32 = 0;
+
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const captured_command = @import("../../core/tooling/captured_command.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
@@ -4331,6 +4351,10 @@ pub const TranscriptRuntime = struct {
     transcript_release: transcript_release.State = .{},
     /// Sorted by entry id so exact lookup stays bounded as history grows.
     tool_details: std.ArrayList(ToolDetailRecord) = .empty,
+    /// Full-detail records shown only in the ctrl+o full transcript. Sibling
+    /// of `tool_details`: parallel to the entry store, never inline, never
+    /// persisted, cleared with the transcript.
+    full_detail_records: std.ArrayList(FullDetailRecord) = .empty,
     /// Monotonically increasing id stamped onto each new entry by the
     /// `append*Entry` helpers. Starts at 1 so 0 can be reserved as a
     /// sentinel. Never reset on `clearTranscript` — even after a wipe,
@@ -4441,6 +4465,8 @@ pub const TranscriptRuntime = struct {
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
+        self.clearFullDetailRecords(alloc);
+        self.full_detail_records.deinit(alloc);
         self.transcript.deinit(alloc);
         _ = self.releasePendingResumeSource(alloc);
         for (self.folded_command_blocks.items) |*block| block.deinit(alloc);
@@ -4800,7 +4826,41 @@ pub const TranscriptRuntime = struct {
         self.lifecycle_state.deinit(alloc);
         self.worker_status.reset();
         self.clearToolDetails(alloc);
+        self.clearFullDetailRecords(alloc);
         return transcript_store.clearTranscript(self, alloc);
+    }
+
+    /// Prepends the live full-detail records (session assembly, network,
+    /// recovery) to the first page of a full-transcript source as synthetic
+    /// notice entries. Records never enter the store, so paging, retention,
+    /// and resume keep their existing contracts.
+    fn prependFullDetailRecords(
+        self: *const TranscriptRuntime,
+        alloc: Allocator,
+        source: *full_transcript_worker.Source,
+    ) !void {
+        if (self.full_detail_records.items.len == 0) return;
+        if (source.range.start != 0) return;
+        const insert_at: usize = if (source.entries.items.len > 0 and
+            source.entries.items[0] == .raw_bytes and
+            source.entries.items[0].raw_bytes.class == .welcome)
+            1
+        else
+            0;
+        for (self.full_detail_records.items, 0..) |record, index| {
+            const topic = try alloc.dupe(u8, record.notice.topic);
+            errdefer alloc.free(topic);
+            const body = try alloc.dupe(u8, record.notice.body);
+            errdefer alloc.free(body);
+            try source.entries.insert(alloc, insert_at + index, .{ .semantic_notice = .{
+                .id = full_detail_record_entry_id,
+                .created_at_ms = record.created_at_ms,
+                .topic = topic,
+                .tone = record.notice.tone,
+                .body = body,
+                .visibility = .full_only,
+            } });
+        }
     }
 
     pub fn snapshotVisibleTranscriptText(
@@ -6087,6 +6147,28 @@ pub const TranscriptRuntime = struct {
         self.tool_details.clearRetainingCapacity();
     }
 
+    fn clearFullDetailRecords(self: *TranscriptRuntime, alloc: Allocator) void {
+        for (self.full_detail_records.items) |*record| record.deinit(alloc);
+        self.full_detail_records.clearRetainingCapacity();
+    }
+
+    /// Appends one full-only detail record (session assembly, network,
+    /// recovery) and marks the full transcript content dirty so an open
+    /// ctrl+o view reloads it. Never touches the entry store.
+    pub fn appendFullDetailRecord(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        notice: types.SemanticNotice,
+    ) !void {
+        const owned = try types.dupeSemanticNotice(alloc, notice);
+        errdefer types.freeSemanticNotice(alloc, owned);
+        try self.full_detail_records.append(alloc, .{
+            .notice = owned,
+            .created_at_ms = io_mod.milliTimestamp(),
+        });
+        self.markTranscriptContentDirty();
+    }
+
     pub fn pruneToolDetailsForRetainedEntries(
         self: *TranscriptRuntime,
         alloc: Allocator,
@@ -6117,6 +6199,7 @@ pub const TranscriptRuntime = struct {
             self.discardInstalledFullTranscriptPage();
         }
         self.clearToolDetails(alloc);
+        self.clearFullDetailRecords(alloc);
         self.full_transcript = self.full_transcript.closed();
     }
 
@@ -10594,6 +10677,7 @@ pub const TranscriptRuntime = struct {
         if (capability) |current| {
             source.capability = try current.cloneReadOnly(alloc);
         }
+        try self.prependFullDetailRecords(alloc, &source);
         debug_trace.logf(
             "full_transcript_cache",
             "page_snapshot revision={d} cols={d} range={d}..{d} entries={d} details={d} blocks={d} diffs={d}",
@@ -13677,4 +13761,54 @@ test "changed stored result retires stale full transcript geometry" {
         try std.testing.expect(try runtime.pollFullTranscriptPageLoad());
         try std.testing.expect(runtime.full_transcript_installed_page == null);
     }
+}
+
+test "prependFullDetailRecords injects records only into the first page" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.appendFullDetailRecord(alloc, .{
+        .topic = "session",
+        .tone = .neutral,
+        .body = "provider: test",
+    });
+
+    const request: full_transcript_page.Request = .{ .content_revision = 1, .cols = 80, .anchor = .tail };
+    var source = full_transcript_worker.Source{ .request = request, .range = .{ .start = 0, .end = 0 }, .styles = .{} };
+    defer source.deinit(alloc);
+    try runtime.prependFullDetailRecords(alloc, &source);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    const notice = source.entries.items[0].semantic_notice;
+    try std.testing.expectEqual(@as(u32, 0), notice.id);
+    try std.testing.expectEqualStrings("session", notice.topic);
+    try std.testing.expectEqualStrings("provider: test", notice.body);
+
+    var later = full_transcript_worker.Source{ .request = request, .range = .{ .start = 1, .end = 1 }, .styles = .{} };
+    defer later.deinit(alloc);
+    try runtime.prependFullDetailRecords(alloc, &later);
+    try std.testing.expectEqual(@as(usize, 0), later.entries.items.len);
+}
+
+test "prependFullDetailRecords keeps the welcome banner first" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.appendFullDetailRecord(alloc, .{
+        .topic = "network",
+        .tone = .neutral,
+        .body = "finish: stop",
+    });
+
+    const request: full_transcript_page.Request = .{ .content_revision = 1, .cols = 80, .anchor = .tail };
+    var source = full_transcript_worker.Source{ .request = request, .range = .{ .start = 0, .end = 1 }, .styles = .{} };
+    defer source.deinit(alloc);
+    try source.entries.append(alloc, .{ .raw_bytes = .{
+        .id = 1,
+        .bytes = try alloc.dupe(u8, "banner"),
+        .class = .welcome,
+    } });
+    try runtime.prependFullDetailRecords(alloc, &source);
+    try std.testing.expectEqual(@as(usize, 2), source.entries.items.len);
+    try std.testing.expect(source.entries.items[0] == .raw_bytes);
+    try std.testing.expect(source.entries.items[1] == .semantic_notice);
 }
