@@ -8,7 +8,7 @@ const output = @import("../output/output_contracts.zig");
 const Allocator = std.mem.Allocator;
 const callback_url = "https://fx.sh/api/slack/oauth/callback";
 const bot_scope = "app_mentions:read";
-const lifetime_ms = 300_000;
+const authorization_lifetime: std.Io.Clock.Duration = .{ .raw = .fromSeconds(300), .clock = .boot };
 
 pub const Action = enum { install, status, refresh };
 pub const Options = struct { action: Action, format: output.OutputFormat = .text };
@@ -70,6 +70,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         value.deinit();
     };
     if (action == .install) {
+        const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), authorization_lifetime);
         var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         var listener = try address.listen(io.getIo(), .{ .reuse_address = false });
         defer listener.deinit(io.getIo());
@@ -93,12 +94,11 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         }
         var context = CallbackContext{ .state = state };
         var cancelled: std.atomic.Value(bool) = .init(false);
-        const deadline = std.Io.Clock.awake.now(io.getIo()).addDuration(.fromMilliseconds(lifetime_ms));
         while (accepted == null) {
-            if (std.Io.Clock.awake.now(io.getIo()).nanoseconds >= deadline.nanoseconds) return error.SlackAuthorizationExpired;
+            if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
             accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, origin);
         }
-        if (std.Io.Clock.awake.now(io.getIo()).nanoseconds >= deadline.nanoseconds) return error.SlackAuthorizationExpired;
+        if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
         if (accepted.?.callback.denied) return error.SlackAuthorizationDenied;
         try append(&form.writer, "redirect_uri", callback_url, false);
         try append(&form.writer, "code", accepted.?.callback.code, false);
@@ -310,4 +310,28 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
     try std.testing.expect(valid_id("UBOT", "UW"));
     try std.testing.expect(valid_id("WBOT", "UW"));
     try std.testing.expect(!valid_id("BBOT", "UW"));
+}
+
+test "Slack authorization deadline includes suspended time" {
+    const Clock = struct {
+        awake_ns: i96 = 0,
+        boot_ns: i96 = 0,
+
+        fn now(raw: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = if (clock == .boot) self.boot_ns else self.awake_ns };
+        }
+    };
+    var clock = Clock{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    const test_io = std.Io{ .userdata = &clock, .vtable = &vtable };
+    const deadline = std.Io.Clock.Timestamp.fromNow(test_io, authorization_lifetime);
+    clock.awake_ns = 60 * std.time.ns_per_s;
+    clock.boot_ns = clock.awake_ns;
+    try std.testing.expectEqual(240 * std.time.ns_per_s, deadline.durationFromNow(test_io).raw.nanoseconds);
+    clock.boot_ns += 240 * std.time.ns_per_s;
+    try std.testing.expectEqual(0, deadline.durationFromNow(test_io).raw.nanoseconds);
+    clock.boot_ns += std.time.ns_per_s;
+    try std.testing.expect(deadline.durationFromNow(test_io).raw.nanoseconds < 0);
 }

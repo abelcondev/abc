@@ -19,7 +19,6 @@ pub const SlashRegistry = command_specs.SlashRegistry;
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
 
 pub const top_level_specs = [_]TopLevelSpec{
-    command_specs.slack_install_spec,
     .{
         .kind = .help,
         .token = "help",
@@ -284,6 +283,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
+    command_specs.slack_install_spec,
 };
 
 pub const top_level_help_default_width = command_specs.top_level_help_default_width;

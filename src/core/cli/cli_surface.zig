@@ -542,7 +542,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
@@ -552,6 +551,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 }
                 return .{ .session = args[1..] };
             }
+            if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
