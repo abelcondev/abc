@@ -1614,6 +1614,7 @@ fn collectShellIdsFromExecution(
                 try collectShellIdsFromText(alloc, result, out);
         }
         for (step.tool_results) |result| {
+            try collectShellIdsFromText(alloc, result.output, out);
             if (result.preview) |preview|
                 try collectShellIdsFromText(alloc, preview, out);
         }
@@ -4935,6 +4936,34 @@ test "collectReferencedShellIds scans persisted tool step previews" {
 
     try std.testing.expectEqual(@as(usize, 1), ids.items.len);
     try std.testing.expectEqualStrings("shell-4", ids.items[0]);
+}
+
+test "collectReferencedShellIds scans inline tool outputs without previews" {
+    const alloc = std.testing.allocator;
+    var turn = try makeAssistantTurn(alloc, "start the server", "running");
+    defer freeHistoryTurn(alloc, turn);
+
+    const envelope = "{\"session_id\":\"shell-11\",\"state\":\"running\"}";
+    const results = try alloc.alloc(core_types.PersistedToolResult, 1);
+    results[0] = .{
+        .tool_call_id = try alloc.dupe(u8, "call-1"),
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .status = .success,
+        .output = try alloc.dupe(u8, envelope),
+        .output_bytes = envelope.len,
+        .stored_output_bytes = envelope.len,
+    };
+    const steps = try alloc.alloc(core_types.ToolExecutionStep, 1);
+    steps[0] = .{ .tool_results = results };
+    turn.assistant.execution = .{ .tool_steps = steps };
+
+    const history = [_]HistoryTurn{turn};
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqualStrings("shell-11", ids.items[0]);
 }
 
 test "collectReferencedShellIds yields nothing for shell-free history" {
