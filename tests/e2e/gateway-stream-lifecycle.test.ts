@@ -6967,7 +6967,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           socket.end(
             "HTTP/1.1 503 Service Unavailable\r\n" +
               "Content-Type: application/json\r\n" +
-              "Retry-After: 0\r\n" +
+              "Retry-After: 1\r\n" +
               `Content-Length: ${Buffer.byteLength(body)}\r\n` +
               "Connection: close\r\n\r\n" +
               body,
@@ -9163,7 +9163,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           delta: partialText,
         })}\n\n`,
       ),
-      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
+      ...Array.from({ length: 9 }, () => unavailableResponse("1")),
       fakeGatewayFinalText(finalText),
     ];
     const gateway = startGateway(() =>
@@ -9195,7 +9195,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("tool call ids remain canonical in storage and portable on model switch", async () => {
     const root = createFixtureRoot("portable-call-ids");
