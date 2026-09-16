@@ -26,6 +26,7 @@ pub const HttpPool = struct {
     last_activity_ms: std.atomic.Value(i64) = .init(0),
     warm_started: std.atomic.Value(bool) = .init(false),
     warm_done: std.atomic.Value(bool) = .init(false),
+    deinitialized: bool = false,
 
     pub const DestroyDisposition = enum {
         /// Pool resources released; caller may free the HttpPool itself.
@@ -44,6 +45,8 @@ pub const HttpPool = struct {
     /// briefly for it, then abandons rather than freeing memory the thread is
     /// using (only reachable on process-abandon paths).
     pub fn deinit(self: *HttpPool) DestroyDisposition {
+        if (self.deinitialized) return .destroyed;
+        self.deinitialized = true;
         if (self.warm_started.load(.acquire) and !self.warm_done.load(.acquire)) {
             var waited_ms: u64 = 0;
             while (!self.warm_done.load(.acquire) and waited_ms < 500) : (waited_ms += 10) {

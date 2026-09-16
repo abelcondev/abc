@@ -6385,6 +6385,10 @@ const LoopbackGatewayMode = enum {
     success_capture,
     model_catalog_success,
     private_model_catalog_success,
+    keep_alive_reuse,
+    keep_alive_close_after_response,
+    reset_mid_request,
+    slow_terminal_chunk,
 };
 
 const LoopbackGatewayFixture = struct {
@@ -6397,6 +6401,8 @@ const LoopbackGatewayFixture = struct {
     accept_started: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
     accepted: std.atomic.Value(bool) = .init(false),
+    accepted_count: std.atomic.Value(usize) = .init(0),
+    requests_served: std.atomic.Value(usize) = .init(0),
     reached_stage: std.atomic.Value(bool) = .init(false),
     request_headers: [16 * 1024]u8 = undefined,
     request_headers_len: std.atomic.Value(usize) = .init(0),
@@ -6518,6 +6524,7 @@ const LoopbackGatewayFixture = struct {
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);
+        _ = self.accepted_count.fetchAdd(1, .seq_cst);
 
         switch (self.mode) {
             .reset_on_accept => {
@@ -6625,6 +6632,7 @@ const LoopbackGatewayFixture = struct {
 
                 var recovered_stream = try self.server.accept(zio);
                 defer recovered_stream.close(zio);
+                _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 try readLoopbackGatewayRequest(zio, recovered_stream, self);
                 try writeLoopbackGatewayBytes(
                     zio,
@@ -6686,7 +6694,70 @@ const LoopbackGatewayFixture = struct {
                         loopback_private_model_catalog_json,
                 );
             },
+            .keep_alive_reuse => {
+                self.markStage();
+                self.serveKeepAliveLoop(zio, stream);
+            },
+            .keep_alive_close_after_response => {
+                self.markStage();
+                // Serve once, then drop the connection without a
+                // Connection: close header, simulating an edge idle timeout:
+                // the client pools the dead connection and discovers it on
+                // the next borrow.
+                self.serveKeepAliveOnce(zio, stream);
+                stream.shutdown(zio, .both) catch {};
+                var recovered = try self.server.accept(zio);
+                defer recovered.close(zio);
+                _ = self.accepted_count.fetchAdd(1, .seq_cst);
+                self.serveKeepAliveOnce(zio, recovered);
+            },
+            .reset_mid_request => {
+                // Read one byte, then RST: the client fails mid-send or at
+                // head read; either way the connection must not be pooled.
+                var one: [1]u8 = undefined;
+                var reader = stream.reader(zio, &one);
+                _ = reader.interface.takeByte() catch {};
+                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&rst),
+                );
+                self.markStage();
+            },
+            .slow_terminal_chunk => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                self.markStage();
+                var frame_buf: [512]u8 = undefined;
+                const partial = try std.fmt.bufPrint(
+                    &frame_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
+                    .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
+                );
+                try writeLoopbackGatewayBytes(zio, stream, partial);
+                self.hold();
+                try writeLoopbackGatewayBytes(zio, stream, "0\r\n\r\n");
+            },
         }
+    }
+
+    fn serveKeepAliveLoop(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        while (!self.stopping.load(.seq_cst)) {
+            readKeepAliveRequest(&reader.interface) catch return;
+            _ = self.requests_served.fetchAdd(1, .seq_cst);
+            writeKeepAliveResponse(zio, stream) catch return;
+        }
+    }
+
+    fn serveKeepAliveOnce(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        readKeepAliveRequest(&reader.interface) catch return;
+        _ = self.requests_served.fetchAdd(1, .seq_cst);
+        writeKeepAliveResponse(zio, stream) catch return;
     }
 };
 
@@ -7024,6 +7095,122 @@ test "unpooled requests keep close semantics" {
     try std.testing.expectEqual(@as(usize, 1), probe.attempts);
     try std.testing.expectEqual(false, probe.keep_alive_seen orelse true);
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+fn pooledLoopbackCall(pool: *http_pool.HttpPool, url: []const u8) anyerror!StreamResult {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    return streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+            .shared_pool = pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{},
+    );
+}
+
+test "shared pool reuses one keep-alive connection across sequential requests" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    var second = try pooledLoopbackCall(&pool, harness.url);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", second.completion.content.?);
+
+    // One accepted connection served both requests.
+    try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    // Close the pooled connection before the fixture teardown so the serve
+    // loop observes EOF and the fixture thread can join.
+    _ = pool.deinit();
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "stale pooled connection fails once, never re-pools, and the next request redials" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_close_after_response, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    // The server silently dropped the pooled connection after responding
+    // (idle-close). The next borrow writes into the dead socket and fails.
+    const stale = pooledLoopbackCall(&pool, harness.url);
+    if (stale) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedStaleFailure;
+    } else |_| {}
+    // The dead connection was destroyed, not returned to the free list.
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+
+    var third = try pooledLoopbackCall(&pool, harness.url);
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", third.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.accepted_count.load(.seq_cst));
+}
+
+test "mid-request reset never returns the connection to the pool" {
+    var harness = try ConnectionSetupHarness.init(.reset_mid_request, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const result = pooledLoopbackCall(&pool, harness.url);
+    if (result) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedResetFailure;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "drain waits for a delayed terminal chunk without failing the request" {
+    var harness = try ConnectionSetupHarness.init(.slow_terminal_chunk, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const started = io_mod.milliTimestamp();
+    var result = try pooledLoopbackCall(&pool, harness.url);
+    defer result.deinit(std.testing.allocator);
+    const elapsed = io_mod.milliTimestamp() - started;
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    try std.testing.expect(elapsed >= 450); // fixture holds the terminal chunk for 500 ms
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -7634,6 +7821,35 @@ fn rawHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[colon_index + 1 ..], " \t");
     }
     return null;
+}
+
+const keep_alive_sse_payload =
+    "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+    "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+
+fn readKeepAliveRequest(reader: *std.Io.Reader) !void {
+    var header_buf: [16 * 1024]u8 = undefined;
+    var header_len: usize = 0;
+    while (header_len < header_buf.len) {
+        header_buf[header_len] = try reader.takeByte();
+        header_len += 1;
+        if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
+    } else {
+        return error.TestRequestTooLarge;
+    }
+    if (loopbackContentLength(header_buf[0 .. header_len - 4])) |content_length| {
+        try reader.discardAll(content_length);
+    }
+}
+
+fn writeKeepAliveResponse(zio: std.Io, stream: std.Io.net.Stream) !void {
+    var frame_buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(
+        &frame_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+        .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
+    );
+    try writeLoopbackGatewayBytes(zio, stream, out);
 }
 
 fn loopbackContentLength(headers: []const u8) ?usize {
