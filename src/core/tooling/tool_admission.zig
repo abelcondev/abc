@@ -2590,9 +2590,17 @@ test "permission target failures name the unresolved path without hiding runtime
     const not_found = (try permissionTargetResolutionFailureMessage(arena, call, error.FileNotFound)).?;
     try std.testing.expectEqualStrings("Path not found: missing/dir", not_found);
 
-    for ([_]anyerror{ error.NotDir, error.SymLinkLoop, error.AccessDenied, error.PermissionDenied, error.NameTooLong }) |err| {
-        const failure = (try permissionTargetResolutionFailureMessage(arena, call, err)) orelse return error.TestExpectedToolFailure;
-        try std.testing.expect(std.mem.find(u8, failure, "missing/dir") != null);
+    const arm_cases = [_]struct { err: anyerror, expected: []const u8 }{
+        .{ .err = error.NotDir, .expected = "Path is not a directory: missing/dir" },
+        .{ .err = error.AccessDenied, .expected = "Access denied for path: missing/dir" },
+        .{ .err = error.PermissionDenied, .expected = "Access denied for path: missing/dir" },
+        .{ .err = error.PathOutsideWorkspace, .expected = "Path is outside the workspace: missing/dir" },
+        .{ .err = error.SymLinkLoop, .expected = "Cannot resolve path \"missing/dir\": SymLinkLoop" },
+        .{ .err = error.NameTooLong, .expected = "Cannot resolve path \"missing/dir\": NameTooLong" },
+    };
+    for (arm_cases) |case| {
+        const failure = (try permissionTargetResolutionFailureMessage(arena, call, case.err)) orelse return error.TestExpectedToolFailure;
+        try std.testing.expectEqualStrings(case.expected, failure);
     }
 
     const command_call: ToolCall = .{
