@@ -63,7 +63,7 @@ Agents can read any page as Markdown by appending `.md` to its URL, or fetch the
 
 ## Custom model connections
 
-Point fx at any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, through named connections in `~/.fx/settings.json`:
+Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
 
 ```bash
 fx provider local
@@ -78,7 +78,7 @@ In the interactive shell, an MCP form with a single select-one field and up to t
 
 ## Themes
 
-fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with `FX_THEME=<name>`.
+fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with `FX_THEME=<name>`. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
 ## Embed fx
 
