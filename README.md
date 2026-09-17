@@ -52,21 +52,7 @@ Inside the shell, run `/help` to browse interactive commands.
 
 ## Documentation
 
-The full manual lives at [fx.sh/docs](https://fx.sh/docs). Start from the page that matches what you are doing:
-
-| I want to... | Read |
-| --- | --- |
-| Install, sign in, run a first session | [Quick start](https://fx.sh/docs), [Installation](https://fx.sh/docs/getting-started/installation), [Authentication](https://fx.sh/docs/getting-started/authentication) |
-| Save, resume, and compact conversations | [Sessions](https://fx.sh/docs/using-fx/sessions) |
-| Look up a command or flag | [CLI reference](https://fx.sh/docs/using-fx/cli), [Slash commands](https://fx.sh/docs/using-fx/slash-commands) |
-| Pick or change models | [Models](https://fx.sh/docs/configure-fx/models) |
-| Use Ollama, OpenRouter, or another OpenAI-compatible endpoint | [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) |
-| Control tool permissions and automatic review | [Permissions](https://fx.sh/docs/configure-fx/permissions) |
-| Configure settings and environment variables | [Configuration](https://fx.sh/docs/configure-fx/configuration) |
-| Add skills, MCP servers, or subagents | [Skills](https://fx.sh/docs/capabilities/skills), [MCP](https://fx.sh/docs/capabilities/mcp), [Subagents](https://fx.sh/docs/capabilities/subagents) |
-| Embed fx in an app or editor | [Embedding fx](https://fx.sh/docs/lib), [ACP server](https://fx.sh/docs/using-fx/acp) |
-
-Agents can read any page as Markdown by appending `.md` to its URL, or fetch the [combined documentation file](https://fx.sh/llms-full.txt) ([index](https://fx.sh/llms.txt)).
+Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
 
 ## Custom model connections
 
@@ -107,6 +93,10 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
+
+## Security
+
+Report security vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
 
 ## License
 
