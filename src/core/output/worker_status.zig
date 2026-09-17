@@ -167,7 +167,7 @@ fn format_status_label(
     else if (status.action == .waiting_for_connectivity)
         std.fmt.bufPrint(
             buf,
-            "{s} · esc to stop",
+            "{s} · esc to pause",
             .{status.label(&base_buf)},
         ) catch status.label(buf)
     else if (status.action == .paused)
@@ -359,7 +359,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · waiting for connection · esc to stop",
+            "⚠ Mac woke from sleep · waiting for connection · esc to pause",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
