@@ -2478,7 +2478,7 @@ fn resolveLiveToolAuthority(
             call,
             advertised_dynamic_tool_names,
         ) catch |err| {
-        const failure = (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call.name, err)) orelse return err;
+        const failure = (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call, err)) orelse return err;
         debug_trace.logf("permission", "event=live_authority_target_failure call_id={s} tool_name={s} err={s}", .{ call.id, call.name, @errorName(err) });
         return .{ .tool_failure = failure };
     };

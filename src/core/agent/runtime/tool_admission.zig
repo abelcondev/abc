@@ -946,7 +946,7 @@ fn permissionErrorOutcome(
     target_class: []const u8,
     ctx: TraceContext,
 ) anyerror!command_admission.PermissionOutcome {
-    if (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call.name, err)) |failure| {
+    if (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call, err)) |failure| {
         debug_trace.eventf("permission", "permission_target_resolution_error", ctx, "call_id={s} tool_name={s} permission_mode={s} err={s} outside_workspace={s} approval_source=tool_layer", .{ call.id, call.name, @tagName(mode), @errorName(err), target_class });
         return .{ .tool_failure = failure };
     }
