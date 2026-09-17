@@ -7548,9 +7548,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     writeFileSync(join(root.workspace, "not-dir"), "UNCHANGED\n");
     symlinkSync("loop", join(root.workspace, "loop"));
     const badCalls = [
-      { id: "missing-search", name: "glob_files", input: { path: "missing", pattern: "*" }, error: "FileNotFound" },
-      { id: "not-dir-search", name: "grep_files", input: { path: "not-dir/child", pattern: "test" }, error: "NotDir" },
-      { id: "loop-search", name: "glob_files", input: { path: "loop/child", pattern: "*" }, error: "SymLinkLoop" },
+      { id: "missing-search", name: "glob_files", input: { path: "missing", pattern: "*" }, expected: "Path not found: missing" },
+      { id: "not-dir-search", name: "grep_files", input: { path: "not-dir/child", pattern: "test" }, expected: "Path is not a directory: not-dir/child" },
+      { id: "loop-search", name: "glob_files", input: { path: "loop/child", pattern: "*" }, expected: 'Cannot resolve path "loop/child": SymLinkLoop' },
     ];
     let childRequests = 0;
     const gateway = startDynamicFakeGateway((body) => {
@@ -7562,7 +7562,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "recovery-read")) {
           for (const call of badCalls) {
-            expect(toolResultOutput(body, call.id)).toContain(`Permission target resolution failed for ${call.name}: ${call.error}`);
+            expect(toolResultOutput(body, call.id)).toContain(call.expected);
           }
           expect(toolResultOutput(body, "recovery-read")).toContain("RECOVERY_READ");
           return fakeGatewayFinalText("CHILD_RECOVERED");
