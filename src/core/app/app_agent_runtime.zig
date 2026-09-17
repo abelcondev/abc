@@ -347,6 +347,7 @@ pub fn Runtime(comptime App: type) type {
             return mcp_elicitation_interaction.respond(alloc, origin, required, .{
                 .questioner = .{ .context = raw_ctx, .ask_fn = askMcpQuestion },
                 .browser = .{ .context = raw_ctx, .open_fn = openMcpUrl },
+                .compact_forms = true,
                 .capabilities = .{ .form = true, .url = true },
             });
         }

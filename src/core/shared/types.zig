@@ -2209,6 +2209,9 @@ pub const QuestionOption = struct {
 pub const QuestionBatchEntry = struct {
     question: []const u8,
     options: []const QuestionOption,
+    /// Submission prompts return JSON {"value": string} or {"option": index},
+    /// keeping typed text distinct from action labels such as Decline.
+    submission: enum { none, input, choice } = .none,
 };
 
 /// One persisted answer from an interactive question batch. The strings are

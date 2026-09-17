@@ -4326,6 +4326,7 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/mcp/features/common.zig");
     _ = @import("core/mcp/features/resources.zig");
     _ = @import("core/mcp/features/prompts.zig");

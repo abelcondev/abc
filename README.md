@@ -120,6 +120,11 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
 
+In the interactive shell, MCP forms with a single select-one field and up to three
+options combine selection and submission in one prompt. You can decline, cancel,
+use a displayed default, or skip an optional field. Text inputs, numbers, booleans,
+and all other forms include a separate review step.
+
 ## Themes
 
 fx ships with built-in `fx-dark` and `fx-light` themes and follows your terminal's light or dark mode automatically. Set `FX_THEME=light` or `FX_THEME=dark` to pin a variant.
