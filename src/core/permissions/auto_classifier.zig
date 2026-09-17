@@ -1884,7 +1884,7 @@ test "review response retries malformed completion once on the same deadline" {
 
 test "review response recovery is bounded and releases every completion" {
     const Fixture = struct {
-        const Mode = enum { recover_clear, recover_caution, invalid_twice, caution, transport, transport_timeout, transport_recover, transport_then_invalid, permanent, cancel_between, cancel_second, expired };
+        const Mode = enum { recover_clear, recover_caution, invalid_twice, caution, transport, transport_timeout, transport_recover, transport_then_invalid, transport_throws, transport_throws_twice, permanent, cancel_between, cancel_second, expired };
         mode: Mode,
         sends: usize = 0,
         released: usize = 0,
@@ -1906,6 +1906,8 @@ test "review response recovery is bounded and releases every completion" {
                 .permanent => return .permanent_failure,
                 .transport_recover => if (self.sends == 1) return .transient_failure,
                 .transport_then_invalid => if (self.sends == 1) return .timed_out,
+                .transport_throws => if (self.sends == 1) return error.ConnectionResetByPeer,
+                .transport_throws_twice => return error.ConnectionResetByPeer,
                 else => {},
             }
             if (self.mode == .cancel_second and self.sends == 2) self.cancel.store(true, .seq_cst);
@@ -1954,7 +1956,7 @@ test "review response recovery is bounded and releases every completion" {
                 var outcome = try reviewer.review(std.testing.allocator, request);
                 defer outcome.deinit(std.testing.allocator);
                 switch (mode) {
-                    .recover_clear, .transport_recover, .transport_then_invalid => {
+                    .recover_clear, .transport_recover, .transport_then_invalid, .transport_throws => {
                         try std.testing.expect(outcome == .valid);
                         try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
                     },
@@ -1965,6 +1967,7 @@ test "review response recovery is bounded and releases every completion" {
                     .invalid_twice => try std.testing.expectEqual(InvalidReason.completion_text, outcome.invalid),
                     .transport => try std.testing.expectEqual(InvalidReason.transport_transient, outcome.invalid),
                     .transport_timeout => try std.testing.expectEqual(InvalidReason.transport_timed_out, outcome.invalid),
+                    .transport_throws_twice => try std.testing.expectEqual(InvalidReason.transport_call_failed, outcome.invalid),
                     .permanent => try std.testing.expectEqual(InvalidReason.transport_permanent, outcome.invalid),
                     .expired => try std.testing.expectEqual(InvalidReason.construction_timed_out, outcome.invalid),
                     .cancel_between, .cancel_second => unreachable,
@@ -1976,8 +1979,8 @@ test "review response recovery is bounded and releases every completion" {
                 else => 2,
             };
             const expected_released: usize = switch (mode) {
-                .transport, .transport_timeout, .permanent => 0,
-                .transport_recover => 1,
+                .transport, .transport_timeout, .transport_throws_twice, .permanent => 0,
+                .transport_recover, .transport_throws => 1,
                 .transport_then_invalid => 2,
                 else => expected_sends,
             };
