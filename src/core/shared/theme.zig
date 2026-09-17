@@ -5,7 +5,7 @@
 //! rendering resolve their themed values from here. User themes load from
 //! `~/.fx/themes/<name>.json` (selected with FX_THEME=<name>) in either the
 //! native fx slot schema or the VS Code theme schema (`colors` +
-//! `tokenColors`), so editor themes like Cursor Dark or GitHub Dark apply
+//! `tokenColors`), so editor themes like GitHub Dark apply
 //! directly. Hex colors resolve to truecolor escapes when the terminal
 //! supports them, otherwise they quantize to the xterm-256 palette.
 
@@ -730,7 +730,7 @@ pub const LoadError = error{ InvalidName, ThemeNotFound, InvalidTheme, OutOfMemo
 
 /// Returns the sibling variant name for the common `-dark` / `-light`
 /// (or `_dark` / `_light`) file naming convention, so a pinned theme can
-/// follow the terminal's detected mode: cursor-dark -> cursor-light.
+/// follow the terminal's detected mode: github-dark -> github-light.
 /// Returns null when the name carries no recognizable variant suffix.
 pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool) !?[]const u8 {
     const suffixes = [_][]const u8{ "-dark", "-light", "_dark", "_light" };
@@ -752,7 +752,7 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
 }
 
 /// Resolves the named theme for the terminal's detected mode: loads it, swaps
-/// to a sibling variant file (cursor-dark <-> cursor-light) when the variant
+/// to a sibling variant file (github-dark <-> github-light) when the variant
 /// mismatches, and returns null to signal the builtin variant when neither
 /// file fits. Used both at startup and on live terminal theme notifications.
 pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {

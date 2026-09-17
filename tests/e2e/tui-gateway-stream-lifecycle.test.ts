@@ -1578,6 +1578,83 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("trace report explains a rejected image when the model catalog is unavailable", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    const workspace = realpathSync(workspacePath);
+    const imagePath = join(workspace, "catalog-rejection.png");
+    copyFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"), imagePath);
+
+    const queuedGateway = startFakeGateway([fakeGatewayFinalText("UNREACHABLE_WITHOUT_IMAGE")], {
+      models: new Response("catalog unavailable", { status: 503 }),
+    });
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 120,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-trace-catalog-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText(`/image ${imagePath}`);
+    await session.waitForText("attached image: catalog-rejection.png", TIMEOUT);
+    await session.sendText("Describe the attached image.");
+    await session.waitForText("Unable to verify image support for this model", TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(0);
+
+    // The notice text wraps unpredictably across terminal widths, so wait for
+    // the report file itself instead of a pane string.
+    await session.sendText("/trace");
+    const rootDir = root;
+    await waitForCondition(
+      () => readdirSync(rootDir).some((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md")),
+      "trace report file",
+    );
+
+    const reports = readdirSync(rootDir)
+      .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
+      .sort();
+    expect(reports).toHaveLength(1);
+    const report = readFileSync(join(rootDir, reports[0]!), "utf8");
+
+    const catalog = report.split("## Model Catalog")[1]?.split("\n## ")[0] ?? "";
+    expect(catalog).toContain("state=failed");
+    expect(catalog).toContain(`selected_model=${MODEL} image_input=unknown`);
+    expect(catalog).toContain("load failed outcome=failed");
+    expect(catalog).toContain(`lookup failed outcome=cache_failed model=${MODEL}`);
+    expect(catalog).toContain(
+      `image_gate failed model=${MODEL} image_support=unknown err=ModelImageCapabilityUnavailable`,
+    );
+
+    const problems = report.split("## Problems")[1]?.split("\n## ")[0] ?? "";
+    expect(problems).toContain(`- model catalog image_gate model=${MODEL}`);
+    expect(problems).not.toContain("no obvious errors");
+
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  }, TIMEOUT);
+
   test("file edits keep earlier instruction bytes stable", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-stable-verification-",

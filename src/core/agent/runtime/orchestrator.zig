@@ -7155,8 +7155,14 @@ fn processQueuedPromptLoop(
                         );
                     },
                     .unavailable => switch (request_capabilities.image_input_support) {
-                        .unknown => return error.ModelImageCapabilityUnavailable,
-                        .non_native => return error.SubscriptionNativeImageUnavailable,
+                        .unknown => {
+                            diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                            return error.ModelImageCapabilityUnavailable;
+                        },
+                        .non_native => {
+                            diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
+                            return error.SubscriptionNativeImageUnavailable;
+                        },
                         .native => unreachable,
                     },
                 };

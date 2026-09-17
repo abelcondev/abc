@@ -2180,6 +2180,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
+    try writeModelCatalogSummary(&out.writer, app);
     try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
@@ -2555,7 +2556,32 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, or MCP state\n");
+    count += try writeModelCatalogProblems(writer);
+
+    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, MCP, or model catalog state\n");
+}
+
+/// Surfaces failed model-catalog loads, capability lookup misses, and image
+/// gate rejections under Problems so an unverifiable-capability failure is
+/// never reported as "no obvious errors".
+fn writeModelCatalogProblems(writer: *std.Io.Writer) !usize {
+    var buf: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const total = diagnostics.snapshotModelCatalogEvents(&buf);
+    var count: usize = 0;
+    var index = total;
+    while (index > 0 and count < 3) {
+        index -= 1;
+        const event = &buf[index];
+        if (!event.failed) continue;
+        count += 1;
+        try writer.print("- model catalog {s}", .{event.name()});
+        if (event.detail().len > 0) {
+            try writer.writeByte(' ');
+            try writer.writeAll(event.detail());
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
 }
 
 const trace_compaction_max_events: usize = 24;
@@ -2863,6 +2889,59 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
     try writer.print("\n## Network Calls\nlast={d} ok={d} errors={d} avg={d}ms min={d}ms max={d}ms\n", .{ n, ok_count, error_count, avg_ms, min_ms, max_ms });
     for (buf[0..n]) |call| {
         try writeNetworkCallCompact(writer, call);
+    }
+}
+
+/// Renders catalog cache state, the selected model's resolved capabilities,
+/// and the always-on catalog event ring so a shared trace explains why an
+/// image submission or capability-dependent feature was rejected.
+fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
+    const App = @TypeOf(app.*);
+    try writer.writeAll("\n## Model Catalog\n");
+    if (comptime @hasField(App, "model_cache")) {
+        const snapshot = app.model_cache.snapshotForTrace();
+        try writer.print("state={s} entries={d}", .{ snapshot.state, snapshot.entries });
+        if (snapshot.last_attempt_ms > 0) {
+            const age_ms = io_mod.milliTimestamp() - snapshot.last_attempt_ms;
+            try writer.print(" last_attempt={d}s ago", .{@divFloor(@max(age_ms, 0), @as(i64, 1000))});
+        }
+        if (snapshot.failure_category) |category| {
+            try writer.print(" failure={s} retryable={s}", .{ category, boolLabel(snapshot.failure_retryable) });
+            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@intFromEnum(status)});
+            if (snapshot.anonymous_fallback) try writer.writeAll(" anonymous_fallback=true");
+        }
+        try writer.writeByte('\n');
+    }
+    if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
+        const model = provider_runtime.model(app);
+        const capabilities = app.resolvedModelCapabilities(model);
+        try writer.print("selected_model={s} image_input={s} vision={s} file_input={s} tool_use={s}", .{
+            model,
+            @tagName(capabilities.image_input_support),
+            boolLabel(capabilities.supports_vision),
+            boolLabel(capabilities.supports_file_input),
+            boolLabel(capabilities.supports_tool_use),
+        });
+        if (capabilities.context_window) |window| try writer.print(" context_window={d}", .{window});
+        try writer.writeByte('\n');
+    }
+    var buf: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const total = diagnostics.snapshotModelCatalogEvents(&buf);
+    if (total == 0) {
+        try writer.writeAll("(no catalog events recorded)\n");
+        return;
+    }
+    try writer.print("events={d} (always recorded; does not require FX_TRACE)\n", .{total});
+    for (buf[0..total]) |*event| {
+        try writeTraceTimestampUtc(writer, event.timestamp_ms);
+        try writer.print(" seq={d} {s}", .{ event.sequence, event.name() });
+        if (event.failed) try writer.writeAll(" failed");
+        if (event.detail().len > 0) {
+            try writer.writeByte(' ');
+            try writer.writeAll(event.detail());
+        }
+        if (event.truncated) try writer.writeAll(" [truncated]");
+        try writer.writeByte('\n');
     }
 }
 
@@ -4402,6 +4481,94 @@ test "trace compaction summary renders recorded events without file tracing" {
     defer wrapped.deinit();
     try writeCompactionSummary(&wrapped.writer, alloc);
     try std.testing.expect(std.mem.find(u8, wrapped.written(), "overwritten_before=3") != null);
+}
+
+test "trace model catalog summary and problems render recorded events" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+
+    var empty: std.Io.Writer.Allocating = .init(alloc);
+    defer empty.deinit();
+    try writeModelCatalogSummary(&empty.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Model Catalog\n(no catalog events recorded)\n") != null);
+
+    diagnostics.recordModelCatalogEvent(true, "load", "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    diagnostics.recordModelCatalogEvent(true, "lookup", "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(false, "load", "outcome=ready entries={d}", .{41});
+    diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeModelCatalogSummary(&out.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, out.written(), "events=4 (always recorded; does not require FX_TRACE)\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "load failed outcome=failed category=transport status=503\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "lookup failed outcome=cache_failed model=moonshotai/kimi-k3\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "image_gate failed model=moonshotai/kimi-k3 image_support=unknown err=ModelImageCapabilityUnavailable\n") != null);
+
+    var problems: std.Io.Writer.Allocating = .init(alloc);
+    defer problems.deinit();
+    const problem_count = try writeModelCatalogProblems(&problems.writer);
+    try std.testing.expectEqual(@as(usize, 3), problem_count);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "- model catalog image_gate model=moonshotai/kimi-k3 image_support=unknown err=ModelImageCapabilityUnavailable\n") != null);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "- model catalog load outcome=failed category=transport status=503\n") != null);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "outcome=ready") == null);
+}
+
+test "trace model catalog summary renders cache state and failure detail" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const Snapshot = struct {
+        state: []const u8,
+        entries: usize,
+        last_attempt_ms: i64,
+        failure_category: ?[]const u8,
+        failure_http_status: ?std.http.Status,
+        failure_retryable: bool,
+        anonymous_fallback: bool,
+    };
+    const CacheStub = struct {
+        snapshot: Snapshot,
+        fn snapshotForTrace(self: *@This()) Snapshot {
+            return self.snapshot;
+        }
+    };
+    const StubApp = struct {
+        model_cache: CacheStub,
+    };
+
+    var stub: StubApp = .{ .model_cache = .{ .snapshot = .{
+        .state = "failed",
+        .entries = 0,
+        .last_attempt_ms = 0,
+        .failure_category = "transport",
+        .failure_http_status = .service_unavailable,
+        .failure_retryable = true,
+        .anonymous_fallback = true,
+    } } };
+    var failed: std.Io.Writer.Allocating = .init(alloc);
+    defer failed.deinit();
+    try writeModelCatalogSummary(&failed.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, failed.written(), "state=failed entries=0 failure=transport retryable=true status=503 anonymous_fallback=true\n") != null);
+
+    stub.model_cache.snapshot = .{
+        .state = "ready",
+        .entries = 41,
+        .last_attempt_ms = 0,
+        .failure_category = null,
+        .failure_http_status = null,
+        .failure_retryable = false,
+        .anonymous_fallback = false,
+    };
+    var ready: std.Io.Writer.Allocating = .init(alloc);
+    defer ready.deinit();
+    try writeModelCatalogSummary(&ready.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, ready.written(), "state=ready entries=41\n") != null);
 }
 
 test "trace report file uses private randomized markdown path" {
