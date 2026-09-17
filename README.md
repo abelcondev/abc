@@ -132,20 +132,20 @@ fx ships with built-in `fx-dark` and `fx-light` themes and follows your terminal
 Custom themes load from `~/.fx/themes/<name>.json`. Pick one persistently in `~/.fx/settings.json`:
 
 ```json
-{ "theme": "cursor-dark" }
+{ "theme": "github-dark" }
 ```
 
 or per launch with `FX_THEME=<name>`, which wins over the settings value:
 
 ```bash
-FX_THEME=cursor-dark fx
+FX_THEME=github-dark fx
 ```
 
 The key also accepts `"light"` and `"dark"` to pin a built-in variant.
 
-A pinned theme follows your terminal's detected light or dark mode when a sibling variant exists: with `FX_THEME=cursor-dark` on a light terminal, fx loads `cursor-light` instead when `~/.fx/themes/cursor-light.json` is present (the `-dark`/`-light` or `_dark`/`_light` suffix convention). Without a sibling file, fx falls back to the built-in theme matching your terminal rather than washing out on the wrong background.
+A pinned theme follows your terminal's detected light or dark mode when a sibling variant exists: with `FX_THEME=github-dark` on a light terminal, fx loads `github-light` instead when `~/.fx/themes/github-light.json` is present (the `-dark`/`-light` or `_dark`/`_light` suffix convention). Without a sibling file, fx falls back to the built-in theme matching your terminal rather than washing out on the wrong background.
 
-Theme files accept the VS Code theme format (`colors` plus `tokenColors`), so editor themes such as Cursor Dark or GitHub Dark work directly:
+Theme files accept the VS Code theme format (`colors` plus `tokenColors`), so editor themes such as GitHub Dark work directly:
 
 ```json
 {
