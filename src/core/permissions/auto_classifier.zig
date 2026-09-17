@@ -66,6 +66,13 @@ pub const InvalidReason = enum {
     arguments_json,
     arguments_shape,
     arguments_decision,
+
+    pub fn is_malformed_completion(self: InvalidReason) bool {
+        return switch (self) {
+            .completion_text, .completion_tool_call_count, .completion_tool_name, .completion_argument_integrity, .arguments_json, .arguments_shape, .arguments_decision => true,
+            else => false,
+        };
+    }
 };
 
 pub const ParseOutcome = union(enum) {
@@ -507,31 +514,42 @@ pub const Reviewer = struct {
             .{ payload.len, io_mod.milliTimestamp() - started_ms, review_turn.target_call_id },
         );
 
-        checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
-        debug_trace.logf(
-            "permission",
-            "event=auto_review_send attempt=1 max_attempts=1 target_call_id={s}",
-            .{review_turn.target_call_id},
-        );
-        var transport_outcome = transport.send(
-            alloc,
-            self.model,
-            payload,
-            deadline,
-            cancel_flag,
-        ) catch |err| switch (err) {
-            error.OutOfMemory, error.Cancelled => return err,
-            else => return .{ .invalid = .transport_call_failed },
-        };
-        switch (transport_outcome) {
-            .cancelled => return error.Cancelled,
-            .timed_out => return .{ .invalid = .transport_timed_out },
-            .permanent_failure => return .{ .invalid = .transport_permanent },
-            .transient_failure => return .{ .invalid = .transport_transient },
-            .completion => |*owned| {
-                defer owned.deinit(alloc);
-                return try parseCompletion(alloc, owned.completion);
-            },
+        var recovery_available = true;
+        while (true) {
+            checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_send attempt={d} max_attempts=2 target_call_id={s}",
+                .{ @as(u8, if (recovery_available) 1 else 2), review_turn.target_call_id },
+            );
+            var transport_outcome = transport.send(
+                alloc,
+                self.model,
+                payload,
+                deadline,
+                cancel_flag,
+            ) catch |err| switch (err) {
+                error.OutOfMemory, error.Cancelled => return err,
+                else => return .{ .invalid = .transport_call_failed },
+            };
+            switch (transport_outcome) {
+                .cancelled => return error.Cancelled,
+                .timed_out => return .{ .invalid = .transport_timed_out },
+                .permanent_failure => return .{ .invalid = .transport_permanent },
+                .transient_failure => return .{ .invalid = .transport_transient },
+                .completion => |*owned| {
+                    defer owned.deinit(alloc);
+                    checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
+                    const parsed = try parseCompletion(alloc, owned.completion);
+                    if (!recovery_available or parsed != .invalid or !parsed.invalid.is_malformed_completion()) return parsed;
+                    debug_trace.logf(
+                        "permission",
+                        "event=auto_review_format_retry reason={s} tool_calls={d} content_bytes={d} target_call_id={s}",
+                        .{ @tagName(parsed.invalid), owned.completion.tool_calls.len, if (owned.completion.content) |content| content.len else 0, review_turn.target_call_id },
+                    );
+                    recovery_available = false;
+                },
+            }
         }
     }
 };
@@ -1334,12 +1352,12 @@ fn buildTestReviewPayload(
 }
 
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
-    if (completion.content) |content| {
-        if (std.mem.trim(u8, content, " \t\r\n").len > 0) {
-            return .{ .invalid = .completion_text };
-        }
-    }
     if (completion.tool_calls.len != 1) {
+        if (completion.tool_calls.len == 0) {
+            if (completion.content) |content| {
+                if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .{ .invalid = .completion_text };
+            }
+        }
         return .{ .invalid = .completion_tool_call_count };
     }
 
@@ -1737,7 +1755,6 @@ test "automatic review rejects missing and legacy decisions" {
         .{ .content = "clear" },
         .{ .tool_calls = &.{} },
         .{ .tool_calls = &.{ valid_call, valid_call } },
-        .{ .content = "commentary", .tool_calls = &.{valid_call} },
     };
     for (completions) |completion| {
         try std.testing.expectEqual(
@@ -1764,6 +1781,156 @@ test "automatic review preserves the exact invalid completion cause" {
         InvalidReason.arguments_decision,
         legacy_decision.invalid,
     );
+}
+
+test "review response uses the structured decision despite commentary" {
+    for ([_][]const u8{ "clear", "caution" }) |decision| {
+        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"decision\":\"{s}\"}}", .{decision});
+        defer std.testing.allocator.free(args);
+        var result = try parseCompletion(std.testing.allocator, .{
+            .content = "Additional text is not decision authority.",
+            .tool_calls = &.{.{ .id = "review", .name = tool_name, .arguments_json = args }},
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result == .valid);
+        try std.testing.expectEqualStrings(decision, @tagName(result.valid.decision));
+    }
+}
+
+test "review response retries malformed completion once on the same deadline" {
+    const Fixture = struct {
+        sends: usize = 0,
+        first_deadline: ?std.Io.Clock.Timestamp = null,
+        first_payload: ?[]u8 = null,
+
+        fn send(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, payload: []const u8, deadline: std.Io.Clock.Timestamp, _: *std.atomic.Value(bool)) !TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+            if (self.sends == 1) {
+                self.first_deadline = deadline;
+                self.first_payload = try alloc.dupe(u8, payload);
+                return .{ .completion = .{ .completion = .{ .content = "Looks safe." } } };
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.sends);
+            try std.testing.expectEqualDeep(self.first_deadline.?, deadline);
+            try std.testing.expectEqualStrings(self.first_payload.?, payload);
+            return .{ .completion = .{ .completion = .{ .tool_calls = &.{.{
+                .id = "review",
+                .name = tool_name,
+                .arguments_json = "{\"decision\":\"clear\"}",
+            }} } } };
+        }
+    };
+    var fixture = Fixture{};
+    defer if (fixture.first_payload) |payload| std.testing.allocator.free(payload);
+    var result = try Reviewer.withTransport(.{
+        .context = &fixture,
+        .send_fn = Fixture.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1000).review(std.testing.allocator, .{
+        .review_turn = .{
+            .model = "test/main",
+            .target_call_id = "pending",
+            .origin = .root,
+            .trusted_root_context = "current_request: Run the fixture.\n",
+            .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "pending",
+                .name = "shell",
+                .arguments_json = "{}",
+            }} },
+        },
+        .targets = &.{},
+        .action = .{ .command = .{ .command = "printf fixture", .resolved_cwd = "/tmp", .background = false, .target_os = .macos } },
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).valid, std.meta.activeTag(result));
+    try std.testing.expectEqual(Decision.clear, result.valid.decision);
+    try std.testing.expectEqual(@as(usize, 2), fixture.sends);
+}
+
+test "review response recovery is bounded and releases every completion" {
+    const Fixture = struct {
+        const Mode = enum { recover_clear, recover_caution, invalid_twice, caution, transport, cancel_between, cancel_second, expired };
+        mode: Mode,
+        sends: usize = 0,
+        released: usize = 0,
+        cancel: std.atomic.Value(bool) = .init(false),
+
+        fn release(raw: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released += 1;
+            if (self.mode == .cancel_between) self.cancel.store(true, .seq_cst);
+        }
+
+        fn send(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, deadline: std.Io.Clock.Timestamp, _: *std.atomic.Value(bool)) !TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+            try std.testing.expect(self.sends <= 2);
+            if (self.mode == .transport) return .transient_failure;
+            if (self.mode == .cancel_second and self.sends == 2) self.cancel.store(true, .seq_cst);
+            if (self.mode == .expired) {
+                while (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake), .lt, deadline)) io_mod.sleep(std.time.ns_per_ms);
+            }
+            const caution = self.mode == .caution or self.mode == .recover_caution;
+            const invalid = self.mode != .caution and (self.sends == 1 or self.mode == .invalid_twice);
+            return .{ .completion = .{
+                .context = self,
+                .deinit_fn = release,
+                .completion = if (invalid) .{ .content = "No structured decision." } else .{
+                    .content = "This prose cannot change the structured decision.",
+                    .tool_calls = if (caution) &.{.{ .id = "review", .name = tool_name, .arguments_json = "{\"decision\":\"caution\"}" }} else &.{.{ .id = "review", .name = tool_name, .arguments_json = "{\"decision\":\"clear\"}" }},
+                },
+            } };
+        }
+    };
+    const request: ReviewRequest = .{
+        .review_turn = .{
+            .model = "test/main",
+            .target_call_id = "pending",
+            .origin = .root,
+            .trusted_root_context = "current_request: Run the fixture.\n",
+            .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{ .id = "pending", .name = "shell", .arguments_json = "{}" }} },
+        },
+        .targets = &.{},
+        .action = .{ .command = .{ .command = "printf fixture", .resolved_cwd = "/tmp", .background = false, .target_os = .macos } },
+    };
+    for (std.enums.values(Fixture.Mode)) |mode| {
+        const cycles: usize = switch (mode) {
+            .cancel_between, .cancel_second => 100,
+            .expired => 1,
+            else => 1000,
+        };
+        for (0..cycles) |_| {
+            var fixture = Fixture{ .mode = mode };
+            const reviewer = Reviewer.withTransport(.{ .context = &fixture, .send_fn = Fixture.send, .build_fn = buildTestReviewPayload }, &fixture.cancel, if (mode == .expired) 20 else 1000);
+            if (mode == .cancel_between or mode == .cancel_second) {
+                try std.testing.expectError(error.Cancelled, reviewer.review(std.testing.allocator, request));
+            } else {
+                var outcome = try reviewer.review(std.testing.allocator, request);
+                defer outcome.deinit(std.testing.allocator);
+                switch (mode) {
+                    .recover_clear => {
+                        try std.testing.expect(outcome == .valid);
+                        try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+                    },
+                    .recover_caution, .caution => {
+                        try std.testing.expect(outcome == .valid);
+                        try std.testing.expectEqual(Decision.caution, outcome.valid.decision);
+                    },
+                    .invalid_twice => try std.testing.expectEqual(InvalidReason.completion_text, outcome.invalid),
+                    .transport => try std.testing.expectEqual(InvalidReason.transport_transient, outcome.invalid),
+                    .expired => try std.testing.expectEqual(InvalidReason.construction_timed_out, outcome.invalid),
+                    .cancel_between, .cancel_second => unreachable,
+                }
+            }
+            const expected_sends: usize = switch (mode) {
+                .caution, .transport, .cancel_between, .expired => 1,
+                else => 2,
+            };
+            try std.testing.expectEqual(expected_sends, fixture.sends);
+            try std.testing.expectEqual(if (mode == .transport) @as(usize, 0) else expected_sends, fixture.released);
+        }
+    }
 }
 
 test "automatic review sends exact unmasked secret-like action evidence" {

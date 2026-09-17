@@ -11,6 +11,7 @@ const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
+const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
@@ -155,7 +156,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 };
 
 pub const provider_bundle = provider_set.Bundle{
-    .capabilities = .{ .fx_search = true, .vision_fallback = true },
+    .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
     .title_model = title_model,
@@ -376,6 +377,29 @@ fn finalizeAgentRequestBody(
     return identified;
 }
 
+test "configured credentials cannot authorize the Gateway transport" {
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var delivery: agent_stream_provider_contract.DeliveryCertainty = .{};
+    var evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    const Ignore = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider_contract.Event) void {}
+    };
+    try std.testing.expectError(error.ConfiguredCredentialCannotAuthorizeGateway, streamAgentCompletion(null, std.testing.allocator, .{
+        .credential = .{ .direct = .{ .secret_bytes = "configured-token", .source = .configured } },
+        .model = "local-model",
+        .retry_count = 1,
+        .messages = &.{},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &cancelled, .emit_fn = Ignore.event },
+        .cancel_flag = &cancelled,
+    }));
+}
+
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
@@ -545,11 +569,15 @@ test "required vision request contains only the registered vision schema" {
 }
 
 fn streamAgentCompletion(
-    _: ?*anyopaque,
+    context: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
+    // The provider runtime installs a process-long gateway connection pool as
+    // the provider context; nothing else uses this context today.
+    const shared_pool: ?*http_pool.HttpPool = if (context) |ctx| @ptrCast(@alignCast(ctx)) else null;
     const credential_source = request.credential.credentialSource();
+    if (credential_source == .configured) return agent_stream_provider_contract.failResult(error.ConfiguredCredentialCannotAuthorizeGateway);
     if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
         return agent_stream_provider_contract.failResult(
             error.SubscriptionCredentialCannotAuthorizeGateway,
@@ -577,6 +605,7 @@ fn streamAgentCompletion(
             .transport => .transport,
             .agent => .agent,
         },
+        .shared_pool = shared_pool,
     };
     const result = (if (request.deadline) |deadline|
         gateway_client.streamGatewayCompletionBounded(

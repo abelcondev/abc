@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
@@ -190,6 +191,10 @@ pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
+/// Max time the post-stream body drain may take before the pooled connection
+/// is abandoned instead of reused. The response is already complete at this
+/// point; only connection reuse is at stake.
+const pool_drain_budget_ms: i64 = 2_000;
 const gateway_connection_setup_timeout_ms: i64 = 30_000;
 const gateway_retry_after_max_ns: u64 = 5 * std.time.ns_per_s;
 const gateway_transfer_buffer_bytes: usize = 256 * 1024;
@@ -729,6 +734,15 @@ fn isRetryableConnectionSetupError(err: anyerror) bool {
     return err == error.TlsInitializationFailed or isRetryableGatewayError(err);
 }
 
+/// std.http.Client does not mark a connection closing when the body write or
+/// flush fails, so deinit would release a poisoned connection (with possibly
+/// buffered unsent bytes) back to the pool. Mark it ourselves so a send
+/// failure can never hand a dirty connection to the next borrower.
+fn markPooledConnectionClosing(req: *std.http.Client.Request, request: StreamRequest) void {
+    if (request.shared_pool == null) return;
+    if (req.connection) |conn| conn.closing = true;
+}
+
 const ConnectionSetupTiming = struct {
     timeout_ms: i64 = gateway_connection_setup_timeout_ms,
 };
@@ -1146,6 +1160,10 @@ pub const StreamRequest = struct {
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// Long-lived pooled HTTP client owned by the provider runtime. When set,
+    /// requests reuse pooled keep-alive connections instead of dialing per
+    /// attempt. Borrowed; must outlive every in-flight stream.
+    shared_pool: ?*http_pool.HttpPool = null,
 };
 
 pub fn streamGatewayCompletion(
@@ -1412,8 +1430,17 @@ fn streamGatewayCompletionCoreWithOptions(
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
+        var local_client: std.http.Client = undefined;
+        const client: *std.http.Client = if (request.shared_pool) |pool|
+            pool.clientFor(request_url)
+        else blk: {
+            local_client = .{ .allocator = alloc, .io = io_mod.getIo() };
+            break :blk &local_client;
+        };
+        defer if (request.shared_pool == null) local_client.deinit();
+        if (request.shared_pool) |pool| {
+            debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, pool.freeConnectionCount() });
+        }
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
@@ -1428,10 +1455,10 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
-        var req = openGatewayRequestBounded(&client, uri, .{
+        var req = openGatewayRequestBounded(client, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
-            .keep_alive = false,
+            .keep_alive = request.shared_pool != null,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1514,6 +1541,7 @@ fn streamGatewayCompletionCoreWithOptions(
         if (request.delivery) |delivery| delivery.markPossiblySent();
         var body_writer = req.sendBodyUnflushed(&send_buf) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1523,6 +1551,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.writer.writeAll(payload) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1532,6 +1561,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.end() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1541,6 +1571,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         req.connection.?.flush() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+            markPooledConnectionClosing(&req, request);
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -1552,7 +1583,10 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
 
         if (active_connected_watch) |watch| {
-            if (watch.arm_response_head()) |err| return @as(anyerror!StreamResult, err);
+            if (watch.arm_response_head()) |err| {
+                markPooledConnectionClosing(&req, request);
+                return @as(anyerror!StreamResult, err);
+            }
         }
         debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
         var response = req.receiveHead(&.{}) catch |err| {
@@ -1640,6 +1674,39 @@ fn streamGatewayCompletionCoreWithOptions(
                 err,
             ));
         };
+        if (request.shared_pool != null) {
+            // SSE consumption stops at the terminal event, which can leave
+            // the HTTP body unread; std's Request.deinit marks body-ful
+            // requests closing unless the body drains to the end. Drain so a
+            // cleanly finished stream returns its connection to the pool.
+            // The drain is bounded: a server that never terminates the body
+            // must not hang an already-completed request. The watcher's
+            // deadline shuts the socket, turning the hang into a drain error;
+            // only reuse is lost, never the response.
+            const drain_started = io_mod.milliTimestamp();
+            var drain_watch_done = std.atomic.Value(bool).init(false);
+            const drain_deadline = std.Io.Clock.Timestamp{
+                .clock = .awake,
+                .raw = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.addDuration(.fromMilliseconds(pool_drain_budget_ms)),
+            };
+            const drain_thread = if (req.connection) |conn|
+                spawn_gateway_cancel_watcher(&drain_watch_done, cancel_flag, null, drain_deadline, null, conn.stream_writer.stream) catch null
+            else
+                null;
+            const drain_ok = if (body_reader.discardRemaining()) |drained_bytes| blk: {
+                debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=ok bytes={d} elapsed_ms={d}", .{ attempt + 1, drained_bytes, io_mod.milliTimestamp() - drain_started });
+                break :blk true;
+            } else |err| blk: {
+                debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=error err={s}", .{ attempt + 1, @errorName(err) });
+                break :blk false;
+            };
+            drain_watch_done.store(true, .seq_cst);
+            if (drain_thread) |thread| thread.join();
+            // The connection returns to the pool NOW, at stream end — the
+            // TTL invariant requires last_activity to track the freshest
+            // return, so stamp only on a clean return.
+            if (drain_ok) request.shared_pool.?.noteActivity();
+        }
         if (active_connected_watch) |watch| {
             if (watch.finish()) |err| {
                 deinitGatewayCompletion(alloc, &completion);
@@ -2028,6 +2095,73 @@ pub fn spawnHttpCancelWatcherBounded(
     return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, null, stream);
 }
 
+/// One shared concrete opener result so every backend reuses the same
+/// bounded-operation instantiation instead of specializing per file.
+pub const OpenedPost = struct {
+    request: ?std.http.Client.Request,
+
+    pub fn deinit(self: *OpenedPost, _: std.mem.Allocator) void {
+        if (self.request) |*request| request.deinit();
+        self.request = null;
+    }
+
+    pub fn take(self: *OpenedPost) std.http.Client.Request {
+        const request = self.request.?;
+        self.request = null;
+        return request;
+    }
+};
+
+pub const PostOperation = struct {
+    client: *std.http.Client,
+    uri: std.Uri,
+    authorization: ?[]const u8,
+    extra_headers: []const std.http.Header = &.{},
+
+    pub fn run(self: *PostOperation) !OpenedPost {
+        var headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = user_agent },
+        };
+        if (self.authorization) |value| headers.authorization = .{ .override = value };
+        return .{ .request = try self.client.request(.POST, self.uri, .{
+            .headers = headers,
+            .extra_headers = self.extra_headers,
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        }) };
+    }
+};
+
+pub fn openBoundedPost(
+    alloc: std.mem.Allocator,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    operation: *PostOperation,
+) !OpenedPost {
+    return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
+}
+
+pub const CancelWatch = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    pub fn start(self: *CancelWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
+        self.done.store(false, .seq_cst);
+        self.thread = if (deadline) |limit|
+            try spawnHttpCancelWatcherBounded(&self.done, cancel, limit, connection)
+        else
+            try spawnHttpCancelWatcher(&self.done, cancel, connection);
+    }
+
+    pub fn stop(self: *CancelWatch) void {
+        self.done.store(true, .seq_cst);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),
@@ -2106,6 +2240,13 @@ test "production response head wait accepts slow headers and still expires" {
 
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
     return selectE2eGatewayUrl(io_mod.getenv(env_name), default_url);
+}
+
+/// Chat URL exactly as the request path resolves it, including the E2E
+/// loopback override. Invalid overrides fall back to the default so launch
+/// warming never fails on configuration.
+pub fn resolveChatUrlForWarmup(default_url: []const u8) []const u8 {
+    return resolveE2eGatewayUrl(e2e_gateway_chat_url_env, default_url) catch default_url;
 }
 
 fn selectE2eGatewayUrl(override_url: ?[]const u8, default_url: []const u8) ![]const u8 {
@@ -6264,6 +6405,12 @@ const LoopbackGatewayMode = enum {
     success_capture,
     model_catalog_success,
     private_model_catalog_success,
+    keep_alive_reuse,
+    keep_alive_close_after_response,
+    reset_mid_request,
+    reset_after_head_read,
+    slow_terminal_chunk,
+    never_terminating_body,
 };
 
 const LoopbackGatewayFixture = struct {
@@ -6276,6 +6423,8 @@ const LoopbackGatewayFixture = struct {
     accept_started: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
     accepted: std.atomic.Value(bool) = .init(false),
+    accepted_count: std.atomic.Value(usize) = .init(0),
+    requests_served: std.atomic.Value(usize) = .init(0),
     reached_stage: std.atomic.Value(bool) = .init(false),
     request_headers: [16 * 1024]u8 = undefined,
     request_headers_len: std.atomic.Value(usize) = .init(0),
@@ -6397,6 +6546,7 @@ const LoopbackGatewayFixture = struct {
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);
+        _ = self.accepted_count.fetchAdd(1, .seq_cst);
 
         switch (self.mode) {
             .reset_on_accept => {
@@ -6504,6 +6654,7 @@ const LoopbackGatewayFixture = struct {
 
                 var recovered_stream = try self.server.accept(zio);
                 defer recovered_stream.close(zio);
+                _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 try readLoopbackGatewayRequest(zio, recovered_stream, self);
                 try writeLoopbackGatewayBytes(
                     zio,
@@ -6565,7 +6716,111 @@ const LoopbackGatewayFixture = struct {
                         loopback_private_model_catalog_json,
                 );
             },
+            .keep_alive_reuse => {
+                self.markStage();
+                self.serveKeepAliveLoop(zio, stream);
+            },
+            .keep_alive_close_after_response => {
+                self.markStage();
+                // Serve once, then drop the connection without a
+                // Connection: close header, simulating an edge idle timeout:
+                // the client pools the dead connection and discovers it on
+                // the next borrow.
+                self.serveKeepAliveOnce(zio, stream);
+                stream.shutdown(zio, .both) catch {};
+                var recovered = try self.server.accept(zio);
+                defer recovered.close(zio);
+                _ = self.accepted_count.fetchAdd(1, .seq_cst);
+                self.serveKeepAliveOnce(zio, recovered);
+            },
+            .reset_mid_request => {
+                // Read one byte, then RST: the client fails mid-send or at
+                // head read; either way the connection must not be pooled.
+                var one: [1]u8 = undefined;
+                var reader = stream.reader(zio, &one);
+                _ = reader.interface.takeByte() catch {};
+                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&rst),
+                );
+                self.markStage();
+            },
+            .reset_after_head_read => {
+                // Read only the request head, wait for the client to block
+                // mid-body against full kernel buffers, then RST: the client
+                // fails inside the send path, and the connection must never
+                // reach the pool.
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                var header_buf: [512]u8 = undefined;
+                var header_len: usize = 0;
+                while (header_len < header_buf.len) {
+                    header_buf[header_len] = reader.interface.takeByte() catch break;
+                    header_len += 1;
+                    if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
+                }
+                sleepBlocking(200);
+                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&rst),
+                );
+                self.markStage();
+            },
+            .slow_terminal_chunk => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                self.markStage();
+                var frame_buf: [512]u8 = undefined;
+                const partial = try std.fmt.bufPrint(
+                    &frame_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
+                    .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
+                );
+                try writeLoopbackGatewayBytes(zio, stream, partial);
+                self.hold();
+                try writeLoopbackGatewayBytes(zio, stream, "0\r\n\r\n");
+            },
+            .never_terminating_body => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                self.markStage();
+                var frame_buf: [512]u8 = undefined;
+                const partial = try std.fmt.bufPrint(
+                    &frame_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
+                    .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
+                );
+                try writeLoopbackGatewayBytes(zio, stream, partial);
+                // The terminal chunk never comes; keep the body open with
+                // one-byte chunks until teardown.
+                while (!self.stopping.load(.seq_cst)) {
+                    writeLoopbackGatewayBytes(zio, stream, "1\r\n:\r\n") catch return;
+                    sleepBlocking(50);
+                }
+            },
         }
+    }
+
+    fn serveKeepAliveLoop(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        while (!self.stopping.load(.seq_cst)) {
+            readKeepAliveRequest(&reader.interface) catch return;
+            _ = self.requests_served.fetchAdd(1, .seq_cst);
+            writeKeepAliveResponse(zio, stream) catch return;
+        }
+    }
+
+    fn serveKeepAliveOnce(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        readKeepAliveRequest(&reader.interface) catch return;
+        _ = self.requests_served.fetchAdd(1, .seq_cst);
+        writeKeepAliveResponse(zio, stream) catch return;
     }
 };
 
@@ -6615,6 +6870,7 @@ const RequestOpenProbe = struct {
     attempts: usize = 0,
     tls_failure_attempt: ?usize = null,
     delays_ms: [3]i64 = .{ 0, 0, 0 },
+    keep_alive_seen: ?bool = null,
 
     fn requestOpenOverride(self: *@This()) RequestOpenOverride {
         return .{ .ctx = @ptrCast(self), .run = open };
@@ -6630,6 +6886,7 @@ const RequestOpenProbe = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         const attempt_index = self.attempts;
         self.attempts += 1;
+        self.keep_alive_seen = options.keep_alive;
         if (attempt_index < self.delays_ms.len) {
             const delay_ms = self.delays_ms[attempt_index];
             if (delay_ms > 0) {
@@ -6829,6 +7086,260 @@ test "transport-owned TLS setup retries before send" {
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
+}
+
+test "shared pool requests keep-alive and never pools server-closed connections" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var probe = RequestOpenProbe{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .request_open_override = probe.requestOpenOverride() },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    try std.testing.expectEqual(true, probe.keep_alive_seen orelse false);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    // The fixture answers with Connection: close; the pool must not retain it.
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "unpooled requests keep close semantics" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .request_open_override = probe.requestOpenOverride() },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    try std.testing.expectEqual(false, probe.keep_alive_seen orelse true);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+fn pooledLoopbackCall(pool: *http_pool.HttpPool, url: []const u8) anyerror!StreamResult {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    return streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+            .shared_pool = pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{},
+    );
+}
+
+test "shared pool reuses one keep-alive connection across sequential requests" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    var second = try pooledLoopbackCall(&pool, harness.url);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", second.completion.content.?);
+
+    // One accepted connection served both requests.
+    try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    // Close the pooled connection before the fixture teardown so the serve
+    // loop observes EOF and the fixture thread can join.
+    _ = pool.deinit();
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "stale pooled connection fails once, never re-pools, and the next request redials" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_close_after_response, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    // The server silently dropped the pooled connection after responding
+    // (idle-close). The next borrow writes into the dead socket and fails.
+    const stale = pooledLoopbackCall(&pool, harness.url);
+    if (stale) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedStaleFailure;
+    } else |_| {}
+    // The dead connection was destroyed, not returned to the free list.
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+
+    var third = try pooledLoopbackCall(&pool, harness.url);
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", third.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.accepted_count.load(.seq_cst));
+}
+
+test "mid-request reset never returns the connection to the pool" {
+    var harness = try ConnectionSetupHarness.init(.reset_mid_request, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const result = pooledLoopbackCall(&pool, harness.url);
+    if (result) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedResetFailure;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "drain waits for a delayed terminal chunk without failing the request" {
+    var harness = try ConnectionSetupHarness.init(.slow_terminal_chunk, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const started = io_mod.milliTimestamp();
+    var result = try pooledLoopbackCall(&pool, harness.url);
+    defer result.deinit(std.testing.allocator);
+    const elapsed = io_mod.milliTimestamp() - started;
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    try std.testing.expect(elapsed >= 450); // fixture holds the terminal chunk for 500 ms
+    try std.testing.expect(elapsed < 15_000);
+    // No pool assertion here: under extreme CI runner load the fixture's
+    // sliced hold can stretch past the drain budget, which by design forfeits
+    // reuse of that connection. Pooling after a normal drain is covered
+    // deterministically by the keep-alive reuse test.
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "never-terminating body completes within the drain budget instead of hanging" {
+    var harness = try ConnectionSetupHarness.init(.never_terminating_body, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const started = io_mod.milliTimestamp();
+    var result = try pooledLoopbackCall(&pool, harness.url);
+    defer result.deinit(std.testing.allocator);
+    const elapsed = io_mod.milliTimestamp() - started;
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    // The drain budget rescues the completed request; it must not hang.
+    try std.testing.expect(elapsed >= pool_drain_budget_ms - 500);
+    try std.testing.expect(elapsed < 15_000);
+    // The connection that never finished its body is destroyed, not pooled.
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "mid-send failure never returns the connection to the pool" {
+    var harness = try ConnectionSetupHarness.init(.reset_after_head_read, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const payload = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = payload,
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{},
+    );
+    if (result) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedSendFailure;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
 }
 
 test "gateway setup trace distinguishes attempt limits from retries used" {
@@ -7437,6 +7948,48 @@ fn rawHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[colon_index + 1 ..], " \t");
     }
     return null;
+}
+
+const keep_alive_sse_payload =
+    "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+    "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+
+/// Larger than the client's transfer buffer, so it cannot all be read ahead
+/// while the terminal SSE event is parsed.
+const keep_alive_padding = ":" ** (66 * 1024);
+
+fn readKeepAliveRequest(reader: *std.Io.Reader) !void {
+    var header_buf: [16 * 1024]u8 = undefined;
+    var header_len: usize = 0;
+    while (header_len < header_buf.len) {
+        header_buf[header_len] = try reader.takeByte();
+        header_len += 1;
+        if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
+    } else {
+        return error.TestRequestTooLarge;
+    }
+    if (loopbackContentLength(header_buf[0 .. header_len - 4])) |content_length| {
+        try reader.discardAll(content_length);
+    }
+}
+
+fn writeKeepAliveResponse(zio: std.Io, stream: std.Io.net.Stream) !void {
+    var head_buf: [512]u8 = undefined;
+    const head_events = try std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
+        .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
+    );
+    try writeLoopbackGatewayBytes(zio, stream, head_events);
+    // Trailing padding arrives late and exceeds the client's transfer
+    // buffer, so the body is provably unread when SSE consumption finishes:
+    // only the client-side drain can return this connection to the pool.
+    io_mod.sleep(150 * std.time.ns_per_ms);
+    var tail_head_buf: [64]u8 = undefined;
+    const tail_head = try std.fmt.bufPrint(&tail_head_buf, "{x}\r\n", .{keep_alive_padding.len});
+    try writeLoopbackGatewayBytes(zio, stream, tail_head);
+    try writeLoopbackGatewayBytes(zio, stream, keep_alive_padding);
+    try writeLoopbackGatewayBytes(zio, stream, "\r\n0\r\n\r\n");
 }
 
 fn loopbackContentLength(headers: []const u8) ?usize {

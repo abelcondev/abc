@@ -1424,8 +1424,10 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
+        .record_tool_call_failed = recordToolCallFailed,
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
@@ -1489,6 +1491,11 @@ fn persistUsageCheckpoint(
         writable.active_id,
         recovery_checkpoint,
     );
+}
+
+fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.state.capability_resolver.state == .failed;
 }
 
 fn resolveModelCapabilities(
@@ -1974,6 +1981,25 @@ fn writeWebFetchProgressUpdate(alloc: Allocator, writer: *std.Io.Writer, tool_ca
 }
 
 fn recordToolCallRejected(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
+    ctx.sendToolCallErrorWithCommandResult(
+        acp_id,
+        toolUpdateContentText(.{
+            .status = .failure,
+            .model_output = model_output,
+        }),
+        command_result_json,
+    ) catch {};
+}
+
+fn recordToolCallFailed(
     raw_ctx: *anyopaque,
     arena: Allocator,
     call: ToolCall,

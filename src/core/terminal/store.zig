@@ -2067,7 +2067,6 @@ pub const CloseCommitOutcome = union(enum) {
 
 pub const EventReplay = struct {
     events: []DurableEvent,
-    gap_through: u64,
     next_event_id: u64,
 
     pub fn deinit(self: *EventReplay, alloc: Allocator) void {
@@ -3580,7 +3579,6 @@ pub const DurableSession = struct {
         }
         return .{
             .events = try events.toOwnedSlice(alloc),
-            .gap_through = self.record.event_gap_through,
             .next_event_id = @min(id, self.record.next_event_id),
         };
     }

@@ -87,14 +87,12 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const SessionRuntime = session_runtime.SessionRuntime;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
-const max_file_mutation_success_bytes: usize = 8 * 1024;
 
 const helpers = struct {
     const requiredStringArg = tool_args.requiredStringArg;
     const parseToolArgsObject = tool_args.parseToolArgsObject;
 };
 
-const optionalIntArg = tool_args.optionalIntArg;
 const parseToolArgsObject = helpers.parseToolArgsObject;
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -197,6 +195,9 @@ pub const Context = struct {
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_progress_ctx: ?*anyopaque = null,
     on_mcp_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
+    tool_progress_ctx: ?*anyopaque = null,
+    on_tool_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
+    subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
@@ -461,10 +462,7 @@ pub fn executeToolCallAuthorized(
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(
-            uses_file_mutation_contract,
-            result,
-        ),
+        .outcome = classifyReturnedToolCallOutcome(result),
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
     });
@@ -483,18 +481,27 @@ fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
 }
 
 fn classifyReturnedToolCallOutcome(
-    uses_file_mutation_contract: bool,
     result: ToolExecutionResult,
 ) diagnostics.ToolCallOutcome {
     if (result.status == .success) return .succeeded;
     if (result.command_result_json != null) return .command_failed;
-    if (uses_file_mutation_contract) return .rejected;
-    return .tool_failed;
+    // Only an explicit denial records a rejection. An authorized execution
+    // that failed — with or without a declared kind — is a tool failure, so
+    // a producer that forgets to declare a kind cannot silently masquerade
+    // as a rejection in diagnostics.
+    return switch (result.failure_kind) {
+        .denied => .rejected,
+        .none, .preflight, .apply => .tool_failed,
+    };
 }
 
 test "returned tool results retain diagnostic outcome identity" {
     const success = ToolExecutionResult{ .model_output = "ok" };
-    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const rejection = ToolExecutionResult{
+        .model_output = "rejected",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
     const command_failure = ToolExecutionResult{
         .model_output = "exit 7",
         .status = .failure,
@@ -504,19 +511,19 @@ test "returned tool results retain diagnostic outcome identity" {
 
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.succeeded,
-        classifyReturnedToolCallOutcome(false, success),
+        classifyReturnedToolCallOutcome(success),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
-        classifyReturnedToolCallOutcome(true, rejection),
+        classifyReturnedToolCallOutcome(rejection),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.command_failed,
-        classifyReturnedToolCallOutcome(false, command_failure),
+        classifyReturnedToolCallOutcome(command_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.tool_failed,
-        classifyReturnedToolCallOutcome(false, tool_failure),
+        classifyReturnedToolCallOutcome(tool_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
@@ -529,6 +536,47 @@ test "returned tool results retain diagnostic outcome identity" {
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.runtime_failed,
         classifyToolExecutionError(error.Unexpected),
+    );
+}
+
+test "executed file mutation failures classify as tool failures, not rejections" {
+    const preflight_failure = ToolExecutionResult{
+        .model_output = "edit_file failed: old_string not found in file",
+        .status = .failure,
+        .failure_kind = .preflight,
+    };
+    const apply_failure = ToolExecutionResult{
+        .model_output = "file mutation rejected because the file changed after preview; make a new tool call for a fresh preview",
+        .status = .failure,
+        .failure_kind = .apply,
+    };
+    const denied_failure = ToolExecutionResult{
+        .model_output = "file mutation execution requires prepared approval",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
+    const undeclared_failure = ToolExecutionResult{
+        .model_output = "some producer forgot its kind",
+        .status = .failure,
+    };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(preflight_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(apply_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(denied_failure),
+    );
+    // A producer that does not declare a kind is still a tool failure; only
+    // explicit denials record rejections.
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(undeclared_failure),
     );
 }
 
@@ -779,11 +827,15 @@ fn executeRegisteredTool(
         .runtime = ctx,
         .authorized_image_catalog = authorized_image_catalog,
     };
-    var subagent_provider = SubagentProviderState{ .runtime = ctx };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
+    var subagent_provider = SubagentProviderState{
+        .runtime = ctx,
+        .call = call,
+        .completion_sink = &dispatch_metadata.subagent_completion,
+    };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -919,6 +971,7 @@ const DispatchMetadata = struct {
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
+    subagent_completion: ?types.SubagentStatus = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     command_result_json: ?[]const u8 = null,
 
@@ -950,6 +1003,7 @@ fn toolExecutionResultFromDispatch(
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
+            .subagent_completion = metadata.subagent_completion,
             .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
         },
@@ -960,6 +1014,7 @@ fn toolExecutionResultFromDispatch(
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
+            .subagent_completion = metadata.subagent_completion,
             .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
         },
@@ -1959,7 +2014,110 @@ test "file mutations reject ordinary execution authority without mutating" {
 
 const SubagentProviderState = struct {
     runtime: Context,
+    call: ToolCall,
+    completion_sink: *?types.SubagentStatus,
 };
+
+fn requestDerivedSubagentSessionTitle(alloc: Allocator, call: ToolCall) Allocator.Error!?[]u8 {
+    const action = try tool_presentation.subagentAction(alloc, call, .identity) orelse return null;
+    alloc.free(action.detail);
+    return action.label;
+}
+
+const SubagentProgressBridge = struct {
+    alloc: Allocator,
+    call: ToolCall,
+    renderer: types.SubagentStatusRenderer,
+    progress_ctx: *anyopaque,
+    progress_fn: *const fn (*anyopaque, types.ToolLifecycleId, []const u8) void,
+    lifecycle_id: types.ToolLifecycleId,
+
+    fn init(alloc: Allocator, ctx: Context, call: ToolCall) ?SubagentProgressBridge {
+        return .{
+            .alloc = alloc,
+            .call = call,
+            .renderer = ctx.subagent_status_renderer orelse return null,
+            .progress_ctx = ctx.tool_progress_ctx orelse return null,
+            .progress_fn = ctx.on_tool_progress orelse return null,
+            .lifecycle_id = ctx.output_chunk_lifecycle_id orelse return null,
+        };
+    }
+
+    fn sink(self: *SubagentProgressBridge) subagent_tool_host.ProgressSink {
+        return .{ .context = self, .publish_fn = publish };
+    }
+
+    fn publish(raw: *anyopaque, status: types.SubagentStatus) void {
+        const self: *SubagentProgressBridge = @ptrCast(@alignCast(raw));
+        var rendered_status = status;
+        const session_title = requestDerivedSubagentSessionTitle(self.alloc, self.call) catch null;
+        defer if (session_title) |title| self.alloc.free(title);
+        rendered_status.session_title = session_title;
+        var status_buf: [256]u8 = undefined;
+        const status_line = self.renderer.render(&status_buf, rendered_status);
+        if (status_line.len == 0) return;
+        const first_line = (tool_presentation.formatSubagentPlainAction(self.alloc, self.call, .active) catch return) orelse return;
+        defer self.alloc.free(first_line);
+        const row = std.fmt.allocPrint(self.alloc, "● {s}\n  {s}", .{ first_line, status_line }) catch return;
+        defer self.alloc.free(row);
+        self.progress_fn(self.progress_ctx, self.lifecycle_id, row);
+    }
+};
+
+test "subagent progress publishes a complete two-line lifecycle row" {
+    const Capture = struct {
+        text: ?[]u8 = null,
+
+        fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+            return std.fmt.bufPrint(buf, "{s} · {s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.session_title orelse "missing", status.input_tokens / 1000 }) catch "";
+        }
+
+        fn publish(raw: *anyopaque, _: types.ToolLifecycleId, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.text = std.testing.allocator.dupe(u8, text) catch null;
+        }
+    };
+    var capture = Capture{};
+    defer if (capture.text) |text| std.testing.allocator.free(text);
+    var bridge = SubagentProgressBridge{
+        .alloc = std.testing.allocator,
+        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .renderer = .{ .ctx = &capture, .render_fn = Capture.render },
+        .progress_ctx = &capture,
+        .progress_fn = Capture.publish,
+        .lifecycle_id = .{ .turn_id = 4, .call_id = "child" },
+    };
+    bridge.sink().publish(.{
+        .model = "openai/gpt-5.5",
+        .effort = types.ReasoningEffort.literal("high"),
+        .input_tokens = 12_000,
+        .context_window = 100_000,
+    });
+
+    try std.testing.expectEqualStrings("● Subagent working · inspect auth\n  openai/gpt-5.5 · high · Subagent · 12k", capture.text.?);
+}
+
+test "subagent session title is derived only from the current request identity" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
+        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Subagent" },
+        .{ .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}", .expected = "reviewer" },
+    };
+    for (cases) |case| {
+        const title = (try requestDerivedSubagentSessionTitle(alloc, .{
+            .id = "child",
+            .name = "subagent",
+            .arguments_json = case.arguments_json,
+        })).?;
+        defer alloc.free(title);
+        try std.testing.expectEqualStrings(case.expected, title);
+    }
+    try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{}",
+    })) == null);
+}
 
 fn subagentProviderFailure(
     alloc: Allocator,
@@ -1985,6 +2143,7 @@ fn executeSubagentProvider(
     const caller_id = ctx.subagent_caller_id orelse
         return subagentProviderFailure(arena, "caller_unavailable");
     const identity_epoch = host.issueOperationIdentity(invocation_id);
+    var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
         .caller_id = caller_id,
         .invocation_id = invocation_id,
@@ -2004,11 +2163,18 @@ fn executeSubagentProvider(
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
         .steering_worker = if (ctx.interactive) ctx.worker else null,
+        .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
+        .model_capability_resolver = ctx.model_capability_resolver,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
         return subagentProviderFailure(arena, "host_failure");
     };
+    if (output.final_status) |status_value| {
+        var status = status_value;
+        status.session_title = requestDerivedSubagentSessionTitle(arena, state.call) catch null;
+        state.completion_sink.* = status;
+    }
     return .{
         .status = if (output.success) .success else .failure,
         .body = output.body,
@@ -2391,31 +2557,6 @@ const CancelTestCommandOnOutput = struct {
         if (std.mem.find(u8, chunk, self.needle) == null) return;
         self.seen = true;
         self.flag.store(true, .seq_cst);
-    }
-};
-
-const TestCommandOutputCapture = struct {
-    alloc: Allocator,
-    bytes: std.ArrayList(u8) = .empty,
-    stdout_chunks: usize = 0,
-    stderr_chunks: usize = 0,
-
-    fn deinit(self: *@This()) void {
-        self.bytes.deinit(self.alloc);
-    }
-
-    fn onChunk(
-        raw_ctx: *anyopaque,
-        _: ?types.ToolLifecycleId,
-        stream: command_contract.CommandOutputStream,
-        chunk: []const u8,
-    ) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        try self.bytes.appendSlice(self.alloc, chunk);
-        switch (stream) {
-            .stdout => self.stdout_chunks += 1,
-            .stderr => self.stderr_chunks += 1,
-        }
     }
 };
 

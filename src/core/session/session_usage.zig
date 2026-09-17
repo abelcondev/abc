@@ -214,7 +214,7 @@ pub const InvocationObservation = struct {
                     "usage generation queued sequence={d} id={s}",
                     .{ self.sequence, reference.generation_id },
                 );
-                ledger.flushProfilePublications();
+                ledger.scheduleProfilePublicationDrain();
             },
             .unavailable => unreachable,
         }
@@ -393,6 +393,11 @@ pub const Usage = struct {
     reconciliation_authority: ?ReconciliationAuthority = null,
     reconciliation_credential_blocked: bool = false,
     generation_usage_providers: generation_usage.Set = .{},
+    publication_drain_mutex: std.Io.Mutex = .init,
+    publication_drain_thread: ?std.Thread = null,
+    publication_drain_done: std.atomic.Value(bool) = .init(true),
+    publication_drain_cancel: std.atomic.Value(bool) = .init(false),
+    publication_drain_epoch: std.atomic.Value(u64) = .init(0),
 
     pub fn initFresh() Usage {
         return .{
@@ -430,17 +435,20 @@ pub const Usage = struct {
 
     pub fn deinit(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.clearOwned(alloc);
         self.* = undefined;
     }
 
     pub fn resetFresh(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, true);
     }
 
     pub fn resetLegacy(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, false);
     }
 
@@ -530,7 +538,7 @@ pub const Usage = struct {
         self.finishInvocation(sequence, duration_ms, outcome);
         _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.scheduleProfilePublicationDrain();
     }
 
     fn finishObservedInvocationDurably(
@@ -562,7 +570,7 @@ pub const Usage = struct {
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
         _ = try self.persistCheckpointForContinuationLocked();
@@ -595,7 +603,7 @@ pub const Usage = struct {
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
         _ = try self.persistCheckpointForContinuationLocked();
@@ -696,7 +704,7 @@ pub const Usage = struct {
             return false;
         }
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        if (durable_bridge) self.flushProfilePublications();
+        if (durable_bridge) self.scheduleProfilePublicationDrain();
         return true;
     }
 
@@ -974,7 +982,7 @@ pub const Usage = struct {
             }
             if (std.mem.eql(u8, pending.id, id)) {
                 if (pending.sequence != sequence or
-                    pending.provider != provider or
+                    !pending.provider.same_authority(provider) or
                     !std.mem.eql(u8, pending.origin, origin) or
                     !optionalStringsEqual(pending.team, team) or
                     pending.credential_source != credential_source or
@@ -1315,6 +1323,57 @@ pub const Usage = struct {
             .facts = facts,
             .checkpoint_changed = checkpoint_changed,
         };
+    }
+
+    /// Queues a profile-publication drain so invocation finish paths never run
+    /// the append-only store's full-file parse on the agent worker thread. The
+    /// session checkpoint is already durable before this is called; the drain
+    /// only updates the profile-level usage ledger. Tests keep the legacy
+    /// synchronous flush so assertions stay deterministic.
+    fn scheduleProfilePublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) {
+            self.flushProfilePublications();
+            return;
+        }
+        _ = self.publication_drain_epoch.fetchAdd(1, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        if (self.publication_drain_thread) |thread| {
+            if (!self.publication_drain_done.load(.seq_cst)) return;
+            thread.join();
+            self.publication_drain_thread = null;
+            self.publication_drain_done.store(true, .seq_cst);
+        }
+        self.publication_mutex.lockUncancelable(io_mod.getIo());
+        const has_sink = self.publication_sink != null;
+        self.publication_mutex.unlock(io_mod.getIo());
+        if (!has_sink) return;
+        self.publication_drain_cancel.store(false, .seq_cst);
+        self.publication_drain_done.store(false, .seq_cst);
+        self.publication_drain_thread = std.Thread.spawn(.{}, publicationDrainThreadMain, .{self}) catch |err| {
+            self.publication_drain_done.store(true, .seq_cst);
+            debug_trace.logf(
+                "session",
+                "usage profile publication drain start failed reason={s}",
+                .{@errorName(err)},
+            );
+            self.flushProfilePublications();
+            return;
+        };
+    }
+
+    /// Stops the background profile-publication drain, joining any live worker.
+    /// A later schedule starts a fresh worker.
+    fn stopPublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
+        self.publication_drain_cancel.store(true, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        const thread = self.publication_drain_thread;
+        self.publication_drain_thread = null;
+        if (thread) |handle| handle.join();
+        self.publication_drain_done.store(true, .seq_cst);
+        self.publication_drain_cancel.store(false, .seq_cst);
     }
 
     fn flushProfilePublications(self: *Usage) void {
@@ -1690,6 +1749,7 @@ pub const Usage = struct {
         session_started_at_ms: i64,
     ) !void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         try validateSnapshot(source);
 
         var copied = try dupeSnapshotOwned(alloc, source);
@@ -2017,6 +2077,7 @@ pub const Usage = struct {
     }
 
     pub fn finishProfilePublicationsBeforeShutdown(self: *Usage) void {
+        self.stopPublicationDrain();
         self.flushProfilePublications();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -2168,7 +2229,7 @@ pub const Usage = struct {
                 generation.sequence != saved.sequence or
                 !std.mem.eql(u8, generation.origin, saved.origin) or
                 !optionalStringsEqual(generation.team, saved.team) or
-                generation.provider != saved.provider or
+                !generation.provider.same_authority(saved.provider) or
                 generation.credential_source != saved.credential_source or
                 !optionalCredentialIdentitiesEqual(generation.credential_identity, saved.credential_identity) or
                 !optionalStringsEqual(generation.account_id, saved.account_id) or
@@ -2251,7 +2312,7 @@ const ReconciliationAuthority = struct {
     credential_identity: ?credential_authority.Identity,
 
     fn eql(self: ReconciliationAuthority, other: ReconciliationAuthority) bool {
-        return self.provider == other.provider and
+        return self.provider.same_authority(other.provider) and
             optionalCredentialIdentitiesEqual(self.credential_identity, other.credential_identity);
     }
 };
@@ -2558,7 +2619,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
             left.sequence != right.sequence or
             !std.mem.eql(u8, left.origin, right.origin) or
             !optionalStringsEqual(left.team, right.team) or
-            left.provider != right.provider or
+            !left.provider.same_authority(right.provider) or
             left.credential_source != right.credential_source or
             !optionalCredentialIdentitiesEqual(left.credential_identity, right.credential_identity) or
             !optionalStringsEqual(left.account_id, right.account_id))
@@ -3130,6 +3191,26 @@ fn reconciliationThreadMain(
     }
 }
 
+fn publicationDrainThreadMain(usage: *Usage) void {
+    defer usage.publication_drain_done.store(true, .seq_cst);
+    var observed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+    while (!usage.publication_drain_cancel.load(.seq_cst)) {
+        usage.flushProfilePublications();
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const current_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (current_epoch != observed_epoch) {
+            observed_epoch = current_epoch;
+            continue;
+        }
+        usage.publication_drain_done.store(true, .seq_cst);
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const confirmed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (confirmed_epoch == observed_epoch) return;
+        usage.publication_drain_done.store(false, .seq_cst);
+        observed_epoch = confirmed_epoch;
+    }
+}
+
 fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(api_key, &digest, .{});
@@ -3167,7 +3248,7 @@ fn reconcilePendingBlocking(
 
         var retry_needed = false;
         for (current.pending) |pending| {
-            if (pending.provider != authority.provider or
+            if (!pending.provider.same_authority(authority.provider) or
                 !optionalCredentialIdentitiesEqual(
                     pending.credential_identity,
                     authority.credential_identity,
@@ -3411,7 +3492,8 @@ fn canonicalExactGenerationId(
     try validateExternalGenerationId(external_id);
     var digest: [Sha256.digest_length]u8 = undefined;
     var hash = Sha256.init(.{});
-    hash.update(@tagName(provider));
+    hash.update(provider.label());
+    if (provider == .configured) if (provider.configured.binding) |binding| hash.update(&binding);
     hash.update(&.{0});
     hash.update(external_id);
     hash.final(&digest);
@@ -3426,6 +3508,7 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",
+        .configured => "exact/configured",
     };
 }
 

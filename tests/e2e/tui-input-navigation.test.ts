@@ -839,8 +839,15 @@ tmuxTest(
         (pane) => pane.includes(fullFooter) && pane.includes(response),
         READY_TIMEOUT,
       );
-      expect(pane).toContain("zz-history");
       expect(pane.split(response)).toHaveLength(2);
+      // The full transcript opens with session, context, and network records,
+      // so the resumed history marker sits above the initial tail viewport.
+      let top = pane;
+      for (let page = 0; page < 20 && !top.includes("zz-history"); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        top = await active.capturePane();
+      }
+      expect(top).toContain("zz-history");
     };
     const expectClearedInline = async () => {
       const footer = await waitForActiveFooter(
@@ -900,6 +907,40 @@ tmuxTest(
     expect(followup).toContain("history prompt complete");
     expect(followup).toContain(draft);
     expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "ctrl+o opens with a session assembly record and per-request network record",
+  async () => {
+    const active = await startFx(80, 24, true, false, 1);
+    await active.sendText("hello");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+
+    // The records never appear in the inline transcript.
+    const inline = await active.capturePane();
+    expect(inline).not.toContain("session: provider:");
+    expect(inline).not.toContain("network: provider:");
+
+    await active.sendKeys("C-o");
+    await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
+    // The records block sits at the top of the full transcript.
+    let top = await active.capturePane();
+    for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
+      await active.sendKeys("PPage");
+      await Bun.sleep(50);
+      top = await active.capturePane();
+    }
+    expect(top).toContain("session: provider:");
+    expect(top).toContain("system prompt: ready");
+    expect(top).toContain("tools:");
+    expect(top).toContain("network: provider:");
+    expect(top).toContain("finish: stop");
+    expect(top).toContain("tokens: 3 in · 5 out");
+    await active.sendKeys("C-o");
+    await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
   },
   TIMEOUT,

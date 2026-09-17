@@ -3,6 +3,7 @@ const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -500,6 +501,9 @@ pub const WorkerEvent = union(enum) {
     question_requested,
     open_model_picker,
     semantic_notice: types.SemanticNotice,
+    /// A full-only observability record (network call outcome) for the ctrl+o
+    /// full transcript's detail section. Never enters the transcript store.
+    full_detail_record: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
     api_status_text: []u8,
@@ -632,7 +636,7 @@ pub const WorkerRuntime = struct {
     fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
         const op = self.compaction_presentation.snapshot.operation orelse return;
         if (op.turn_id != turn_id or !op.active()) return;
-        debug_trace.logf("context_compaction", "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        diagnostics.traceCompactionLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
         var feedback = compaction_activity.failure(
             if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
             op.stage(),
@@ -889,7 +893,12 @@ pub const WorkerRuntime = struct {
         self.worker_events = .empty;
         return .{
             .events = events,
-            .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and self.active_turn_id != 0) self.active_turn_id else null,
+            .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and
+                self.active_turn_id != 0 and
+                self.steering_cancel_turn_id != self.active_turn_id)
+                self.active_turn_id
+            else
+                null,
         };
     }
 
@@ -1036,9 +1045,10 @@ pub const WorkerRuntime = struct {
             debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} compaction_active={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), self.compactionInFlightLocked(), interrupt_after_admission });
         }
         if (interrupt_after_admission) {
-            if (sameTurnSteeringEligible(queued)) {
-                self.steering_cancel_turn_id = self.active_turn_id;
-            }
+            self.steering_cancel_turn_id = if (sameTurnSteeringEligible(queued))
+                self.active_turn_id
+            else
+                null;
             self.worker_cancel_requested.store(true, .seq_cst);
         }
     }
@@ -2764,11 +2774,6 @@ fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, to
     prompt.grants = next;
 }
 
-fn freeStringSlice(alloc: std.mem.Allocator, values: [][]u8) void {
-    for (values) |value| alloc.free(value);
-    if (values.len > 0) alloc.free(values);
-}
-
 fn appendHistoryTurnProjection(
     alloc: std.mem.Allocator,
     current: []const types.HistoryTurn,
@@ -3971,6 +3976,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .question_requested => .question_requested,
         .open_model_picker => .open_model_picker,
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
+        .full_detail_record => |notice| .{ .full_detail_record = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
@@ -4072,6 +4078,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .notification => {},
         .open_model_picker => {},
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
+        .full_detail_record => |notice| types.freeSemanticNotice(alloc, notice),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .api_status_text => |text| alloc.free(text),
@@ -4277,6 +4284,20 @@ fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !Qu
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+fn makeImagePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
+    var prompt = try makePrompt(alloc, text, model);
+    errdefer freeQueuedPrompt(alloc, prompt);
+    const images = try alloc.alloc(types.ImageAttachment, 1);
+    errdefer alloc.free(images);
+    const path = try alloc.dupe(u8, "/tmp/steering.png");
+    errdefer alloc.free(path);
+    const media_type = try alloc.dupe(u8, "image/png");
+    errdefer alloc.free(media_type);
+    images[0] = .{ .path = path, .media_type = media_type };
+    prompt.images = images;
+    return prompt;
 }
 
 fn makeGrant(alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !types.PermissionGrant {
@@ -4578,6 +4599,9 @@ test "explicit interrupt overrides immediate steering cancellation" {
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
     runtime.requestInteractiveCancel();
     try std.testing.expect(runtime.cancellationStopsTurn());
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, 41), batch.cancelled_turn_id);
     var interrupt_snapshot = try runtime.snapshotState(alloc);
     defer interrupt_snapshot.deinit(alloc);
     try std.testing.expect(interrupt_snapshot.cancel_requested);
@@ -5203,6 +5227,102 @@ test "takeEventBatch snapshots cancellation with detached events" {
     try std.testing.expect(batch.events.items[0] == .assistant_presentation);
     try std.testing.expect(batch.events.items[0].assistant_presentation == .text);
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+}
+
+test "rich immediate steering revokes an earlier continuable cancellation" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "plain steer", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "rich steer", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(runtime.cancellationStopsTurn());
+    try runtime.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("must stay hidden") } });
+
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, 41), batch.cancelled_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), batch.events.items.len);
+    try std.testing.expect(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled) == .interrupt,
+    );
+}
+
+test "plain input cannot make an earlier rich cancellation continuable" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "rich steer", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "plain next turn", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(runtime.cancellationStopsTurn());
+    try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
+    try std.testing.expectEqual(PromptDelivery.ordinary, runtime.queued_prompts.items[1].delivery);
+
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, 41), batch.cancelled_turn_id);
+    try std.testing.expect(
+        try runtime.takeSteeringBoundary(alloc, 41, .cancelled) == .interrupt,
+    );
+}
+
+test "takeEventBatch keeps the steering tail live before boundary adoption" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(!runtime.cancellationStopsTurn());
+    try runtime.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("buffered tail") } });
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?u64, null), batch.cancelled_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), batch.events.items.len);
+    try std.testing.expectEqualStrings("buffered tail", batch.events.items[0].assistant_presentation.text);
+
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(?u64, null), batch.cancelled_turn_id);
+    var feedback = runtime.takeEventBatch();
+    defer freeEventList(alloc, &feedback.events);
+    try std.testing.expectEqual(@as(usize, 1), feedback.events.items.len);
+    try std.testing.expectEqualStrings("steer", feedback.events.items[0].append_user_feedback);
+}
+
+test "takeEventBatch requires a matching active steering owner to continue" {
+    const cases = [_]struct { active: u64, owner: ?u64, requested: bool, stopped: ?u64 }{
+        .{ .active = 7, .owner = null, .requested = true, .stopped = 7 },
+        .{ .active = 7, .owner = 6, .requested = true, .stopped = 7 },
+        .{ .active = 7, .owner = 7, .requested = true, .stopped = null },
+        .{ .active = 7, .owner = null, .requested = false, .stopped = null },
+        .{ .active = 0, .owner = null, .requested = true, .stopped = null },
+    };
+    for (cases) |case| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(std.testing.allocator);
+        runtime.active_turn_id = case.active;
+        runtime.steering_cancel_turn_id = case.owner;
+        runtime.worker_cancel_requested.store(case.requested, .seq_cst);
+        var batch = runtime.takeEventBatch();
+        defer freeEventList(std.testing.allocator, &batch.events);
+        try std.testing.expectEqual(case.stopped, batch.cancelled_turn_id);
+    }
 }
 
 test "state snapshot reports completion queued after event batch detach" {

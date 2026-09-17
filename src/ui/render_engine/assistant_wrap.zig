@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_checkpoint = @import("build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const assistant_pacer = @import("../assistant/pacer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1117,7 +1118,9 @@ fn dimTaskMarkerWidth(text: []const u8, start: usize) ?usize {
 
 fn taskMarkerWidth(text: []const u8, start: usize) ?usize {
     const dim_open = "\x1b[2m";
-    const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m" };
+    // Recognize both builtin variants plus whatever the active theme set, so
+    // completed markers keep measuring correctly under custom themes.
+    const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m", shared_theme.current().task_completed_open };
     const completed_close = "\x1b[39m";
     const completed = "\xe2\x9c\x93";
 

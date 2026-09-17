@@ -13,6 +13,7 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -3596,6 +3597,7 @@ fn restoredRecoveryCause(
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
+        .compaction_prepared => .compaction_prepared,
         .authentication => .authentication,
         .request_limit_reached => .request_limit_reached,
     };
@@ -3643,7 +3645,7 @@ fn recoverySelectionChanged(
     selected_model: []const u8,
     selected_fast_mode: bool,
 ) bool {
-    return checkpoint.authority.provider != selected_provider or !std.mem.eql(
+    return !checkpoint.authority.provider.same_authority(selected_provider) or !std.mem.eql(
         u8,
         checkpoint.authority.model,
         selected_model,
@@ -3760,6 +3762,7 @@ fn checkpointCause(
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
+        .compaction_prepared => .compaction_prepared,
         .authentication => .authentication,
         .request_limit_reached => .request_limit_reached,
         .content_filter => .provider_unavailable,
@@ -3813,7 +3816,6 @@ noinline fn pausedRequiredAction(
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -3829,6 +3831,11 @@ fn persistRecoveryCheckpoint(
     trace_ctx: TraceContext,
 ) !void {
     const effect = deps.recovery_checkpoint orelse return;
+    // Every sink copies or serializes the borrowed checkpoint synchronously.
+    // Retaining these full-history reconstructions in the turn arena is quadratic.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
     const execution = try runtime_execution_memory.buildExecutionMemory(
         arena,
         current_turn_messages,
@@ -3877,8 +3884,187 @@ fn persistRecoveryCheckpoint(
     );
 }
 
+fn persist_compaction_source(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    arena: Allocator,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    tool_evidence: model_response_recovery.ToolEvidence,
+    trace_ctx: TraceContext,
+) !void {
+    const effect = deps.recovery_checkpoint orelse return;
+    const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
+    try effect.set(deps.ctx, .{
+        .turn_id = job.turn_id,
+        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .assistant_source = @constCast(""),
+        .execution = try finalization.compacted_execution.project(arena, execution),
+        .cause = .compaction_prepared,
+        .action = if (tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
+        .tool_state = checkpointToolState(tool_evidence),
+        .authority = .{
+            .provider = job.provider,
+            .model = @constCast(route_model),
+            .credential_source = job.credential_source,
+            .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
+        },
+        .requested_fast_mode = requested_fast_mode,
+        .fast_mode = fast_mode,
+        .max_provider_attempts = attempt_limit,
+        .consumed_provider_attempts = consumed_attempts,
+        .outstanding_reservation = false,
+    });
+    diagnostics.traceCompactionEvent(trace_ctx, "source_checkpointed", "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
+}
+
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
     return std.meta.activeTag(result) == .completed;
+}
+
+test "recovery checkpoints do not accumulate temporary history copies in the turn arena" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        checkpoint: ?session_codec.RecoveryCheckpoint = null,
+        fail: bool = false,
+
+        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.CheckpointWriteFailed;
+            const next = try checkpoint.dupe(std.testing.allocator);
+            if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
+            self.checkpoint = next;
+        }
+    };
+    var sink: Sink = .{};
+    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = &sink;
+    deps.recovery_checkpoint = .{ .set = Sink.set };
+    var fixture: support.PromptFixture = .{};
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    const alloc = turn.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    for (0..1000) |step_index| {
+        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const calls = try alloc.alloc(ToolCall, 1);
+        calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
+        try messages.appendSlice(alloc, &.{
+            .{ .role = .assistant, .tool_calls = calls },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+        });
+        const retained_bytes = turn.queryCapacity();
+        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
+        try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+        try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
+        try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
+    }
+    sink.fail = true;
+    const retained_bytes = turn.queryCapacity();
+    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
+    try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
+}
+
+/// Pure formatter for the full-only network record: provider, model, latency,
+/// and the settled outcome. Only enum labels and provider-assigned ids are
+/// rendered; provider-controlled detail text is deliberately excluded.
+fn writeNetworkRecordBody(
+    writer: *std.Io.Writer,
+    provider: []const u8,
+    model: []const u8,
+    elapsed_ms: u64,
+    result: *const runtime_gateway_step.StreamResult,
+) !void {
+    try writer.print("provider: {s} · model: {s} · {d}ms\n", .{ provider, model, elapsed_ms });
+    switch (result.*) {
+        .completed => |*completed| {
+            try writer.writeAll("finish: ");
+            if (completed.completion.finish_reason) |reason| {
+                try writer.writeAll(@tagName(reason));
+            } else {
+                try writer.writeAll("unknown");
+            }
+            if (completed.completion.generation_id) |generation_id| {
+                try writer.print(" · generation: {s}", .{generation_id});
+            }
+            try writeUsageTokens(writer, completed.completion.usage);
+        },
+        .failed => |*failure| {
+            try writer.print("failed: {s}", .{@tagName(failure.kind)});
+            if (failure.retry_after_seconds) |seconds| {
+                try writer.print(" · retry after: {d}s", .{seconds});
+            }
+        },
+    }
+}
+
+/// Appends the token-usage line when the completion reports any token counts.
+/// Reported values render exactly, including zero; absent fields are omitted.
+fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
+    const fields = .{
+        .{ "in", usage.input_tokens },
+        .{ "out", usage.output_tokens },
+        .{ "cache-read", usage.cache_read_tokens },
+        .{ "cache-write", usage.cache_write_tokens },
+        .{ "reasoning", usage.reasoning_tokens },
+    };
+    var wrote_any = false;
+    inline for (fields) |field| {
+        if (field[1]) |count| {
+            try writer.writeAll(if (wrote_any) " · " else "\ntokens: ");
+            wrote_any = true;
+            try writer.print("{d} {s}", .{ count, field[0] });
+        }
+    }
+}
+
+/// Publishes one full-detail record per settled provider request so the
+/// ctrl+o full transcript carries network call outcomes that the footer only
+/// shows transiently. Publication failure never fails the turn.
+fn pushNetworkRecord(
+    deps: *const AgentRuntimeDeps,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    started_ms: i64,
+    result: *const runtime_gateway_step.StreamResult,
+) void {
+    const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    writeNetworkRecordBody(&body.writer, provider.label(), model, elapsed_ms, result) catch |err| {
+        debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
+        return;
+    };
+    // The event channel owns its payload: dupe before transfer, free on
+    // publication failure.
+    const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
+        .topic = "network",
+        .tone = if (streamSucceeded(result.*)) .neutral else .warning,
+        .body = body.written(),
+        .visibility = .full_only,
+    }) catch |err| {
+        debug_trace.logf("agent", "network record allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
+        types.freeSemanticNotice(std.heap.c_allocator, owned);
+        debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
@@ -4213,6 +4399,131 @@ noinline fn clearAutoRetryStatusIfNeeded(
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
 }
 
+noinline fn clear_deferred_retry_status(deps: *const AgentRuntimeDeps) void {
+    clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
+        debug_trace.logf(
+            "agent",
+            "failed to clear due retry status err={s}",
+            .{@errorName(clear_err)},
+        );
+    };
+}
+
+noinline fn settle_deferred_tool_starts(
+    deps: *const AgentRuntimeDeps,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    turn_id: u64,
+    cancel_flag: *const std.atomic.Value(bool),
+) void {
+    const settlement = if (cancel_flag.load(.seq_cst))
+        stream_ctx.provisional_statuses.finishTrackedCancelled(
+            deps,
+            stream_ctx.alloc,
+            arena,
+            turn_id,
+        )
+    else
+        stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
+            deps,
+            stream_ctx.alloc,
+            arena,
+            turn_id,
+            &.{},
+        );
+    settlement catch |err| {
+        debug_trace.logf(
+            "agent",
+            "failed to settle interrupted tool starts err={s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
+test "deferred retry cleanup clears status and contains sink errors" {
+    const support = @import("tests/support.zig");
+    var normal = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer normal.deinit();
+    const deps = normal.deps();
+    clear_deferred_retry_status(&deps);
+    try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
+    defer failed.deinit();
+    const failed_deps = failed.deps();
+    clear_deferred_retry_status(&failed_deps);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), failed.route_recovery_clear_count);
+}
+
+test "deferred tool cleanup preserves interruption and cancellation outcomes" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 71, .alloc = alloc };
+    defer stream_ctx.deinit();
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "local", "read_file", .read, "Reading", "fixture.txt", null);
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "remote", "exa_search", .read, "Searching", null, null);
+    var cancelled = std.atomic.Value(bool).init(false);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) == null);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "remote", .name = "exa_search", .arguments_json = "{}" }) != null);
+    cancelled.store(true, .seq_cst);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
+    var local_count: usize = 0;
+    var remote_count: usize = 0;
+    for (fake.lifecycle_events.items) |event| {
+        if (event != .terminal) continue;
+        if (std.mem.eql(u8, event.terminal.id.call_id, "local")) {
+            try std.testing.expectEqual(.failed, event.terminal.outcome.kind);
+            local_count += 1;
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "remote")) {
+            try std.testing.expectEqual(.cancelled, event.terminal.outcome.kind);
+            remote_count += 1;
+        } else return error.UnexpectedTerminalIdentity;
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_count);
+    try std.testing.expectEqual(@as(usize, 1), remote_count);
+}
+
+test "deferred tool cleanup contains publication failure and preserves tracking" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        calls: usize = 0,
+        failed_terminal: bool = false,
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.failed_terminal = event == .terminal and event.terminal.outcome.kind == .failed;
+            return error.TestCleanupSinkFailed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var deps = fake.deps();
+    var sink = Sink{};
+    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 73, .alloc = alloc };
+    defer stream_ctx.deinit();
+    try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
+    deps.ctx = &sink;
+    deps.push_tool_lifecycle = Sink.push;
+    var cancelled = std.atomic.Value(bool).init(false);
+    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 73, &cancelled);
+    try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    try std.testing.expect(sink.failed_terminal);
+    try std.testing.expectEqual(@as(usize, 0), stream_ctx.provisional_statuses.terminal_ids.items.len);
+    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) != null);
+}
+
 fn pushTerminalAutoRetryStatusIfNeeded(
     deps: *const AgentRuntimeDeps,
     recovery_active: bool,
@@ -4348,6 +4659,7 @@ fn auto_retry_status(
             .provider_unavailable => .provider_unavailable,
             .rate_limited => .rate_limited,
             .system_resumed => .system_resumed,
+            .compaction_prepared => .compaction_prepared,
             .authentication => .authentication,
             .request_limit_reached => .request_limit_reached,
             .content_filter => null,
@@ -5534,7 +5846,7 @@ pub const RetainedCompactionWindow = struct {
         });
         if (plan.accepted_handoff_tokens != null) return false;
         target.* = if (self.retained_tokens <= self.newest_exchange_tokens) 0 else target.* / 2;
-        debug_trace.logf("context_compaction", "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
+        diagnostics.traceCompactionLog(false, "refine retained_tokens={d} protected_tokens={d} next_target={d}", .{ self.retained_tokens, fixed_cost.estimated_input_tokens, target.* });
         return true;
     }
 };
@@ -5560,9 +5872,9 @@ pub fn prepareRetainedCompactionWindow(
         .estimated_tokens = 0,
     } else runtime_prompt_context.selectRecentContext(
         combined.items,
-        options.target orelse runtime_prompt_context.recentContextTarget(capabilities, source_tokens),
+        @min(@as(usize, 16000), options.target orelse runtime_prompt_context.recentContextTarget(capabilities, source_tokens)),
         runtime_prompt_context.usableInputTokens(capabilities),
-        .{ .provider = provider_selection },
+        .{ .provider = provider_selection, .reject_oversized_tool_step = true },
     );
     var cut = selection.cut;
     if (active) |turn| {
@@ -5655,7 +5967,7 @@ pub fn prepareManualCompactionContinuation(
         0,
     );
     var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
-    provider_options.prompt_caching = true;
+    provider_options.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
     return .{
         .request = .{
             .model = model,
@@ -5766,6 +6078,11 @@ pub fn compactContextTransaction(
     var stage: compaction_activity.Stage = .preparation;
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
+        if (err == error.Cancelled) {
+            diagnostics.traceCompactionEvent(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        } else {
+            diagnostics.traceCompactionFailure(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+        }
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = request.trace_ctx.turn_id, .err = err };
@@ -5779,18 +6096,51 @@ pub fn compactContextTransaction(
         .source_tokens = request.source_tokens,
         .newest_exchange_tokens = request.newest_exchange_tokens,
     };
-    if (runtime_prompt_context.planCompaction(plan_input).decision == .no_op) {
+    const initial_plan = runtime_prompt_context.planCompaction(plan_input);
+    if (initial_plan.decision == .no_op) {
+        diagnostics.traceCompactionEvent(
+            request.trace_ctx,
+            "skipped_no_op",
+            "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                initial_plan.usable_input_tokens,
+                initial_plan.high_water_tokens,
+            },
+        );
         if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
         return null;
     }
     const fixed_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, "");
     plan_input.protected_tokens = fixed_cost.estimated_input_tokens;
     const plan = runtime_prompt_context.planCompaction(plan_input);
-    const accepted_tokens = plan.accepted_handoff_tokens orelse
+    const accepted_tokens = plan.accepted_handoff_tokens orelse {
+        diagnostics.traceCompactionFailure(
+            request.trace_ctx,
+            "capacity_exceeded_at_plan",
+            "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
+            .{
+                @tagName(request.trigger),
+                request.request_tokens,
+                request.source_tokens,
+                fixed_cost.estimated_input_tokens,
+                request.newest_exchange_tokens,
+                plan.usable_input_tokens,
+                plan.high_water_tokens,
+                plan.session_target_tokens,
+            },
+        );
         return error.ContextCapacityExceeded;
-    const generation_tokens = plan.generation_tokens orelse
-        return error.ContextCapacityExceeded;
+    };
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
+        diagnostics.traceCompactionFailure(
+            request.trace_ctx,
+            "credential_unauthorized",
+            "trigger={s} provider={s} credential_source={s}",
+            .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
+        );
         return error.ContextCompactionUnavailable;
     }
     const compaction_model = request.continuation.request.model;
@@ -5798,10 +6148,6 @@ pub fn compactContextTransaction(
         deps.ctx,
         compaction_model,
     );
-    const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
-        @min(generation_tokens, @as(usize, @intCast(limit)))
-    else
-        generation_tokens;
 
     try runtime_context_compaction.promoteMessageResults(
         alloc,
@@ -5827,18 +6173,14 @@ pub fn compactContextTransaction(
             .retry_count = request.retry_count,
             .cancel_flag = request.cancel_flag,
             .accepted_tokens = accepted_tokens,
-            .generation_tokens = compactor_generation_tokens,
-            .compactor_input_tokens = runtime_prompt_context.usableInputTokensForGeneration(
-                compactor_capabilities,
-                @min(compactor_generation_tokens, accepted_tokens),
-            ),
-            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
-                compactor_capabilities,
-                .auto,
-                false,
-            ),
+            .max_output_tokens = request.continuation.request.max_output_tokens,
+            .deadline = if (request.continuation.request.budget) |budget| budget.deadline else null,
+            .compactor_input_tokens = runtime_prompt_context.usableInputTokens(compactor_capabilities),
+            .provider_options = request.continuation.request.provider_options,
             .usage = deps.usage,
             .usage_allocator = deps.usage_allocator,
+            .policy = if (request.result_storage == .unavailable) .legacy else .assistant_first,
+            .result_storage = request.result_storage,
             .trace_ctx = request.trace_ctx,
         },
     );
@@ -5848,6 +6190,18 @@ pub fn compactContextTransaction(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const candidate_cost = try request.continuation.measure(alloc, deps.agent_stream_provider, compacted.handoff);
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
+        diagnostics.traceCompactionEvent(
+            request.trace_ctx,
+            "candidate_over_capacity",
+            "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
+            .{
+                @tagName(request.trigger),
+                candidate_cost.estimated_input_tokens,
+                fixed_cost.estimated_input_tokens,
+                accepted_tokens,
+                compacted.handoff.len,
+            },
+        );
         return error.ContextCapacityExceeded;
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -5858,6 +6212,18 @@ pub fn compactContextTransaction(
         .removed_turn_count = request.removed_turn_count,
         .compaction_count = request.compaction_count,
     }, request.active_prefix, request.retained_from);
+    diagnostics.traceCompactionEvent(
+        request.trace_ctx,
+        "committed",
+        "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
+        .{
+            @tagName(request.trigger),
+            request.removed_turn_count,
+            request.compaction_count,
+            compacted.handoff.len,
+            accepted_tokens,
+        },
+    );
     // A successful acknowledgement wins even if cancellation arrived during publication.
     if (operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{
         .outcome = .succeeded,
@@ -6268,6 +6634,8 @@ fn processQueuedPromptLoop(
     defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
     defer shell_execution_failure_retry.deinit(arena);
+    var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -6377,6 +6745,7 @@ fn processQueuedPromptLoop(
         checkpoint.fast_mode
     else
         selected_fast_mode;
+    var fast_unavailable_notified = false;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -6399,15 +6768,7 @@ fn processQueuedPromptLoop(
         .transport_interrupted;
     var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
     var pending_auto_retry_status: ?types.RouteRecoveryStatus = null;
-    errdefer if (pending_auto_retry_status != null) {
-        clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
-            debug_trace.logf(
-                "agent",
-                "failed to clear due retry status err={s}",
-                .{@errorName(clear_err)},
-            );
-        };
-    };
+    errdefer if (pending_auto_retry_status != null) clear_deferred_retry_status(deps);
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -6544,28 +6905,7 @@ fn processQueuedPromptLoop(
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
-                const settlement = if (config.cancel_flag.load(.seq_cst))
-                    stream_ctx.provisional_statuses.finishTrackedCancelled(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                    )
-                else
-                    stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                        &.{},
-                    );
-                settlement catch |err| {
-                    debug_trace.logf(
-                        "agent",
-                        "failed to settle interrupted tool starts err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
             }
         }
 
@@ -6581,7 +6921,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -6617,7 +6956,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -6798,8 +7136,19 @@ fn processQueuedPromptLoop(
             const request_messages = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support == .native, config.max_tool_result_bytes);
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
-            provider_opts.prompt_caching = true;
+            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            // Fast drops silently when the catalog cannot confirm support.
+            // Tell the user once per turn, but only when the catalog itself is
+            // known to be down; a reachable catalog that simply lacks fast
+            // metadata for the model stays quiet.
+            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
+                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
+            {
+                fast_unavailable_notified = true;
+                try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
+                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
@@ -6854,11 +7203,11 @@ fn processQueuedPromptLoop(
                     else
                         0,
                 });
-                debug_trace.eventf(
-                    "context_compaction",
-                    "decision",
+                diagnostics.traceCompactionEventIf(
+                    projection_plan.decision != .no_op,
                     step_ctx,
-                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
+                    "decision",
+                    "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
                         request_cost.serialized_bytes,
@@ -6871,15 +7220,17 @@ fn processQueuedPromptLoop(
                         projection_plan.high_water_tokens,
                         projection_plan.session_target_tokens,
                         projection_plan.accepted_handoff_tokens,
-                        projection_plan.generation_tokens,
+                        request_data.max_output_tokens,
                     },
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
+                        diagnostics.traceCompactionFailure(step_ctx, "overflow_without_compaction", "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
+                                diagnostics.traceCompactionFailure(step_ctx, "no_compactable_context", "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -6896,11 +7247,12 @@ fn processQueuedPromptLoop(
                                 job.history.len,
                             );
                             const prefix_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]);
-                            const active_prefix: ?types.AssistantHistoryTurn = if (within_turn_suffix.items.len > compacted_suffix_len) .{
+                            // The pending user is source too, even before the first tool.
+                            const active_prefix: ?types.AssistantHistoryTurn = .{
                                 .user = .{ .text = job.prompt, .images = job.images },
                                 .assistant = @constCast(""),
                                 .execution = prefix_execution,
-                            } else null;
+                            };
                             const window = try prepareRetainedCompactionWindow(arena, compaction_history, .{
                                 .user = .{ .text = job.prompt, .images = job.images },
                                 .assistant = @constCast(""),
@@ -6908,7 +7260,11 @@ fn processQueuedPromptLoop(
                             }, request_capabilities, request_cost.estimated_input_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, .{ .target = retention_target });
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
-                                    if (retention_target == 0 or request_cost.estimated_input_tokens <= (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) return error.ContextCapacityExceeded;
+                                    if (retention_target == 0) {
+                                        diagnostics.traceCompactionFailure(step_ctx, "retention_exhausted", "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        return error.ContextCapacityExceeded;
+                                    }
+                                    diagnostics.traceCompactionFailure(step_ctx, "retention_forced_zero", "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -6970,6 +7326,7 @@ fn processQueuedPromptLoop(
                             const next_compaction_history_tail = window.retained_messages;
                             const next_compaction_count = compaction_count + 1;
                             const next_history = try arena.alloc(HistoryTurn, window.retained_history.len + 1);
+                            try persist_compaction_source(deps, finalization, arena, job, within_turn_suffix.items, gateway_model, selected_fast_mode, route_fast_mode, semantic_limit, semantic_attempt, preserved_tool_evidence, step_ctx);
                             var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                             const transaction_result = compactContextTransaction(arena, deps, .{
                                 .trigger = compaction_trigger,
@@ -7036,10 +7393,9 @@ fn processQueuedPromptLoop(
                             if (context_overflow_recovery == .pending) {
                                 context_overflow_recovery = .used;
                             }
-                            debug_trace.eventf(
-                                "context_compaction",
-                                "installed",
+                            diagnostics.traceCompactionEvent(
                                 step_ctx,
+                                "installed",
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
@@ -7080,6 +7436,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
+                diagnostics.traceCompactionFailure(step_ctx, "overflow_recovery_incomplete", "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
@@ -7090,7 +7447,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7187,7 +7543,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -7283,7 +7638,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7322,7 +7676,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -7515,6 +7868,7 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
+            pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
@@ -7540,6 +7894,7 @@ fn processQueuedPromptLoop(
                     model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
+                    const replay_wait_started_ms = io_mod.milliTimestamp();
                     stream_result = try runtime_gateway_step.streamModelCompletion(
                         deps.agent_stream_provider,
                         arena,
@@ -7547,6 +7902,7 @@ fn processQueuedPromptLoop(
                         deps.usage,
                         deps.usage_allocator,
                     );
+                    pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
                         overlay_arena,
@@ -7591,7 +7947,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(""),
@@ -7635,10 +7990,9 @@ fn processQueuedPromptLoop(
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
-                    debug_trace.eventf(
-                        "context_compaction",
-                        "provider_overflow_recovery",
+                    diagnostics.traceCompactionEvent(
                         step_ctx,
+                        "provider_overflow_recovery",
                         "model={s} request_bytes={d} estimated_tokens={d}",
                         .{
                             gateway_model,
@@ -7684,7 +8038,6 @@ fn processQueuedPromptLoop(
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
-                    arena,
                     job,
                     within_turn_suffix.items,
                     stream_ctx.interruption_source_or(response_completion.content orelse ""),
@@ -7776,7 +8129,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
@@ -7815,7 +8167,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             stream_ctx.interruption_source_or(""),
@@ -8113,7 +8464,6 @@ fn processQueuedPromptLoop(
                     try persistRecoveryCheckpoint(
                         deps,
                         finalization,
-                        arena,
                         job,
                         within_turn_suffix.items,
                         partial_assistant,
@@ -8151,7 +8501,6 @@ fn processQueuedPromptLoop(
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
-                            arena,
                             job,
                             within_turn_suffix.items,
                             partial_assistant,
@@ -9272,7 +9621,9 @@ fn processQueuedPromptLoop(
             silent_tool_steps += 1;
         }
 
-        var step_batch = runtime_tool_batch.StepBatchState{};
+        var step_batch = runtime_tool_batch.StepBatchState{
+            .identical_failure_escalation = &identical_failure_escalation,
+        };
         terminal_validation_retry.beginBatch();
         shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
@@ -9539,6 +9890,7 @@ fn processQueuedPromptLoop(
                             .status = .failure,
                             .model_output = failure_output,
                             .status_detail = "preflight failed",
+                            .failure_kind = .preflight,
                         };
                         precomputed_results[group_index] = failure;
                         continue;
@@ -9717,13 +10069,24 @@ fn processQueuedPromptLoop(
                 ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity != .valid) continue;
-                    try runtime_tool_admission.recordRejectedToolCall(
-                        deps,
-                        arena,
-                        parallel_call,
-                        execution.model_output,
-                        null,
-                    );
+                    // Results that failed the tool's own preflight/content
+                    // checks are tool failures, not permission rejections.
+                    switch (execution.failure_kind) {
+                        .preflight, .apply => try runtime_tool_admission.recordFailedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                        .none, .denied => try runtime_tool_admission.recordRejectedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                    }
                 }
                 const cancelled_call = try runtime_tool_batch.assembleParallelToolResults(
                     arena,
@@ -10683,6 +11046,7 @@ fn processQueuedPromptLoop(
                     .status = .failure,
                     .model_output = failure_output,
                     .status_detail = "preflight failed",
+                    .failure_kind = .preflight,
                 };
                 const prepared_failure = try runtime_execution_memory.prepareToolModelOutput(
                     arena,
@@ -10714,7 +11078,9 @@ fn processQueuedPromptLoop(
                     prepared_failure.memory,
                     .{ .increment_error = true },
                 );
-                try runtime_tool_admission.recordRejectedToolCall(
+                // A permission-stage tool_failure ran the tool's preflight
+                // content checks and failed them; record a tool failure.
+                try runtime_tool_admission.recordFailedToolCall(
                     deps,
                     arena,
                     tool_call,
@@ -11884,4 +12250,49 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "writeNetworkRecordBody renders completed and failed outcomes" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{ .completion = .{
+        .finish_reason = .stop,
+        .generation_id = "gen_test_123",
+        .usage = .{
+            .input_tokens = 1240,
+            .output_tokens = 56,
+            .cache_read_tokens = 900,
+        },
+    } } };
+    try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
+    try std.testing.expectEqualStrings(
+        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read",
+        body.written(),
+    );
+
+    body.clearRetainingCapacity();
+    var failed: runtime_gateway_step.StreamResult = .{ .failed = .{
+        .kind = .rate_limited,
+        .retry_after_seconds = 4,
+    } };
+    try writeNetworkRecordBody(&body.writer, "codex", "gpt-5.2", 1503, &failed);
+    try std.testing.expectEqualStrings(
+        "provider: codex · model: gpt-5.2 · 1503ms\nfailed: rate_limited · retry after: 4s",
+        body.written(),
+    );
+}
+
+test "writeNetworkRecordBody omits absent finish reason and generation" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{} };
+    try writeNetworkRecordBody(&body.writer, "gateway", "m", 0, &completed);
+    try std.testing.expectEqualStrings(
+        "provider: gateway · model: m · 0ms\nfinish: unknown",
+        body.written(),
+    );
 }

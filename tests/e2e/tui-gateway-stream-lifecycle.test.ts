@@ -60,7 +60,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
-  writeFileSync(join(home, ".fx/settings.json"), "{}");
+  writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
   let first = true, sentFeedback = false, receivedFeedback: any, followup = false;
@@ -90,7 +90,10 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
           else { expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE"); expect(raw).toContain("CHILD_FEEDBACK_TOKEN"); }
           followupDone = true; return fakeGatewayFinalText("CHILD_FOLLOWUP_DONE");
         }
-        if (childCalls === 1) return fakeShellRun("child-steering-shell", "sh hold.sh");
+        if (childCalls === 1) return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "child-steering-shell", toolName: "shell", input: { request: { action: "run", command: "sh hold.sh", yield_time_ms: 30_000 } } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 12_000 }, outputTokens: { total: 10 } } },
+        ]);
         expect(raw).toContain("ORIGINAL_TOOL_DONE");
         if (!lateFeedback) {
           expect(raw).toContain("CHILD_FEEDBACK_TOKEN");
@@ -143,6 +146,12 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Start the child task.");
     await waitForPath(join(workspace, "starts"));
+    await session.waitForPane(
+      pane => /reviewer working[^\n]*CHILD_STEERING_TASK[^\n]*\n[^\n]*gpt-5\.5/.test(pane),
+      TIMEOUT,
+    ).catch(error => {
+      throw new Error(`${error}\n${readFileSync(trace, "utf8").slice(-16_000)}`);
+    });
     const original = childState();
     await session.sendText("Send the child useful review feedback.");
     if (lateFeedback) {
@@ -1591,6 +1600,111 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT);
 
+  test("interactive launch flags override model effort and fast mode", async () => {
+    const LAUNCH_MODEL = "provider/launch-model";
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-launch-flags-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    const workspace = realpathSync(workspacePath);
+
+    const queuedGateway = startFakeGateway([
+      fakeGatewayFinalText("LAUNCH_FLAGS_OK"),
+      fakeGatewayFinalText("RESUME_FLAGS_OK"),
+    ], {
+      models: [{
+        id: LAUNCH_MODEL,
+        type: "language",
+        tags: ["tool-use", "reasoning"],
+        fast_options: [{ type: "toggle" }],
+        reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+      }],
+    });
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --model ${LAUNCH_MODEL} --effort high --fast`,
+      cwd: workspace,
+      width: 72,
+      height: 24,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-launch-flags-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: undefined,
+      },
+    });
+    await session.waitForText("launch-model · high · ⚡︎", TIMEOUT);
+
+    await session.sendText("Prove the launch flags.");
+    await session.waitForText("LAUNCH_FLAGS_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    expect(queuedGateway.requests).toHaveLength(1);
+    expect(queuedGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(LAUNCH_MODEL);
+    const request = JSON.parse(queuedGateway.requests[0]!.body);
+    expect(request).toMatchObject({
+      reasoning: "high",
+      providerOptions: { gateway: { speed: "fast" } },
+    });
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    await session.kill();
+    // The first launch stored the configured model with Fast mode off; the
+    // resume leg's flags must win over those stored preferences for this launch.
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume-last`,
+      cwd: workspace,
+      width: 72,
+      height: 24,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-launch-flags-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: undefined,
+      },
+    });
+    await session.waitForText("launch-model · low · ⚡︎", TIMEOUT);
+
+    await session.sendText("Continue with the resume flags.");
+    await session.waitForText("RESUME_FLAGS_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    expect(queuedGateway.requests).toHaveLength(2);
+    const resumedRequest = JSON.parse(queuedGateway.requests[1]!.body);
+    expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(LAUNCH_MODEL);
+    expect(resumedRequest).toMatchObject({
+      reasoning: "low",
+      providerOptions: { gateway: { speed: "fast" } },
+    });
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test(
     "clear response language mismatch never reaches TUI scrollback",
     async () => {
@@ -2241,8 +2355,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      await session.waitForText(finalText, TIMEOUT * 2);
-      const scrollback = await session.captureFullScrollback();
+      const scrollback = await waitForScrollback(
+        session,
+        (candidate) => candidate.includes(finalText) && TURN_SUMMARY_WITH_TOKENS.test(candidate),
+        "completed route recovery summary",
+        TIMEOUT * 2,
+      );
 
       expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("System");
@@ -3095,7 +3213,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText(seedPrompt);
-      await session.waitForText(seedReply, TIMEOUT);
+      await waitForScrollback(
+        session,
+        (value) => value.includes(seedReply) && TURN_SUMMARY_WITH_TOKENS.test(value),
+        "completed seed turn before idle submission",
+      );
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
       session.sendKeysImmediate(["Enter"]);
@@ -5654,10 +5776,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
-      for (let page = 0; page < 10; page += 1) {
+      let fullAtFirst = await session.capturePane();
+      for (
+        let page = 0;
+        page < 20 && !fullAtFirst.includes(`├ Ran ${firstDisplayCommand}`);
+        page += 1
+      ) {
         await session.sendKeys("PPage");
+        await Bun.sleep(50);
+        fullAtFirst = await session.capturePane();
       }
-      const fullAtFirst = await session.waitForText(firstDisplayCommand, TIMEOUT);
       expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
       expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);

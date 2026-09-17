@@ -111,6 +111,7 @@ pub const CredentialSource = enum {
     chatgpt_subscription,
     grok_subscription,
     host_managed,
+    configured,
 };
 
 pub const DirectCredentialLease = struct {
@@ -171,7 +172,7 @@ test "empty direct credential lease preserves absent authority" {
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     const source = parseRuntimeCredentialSource(text) orelse return null;
-    return if (source == .host_managed) null else source;
+    return if (source == .host_managed or source == .configured) null else source;
 }
 
 pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
@@ -180,7 +181,7 @@ pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed) continue;
+        if (source == .host_managed or source == .configured) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
@@ -315,6 +316,7 @@ pub const ModelRecoveryCause = enum {
     system_resumed,
     authentication,
     request_limit_reached,
+    compaction_prepared,
 };
 
 pub const ModelRecoveryAction = enum {
@@ -350,6 +352,7 @@ pub const ModelFailureDiagnostic = struct {
             .system_resumed => "SystemResumed",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
+            .compaction_prepared => "CompactionPrepared",
         };
     }
 
@@ -497,6 +500,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication refreshed",
             .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Resuming saved compaction",
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
@@ -602,6 +606,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication expired",
             .request_limit_reached => unreachable,
+            .compaction_prepared => "Saved compaction",
         };
         return self.pausedCauseLabel(buf, name);
     }
@@ -807,6 +812,23 @@ pub const WebFetchCompletion = struct {
 
     pub fn url(self: *const WebFetchCompletion) []const u8 {
         return self.url_buf[0..self.url_len];
+    }
+};
+
+pub const SubagentStatus = struct {
+    session_title: ?[]const u8 = null,
+    model: []const u8,
+    effort: ReasoningEffort,
+    input_tokens: u64,
+    context_window: ?u32,
+};
+
+pub const SubagentStatusRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (*anyopaque, buf: []u8, SubagentStatus) []const u8,
+
+    pub fn render(self: SubagentStatusRenderer, buf: []u8, status: SubagentStatus) []const u8 {
+        return self.render_fn(self.ctx, buf, status);
     }
 };
 
@@ -1141,7 +1163,7 @@ pub const ProviderReplay = struct {
     parts_json: []const u8,
 
     pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
-        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+        return self.source.provider.same_authority(source.provider) and std.mem.eql(u8, self.source.model, source.model);
     }
 };
 
@@ -1168,6 +1190,8 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    // Source provenance for compaction, never permission authority.
+    context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
 };
 

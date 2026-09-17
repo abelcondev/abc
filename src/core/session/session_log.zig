@@ -649,7 +649,7 @@ fn encodeConversationMetadataWithTitle(
         .created_at_ms = state.created_at_ms,
         .updated_at_ms = state.updated_at_ms,
         .conversation_language = state.conversation_language.view(),
-        .provider = @tagName(state.preferences.provider),
+        .provider = state.preferences.provider,
         .model = state.preferences.model,
         .effort = state.preferences.effort.label(),
         .fast_mode = state.preferences.fast_mode,
@@ -688,10 +688,30 @@ fn writeConversationRecoveryState(
     conversation_seq: u64,
 ) !void {
     if (recovery_checkpoint) |checkpoint| {
-        const recovery_bytes = try session_codec.encodeRecoveryCheckpoint(
-            alloc,
+        var projection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer projection_arena.deinit();
+        const projected = try spillRecoveryCheckpointOutputs(
+            projection_arena.allocator(),
+            dir,
             checkpoint,
         );
+        const recovery_bytes = session_codec.encodeRecoveryCheckpoint(
+            alloc,
+            projected,
+        ) catch |err| switch (err) {
+            // The durable checkpoint is a resume aid, not turn-critical
+            // state. An oversized checkpoint keeps the previously persisted
+            // file and the turn continues; in-memory state still advances.
+            error.RecoveryCheckpointTooLarge => {
+                debug_trace.logf(
+                    "session",
+                    "event=recovery_checkpoint_oversized cap_bytes={d}; keeping previous durable checkpoint",
+                    .{session_codec.max_recovery_checkpoint_bytes},
+                );
+                return;
+            },
+            else => return err,
+        };
         defer alloc.free(recovery_bytes);
         const bound_bytes = try std.fmt.allocPrint(
             alloc,
@@ -712,6 +732,104 @@ fn writeConversationRecoveryState(
         };
         try io_mod.syncVerifiedDir(dir.dir);
     }
+}
+
+/// Inline tool-result output budget for the durable recovery checkpoint.
+/// Larger outputs live in the session's result store and the checkpoint
+/// carries their content-addressed handle instead.
+const recovery_checkpoint_inline_output_max_bytes: usize = result_store.preview_bytes;
+
+/// Returns a copy of the checkpoint whose oversized tool-result outputs are
+/// spilled to the session result store and replaced by their handle. The
+/// source checkpoint is borrowed; the projection owns only its own
+/// allocations, and `alloc` is expected to free them in bulk. Spill failures
+/// keep the offending result inline so a store hiccup cannot block the
+/// checkpoint write.
+fn spillRecoveryCheckpointOutputs(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    checkpoint: session_codec.RecoveryCheckpoint,
+) !session_codec.RecoveryCheckpoint {
+    var spills = false;
+    for (checkpoint.execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            if (result.output_handle != null or
+                result.output.len > recovery_checkpoint_inline_output_max_bytes)
+            {
+                spills = true;
+                break;
+            }
+        }
+    }
+    if (!spills) return checkpoint;
+
+    var result_dir: ?[]const u8 = null;
+    const steps = try alloc.alloc(types.ToolExecutionStep, checkpoint.execution.tool_steps.len);
+    for (checkpoint.execution.tool_steps, 0..) |step, index| {
+        steps[index] = step;
+        var results_changed = false;
+        for (step.tool_results) |result| {
+            if (result.output_handle != null or
+                result.output.len > recovery_checkpoint_inline_output_max_bytes)
+            {
+                results_changed = true;
+                break;
+            }
+        }
+        if (!results_changed) continue;
+        const results = try alloc.alloc(types.PersistedToolResult, step.tool_results.len);
+        for (step.tool_results, 0..) |result, result_index| {
+            results[result_index] = try projectRecoveryResult(alloc, dir, &result_dir, result);
+        }
+        steps[index].tool_results = results;
+    }
+    var projected = checkpoint;
+    projected.execution.tool_steps = steps;
+    return projected;
+}
+
+fn projectRecoveryResult(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    result_dir: *?[]const u8,
+    result: types.PersistedToolResult,
+) !types.PersistedToolResult {
+    var projected = result;
+    // Only spill output the restore path can read back; larger inline output
+    // stays put and the oversize guard in writeConversationRecoveryState
+    // covers the checkpoint as a whole.
+    if (projected.output_handle == null and
+        projected.output.len > recovery_checkpoint_inline_output_max_bytes and
+        projected.output.len <= result_store.stored_text_max_bytes)
+    {
+        if (result_dir.* == null) {
+            const base = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+            result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
+        }
+        const handle = result_store.storeLargeResult(
+            alloc,
+            result_dir.*.?,
+            result.tool_call_id,
+            result.tool_name,
+            result.output,
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=recovery_checkpoint_spill_failed tool_call_id={s} err={s}; keeping result inline",
+                .{ result.tool_call_id, @errorName(err) },
+            );
+            return projected;
+        };
+        projected.output_handle = handle;
+        projected.stored_output_bytes = result.output.len;
+    }
+    if (projected.output_handle != null and projected.output.len != 0) {
+        if (projected.preview == null) {
+            projected.preview = try result_store.previewText(alloc, result.output, result_store.preview_bytes);
+        }
+        projected.output = "";
+    }
+    return projected;
 }
 
 fn loadConversationPermissionState(
@@ -863,6 +981,9 @@ fn load_conversation_state_at_boundary(
         null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (recovery_checkpoint) |*checkpoint| {
+        var capability: ?session_child_store.SessionChildCapability = null;
+        defer if (capability) |*value| value.deinit();
+        try restoreExecutionResultBodies(alloc, dir, &capability, &checkpoint.execution);
         if (checkpoint.user.work_id == null) {
             checkpoint.user.work_id = open_work_id;
             open_work_id = null;
@@ -879,8 +1000,7 @@ fn load_conversation_state_at_boundary(
     const language = session.ConversationLanguage.fromSlice(
         metadata.value.conversation_language,
     ) catch return error.InvalidSessionMetadata;
-    const provider = model_provider.parse(metadata.value.provider) orelse
-        return error.InvalidSessionMetadata;
+    const provider = metadata.value.provider;
     const effort = types.ReasoningEffort.parse(metadata.value.effort) orelse
         return error.InvalidSessionMetadata;
     return .{
@@ -1276,6 +1396,24 @@ fn openConversationWritableSession(
         null,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
+    if (state.recovery_checkpoint) |checkpoint| {
+        if (checkpoint.cause == .compaction_prepared) {
+            // This checkpoint records completed source, not permission to run
+            // captured work. Make it ordinary interrupted history before a new
+            // prompt can replace the recovery slot. Sequence binding makes a
+            // crash after this append safe even if sidecar cleanup did not run.
+            const timestamp = io_mod.milliTimestamp();
+            try conversation_writer.appendHistoryTurn(alloc, timestamp, checkpoint.interruptedTurn());
+            writeConversationRecoveryState(alloc, &writable.dir, null, conversation_writer.last_seq) catch |err| {
+                debug_trace.logf("session", "compaction source committed but recovery cleanup failed err={s}", .{@errorName(err)});
+            };
+            var restored = (try load_conversation_state_at_boundary(alloc, &writable.dir, writable.session_id, null, null, null)) orelse return error.InvalidSessionMetadata;
+            restored.updated_at_ms = timestamp;
+            state.deinit(alloc);
+            state = restored;
+            debug_trace.logf("session", "event=compaction_source_restored session={s} through_seq={d}", .{ writable.session_id, conversation_writer.last_seq });
+        }
+    }
     const active_id = try alloc.dupe(u8, writable.session_id);
     errdefer alloc.free(active_id);
     const generation = randomIdentifier();
@@ -2163,31 +2301,40 @@ fn restoreContextResultBodies(alloc: Allocator, dir: *io_mod.VerifiedDir, histor
             .interrupted => |*entry| &entry.execution,
             .compacted_summary => continue,
         };
-        for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
-            const handle = result.output_handle orelse continue;
-            if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
-            const body = if (result.truncated)
-                try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
-            else blk: {
-                if (capability == null) {
-                    const path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
-                    defer alloc.free(path);
-                    capability = try session_child_store.SessionChildCapability.init(alloc, dir.dir, path, .read_only);
-                }
-                break :blk result_store.readForReplayManaged(alloc, &capability.?, handle, result.stored_output_bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => {
-                        debug_trace.logf("session", "event=context_result_unavailable handle={s} err={s}; marking content unavailable", .{ handle, @errorName(err) });
-                        const unavailable = try alloc.dupe(u8, "Saved tool-result content is unavailable. The complete output could not be restored.");
-                        result.truncated = true;
-                        break :blk unavailable;
-                    },
-                };
-            };
-            alloc.free(result.output);
-            result.output = body;
-        };
+        try restoreExecutionResultBodies(alloc, dir, &capability, execution);
     }
+}
+
+fn restoreExecutionResultBodies(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    capability: *?session_child_store.SessionChildCapability,
+    execution: *types.ExecutionMemory,
+) !void {
+    for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
+        const handle = result.output_handle orelse continue;
+        if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
+        const body = if (result.truncated)
+            try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
+        else blk: {
+            if (capability.* == null) {
+                const path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+                defer alloc.free(path);
+                capability.* = try session_child_store.SessionChildCapability.init(alloc, dir.dir, path, .read_only);
+            }
+            break :blk result_store.readForReplayManaged(alloc, &capability.*.?, handle, result.stored_output_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=context_result_unavailable handle={s} err={s}; marking content unavailable", .{ handle, @errorName(err) });
+                    const unavailable = try alloc.dupe(u8, "Saved tool-result content is unavailable. The complete output could not be restored.");
+                    result.truncated = true;
+                    break :blk unavailable;
+                },
+            };
+        };
+        alloc.free(result.output);
+        result.output = body;
+    };
 }
 
 fn projectConversationSnapshotLocators(
@@ -3710,7 +3857,7 @@ fn createNativeSession(
         .created_at_ms = initial_state.created_at_ms,
         .updated_at_ms = initial_state.updated_at_ms,
         .conversation_language = initial_state.conversation_language.view(),
-        .provider = @tagName(initial_state.preferences.provider),
+        .provider = initial_state.preferences.provider,
         .model = initial_state.preferences.model,
         .effort = initial_state.preferences.effort.label(),
         .fast_mode = initial_state.preferences.fast_mode,
@@ -4664,7 +4811,7 @@ test "conversation storage creates only metadata and event log" {
         .created_at_ms = 10,
         .updated_at_ms = 10,
         .conversation_language = "en",
-        .provider = "gateway",
+        .provider = .gateway,
         .model = "openai/gpt-5.6",
         .effort = "high",
         .fast_mode = false,
@@ -5324,6 +5471,288 @@ test "cache-free recovery checkpoint resumes and clears independently" {
     var cleared = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer cleared.deinit(alloc);
     try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), cleared.recovery_checkpoint);
+}
+
+test "recovery checkpoint spills oversized tool outputs and reload restores them" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery-spill", 10);
+    defer initial.deinit(alloc);
+
+    const big = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    @memcpy(big[big.len - 9 ..], "ENDMARKER");
+
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-big", .name = "command", .arguments_json = "{}" },
+        .{ .id = "call-small", .name = "command", .arguments_json = "{}" },
+        .{ .id = "call-truncated", .name = "command", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call-big"),
+            .tool_name = @constCast("command"),
+            .status = .success,
+            .output = big,
+            .output_bytes = big.len,
+            .stored_output_bytes = big.len,
+        },
+        .{
+            .tool_call_id = @constCast("call-small"),
+            .tool_name = @constCast("command"),
+            .status = .success,
+            .output = @constCast("tiny output"),
+            .output_bytes = 11,
+            .stored_output_bytes = 11,
+        },
+        .{
+            .tool_call_id = @constCast("call-truncated"),
+            .tool_name = @constCast("command"),
+            .status = .success,
+            .output = @constCast("TRUNCATED-INLINE"),
+            .output_handle = @constCast("result-command-0000000000000000-0000000000000000.txt"),
+            .preview = @constCast("truncated preview"),
+            .output_bytes = 100000,
+            .stored_output_bytes = 100000,
+            .truncated = true,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &loaded.log.dir,
+            recovery_checkpoint_file,
+            session_codec.max_recovery_checkpoint_bytes + 128,
+        );
+        defer alloc.free(bytes);
+        // The spilled body and the truncated inline body stay out of the file.
+        try std.testing.expect(std.mem.find(u8, bytes, "ENDMARKER") == null);
+        try std.testing.expect(std.mem.find(u8, bytes, "TRUNCATED-INLINE") == null);
+        try std.testing.expect(std.mem.find(u8, bytes, "result-command-") != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "tiny output") != null);
+        try std.testing.expect(bytes.len < big.len);
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        const restored = resumed.state.recovery_checkpoint.?;
+        const restored_results = restored.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(big.len, restored_results[0].output.len);
+        try std.testing.expect(std.mem.endsWith(u8, restored_results[0].output, "ENDMARKER"));
+        try std.testing.expectEqualStrings("tiny output", restored_results[1].output);
+        // Truncated results restore as their stored-result placeholder.
+        try std.testing.expect(std.mem.find(u8, restored_results[2].output, "read_tool_result") != null);
+    }
+}
+
+test "oversized recovery checkpoint keeps the previous durable checkpoint" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery-oversized", 10);
+    defer initial.deinit(alloc);
+    const first = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    const oversized_source = try alloc.alloc(u8, session_codec.max_recovery_checkpoint_bytes);
+    defer alloc.free(oversized_source);
+    @memset(oversized_source, 'a');
+    var oversized = first;
+    oversized.turn_id = 9;
+    oversized.assistant_source = oversized_source;
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = first },
+        }, 20);
+        // The oversized checkpoint must not fail the session update.
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = oversized },
+        }, 21);
+        // In-memory state still advances to the freshest checkpoint.
+        try std.testing.expectEqual(@as(u64, 9), loaded.state.recovery_checkpoint.?.turn_id);
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &loaded.log.dir,
+            recovery_checkpoint_file,
+            session_codec.max_recovery_checkpoint_bytes + 128,
+        );
+        defer alloc.free(bytes);
+        // The durable file keeps the last persistable checkpoint.
+        try std.testing.expect(std.mem.find(u8, bytes, "\"turn_id\":7") != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"turn_id\":9") == null);
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
+    }
+}
+
+test "tool-result spill keeps an over-cap checkpoint persistable and resumable" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery-rescue", 10);
+    defer initial.deinit(alloc);
+
+    // Seventeen 4 MiB results would serialize past the 64 MiB cap if kept inline.
+    const result_count = 17;
+    const output_len = 4 * 1024 * 1024;
+    var outputs: [result_count][]u8 = undefined;
+    for (&outputs, 0..) |*slot, index| {
+        slot.* = try alloc.alloc(u8, output_len);
+        @memset(slot.*, @as(u8, @intCast('a' + index)));
+    }
+    defer for (outputs) |bytes| alloc.free(bytes);
+
+    var calls: [result_count]types.ToolCall = undefined;
+    var results: [result_count]types.PersistedToolResult = undefined;
+    for (&calls, &results, 0..) |*call, *result, index| {
+        const id = try std.fmt.allocPrint(alloc, "call-big-{d}", .{index});
+        call.* = .{ .id = id, .name = "command", .arguments_json = "{}" };
+        result.* = .{
+            .tool_call_id = id,
+            .tool_name = @constCast("command"),
+            .status = .success,
+            .output = outputs[index],
+            .output_bytes = output_len,
+            .stored_output_bytes = output_len,
+        };
+    }
+    defer for (calls) |call| alloc.free(call.id);
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &loaded.log.dir,
+            recovery_checkpoint_file,
+            session_codec.max_recovery_checkpoint_bytes + 128,
+        );
+        defer alloc.free(bytes);
+        try std.testing.expect(bytes.len < 1024 * 1024);
+        try std.testing.expect(std.mem.find(u8, bytes, "result-command-") != null);
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        const restored = resumed.state.recovery_checkpoint.?.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(result_count, restored.len);
+        for (restored, 0..) |result, index| {
+            try std.testing.expectEqual(output_len, result.output.len);
+            try std.testing.expectEqual(@as(u8, @intCast('a' + index)), result.output[0]);
+            try std.testing.expectEqual(@as(u8, @intCast('a' + index)), result.output[output_len - 1]);
+        }
+    }
+}
+
+test "recovery checkpoint spill failure keeps the result inline" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery-spill-failure", 10);
+    defer initial.deinit(alloc);
+
+    const big = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'y');
+    @memcpy(big[big.len - 9 ..], "ENDMARKER");
+
+    var calls = [_]types.ToolCall{.{ .id = "call-big", .name = "command", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-big"),
+        .tool_name = @constCast("command"),
+        .status = .success,
+        .output = big,
+        .output_bytes = big.len,
+        .stored_output_bytes = big.len,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    // Block the result store: tool-results exists as a regular file.
+    const session_path = try std.fs.path.join(alloc, &.{ temp.home, ".fx", "sessions", initial.id });
+    defer alloc.free(session_path);
+    var session_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), session_path, .{});
+    defer session_dir.close(io_mod.getIo());
+    var bogus = try session_dir.createFile(io_mod.getIo(), "tool-results", .{});
+    bogus.close(io_mod.getIo());
+
+    // The store failure must not block the checkpoint write.
+    _ = try loaded.appendEvent(alloc, .{
+        .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+    }, 20);
+    const bytes = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        recovery_checkpoint_file,
+        session_codec.max_recovery_checkpoint_bytes + 128,
+    );
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "ENDMARKER") != null);
 }
 
 test "committed conversation supersedes recovery after interrupted cleanup" {

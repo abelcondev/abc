@@ -503,6 +503,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -538,6 +539,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
+    catalog_unavailable: bool = false,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -573,6 +575,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
+    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -686,6 +689,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.system_notices);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
+        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
+        self.full_detail_records.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -700,6 +705,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -793,6 +799,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
+            .model_catalog_unavailable = catalogUnavailable,
             .take_steering_boundary = if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
@@ -800,6 +807,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
             .usage = self.usage,
             .usage_allocator = self.alloc,
@@ -833,6 +841,11 @@ pub const FakeAgentRuntimeDeps = struct {
     fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         return self.root_permission_mode.?;
+    }
+
+    fn catalogUnavailable(raw: *anyopaque) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.catalog_unavailable;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -969,7 +982,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 @as(u64, @intCast(self.parent_turn_prepare_count)),
             .delivery_id = try arena.dupe(u8, "delivery"),
             .start_offset = 0,
-            .end_offset = 0,
             .total_bytes = 0,
         };
         return .{
@@ -1579,6 +1591,12 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("rejected:{s}", .{call.name});
     }
 
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
+    }
+
     fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const owned = if (active_prefix) |prefix| try types.dupeHistoryTurn(self.alloc, .{ .assistant = prefix }) else null;
@@ -1626,6 +1644,12 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         switch (event) {
+            .full_detail_record => |notice| {
+                const owned = try types.dupeSemanticNotice(self.alloc, notice);
+                errdefer types.freeSemanticNotice(self.alloc, owned);
+                try self.full_detail_records.append(self.alloc, owned);
+                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            },
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});

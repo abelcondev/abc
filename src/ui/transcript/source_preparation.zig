@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_output_runtime = @import("command_output_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const sort_utils = @import("../../core/shared/sort_utils.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
@@ -211,17 +212,82 @@ pub const RetentionIdentity = struct {
     pub const TextExtent = struct { entry_id: u32, bytes: usize };
     lines: []const transcript_blocks.LineProvenance = &.{},
     text_extents: []TextExtent = &.{},
+    publication_entries: []u32 = &.{},
+    publication_release_floor: u32 = 0,
 
     pub fn deinit(self: *RetentionIdentity, alloc: Allocator) void {
         alloc.free(self.lines);
         alloc.free(self.text_extents);
+        alloc.free(self.publication_entries);
         self.* = .{};
     }
 
     pub fn clone(self: RetentionIdentity, alloc: Allocator) !RetentionIdentity {
         const lines = try alloc.dupe(transcript_blocks.LineProvenance, self.lines);
         errdefer alloc.free(lines);
-        return .{ .lines = lines, .text_extents = try alloc.dupe(TextExtent, self.text_extents) };
+        const text_extents = try alloc.dupe(TextExtent, self.text_extents);
+        errdefer alloc.free(text_extents);
+        return .{ .lines = lines, .text_extents = text_extents, .publication_entries = try alloc.dupe(u32, self.publication_entries), .publication_release_floor = self.publication_release_floor };
+    }
+
+    /// Restricts the receipt to the source prefix materialized by a held frame.
+    /// Unpainted entries, including later bytes in the last entry, stay producer-owned.
+    pub fn retainPrefix(identity: *RetentionIdentity, alloc: Allocator, entries: []const transcript_blocks.TranscriptEntry, prefix: []const u8, cols: u16) !u32 {
+        const hard_lines = try buildHardLineStarts(alloc, prefix);
+        defer hard_lines.deinit(alloc);
+        const line_count = @min(identity.lines.len, hard_lines.len());
+        const Span = struct { start: usize, end: usize, publication_end: u32 };
+        var spans: std.AutoHashMapUnmanaged(u32, Span) = .empty;
+        defer spans.deinit(alloc);
+        var visual_rows: u32 = 0;
+        var owner: ?u32 = null;
+        for (0..hard_lines.len()) |index| {
+            const ref = hardLineRefAt(hard_lines, prefix.len, index);
+            visual_rows += visualRowsForLine((TranscriptRef{ .ref = ref }).resolve(.{ .bytes = prefix }), cols);
+            if (index >= line_count) continue;
+            owner = publication_owner(owner, identity.lines[index]);
+            if (identity.lines[index] == .entry) {
+                const span = try spans.getOrPut(alloc, identity.lines[index].entry.entry_id);
+                const end = if (index + 1 < hard_lines.starts.len) hard_lines.starts[index + 1] else prefix.len;
+                if (!span.found_existing) span.value_ptr.* = .{ .start = hard_lines.starts[index], .end = end, .publication_end = visual_rows } else span.value_ptr.end = end;
+            }
+            if (owner) |id| if (spans.getPtr(id)) |span| {
+                span.publication_end = visual_rows;
+            };
+        }
+        var extents: std.ArrayList(TextExtent) = .empty;
+        defer extents.deinit(alloc);
+        for (entries) |entry| {
+            const span = spans.get(entry.id()) orelse continue;
+            var bytes = switch (entry) {
+                .assistant_turn => |value| value.segments.text.items.len,
+                .raw_bytes => |value| value.bytes.len,
+                else => continue,
+            };
+            if (span.end == prefix.len) {
+                if (entry == .assistant_turn) {
+                    var map = try assistant_wrap.retentionSourceMap(alloc, entry.assistant_turn.segments.text.items, cols);
+                    defer map.deinit(alloc);
+                    bytes = @min(bytes, map.sourceAt(span.end - span.start));
+                } else if (entry.raw_bytes.class != .tool_status) {
+                    bytes = @min(bytes, span.end - span.start);
+                }
+            }
+            try extents.append(alloc, .{ .entry_id = entry.id(), .bytes = bytes });
+        }
+        const lines = try alloc.dupe(transcript_blocks.LineProvenance, identity.lines[0..line_count]);
+        errdefer alloc.free(lines);
+        const text_extents = try extents.toOwnedSlice(alloc);
+        alloc.free(identity.lines);
+        alloc.free(identity.text_extents);
+        identity.lines = lines;
+        identity.text_extents = text_extents;
+        var release_floor: u32 = if (identity.publication_entries.len > 0) std.math.maxInt(u32) else 0;
+        for (identity.publication_entries) |id| {
+            release_floor = @min(release_floor, if (spans.get(id)) |span| span.publication_end else 0);
+        }
+        identity.publication_release_floor = release_floor;
+        return visual_rows;
     }
 
     pub fn capture(self: anytype, alloc: Allocator, source: *const TranscriptPreparationSource) !RetentionIdentity {
@@ -237,7 +303,10 @@ pub const RetentionIdentity = struct {
         }
         const lines = try alloc.dupe(transcript_blocks.LineProvenance, source.line_provenance);
         errdefer alloc.free(lines);
-        return .{ .lines = lines, .text_extents = try extents.toOwnedSlice(alloc) };
+        const publication_entries = try alloc.dupe(u32, source.publication_entries);
+        errdefer alloc.free(publication_entries);
+        const release_floor = try publicationReleaseFloor(alloc, source);
+        return .{ .lines = lines, .text_extents = try extents.toOwnedSlice(alloc), .publication_entries = publication_entries, .publication_release_floor = release_floor };
     }
 };
 
@@ -245,6 +314,8 @@ pub const TranscriptPreparationSource = struct {
     bytes: []u8,
     folded_summary_indices: []usize,
     line_provenance: []const transcript_blocks.LineProvenance = &.{},
+    publication_entries: []u32 = &.{},
+    publication_owned_end: usize = 0,
     preview: render_engine.frame_layout.TranscriptFlowPreview,
     tail_kind: ?transcript_blocks.TranscriptBlockKind,
     tracked_entry_id: ?u32,
@@ -268,6 +339,7 @@ pub const TranscriptPreparationSource = struct {
         if (self.bytes.len > 0) alloc.free(self.bytes);
         if (self.folded_summary_indices.len > 0) alloc.free(self.folded_summary_indices);
         if (self.line_provenance.len > 0) alloc.free(self.line_provenance);
+        alloc.free(self.publication_entries);
         if (self.hard_line_starts.len > 0) alloc.free(self.hard_line_starts);
         if (self.transcript_visible_lines.len > 0) alloc.free(self.transcript_visible_lines);
         if (self.transcript_line_visual_rows.len > 0) alloc.free(self.transcript_line_visual_rows);
@@ -336,6 +408,8 @@ pub const TranscriptPreparationSource = struct {
             self.line_provenance,
         );
         errdefer alloc.free(line_provenance);
+        const publication_entries = try alloc.dupe(u32, self.publication_entries);
+        errdefer alloc.free(publication_entries);
         const hard_line_starts = try alloc.dupe(usize, self.hard_line_starts);
         errdefer alloc.free(hard_line_starts);
         const transcript_visible_lines = try alloc.dupe(
@@ -353,6 +427,8 @@ pub const TranscriptPreparationSource = struct {
             .bytes = bytes,
             .folded_summary_indices = folded_summary_indices,
             .line_provenance = line_provenance,
+            .publication_entries = publication_entries,
+            .publication_owned_end = self.publication_owned_end,
             .preview = self.preview,
             .tail_kind = self.tail_kind,
             .tracked_entry_id = self.tracked_entry_id,
@@ -392,6 +468,307 @@ pub fn prepareRetentionSource(self: anytype, alloc: Allocator) !TranscriptPrepar
     errdefer source.deinit(alloc);
     try source.ensureLineIndex(alloc);
     return source;
+}
+
+/// Entry projections own their following separators and boundary blanks;
+/// other provenance ends publication ownership. Folded command output's optional
+/// entry ID identifies its summary, not a retained conversation projection.
+pub fn publication_owner(previous: ?u32, line: transcript_blocks.LineProvenance) ?u32 {
+    return switch (line) {
+        .entry => |entry| entry.entry_id,
+        .block_separator, .boundary_blank => previous,
+        .unattributed, .capped_continuation, .folded_command_output, .empty_transcript => null,
+    };
+}
+
+fn publicationReleaseFloor(alloc: Allocator, source: *const TranscriptPreparationSource) !u32 {
+    if (source.publication_entries.len == 0 or source.transcript_visual_row_offsets.len == 0) return 0;
+    var ends: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer ends.deinit(alloc);
+    for (source.publication_entries) |id| try ends.put(alloc, id, 0);
+    var owner: ?u32 = null;
+    for (source.line_provenance, 0..) |line, index| {
+        owner = publication_owner(owner, line);
+        if (owner) |id| {
+            if (ends.getPtr(id)) |end| end.* = source.transcript_visual_row_offsets[index + 1];
+        }
+    }
+    var floor: u32 = std.math.maxInt(u32);
+    var values = ends.valueIterator();
+    while (values.next()) |value| floor = @min(floor, value.*);
+    return floor;
+}
+
+const PublicationRange = struct { start: usize, end: usize };
+
+fn publicationGapStart(source: *const TranscriptPreparationSource, at: usize) usize {
+    var start = at;
+    while (start > 0 and (source.line_provenance[start - 1] == .block_separator or source.line_provenance[start - 1] == .boundary_blank)) start -= 1;
+    return start;
+}
+
+fn publicationRanges(alloc: Allocator, source: *const TranscriptPreparationSource) !std.AutoHashMapUnmanaged(u32, PublicationRange) {
+    var ranges: std.AutoHashMapUnmanaged(u32, PublicationRange) = .empty;
+    errdefer ranges.deinit(alloc);
+    for (source.line_provenance, 0..) |line, index| {
+        if (line != .entry) continue;
+        const item = try ranges.getOrPut(alloc, line.entry.entry_id);
+        if (!item.found_existing) item.value_ptr.* = .{ .start = index, .end = index + 1 } else item.value_ptr.end = index + 1;
+    }
+    var values = ranges.valueIterator();
+    while (values.next()) |range| {
+        while (range.end < source.line_provenance.len and (source.line_provenance[range.end] == .block_separator or source.line_provenance[range.end] == .boundary_blank)) range.end += 1;
+    }
+    return ranges;
+}
+
+fn sourceLineByte(source: *const TranscriptPreparationSource, line: usize) usize {
+    return if (line < source.hard_line_starts.len) source.hard_line_starts[line] else source.bytes.len;
+}
+
+fn remapPublicationByte(source: *const TranscriptPreparationSource, positions: []const usize, byte: usize) usize {
+    if (byte >= source.bytes.len) return positions[positions.len - 1];
+    var line: usize = 0;
+    for (source.hard_line_starts, 0..) |start, index| {
+        if (start > byte) break;
+        line = index;
+    }
+    return positions[line] + byte - source.hard_line_starts[line];
+}
+
+fn publicationLineAt(source: *const TranscriptPreparationSource, byte: usize) usize {
+    if (byte >= source.bytes.len) return source.hard_line_starts.len;
+    var line: usize = 0;
+    for (source.hard_line_starts, 0..) |start, index| {
+        if (start > byte) break;
+        line = index;
+    }
+    return line;
+}
+
+/// Keeps only projections already owned by the committed flow. The recorded
+/// store remains capped; successful frame receipts own their eventual release.
+pub fn preservePublicationEntries(
+    alloc: Allocator,
+    before: *const TranscriptPreparationSource,
+    next: *TranscriptPreparationSource,
+    entry_ids: []const u32,
+    publication_limit: ?usize,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    try build_checkpoint.poll(checkpoint);
+    if (entry_ids.len == 0) return;
+    try next.ensureLineIndexInterruptible(alloc, checkpoint);
+    var old_ranges = try publicationRanges(alloc, before);
+    defer old_ranges.deinit(alloc);
+    var next_ranges = try publicationRanges(alloc, next);
+    defer next_ranges.deinit(alloc);
+    const Edit = struct {
+        at: usize,
+        end: usize,
+        old: PublicationRange,
+        old_end_byte: usize,
+        following_new_entry: bool = false,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return a.at < b.at or (a.at == b.at and a.old.start < b.old.start);
+        }
+    };
+    var edits: std.ArrayList(Edit) = .empty;
+    defer edits.deinit(alloc);
+    const following_positions = try alloc.alloc(usize, before.line_provenance.len + 1);
+    defer alloc.free(following_positions);
+    var first_new = next.hard_line_starts.len;
+    for (next.line_provenance, 0..) |line, index| {
+        if (line == .entry and !old_ranges.contains(line.entry.entry_id)) {
+            first_new = index;
+            break;
+        }
+    }
+    following_positions[before.line_provenance.len] = first_new;
+    var reverse = before.line_provenance.len;
+    while (reverse > 0) {
+        reverse -= 1;
+        try build_checkpoint.tick(checkpoint);
+        var at = following_positions[reverse + 1];
+        if (before.line_provenance[reverse] == .entry) {
+            if (next_ranges.get(before.line_provenance[reverse].entry.entry_id)) |range| at = @min(at, range.start);
+        }
+        following_positions[reverse] = at;
+    }
+    for (entry_ids) |id| {
+        try build_checkpoint.tick(checkpoint);
+        var old = old_ranges.get(id) orelse continue;
+        var old_end_byte = sourceLineByte(before, old.end);
+        if (publication_limit) |limit| {
+            if (std.mem.findScalar(u32, before.publication_entries, id) == null and old_end_byte > limit) {
+                if (sourceLineByte(before, old.start) >= limit) continue;
+                old_end_byte = limit;
+                const end_line = publicationLineAt(before, limit);
+                old.end = end_line + @intFromBool(sourceLineByte(before, end_line) < limit);
+            }
+        }
+        old.start = publicationGapStart(before, old.start);
+        if (next_ranges.get(id)) |range| {
+            try edits.append(alloc, .{ .at = publicationGapStart(next, range.start), .end = range.end, .old = old, .old_end_byte = old_end_byte });
+            continue;
+        }
+        const at = following_positions[old.end];
+        try edits.append(alloc, .{ .at = publicationGapStart(next, at), .end = at, .old = old, .old_end_byte = old_end_byte, .following_new_entry = at == first_new and at < next.hard_line_starts.len });
+    }
+    if (edits.items.len == 0) return;
+    sort_utils.sort(Edit, edits.items, {}, Edit.less);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    var provenance: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    defer provenance.deinit(alloc);
+    const positions = try alloc.alloc(usize, next.hard_line_starts.len + 1);
+    defer alloc.free(positions);
+    var cursor: usize = 0;
+    var old_through: usize = 0;
+    var publication_owned_end: usize = 0;
+    for (edits.items) |edit| {
+        while (cursor < edit.at) : (cursor += 1) {
+            positions[cursor] = bytes.items.len;
+            try bytes.appendSlice(alloc, next.bytes[sourceLineByte(next, cursor)..sourceLineByte(next, cursor + 1)]);
+            try provenance.append(alloc, next.line_provenance[cursor]);
+        }
+        const start = bytes.items.len;
+        const old_start = @max(old_through, edit.old.start);
+        if (start > 0 and bytes.items[start - 1] != '\n') try bytes.append(alloc, '\n');
+        try build_checkpoint.consume(checkpoint, edit.old_end_byte - sourceLineByte(before, old_start));
+        try bytes.appendSlice(alloc, before.bytes[sourceLineByte(before, old_start)..edit.old_end_byte]);
+        try provenance.appendSlice(alloc, before.line_provenance[old_start..edit.old.end]);
+        old_through = edit.old.end;
+        publication_owned_end = bytes.items.len;
+        if (edit.end < next.hard_line_starts.len and bytes.items.len > 0 and bytes.items[bytes.items.len - 1] != '\n') try bytes.append(alloc, '\n');
+        const last_old = before.line_provenance[edit.old.end - 1];
+        if (edit.following_new_entry and last_old != .block_separator and last_old != .boundary_blank) {
+            try bytes.appendSlice(alloc, next.bytes[sourceLineByte(next, edit.at)..sourceLineByte(next, edit.end)]);
+            try provenance.appendSlice(alloc, next.line_provenance[edit.at..edit.end]);
+        }
+        while (cursor < edit.end) : (cursor += 1) positions[cursor] = start;
+    }
+    while (cursor < next.hard_line_starts.len) : (cursor += 1) {
+        positions[cursor] = bytes.items.len;
+        try bytes.appendSlice(alloc, next.bytes[sourceLineByte(next, cursor)..sourceLineByte(next, cursor + 1)]);
+        try provenance.append(alloc, next.line_provenance[cursor]);
+    }
+    positions[cursor] = bytes.items.len;
+    var replacement = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try bytes.toOwnedSlice(alloc), next.cols, checkpoint);
+    errdefer replacement.deinit(alloc);
+    const natural_rows = replacement.preview.natural_visual_rows;
+    replacement.preview = if (next.bytes.len == 0) before.preview else next.preview;
+    replacement.preview.natural_visual_rows = natural_rows;
+    replacement.line_provenance = try provenance.toOwnedSlice(alloc);
+    replacement.publication_entries = try alloc.dupe(u32, entry_ids);
+    replacement.publication_owned_end = publication_owned_end;
+    replacement.folded_summary_indices = try alloc.dupe(usize, next.folded_summary_indices);
+    for (replacement.folded_summary_indices) |*line| line.* = publicationLineAt(&replacement, remapPublicationByte(next, positions, sourceLineByte(next, line.*)));
+    replacement.tail_kind = if (next.bytes.len == 0) before.tail_kind else next.tail_kind;
+    replacement.tracked_entry_id = next.tracked_entry_id;
+    replacement.tracked_entry_start_line = if (next.tracked_entry_start_line) |line| publicationLineAt(&replacement, remapPublicationByte(next, positions, sourceLineByte(next, line))) else null;
+    replacement.replaceable_last_line = next.replaceable_last_line;
+    replacement.replaceable_start = remapPublicationByte(next, positions, next.replaceable_start);
+    replacement.replaceable_row = next.replaceable_row;
+    replacement.welcome_cut_line = if (next.welcome_cut_line) |line| publicationLineAt(&replacement, remapPublicationByte(next, positions, sourceLineByte(next, line))) else null;
+    replacement.welcome_boundary = next.welcome_boundary;
+    replacement.recorded_entries_authoritative = true;
+    replacement.cache_origin_untrimmed = false;
+    replacement.finality = try next.finality.clone(alloc);
+    if (replacement.finality.mutation_pin_start) |byte| replacement.finality.mutation_pin_start = remapPublicationByte(next, positions, byte);
+    if (replacement.finality.assistant_tail_start) |byte| replacement.finality.assistant_tail_start = remapPublicationByte(next, positions, byte);
+    for (@constCast(replacement.finality.tool_turn_floors)) |*floor| floor.start_byte = remapPublicationByte(next, positions, floor.start_byte);
+    next.deinit(alloc);
+    next.* = replacement;
+}
+
+fn checkPublicationProjectionAllocation(alloc: Allocator) !void {
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "old\n\nnew"), 80, null);
+    defer before.deinit(alloc);
+    const old_lines = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
+        .block_separator,
+        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
+    };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &old_lines);
+    var next = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "new"), 80, null);
+    defer next.deinit(alloc);
+    next.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, old_lines[2..]);
+    next.preview.footer_boundary_gap_rows = 1;
+    next.preview.cursor_row = 7;
+    next.preview.cursor_col = 4;
+    next.finality.assistant_tail_start = 0;
+    next.tracked_entry_id = 2;
+    next.tracked_entry_start_line = 0;
+    preservePublicationEntries(alloc, &before, &next, &.{1}, null, null) catch |err| {
+        try std.testing.expectEqualStrings("new", next.bytes);
+        try std.testing.expectEqual(@as(?usize, 0), next.finality.assistant_tail_start);
+        return err;
+    };
+    try std.testing.expectEqualStrings("old\n\nnew", next.bytes);
+    try std.testing.expectEqual(@as(u16, 1), next.preview.footer_boundary_gap_rows);
+    try std.testing.expectEqual(@as(u16, 7), next.preview.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), next.preview.cursor_col);
+    try std.testing.expectEqual(@as(?usize, 5), next.finality.assistant_tail_start);
+    try std.testing.expectEqual(@as(?usize, 2), next.tracked_entry_start_line);
+}
+
+test "rewrite publication preserves preceding gaps without committing a new separator" {
+    const alloc = std.testing.allocator;
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "live\n\nold"), 80, null);
+    defer before.deinit(alloc);
+    const old_lines = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 1, .entry_class = .tool_status } }, .block_separator,
+        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
+    };
+    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &old_lines);
+    var next = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "live\n\nnew"), 80, null);
+    defer next.deinit(alloc);
+    var next_lines = old_lines;
+    next_lines[2].entry.entry_id = 3;
+    next.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &next_lines);
+    try preservePublicationEntries(alloc, &before, &next, &.{2}, null, null);
+    try std.testing.expectEqualStrings("live\n\nold\n\nnew", next.bytes);
+    try std.testing.expectEqual(@as(usize, "live\n\nold".len), next.publication_owned_end);
+    const entries = [_]transcript_blocks.TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "live", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "new", .class = .unknown_raw } },
+    };
+    const host = .{ .entries = .{ .items = &entries } };
+    var identity = try RetentionIdentity.capture(&host, alloc, &next);
+    defer identity.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), identity.publication_release_floor);
+    _ = try identity.retainPrefix(alloc, &entries, "live\n\nold\n", 80);
+    try std.testing.expectEqual(@as(u32, 3), identity.publication_release_floor);
+    try std.testing.expectEqual(@as(usize, 1), identity.text_extents.len);
+}
+
+test "rewrite publication prefix receipts exclude unpainted raw and assistant text" {
+    const alloc = std.testing.allocator;
+    const Runtime = @import("runtime.zig").TranscriptRuntime;
+    for ([_]bool{ false, true }) |assistant| {
+        var runtime = Runtime{ .layout = .{ .cols = 80, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 } };
+        defer runtime.deinit(alloc);
+        var metrics: types.Metrics = .{};
+        const text = "1. FIRST\n2. UNPAINTED\n";
+        const id = if (assistant) try runtime.streamAssistantChunk(alloc, &metrics, text) else try runtime.appendRawTranscriptEntryClassified(alloc, text, .unknown_raw);
+        var source = try prepareRetentionSource(&runtime, alloc);
+        defer source.deinit(alloc);
+        try std.testing.expect(source.hard_line_starts.len > 1);
+        const prefix = source.bytes[0..source.hard_line_starts[1]];
+        var identity = try RetentionIdentity.capture(&runtime, alloc, &source);
+        defer identity.deinit(alloc);
+        _ = try identity.retainPrefix(alloc, runtime.entries.items, prefix, 80);
+        const extent = for (identity.text_extents) |extent| {
+            if (extent.entry_id == id) break extent;
+        } else return error.MissingPublishedExtent;
+        try std.testing.expect(extent.bytes <= std.mem.find(u8, text, "2. UNPAINTED").?);
+        try std.testing.expectEqual(@as(usize, 1), identity.lines.len);
+    }
+}
+
+test "rewrite publication projection preserves preview and finality across allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPublicationProjectionAllocation, .{});
 }
 
 /// Maps boundaries through the producer's retained version of the same source.
@@ -1052,7 +1429,7 @@ fn prepareTranscriptSourceInternal(
             self.command_output_render.styles,
         );
 
-    return .{
+    var source: TranscriptPreparationSource = .{
         .bytes = bytes,
         .folded_summary_indices = folded_summary_indices,
         .line_provenance = line_provenance,
@@ -1070,6 +1447,25 @@ fn prepareTranscriptSourceInternal(
         .cache_origin_untrimmed = cache_origin_untrimmed,
         .finality = finality,
     };
+    bytes = &.{};
+    folded_summary_indices = &.{};
+    line_provenance = &.{};
+    finality = .{};
+    errdefer source.deinit(alloc);
+    if (comptime @hasDecl(@TypeOf(self.*), "committedRetentionIdentity")) {
+        if (!self.fullTranscriptActive()) {
+            if (self.committedRetentionIdentity()) |identity| {
+                if (identity.publication_entries.len > 0) {
+                    if (try self.prepareCommittedRetentionSourceInterruptible(alloc, checkpoint)) |value| {
+                        var before = value;
+                        defer before.deinit(alloc);
+                        try preservePublicationEntries(alloc, &before, &source, identity.publication_entries, null, checkpoint);
+                    }
+                }
+            }
+        }
+    }
+    return source;
 }
 
 const CommandOutputOverrides = struct {

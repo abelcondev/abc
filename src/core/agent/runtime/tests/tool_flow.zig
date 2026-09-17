@@ -77,9 +77,7 @@ const PostEffectTerminalFailure = struct {
     }
 };
 
-const read_file_advertised_names = [_][]const u8{"read_file"};
 const terminal_advertised_names = [_][]const u8{"shell"};
-const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
 const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 fn makeOwnedVisionCatalog(
@@ -5385,7 +5383,7 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     try std.testing.expectEqualStrings("diff preview", hooks.diff_preview.?);
 }
 
-test "processQueuedPrompt records permission preflight failures as denied tool calls" {
+test "processQueuedPrompt records permission preflight failures as failed tool calls" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -5401,8 +5399,10 @@ test "processQueuedPrompt records permission preflight failures as denied tool c
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("read_file", hooks.rejected_names.items[0]);
+    // A preflight content failure is a tool failure, not a rejection.
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
@@ -5428,7 +5428,12 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 2), hooks.rejected_names.items.len);
+    // The denied web_search stays rejected; the read_file preflight failure
+    // is a tool failure.
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try std.testing.expectEqualStrings("web_search", hooks.rejected_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try expectLifecycleCallIds(hooks.lifecycle_events.items, &.{
         "call_search",
@@ -6603,7 +6608,10 @@ test "child target failures settle the batch before and after permission without
         try std.testing.expectEqualStrings("good-neighbor", probe.hooks.executed_call_ids.items[0]);
         try std.testing.expectEqual(@as(usize, if (case.after_permission) 2 else 1), probe.hooks.permission_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
-        try std.testing.expectEqual(@as(usize, 1), probe.hooks.rejected_names.items.len);
+        // Target-resolution failures arrive through the permission tool_failure
+        // channel and record as tool failures, not rejections.
+        try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.hooks.rejected_names.items.len);
     }
 }
 

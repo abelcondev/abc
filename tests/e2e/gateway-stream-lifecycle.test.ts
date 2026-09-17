@@ -1307,6 +1307,247 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask applies --model, --effort, and --fast overrides to the gateway request", async () => {
+    const root = createFixtureRoot("ask-flag-overrides");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("FLAG_OVERRIDES_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            fast_options: [{ type: "toggle" }],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        [
+          "ask", "--json", "--auto", "--no-save",
+          "--model", MODEL,
+          "--effort", "high",
+          "--fast",
+          "Use the flag overrides.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "FLAG_OVERRIDES_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask --model without --fast drops the compiled-default fast mode", async () => {
+    const root = createFixtureRoot("ask-model-override-drops-fast");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("MODEL_ONLY_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "--model", MODEL, "Use the overridden model."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "MODEL_ONLY_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask flag overrides win over resumed session preferences without persisting", async () => {
+    const root = createFixtureRoot("ask-flag-resume");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("RESUME_FLAGS_COMPLETE"),
+      {
+        models: [
+          {
+            id: DEFAULT_MODEL,
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+          {
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            fast_options: [{ type: "toggle" }],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          },
+        ],
+      },
+    );
+
+    try {
+      const env = {
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_MODEL: undefined,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      };
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Start the saved session."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      expect(sessionId).not.toBe("");
+
+      const overridden = await runFx(
+        [
+          "ask", "--json", "--auto",
+          "--resume-id", sessionId,
+          "--model", MODEL,
+          "--effort", "high",
+          "--no-fast",
+          "Continue with the flag overrides.",
+        ],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(overridden.code).toBe(0);
+      expect(overridden.stderr).toBe("");
+      expect(gateway.requests[1]!.headers.get("ai-language-model-id")).toBe(
+        MODEL,
+      );
+      const overriddenRequest = JSON.parse(gateway.requests[1]!.body);
+      expect(overriddenRequest).toMatchObject({ reasoning: "high" });
+      expect(overriddenRequest).not.toHaveProperty("providerOptions.gateway.speed");
+
+      const restored = await runFx(
+        ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue without flags."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(restored.code).toBe(0);
+      expect(restored.stderr).toBe("");
+      expect(gateway.requests[2]!.headers.get("ai-language-model-id")).toBe(
+        DEFAULT_MODEL,
+      );
+      const restoredRequest = JSON.parse(gateway.requests[2]!.body);
+      expect(restoredRequest).not.toHaveProperty("reasoning");
+      expect(restoredRequest).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask with fast mode enabled warns once and runs standard speed when the model catalog fails", async () => {
+    const root = createFixtureRoot("fast-catalog-failure");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ fast_mode: true }),
+    );
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("STANDARD_SPEED_COMPLETE"),
+      {
+        models: () => new Response("catalog unavailable", { status: 500 }),
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run without the catalog."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "STANDARD_SPEED_COMPLETE",
+      );
+      expect(result.stderr).toContain("Fast mode is unavailable");
+      expect(
+        result.stderr.match(/Fast mode is unavailable/g),
+      ).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(1);
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
       const root = createFixtureRoot(`permission-mode-${mode}`);
@@ -5697,8 +5938,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       ordinary++;
       if (ordinary === 6) {
         expect(body).toContain("context_handoff");
-        expect(body).toContain("LARGE_REASONING_5");
-        expect(body).not.toContain("LARGE_REASONING_1");
+        expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        expect(body).not.toContain("LARGE_REASONING_");
       }
       if (ordinary <= 6) return fakeGatewaySse([
         { type: "reasoning-start", id: `reasoning-${ordinary}` },
@@ -5706,7 +5947,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         { type: "tool-call", toolCallId: `read-${ordinary}`, toolName: "read_file", input: { path: "sentinel.txt" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]);
-      if (ordinary === 7) return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      if (ordinary === 7) {
+        expect(body).toContain("LARGE_REASONING_6");
+        expect(toolResultOutput(body, "read-6")).toContain("REPLAY_RESULT_SENTINEL");
+        return fakeGatewayFinalText("REPLAY_TURN_DONE");
+      }
       if (ordinary === 8) return fakeGatewaySse([
         { type: "reasoning-start", id: "recent-reasoning" },
         { type: "reasoning-end", id: "recent-reasoning", providerMetadata: { openai: { reasoningEncryptedContent: "RECENT_REASONING_SIGNATURE" } } },
@@ -6096,7 +6341,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).toContain("context_handoff");
+        expect(secondCompactText).toContain("PREVIOUS_DERIVED_SUMMARY (not original user text)");
+        expect(secondCompactText).toContain("Continue the compacted session.");
+        expect(secondCompactText).not.toContain("context_handoff");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -6826,7 +7073,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("HTTP 413 after a local tool fails capacity without replaying the tool", async () => {
+  test("HTTP 413 during compaction preserves the completed local tool without replay", async () => {
     const root = createFixtureRoot("prompt-too-long-no-tool-replay");
     const tracePath = join(root.root, "trace.log");
     const sideEffectPath = join(root.workspace, "tool-side-effect.log");
@@ -6861,12 +7108,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("ContextCapacityExceeded");
+      expect(serializedError).toContain("ContextCompactionUnavailable");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(3);
+      const summaryRequest = JSON.parse(gateway.requests[2]!.body);
+      expect(summaryRequest.tools).toEqual([]);
+      expect(summaryRequest.toolChoice).toEqual({ type: "none" });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

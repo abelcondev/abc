@@ -320,6 +320,7 @@ pub fn Bindings(comptime App: type) type {
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
+                .subagent_status_renderer = subagentStatusRenderer(app),
                 .permission_target_for_call = agentPermissionTargetForCall,
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
@@ -360,8 +361,10 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
+                .model_catalog_unavailable = agentModelCatalogUnavailable,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
+                .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .usage_allocator = app.alloc,
@@ -406,6 +409,10 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+                debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+                return null;
+            }
             var refreshed = (try auth_runtime.refreshCredentialForAccount(
                 app.auth.oauthTransport(),
                 std.heap.c_allocator,
@@ -593,6 +600,67 @@ pub fn Bindings(comptime App: type) type {
                                     );
                                 }
                             }
+                        } else if (comptime @hasField(App, "terminal_client") and @hasField(App, "managed_executions")) {
+                            // Terminal-session actions (interact, stop) carry no
+                            // command argument; their status line shows the launch
+                            // command resolved from the session registry, truncated
+                            // to the compact activity bound. Store the reflow-bound
+                            // display so group projection can reclip the phrase to
+                            // the live terminal width like any other command.
+                            if (app.toolRegistry().lookup(started.tool_name)) |spec| {
+                                if (spec.executor_kind == .terminal) {
+                                    const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                                        if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+                                    else
+                                        app.workspace_root;
+                                    const session_call: ToolCall = .{
+                                        .id = started.id.call_id,
+                                        .name = started.tool_name,
+                                        .arguments_json = arguments_json,
+                                    };
+                                    const session_display = tool_presentation.resolveTerminalDisplayTargetBounded(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        workspace_root,
+                                        &app.terminal_client,
+                                        &app.managed_executions,
+                                        session_call,
+                                        tool_presentation.max_run_command_reflow_bytes,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command display unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    defer if (session_display) |bytes| alloc.free(bytes);
+                                    const session_label = tool_presentation.terminalSessionCompletedActionLabel(
+                                        alloc,
+                                        app.toolRegistry(),
+                                        session_call,
+                                    ) catch |err| blk: {
+                                        debug_trace.logf(
+                                            "ui_activity",
+                                            "session command action label unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                        break :blk null;
+                                    };
+                                    if (session_display != null and session_label != null) {
+                                        app.shell.setToolCommandMetadata(
+                                            alloc,
+                                            started.id,
+                                            session_display.?,
+                                            session_label.?,
+                                        ) catch |err| debug_trace.logf(
+                                            "ui_activity",
+                                            "command metadata unavailable turn_id={d} err={s}",
+                                            .{ started.id.turn_id, @errorName(err) },
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -639,6 +707,47 @@ pub fn Bindings(comptime App: type) type {
                 return;
             };
             debug_trace.logf("mcp", "queued MCP tool progress turn_id={d}", .{lifecycle_id.turn_id});
+        }
+
+        pub fn onToolProgress(ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            app_worker_runtime.Runtime(App).pushToolLifecycle(app, .{ .progress = .{
+                .id = lifecycle_id,
+                .text = text,
+            } }) catch |err| {
+                debug_trace.logf("subagent", "failed to publish subagent progress err={s}", .{@errorName(err)});
+            };
+        }
+
+        fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const show_context = if (comptime @hasField(App, "statusline_context")) app.statusline_context else false;
+            const show_session = if (comptime @hasField(App, "statusline_session")) app.statusline_session else false;
+            var items: ui_render.StatuslineItems = .{
+                .context_used = if (show_context) status.input_tokens else 0,
+                .context_total = if (show_context) status.context_window else null,
+                .session_title = if (show_session) status.session_title else null,
+            };
+            if (comptime @hasField(App, "workspace_identity")) {
+                if (app.workspace_identity.enabled) {
+                    const identity = app.workspace_identity.snapshot();
+                    items.workspace_label = identity.workspace_label;
+                    items.git_branch = identity.git_branch;
+                }
+            }
+            const caps = model_capabilities.resolveForApp(App, app, status.model);
+            return ui_render.buildSessionStatusLine(
+                status.model,
+                status.effort,
+                caps.supports_reasoning,
+                items,
+                ui_render.subagent_status_width,
+                buf,
+            );
+        }
+
+        pub fn subagentStatusRenderer(app: *App) types.SubagentStatusRenderer {
+            return .{ .ctx = app, .render_fn = renderSubagentStatusLine };
         }
 
         pub fn onWebSearchProgress(ctx: *anyopaque, call_id: []const u8, progress: types.WebSearchProgress) void {
@@ -706,7 +815,6 @@ pub fn Bindings(comptime App: type) type {
                     .delivery_id = result.work_id,
                     .through_sequence = result.receipt_sequence,
                     .start_offset = 0,
-                    .end_offset = result.body.len,
                     .total_bytes = result.body.len,
                 });
             }
@@ -779,6 +887,14 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
                 try app.appendStaticContextMessage(arena, project_context, messages);
             }
+        }
+
+        fn agentModelCatalogUnavailable(ctx: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "isModelCacheFailed")) {
+                return app.isModelCacheFailed();
+            }
+            return false;
         }
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
@@ -901,6 +1017,23 @@ pub fn Bindings(comptime App: type) type {
                 .arguments_json = call.arguments_json,
                 .model_output = model_output,
                 .outcome = .rejected,
+                .started_at_ms = io_mod.milliTimestamp(),
+            });
+        }
+
+        fn agentRecordToolCallFailed(
+            ctx: *anyopaque,
+            _: Allocator,
+            call: ToolCall,
+            model_output: []const u8,
+            _: ?[]const u8,
+        ) !void {
+            _ = ctx;
+            diagnostics.recordToolCallResult(.{
+                .name = call.name,
+                .arguments_json = call.arguments_json,
+                .model_output = model_output,
+                .outcome = .tool_failed,
                 .started_at_ms = io_mod.milliTimestamp(),
             });
         }
@@ -1174,6 +1307,7 @@ pub fn Bindings(comptime App: type) type {
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
                             .host_managed => credentials.host_managed_auth_message,
+                            .configured => "Check the configured provider auth environment variable.",
                         },
                     },
                 )
@@ -2602,6 +2736,42 @@ test "MCP progress callback publishes the owning tool lifecycle" {
         lifecycle.progress.text,
         "● MCP fixture halfway",
     ) != null);
+}
+
+test "subagent status renderer honors session and parent workspace toggles" {
+    const StatusApp = struct {
+        statusline_context: bool = true,
+        statusline_session: bool = true,
+        workspace_identity: @import("../workspace/statusline_identity.zig").Runtime = .{
+            .enabled = true,
+            .workspace_label = @constCast("~/fx"),
+            .branch_label = @constCast("feature/status"),
+        },
+
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) model_capabilities.Capabilities {
+            return .{ .supports_reasoning = true };
+        }
+    };
+    var app = StatusApp{};
+    const renderer = Bindings(StatusApp).subagentStatusRenderer(&app);
+    var buf: [256]u8 = undefined;
+    const status = types.SubagentStatus{
+        .model = "openai/gpt-5.5",
+        .effort = types.ReasoningEffort.literal("high"),
+        .input_tokens = 12_000,
+        .context_window = 100_000,
+        .session_title = "reviewer",
+    };
+
+    try std.testing.expectEqualStrings(
+        "gpt-5.5 · high · reviewer · 12k/100k 12% · ~/fx (feature/status)",
+        renderer.render(&buf, status),
+    );
+
+    app.statusline_context = false;
+    app.statusline_session = false;
+    app.workspace_identity.enabled = false;
+    try std.testing.expectEqualStrings("gpt-5.5 · high", renderer.render(&buf, status));
 }
 
 test "agent context and system notices share semantic transport with distinct fields" {

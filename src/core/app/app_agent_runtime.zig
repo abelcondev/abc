@@ -6,6 +6,7 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const shared_theme = @import("../shared/theme.zig");
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
@@ -291,6 +292,9 @@ pub fn Runtime(comptime App: type) type {
                 .mcp_call_feature = if (comptime runtime_profile.allows(App, .mcp)) callMcpFeature else null,
                 .mcp_progress_ctx = @ptrCast(app),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
+                .tool_progress_ctx = @ptrCast(app),
+                .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
+                .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(app),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
             };
@@ -889,6 +893,7 @@ pub fn Runtime(comptime App: type) type {
                     appAccessScope(app),
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .stale_shell_handles = app.session.has_stale_shell_handles,
             }, arena, messages);
         }
 
@@ -1039,6 +1044,7 @@ pub fn Runtime(comptime App: type) type {
                     null;
 
             var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
             deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
@@ -1096,7 +1102,8 @@ pub fn Runtime(comptime App: type) type {
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,
             );
-            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const permission_mode = app_permission_runtime.Runtime(App).livePermissionSnapshot(app).mode;
             var tool_projection = try app.snapshotModelToolProjection(arena, permission_mode);
@@ -1425,7 +1432,7 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ label, value });
+    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().dim_style, value });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {

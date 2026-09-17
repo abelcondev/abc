@@ -2197,7 +2197,9 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
+    try writeCompactionSummary(&out.writer, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
+    try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
@@ -2459,6 +2461,7 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
 }
 
 fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    const App = @TypeOf(app.*);
     try writer.writeAll("\n## Problems\n");
     var count: usize = 0;
 
@@ -2477,6 +2480,23 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
         if (entry.completed_tool_names.len > 0) try writer.print(" completed_tools={d}", .{entry.completed_tool_names.len});
         try writer.writeByte('\n');
+    }
+
+    if (comptime @hasField(App, "session_persistence")) {
+        const Persistence = @TypeOf(app.session_persistence);
+        if (comptime @hasField(Persistence, "title_generation")) {
+            const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+            if (comptime @hasField(TitleGeneration, "last")) {
+                const last = &app.session_persistence.title_generation.last;
+                if (last.status == .failed or last.status == .dropped) {
+                    count += 1;
+                    try writer.print("- session title generation {s}", .{@tagName(last.status)});
+                    if (last.reason) |reason| try writer.print(" reason={s}", .{@tagName(reason)});
+                    if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
+                    try writer.writeByte('\n');
+                }
+            }
+        }
     }
 
     var network_buf: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
@@ -2507,6 +2527,29 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writeToolCallCompact(writer, call);
     }
 
+    var compaction_buf: [diagnostics.compaction_ring_capacity]diagnostics.CompactionEvent = undefined;
+    const compaction_n = diagnostics.snapshotCompactionEvents(&compaction_buf);
+    var compaction_reported: usize = 0;
+    var ci = compaction_n;
+    while (ci > 0 and compaction_reported < 3) {
+        ci -= 1;
+        const event = &compaction_buf[ci];
+        if (!event.failed) continue;
+        count += 1;
+        compaction_reported += 1;
+        try writer.writeAll("- context compaction ");
+        try writer.writeAll(event.name());
+        if (event.turn_id != 0) try writer.print(" turn_id={d}", .{event.turn_id});
+        if (event.detail_len > 0) {
+            try writer.writeAll(" detail=");
+            const detail = event.detail();
+            const visible = if (detail.len > 160) detail[0..160] else detail;
+            try writeTraceTextNeutralized(writer, visible);
+            if (detail.len > 160) try writer.writeAll(" ...");
+        }
+        try writer.writeByte('\n');
+    }
+
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
     else
@@ -2533,7 +2576,105 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, or MCP state\n");
+    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, or MCP state\n");
+}
+
+const trace_compaction_max_events: usize = 24;
+
+/// Renders the always-on compaction decision and failure trail so a shared
+/// trace explains what the compaction pipeline did even when FX_TRACE was off.
+fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    var buf: [diagnostics.compaction_ring_capacity]diagnostics.CompactionEvent = undefined;
+    const total = diagnostics.snapshotCompactionEvents(&buf);
+
+    try writer.writeAll("\n## Context Compaction\n");
+    if (total == 0) {
+        try writer.writeAll("(none recorded)\n");
+        return;
+    }
+    var failed: usize = 0;
+    for (buf[0..total]) |event| {
+        if (event.failed) failed += 1;
+    }
+    try writer.print("last={d} failed={d}", .{ total, failed });
+    // Events evicted by the bounded ring are reported, not silently dropped.
+    const overwritten = buf[0].sequence -| 1;
+    if (overwritten > 0) try writer.print(" overwritten_before={d}", .{overwritten});
+    try writer.writeAll(" (always recorded; does not require FX_TRACE)\n");
+
+    const start = if (total > trace_compaction_max_events) total - trace_compaction_max_events else 0;
+    if (start > 0) try writer.print("... ({d} older events omitted)\n", .{start});
+    for (buf[start..total]) |*event| {
+        var line: std.Io.Writer.Allocating = .init(alloc);
+        defer line.deinit();
+        try writeTraceTimestampUtc(&line.writer, event.timestamp_ms);
+        try line.writer.print(" event={s}", .{event.name()});
+        if (event.turn_id != 0) try line.writer.print(" turn_id={d}", .{event.turn_id});
+        if (event.step_id != 0) try line.writer.print(" step_id={d}", .{event.step_id});
+        if (event.subagent_id != 0) try line.writer.print(" subagent_id={d}", .{event.subagent_id});
+        if (event.failed) try line.writer.writeAll(" failed");
+        if (event.detail_len > 0) {
+            try line.writer.writeByte(' ');
+            try line.writer.writeAll(event.detail());
+        }
+        if (event.truncated) try line.writer.writeAll(" ...");
+        // Compaction events carry internal counters and enum names only, never
+        // user payloads, so they render unmasked like network-call telemetry.
+        const raw = line.written();
+        const visible = if (raw.len > trace_transcript_max_line_bytes)
+            raw[0..trace_transcript_max_line_bytes]
+        else
+            raw;
+        try writeTraceTextNeutralized(writer, visible);
+        if (raw.len > trace_transcript_max_line_bytes) {
+            try writer.writeAll(" ...\n");
+        } else {
+            try writer.writeByte('\n');
+        }
+    }
+}
+
+/// Renders the retained session title generation outcome so a shared trace can
+/// explain why a session has no generated title even when FX_TRACE was off.
+fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    const App = @TypeOf(app.*);
+    if (comptime !@hasField(App, "session_persistence")) return;
+    const Persistence = @TypeOf(app.session_persistence);
+    if (comptime !@hasField(Persistence, "title_generation")) return;
+    const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+    if (comptime !@hasField(TitleGeneration, "last")) return;
+
+    try writer.writeAll("\n## Session Title\n");
+    if (comptime @hasField(App, "session_title_generation")) {
+        try writer.print("setting: {s}\n", .{boolLabel(app.session_title_generation)});
+    }
+    if (comptime @hasField(App, "session_title")) {
+        if (app.session_title.items.len > 0) {
+            try writer.writeAll("title: ");
+            try writeMaskedInline(writer, alloc, app.session_title.items);
+            try writer.writeByte('\n');
+        } else {
+            try writer.writeAll("title: (none)\n");
+        }
+    }
+    const generation = &app.session_persistence.title_generation;
+    if (generation.task) |task| {
+        try writer.print("generation: status=running session={s} model={s}", .{ task.session_id, task.model });
+        if (task.started_at_ms > 0) {
+            const elapsed = io_mod.milliTimestamp() - task.started_at_ms;
+            if (elapsed >= 0) try writer.print(" elapsed={d}ms", .{elapsed});
+        }
+        try writer.writeByte('\n');
+        return;
+    }
+    const last = &generation.last;
+    try writer.print("generation: status={s}", .{@tagName(last.status)});
+    if (last.sessionId().len > 0) try writer.print(" session={s}", .{last.sessionId()});
+    if (last.model().len > 0) try writer.print(" model={s}", .{last.model()});
+    if (last.reason) |reason| try writer.print(" reason={s}", .{@tagName(reason)});
+    if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
+    if (last.elapsed_ms >= 0) try writer.print(" elapsed={d}ms", .{last.elapsed_ms});
+    try writer.writeByte('\n');
 }
 
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -4254,6 +4395,36 @@ test "trace notice distinguishes Markdown file outcomes without a feedback CTA" 
     }
 }
 
+test "trace compaction summary renders recorded events without file tracing" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var empty: std.Io.Writer.Allocating = .init(alloc);
+    defer empty.deinit();
+    try writeCompactionSummary(&empty.writer, alloc);
+    try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
+
+    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, "decision", "decision=compact estimated_tokens={d}", .{279466});
+    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, "retention_exhausted", "estimated_tokens={d}", .{59000});
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeCompactionSummary(&out.writer, alloc);
+    try std.testing.expect(std.mem.find(u8, out.written(), "last=2 failed=1 (always recorded; does not require FX_TRACE)\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "event=decision turn_id=10 step_id=176 decision=compact estimated_tokens=279466\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "event=retention_exhausted turn_id=10 failed estimated_tokens=59000\n") != null);
+
+    diagnostics.resetForTest();
+    for (0..diagnostics.compaction_ring_capacity + 3) |index| {
+        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, "decision", "decision=compact index={d}", .{index});
+    }
+    var wrapped: std.Io.Writer.Allocating = .init(alloc);
+    defer wrapped.deinit();
+    try writeCompactionSummary(&wrapped.writer, alloc);
+    try std.testing.expect(std.mem.find(u8, wrapped.written(), "overwritten_before=3") != null);
+}
+
 test "trace report file uses private randomized markdown path" {
     const alloc = std.testing.allocator;
     const path = try writeTraceReportFile(alloc, "hello\n");
@@ -4298,6 +4469,53 @@ test "trace auth summary preserves missing and loaded status text" {
         "auth: source=fx login refreshable=true gateway_team=unset\n",
         loaded.written(),
     );
+}
+
+test "trace session title summary reports the retained generation outcome" {
+    const alloc = std.testing.allocator;
+    var app = struct {
+        session_persistence: app_session_runtime.Persistence = .{},
+        session_title: std.ArrayList(u8) = .empty,
+        session_title_generation: bool = true,
+    }{};
+    defer app.session_persistence.deinit(alloc);
+    defer app.session_title.deinit(alloc);
+
+    var idle: std.Io.Writer.Allocating = .init(alloc);
+    defer idle.deinit();
+    try writeSessionTitleSummary(&idle.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "## Session Title\n") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "setting: true") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "title: (none)") != null);
+    try std.testing.expect(std.mem.find(u8, idle.written(), "generation: status=none") != null);
+
+    const generation = &app.session_persistence.title_generation;
+    generation.last.status = .failed;
+    generation.last.reason = .transport_error;
+    generation.last.detail = "ConnectionRefused";
+    generation.last.elapsed_ms = 15001;
+    const model = "openai/gpt-5.6-luna";
+    @memcpy(generation.last.model_buf[0..model.len], model);
+    generation.last.model_len = model.len;
+    const session_id = "abc123sess";
+    @memcpy(generation.last.session_buf[0..session_id.len], session_id);
+    generation.last.session_len = session_id.len;
+
+    var failed: std.Io.Writer.Allocating = .init(alloc);
+    defer failed.deinit();
+    try writeSessionTitleSummary(&failed.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, failed.written(), "generation: status=failed session=abc123sess model=openai/gpt-5.6-luna reason=transport_error detail=ConnectionRefused elapsed=15001ms") != null);
+
+    generation.last.status = .installed;
+    generation.last.reason = null;
+    generation.last.detail = "";
+    try app.session_title.appendSlice(alloc, "Fix renderer lag");
+
+    var installed: std.Io.Writer.Allocating = .init(alloc);
+    defer installed.deinit();
+    try writeSessionTitleSummary(&installed.writer, &app, alloc);
+    try std.testing.expect(std.mem.find(u8, installed.written(), "title: Fix renderer lag") != null);
+    try std.testing.expect(std.mem.find(u8, installed.written(), "generation: status=installed") != null);
 }
 
 test "trace tool calls preserve outcomes and mask obvious secrets" {

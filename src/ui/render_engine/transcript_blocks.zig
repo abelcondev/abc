@@ -2,6 +2,7 @@ const std = @import("std");
 const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
@@ -34,7 +35,6 @@ pub const Styles = struct {
     reset_style: []const u8 = "",
     dim_style: []const u8 = "",
     red_style: []const u8 = "",
-    cancelled_text_style: []const u8 = "",
     notice_information_style: []const u8 = "",
     notice_success_style: []const u8 = "",
     notice_warning_style: []const u8 = "",
@@ -1006,7 +1006,7 @@ const CodeStyle = struct {
 
     fn applySequence(self: *CodeStyle, sequence: []const u8) void {
         if (sequence.len < 4 or sequence[0] != 0x1b or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') return;
-        if (std.mem.startsWith(u8, sequence, "\x1b[38;5;")) {
+        if (shared_theme.sgrHasParam(sequence, "38")) {
             self.foreground = sequence;
         } else if (std.mem.eql(u8, sequence, "\x1b[39m") or std.mem.eql(u8, sequence, "\x1b[0m")) {
             self.foreground = null;

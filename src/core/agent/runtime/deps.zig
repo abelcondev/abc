@@ -32,6 +32,8 @@ const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
+/// Borrows checkpoint slices only for the call. A sink must synchronously copy
+/// or serialize anything it retains, including when a save fails.
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
 };
@@ -139,7 +141,6 @@ pub const ParentTurnDeliveryAck = struct {
     through_sequence: u64,
     delivery_id: []const u8,
     start_offset: u64,
-    end_offset: u64,
     total_bytes: u64,
 };
 
@@ -221,6 +222,7 @@ pub const AgentRuntimeDeps = struct {
     describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     permission_target_for_call: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     execute_tool_call: *const fn (ctx: *anyopaque, request: ToolExecutionRequest) anyerror!ToolExecutionResult,
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
@@ -249,8 +251,17 @@ pub const AgentRuntimeDeps = struct {
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
+    /// Reports that the model catalog is known to be failed or unreachable, so
+    /// capability drops are provenance-attributed instead of silent. Null means
+    /// the host cannot tell, and capability drops stay quiet.
+    model_catalog_unavailable: ?*const fn (ctx: *anyopaque) bool = null,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,
     record_tool_call_rejected: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
+    /// Records a call that reached the tool's own preflight/content checks and
+    /// failed them (never denied, never fully executed its effect). Kept
+    /// distinct from record_tool_call_rejected so diagnostics do not report
+    /// content failures as permission rejections.
+    record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     usage: ?*session_usage.Usage = null,

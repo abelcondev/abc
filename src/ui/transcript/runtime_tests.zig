@@ -279,7 +279,6 @@ fn testPaintPlan(
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = selection.bottom_row, .col = 1, .visible = true },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -8776,17 +8775,21 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer compact_prepared.deinit(alloc);
     const facts = runtime.planTranscriptScroll(&compact_prepared);
     try std.testing.expect(facts.target_visual_offset > facts.source_visual_offset);
-    // The consolidation changed committed rows in place, so this frame has
-    // no ability to materialize the held range: zero release, re-anchor on
-    // the rewritten flow, and mark the finality debt.
-    try std.testing.expect(!facts.source_compatible);
-    try std.testing.expect(facts.recovery_rebase);
-    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
-    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
-    try std.testing.expect(facts.finality_hold);
+    // The intervening recorded write rebases the committed prompt/assistant
+    // prefix before the new table is admitted, so release can start here.
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(!facts.recovery_rebase);
+    try std.testing.expect(facts.semantic_rows > 0);
+    try std.testing.expect(facts.planned_rows > 0);
+    try std.testing.expect(std.mem.startsWith(u8, compact_source.bytes, runtime.transcript_commit_state.stable.flow));
+    try std.testing.expect(std.mem.find(u8, runtime.transcript_commit_state.stable.flow, "give me a table") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.transcript_commit_state.stable.flow, "follow-up table row") == null);
+    const history_before_release = runtime.transcriptCommitDiagnostic().history_visual_offset;
     try commitPreparedForTest(&runtime, alloc, &compact_source, &compact_prepared);
+    try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset > history_before_release);
+    try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset - history_before_release <= facts.semantic_rows);
 
-    // The following compatible frame settles the debt with final bytes.
+    // This fixture settles in that release; a repeated frame must be quiet.
     var settle_source = try runtime.prepareTranscriptSource(alloc, null);
     defer settle_source.deinit(alloc);
     var settle_prepared = try prepareTestSourceForCurrentArea(
@@ -8797,8 +8800,12 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer settle_prepared.deinit(alloc);
     const settle_facts = runtime.planTranscriptScroll(&settle_prepared);
     try std.testing.expect(settle_facts.source_compatible);
-    try std.testing.expect(settle_facts.semantic_rows > 0);
-    try std.testing.expect(settle_facts.planned_rows > 0);
+    try std.testing.expectEqual(@as(u32, 0), settle_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), settle_facts.planned_rows);
+    const settled_history = runtime.transcriptCommitDiagnostic().history_visual_offset;
+    try commitPreparedForTest(&runtime, alloc, &settle_source, &settle_prepared);
+    try std.testing.expectEqual(settled_history, runtime.transcriptCommitDiagnostic().history_visual_offset);
+    try std.testing.expectEqual(runtime.transcript_commit_state.stable.visual_offset, settled_history);
 }
 
 fn removeRawEntriesForTest(
@@ -16444,8 +16451,8 @@ test "pending replacement notice holds release until the finished replacement se
     try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
     try std.testing.expect(quiet_facts.finality_hold);
 
-    // The finished replacement clears the pin; the incompatible frame
-    // re-anchors with zero release and the next frame settles everything.
+    // Finishing clears the pin and rebases its replacement before planning.
+    // Compatibility permits release; the frame receipt must still accept it.
     try std.testing.expect(try runtime.replaceSemanticNotice(alloc, notice_id, .{
         .topic = "feedback",
         .tone = .success,
@@ -16456,10 +16463,14 @@ test "pending replacement notice holds release until the finished replacement se
     var replaced_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &replaced_source);
     defer replaced_prepared.deinit(alloc);
     const replaced_facts = runtime.planTranscriptScroll(&replaced_prepared);
-    try std.testing.expect(!replaced_facts.source_compatible);
-    try std.testing.expectEqual(@as(u32, 0), replaced_facts.semantic_rows);
-    try std.testing.expectEqual(@as(u16, 0), replaced_facts.planned_rows);
+    try std.testing.expect(replaced_source.finality.mutation_pin_start == null);
+    try std.testing.expect(replaced_facts.source_compatible);
+    try std.testing.expect(replaced_facts.semantic_rows > 0);
+    try std.testing.expect(replaced_facts.planned_rows > 0);
+    const before_release = runtime.transcriptCommitDiagnostic().history_visual_offset;
     try commitPreparedForTest(&runtime, alloc, &replaced_source, &replaced_prepared);
+    try std.testing.expectEqual(@min(replaced_facts.semantic_rows, @as(u32, replaced_facts.planned_rows)), runtime.transcriptCommitDiagnostic().history_visual_offset - before_release);
+    try std.testing.expectEqual(replaced_facts.source_visual_offset + @min(replaced_facts.semantic_progress_rows, @as(u32, replaced_facts.planned_rows)), runtime.transcriptCommitDiagnostic().visual_offset);
 
     var settle_source = try runtime.prepareTranscriptSource(alloc, null);
     defer settle_source.deinit(alloc);

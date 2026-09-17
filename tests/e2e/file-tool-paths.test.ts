@@ -1027,6 +1027,75 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "repeated identical failing edits return recovery guidance and escalate within a turn",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const target = join(root.workspace, "strategy.ts");
+        writeFileSync(target, "export interface RacePlan {\n  laps: number;\n}\n");
+        // The requested removal is already applied, so both edits fail.
+        const failingEdit = {
+          path: "strategy.ts",
+          old_string: "  trajectory?: Trajectory;\n}",
+          new_string: "}",
+        };
+        const gateway = startFakeGateway([
+          toolCall("edit_1", "edit_file", failingEdit),
+          (body) => {
+            const output = toolResultOutput(body, "edit_1");
+            expect(output).toContain("old_string not found in file");
+            expect(output).toContain("Re-read the file");
+            expect(output).toContain(
+              "if the change is already applied, do not retry",
+            );
+            expect(output).not.toContain("already failed");
+            return toolCall("edit_2", "edit_file", failingEdit);
+          },
+          (body) => {
+            const output = toolResultOutput(body, "edit_2");
+            expect(output).toContain("old_string not found in file");
+            expect(output).toContain("already failed 2 times this turn");
+            expect(output).toContain("Do not retry it unchanged");
+            return finalText("stopping after the escalated failure");
+          },
+        ]);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--auto",
+              "--quiet",
+              "--json",
+              "--no-save",
+              "Apply the requested edit, then apply it once more.",
+            ],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+
+          expect(gateway.requests).toHaveLength(3);
+          expect(json.tool_calls).toEqual([
+            { name: "edit_file", status: "error" },
+            { name: "edit_file", status: "error" },
+          ]);
+          expect(readFileSync(target, "utf8")).toBe(
+            "export interface RacePlan {\n  laps: number;\n}\n",
+          );
+        } finally {
+          gateway.stop();
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "external relative read-only tools resolve their canonical roots",
     async () => {
       const root = createIsolatedRoot();
