@@ -4773,20 +4773,6 @@ fn pushUnsafeNoRetryStatus(
 /// A turn that can never recover hands the user's prompt back to the composer
 /// so nothing typed is lost. Only genuine user turns restore: resumed recovery
 /// jobs and subagent turns keep their own state.
-// A user cancel during a recovery episode kills the durable checkpoint with
-// the turn; otherwise the next resume would auto-continue a turn the user
-// explicitly stopped.
-fn clearRecoveryCheckpointOnUserCancel(
-    deps: *const AgentRuntimeDeps,
-    recovery_strategy: ?model_response_recovery.Strategy,
-) void {
-    if (recovery_strategy == null) return;
-    const effect = deps.recovery_checkpoint orelse return;
-    effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
-    };
-}
-
 // Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
 // negative under NTP correction; a backward step reads as zero elapsed,
 // never a trap.
@@ -4817,6 +4803,17 @@ fn restorePromptAfterTerminalFailure(
     if (prompt.len == 0) return;
     restore(deps.ctx, prompt) catch |err| {
         debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
+    };
+}
+
+// A user-cancelled turn's durable checkpoint dies with it; otherwise the next
+// resume would auto-continue a turn the user explicitly stopped. Runs on every
+// cancel path, including a cancel during the episode's first retry wait, and
+// no-ops when no checkpoint exists.
+fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
     };
 }
 
@@ -6820,6 +6817,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
+            clearRecoveryCheckpointOnUserCancel(deps);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -7764,7 +7762,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
+                    clearRecoveryCheckpointOnUserCancel(deps);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -8313,7 +8311,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8367,6 +8365,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
+                clearRecoveryCheckpointOnUserCancel(deps);
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8687,7 +8686,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps, recovery_strategy);
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;

@@ -6109,6 +6109,32 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     try std.testing.expect(!checkpoint.outstanding_reservation);
 }
 
+test "processQueuedPrompt cancellation during recovery clears the durable checkpoint" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .service_unavailable },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // The cancel lands during the episode's first retry wait, before any
+    // recovery strategy is assigned: the checkpoint must still die with the
+    // turn or the next resume would revive a turn the user stopped.
+    try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
 test "processQueuedPrompt cancellation during network backoff clears retry status" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
