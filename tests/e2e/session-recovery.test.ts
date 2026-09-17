@@ -11,6 +11,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -114,6 +115,59 @@ async function continueSession(
 }
 
 const LEGACY_TITLE = "Synthetic legacy recovery conversation";
+
+test("resume writes a replay cache and replays identically with it corrupt or missing", async () => {
+  const fixture = createFixture("fx-history-cache-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("CACHE_BASELINE_TURN"),
+    fakeGatewayFinalText("CACHE_CONTINUED_TURN"),
+    fakeGatewayFinalText("CACHE_CORRUPTED_TURN"),
+    fakeGatewayFinalText("CACHE_REBUILT_TURN"),
+  ]);
+  try {
+    const id = await createSavedSession(fixture, gateway);
+    const sessionDir = join(fixture.home, ".fx", "sessions", id);
+    const cachePath = join(sessionDir, "history-cache.bin");
+
+    // Fresh sessions keep the minimal footprint; the first writable resume
+    // builds the cache.
+    expect(existsSync(cachePath)).toBe(false);
+
+    const continued = await continueSession(fixture, gateway, id);
+    expect(continued.code).toBe(0);
+    expect(continued.stderr).toBe("");
+    expect(JSON.parse(continued.stdout).output).toBe("CACHE_CONTINUED_TURN");
+    expect(gateway.requests[1]!.body).toContain("CACHE_BASELINE_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+    const baselineSize = statSync(cachePath).size;
+    expect(baselineSize).toBeGreaterThan(0);
+
+    // Corrupt one cache payload byte: the next resume must stay correct via
+    // the log fallback (prefix CRC rejection or full rebuild).
+    const bytes = readFileSync(cachePath);
+    bytes[bytes.byteLength - 4] = bytes[bytes.byteLength - 4]! ^ 0xff;
+    writeFileSync(cachePath, bytes, { mode: 0o600 });
+    const corrupted = await continueSession(fixture, gateway, id);
+    expect(corrupted.code).toBe(0);
+    expect(corrupted.stderr).toBe("");
+    expect(JSON.parse(corrupted.stdout).output).toBe("CACHE_CORRUPTED_TURN");
+    expect(gateway.requests[2]!.body).toContain("CACHE_CONTINUED_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+
+    // A deleted cache is rebuilt by the next writable resume.
+    rmSync(cachePath);
+    const rebuilt = await continueSession(fixture, gateway, id);
+    expect(rebuilt.code).toBe(0);
+    expect(rebuilt.stderr).toBe("");
+    expect(JSON.parse(rebuilt.stdout).output).toBe("CACHE_REBUILT_TURN");
+    expect(gateway.requests[3]!.body).toContain("CACHE_CORRUPTED_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+    expect(statSync(cachePath).size).toBeGreaterThan(baselineSize);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("latest resume preserves an unrelated pending authority directory", async () => {
   const fixture = createFixture("fx-latest-pending-");
@@ -1240,6 +1294,8 @@ describe("session recovery", () => {
         .sort();
       expect(files).toEqual([
         "events.jsonl",
+        // Replay cache built by the writable resume; derived from events.jsonl.
+        "history-cache.bin",
         "permissions.json",
         "session.json",
         "session.lock",

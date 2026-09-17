@@ -9,6 +9,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const types = @import("../shared/types.zig");
 const session_event = @import("session_event.zig");
+const history_snapshot = @import("history_snapshot.zig");
 const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -124,24 +125,34 @@ pub const ConversationWriter = struct {
 
     /// Takes ownership of `file` only on success.
     pub fn init(alloc: Allocator, file: std.Io.File) !ConversationWriter {
-        return initWithReplayScan(alloc, file, null);
+        return initWithReplayScan(alloc, file, null, null, null);
     }
 
-    fn initWithReplayScan(alloc: Allocator, file: std.Io.File, replay_scan: ?*ConversationReplayScan) !ConversationWriter {
+    fn initWithReplayScan(
+        alloc: Allocator,
+        file: std.Io.File,
+        replay_scan: ?*ConversationReplayScan,
+        source: ?*HistoryFrameSource,
+        snapshot_tee: ?*history_snapshot.Writer,
+    ) !ConversationWriter {
         const length = try file.length(io_mod.getIo());
         var writer = ConversationWriter{ .alloc = alloc, .file = file };
         errdefer {
             writer.clearPendingToolCalls();
             writer.pending_tool_calls.deinit(alloc);
         }
+        var log_source = HistoryFrameSource{ .log_file = file, .log_length = length };
+        const frames = source orelse &log_source;
+        if (source == null) frames.reset();
+        var frame_arena = std.heap.ArenaAllocator.init(alloc);
+        defer frame_arena.deinit();
         var offset: u64 = 0;
         var open_turn_offset: ?u64 = null;
         var open_turn_prior_seq: u64 = 0;
+        var open_turn_snapshot_len: ?u64 = null;
         var checkpointed_turn = false;
-        var buffer: [8192]u8 = undefined;
-        var reader = file.reader(io_mod.getIo(), &buffer);
-        while (offset < length) {
-            const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+        while (true) {
+            const frame = frames.next(frame_arena.allocator()) catch |err| switch (err) {
                 error.TruncatedEventFrame => {
                     try file.setLength(io_mod.getIo(), offset);
                     try file.sync(io_mod.getIo());
@@ -150,38 +161,49 @@ pub const ConversationWriter = struct {
                 },
                 else => return err,
             } orelse break;
-            defer alloc.free(line.bytes);
-            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-            defer decoded.deinit();
+            const envelope = frame.envelope;
             try session_event.validateConversationTransition(.{
                 .last_seq = writer.last_seq,
                 .latest_checkpoint_coverage = writer.latest_checkpoint_coverage,
                 .pending_tool_calls = writer.pending_tool_calls.items,
-            }, decoded.value);
-            switch (decoded.value.event) {
+            }, envelope);
+            switch (envelope.event) {
                 .user => {
                     if (open_turn_offset != null) return error.InvalidConversationFrame;
-                    open_turn_offset = offset;
+                    open_turn_offset = frame.log_offset;
                     open_turn_prior_seq = writer.last_seq;
+                    // Cache position of this open turn's first frame: the
+                    // truncation mirror for an unfinished tail turn. Frames
+                    // served from a verified prefix point at their own offset;
+                    // frames teed now point at the writer's pre-append length.
+                    open_turn_snapshot_len = frames.last_frame_snapshot_file_offset orelse
+                        if (snapshot_tee) |tee| tee.len else null;
                 },
                 .turn_completed, .interrupted => {
                     if (open_turn_offset == null) return error.InvalidConversationFrame;
                     open_turn_offset = null;
+                    open_turn_snapshot_len = null;
                     checkpointed_turn = false;
                 },
                 .context_checkpoint => if (open_turn_offset != null) {
-                    open_turn_offset = line.next_offset;
-                    open_turn_prior_seq = decoded.value.seq;
+                    open_turn_offset = frame.nextOffset();
+                    open_turn_prior_seq = envelope.seq;
                     checkpointed_turn = true;
                 },
                 .assistant, .tool_call, .tool_result, .steering => if (open_turn_offset == null) {
                     return error.InvalidConversationFrame;
                 },
             }
-            try writer.applyReplayedEvent(decoded.value.seq, decoded.value.event);
-            if (replay_scan) |scan| try scan.observe(offset, decoded.value.seq, decoded.value.event);
-            offset = line.next_offset;
+            try writer.applyReplayedEvent(envelope.seq, envelope.event);
+            if (replay_scan) |scan| try scan.observe(frame.log_offset, envelope.seq, envelope.event);
+            // Tee only frames read from the log. Cache-sourced frames are
+            // already in the cache; re-appending them would duplicate it.
+            if (snapshot_tee) |tee| {
+                if (frames.last_frame_snapshot_file_offset == null) tee.append(envelope, frame.log_offset, frame.log_bytes, frame.line_crc);
+            }
+            offset = frame.nextOffset();
             writer.committed_bytes = offset;
+            _ = frame_arena.reset(.retain_capacity);
         }
         if (open_turn_offset) |truncate_from| {
             debug_trace.logf(
@@ -198,6 +220,11 @@ pub const ConversationWriter = struct {
             if (replay_scan) |scan| {
                 scan.last_seq = writer.last_seq;
                 if (!writer.turn_open) scan.active_user_offset = null;
+            }
+            // The open turn's frames were already mirrored into the cache;
+            // truncate the cache to the same logical point.
+            if (snapshot_tee) |tee| {
+                if (open_turn_snapshot_len) |snapshot_len| tee.truncateTo(snapshot_len);
             }
         }
         return writer;
@@ -605,6 +632,8 @@ fn createConversationStorage(
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
+    // Fresh sessions keep the minimal durable footprint; the replay cache is
+    // built lazily by the first writable resume (see openConversationWritableSession).
     return ConversationWriter.init(alloc, file);
 }
 
@@ -887,7 +916,7 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
-    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null, null);
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null, null, null);
 }
 
 /// Loads owned detail state, distinguishing unreadable conversation history
@@ -898,7 +927,7 @@ pub fn loadConversationDetailState(
     session_id: []const u8,
 ) !session_codec.DurableSessionState {
     var history_failed = false;
-    return (load_conversation_state_at_boundary(alloc, dir, session_id, null, null, &history_failed) catch |err| {
+    return (load_conversation_state_at_boundary(alloc, dir, session_id, null, null, &history_failed, null) catch |err| {
         if (err == error.OutOfMemory or !history_failed) return err;
         debug_trace.logf("session", "conversation detail history unavailable id={s} err={s}", .{ session_id, @errorName(err) });
         return error.ConversationHistoryUnavailable;
@@ -912,6 +941,7 @@ fn load_conversation_state_at_boundary(
     recovery: ?ConversationRecoveryBoundary,
     replay_window: ?ConversationReplayWindow,
     history_failed: ?*bool,
+    history_source: ?*HistoryFrameSource,
 ) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
@@ -953,7 +983,33 @@ fn load_conversation_state_at_boundary(
         var event_file = try openManagedFile(dir, events_file, .read_only);
         defer event_file.close(io_mod.getIo());
         const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
-        break :blk try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id, replay_window);
+        // Recovery boundaries keep the raw-log path; the snapshot cache covers
+        // only full loads, where a prefix replay splices into the live log.
+        if (recovery != null) {
+            var pure_log = HistoryFrameSource{ .log_file = event_file, .log_length = length, .limit = length };
+            break :blk try replayConversationHistory(alloc, &pure_log, &conversation_seq, &open_work_id, replay_window);
+        }
+        var owned_source: HistoryFrameSource = undefined;
+        const frames = history_source orelse frames_blk: {
+            owned_source = try HistoryFrameSource.open(alloc, dir, expected_session_id, event_file, length);
+            break :frames_blk &owned_source;
+        };
+        defer if (history_source == null) frames.deinit(alloc);
+        const result = replayConversationHistory(alloc, frames, &conversation_seq, &open_work_id, replay_window) catch |err| retry: {
+            if (err == error.OutOfMemory or frames.verified == null) return err;
+            // A cache-sourced replay failure is a cache problem, not a log
+            // problem: retry once from the raw log so the cache can never fail
+            // a load. The writable caller owns rebuild decisions; read-only
+            // loads just fall back.
+            debug_trace.logf("session", "history cache replay rejected id={s} err={s}; reading log", .{ expected_session_id, @errorName(err) });
+            conversation_seq = 0;
+            open_work_id = null;
+            frames.verified_cleanup(alloc);
+            frames.reset();
+            if (history_source != null) history_snapshot.deleteForRebuild(dir);
+            break :retry try replayConversationHistory(alloc, frames, &conversation_seq, &open_work_id, replay_window);
+        };
+        break :blk result;
     };
     errdefer session.freeHistoryTurnSlice(alloc, history);
     if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
@@ -1160,7 +1216,7 @@ pub fn load_conversation_recovery_state(
     session_id: []const u8,
     boundary: ConversationRecoveryBoundary,
 ) !session_codec.DurableSessionState {
-    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null, null) catch |err| switch (err) {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null, null, null) catch |err| switch (err) {
         error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
         else => return err,
     };
@@ -1364,11 +1420,62 @@ fn openConversationWritableSession(
     writable: *WritableSessionDir,
 ) !LoadedWritableSession {
     var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
+    const log_length = try event_file.length(io_mod.getIo());
+
+    // Verify the replay cache against the log, then scan from it. Any
+    // cache-origin failure discards the cache and retries from the raw log, so
+    // a bad cache can never block a resume.
+    var source: ?HistoryFrameSource = null;
     var replay_scan: ConversationReplayScan = .{};
-    var conversation_writer = ConversationWriter.initWithReplayScan(alloc, event_file, &replay_scan) catch |err| {
-        event_file.close(io_mod.getIo());
-        return err;
-    };
+    var conversation_writer: ConversationWriter = undefined;
+    var snapshot_writer: ?history_snapshot.Writer = null;
+    while (true) {
+        source = try HistoryFrameSource.open(alloc, &writable.dir, writable.session_id, event_file, log_length);
+        const used_cache = source.?.verified != null;
+        snapshot_writer = if (source.?.verified) |*verified|
+            history_snapshot.Writer.beginAppend(alloc, &writable.dir, verified.prefix_file_bytes) catch |err| blk: {
+                debug_trace.logf("session", "history cache append-open failed id={s} err={s}", .{ writable.session_id, @errorName(err) });
+                break :blk null;
+            }
+        else if (log_length == 0)
+            // A brand-new conversation keeps the minimal durable footprint; the
+            // cache is built by the first resume with real content.
+            null
+        else
+            history_snapshot.Writer.beginReplace(alloc, &writable.dir, writable.session_id) catch |err| blk: {
+                debug_trace.logf("session", "history cache rebuild-open failed id={s} err={s}", .{ writable.session_id, @errorName(err) });
+                break :blk null;
+            };
+        conversation_writer = ConversationWriter.initWithReplayScan(
+            alloc,
+            event_file,
+            &replay_scan,
+            &source.?,
+            if (snapshot_writer) |*writer| writer else null,
+        ) catch |err| {
+            if (snapshot_writer) |*writer| writer.finalize();
+            snapshot_writer = null;
+            source.?.deinit(alloc);
+            source = null;
+            if (used_cache) {
+                // A cache-backed scan failure is a cache problem, not a log
+                // problem: drop the cache and retry from the raw log once.
+                debug_trace.logf("session", "history cache scan rejected id={s} err={s}; rebuilding from log", .{ writable.session_id, @errorName(err) });
+                history_snapshot.deleteForRebuild(&writable.dir);
+                continue;
+            }
+            event_file.close(io_mod.getIo());
+            return err;
+        };
+        break;
+    }
+    var frames = &source.?;
+    errdefer frames.deinit(alloc);
+    // The cache is written only by the open-time scan tee; nothing appends at
+    // commit time, so the tee writer is finalized here and no writer state
+    // leaks into the session writer.
+    if (snapshot_writer) |*writer| writer.finalize();
+    snapshot_writer = null;
     errdefer conversation_writer.deinit();
     if (conversation_writer.turn_open) {
         var recovery = try loadConversationRecoveryCheckpoint(
@@ -1386,7 +1493,7 @@ fn openConversationWritableSession(
             try replay_scan.observe(offset, conversation_writer.last_seq, interrupted);
         }
     }
-    const replay_window = try replay_scan.finish(alloc, event_file, conversation_writer.committed_bytes);
+    const replay_window = try replay_scan.finish(alloc, frames);
     var state = (try load_conversation_state_at_boundary(
         alloc,
         &writable.dir,
@@ -1394,6 +1501,7 @@ fn openConversationWritableSession(
         null,
         replay_window,
         null,
+        frames,
     )) orelse return error.InvalidSessionMetadata;
     errdefer state.deinit(alloc);
     if (state.recovery_checkpoint) |checkpoint| {
@@ -1407,7 +1515,7 @@ fn openConversationWritableSession(
             writeConversationRecoveryState(alloc, &writable.dir, null, conversation_writer.last_seq) catch |err| {
                 debug_trace.logf("session", "compaction source committed but recovery cleanup failed err={s}", .{@errorName(err)});
             };
-            var restored = (try load_conversation_state_at_boundary(alloc, &writable.dir, writable.session_id, null, null, null)) orelse return error.InvalidSessionMetadata;
+            var restored = (try load_conversation_state_at_boundary(alloc, &writable.dir, writable.session_id, null, null, null, frames)) orelse return error.InvalidSessionMetadata;
             restored.updated_at_ms = timestamp;
             state.deinit(alloc);
             state = restored;
@@ -1423,6 +1531,7 @@ fn openConversationWritableSession(
         .through_event_id = randomIdentifier(),
         .through_event_log_bytes = conversation_writer.committed_bytes,
     };
+    frames.deinit(alloc);
     const result = LoadedWritableSession{
         .active_id = active_id,
         .state = state,
@@ -1434,17 +1543,194 @@ fn openConversationWritableSession(
     return result;
 }
 
+/// One replay frame regardless of origin. Snapshot frames carry their verified
+/// decoded envelope; log frames decode the JSON line as before.
+const HistoryFrame = struct {
+    log_offset: u64,
+    log_bytes: u32,
+    line_crc: u32,
+    envelope: session_event.ConversationEnvelope,
+
+    fn nextOffset(self: HistoryFrame) u64 {
+        return self.log_offset + self.log_bytes;
+    }
+};
+
+/// Serves replay frames from the verified snapshot prefix, then the log
+/// suffix. When no usable snapshot exists, serves the whole log. Never writes;
+/// callers on writable paths decide whether to rebuild or extend the cache.
+const HistoryFrameSource = struct {
+    log_file: std.Io.File,
+    log_length: u64,
+    /// Fixed read boundary for recovery loads; null follows the physical
+    /// length so later passes see frames appended after the source opened.
+    limit: ?u64 = null,
+    verified: ?history_snapshot.Verified = null,
+    cursor: history_snapshot.Cursor = undefined,
+    buffer: [8192]u8 = undefined,
+    reader: ?std.Io.File.Reader = null,
+    log_next: u64 = 0,
+    /// Cache-file offset of the last frame served from the snapshot, null when
+    /// the last frame came from the log. The writable scan uses this to mirror
+    /// log truncations into the cache.
+    last_frame_snapshot_file_offset: ?u64 = null,
+
+    /// Verifies the snapshot against the already-open log file and prepares a
+    /// merged source. Pure log when the cache is absent or invalid.
+    fn open(
+        alloc: Allocator,
+        dir: *io_mod.VerifiedDir,
+        session_id: []const u8,
+        log_file: std.Io.File,
+        log_length: u64,
+    ) !HistoryFrameSource {
+        var source = HistoryFrameSource{ .log_file = log_file, .log_length = log_length };
+        if (history_snapshot.openAndVerify(alloc, dir, session_id, log_file, log_length) catch |err| blk: {
+            debug_trace.logf("session", "history cache verify failed id={s} err={s}", .{ session_id, @errorName(err) });
+            break :blk null;
+        }) |verified| {
+            source.verified = verified;
+            source.cursor = .{ .file = verified.file, .frames = verified.frames };
+            source.log_next = verified.covered_log_bytes;
+        }
+        return source;
+    }
+
+    /// Wraps an already-verified snapshot (the writable open verifies once and
+    /// shares the result between the writer scan and the state load).
+    fn fromVerified(verified: history_snapshot.Verified, log_file: std.Io.File, log_length: u64) HistoryFrameSource {
+        var source = HistoryFrameSource{ .log_file = log_file, .log_length = log_length, .verified = verified };
+        source.cursor = .{ .file = verified.file, .frames = verified.frames };
+        source.log_next = verified.covered_log_bytes;
+        return source;
+    }
+
+    fn deinit(self: *HistoryFrameSource, alloc: Allocator) void {
+        if (self.verified) |*verified| verified.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Drops the cache portion after a cache-sourced failure; the source
+    /// becomes pure log. Callers then reset() and replay from the log.
+    fn verified_cleanup(self: *HistoryFrameSource, alloc: Allocator) void {
+        if (self.verified) |*verified| verified.deinit(alloc);
+        self.verified = null;
+        self.cursor = undefined;
+        self.reader = null;
+        self.log_next = 0;
+        self.last_frame_snapshot_file_offset = null;
+    }
+
+    fn coveredLogBytes(self: *const HistoryFrameSource) u64 {
+        return if (self.verified) |*verified| verified.covered_log_bytes else 0;
+    }
+
+    /// Re-stats the log so a pass that follows an open-time truncation or a
+    /// recovery append reads the current file, not the length captured at open.
+    fn refresh(self: *HistoryFrameSource) !void {
+        const physical = try self.log_file.length(io_mod.getIo());
+        self.log_length = if (self.limit) |limit| @min(physical, limit) else physical;
+    }
+
+    /// Repositions the source at the frame starting at `log_offset`.
+    fn seekLogOffset(self: *HistoryFrameSource, log_offset: u64) !void {
+        try self.refresh();
+        if (self.verified) |*verified| {
+            if (log_offset < verified.covered_log_bytes) {
+                try self.cursor.seekLogOffset(log_offset);
+                self.log_next = verified.covered_log_bytes;
+                self.reader = null;
+                return;
+            }
+            self.cursor.index = verified.frames.len;
+        }
+        if (log_offset > self.log_length) return error.InvalidConversationFrame;
+        self.log_next = log_offset;
+        self.reader = null;
+    }
+
+    fn reset(self: *HistoryFrameSource) void {
+        if (self.verified != null) self.cursor.reset();
+        self.reader = null;
+        self.refresh() catch {};
+        self.log_next = self.coveredLogBytes();
+    }
+
+    /// Returns the next frame in log order, or null at the end. Decoded memory
+    /// is owned by `arena`.
+    fn next(self: *HistoryFrameSource, arena: Allocator) !?HistoryFrame {
+        if (self.verified) |*verified| {
+            if (self.cursor.index < verified.frames.len) {
+                const meta = verified.frames[self.cursor.index];
+                const envelope = (try self.cursor.next(arena)) orelse return error.InvalidCache;
+                self.last_frame_snapshot_file_offset = meta.file_offset;
+                return .{
+                    .log_offset = meta.log_offset,
+                    .log_bytes = meta.log_bytes,
+                    .line_crc = meta.line_crc,
+                    .envelope = envelope,
+                };
+            }
+        }
+        self.last_frame_snapshot_file_offset = null;
+        return self.nextFromLog(arena);
+    }
+
+    fn nextFromLog(self: *HistoryFrameSource, arena: Allocator) !?HistoryFrame {
+        if (self.log_next >= self.log_length) return null;
+        if (self.reader == null) {
+            self.reader = self.log_file.reader(io_mod.getIo(), &self.buffer);
+            self.reader.?.pos = self.log_next;
+        }
+        const frame_offset = self.log_next;
+        const line = (try session_replay.readBufferedLine(arena, &self.reader.?, self.log_length, null)) orelse return null;
+        self.log_next = line.next_offset;
+        const decoded = try session_event.decodeConversationFrame(arena, line.bytes);
+        return .{
+            .log_offset = frame_offset,
+            .log_bytes = @intCast(line.bytes.len),
+            .line_crc = std.hash.Crc32.hash(line.bytes),
+            .envelope = decoded.value,
+        };
+    }
+
+    /// Reads exactly the frame starting at `log_offset`.
+    fn readAtLogOffset(self: *HistoryFrameSource, arena: Allocator, log_offset: u64) !?HistoryFrame {
+        try self.refresh();
+        if (self.verified) |*verified| {
+            if (log_offset < verified.covered_log_bytes) {
+                var probe = self.cursor;
+                try probe.seekLogOffset(log_offset);
+                const meta = probe.frames[probe.index];
+                const envelope = (try probe.next(arena)) orelse return error.InvalidCache;
+                return .{
+                    .log_offset = meta.log_offset,
+                    .log_bytes = meta.log_bytes,
+                    .line_crc = meta.line_crc,
+                    .envelope = envelope,
+                };
+            }
+        }
+        const line = (try session_replay.readLineAt(arena, self.log_file, log_offset, self.log_length)) orelse return null;
+        const decoded = try session_event.decodeConversationFrame(arena, line.bytes);
+        return .{
+            .log_offset = log_offset,
+            .log_bytes = @intCast(line.bytes.len),
+            .line_crc = std.hash.Crc32.hash(line.bytes),
+            .envelope = decoded.value,
+        };
+    }
+};
+
 fn replayConversationHistory(
     alloc: Allocator,
-    file: std.Io.File,
-    length: u64,
+    source: *HistoryFrameSource,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
     replay_window: ?ConversationReplayWindow,
 ) ![]session.HistoryTurn {
-    const window = replay_window orelse try findConversationReplayWindow(alloc, file, length);
+    const window = replay_window orelse try findConversationReplayWindow(alloc, source);
     conversation_seq.* = window.last_complete_seq;
-    var offset = window.offset;
     var history: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
@@ -1452,12 +1738,11 @@ fn replayConversationHistory(
     }
     var turn = ConversationTurnBuilder.init(alloc);
     defer turn.deinit();
+    var frame_arena = std.heap.ArenaAllocator.init(alloc);
+    defer frame_arena.deinit();
     if (window.checkpoint_offset) |checkpoint_offset| {
-        const line = try session_replay.readLineAt(alloc, file, checkpoint_offset, length) orelse return error.InvalidConversationFrame;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const summary = try alloc.dupe(u8, decoded.value.event.context_checkpoint.summary);
+        const frame = (try source.readAtLogOffset(frame_arena.allocator(), checkpoint_offset)) orelse return error.InvalidConversationFrame;
+        const summary = try alloc.dupe(u8, frame.envelope.event.context_checkpoint.summary);
         errdefer alloc.free(summary);
         try history.append(alloc, .{ .compacted_summary = .{
             .summary = summary,
@@ -1468,27 +1753,19 @@ fn replayConversationHistory(
         } });
     }
     if (window.active_user_offset) |user_offset| {
-        const line = try session_replay.readLineAt(alloc, file, user_offset, length) orelse
+        const frame = (try source.readAtLogOffset(frame_arena.allocator(), user_offset)) orelse
             return error.InvalidConversationFrame;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        if (decoded.value.event != .user) return error.InvalidConversationFrame;
-        try turn.begin(decoded.value.event.user);
+        if (frame.envelope.event != .user) return error.InvalidConversationFrame;
+        try turn.begin(frame.envelope.event.user);
     }
     var checkpoint_turn_open = window.active_user_offset != null;
-    var buffer: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &buffer);
-    reader.pos = offset;
-    while (offset < length) {
-        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+    try source.seekLogOffset(window.offset);
+    while (true) {
+        const frame = source.next(frame_arena.allocator()) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        switch (decoded.value.event) {
+        switch (frame.envelope.event) {
             .user => |value| try turn.begin(value),
             .assistant => |value| try turn.appendAssistant(value),
             .tool_call => |value| try turn.appendToolCall(value),
@@ -1511,7 +1788,7 @@ fn replayConversationHistory(
                 checkpoint_turn_open = turn.user != null;
             },
         }
-        offset = line.next_offset;
+        _ = frame_arena.reset(.retain_capacity);
     }
     // A concurrent writer may have exposed a complete-record prefix of its
     // final batched turn before sync. The next writable open truncates that
@@ -1637,7 +1914,25 @@ pub fn loadConversationArchive(
     var file = try openManagedFile(dir, events_file, .read_only);
     defer file.close(io_mod.getIo());
     const length = try file.length(io_mod.getIo());
-    return load_conversation_archive_from_file(alloc, file, length, false);
+    var source = HistoryFrameSource{ .log_file = file, .log_length = length, .limit = length };
+    if (readConversationMetadata(alloc, dir) catch null) |metadata| {
+        defer metadata.deinit();
+        const opened: ?HistoryFrameSource = HistoryFrameSource.open(alloc, dir, metadata.value.id, file, length) catch |err| blk: {
+            debug_trace.logf("session", "history cache archive open failed err={s}; reading log", .{@errorName(err)});
+            break :blk null;
+        };
+        if (opened) |with_cache| {
+            if (with_cache.verified != null) source = with_cache;
+        }
+    }
+    defer source.deinit(alloc);
+    return load_conversation_archive_from_source(alloc, &source, false) catch |err| {
+        if (err == error.OutOfMemory or source.verified == null) return err;
+        debug_trace.logf("session", "history cache archive rejected err={s}; reading log", .{@errorName(err)});
+        source.verified_cleanup(alloc);
+        source.reset();
+        return load_conversation_archive_from_source(alloc, &source, false);
+    };
 }
 
 fn load_conversation_archive_from_file(
@@ -1646,7 +1941,15 @@ fn load_conversation_archive_from_file(
     length: u64,
     close_open_turn: bool,
 ) ![]session.HistoryTurn {
-    var offset: u64 = 0;
+    var source = HistoryFrameSource{ .log_file = file, .log_length = length, .limit = length };
+    return load_conversation_archive_from_source(alloc, &source, close_open_turn);
+}
+
+fn load_conversation_archive_from_source(
+    alloc: Allocator,
+    source: *HistoryFrameSource,
+    close_open_turn: bool,
+) ![]session.HistoryTurn {
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
@@ -1656,17 +1959,16 @@ fn load_conversation_archive_from_file(
     defer builder.deinit();
     var raw_turn_count: usize = 0;
     var compaction_count: usize = 0;
-    var buffer: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &buffer);
-    while (offset < length) {
-        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+    var frame_arena = std.heap.ArenaAllocator.init(alloc);
+    defer frame_arena.deinit();
+    source.reset();
+    while (true) {
+        const frame = source.next(frame_arena.allocator()) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        const completed: ?session.HistoryTurn = switch (decoded.value.event) {
+        const decoded_value = frame.envelope;
+        const completed: ?session.HistoryTurn = switch (decoded_value.event) {
             .user => |value| blk: {
                 try builder.begin(value);
                 break :blk null;
@@ -1709,7 +2011,7 @@ fn load_conversation_archive_from_file(
             try turns.append(alloc, turn);
             if (turn != .compacted_summary) raw_turn_count += 1;
         }
-        offset = line.next_offset;
+        _ = frame_arena.reset(.retain_capacity);
     }
     if (close_open_turn and builder.user != null) {
         const completed = try builder.finishInterrupted(.{ .reason = .failed });
@@ -1765,7 +2067,7 @@ const ConversationReplayScan = struct {
         }
     }
 
-    fn finish(self: *const ConversationReplayScan, alloc: Allocator, file: std.Io.File, length: u64) !ConversationReplayWindow {
+    fn finish(self: *const ConversationReplayScan, alloc: Allocator, source: *HistoryFrameSource) !ConversationReplayWindow {
         var window = self.window;
         // Coverage can precede the checkpoint: retain the recent exchanges
         // between those boundaries rather than replaying only after the record.
@@ -1773,23 +2075,22 @@ const ConversationReplayScan = struct {
             window.offset = 0;
             window.active_user_offset = null;
             window.prior_turn_count = 0;
-            var buffer: [8192]u8 = undefined;
-            var reader = file.reader(io_mod.getIo(), &buffer);
-            while (window.offset < length) {
-                const line = try session_replay.readBufferedLine(alloc, &reader, length, null) orelse break;
-                defer alloc.free(line.bytes);
-                var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-                defer decoded.deinit();
-                if (decoded.value.seq > window.coverage) break;
-                switch (decoded.value.event) {
-                    .user => window.active_user_offset = window.offset,
+            source.reset();
+            var frame_arena = std.heap.ArenaAllocator.init(alloc);
+            defer frame_arena.deinit();
+            while (true) {
+                const frame = (try source.next(frame_arena.allocator())) orelse break;
+                if (frame.envelope.seq > window.coverage) break;
+                switch (frame.envelope.event) {
+                    .user => window.active_user_offset = frame.log_offset,
                     .turn_completed, .interrupted => {
                         window.active_user_offset = null;
                         window.prior_turn_count += 1;
                     },
                     else => {},
                 }
-                window.offset = line.next_offset;
+                window.offset = frame.nextOffset();
+                _ = frame_arena.reset(.retain_capacity);
             }
         }
         return window;
@@ -1798,25 +2099,21 @@ const ConversationReplayScan = struct {
 
 fn findConversationReplayWindow(
     alloc: Allocator,
-    file: std.Io.File,
-    length: u64,
+    source: *HistoryFrameSource,
 ) !ConversationReplayWindow {
     var scan: ConversationReplayScan = .{};
-    var offset: u64 = 0;
-    var buffer: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &buffer);
-    while (offset < length) {
-        const line = session_replay.readBufferedLine(alloc, &reader, length, null) catch |err| switch (err) {
+    source.reset();
+    var frame_arena = std.heap.ArenaAllocator.init(alloc);
+    defer frame_arena.deinit();
+    while (true) {
+        const frame = source.next(frame_arena.allocator()) catch |err| switch (err) {
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
-        defer alloc.free(line.bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-        defer decoded.deinit();
-        try scan.observe(offset, decoded.value.seq, decoded.value.event);
-        offset = line.next_offset;
+        try scan.observe(frame.log_offset, frame.envelope.seq, frame.envelope.event);
+        _ = frame_arena.reset(.retain_capacity);
     }
-    return scan.finish(alloc, file, length);
+    return scan.finish(alloc, source);
 }
 
 const ConversationTurnBuilder = struct {
@@ -2481,6 +2778,7 @@ fn deleteLegacyConversationFiles(
         commit_lock_file,
         session_display_metadata.sidecar_file,
         "resume-view.bin",
+        history_snapshot.file_name,
     };
     for (names) |name| try deleteConversationMigrationFile(dir, name);
     if (source_generation) |generation| {
@@ -3259,11 +3557,6 @@ fn importLegacySnapshotStateWithOps(
         events_file,
         .read_write,
     );
-    var conversation_writer = ConversationWriter.init(alloc, event_file) catch |err| {
-        event_file.close(io_mod.getIo());
-        return err;
-    };
-    errdefer conversation_writer.deinit();
     deleteLegacyConversationFiles(
         alloc,
         &writable.dir,
@@ -3273,6 +3566,35 @@ fn importLegacySnapshotStateWithOps(
         "event=legacy_session_cleanup_failed session={s} err={s}",
         .{ writable.session_id, @errorName(err) },
     );
+
+    // Tee the freshly migrated log into a replay cache during the writer's
+    // open scan so legacy sessions are cache-backed from their first resume.
+    var import_source = HistoryFrameSource{
+        .log_file = event_file,
+        .log_length = try event_file.length(io_mod.getIo()),
+    };
+    var import_snapshot: ?history_snapshot.Writer = history_snapshot.Writer.beginReplace(
+        alloc,
+        &writable.dir,
+        writable.session_id,
+    ) catch |err| blk: {
+        debug_trace.logf("session", "history cache create-on-import failed id={s} err={s}", .{ writable.session_id, @errorName(err) });
+        break :blk null;
+    };
+    var conversation_writer = ConversationWriter.initWithReplayScan(
+        alloc,
+        event_file,
+        null,
+        &import_source,
+        if (import_snapshot) |*snapshot| snapshot else null,
+    ) catch |err| {
+        if (import_snapshot) |*snapshot| snapshot.finalize();
+        event_file.close(io_mod.getIo());
+        return err;
+    };
+    if (import_snapshot) |*snap| snap.finalize();
+    import_snapshot = null;
+    errdefer conversation_writer.deinit();
 
     const position = CommitPosition{
         .log_generation = randomIdentifier(),
@@ -5790,6 +6112,319 @@ test "committed conversation supersedes recovery after interrupted cleanup" {
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
     try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), resumed.state.recovery_checkpoint);
+}
+
+fn expectSameHistory(expected: []const session.HistoryTurn, actual: []const session.HistoryTurn) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+        switch (want) {
+            .assistant => |w| {
+                const g = got.assistant;
+                try std.testing.expectEqualStrings(w.user.text, g.user.text);
+                try std.testing.expectEqualStrings(w.assistant, g.assistant);
+                try std.testing.expectEqual(w.execution.tool_steps.len, g.execution.tool_steps.len);
+                for (w.execution.tool_steps, g.execution.tool_steps) |want_step, got_step| {
+                    try std.testing.expectEqual(want_step.tool_calls.len, got_step.tool_calls.len);
+                    for (want_step.tool_calls, got_step.tool_calls) |want_call, got_call| {
+                        try std.testing.expectEqualStrings(want_call.id, got_call.id);
+                        try std.testing.expectEqualStrings(want_call.arguments_json, got_call.arguments_json);
+                    }
+                    try std.testing.expectEqual(want_step.tool_results.len, got_step.tool_results.len);
+                    for (want_step.tool_results, got_step.tool_results) |want_result, got_result| {
+                        try std.testing.expectEqualStrings(want_result.tool_call_id, got_result.tool_call_id);
+                        try std.testing.expectEqualStrings(want_result.output, got_result.output);
+                        try std.testing.expectEqual(want_result.status, got_result.status);
+                    }
+                }
+            },
+            .interrupted => |w| {
+                const g = got.interrupted;
+                try std.testing.expectEqualStrings(w.user.text, g.user.text);
+                try std.testing.expectEqual(w.terminal_reason, g.terminal_reason);
+            },
+            .compacted_summary => |w| {
+                const g = got.compacted_summary;
+                try std.testing.expectEqualStrings(w.summary, g.summary);
+                try std.testing.expectEqual(w.removed_turn_count, g.removed_turn_count);
+            },
+        }
+    }
+}
+
+/// Duplicates a history so it outlives the resumed session it came from.
+fn dupeHistory(alloc: Allocator, history: []const session.HistoryTurn) ![]session.HistoryTurn {
+    const copy = try alloc.alloc(session.HistoryTurn, history.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copy[0..initialized]) |turn| session.freeHistoryTurn(alloc, turn);
+        alloc.free(copy);
+    }
+    for (history, 0..) |turn, index| {
+        copy[index] = try session.dupeHistoryTurn(alloc, turn);
+        initialized += 1;
+    }
+    return copy;
+}
+
+fn cacheFileExists(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !bool {
+    const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+    defer alloc.free(sessions);
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    defer alloc.free(path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io_mod.getIo());
+    return true;
+}
+
+fn cacheFileSize(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !u64 {
+    const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+    defer alloc.free(sessions);
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    defer alloc.free(path);
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    return file.length(io_mod.getIo());
+}
+
+fn deleteCacheFileForTest(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !void {
+    const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+    defer alloc.free(sessions);
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    defer alloc.free(path);
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path);
+}
+
+fn buildTwoTurnSession(alloc: Allocator, temp: *TempRoot, id: []const u8) !void {
+    var initial = try testState(alloc, id, 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = initial.conversation_language,
+        .total_input_tokens = 1,
+        .total_output_tokens = 2,
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("first question") },
+            .assistant = @constCast("first answer"),
+        } },
+    } }, 20);
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "command", .arguments_json = "{\"command\":\"ls\"}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("command"),
+        .status = .success,
+        .output = @constCast("listed"),
+        .output_handle = @constCast("result-1.log"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = initial.conversation_language,
+        .total_input_tokens = 3,
+        .total_output_tokens = 4,
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("second question") },
+            .assistant = @constCast("second answer"),
+            .execution = .{ .tool_steps = &steps },
+        } },
+    } }, 30);
+}
+
+test "history snapshot cache builds on writable resume and replays identically" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    const id = "snapshot-identical";
+    try buildTwoTurnSession(alloc, &temp, id);
+    try std.testing.expect(!try cacheFileExists(alloc, &temp, id));
+
+    // First resume builds the cache during the writable-open scan.
+    var first = try temp.root.resumeForWrite(alloc, id, .{});
+    const cached_history = try dupeHistory(alloc, first.state.history);
+    defer session.freeHistoryTurnSlice(alloc, cached_history);
+    first.deinit(alloc);
+    try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+
+    // Second resume reads the cache. Verify via the source that the snapshot
+    // verifies against the log, then compare history content.
+    {
+        const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+        defer alloc.free(sessions);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ sessions, id });
+        defer alloc.free(path);
+        var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{});
+        defer dir.close(io_mod.getIo());
+        var verified_dir: io_mod.VerifiedDir = .{ .dir = dir };
+        var log_file = try dir.openFile(io_mod.getIo(), events_file, .{});
+        defer log_file.close(io_mod.getIo());
+        const log_len = try log_file.length(io_mod.getIo());
+        var verified = (try history_snapshot.openAndVerify(alloc, &verified_dir, id, log_file, log_len)).?;
+        defer verified.deinit(alloc);
+        try std.testing.expectEqual(log_len, verified.covered_log_bytes);
+    }
+    var second = try temp.root.resumeForWrite(alloc, id, .{});
+    const snapshot_history = try dupeHistory(alloc, second.state.history);
+    defer session.freeHistoryTurnSlice(alloc, snapshot_history);
+    // A new turn commits only to the log; the next resume splices the log
+    // suffix onto the cached prefix and re-tees the cache forward.
+    const cache_size_before = try cacheFileSize(alloc, &temp, id);
+    var third_state = try testState(alloc, id, 40);
+    defer third_state.deinit(alloc);
+    _ = try second.appendEvent(alloc, .{ .history_turn_committed = .{
+        .conversation_language = third_state.conversation_language,
+        .total_input_tokens = 1,
+        .total_output_tokens = 1,
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("mirror question") },
+            .assistant = @constCast("mirror answer"),
+        } },
+    } }, 40);
+    try std.testing.expectEqual(cache_size_before, try cacheFileSize(alloc, &temp, id));
+    second.deinit(alloc);
+    try expectSameHistory(cached_history, snapshot_history);
+
+    var third = try temp.root.resumeForWrite(alloc, id, .{});
+    // The suffix replay sees the appended turn without a rebuild.
+    try expectSameHistory(snapshot_history, third.state.history[0..2]);
+    try std.testing.expectEqual(@as(usize, 3), third.state.history.len);
+    try std.testing.expectEqualStrings("mirror question", third.state.history[2].assistant.user.text);
+    try std.testing.expect(try cacheFileSize(alloc, &temp, id) > cache_size_before);
+    third.deinit(alloc);
+
+    // Deleting the cache falls back to the full log replay with identical
+    // content, and the writable resume rebuilds the cache.
+    try deleteCacheFileForTest(alloc, &temp, id);
+    var fourth = try temp.root.resumeForWrite(alloc, id, .{});
+    defer fourth.deinit(alloc);
+    try expectSameHistory(snapshot_history, fourth.state.history[0..2]);
+    try std.testing.expectEqualStrings("mirror question", fourth.state.history[2].assistant.user.text);
+    try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+}
+
+test "history snapshot tolerates torn cache tails and spliced log growth" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    const id = "snapshot-torn-and-grown";
+    try buildTwoTurnSession(alloc, &temp, id);
+
+    var first = try temp.root.resumeForWrite(alloc, id, .{});
+    const baseline = try dupeHistory(alloc, first.state.history);
+    defer session.freeHistoryTurnSlice(alloc, baseline);
+    first.deinit(alloc);
+    try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+
+    // Tear the cache tail mid-frame: the valid prefix shortens and the resume
+    // splices the uncovered log suffix.
+    {
+        const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+        defer alloc.free(sessions);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
+        defer alloc.free(path);
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
+        defer file.close(io_mod.getIo());
+        const len = try file.length(io_mod.getIo());
+        try file.setLength(io_mod.getIo(), len - 3);
+    }
+    var torn = try temp.root.resumeForWrite(alloc, id, .{});
+    const torn_history = try dupeHistory(alloc, torn.state.history);
+    defer session.freeHistoryTurnSlice(alloc, torn_history);
+    torn.deinit(alloc);
+    try expectSameHistory(baseline, torn_history);
+
+    // A third turn committed through the live session lands only in the log
+    // (nothing mirrors at commit time); the next resume replays it as a log
+    // suffix over the cached prefix and re-tees the cache forward.
+    {
+        var loaded = try temp.root.resumeForWrite(alloc, id, .{});
+        var initial = try testState(alloc, id, 40);
+        defer initial.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = initial.conversation_language,
+            .total_input_tokens = 5,
+            .total_output_tokens = 6,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("third question") },
+                .assistant = @constCast("third answer"),
+            } },
+        } }, 50);
+        loaded.deinit(alloc);
+    }
+    var rebuilt = try temp.root.resumeForWrite(alloc, id, .{});
+    const rebuilt_history = try dupeHistory(alloc, rebuilt.state.history);
+    defer session.freeHistoryTurnSlice(alloc, rebuilt_history);
+    rebuilt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), rebuilt_history.len);
+    try expectSameHistory(baseline, rebuilt_history[0..2]);
+    try std.testing.expectEqualStrings("third question", rebuilt_history[2].assistant.user.text);
+
+    // Corrupt the last cache frame's payload: CRC mismatch shortens the
+    // prefix, the log suffix covers the rest.
+    {
+        const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+        defer alloc.free(sessions);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
+        defer alloc.free(path);
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
+        defer file.close(io_mod.getIo());
+        const len = try file.length(io_mod.getIo());
+        try file.writePositionalAll(io_mod.getIo(), "Z", len - 2);
+    }
+    var grown = try temp.root.resumeForWrite(alloc, id, .{});
+    defer grown.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), grown.state.history.len);
+    try std.testing.expectEqualStrings("third question", grown.state.history[2].assistant.user.text);
+}
+
+test "history snapshot replays compacted sessions identically" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    const id = "snapshot-compacted";
+    var initial = try testState(alloc, id, 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = initial.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("old question") },
+                .assistant = @constCast("old answer"),
+            } },
+        } }, 20);
+        _ = try loaded.commitContextCompaction(alloc, .{
+            .summary = @constCast("<context_handoff>earlier work summarized</context_handoff>"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        }, null, null, 30);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = initial.conversation_language,
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("new question") },
+                .assistant = @constCast("new answer"),
+            } },
+        } }, 40);
+    }
+    var first = try temp.root.resumeForWrite(alloc, id, .{});
+    const uncached = try dupeHistory(alloc, first.state.history);
+    defer session.freeHistoryTurnSlice(alloc, uncached);
+    first.deinit(alloc);
+    try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+
+    var second = try temp.root.resumeForWrite(alloc, id, .{});
+    defer second.deinit(alloc);
+    try expectSameHistory(uncached, second.state.history);
+    try std.testing.expect(second.state.history[0] == .compacted_summary);
 }
 
 test "mid-turn checkpoint resumes only its suffix while preserving archived tool execution" {
