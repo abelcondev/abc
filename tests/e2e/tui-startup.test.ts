@@ -698,4 +698,38 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "settings-pinned variant ignores live terminal mode flips",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-pin-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {},
+          { settingsTheme: "dark", colorFgBg: "15;0" }, // dark terminal, pinned dark
+        );
+        expect(pane).toContain("Run /help for commands");
+        expect(escapes).toContain("38;5;255"); // fx-dark hint
+        expect(escapes).not.toContain("38;5;235"); // fx-light hint
+
+        // The terminal reports a light-mode change mid-session (DEC 997);
+        // a pinned variant must not follow it.
+        session!.sendKeysImmediate(["-H", "1b", "5b", "3f", "39", "39", "37", "3b", "32", "6e"]);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        const after = await session!.capturePaneEscapes();
+        expect(after).toContain("38;5;255");
+        expect(after).not.toContain("38;5;235");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });

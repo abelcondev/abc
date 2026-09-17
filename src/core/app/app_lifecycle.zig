@@ -698,7 +698,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         switch (choice) {
             .pin_light, .pin_dark => {
                 const light = choice == .pin_light;
-                shared_theme.setSource(null, light);
+                // The flag marks "pinned", not the direction: any configured
+                // pin locks live theme updates out.
+                shared_theme.setSource(null, true);
                 ui_render.initTheme(light, null);
             },
             .custom => |name| {
