@@ -220,11 +220,11 @@ fn format_retry_label(
 
 fn format_recovered_label(buf: []u8, status: types.RouteRecoveryStatus) []const u8 {
     return switch (status.kind) {
-        .auto_recovered => if (status.succeeded_attempt > 0 and status.attempt_limit > 0)
+        .auto_recovered => if (status.succeeded_attempt > 0)
             std.fmt.bufPrint(
                 buf,
-                "✓ recovered · attempt {d}/{d}",
-                .{ status.succeeded_attempt, status.attempt_limit },
+                "✓ recovered · attempt {d}",
+                .{status.succeeded_attempt},
             ) catch "✓ recovered"
         else
             "✓ recovered",
@@ -375,7 +375,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · send a new message when you're ready",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2 · send a new message when you're ready",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -391,7 +391,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Response ended early · recovery paused after 10/10 attempts · reopen the session to continue",
+            "⚠ Response ended early · recovery paused after 10 attempts · reopen the session to continue",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,

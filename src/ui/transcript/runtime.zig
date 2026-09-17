@@ -796,7 +796,7 @@ test "recovered route status is transient and final summary stays normal" {
     switch (runtime.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.success, thinking.tone);
-            try std.testing.expectEqualStrings("✓ recovered · attempt 3/3", thinking.label);
+            try std.testing.expectEqualStrings("✓ recovered · attempt 3", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

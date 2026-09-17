@@ -5618,7 +5618,7 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error · checking uncertain tool state");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
 }
 
 test "processQueuedPrompt pauses when uncertain tool reconciliation returns another tool" {
@@ -5917,7 +5917,7 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     // The in-flight republication mirrors the wait row's delay segment so the
     // status row never changes shape mid-cycle.
     try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
-    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
+    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3");
 }
 
 test "processQueuedPrompt probes gateway stream timeout without consuming the attempt budget" {
@@ -5966,7 +5966,7 @@ test "processQueuedPrompt probes gateway stream timeout without consuming the at
         "⚠ Gateway stream timed out · checking the connection · 1s",
     );
     // Both probes transmitted nothing billable, so the success is attempt 1.
-    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 1/10");
+    try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 1");
 }
 
 test "processQueuedPrompt retries post-tool provider error without synthetic recovery message" {
@@ -6149,6 +6149,32 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
     try std.testing.expect(!checkpoint.outstanding_reservation);
+}
+
+test "processQueuedPrompt cancellation during recovery clears the durable checkpoint" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .service_unavailable },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // The cancel lands during the episode's first retry wait, before any
+    // recovery strategy is assigned: the checkpoint must still die with the
+    // turn or the next resume would revive a turn the user stopped.
+    try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt cancellation during network backoff clears retry status" {
@@ -6346,7 +6372,7 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     try std.testing.expect(hooks.route_recovery_statuses.items[0].retry_deadline != null);
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try std.testing.expect(hooks.route_recovery_statuses.items[1].retry_deadline == null);
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
@@ -6397,7 +6423,7 @@ test "processQueuedPrompt counts and retries a definitely unsent native setup fa
         &hooks,
         2,
         .auto_recovered,
-        "✓ recovered · succeeded on attempt 2/2",
+        "✓ recovered · succeeded on attempt 2",
     );
 }
 
@@ -6758,7 +6784,7 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expectEqual(types.ModelRecoveryCause.provider_unavailable, checkpoint.cause);
     // Each failure status is published once at failure and republished when the
     // next attempt is admitted, so the pause status lands at index 3.
-    try expectRouteStatus(&hooks, 3, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2/2 attempts");
+    try expectRouteStatus(&hooks, 3, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2 attempts");
 
     var continued_checkpoint = try checkpoint.dupe(alloc);
     defer continued_checkpoint.deinit(alloc);
@@ -7030,7 +7056,7 @@ test "processQueuedPrompt replaces scheduled retry after provider pre-admission 
         &hooks,
         1,
         .terminal_provider_error,
-        "⚠ Network interrupted · TestProviderSerializationFailed · stopped after 1/2 attempts",
+        "⚠ Network interrupted · TestProviderSerializationFailed · stopped after 1 attempt",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -7063,7 +7089,7 @@ test "processQueuedPrompt replaces scheduled retry when in-flight publication fa
         &hooks,
         1,
         .terminal_provider_error,
-        "⚠ Network interrupted · TestRouteRecoveryPublicationFailed · stopped after 1/2 attempts",
+        "⚠ Network interrupted · TestRouteRecoveryPublicationFailed · stopped after 1 attempt",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -7224,7 +7250,7 @@ test "processQueuedPrompt replaces retry status after an invalid replay completi
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · stopped after 2/3 attempts");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · stopped after 2 attempts");
 }
 
 test "processQueuedPrompt retries ReadFailed after assistant source until the stall detector stops" {
@@ -7449,7 +7475,7 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · regenerating unstarted tool");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/3");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
     try expectBodyContains(&gateway, 2, "call_read_recovered");
     try expectBodyContains(&gateway, 2, "\"output\":{\"type\":\"text\",\"value\":\"ok\"}");
@@ -7645,7 +7671,7 @@ test "processQueuedPrompt reconciles ReadFailed after provider-executed tool sta
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · checking uncertain tool state");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · checking uncertain tool state");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
 }
 
 test "processQueuedPrompt restarts failed response without committing its partial preview" {
@@ -7681,7 +7707,7 @@ test "processQueuedPrompt restarts failed response without committing its partia
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after text · restarting response");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
     try std.testing.expectEqualStrings("A complete replacement response.", hooks.history_turns.items[0].assistant.assistant);
 }
 
@@ -7714,7 +7740,7 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: failed after tool start · regenerating unstarted tool");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
 }
 
 test "processQueuedPrompt routes content filter to local recovery without replay" {
@@ -7794,7 +7820,7 @@ test "processQueuedPrompt disable Fast recovery retries the same exact model" {
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: fast route failed · retrying request");
-    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2/2");
+    try expectRouteStatus(&hooks, 2, .auto_recovered, "✓ recovered · succeeded on attempt 2");
 }
 
 test "processQueuedPrompt keeps retrying past the old budget without invoking route recovery" {

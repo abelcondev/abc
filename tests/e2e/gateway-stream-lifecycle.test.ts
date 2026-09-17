@@ -6785,7 +6785,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request");
       expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
@@ -6897,7 +6897,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.stderr).toMatch(
           /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request$/m,
         );
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
+        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
         expect(json.recovery?.state).toBe("recovered");
@@ -7023,7 +7023,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         /Network interrupted · [^\r\n]+ · retrying request/,
       );
       expect(result.stderr).not.toContain("retrying request in 16s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 7/10");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 7");
       expect(connections).toBe(7);
       expect(requests).toBe(6);
       expect(socketFailure).toBeUndefined();
@@ -8690,7 +8690,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toContain(
         "Provider unavailable · provider_error · checking uncertain tool state",
       );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 2");
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
@@ -8835,7 +8835,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toContain(
         "Provider unavailable · provider_error: second route failure · retrying request in 1s",
       );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
@@ -9037,7 +9037,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toContain(
         "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
       );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 13/10");
+      expect(result.stderr).toContain("recovered · succeeded on attempt 13");
       expect(result.stderr).not.toContain("recovery paused");
     } finally {
       gateway.stop();
@@ -9811,8 +9811,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.stderr).toContain(
           fixture.streamedText ? "restarting response" : "retrying request",
         );
-        expect(result.stderr).not.toContain("· attempt 1/10");
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
+        expect(result.stderr).not.toContain("/10");
+        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
 
         const json = parseAskJson(result.stdout);
         expect(json.exit_code).toBe(0);

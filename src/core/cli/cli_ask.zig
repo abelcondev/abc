@@ -7995,7 +7995,7 @@ test "render final JSON reports the successful recovery attempt" {
     try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "✓ recovered · succeeded on attempt 3/10",
+        "✓ recovered · succeeded on attempt 3",
         recovery.get("message").?.string,
     );
     try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
@@ -8025,7 +8025,7 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
     const recovery = parsed.value.object.get("recovery").?.object;
     try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2/2 attempts",
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
         recovery.get("message").?.string,
     );
 }
@@ -9255,7 +9255,7 @@ test "fx ask JSON reports the consumed attempt after retry admission failure" {
         parsed.value.object.get("error").?.string,
     );
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s") != null);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1/2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1 attempt") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {

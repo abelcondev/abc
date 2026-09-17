@@ -480,8 +480,8 @@ pub const RouteRecoveryStatus = struct {
             .auto_retry => self.recoveryLabel(buf),
             .auto_recovered => std.fmt.bufPrint(
                 buf,
-                "✓ recovered · succeeded on attempt {d}/{d}",
-                .{ self.succeeded_attempt, self.attempt_limit },
+                "✓ recovered · succeeded on attempt {d}",
+                .{self.succeeded_attempt},
             ) catch "✓ recovered",
             .manual_retry_without_fast => self.manualRetryLabel(buf),
             .manual_recovered_without_fast => "✓ recovered · Fast disabled",
@@ -595,20 +595,30 @@ pub const RouteRecoveryStatus = struct {
         ) catch "⚠ Recovering model response";
     }
 
+    // Display names for paused and terminal recovery states; single source so
+    // the stall and generic branches cannot drift. In-progress resume copy
+    // stays in recoveryLabel, where the wording reads differently mid-flight.
+    fn pausedCauseDisplayName(cause: ModelRecoveryCause) []const u8 {
+        return switch (cause) {
+            .network_interrupted => "Network interrupted",
+            .connectivity_lost => "Connection lost",
+            .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
+            .provider_unavailable => "Provider unavailable",
+            .rate_limited => "Rate limited",
+            .system_resumed => "Mac woke from sleep",
+            .authentication => "Authentication expired",
+            .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Saved compaction",
+        };
+    }
+
     fn pausedLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         if (self.required_action == .surface_stall) {
-            const cause_text: []const u8 = if (self.cause) |cause| switch (cause) {
-                .network_interrupted => "Network interrupted",
-                .connectivity_lost => "Connection lost",
-                .response_interrupted => "Response ended early",
-                .provider_stream_timeout => "Gateway stream timed out",
-                .provider_unavailable => "Provider unavailable",
-                .rate_limited => "Rate limited",
-                .system_resumed => "Mac woke from sleep",
-                .authentication => "Authentication expired",
-                .request_limit_reached => "Provider request limit reached",
-                .compaction_prepared => "Compaction prepared",
-            } else "Response failed";
+            const cause_text: []const u8 = if (self.cause) |cause|
+                pausedCauseDisplayName(cause)
+            else
+                "Response failed";
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
@@ -623,46 +633,46 @@ pub const RouteRecoveryStatus = struct {
             ) catch "⚠ Response kept failing at the same point";
         }
         const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
-        if (cause == .rate_limited and self.failed_attempt < self.attempt_limit) {
+        if (cause == .rate_limited) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Rate limited · recovery paused";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
+                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}",
+                .{self.failed_attempt},
             ) catch "⚠ Rate limited · recovery paused";
         }
-        if (cause == .system_resumed and self.failed_attempt < self.attempt_limit) {
+        if (cause == .system_resumed) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Connection unavailable · recovery paused";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
+                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}",
+                .{self.failed_attempt},
             ) catch "⚠ Connection unavailable · recovery paused";
         }
         if (cause == .provider_stream_timeout) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Gateway stream timed out · automatic retry paused";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}",
+                .{self.failed_attempt},
             ) catch "⚠ Gateway stream timed out · automatic retry paused";
         }
         if (cause == .request_limit_reached) {
@@ -679,19 +689,7 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Response paused · provider-request safety limit reached";
         }
-        const name = switch (cause) {
-            .network_interrupted => "Network interrupted",
-            .connectivity_lost => "Connection lost",
-            .response_interrupted => "Response ended early",
-            .provider_stream_timeout => "Gateway stream timed out",
-            .provider_unavailable => "Provider unavailable",
-            .rate_limited => "Rate limited",
-            .system_resumed => "Mac woke from sleep",
-            .authentication => "Authentication expired",
-            .request_limit_reached => unreachable,
-            .compaction_prepared => "Saved compaction",
-        };
-        return self.pausedCauseLabel(buf, name);
+        return self.pausedCauseLabel(buf, pausedCauseDisplayName(cause));
     }
 
     fn pausedCauseLabel(
@@ -705,17 +703,18 @@ pub const RouteRecoveryStatus = struct {
             "recovery paused"
         else
             "stopped";
+        const plural: []const u8 = if (self.failed_attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
             return std.fmt.bufPrint(
                 buf,
-                "⚠ {s} · {s} · {s} after {d}/{d} attempts",
-                .{ name, diagnostic.humanText(), state_text, self.failed_attempt, self.attempt_limit },
+                "⚠ {s} · {s} · {s} after {d} attempt{s}",
+                .{ name, diagnostic.humanText(), state_text, self.failed_attempt, plural },
             ) catch "⚠ Model response recovery ended";
         }
         return std.fmt.bufPrint(
             buf,
-            "⚠ {s} · {s} after {d}/{d} attempts",
-            .{ name, state_text, self.failed_attempt, self.attempt_limit },
+            "⚠ {s} · {s} after {d} attempt{s}",
+            .{ name, state_text, self.failed_attempt, plural },
         ) catch "⚠ Model response recovery ended";
     }
 };
