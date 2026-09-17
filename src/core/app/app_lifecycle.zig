@@ -148,6 +148,9 @@ pub const StartupState = struct {
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
+    /// Resolved review-model override for automatic permission review. Owned;
+    /// empty keeps the reviewer's compiled default.
+    review_model: []u8 = &.{},
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -165,6 +168,7 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.review_model.len > 0) alloc.free(self.review_model);
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -248,6 +252,13 @@ pub const StartupState = struct {
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
+        return value;
+    }
+
+    /// Moves the owned review-model override out; caller owns the bytes.
+    pub fn takeReviewModel(self: *StartupState) []u8 {
+        const value = self.review_model;
+        self.review_model = &.{};
         return value;
     }
 };
@@ -590,6 +601,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
+    state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;

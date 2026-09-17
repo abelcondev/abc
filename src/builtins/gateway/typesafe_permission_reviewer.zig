@@ -1,12 +1,12 @@
 //! Optional automatic permission review backed by TypeSafe's System One API.
 //!
-//! Enabled with FX_REVIEW_MODEL=typesafeai/jev. The review request carries the
-//! same composed policy, context, and exact pending action as the default
-//! reviewer; the typed answer is mapped into one `permission_decision` tool
-//! call so parsing and every downstream consumer behave unchanged. Jev
-//! probabilities and confidence are recorded in the rationale and trace, never
-//! gated on. Requires TYPESAFE_API_KEY; TYPESAFE_BASE_URL overrides the
-//! endpoint and exists for tests.
+//! Selected with the review_model setting (or FX_REVIEW_MODEL) set to
+//! typesafeai/jev. The review request carries the same composed policy,
+//! context, and exact pending action as the default reviewer; the typed answer
+//! is mapped into one `permission_decision` tool call so parsing and every
+//! downstream consumer behave unchanged. Jev probabilities and confidence are
+//! recorded in the rationale and trace, never gated on. Requires
+//! TYPESAFE_API_KEY; TYPESAFE_BASE_URL overrides the endpoint for tests.
 
 const std = @import("std");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
@@ -39,16 +39,18 @@ const Config = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
 };
 
-/// Whether the user selected the TypeSafe Jev reviewer for this process.
-pub fn envSelected() bool {
-    const raw = io_mod.getenv("FX_REVIEW_MODEL") orelse return false;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    return std.mem.eql(u8, trimmed, review_model_id);
+/// Whether a resolved review-model id selects the TypeSafe Jev reviewer.
+/// Accepts the gateway catalog spelling as an alias.
+pub fn isJevModelId(model: []const u8) bool {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    return std.mem.eql(u8, trimmed, review_model_id) or
+        std.mem.eql(u8, trimmed, "typesafe-ai/jev");
 }
 
 /// Provider-compatible entry point. Called from the builtin gateway reviewer
-/// when envSelected() is true. A missing API key degrades to an unconfigured
-/// transport outcome, which holds the action like any unavailable review.
+/// when isJevModelId() matches the resolved review model. A missing API key
+/// degrades to an unconfigured transport outcome, which holds the action like
+/// any unavailable review.
 pub fn review(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -503,3 +505,11 @@ const FakeJevServer = struct {
         try writer.interface.flush();
     }
 };
+
+test "isJevModelId matches canonical and gateway spellings only" {
+    try std.testing.expect(isJevModelId("typesafeai/jev"));
+    try std.testing.expect(isJevModelId("typesafe-ai/jev"));
+    try std.testing.expect(isJevModelId(" typesafeai/jev "));
+    try std.testing.expect(!isJevModelId("openai/gpt-5.6-luna"));
+    try std.testing.expect(!isJevModelId(""));
+}

@@ -232,6 +232,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     host.unavailable_secret_store,
                 .model = provider_runtime.model(app),
+                .reviewer_model = if (comptime @hasField(App, "review_model")) app.review_model else "",
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",

@@ -32,7 +32,7 @@ afterEach(() => {
   }
 });
 
-function createIsolatedRoot(): IsolatedRoot {
+function createIsolatedRoot(settings: Record<string, unknown> = {}): IsolatedRoot {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "fx-review-model-override-e2e-")),
   );
@@ -42,7 +42,7 @@ function createIsolatedRoot(): IsolatedRoot {
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ sandbox: "none", permission: {} }),
+    JSON.stringify({ sandbox: "none", permission: {}, ...settings }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -183,6 +183,69 @@ describe("review model override", () => {
   );
 
   test(
+    "review_model in settings.json selects the Jev reviewer without the env var",
+    async () => {
+      const root = createIsolatedRoot({ review_model: JEV_MODEL_ID });
+      const jev = startJevStub("clear");
+      const gateway = startFakeGateway([
+        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
+        fakeGatewayFinalText("Ran the command."),
+      ]);
+      gateways.push(gateway);
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
+        {
+          cwd: root.workspace,
+          env: overrideEnv(root, gateway, {
+            FX_REVIEW_MODEL: undefined,
+            TYPESAFE_API_KEY: "e2e-typesafe-key",
+            TYPESAFE_BASE_URL: jev.url,
+          }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(EXECUTED_MARKER);
+      expect(jev.requests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "review_model set to another gateway chat model keeps the gateway path with that model id",
+    async () => {
+      const root = createIsolatedRoot({ review_model: "openai/gpt-5-alt" });
+      const jev = startJevStub("clear");
+      const gateway = startFakeGateway([
+        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
+        fakeGatewayFinalText("Ran the command."),
+      ]);
+      gateways.push(gateway);
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
+        {
+          cwd: root.workspace,
+          env: overrideEnv(root, gateway, {
+            FX_REVIEW_MODEL: undefined,
+            TYPESAFE_API_KEY: "e2e-typesafe-key",
+            TYPESAFE_BASE_URL: jev.url,
+          }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(EXECUTED_MARKER);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(
+        gateway.classifierRequests[0].headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5-alt");
+      expect(jev.requests).toHaveLength(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "without FX_REVIEW_MODEL the default gateway reviewer is used even when TypeSafe credentials exist",
     async () => {
       const root = createIsolatedRoot();
@@ -207,6 +270,9 @@ describe("review model override", () => {
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(EXECUTED_MARKER);
       expect(gateway.classifierRequests).toHaveLength(1);
+      expect(
+        gateway.classifierRequests[0].headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5.6-luna");
       expect(jev.requests).toHaveLength(0);
     },
     TIMEOUT,
