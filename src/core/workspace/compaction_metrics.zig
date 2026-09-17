@@ -40,9 +40,9 @@ const Ring = struct {
     stored: usize = 0,
     total: u64 = 0,
 
-    fn append(self: *Ring, event: Event) void {
+    fn append(self: *Ring, event: *const Event) void {
         self.total +|= 1;
-        self.events[self.head] = event;
+        self.events[self.head] = event.*;
         self.events[self.head].sequence = self.total;
         self.head = (self.head + 1) % ring_capacity;
         self.stored = @min(self.stored + 1, ring_capacity);
@@ -61,7 +61,9 @@ var mutex: std.Io.Mutex = .init;
 // Zero-initialized storage stays in .bss; unused slots are never read.
 var ring: Ring = std.mem.zeroes(Ring);
 
-pub fn record(name: []const u8, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
+// Keep format specialization at the caller while sharing ring mutation without
+// adding another Event-sized stack copy.
+pub inline fn record(name: []const u8, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
     var event: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),
         .turn_id = turn_id,
@@ -76,6 +78,10 @@ pub fn record(name: []const u8, turn_id: u64, step_id: u64, subagent_id: u64, fa
         event.truncated = true;
     };
     event.detail_len = @intCast(writer.buffered().len);
+    append_recorded_event(&event);
+}
+
+noinline fn append_recorded_event(event: *const Event) void {
     const io = io_mod.getIo();
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
@@ -101,7 +107,7 @@ pub fn reset() void {
 test "compaction diagnostic ring retains the newest events in order" {
     var local: Ring = .{};
     for (0..ring_capacity + 3) |index| {
-        local.append(.{ .timestamp_ms = @intCast(index) });
+        local.append(&.{ .timestamp_ms = @intCast(index) });
     }
     var events: [ring_capacity]Event = undefined;
     try std.testing.expectEqual(ring_capacity, local.snapshot(&events));
