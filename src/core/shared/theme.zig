@@ -156,6 +156,41 @@ pub fn activate(theme: Theme) void {
     active_theme = theme;
 }
 
+pub const ThemeChoice = union(enum) {
+    pin_light,
+    pin_dark,
+    custom: []const u8,
+};
+
+/// Classifies a configured theme value (FX_THEME or the settings "theme"
+/// key): light/dark pin the builtin variant, anything else names a theme file
+/// under ~/.fx/themes.
+pub fn classifyValue(value: []const u8) ?ThemeChoice {
+    if (value.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(value, "light")) return .pin_light;
+    if (std.ascii.eqlIgnoreCase(value, "dark")) return .pin_dark;
+    return .{ .custom = value };
+}
+
+/// Where the active theme came from: the configured custom theme file key (so
+/// live terminal flips can re-resolve it), and whether a light/dark variant is
+/// pinned by configuration. Recorded once at startup by the app lifecycle.
+var source_name: ?[]const u8 = null;
+var pinned_variant: ?bool = null;
+
+pub fn setSource(name: ?[]const u8, pinned: ?bool) void {
+    source_name = name;
+    pinned_variant = pinned;
+}
+
+pub fn sourceName() ?[]const u8 {
+    return source_name;
+}
+
+pub fn variantPinned() bool {
+    return pinned_variant != null;
+}
+
 // --- Hex colors and terminal capability resolution ---
 
 pub const HexColor = struct { rgb: Rgb, alpha: u8 };
@@ -1029,4 +1064,23 @@ test "closingFor resets exactly what the open set" {
     try std.testing.expectEqualStrings("\x1b[39m\x1b[22m\x1b[23m", closingFor("\x1b[1;3;38;2;1;2;3m"));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor(fx_dark.approval_button_active_style));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m", closingFor(fx_dark.approval_button_inactive_style));
+}
+
+test "classifyValue maps configured theme values" {
+    try std.testing.expect(classifyValue("") == null);
+    try std.testing.expect(classifyValue("light").? == .pin_light);
+    try std.testing.expect(classifyValue("Dark").? == .pin_dark);
+    try std.testing.expectEqualStrings("cursor-dark", classifyValue("cursor-dark").?.custom);
+}
+
+test "theme source records the configured name and pin for live re-resolution" {
+    defer setSource(null, null);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(!variantPinned());
+    setSource("cursor-dark", null);
+    try std.testing.expectEqualStrings("cursor-dark", sourceName().?);
+    try std.testing.expect(!variantPinned());
+    setSource(null, true);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(variantPinned());
 }
