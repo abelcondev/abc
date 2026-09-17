@@ -11,7 +11,7 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent CLI written in Zig: a 6.17 MiB native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
+fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
 ## Install
 
@@ -43,62 +43,42 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
-### Automatic tool review
+## Documentation
 
-In auto mode, a valid structured safety decision remains usable when the reviewer adds commentary. If the response has no valid decision, fx retries the review once within its original 30-second deadline. A safety caution is never retried for approval. If review still fails, the action stays unexecuted and the agent can continue with other tools.
+The full manual lives at [fx.sh/docs](https://fx.sh/docs). Start from the page that matches what you are doing:
 
-### Long conversations
+| I want to... | Read |
+| --- | --- |
+| Install, sign in, run a first session | [Quick start](https://fx.sh/docs), [Installation](https://fx.sh/docs/getting-started/installation), [Authentication](https://fx.sh/docs/getting-started/authentication) |
+| Save, resume, and compact conversations | [Sessions](https://fx.sh/docs/using-fx/sessions) |
+| Look up a command or flag | [CLI reference](https://fx.sh/docs/using-fx/cli), [Slash commands](https://fx.sh/docs/using-fx/slash-commands) |
+| Pick or change models | [Models](https://fx.sh/docs/configure-fx/models) |
+| Use Ollama, OpenRouter, or another OpenAI-compatible endpoint | [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) |
+| Control tool permissions and automatic review | [Permissions](https://fx.sh/docs/configure-fx/permissions) |
+| Configure settings and environment variables | [Configuration](https://fx.sh/docs/configure-fx/configuration) |
+| Add skills, MCP servers, or subagents | [Skills](https://fx.sh/docs/capabilities/skills), [MCP](https://fx.sh/docs/capabilities/mcp), [Subagents](https://fx.sh/docs/capabilities/subagents) |
+| Embed fx in an app or editor | [Embedding fx](https://fx.sh/docs/lib), [ACP server](https://fx.sh/docs/using-fx/acp) |
 
-fx automatically compacts context at 80% of the selected model's usable input capacity. Run `/compact` to compact earlier. In saved sessions, older assistant work is summarized while original user text stays unchanged and chronological when it fits. If necessary, older user messages are summarized too, without a capacity question.
-
-Recent complete tool exchanges stay in context within a budget; older available results remain accessible through stored handles. Compaction uses the model's normal input/output limits and settings, validates the finished context, and switches only after the checkpoint is committed. Failed or cancelled compaction keeps the previous committed context. A saved session can resume from that checkpoint and later saved work.
+Agents can read any page as Markdown by appending `.md` to its URL, or fetch the [combined documentation file](https://fx.sh/llms-full.txt) ([index](https://fx.sh/llms.txt)).
 
 ## Custom model connections
 
-The native CLI can use a user-configured OpenAI Chat Completions endpoint, including local servers and gateways such as Ollama and OpenRouter. Add named connections to `~/.fx/settings.json`; keep existing unrelated settings. For example:
-
-```json
-{
-  "provider": "local",
-  "providers": {
-    "local": {
-      "protocol": "openai-chat-completions",
-      "base_url": "http://localhost:11434/v1",
-      "auth": { "type": "none" }
-    },
-    "openrouter": {
-      "protocol": "openai-chat-completions",
-      "base_url": "https://openrouter.ai/api/v1",
-      "auth": { "type": "bearer", "env": "OPENROUTER_API_KEY" }
-    }
-  },
-  "models": {
-    "local": "qwen2.5:7b",
-    "openrouter": "openai/gpt-4.1"
-  }
-}
-```
-
-Use a model actually available on your server. `base_url` includes the API prefix, such as `/v1`; fx adds `/chat/completions`. Remote endpoints require HTTPS. Loopback HTTP is supported for local servers. Anonymous connections send no Authorization header; bearer connections read only their named environment variable, not a Gateway or subscription credential.
+Point fx at any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, through named connections in `~/.fx/settings.json`:
 
 ```bash
 fx provider local
-fx ask "explain this repository"
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
-fx status --json
 ```
 
-`fx provider` saves a preference. `FX_PROVIDER` and `FX_MODEL` affect the invocation without rewriting settings. User-owned workspace overrides can select a connection; committed project `.fx.json` cannot define or select model endpoints. The interactive sign-in picker remains for built-in providers. Configured connections are selected through the file or CLI and work in the interactive shell, `fx ask`, and native ACP.
+See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
-An explicit model does not require catalog discovery. `fx models` lists model IDs supplied in the connection's optional `model_metadata` object. Its per-model fields are `context_window`, `max_output_tokens`, `supports_tool_use`, and `supports_vision`. Set token limits to the server's actual configuration; without a known context window, automatic compaction cannot determine its threshold. Native image input is not yet implemented by this adapter, even if the backend supports it.
+## MCP forms
 
-Text, reasoning, and function-tool streaming are supported through the Chat Completions endpoint. fx preserves `reasoning`, `reasoning_content`, and ordered `reasoning_details` across tool calls and saved-session continuation on the same connection and model. Signed and encrypted reasoning details stay opaque; they are not forwarded when the connection or model changes. Provider-specific reasoning controls and the Responses API are not part of this adapter.
+In the interactive shell, an MCP form with a single select-one field and up to three options submits in the same prompt; every other form keeps a separate review step. See [MCP](https://fx.sh/docs/capabilities/mcp) for server setup.
 
-Streams must include a finish reason followed by `[DONE]`; partial tool arguments never execute. Cumulative token-usage updates replace earlier observations rather than being added together. The default `tool_choice_mode` is `omit` for servers with partial OpenAI compatibility; set it to `send` only when the server supports that field. Tool controls are omitted when no tools are advertised, and required tool outcomes are still validated locally. The selected model and server must support function tools for coding-agent tasks.
+## Themes
 
-Automatic permission review uses the selected model on the same connection. An optional `reviewer_model` in that connection can select another model there. A model that cannot produce a valid review decision leaves the action unapproved; fx never silently uses a cloud reviewer or changes permission mode. Gateway-only search, credits and vision fallback are unavailable on custom connections. Token usage is reported when provided; unknown cost is not treated as zero.
-
-Saved custom sessions retain the connection name and a non-secret endpoint/authentication fingerprint. Changing or removing that connection prevents an implicit resume against a different destination. Existing history remains readable. Built-in sessions retain their existing provider representation; custom sessions require a build that supports configured connections. Invalid profile configuration fails model startup rather than falling back to Gateway. An unsafe profile directory still permits interactive inspection and local recovery, but model requests stay disabled until you repair the profile and restart fx.
+fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with `FX_THEME=<name>`.
 
 ## Embed fx
 
@@ -110,72 +90,7 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
-The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
-
-The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For runnable Node.js, browser, Next.js, and Nuxt applications, see the [libfx examples](examples/README.md).
-
-## Extend fx
-
-- [Skills](https://fx.sh/docs/capabilities/skills): reusable instructions the agent loads when invoked
-- [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
-- [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
-
-In the interactive shell, MCP forms with a single select-one field and up to three
-options combine selection and submission in one prompt. You can decline, cancel,
-use a displayed default, or skip an optional field. Text inputs, numbers, booleans,
-and all other forms include a separate review step.
-
-## Themes
-
-fx ships with built-in `fx-dark` and `fx-light` themes and follows your terminal's light or dark mode automatically. Set `FX_THEME=light` or `FX_THEME=dark` to pin a variant.
-
-Custom themes load from `~/.fx/themes/<name>.json`. Pick one persistently in `~/.fx/settings.json`:
-
-```json
-{ "theme": "github-dark" }
-```
-
-or per launch with `FX_THEME=<name>`, which wins over the settings value:
-
-```bash
-FX_THEME=github-dark fx
-```
-
-The key also accepts `"light"` and `"dark"` to pin a built-in variant.
-
-A pinned theme follows your terminal's detected light or dark mode when a sibling variant exists: with `FX_THEME=github-dark` on a light terminal, fx loads `github-light` instead when `~/.fx/themes/github-light.json` is present (the `-dark`/`-light` or `_dark`/`_light` suffix convention). Without a sibling file, fx falls back to the built-in theme matching your terminal rather than washing out on the wrong background.
-
-Theme files accept the VS Code theme format (`colors` plus `tokenColors`), so editor themes such as GitHub Dark work directly:
-
-```json
-{
-  "name": "My Theme",
-  "colors": { "editor.background": "#181818", "editor.foreground": "#F0F0F0" },
-  "tokenColors": [
-    { "scope": "keyword", "settings": { "foreground": "#82D2CE" } }
-  ]
-}
-```
-
-The native fx schema addresses individual slots, and any slot you omit inherits the built-in defaults:
-
-```json
-{
-  "name": "My Theme",
-  "type": "dark",
-  "colors": {
-    "divider": "#3a3a3a",
-    "approval_button_active": { "fg": "#191c22", "bg": "#81A1C1", "bold": true }
-  },
-  "syntax": { "keyword": "#82D2CE", "comment": { "fg": "#6A9955", "italic": true } }
-}
-```
-
-Colors are hex values. They render in truecolor when the terminal supports it and quantize to the nearest xterm-256 color otherwise.
-
-## Documentation
-
-Read the [fx documentation](https://fx.sh/docs) for sessions, models, permissions, configuration, and the full CLI and slash command references.
+The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
 ## Build from source
 
@@ -190,14 +105,9 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
-A [bounded long-turn memory benchmark](docs/long-turn-memory.md) exercises saved turns against a local model fixture.
-
 ## License
 
-[Apache-2.0](LICENSE)
-
-Third-party licenses and attributions are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Credits
 
