@@ -12,7 +12,10 @@
 //! * The cache binds to the log by watermark: the last frame records the log
 //!   byte range and CRC of the log line it was written from. A load verifies
 //!   the covered length and the final covered line against the real log; a
-//!   mismatch (rewritten, truncated, or replaced log) discards the cache.
+//!   mismatch (rewritten, truncated, or replaced log) discards the cache. An
+//!   in-place, length-preserving rewrite of a middle log line is deliberately
+//!   invisible to the watermark (see the middle-rewrite pin test); the log
+//!   format never rewrites middle lines, so the binding targets real edits.
 //! * A log that grew since the cache was written is fine: the cache covers a
 //!   prefix and the caller replays the suffix from the log.
 //! * The binary schema binds to `conversation_schema_version` (the log's own
@@ -482,7 +485,8 @@ pub fn openAndVerify(
     if (id_len != session_id.len) return null;
     const id_buf = alloc.alloc(u8, id_len) catch return error.OutOfMemory;
     defer alloc.free(id_buf);
-    _ = file.readPositionalAll(io_mod.getIo(), id_buf, header_len_min) catch return null;
+    const id_read = file.readPositionalAll(io_mod.getIo(), id_buf, header_len_min) catch return null;
+    if (id_read != id_len) return null;
     if (!std.mem.eql(u8, id_buf, session_id)) return null;
 
     var file_offset: u64 = header_len_min + @as(u64, id_len);

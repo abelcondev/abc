@@ -1429,9 +1429,10 @@ fn openConversationWritableSession(
     var replay_scan: ConversationReplayScan = .{};
     var conversation_writer: ConversationWriter = undefined;
     var snapshot_writer: ?history_snapshot.Writer = null;
+    var cache_retry_spent = false;
     while (true) {
         source = try HistoryFrameSource.open(alloc, &writable.dir, writable.session_id, event_file, log_length);
-        const used_cache = source.?.verified != null;
+        const used_cache = !cache_retry_spent and source.?.verified != null;
         snapshot_writer = if (source.?.verified) |*verified|
             history_snapshot.Writer.beginAppend(alloc, &writable.dir, verified.prefix_file_bytes) catch |err| blk: {
                 debug_trace.logf("session", "history cache append-open failed id={s} err={s}", .{ writable.session_id, @errorName(err) });
@@ -1466,9 +1467,12 @@ fn openConversationWritableSession(
                 // problem: drop the cache and retry from the raw log once.
                 // The scan state observed partial cache frames, so it must be
                 // reset or the retry's first log frame fails seq continuity.
+                // The spent flag makes termination structural even when the
+                // delete itself fails and the next open verifies again.
                 debug_trace.logf("session", "history cache scan rejected id={s} err={s}; rebuilding from log", .{ writable.session_id, @errorName(err) });
                 history_snapshot.deleteForRebuild(&writable.dir);
                 replay_scan = .{};
+                cache_retry_spent = true;
                 continue;
             }
             event_file.close(io_mod.getIo());
@@ -1651,7 +1655,9 @@ const HistoryFrameSource = struct {
         if (self.verified != null) self.cursor.reset();
         self.reader = null;
         self.last_frame_snapshot_file_offset = null;
-        self.refresh() catch {};
+        self.refresh() catch |err| {
+            debug_trace.logf("session", "history source refresh failed err={s}; keeping stale length", .{@errorName(err)});
+        };
         self.log_next = self.coveredLogBytes();
     }
 
