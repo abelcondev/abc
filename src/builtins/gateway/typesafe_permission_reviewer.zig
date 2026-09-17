@@ -18,6 +18,10 @@ const Allocator = std.mem.Allocator;
 
 const default_endpoint = "https://api.typesafe.ai/v1/systemone";
 const jev_model = "jev-latest";
+/// Gateway catalog id and evaluation-endpoint model slug.
+const gateway_model_id = "typesafe-ai/jev";
+const gateway_eval_suffix = "/v4/ai/evaluation-model";
+const gateway_chat_suffix = "/v4/ai/language-model";
 pub const review_model_id = "typesafeai/jev";
 
 const decision_instructions =
@@ -37,7 +41,52 @@ const Config = struct {
     api_key: []const u8,
     endpoint: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// True when the request goes to the gateway evaluation-model endpoint
+    /// with gateway credentials and protocol headers instead of TypeSafe direct.
+    via_gateway: bool = false,
 };
+
+const Route = struct {
+    api_key: []const u8,
+    endpoint: []const u8,
+    via_gateway: bool,
+    model: []const u8,
+};
+
+/// Writes the evaluation-model sibling of a gateway chat URL into out and
+/// returns it. Returns null when the URL lacks the language-model suffix or
+/// out is too small.
+fn gatewayEvalEndpoint(chat_url: []const u8, out: []u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, chat_url, gateway_chat_suffix)) return null;
+    const prefix_len = chat_url.len - gateway_chat_suffix.len;
+    const total = prefix_len + gateway_eval_suffix.len;
+    if (total > out.len) return null;
+    @memcpy(out[0..prefix_len], chat_url[0..prefix_len]);
+    @memcpy(out[prefix_len..total], gateway_eval_suffix);
+    return out[0..total];
+}
+
+/// Picks the Jev transport: TypeSafe direct when TYPESAFE_API_KEY is set,
+/// otherwise the gateway evaluation-model endpoint with the gateway
+/// credential. eval_endpoint is scratch storage for the derived URL.
+fn resolveRoute(direct_api_key: ?[]const u8, direct_base_url: ?[]const u8, gateway_credential: []const u8, gateway_chat_url: []const u8, eval_endpoint: []u8) ?Route {
+    if (direct_api_key) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return .{
+            .api_key = key,
+            .endpoint = direct_base_url orelse default_endpoint,
+            .via_gateway = false,
+            .model = jev_model,
+        };
+    }
+    if (gateway_credential.len == 0) return null;
+    const endpoint = gatewayEvalEndpoint(gateway_chat_url, eval_endpoint) orelse return null;
+    return .{
+        .api_key = gateway_credential,
+        .endpoint = endpoint,
+        .via_gateway = true,
+        .model = gateway_model_id,
+    };
+}
 
 /// Whether a resolved review-model id selects the TypeSafe Jev reviewer.
 /// Accepts the gateway catalog spelling as an alias.
@@ -48,31 +97,40 @@ pub fn isJevModelId(model: []const u8) bool {
 }
 
 /// Provider-compatible entry point. Called from the builtin gateway reviewer
-/// when isJevModelId() matches the resolved review model. A missing API key
-/// degrades to an unconfigured transport outcome, which holds the action like
-/// any unavailable review.
+/// when isJevModelId() matches the resolved review model. TypeSafe direct when
+/// TYPESAFE_API_KEY is set; otherwise the gateway evaluation-model endpoint
+/// with the session's gateway credential. Missing credentials degrade to an
+/// unconfigured transport outcome, which holds the action like any
+/// unavailable review.
 pub fn review(
     _: ?*anyopaque,
     alloc: Allocator,
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
-    const api_key = io_mod.getenv("TYPESAFE_API_KEY") orelse {
-        debug_trace.logf("permission", "event=auto_review_typesafe result=permanent_failure reason=missing_typesafe_api_key", .{});
+    var eval_endpoint_buf: [4096]u8 = undefined;
+    const route = resolveRoute(
+        io_mod.getenv("TYPESAFE_API_KEY"),
+        io_mod.getenv("TYPESAFE_BASE_URL"),
+        input.credential,
+        input.endpoint,
+        &eval_endpoint_buf,
+    ) orelse {
+        debug_trace.logf("permission", "event=auto_review_typesafe result=permanent_failure reason=missing_reviewer_credential", .{});
         return .{ .invalid = .transport_unconfigured };
     };
-    const endpoint = io_mod.getenv("TYPESAFE_BASE_URL") orelse default_endpoint;
     var config = Config{
-        .api_key = api_key,
-        .endpoint = endpoint,
+        .api_key = route.api_key,
+        .endpoint = route.endpoint,
         .cancel_flag = input.cancel_flag,
+        .via_gateway = route.via_gateway,
     };
-    debug_trace.logf("permission", "event=auto_review_typesafe_selected endpoint={s}", .{config.endpoint});
+    debug_trace.logf("permission", "event=auto_review_typesafe_selected endpoint={s} via_gateway={}", .{ config.endpoint, route.via_gateway });
     return permission_auto_classifier.Reviewer.withTransportModel(.{
         .context = @ptrCast(&config),
         .build_fn = buildReviewBody,
         .send_fn = sendReview,
-    }, input.cancel_flag, permission_auto_classifier.Reviewer.default_timeout_ms, jev_model).review(alloc, request);
+    }, input.cancel_flag, permission_auto_classifier.Reviewer.default_timeout_ms, route.model).review(alloc, request);
 }
 
 /// Composes the System One request body from the reviewer's already-composed
@@ -263,12 +321,17 @@ fn sendReview(
     const auth_header = std.fmt.allocPrint(alloc, "Bearer {s}", .{config.api_key}) catch |err| return err;
     defer alloc.free(auth_header);
 
+    const gateway_extra = [_]std.http.Header{
+        .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
+        .{ .name = "ai-language-model-id", .value = gateway_model_id },
+    };
+
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d}", .{payload.len});
+    debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d} via_gateway={}", .{ payload.len, config.via_gateway });
     const result = client.fetch(.{
         .location = .{ .url = config.endpoint },
         .method = .POST,
@@ -278,6 +341,7 @@ fn sendReview(
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,
         },
+        .extra_headers = if (config.via_gateway) &gateway_extra else &.{},
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     }) catch |err| {
@@ -436,20 +500,32 @@ const FakeJevServer = struct {
     server: std.Io.net.Server,
     url: []u8,
     mode: Mode,
+    path: []const u8 = "/v1/systemone",
     thread: ?std.Thread = null,
     failure: ?anyerror = null,
+    captured_head: [4096]u8 = undefined,
+    captured_len: usize = 0,
 
     fn init(mode: Mode) !FakeJevServer {
+        return initWithPath(mode, "/v1/systemone");
+    }
+
+    fn initWithPath(mode: Mode, path: []const u8) !FakeJevServer {
         var self = FakeJevServer{
             .server = undefined,
             .url = undefined,
             .mode = mode,
+            .path = path,
         };
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
         errdefer self.server.deinit(self.io_backend.io());
-        self.url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/v1/systemone", .{self.server.socket.address.getPort()});
+        self.url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}{s}", .{ self.server.socket.address.getPort(), path });
         return self;
+    }
+
+    fn captured(self: *const FakeJevServer) []const u8 {
+        return self.captured_head[0..self.captured_len];
     }
 
     fn start(self: *FakeJevServer) !void {
@@ -475,7 +551,7 @@ const FakeJevServer = struct {
         const zio = self.io_backend.io();
         var stream = try self.server.accept(zio);
         defer stream.close(zio);
-        // Discard the request head and body.
+        // Read the request head (captured for assertions) and discard the body.
         var socket_buffer: [4096]u8 = undefined;
         var reader = stream.reader(zio, &socket_buffer);
         var head_bytes: usize = 0;
@@ -485,6 +561,10 @@ const FakeJevServer = struct {
                 error.EndOfStream => break,
                 else => return err,
             };
+            if (head_bytes < self.captured_head.len) {
+                self.captured_head[head_bytes] = byte;
+                self.captured_len = head_bytes + 1;
+            }
             head_bytes += 1;
             tail = .{ tail[1], tail[2], tail[3], byte };
             if (std.mem.eql(u8, &tail, "\r\n\r\n")) break;
@@ -512,4 +592,53 @@ test "isJevModelId matches canonical and gateway spellings only" {
     try std.testing.expect(isJevModelId(" typesafeai/jev "));
     try std.testing.expect(!isJevModelId("openai/gpt-5.6-luna"));
     try std.testing.expect(!isJevModelId(""));
+}
+
+test "route resolution prefers TypeSafe direct and derives the gateway evaluation endpoint" {
+    var buf: [4096]u8 = undefined;
+
+    const direct = resolveRoute("ts-key", null, "gw-key", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf).?;
+    try std.testing.expect(!direct.via_gateway);
+    try std.testing.expectEqualStrings("ts-key", direct.api_key);
+    try std.testing.expectEqualStrings(default_endpoint, direct.endpoint);
+    try std.testing.expectEqualStrings(jev_model, direct.model);
+
+    const custom_base = resolveRoute("ts-key", "http://127.0.0.1:1/v1/systemone", "gw-key", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf).?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:1/v1/systemone", custom_base.endpoint);
+
+    const blank_direct = resolveRoute("  ", null, "gw-key", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf).?;
+    try std.testing.expect(blank_direct.via_gateway);
+
+    const gateway = resolveRoute(null, null, "gw-key", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf).?;
+    try std.testing.expect(gateway.via_gateway);
+    try std.testing.expectEqualStrings("gw-key", gateway.api_key);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/evaluation-model", gateway.endpoint);
+    try std.testing.expectEqualStrings(gateway_model_id, gateway.model);
+
+    try std.testing.expect(resolveRoute(null, null, "", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf) == null);
+    try std.testing.expect(resolveRoute(null, null, "gw-key", "https://example.test/chat", &buf) == null);
+}
+
+test "gateway transport posts to the evaluation-model endpoint with protocol headers" {
+    const alloc = std.testing.allocator;
+    var server = try FakeJevServer.initWithPath(.ok, "/v4/ai/evaluation-model");
+    defer server.deinit();
+    try server.start();
+    var cancel = std.atomic.Value(bool).init(false);
+    var config = Config{ .api_key = "gw-key", .endpoint = server.url, .via_gateway = true };
+    const outcome = try sendReview(@ptrCast(&config), alloc, gateway_model_id, "{}", .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(5000) }), &cancel);
+    switch (outcome) {
+        .completion => |owned| {
+            var held = owned;
+            defer held.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), held.completion.tool_calls.len);
+            try std.testing.expect(std.mem.find(u8, held.completion.tool_calls[0].arguments_json, "\"decision\":\"clear\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const head = server.captured();
+    try std.testing.expect(std.mem.find(u8, head, "POST /v4/ai/evaluation-model HTTP") != null);
+    try std.testing.expect(std.mem.find(u8, head, "authorization: Bearer gw-key") != null);
+    try std.testing.expect(std.mem.find(u8, head, "ai-gateway-protocol-version: 0.0.1") != null);
+    try std.testing.expect(std.mem.find(u8, head, "ai-language-model-id: typesafe-ai/jev") != null);
 }

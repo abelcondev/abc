@@ -279,13 +279,12 @@ describe("review model override", () => {
   );
 
   test(
-    "override without TYPESAFE_API_KEY holds the action instead of executing unreviewed",
+    "without TYPESAFE_API_KEY the Jev review goes through the gateway evaluation endpoint",
     async () => {
       const root = createIsolatedRoot();
-      const jev = startJevStub("clear");
       const gateway = startFakeGateway([
         fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Review unavailable, holding."),
+        fakeGatewayFinalText("Ran the command."),
       ]);
       gateways.push(gateway);
       const result = await runFx(
@@ -295,14 +294,59 @@ describe("review model override", () => {
           env: overrideEnv(root, gateway, {
             FX_REVIEW_MODEL: JEV_MODEL_ID,
             TYPESAFE_API_KEY: undefined,
-            TYPESAFE_BASE_URL: jev.url,
+            TYPESAFE_BASE_URL: undefined,
+          }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(EXECUTED_MARKER);
+      expect(gateway.evaluationRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const review = JSON.parse(gateway.evaluationRequests[0].body);
+      expect(review.model).toBe("typesafe-ai/jev");
+      expect(review.questions.decision.type).toBe("choice");
+      expect(
+        gateway.evaluationRequests[0].headers.get("authorization"),
+      ).toBe("Bearer fake-review-model-override-key");
+      expect(
+        gateway.evaluationRequests[0].headers.get("ai-language-model-id"),
+      ).toBe("typesafe-ai/jev");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a failing Jev evaluation endpoint holds the action instead of executing unreviewed",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway(
+        [
+          fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
+          fakeGatewayFinalText("Review unavailable, holding."),
+        ],
+        {
+          evaluationResponse: new Response("upstream unavailable", {
+            status: 500,
+          }),
+        },
+      );
+      gateways.push(gateway);
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
+        {
+          cwd: root.workspace,
+          env: overrideEnv(root, gateway, {
+            FX_REVIEW_MODEL: JEV_MODEL_ID,
+            TYPESAFE_API_KEY: undefined,
+            TYPESAFE_BASE_URL: undefined,
           }),
           timeoutMs: TIMEOUT,
         },
       );
       expect(result.code).toBe(0);
       expect(result.stdout).not.toContain(EXECUTED_MARKER);
-      expect(jev.requests).toHaveLength(0);
+      expect(gateway.evaluationRequests.length).toBeGreaterThan(0);
       expect(gateway.classifierRequests).toHaveLength(0);
     },
     TIMEOUT,
