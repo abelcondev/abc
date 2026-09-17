@@ -681,8 +681,17 @@ fn highlightCommandPhrase(
 ) !?[]const u8 {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
-    const first_space = std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
-    const command = phrase[first_space + 1 ..];
+    // Prefer the recorded action label so multi-word labels ("Timed out")
+    // split at the true boundary; fall back to the first space.
+    const label_end = if (record.command_action_label) |action|
+        if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
+            action.len
+        else
+            null
+    else
+        null;
+    const split = label_end orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
+    const command = phrase[split + 1 ..];
     if (command.len == 0) return null;
     const theme = shared_theme.current();
     const profile = code_highlight_languages.resolve("sh") orelse return null;
@@ -697,7 +706,7 @@ fn highlightCommandPhrase(
         variant,
         if (base_style.len > 0) base_style else null,
     );
-    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ phrase[0..first_space], highlighted });
+    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ phrase[0..split], highlighted });
 }
 
 fn formatExpandedChild(
