@@ -2872,9 +2872,10 @@ const App = struct {
         const now_ms = io_mod.milliTimestamp();
         self.terminal_input_runtime.terminal_theme_monitor.poll(now_ms);
 
-        // FX_THEME=light|dark pins the variant; keep owning protocol bytes
-        // (monitor started) but never query or apply live theme updates.
-        // Custom theme files stay live: updates re-resolve the theme pair.
+        // A configured light|dark pin (FX_THEME or the settings "theme" key)
+        // locks the variant; keep owning protocol bytes (monitor started) but
+        // never query or apply live theme updates. Custom theme files stay
+        // live: updates re-resolve the theme pair.
         if (ui_render.themeInputLocked()) {
             _ = self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate();
             return;

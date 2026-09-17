@@ -55,6 +55,7 @@ pub const Settings = struct {
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
@@ -72,6 +73,7 @@ pub const Settings = struct {
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
+        if (self.theme) |value| alloc.free(value);
         self.* = .{};
     }
 };
@@ -664,6 +666,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
+        "theme",
         "session_titles",
         "startup_scrollback",
         "prompt_history",
@@ -1559,6 +1562,12 @@ fn parseProfileOnlyFields(
             return error.InvalidUpdateChannelValue;
     }
 
+    if (root.object.get("theme")) |theme_value| {
+        const value = theme_value;
+        if (value != .string) return error.InvalidThemeType;
+        if (value.string.len > 0) settings.theme = try alloc.dupe(u8, value.string);
+    }
+
     if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
         const value = startup_scrollback_value;
         if (value != .bool) return error.InvalidStartupScrollbackType;
@@ -1673,6 +1682,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
+    if (incoming.theme) |value| {
+        if (target.theme) |old| alloc.free(old);
+        target.theme = value;
+        incoming.theme = null;
+    }
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
@@ -3974,4 +3988,34 @@ test "malformed or duplicate additional directories do not discard sibling setti
         }
         try std.testing.expect(found_diagnostic);
     }
+}
+
+test "theme setting parses from profile settings and project theme is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"theme\":\"cursor-dark\"}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"theme\":\"project-theme\"}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("cursor-dark", result.settings.theme.?);
+    try expectIgnoredProjectKey(result.diagnostics, "theme");
+}
+
+test "theme setting rejects non-string values" {
+    try std.testing.expectError(
+        error.InvalidThemeType,
+        parseSettingsJson(std.testing.allocator, "{\"theme\":3}"),
+    );
+    var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
 }

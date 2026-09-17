@@ -52,11 +52,11 @@ pub fn setTruecolorSupport(enabled: bool) void {
     truecolor_enabled = enabled;
 }
 
-// Only an explicit FX_THEME=light|dark pins the variant. Custom themes
-// (FX_THEME=<name>) keep the live monitor so terminal mode flips re-resolve
-// the theme pair without a restart.
+// A configured light|dark pin (FX_THEME or the settings "theme" key) locks the
+// variant. Custom themes keep the live monitor so terminal mode flips
+// re-resolve the theme pair without a restart.
 pub fn themeInputLocked() bool {
-    return explicitThemeOverride() != null;
+    return explicitThemeOverride() != null or shared_theme.variantPinned();
 }
 
 pub fn truecolorIsEnabled() bool {
