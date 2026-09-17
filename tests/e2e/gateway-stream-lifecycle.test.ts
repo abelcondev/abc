@@ -7624,7 +7624,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           return fakeGatewayFinalText("CHILD_RECOVERED");
         }
         if (hasCurrentToolResult(body, "approval-search")) {
-          expect(toolResultOutput(body, "approval-search")).toContain("FileNotFound");
+          expect(toolResultOutput(body, "approval-search")).toContain("Path not found: search-target");
           return fakeGatewayToolCall("after-approval", "read_file", { path: "notes.txt" });
         }
         return fakeGatewayToolCall("approval-search", "grep_files", { pattern: "APPROVAL_SEARCH", path: "search-target" });
