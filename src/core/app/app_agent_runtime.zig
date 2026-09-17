@@ -7,6 +7,8 @@ const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const shared_theme = @import("../shared/theme.zig");
+const code_highlight = @import("../agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../agent/presentation/code_highlight_languages.zig");
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
@@ -1368,7 +1370,7 @@ fn formatToolAction(
             .completed => "Ran",
             .denied => denied_label.?,
         };
-        return formatToolActionValue(
+        return formatCommandActionValue(
             arena,
             label,
             activity.detail,
@@ -1433,6 +1435,22 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+}
+
+/// Command rows keep the muted tool-text base and add shell syntax colors for
+/// quoted strings, numbers, comments, and keywords.
+fn formatCommandActionValue(arena: Allocator, label: []const u8, command: []const u8) ![]const u8 {
+    const theme = shared_theme.current();
+    const profile = code_highlight_languages.resolve("sh") orelse
+        return formatToolActionValue(arena, label, command);
+    const highlighted = try code_highlight.highlight(
+        arena,
+        command,
+        profile,
+        if (theme.light) .light else .dark,
+        theme.tool_stdout_style,
+    );
+    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -3407,4 +3425,35 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
+}
+
+test "app agent runtime highlights shell command rows over the tool text base" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const run_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'hello world' | wc -c\"}",
+    };
+    const completed = try app.describeToolActionCompleted(arena, run_call);
+
+    // The label and untokenized command text keep the muted tool-text base,
+    // while the quoted string picks up the syntax palette color and returns
+    // to the base after its close.
+    try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        completed,
+        "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
+    ) != null);
+    try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
+    // Plain bytes are intact beneath the styling.
+    try std.testing.expect(std.mem.indexOf(u8, completed, "printf ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "| wc -c") != null);
 }

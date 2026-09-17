@@ -15302,7 +15302,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran true"),
+            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -15818,7 +15818,7 @@ fn checkCommandProcessTerminalAllocationFailuresImpl(alloc: Allocator) !void {
         try std.testing.expect(detail.command_output_entry_id == null);
         const status = runtime.toolStatusEntryLabel(entry_id).?;
         try std.testing.expect(std.mem.find(u8, status, "run_command") != null);
-        try std.testing.expect(std.mem.find(u8, status, "Ran true") == null);
+        try std.testing.expect(std.mem.find(u8, status, "\x1b[38;5;250mtrue\x1b[39m") == null);
         return err;
     };
 
@@ -16741,4 +16741,35 @@ test "finality candidates retain the global pin for an unidentified tool row" {
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), source.finality.tool_turn_floors.len);
     try std.testing.expect(source.finality.mutation_pin_start != null);
+}
+
+test "grouped completed command rows shell-highlight quoted strings over the row base" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-1" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "printf 'hello world'", "Ran");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf 'hello world'" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // The action label keeps the row's ambient style; the quoted string picks
+    // up the syntax palette and returns to the row base after its close.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245mprintf ") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
 }

@@ -11,8 +11,8 @@ const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
-const code_highlight = @import("code_highlight.zig");
-const code_highlight_languages = @import("code_highlight_languages.zig");
+const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -952,7 +952,7 @@ fn renderCodeBlockForTranscriptWithTheme(
     else
         "";
     const styled_code = if (profile) |resolved|
-        try code_highlight.highlight(alloc, block.code, resolved, theme)
+        try code_highlight.highlight(alloc, block.code, resolved, theme, null)
     else
         null;
     defer if (styled_code) |code| alloc.free(code);

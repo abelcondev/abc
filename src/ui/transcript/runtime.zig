@@ -2400,7 +2400,7 @@ test "nonzero command remains Ran in the current compact projection" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran false") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mfalse\x1b[39m") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ exit code 7"));
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
@@ -2516,7 +2516,7 @@ test "nonzero streamed command reuses its active output block" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran printf lines; exit 7") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "printf lines; exit \x1b[38;5;250m7\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
 
@@ -3077,7 +3077,7 @@ test "historical nonzero command keeps replay ownership outside compact sideband
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ "));
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran false") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mfalse\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ exit code 7") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ … 2 lines more") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ five") == null);

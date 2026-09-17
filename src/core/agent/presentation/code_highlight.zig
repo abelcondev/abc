@@ -1,5 +1,5 @@
 const std = @import("std");
-const shared_theme = @import("../../core/shared/theme.zig");
+const shared_theme = @import("../../shared/theme.zig");
 const languages = @import("code_highlight_languages.zig");
 
 const Allocator = std.mem.Allocator;
@@ -25,15 +25,20 @@ fn paletteForTheme(theme: Theme) Palette {
     };
 }
 
+/// When `base` is set, the span opens with it and every token close restores
+/// it, so untokenized text keeps the caller's ambient color. Null leaves plain
+/// text at the terminal default, as before.
 pub fn highlight(
     alloc: Allocator,
     source: []const u8,
     profile: *const languages.Profile,
     theme: Theme,
+    base: ?[]const u8,
 ) ![]u8 {
     var styled: std.ArrayList(u8) = .empty;
     errdefer styled.deinit(alloc);
     const palette = paletteForTheme(theme);
+    if (base) |base_style| try styled.appendSlice(alloc, base_style);
 
     var index: usize = 0;
     while (index < source.len) {
@@ -43,24 +48,24 @@ pub fn highlight(
             continue;
         }
         if (blockCommentEnd(source, index, profile.block_comment)) |end| {
-            try appendStyled(alloc, &styled, palette.comment_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             index = end;
             continue;
         }
         if (lineCommentEnd(source, index, profile.line_comments)) |end| {
-            try appendStyled(alloc, &styled, palette.comment_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             index = end;
             continue;
         }
         if (isQuote(source[index], profile.quotes)) {
             const end = quotedEnd(source, index);
-            try appendStyled(alloc, &styled, palette.string_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.string_style, source[index..end], base);
             index = end;
             continue;
         }
         if (isNumberStart(source, index)) {
             const end = numberEnd(source, index);
-            try appendStyled(alloc, &styled, palette.number_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
             index = end;
             continue;
         }
@@ -68,9 +73,9 @@ pub fn highlight(
             const end = identifierEnd(source, index);
             const token = source[index..end];
             if (inList(token, profile.keywords, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, palette.keyword_style, token);
+                try appendStyled(alloc, &styled, palette.keyword_style, token, base);
             } else if (inList(token, profile.literals, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, palette.number_style, token);
+                try appendStyled(alloc, &styled, palette.number_style, token, base);
             } else {
                 try styled.appendSlice(alloc, token);
             }
@@ -84,12 +89,13 @@ pub fn highlight(
     return styled.toOwnedSlice(alloc);
 }
 
-fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8) !void {
+fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8, base: ?[]const u8) !void {
     try out.appendSlice(alloc, style);
     try out.appendSlice(alloc, text);
     // Close whatever the slot opened: fg-only slots keep the plain reset,
     // themed slots carrying bold/italic get those reset too.
     try out.appendSlice(alloc, shared_theme.closingFor(style));
+    if (base) |base_style| try out.appendSlice(alloc, base_style);
 }
 
 fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.BlockComment) ?usize {
@@ -204,7 +210,7 @@ fn count(text: []const u8, needle: []const u8) usize {
 test "supported source gains balanced colors without changing code bytes" {
     const alloc = std.testing.allocator;
     const source = "const value = \"const\"; // return\n";
-    const styled = try highlight(alloc, source, languages.resolve("zig").?, .dark);
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .dark, null);
     defer alloc.free(styled);
 
     const plain = try stripAnsi(alloc, styled);
@@ -221,7 +227,7 @@ test "supported source gains balanced colors without changing code bytes" {
 test "light theme uses a readable syntax palette without changing code bytes" {
     const alloc = std.testing.allocator;
     const source = "const value = \"ready\"; // comment\n";
-    const styled = try highlight(alloc, source, languages.resolve("zig").?, .light);
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .light, null);
     defer alloc.free(styled);
 
     const plain = try stripAnsi(alloc, styled);
@@ -267,7 +273,7 @@ test "every registered profile highlights representative source" {
     };
 
     for (cases) |case| {
-        const styled = try highlight(alloc, case.source, languages.resolve(case.label).?, .dark);
+        const styled = try highlight(alloc, case.source, languages.resolve(case.label).?, .dark, null);
         defer alloc.free(styled);
         const plain = try stripAnsi(alloc, styled);
         defer alloc.free(plain);
@@ -279,11 +285,11 @@ test "every registered profile highlights representative source" {
 test "profiles use configured block comments and case-insensitive keywords" {
     const alloc = std.testing.allocator;
     const source = "/* comment */\nSELECT id FROM users\n<!-- note -->";
-    const css = try highlight(alloc, source[0..13], languages.resolve("css").?, .dark);
+    const css = try highlight(alloc, source[0..13], languages.resolve("css").?, .dark, null);
     defer alloc.free(css);
-    const sql = try highlight(alloc, source[14..34], languages.resolve("sql").?, .dark);
+    const sql = try highlight(alloc, source[14..34], languages.resolve("sql").?, .dark, null);
     defer alloc.free(sql);
-    const html = try highlight(alloc, source[35..], languages.resolve("html").?, .dark);
+    const html = try highlight(alloc, source[35..], languages.resolve("html").?, .dark, null);
     defer alloc.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
@@ -301,7 +307,7 @@ test "themed attribute slots close fully without bleeding into later text" {
     custom.syntax.keyword_style = "\x1b[1;38;2;130;210;206m";
     shared_theme.activate(custom);
 
-    const styled = try highlight(alloc, "const x = 1; // note\n", languages.resolve("zig").?, .dark);
+    const styled = try highlight(alloc, "const x = 1; // note\n", languages.resolve("zig").?, .dark, null);
     defer alloc.free(styled);
 
     // Italic comment and bold keyword each close with their attributes reset.
@@ -309,4 +315,15 @@ test "themed attribute slots close fully without bleeding into later text" {
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[1;38;2;130;210;206mconst\x1b[39m\x1b[22m") != null);
     // Nothing stays bold or italic past the final close.
     try std.testing.expect(!std.mem.endsWith(u8, styled, "\x1b[3;38;2;106;153;85m"));
+}
+
+test "base style wraps the span and restores after each token" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, "<base>");
+    defer alloc.free(styled);
+
+    // The span opens with the base, and every token close re-establishes it.
+    try std.testing.expect(std.mem.startsWith(u8, styled, "<base>echo "));
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m42\x1b[39m<base>") != null);
 }
