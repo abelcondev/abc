@@ -13,6 +13,13 @@
 
 fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
+## Highlights
+
+- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
+- **Shell-like output:** inline rendering that preserves your terminal scrollback
+- **Extensible:** skills, MCP servers, and subagents
+
 ## Install
 
 ```bash
@@ -71,10 +78,6 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
-
-## MCP forms
-
-In the interactive shell, an MCP form with a single select-one field and up to three options submits in the same prompt; every other form keeps a separate review step. See [MCP](https://fx.sh/docs/capabilities/mcp) for server setup.
 
 ## Themes
 
