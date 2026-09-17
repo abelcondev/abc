@@ -626,7 +626,7 @@ pub const Runtime = struct {
                     .{ if (metadata != null) "ready_hit" else "missing_entry", model },
                 );
                 if (metadata == null) {
-                    diagnostics.recordModelCatalogEvent(true, "lookup", "outcome=missing_entry model={s}", .{model});
+                    diagnostics.recordModelCatalogEvent(false, "lookup", "outcome=missing_entry model={s}", .{model});
                 }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
@@ -1765,8 +1765,10 @@ test "model cache request resolution records lookup misses for the trace report"
     const count = diagnostics.snapshotModelCatalogEvents(&events);
     try std.testing.expectEqual(@as(usize, 3), count);
     try std.testing.expectEqualStrings("lookup", events[0].name());
-    try std.testing.expect(events[0].failed);
+    try std.testing.expect(!events[0].failed);
     try std.testing.expectEqualStrings("outcome=missing_entry model=zai/glm-5.2", events[0].detail());
+    try std.testing.expect(events[1].failed);
+    try std.testing.expect(events[2].failed);
     try std.testing.expectEqualStrings("outcome=cache_failed model=zai/glm-5.2", events[1].detail());
     try std.testing.expectEqualStrings("outcome=cache_unavailable model=zai/glm-5.2", events[2].detail());
 }
