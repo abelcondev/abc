@@ -1622,14 +1622,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     await session.waitForText("Unable to verify image support for this model", TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(0);
 
+    // The notice text wraps unpredictably across terminal widths, so wait for
+    // the report file itself instead of a pane string.
     await session.sendText("/trace");
-    await session.waitForText("Review and redact it before sharing", TIMEOUT);
+    const rootDir = root;
+    await waitForCondition(
+      () => readdirSync(rootDir).some((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md")),
+      "trace report file",
+    );
 
-    const reports = readdirSync(root)
+    const reports = readdirSync(rootDir)
       .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
       .sort();
     expect(reports).toHaveLength(1);
-    const report = readFileSync(join(root, reports[0]!), "utf8");
+    const report = readFileSync(join(rootDir, reports[0]!), "utf8");
 
     const catalog = report.split("## Model Catalog")[1]?.split("\n## ")[0] ?? "";
     expect(catalog).toContain("state=failed");
