@@ -2446,7 +2446,7 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
                 turn,
-                .strict,
+                .finished_prompt,
                 finished.snapshot_file_ownership,
             );
         }
@@ -2634,6 +2634,11 @@ pub fn Runtime(comptime App: type) type {
         const AppendHistoryMode = enum {
             strict,
             visual_epoch,
+            /// A rendered, user-visible finished turn. A validation or commit
+            /// failure must not take the session down: commit in memory, warn,
+            /// and keep the process alive. `SessionPersistenceUncertain` still
+            /// propagates, because the write may have partially landed.
+            finished_prompt,
         };
 
         fn appendHistoryTurnWithPendingPresentation(
@@ -2758,7 +2763,9 @@ pub fn Runtime(comptime App: type) type {
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
                 return switch (mode) {
-                    .strict => err,
+                    // In-memory preparation failure (out of memory) cannot be
+                    // degraded: the in-memory commit needs the prepared copy.
+                    .strict, .finished_prompt => err,
                     .visual_epoch => .uncommitted,
                 };
             };
@@ -2796,34 +2803,56 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const first_work = app.session_persistence.remember_fresh_session and !hasDurableUserWork(loaded);
-            try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            _ = loaded.appendEvent(
-                app.alloc,
-                .{ .history_turn_committed = .{
-                    .conversation_language = app.session.languageSnapshot(),
-                    .total_input_tokens = app.total_input_tokens,
-                    .total_output_tokens = app.total_output_tokens,
-                    .turn = prepared,
-                } },
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                if (err == error.SessionPersistenceUncertain) {
-                    if (snapshot_file_ownership) |ownership| ownership.transfer();
-                    return err;
-                }
-                return switch (mode) {
-                    .strict => err,
-                    .visual_epoch => blk: {
-                        debug_trace.logf(
-                            "session",
-                            "visual epoch history not committed err={s}",
-                            .{@errorName(err)},
-                        );
-                        break :blk .uncommitted;
-                    },
-                };
+            var persistence_failure: ?anyerror = null;
+            loaded.prepareHistoryTurnForCommit(app.alloc, &prepared) catch |err| {
+                if (mode == .finished_prompt and err != error.SessionPersistenceUncertain) {
+                    persistence_failure = err;
+                } else return err;
             };
-            if (first_work) {
+            if (persistence_failure == null) {
+                _ = loaded.appendEvent(
+                    app.alloc,
+                    .{ .history_turn_committed = .{
+                        .conversation_language = app.session.languageSnapshot(),
+                        .total_input_tokens = app.total_input_tokens,
+                        .total_output_tokens = app.total_output_tokens,
+                        .turn = prepared,
+                    } },
+                    io_mod.milliTimestamp(),
+                ) catch |err| {
+                    if (err == error.SessionPersistenceUncertain) {
+                        if (snapshot_file_ownership) |ownership| ownership.transfer();
+                        return err;
+                    }
+                    switch (mode) {
+                        .strict => return err,
+                        .visual_epoch => {
+                            debug_trace.logf(
+                                "session",
+                                "visual epoch history not committed err={s}",
+                                .{@errorName(err)},
+                            );
+                            return .uncommitted;
+                        },
+                        .finished_prompt => persistence_failure = err,
+                    }
+                };
+            }
+            if (persistence_failure) |err| {
+                // The turn already rendered. Keep the session alive and coherent
+                // in memory, record the failure for shutdown reporting, and warn
+                // instead of taking the process down.
+                recordShutdownFailure(app, err);
+                if (comptime @hasDecl(App, "writeDomainNotice")) {
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                        .{@errorName(err)},
+                    );
+                    defer app.alloc.free(body);
+                    app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                }
+            } else if (first_work) {
                 app.session_persistence.remember_fresh_session = false;
                 remember_failure = rememberSession(app, loaded.active_id);
             }
@@ -9675,6 +9704,80 @@ test "appendFinishedPrompt does not transfer snapshot ownership when history ins
 
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 0), probe.transfers);
+}
+
+test "appendFinishedPrompt keeps the session alive when the turn cannot be saved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // A finished turn whose file evidence carries an empty path: the
+    // conversation validator rejects the write with InvalidConversationEvent.
+    var evidence = [_]types.FileEvidence{.{
+        .path = @constCast(""),
+        .tool_call_id = @constCast("call_poison"),
+        .tool_name = @constCast("grep_files"),
+        .action = .search,
+        .status = .success,
+    }};
+    const poisoned = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("done"),
+        .execution = .{ .files = evidence[0..] },
+    } };
+
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = poisoned });
+
+    // The turn stays in memory and the process keeps running.
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    // The failure is latched for shutdown reporting.
+    try std.testing.expectEqual(
+        @as(?anyerror, error.InvalidConversationEvent),
+        app.session_persistence.shutdown_failure,
+    );
+    // The user sees a warning instead of a disappearing process.
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, app.notices.items[0], "could not save") != null);
+
+    // Nothing of the rejected turn reached the journal.
+    {
+        var loaded = try app.session_persistence.store.?.loadReadOnly(
+            alloc,
+            app.session_persistence.writable.?.active_id,
+        );
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), loaded.history.len);
+    }
+
+    // A later clean turn still persists; the writer is not latched shut.
+    const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
+    defer session_runtime.freeHistoryTurn(alloc, clean);
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = clean });
+
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    var loaded = try app.session_persistence.store.?.loadReadOnly(
+        alloc,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try std.testing.expectEqualStrings("next", loaded.history[0].assistant.user.text);
 }
 
 test "visual epoch history append reports committed without persistence" {
