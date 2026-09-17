@@ -407,18 +407,23 @@ function serveFakeGateway(
           body: await req.text(),
           headers: new Headers(req.headers),
         });
+        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
+        // usage and confidence under providerMetadata.typesafe.
         const evaluationResponse = options.evaluationResponse ??
           Response.json({
-            model: "jev-1.13.0",
             answers: {
               decision: {
                 type: "choice",
                 choice: "clear",
                 probabilities: { clear: 0.99, caution: 0.01 },
-                confidence: 0.97,
               },
             },
-            usage: { input_tokens: 100, output_tokens: 10 },
+            rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+            usage: { inputTokens: 100, outputTokens: 10 },
+            warnings: [],
+            providerMetadata: {
+              typesafe: { confidence: { decision: 0.97 } },
+            },
           });
         return typeof evaluationResponse === "function"
           ? await evaluationResponse(evaluationRequests[evaluationRequests.length - 1].body)

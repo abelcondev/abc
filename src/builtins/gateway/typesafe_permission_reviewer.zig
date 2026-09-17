@@ -239,6 +239,23 @@ fn parseJevDecision(alloc: Allocator, body: []const u8) error{ Malformed, OutOfM
         return error.Malformed;
     var result = JevDecision{ .decision = if (choice.len == 5) "clear" else "caution" };
     if (decision_answer.object.get("confidence")) |confidence| result.confidence = numberValue(confidence);
+    // The gateway envelope carries per-question confidence under
+    // providerMetadata instead of inside the answer.
+    if (result.confidence == null) {
+        if (root.object.get("providerMetadata")) |metadata| {
+            if (metadata == .object) {
+                if (metadata.object.get("typesafe")) |typesafe| {
+                    if (typesafe == .object) {
+                        if (typesafe.object.get("confidence")) |confidence| {
+                            if (confidence == .object) {
+                                if (confidence.object.get("decision")) |value| result.confidence = numberValue(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (decision_answer.object.get("probabilities")) |probabilities| {
         if (probabilities == .object) {
             if (probabilities.object.get("clear")) |value| result.p_clear = numberValue(value);
@@ -247,10 +264,12 @@ fn parseJevDecision(alloc: Allocator, body: []const u8) error{ Malformed, OutOfM
     }
     if (root.object.get("usage")) |usage| {
         if (usage == .object) {
-            if (usage.object.get("input_tokens")) |value| {
+            // TypeSafe direct uses snake_case; the gateway envelope uses
+            // camelCase.
+            if (usage.object.get("input_tokens") orelse usage.object.get("inputTokens")) |value| {
                 if (value == .integer) result.input_tokens = @intCast(value.integer);
             }
-            if (usage.object.get("output_tokens")) |value| {
+            if (usage.object.get("output_tokens") orelse usage.object.get("outputTokens")) |value| {
                 if (value == .integer) result.output_tokens = @intCast(value.integer);
             }
         }
@@ -452,6 +471,24 @@ test "jev decision parsing maps a valid clear answer" {
     defer alloc.free(args);
     try std.testing.expect(std.mem.find(u8, args, "\"decision\":\"clear\"") != null);
     try std.testing.expect(std.mem.find(u8, args, "p_clear=0.990") != null);
+}
+
+test "jev decision parsing reads the gateway envelope" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"answers":{"decision":{"type":"choice","choice":"caution","probabilities":{"clear":0.03,"caution":0.97}}},"rounding":{"probabilityDecimals":2,"scoreDecimals":2},"usage":{"inputTokens":350,"outputTokens":39},"warnings":[],"providerMetadata":{"typesafe":{"confidence":{"decision":0.94}}},"gateway":{"routing":{"resolvedProvider":"typesafe-ai"},"cost":"0.0000147","generationId":"gen_test"}}
+    ;
+    const jev = try parseJevDecision(alloc, body);
+    try std.testing.expectEqualStrings("caution", jev.decision);
+    try std.testing.expectApproxEqAbs(0.97, jev.p_caution.?, 0.001);
+    try std.testing.expectApproxEqAbs(0.94, jev.confidence.?, 0.001);
+    try std.testing.expectEqual(@as(?u64, 350), jev.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 39), jev.output_tokens);
+
+    const args = try decisionArgumentsJson(alloc, jev);
+    defer alloc.free(args);
+    try std.testing.expect(std.mem.find(u8, args, "\"decision\":\"caution\"") != null);
+    try std.testing.expect(std.mem.find(u8, args, "confidence=0.940") != null);
 }
 
 test "jev decision parsing rejects malformed and out-of-contract bodies" {
