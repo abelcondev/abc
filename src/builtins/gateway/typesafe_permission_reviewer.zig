@@ -44,6 +44,8 @@ const Config = struct {
     /// True when the request goes to the gateway evaluation-model endpoint
     /// with gateway credentials and protocol headers instead of TypeSafe direct.
     via_gateway: bool = false,
+    /// Gateway team selector forwarded on gateway-routed requests.
+    gateway_team: ?[]const u8 = null,
 };
 
 const Route = struct {
@@ -124,6 +126,7 @@ pub fn review(
         .endpoint = route.endpoint,
         .cancel_flag = input.cancel_flag,
         .via_gateway = route.via_gateway,
+        .gateway_team = input.tenant,
     };
     debug_trace.logf("permission", "event=auto_review_typesafe_selected endpoint={s} via_gateway={}", .{ config.endpoint, route.via_gateway });
     return permission_auto_classifier.Reviewer.withTransportModel(.{
@@ -321,10 +324,18 @@ fn sendReview(
     const auth_header = std.fmt.allocPrint(alloc, "Bearer {s}", .{config.api_key}) catch |err| return err;
     defer alloc.free(auth_header);
 
-    const gateway_extra = [_]std.http.Header{
-        .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-        .{ .name = "ai-language-model-id", .value = gateway_model_id },
-    };
+    var extra_buf: [3]std.http.Header = undefined;
+    var extra_len: usize = 0;
+    if (config.via_gateway) {
+        extra_buf[extra_len] = .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .name = "ai-language-model-id", .value = gateway_model_id };
+        extra_len += 1;
+        if (config.gateway_team) |team| {
+            extra_buf[extra_len] = .{ .name = "x-vercel-ai-gateway-team", .value = team };
+            extra_len += 1;
+        }
+    }
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -341,7 +352,7 @@ fn sendReview(
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,
         },
-        .extra_headers = if (config.via_gateway) &gateway_extra else &.{},
+        .extra_headers = extra_buf[0..extra_len],
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     }) catch |err| {
@@ -625,7 +636,7 @@ test "gateway transport posts to the evaluation-model endpoint with protocol hea
     defer server.deinit();
     try server.start();
     var cancel = std.atomic.Value(bool).init(false);
-    var config = Config{ .api_key = "gw-key", .endpoint = server.url, .via_gateway = true };
+    var config = Config{ .api_key = "gw-key", .endpoint = server.url, .via_gateway = true, .gateway_team = "test-team" };
     const outcome = try sendReview(@ptrCast(&config), alloc, gateway_model_id, "{}", .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(5000) }), &cancel);
     switch (outcome) {
         .completion => |owned| {
@@ -641,4 +652,5 @@ test "gateway transport posts to the evaluation-model endpoint with protocol hea
     try std.testing.expect(std.mem.find(u8, head, "authorization: Bearer gw-key") != null);
     try std.testing.expect(std.mem.find(u8, head, "ai-gateway-protocol-version: 0.0.1") != null);
     try std.testing.expect(std.mem.find(u8, head, "ai-language-model-id: typesafe-ai/jev") != null);
+    try std.testing.expect(std.mem.find(u8, head, "x-vercel-ai-gateway-team: test-team") != null);
 }
