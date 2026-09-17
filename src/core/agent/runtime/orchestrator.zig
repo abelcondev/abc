@@ -4770,9 +4770,6 @@ fn pushUnsafeNoRetryStatus(
     });
 }
 
-/// A turn that can never recover hands the user's prompt back to the composer
-/// so nothing typed is lost. Only genuine user turns restore: resumed recovery
-/// jobs and subagent turns keep their own state.
 // Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
 // negative under NTP correction; a backward step reads as zero elapsed,
 // never a trap.
@@ -4791,6 +4788,9 @@ test "recoveryElapsedNs clamps backward wall-clock steps" {
     try std.testing.expect(elapsed <= 3_000 * std.time.ns_per_ms);
 }
 
+/// A turn that can never recover hands the user's prompt back to the composer
+/// so nothing typed is lost. Only genuine user turns restore: resumed recovery
+/// jobs and subagent turns keep their own state.
 fn restorePromptAfterTerminalFailure(
     deps: *const AgentRuntimeDeps,
     job: QueuedPrompt,
@@ -4807,9 +4807,9 @@ fn restorePromptAfterTerminalFailure(
 }
 
 // A user-cancelled turn's durable checkpoint dies with it; otherwise the next
-// resume would auto-continue a turn the user explicitly stopped. Runs on every
-// cancel path, including a cancel during the episode's first retry wait, and
-// no-ops when no checkpoint exists.
+// resume would auto-continue a turn the user explicitly stopped. Covers the
+// model-response cancel paths, including a cancel during an episode's first
+// retry wait; no-ops when no checkpoint exists.
 fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
     const effect = deps.recovery_checkpoint orelse return;
     effect.clear(deps.ctx) catch |err| {
