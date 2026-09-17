@@ -146,7 +146,8 @@ tmuxTest("native-clear replay settles a complete paste before the next key", asy
   expect(readFileSync(stderr_path, "utf8")).toBe("");
 }, 30_000);
 
-tmuxTest("tmux leaves native-clear probing disabled and preserves ordinary input", async () => {  const dir = mkdtempSync(join(tmpdir(), "fx-native-clear-tmux-"));
+tmuxTest("tmux leaves native-clear probing disabled and preserves ordinary input", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-native-clear-tmux-"));
   temp_dirs.push(dir);
   const trace_path = join(dir, "trace.log");
   const stderr_path = join(dir, "stderr.log");
@@ -218,17 +219,18 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
     await session.sendKeys("C-o");
     await session.waitForText("ctrl+o close", 10_000);
     await session.sendLiteral("j");
-    await new Promise((resolve) => setTimeout(resolve, 750));
+
+    // The typed byte still reaches the composer through the modal fallthrough.
+    // Waiting for it first proves the byte traversed the input path while the
+    // transcript owned the screen, so the no-probe assertion needs no sleep.
+    await session.sendKeys("C-o");
+    await session.waitForPane((pane) => composerContains(pane, "aj"), 10_000);
 
     const trace = readFileSync(trace_path, "utf8");
     const requests = trace.split("native_clear_probe requested").length - 1;
     expect(requests).toBe(baseline_requests);
     expect(trace).not.toContain("native_clear_probe mismatch");
     expect(trace).not.toContain("native_clear_recovery_requested");
-
-    // The typed byte still reaches the composer through the modal fallthrough.
-    await session.sendKeys("C-o");
-    await session.waitForPane((pane) => composerContains(pane, "aj"), 10_000);
     expect(readFileSync(stderr_path, "utf8")).toBe("");
   } finally {
     gateway.stop();
