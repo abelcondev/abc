@@ -2424,17 +2424,22 @@ pub fn permissionTargetResolutionFailureMessage(
 
 /// Best-effort extraction of the path the caller asked for, so the failure
 /// names the exact argument the model can correct. Falls back to no path when
-/// the arguments do not carry one; the base message still applies.
+/// the arguments do not carry one; the base message still applies. File tools
+/// resolve their `path` argument, command tools resolve `cwd`; each prefers
+/// its own key so a stray extra key cannot misname the argument that failed.
 fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    if (tool_args.optionalStringArg(args, "path")) |path| {
-        if (path.len > 0) return path;
+    const is_file_tool = permissions.allowsExternalPath(call.name);
+    const primary_key: []const u8 = if (is_file_tool) "path" else "cwd";
+    const secondary_key: []const u8 = if (is_file_tool) "cwd" else "path";
+    if (tool_args.optionalStringArg(args, primary_key)) |primary| {
+        if (primary.len > 0) return primary;
     }
-    if (tool_args.optionalStringArg(args, "cwd")) |cwd| {
-        if (cwd.len > 0) return cwd;
+    if (tool_args.optionalStringArg(args, secondary_key)) |secondary| {
+        if (secondary.len > 0) return secondary;
     }
     return null;
 }
@@ -2610,6 +2615,22 @@ test "permission target failures name the unresolved path without hiding runtime
     };
     const cwd_failure = (try permissionTargetResolutionFailureMessage(arena, command_call, error.FileNotFound)).?;
     try std.testing.expectEqualStrings("Path not found: gone/dir", cwd_failure);
+
+    const mixed_command_call: ToolCall = .{
+        .id = "command_both_keys",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"ls\",\"path\":\"decoy\",\"cwd\":\"gone/dir\"}",
+    };
+    const mixed_command_failure = (try permissionTargetResolutionFailureMessage(arena, mixed_command_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: gone/dir", mixed_command_failure);
+
+    const mixed_file_call: ToolCall = .{
+        .id = "file_both_keys",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"missing/dir\",\"cwd\":\"decoy\"}",
+    };
+    const mixed_file_failure = (try permissionTargetResolutionFailureMessage(arena, mixed_file_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: missing/dir", mixed_file_failure);
 
     const no_path_call: ToolCall = .{ .id = "no_path", .name = "grep_files", .arguments_json = "{\"pattern\":\"x\"}" };
     const bare_failure = (try permissionTargetResolutionFailureMessage(arena, no_path_call, error.FileNotFound)).?;
