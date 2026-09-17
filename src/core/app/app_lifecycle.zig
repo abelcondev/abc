@@ -686,11 +686,14 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         io_mod.getenv("TERM_PROGRAM"),
     );
     ui_render.setTruecolorSupport(truecolor);
-    // Theme selection: FX_THEME wins over the settings "theme" key. light/dark
-    // pin the builtin variant and skip the OSC 11 probe; any other value names
-    // a theme file under ~/.fx/themes.
-    const env_theme = io_mod.getenv("FX_THEME");
-    const configured_theme = if (env_theme) |value| (if (value.len > 0) value else null) else state.theme;
+    // Theme selection: FX_THEME wins over the settings "theme" key; an empty
+    // FX_THEME counts as unset per the codebase convention. light/dark pin the
+    // builtin variant and skip the OSC 11 probe; any other value names a theme
+    // file under ~/.fx/themes.
+    var configured_theme: ?[]const u8 = state.theme;
+    if (io_mod.getenv("FX_THEME")) |value| {
+        if (value.len > 0) configured_theme = value;
+    }
     if (if (configured_theme) |value| shared_theme.classifyValue(value) else null) |choice| {
         switch (choice) {
             .pin_light, .pin_dark => {
@@ -699,7 +702,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
                 ui_render.initTheme(light, null);
             },
             .custom => |name| {
-                shared_theme.setSource(name, null);
+                shared_theme.setSource(name, false);
                 const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
                 const custom_theme = shared_theme.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
                     debug_trace.logf("theme", "custom_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
@@ -713,7 +716,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             },
         }
     } else {
-        shared_theme.setSource(null, null);
+        shared_theme.setSource(null, false);
         const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
         ui_render.initTheme(detected.light, detected.rgb);
     }

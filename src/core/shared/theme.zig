@@ -175,20 +175,35 @@ pub fn classifyValue(value: []const u8) ?ThemeChoice {
 /// Where the active theme came from: the configured custom theme file key (so
 /// live terminal flips can re-resolve it), and whether a light/dark variant is
 /// pinned by configuration. Recorded once at startup by the app lifecycle.
-var source_name: ?[]const u8 = null;
-var pinned_variant: ?bool = null;
+/// The name is copied into bounded internal storage: callers never donate
+/// memory, and the bound matches loadNamed's validation.
+var source_name_buf: [64]u8 = undefined;
+var source_name_len: usize = 0;
+var source_name_set: bool = false;
+var variant_pinned: bool = false;
 
-pub fn setSource(name: ?[]const u8, pinned: ?bool) void {
-    source_name = name;
-    pinned_variant = pinned;
+pub fn setSource(name: ?[]const u8, pinned: bool) void {
+    source_name_set = false;
+    source_name_len = 0;
+    if (name) |value| {
+        if (value.len <= source_name_buf.len) {
+            @memcpy(source_name_buf[0..value.len], value);
+            source_name_len = value.len;
+            source_name_set = true;
+        } else {
+            debug_trace.logf("theme", "theme_source_name_too_long len={d}", .{value.len});
+        }
+    }
+    variant_pinned = pinned;
 }
 
 pub fn sourceName() ?[]const u8 {
-    return source_name;
+    if (!source_name_set) return null;
+    return source_name_buf[0..source_name_len];
 }
 
 pub fn variantPinned() bool {
-    return pinned_variant != null;
+    return variant_pinned;
 }
 
 // --- Hex colors and terminal capability resolution ---
@@ -1073,14 +1088,24 @@ test "classifyValue maps configured theme values" {
     try std.testing.expectEqualStrings("cursor-dark", classifyValue("cursor-dark").?.custom);
 }
 
-test "theme source records the configured name and pin for live re-resolution" {
-    defer setSource(null, null);
+test "theme source copies the configured name and pin for live re-resolution" {
+    defer setSource(null, false);
     try std.testing.expect(sourceName() == null);
     try std.testing.expect(!variantPinned());
-    setSource("cursor-dark", null);
+
+    // The donor buffer may be freed right after setSource; the source state
+    // must not dangle (startup state is deinited before the event loop).
+    const donated = try std.testing.allocator.dupe(u8, "cursor-dark");
+    setSource(donated, false);
+    std.testing.allocator.free(donated);
     try std.testing.expectEqualStrings("cursor-dark", sourceName().?);
     try std.testing.expect(!variantPinned());
+
     setSource(null, true);
     try std.testing.expect(sourceName() == null);
     try std.testing.expect(variantPinned());
+
+    const too_long = "x" ** 65;
+    setSource(too_long, false);
+    try std.testing.expect(sourceName() == null);
 }
