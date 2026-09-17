@@ -72,6 +72,10 @@ pub const StreamChunkContext = struct {
     first_model_output_at_ms: ?i64 = null,
     markdown: assistant_presentation.MarkdownProcessor = .{},
     raw_text: std.ArrayList(u8) = .empty,
+    /// Every streamed byte counts as progress for the stall detector: text,
+    /// reasoning, and tool-input chunks alike. A turn composing one large
+    /// tool call must not read as zero progress.
+    streamed_output_bytes: usize = 0,
     interrupted_source: std.ArrayList(u8) = .empty,
     response_started: bool = false,
     published_phase: ?types.TurnPhase = null,
@@ -157,6 +161,7 @@ pub const StreamChunkContext = struct {
         self.saw_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
+        self.streamed_output_bytes = 0;
         self.published_phase = null;
     }
 
@@ -230,6 +235,7 @@ pub const StreamChunkContext = struct {
 pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.markModelOutput();
+    stream_ctx.streamed_output_bytes += chunk.len;
     publishTurnPhase(stream_ctx, .generating);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeContent(chunk)) catch |err| {
@@ -245,6 +251,7 @@ pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
 pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.markModelOutput();
+    stream_ctx.streamed_output_bytes += chunk.len;
     publishTurnPhase(stream_ctx, .thinking);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeReasoning(chunk)) catch |err| {
@@ -273,6 +280,7 @@ pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase)
 
 pub fn onStreamToolInputChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    stream_ctx.streamed_output_bytes += chunk.len;
     publishTurnPhase(stream_ctx, .running);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeToolInput(chunk)) catch |err| {

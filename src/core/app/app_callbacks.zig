@@ -335,6 +335,7 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.writable != null)
                         .{
                             .set = agentSetRecoveryCheckpoint,
+                            .clear = agentClearRecoveryCheckpoint,
                         }
                     else
                         null
@@ -349,6 +350,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_interactive_notice = agentPushInteractiveNotice,
                 .push_context_notice = agentPushContextNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
+                .restore_failed_prompt = agentRestoreFailedPrompt,
                 .push_command_output_complete = agentPushCommandOutputComplete,
                 .push_http_error = agentPushHttpError,
                 .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
@@ -1176,6 +1178,11 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
         }
 
+        fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
+        }
+
         fn agentPersistUsageCheckpoint(
             ctx: *anyopaque,
             snapshot: session_usage.Snapshot,
@@ -1280,6 +1287,12 @@ pub fn Bindings(comptime App: type) type {
         fn agentPushRouteRecoveryStatus(ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .route_recovery_status = status });
+        }
+
+        fn agentRestoreFailedPrompt(ctx: *anyopaque, prompt: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            // pushEvent copies the payload into the queue's ownership.
+            try app_worker_runtime.Runtime(App).pushEvent(app, .{ .restore_failed_prompt = @constCast(prompt) });
         }
 
         fn agentPushCommandOutputComplete(ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {

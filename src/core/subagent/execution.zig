@@ -612,6 +612,21 @@ pub const TurnContext = struct {
             else => return error.SessionCommitFailed,
         };
     }
+
+    pub fn clearRecoveryCheckpoint(
+        self: *TurnContext,
+        timestamp_ms: i64,
+    ) CommitError!void {
+        if (self.loaded.state.recovery_checkpoint == null) return;
+        _ = self.loaded.appendEvent(
+            self.alloc,
+            .{ .recovery_checkpoint_cleared = .{} },
+            timestamp_ms,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.SessionCommitFailed,
+        };
+    }
 };
 
 pub fn failureDiagnosticValue(code: []const u8, detail: []const u8) types.ModelFailureDiagnostic {
