@@ -1021,7 +1021,13 @@ fn connectServerBounded(
             control,
         ) catch |err| {
             server.tool_catalog.deinit(alloc);
-            server.disconnect();
+            // A cancelled startup has no session state to flush; kill the
+            // child immediately so shutdown cannot stall in grace windows.
+            if (err == error.Cancelled) {
+                server.disconnectImmediate();
+            } else {
+                server.disconnect();
+            }
             if (server.restart_attempts >= server.config.restart_limit) return err;
             server.restart_attempts += 1;
             debug_trace.logf(

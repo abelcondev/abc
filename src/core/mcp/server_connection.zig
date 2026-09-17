@@ -52,6 +52,13 @@ pub const DetachedTransport = struct {
         if (self.legacy_sse) |client| client.deinit();
         self.* = undefined;
     }
+
+    pub fn deinitImmediate(self: *DetachedTransport) void {
+        if (self.dispatcher) |dispatcher| dispatcher.deinitImmediate();
+        if (self.legacy_http) |client| client.deinit();
+        if (self.legacy_sse) |client| client.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const Server = struct {
@@ -205,6 +212,15 @@ pub const Server = struct {
         detached.deinit(true);
     }
 
+    /// Teardown after a cancelled startup: the handshake never completed, so
+    /// there is no session state to flush and no reason to wait out the
+    /// graceful termination windows.
+    pub fn disconnectImmediate(self: *Server) void {
+        self.stopToolSubscription();
+        var detached = self.detachTransport();
+        detached.deinitImmediate();
+    }
+
     pub fn detachTransport(self: *Server) DetachedTransport {
         const detached = DetachedTransport{
             .dispatcher = self.dispatcher,
@@ -295,24 +311,32 @@ pub const DetachedConnection = struct {
     tool_subscription: ?*tool_subscription.State,
 
     pub fn deinit(self: *DetachedConnection, alloc: Allocator) void {
-        self.deinitWithDispatcherMode(alloc, true);
+        self.deinitWithDispatcherMode(alloc, .forced);
     }
 
     pub fn deinitGracefully(self: *DetachedConnection, alloc: Allocator) void {
-        self.deinitWithDispatcherMode(alloc, false);
+        self.deinitWithDispatcherMode(alloc, .graceful);
     }
+
+    /// Process-exit teardown: kill the stdio child immediately instead of
+    /// waiting out the stdin-close and SIGTERM grace windows.
+    pub fn deinitImmediate(self: *DetachedConnection, alloc: Allocator) void {
+        self.deinitWithDispatcherMode(alloc, .immediate);
+    }
+
+    const DispatcherShutdown = enum { graceful, forced, immediate };
 
     fn deinitWithDispatcherMode(
         self: *DetachedConnection,
         alloc: Allocator,
-        force_dispatcher_shutdown: bool,
+        dispatcher_shutdown: DispatcherShutdown,
     ) void {
         if (self.tool_subscription) |subscription| subscription.stopAndDestroy();
         if (self.dispatcher) |dispatcher| {
-            if (force_dispatcher_shutdown) {
-                dispatcher.deinitForced();
-            } else {
-                dispatcher.deinit();
+            switch (dispatcher_shutdown) {
+                .forced => dispatcher.deinitForced(),
+                .graceful => dispatcher.deinit(),
+                .immediate => dispatcher.deinitImmediate(),
             }
         }
         if (self.legacy_http) |client| client.deinit();
