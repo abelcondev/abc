@@ -1457,11 +1457,18 @@ fn openConversationWritableSession(
             snapshot_writer = null;
             source.?.deinit(alloc);
             source = null;
+            if (err == error.OutOfMemory) {
+                event_file.close(io_mod.getIo());
+                return err;
+            }
             if (used_cache) {
                 // A cache-backed scan failure is a cache problem, not a log
                 // problem: drop the cache and retry from the raw log once.
+                // The scan state observed partial cache frames, so it must be
+                // reset or the retry's first log frame fails seq continuity.
                 debug_trace.logf("session", "history cache scan rejected id={s} err={s}; rebuilding from log", .{ writable.session_id, @errorName(err) });
                 history_snapshot.deleteForRebuild(&writable.dir);
+                replay_scan = .{};
                 continue;
             }
             event_file.close(io_mod.getIo());
@@ -1596,15 +1603,6 @@ const HistoryFrameSource = struct {
         return source;
     }
 
-    /// Wraps an already-verified snapshot (the writable open verifies once and
-    /// shares the result between the writer scan and the state load).
-    fn fromVerified(verified: history_snapshot.Verified, log_file: std.Io.File, log_length: u64) HistoryFrameSource {
-        var source = HistoryFrameSource{ .log_file = log_file, .log_length = log_length, .verified = verified };
-        source.cursor = .{ .file = verified.file, .frames = verified.frames };
-        source.log_next = verified.covered_log_bytes;
-        return source;
-    }
-
     fn deinit(self: *HistoryFrameSource, alloc: Allocator) void {
         if (self.verified) |*verified| verified.deinit(alloc);
         self.* = undefined;
@@ -1652,6 +1650,7 @@ const HistoryFrameSource = struct {
     fn reset(self: *HistoryFrameSource) void {
         if (self.verified != null) self.cursor.reset();
         self.reader = null;
+        self.last_frame_snapshot_file_offset = null;
         self.refresh() catch {};
         self.log_next = self.coveredLogBytes();
     }
@@ -1922,7 +1921,12 @@ pub fn loadConversationArchive(
             break :blk null;
         };
         if (opened) |with_cache| {
-            if (with_cache.verified != null) source = with_cache;
+            if (with_cache.verified != null) {
+                // Keep the load bounded at open time, matching the raw-log path.
+                var bounded = with_cache;
+                bounded.limit = length;
+                source = bounded;
+            }
         }
     }
     defer source.deinit(alloc);
@@ -6304,6 +6308,41 @@ test "history snapshot cache builds on writable resume and replays identically" 
     try expectSameHistory(snapshot_history, fourth.state.history[0..2]);
     try std.testing.expectEqualStrings("mirror question", fourth.state.history[2].assistant.user.text);
     try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+}
+
+test "history snapshot resume reads cached content over a middle-rewritten log" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    const id = "snapshot-consumed";
+    try buildTwoTurnSession(alloc, &temp, id);
+
+    var first = try temp.root.resumeForWrite(alloc, id, .{});
+    first.deinit(alloc);
+    try std.testing.expect(try cacheFileExists(alloc, &temp, id));
+
+    // Rewrite a middle log line in place, preserving total length and the
+    // final line: the watermark cannot see it, and this test pins that a
+    // verified cache serves its own content for the covered prefix.
+    {
+        const sessions = try profile_paths.sessionsDir(alloc, temp.home);
+        defer alloc.free(sessions);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, "events.jsonl" });
+        defer alloc.free(path);
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
+        defer file.close(io_mod.getIo());
+        const len = try file.length(io_mod.getIo());
+        const bytes = try alloc.alloc(u8, @intCast(len));
+        defer alloc.free(bytes);
+        _ = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
+        const at = std.mem.find(u8, bytes, "first question").?;
+        @memcpy(bytes[at..][0.."first question".len], "first qu3stion");
+        try file.writePositionalAll(io_mod.getIo(), bytes, 0);
+    }
+
+    var second = try temp.root.resumeForWrite(alloc, id, .{});
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("first question", second.state.history[0].assistant.user.text);
 }
 
 test "history snapshot tolerates torn cache tails and spliced log growth" {

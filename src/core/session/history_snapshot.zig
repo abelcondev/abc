@@ -19,8 +19,9 @@
 //!   schema contract) plus a cache format version; a bump of either
 //!   invalidates older caches instead of misparsing them. Payload edits that
 //!   keep the log schema must bump the cache format version.
-//! * The cache is written only on writable session opens (turn commits and the
-//!   open-time scan tee). Read-only loads use it but never create it.
+//! * The cache is written only by the open-time scan tee on writable session
+//!   opens; nothing appends at commit time. Read-only loads use it but never
+//!   create it.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -33,7 +34,7 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 pub const file_name = "history-cache.bin";
 
-const magic = "fx-history-cache\x1a\n"; // 17 bytes
+const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
 const format_version: u16 = 1;
 /// Frames carry 32-bit lengths; a single log line can be large (embedded tool
 /// output), so the cap stays generous. Anything larger is a corrupt cache.
@@ -255,18 +256,10 @@ fn freeAny(alloc: Allocator, comptime T: type, value: T) void {
 }
 
 // ---------------------------------------------------------------------------
-// Schema fingerprint
-//
-// A comptime hash over the transitive field layout of ConversationEnvelope.
-// Any added, removed, renamed, or retyped field — here or in the shared types
-// the events reference — changes the fingerprint and invalidates old caches.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Frame layout
 //
-// header: magic ++ u16 version ++ u64 schema fingerprint ++ u32 session id
-//         length ++ session id bytes
+// header: magic ++ u64 cache format version ++ u64 conversation schema
+//         version ++ u64 session id length ++ session id bytes
 // frame:  u32 frame_len (bytes of crc ++ payload that follow)
 //         u32 crc32(payload)
 //         payload: u64 log_offset ++ u32 log_bytes ++ u32 line_crc32 ++
@@ -325,6 +318,10 @@ const envelope_seq_offset = 24 + 8;
 
 pub const Writer = struct {
     alloc: Allocator,
+    /// Borrowed for deletion of a broken cache at finalize. Valid because the
+    /// writer is finalized at session-open time, before the owning session
+    /// struct can move.
+    dir: *io_mod.VerifiedDir,
     file: ?std.Io.File,
     len: u64 = 0,
     broken: bool = false,
@@ -342,7 +339,7 @@ pub const Writer = struct {
         };
         errdefer file.close(io_mod.getIo());
         try file.writePositionalAll(io_mod.getIo(), header.items, 0);
-        return .{ .alloc = alloc, .file = file, .len = header.items.len };
+        return .{ .alloc = alloc, .dir = dir, .file = file, .len = header.items.len };
     }
 
     /// Opens an existing verified cache to append after its valid prefix.
@@ -351,7 +348,7 @@ pub const Writer = struct {
         var file = try openCacheFile(dir, .read_write);
         errdefer file.close(io_mod.getIo());
         try file.setLength(io_mod.getIo(), prefix_file_bytes);
-        return .{ .alloc = alloc, .file = file, .len = prefix_file_bytes };
+        return .{ .alloc = alloc, .dir = dir, .file = file, .len = prefix_file_bytes };
     }
 
     /// Appends one frame mirroring a committed log line. `log_offset` and
@@ -405,31 +402,26 @@ pub const Writer = struct {
         self.len = file_offset;
     }
 
-    /// Syncs and closes the cache. The directory is not referenced here, so a
-    /// finalize from ConversationWriter.deinit stays valid after the owning
-    /// session struct moved. Use finalizeWithDir to also delete on broken.
+    /// Syncs and closes the cache. A broken writer deletes the file so the next
+    /// open rebuilds from the log; deletion goes through the directory the
+    /// writer was created with, which outlives the writer by construction.
     pub fn finalize(self: *Writer) void {
         const alloc = self.alloc;
+        const dir = self.dir;
         const file = self.file orelse {
-            self.* = .{ .alloc = alloc, .file = null };
+            self.* = .{ .alloc = alloc, .dir = dir, .file = null };
             return;
         };
-        if (!self.broken) {
+        if (self.broken) {
+            file.close(io_mod.getIo());
+            deleteCacheFile(dir);
+        } else {
             file.sync(io_mod.getIo()) catch |err| {
                 debug_trace.logf("session", "history cache sync failed err={s}", .{@errorName(err)});
             };
+            file.close(io_mod.getIo());
         }
-        file.close(io_mod.getIo());
-        self.* = .{ .alloc = alloc, .file = null };
-    }
-
-    /// Closes the cache and deletes it when the writer broke, so the next open
-    /// rebuilds from the log. Callers must pass the live session directory; the
-    /// writer deliberately does not borrow it across session moves.
-    pub fn finalizeWithDir(self: *Writer, dir: *io_mod.VerifiedDir) void {
-        const broken = self.broken;
-        self.finalize();
-        if (broken) deleteCacheFile(dir);
+        self.* = .{ .alloc = alloc, .dir = dir, .file = null };
     }
 };
 
@@ -480,7 +472,8 @@ pub fn openAndVerify(
     defer frames.deinit(alloc); // no-op after a successful toOwnedSlice
 
     var header: [header_len_min]u8 = undefined;
-    _ = file.readPositionalAll(io_mod.getIo(), &header, 0) catch return null;
+    const header_read = file.readPositionalAll(io_mod.getIo(), &header, 0) catch return null;
+    if (header_read != header.len) return null;
     if (!std.mem.eql(u8, header[0..magic.len], magic)) return null;
     if (std.mem.readInt(u64, header[magic.len..][0..8], .little) != format_version) return null;
     if (std.mem.readInt(u64, header[magic.len + 8 ..][0..8], .little) != session_event.conversation_schema_version) return null;
@@ -645,12 +638,6 @@ fn deleteCacheFile(dir: *io_mod.VerifiedDir) void {
 /// Deletes the cache after a cache-backed load was rejected, so the retry and
 /// later opens rebuild from the authoritative log. Writable paths only.
 pub fn deleteForRebuild(dir: *io_mod.VerifiedDir) void {
-    deleteCacheFile(dir);
-}
-
-/// Drops the cache alongside the log when a migration rewrites the session.
-/// Bound to the legacy-import deletion list in session_log.zig.
-pub fn deleteForMigration(dir: *io_mod.VerifiedDir) void {
     deleteCacheFile(dir);
 }
 
