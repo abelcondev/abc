@@ -503,6 +503,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -666,8 +667,10 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_clears: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
+    pause_on_auto_retry_attempt: ?usize = null,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
@@ -704,6 +707,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -781,6 +785,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             } else null,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -805,10 +810,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
             .usage = self.usage,
             .usage_allocator = self.alloc,
         };
+    }
+
+    fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_checkpoint_clears += 1;
     }
 
     fn setRecoveryCheckpoint(
@@ -1588,6 +1599,12 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("rejected:{s}", .{call.name});
     }
 
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
+    }
+
     fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const owned = if (active_prefix) |prefix| try types.dupeHistoryTurn(self.alloc, .{ .assistant = prefix }) else null;
@@ -1783,7 +1800,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         if (self.pause_on_auto_retry_status and
             status.kind == .auto_retry and
-            status.retry_deadline != null)
+            status.retry_deadline != null and
+            (self.pause_on_auto_retry_attempt == null or
+                self.pause_on_auto_retry_attempt.? == status.failed_attempt))
         {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
         }

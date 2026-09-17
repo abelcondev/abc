@@ -682,6 +682,14 @@ const App = struct {
             launch.modifiers.additional_directories,
             launch.modifiers.saved_directories_suppressed,
         );
+        if (comptime !host_target.is_wasm) {
+            app.provider_selection.ensureGatewayHttpPool();
+            if (app.provider_selection.selection().provider == .gateway) {
+                if (app.provider_selection.gateway_http_pool) |pool| {
+                    pool.warmAsync(gateway_client.resolveChatUrlForWarmup(builtin_gateway.agentChatUrl()));
+                }
+            }
+        }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
@@ -1327,10 +1335,6 @@ const App = struct {
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
-    }
-
-    pub fn continuePausedRecovery(self: *App) !bool {
-        return SessionAppRuntime.continuePausedRecovery(self);
     }
 
     pub fn queueRecoveryCheckpoint(
@@ -2001,6 +2005,15 @@ const App = struct {
         }
         var providers = builtin_providers.native;
         providers.definitions = self.provider_selection.definitions.definitions;
+        if (self.provider_selection.gateway_http_pool) |pool| {
+            // Rebind the gateway stream provider to the process-long pooled
+            // client so chat requests reuse warm keep-alive connections.
+            if (providers.gateway.agent_stream) |stream| {
+                var stamped = stream;
+                stamped.context = pool;
+                providers.gateway.agent_stream = stamped;
+            }
+        }
         if (comptime !host_profile.tools) {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
@@ -2864,9 +2877,10 @@ const App = struct {
         const now_ms = io_mod.milliTimestamp();
         self.terminal_input_runtime.terminal_theme_monitor.poll(now_ms);
 
-        // FX_THEME=light|dark pins the variant; keep owning protocol bytes
-        // (monitor started) but never query or apply live theme updates.
-        // Custom theme files stay live: updates re-resolve the theme pair.
+        // A configured light|dark pin (FX_THEME or the settings "theme" key)
+        // locks the variant; keep owning protocol bytes (monitor started) but
+        // never query or apply live theme updates. Custom theme files stay
+        // live: updates re-resolve the theme pair.
         if (ui_render.themeInputLocked()) {
             _ = self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate();
             return;
@@ -4314,6 +4328,7 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/mcp/features/common.zig");
     _ = @import("core/mcp/features/resources.zig");
     _ = @import("core/mcp/features/prompts.zig");

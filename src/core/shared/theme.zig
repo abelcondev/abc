@@ -156,6 +156,56 @@ pub fn activate(theme: Theme) void {
     active_theme = theme;
 }
 
+pub const ThemeChoice = union(enum) {
+    pin_light,
+    pin_dark,
+    custom: []const u8,
+};
+
+/// Classifies a configured theme value (FX_THEME or the settings "theme"
+/// key): light/dark pin the builtin variant, anything else names a theme file
+/// under ~/.fx/themes.
+pub fn classifyValue(value: []const u8) ?ThemeChoice {
+    if (value.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(value, "light")) return .pin_light;
+    if (std.ascii.eqlIgnoreCase(value, "dark")) return .pin_dark;
+    return .{ .custom = value };
+}
+
+/// Where the active theme came from: the configured custom theme file key (so
+/// live terminal flips can re-resolve it), and whether a light/dark variant is
+/// pinned by configuration. Recorded once at startup by the app lifecycle.
+/// The name is copied into bounded internal storage: callers never donate
+/// memory, and the bound matches loadNamed's validation.
+var source_name_buf: [64]u8 = undefined;
+var source_name_len: usize = 0;
+var source_name_set: bool = false;
+var variant_pinned: bool = false;
+
+pub fn setSource(name: ?[]const u8, pinned: bool) void {
+    source_name_set = false;
+    source_name_len = 0;
+    if (name) |value| {
+        if (value.len <= source_name_buf.len) {
+            @memcpy(source_name_buf[0..value.len], value);
+            source_name_len = value.len;
+            source_name_set = true;
+        } else {
+            debug_trace.logf("theme", "theme_source_name_too_long len={d}", .{value.len});
+        }
+    }
+    variant_pinned = pinned;
+}
+
+pub fn sourceName() ?[]const u8 {
+    if (!source_name_set) return null;
+    return source_name_buf[0..source_name_len];
+}
+
+pub fn variantPinned() bool {
+    return variant_pinned;
+}
+
 // --- Hex colors and terminal capability resolution ---
 
 pub const HexColor = struct { rgb: Rgb, alpha: u8 };
@@ -802,6 +852,9 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.user_card_accent_style);
     try std.testing.expectEqualStrings("\x1b[38;5;247m", fx_light.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.task_completed_open);
+    // Tool text stays the pre-theme gray in both variants (parity guard).
+    try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_light.tool_stdout_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_light.tool_stderr_style);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;5;243m", fx_light.syntax.comment_style);
 
@@ -1026,4 +1079,33 @@ test "closingFor resets exactly what the open set" {
     try std.testing.expectEqualStrings("\x1b[39m\x1b[22m\x1b[23m", closingFor("\x1b[1;3;38;2;1;2;3m"));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor(fx_dark.approval_button_active_style));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m", closingFor(fx_dark.approval_button_inactive_style));
+}
+
+test "classifyValue maps configured theme values" {
+    try std.testing.expect(classifyValue("") == null);
+    try std.testing.expect(classifyValue("light").? == .pin_light);
+    try std.testing.expect(classifyValue("Dark").? == .pin_dark);
+    try std.testing.expectEqualStrings("cursor-dark", classifyValue("cursor-dark").?.custom);
+}
+
+test "theme source copies the configured name and pin for live re-resolution" {
+    defer setSource(null, false);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(!variantPinned());
+
+    // The donor buffer may be freed right after setSource; the source state
+    // must not dangle (startup state is deinited before the event loop).
+    const donated = try std.testing.allocator.dupe(u8, "cursor-dark");
+    setSource(donated, false);
+    std.testing.allocator.free(donated);
+    try std.testing.expectEqualStrings("cursor-dark", sourceName().?);
+    try std.testing.expect(!variantPinned());
+
+    setSource(null, true);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(variantPinned());
+
+    const too_long = "x" ** 65;
+    setSource(too_long, false);
+    try std.testing.expect(sourceName() == null);
 }

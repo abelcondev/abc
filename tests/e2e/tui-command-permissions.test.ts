@@ -1673,7 +1673,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI trace distinguishes rejected edits from failed commands",
+    "TUI trace distinguishes failed edits from failed commands",
     async () => {
       const root = createIsolatedRoot();
       const fixturePath = join(root.workspace, "duplicate.txt");
@@ -1691,7 +1691,7 @@ describe("effect-aware command permissions", () => {
           path: "duplicate.txt",
           old_string: "same",
           new_string: "new",
-        }, "trace_edit_rejected"),
+        }, "trace_edit_failed"),
         toolCall("exit 7", {}, "trace_command_failed"),
         finalText("diagnostic fixture complete"),
       ]);
@@ -1727,15 +1727,15 @@ describe("effect-aware command permissions", () => {
 
       expect(gateway.requests).toHaveLength(6);
       expect(report).toContain(
-        "last=4 succeeded=2 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+        "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
       );
       const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
       expect(localCalls).toBeDefined();
       expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
       expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
       expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=edit_file outcome=rejected duration=\d+ms source=parent\n/);
-      expect(report).toContain("name=edit_file outcome=rejected");
+      expect(localCalls).toMatch(/name=edit_file outcome=tool_failed duration=\d+ms source=parent\n/);
+      expect(report).toContain("name=edit_file outcome=tool_failed");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
       expect(report).not.toContain("name=shell outcome=runtime_failed");

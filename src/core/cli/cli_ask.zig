@@ -24,6 +24,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const http_pool = @import("../shared/http_pool.zig");
+const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
@@ -1477,6 +1479,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
     defer startup.deinit(alloc);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
+    // Bind gateway chat traffic to a per-process connection pool and warm one
+    // connection in the background while the rest of startup continues.
+    var gateway_pool: ?*http_pool.HttpPool = null;
+    defer if (gateway_pool) |pool| {
+        if (pool.deinit() == .destroyed) alloc.destroy(pool);
+    };
+    if (io_mod.getenv("FX_BENCH") == null and startup.provider == .gateway) {
+        if (alloc.create(http_pool.HttpPool)) |pool| {
+            pool.* = http_pool.HttpPool.init(alloc);
+            gateway_pool = pool;
+            if (cfg.provider_set.gateway.agent_stream) |stream| {
+                var stamped = stream;
+                stamped.context = pool;
+                cfg.provider_set.gateway.agent_stream = stamped;
+            }
+            pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
+        } else |_| {}
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -2110,6 +2130,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
@@ -2129,6 +2150,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
+        .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
@@ -2754,6 +2776,29 @@ fn recordToolCallRejected(
     );
 }
 
+fn recordToolCallFailed(
+    raw_ctx: *anyopaque,
+    _: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.output_mode.capturesJson()) return;
+    appendToolCallRecordBestEffort(
+        ctx,
+        call,
+        "error",
+        .{
+            .status = .failure,
+            .model_output = model_output,
+            .command_result_json = command_result_json,
+        },
+        .tool_failed,
+        "tool_failed",
+    );
+}
+
 fn appendToolCallRecordBestEffort(
     ctx: *AskContext,
     call: ToolCall,
@@ -3049,6 +3094,19 @@ fn setRecoveryCheckpoint(
         now_ms,
     );
     ctx.prompt_snapshot_committed = true;
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
+    );
 }
 
 fn flushAskSessionUsage(
@@ -4018,7 +4076,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
+            if (recovery.kind == .terminal_provider_error)
+                // A genuine lifecycle pause (action == .paused) is resumable; a
+                // terminal stop (no action) is not. JSON consumers need the
+                // distinction.
+                if (recovery.action == .paused) "paused" else "failed"
+            else if (recovery.isRecovered()) "recovered" else "active",
             .{},
             &out.writer,
         );
@@ -7938,7 +8001,7 @@ test "render final JSON reports the successful recovery attempt" {
     try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "✓ recovered · succeeded on attempt 3/10",
+        "✓ recovered · succeeded on attempt 3",
         recovery.get("message").?.string,
     );
     try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
@@ -7966,9 +8029,9 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
         recovery.get("message").?.string,
     );
 }
@@ -9168,7 +9231,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
     try std.testing.expect(parsed.value.object.get("recovery") == null);
     try std.testing.expectEqualStrings(
-        "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
+        "[notice] ⚠ Network interrupted · waiting for connection\n",
         stderr_capture.bytes.items,
     );
 }
@@ -9190,15 +9253,15 @@ test "fx ask JSON reports the consumed attempt after retry admission failure" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
     try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
     try std.testing.expectEqualStrings(
         "TestProviderSerializationFailed",
         parsed.value.object.get("error").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s · attempt 1/2") != null);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "recovery paused after 1/2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1 attempt") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {

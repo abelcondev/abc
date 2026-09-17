@@ -394,6 +394,7 @@ const OwnedQuestionOption = struct {
 const OwnedQuestionEntry = struct {
     question: []u8,
     options: []OwnedQuestionOption,
+    submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
 };
 
 pub const QuestionPromptSource = enum {
@@ -518,6 +519,9 @@ pub const WorkerEvent = union(enum) {
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
+    /// A turn that can never recover hands the prompt back to the composer.
+    /// Owned by the event; the consumer frees it.
+    restore_failed_prompt: []u8,
 };
 
 pub const WorkerEventBatch = struct {
@@ -2666,7 +2670,7 @@ fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEn
         const desc_dup: ?[]u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup };
+    return .{ .question = question_dup, .options = options_dup, .submission = entry.submission };
 }
 
 fn freeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: OwnedQuestionEntry) void {
@@ -2734,7 +2738,7 @@ fn dupePendingEntrySnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionEntr
         const desc_dup: ?[]const u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup };
+    return .{ .question = question_dup, .options = options_dup, .submission = pending.submission };
 }
 
 fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatch) !PendingQuestionBatchSnapshot {
@@ -4057,6 +4061,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .error_text => |notice| .{ .error_text = try types.dupeSemanticNotice(alloc, notice) },
+        .restore_failed_prompt => |text| .{ .restore_failed_prompt = try alloc.dupe(u8, text) },
     };
 }
 
@@ -4108,6 +4113,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             alloc.free(grant.target_path);
         },
         .error_text => |notice| types.freeSemanticNotice(alloc, notice),
+        .restore_failed_prompt => |text| alloc.free(text),
         else => {},
     }
 }

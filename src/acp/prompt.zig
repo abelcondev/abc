@@ -1407,6 +1407,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .recovery_checkpoint = if (session.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
@@ -1427,6 +1428,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
+        .record_tool_call_failed = recordToolCallFailed,
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
@@ -1998,6 +2000,25 @@ fn recordToolCallRejected(
     ) catch {};
 }
 
+fn recordToolCallFailed(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
+    ctx.sendToolCallErrorWithCommandResult(
+        acp_id,
+        toolUpdateContentText(.{
+            .status = .failure,
+            .model_output = model_output,
+        }),
+        command_result_json,
+    ) catch {};
+}
+
 fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
     return tool_call_presentation.toolUpdateContentText(result.status == .failure, result.model_output);
 }
@@ -2139,7 +2160,24 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    // The durable checkpoint references the prompt's captured image bytes, so
+    // the prompt's deinit must not delete them. A failed turn never reaches
+    // the success-path retain, making this the only retain on that path.
     if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
+    );
 }
 
 /// Stores grants on the active ACP session without persisting them.

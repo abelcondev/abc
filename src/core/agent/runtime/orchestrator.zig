@@ -3392,7 +3392,7 @@ fn appendRecoveryConversationContext(
 ) !void {
     const selected = strategy orelse return;
     const prompt = switch (selected) {
-        .retry_request, .pause, .stop => return,
+        .retry_request, .pause, .stop, .wait_for_connectivity, .probe_liveness => return,
         .continue_response => continue_response_recovery_prompt,
         .regenerate_tool => regenerate_tool_recovery_prompt,
         .continue_after_confirmed_tool => continue_after_confirmed_tool_recovery_prompt,
@@ -3592,6 +3592,7 @@ fn restoredRecoveryCause(
 ) model_response_recovery.FailureCause {
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
+        .connectivity_lost => .connectivity_lost,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3757,6 +3758,7 @@ fn checkpointCause(
 ) types.ModelRecoveryCause {
     return switch (cause) {
         .transport_interrupted => .network_interrupted,
+        .connectivity_lost => .connectivity_lost,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3778,6 +3780,8 @@ fn checkpointAction(
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
         .reconcile_tool => .reconciling_tool,
+        .wait_for_connectivity => .waiting_for_connectivity,
+        .probe_liveness => .checking_liveness,
         .pause, .stop => .paused,
     };
 }
@@ -3801,6 +3805,7 @@ fn recoveryRequiredAction(
         .continue_later => .continue_later,
         .inspect_uncertain_tool => .inspect_uncertain_tool,
         .change_request => .change_request,
+        .surface_stall => .surface_stall,
     };
 }
 
@@ -3940,6 +3945,8 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
             if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
             self.checkpoint = next;
         }
+
+        fn clear(_: *anyopaque) !void {}
     };
     var sink: Sink = .{};
     defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
@@ -3947,7 +3954,7 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     defer fake.deinit();
     var deps = fake.deps();
     deps.ctx = &sink;
-    deps.recovery_checkpoint = .{ .set = Sink.set };
+    deps.recovery_checkpoint = .{ .set = Sink.set, .clear = Sink.clear };
     var fixture: support.PromptFixture = .{};
     var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
         hooks.RuntimeView.empty(),
@@ -4654,6 +4661,7 @@ fn auto_retry_status(
         .attempt_limit = attempt_limit,
         .cause = switch (cause) {
             .transport_interrupted => .network_interrupted,
+            .connectivity_lost => .connectivity_lost,
             .response_interrupted => .response_interrupted,
             .provider_stream_timeout => .provider_stream_timeout,
             .provider_unavailable => .provider_unavailable,
@@ -4670,6 +4678,8 @@ fn auto_retry_status(
             .regenerate_tool => .regenerating_tool,
             .continue_after_confirmed_tool => .continuing_after_tool,
             .reconcile_tool => .reconciling_tool,
+            .wait_for_connectivity => .waiting_for_connectivity,
+            .probe_liveness => .checking_liveness,
             .pause => .paused,
             .stop => null,
         },
@@ -4677,6 +4687,15 @@ fn auto_retry_status(
         .retry_deadline = retry_deadline,
         .diagnostic = diagnostic,
     };
+}
+
+/// The status row must not change shape between the wait and the in-flight
+/// beat: when the countdown segment vanished, right-aligned footer content
+/// shifted with it. Mirror exactly what the wait row displayed (the segment
+/// appears only when the wait rendered one); the next failure or the
+/// recovered status replaces it.
+fn inFlightDelaySeconds(delay_ns: u64) u64 {
+    return delay_ns / std.time.ns_per_s;
 }
 
 fn pushAutoRetryStatus(
@@ -4783,6 +4802,47 @@ fn finishRecoveryPaused(
     finish_trace.finish("recovery_paused");
 }
 
+/// No-progress stop: the exchange kept failing at the same point, so the turn
+/// ends honestly (terminal, prompt restored) instead of pausing or restarting
+/// forever. Used when decide() returns stop + surface_stall.
+fn finishRecoveryStalled(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    finish_trace: *PromptFinishTrace,
+    cause: model_response_recovery.FailureCause,
+    consumed_attempts: usize,
+    attempt_limit: usize,
+    diagnostic: ?types.ModelFailureDiagnostic,
+) !void {
+    try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
+        deps,
+        stream_ctx.alloc,
+        arena,
+        finalization.turn_id,
+        &.{},
+    );
+    try pushRouteRecoveryStatus(deps, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = consumed_attempts,
+        .attempt_limit = attempt_limit,
+        .cause = checkpointCause(cause),
+        .required_action = .surface_stall,
+        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
+    });
+    // A stall-stopped turn is terminally dead: without clearing the durable
+    // checkpoint, the next resume would auto-continue it and re-spend attempts
+    // on a turn the UI already called stopped.
+    if (deps.recovery_checkpoint) |effect| {
+        effect.clear(deps.ctx) catch |err| {
+            debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
+        };
+    }
+    try finalization.finish(.failed, null, null);
+    finish_trace.finish("recovery_stalled");
+}
+
 fn pushUnsafeNoRetryStatus(
     deps: *const AgentRuntimeDeps,
     reason: types.RouteRecoveryUnsafeReason,
@@ -4795,6 +4855,53 @@ fn pushUnsafeNoRetryStatus(
         },
         .diagnostic = diagnostic,
     });
+}
+
+// Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
+// negative under NTP correction; a backward step reads as zero elapsed,
+// never a trap.
+fn recoveryElapsedNs(recovery_started_at_ms: ?i64) ?u64 {
+    const started = recovery_started_at_ms orelse return null;
+    const delta_ms = io_mod.milliTimestamp() - started;
+    if (delta_ms <= 0) return 0;
+    return @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+}
+
+test "recoveryElapsedNs clamps backward wall-clock steps" {
+    try std.testing.expectEqual(@as(?u64, null), recoveryElapsedNs(null));
+    try std.testing.expectEqual(@as(?u64, 0), recoveryElapsedNs(io_mod.milliTimestamp() + 60_000));
+    const elapsed = recoveryElapsedNs(io_mod.milliTimestamp() - 2_000).?;
+    try std.testing.expect(elapsed >= 1_500 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed <= 3_000 * std.time.ns_per_ms);
+}
+
+/// A turn that can never recover hands the user's prompt back to the composer
+/// so nothing typed is lost. Only genuine user turns restore: resumed recovery
+/// jobs and subagent turns keep their own state.
+fn restorePromptAfterTerminalFailure(
+    deps: *const AgentRuntimeDeps,
+    job: QueuedPrompt,
+    config: Config,
+) void {
+    if (config.origin != .root) return;
+    if (job.recovery_checkpoint != null) return;
+    const restore = deps.restore_failed_prompt orelse return;
+    const prompt = std.mem.trim(u8, job.prompt, " \t\r\n");
+    if (prompt.len == 0) return;
+    restore(deps.ctx, prompt) catch |err| {
+        debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
+    };
+}
+
+// A user-cancelled turn's durable checkpoint dies with it; otherwise the next
+// resume would auto-continue a turn the user explicitly stopped. Covers the
+// model-response cancel paths, including a cancel during an episode's first
+// retry wait; no-ops when no checkpoint exists.
+fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
@@ -6634,6 +6741,8 @@ fn processQueuedPromptLoop(
     defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
     defer shell_execution_failure_retry.deinit(arena);
+    var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -6749,6 +6858,12 @@ fn processQueuedPromptLoop(
     else
         restored_attempts;
     var retry_pacing: model_response_recovery.RetryPacingState = .idle;
+    // Wall-clock state for autonomous recovery: when this turn entered
+    // recovery (drives the billable-retry throttle), and the no-progress
+    // detector that stops identical-failure restart loops.
+    var recovery_started_at_ms: ?i64 = null;
+    var recovery_last_progress: ?usize = null;
+    var recovery_no_progress_streak: usize = 0;
     const response_language_expectation = if (config.enforce_response_language and
         config.origin == .root and
         job.recovery_checkpoint == null)
@@ -6791,6 +6906,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
+            clearRecoveryCheckpointOnUserCancel(deps);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -6948,41 +7064,11 @@ fn processQueuedPromptLoop(
                 pending_auto_retry_status = null;
                 return;
             }
-            if (semantic_attempt >= semantic_limit) {
-                recovery_cause = .request_limit_reached;
-                recovery_strategy = .pause;
-                try persistRecoveryCheckpoint(
-                    deps,
-                    finalization,
-                    job,
-                    within_turn_suffix.items,
-                    stream_ctx.interruption_source_or(""),
-                    gateway_model,
-                    selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
-                    false,
-                    recovery_cause,
-                    recovery_strategy,
-                    preserved_tool_evidence,
-                    step_ctx,
-                );
-                try finishRecoveryPaused(
-                    deps,
-                    finalization,
-                    &stream_ctx,
-                    arena,
-                    &finish_trace,
-                    recovery_cause,
-                    semantic_attempt,
-                    semantic_limit,
-                    pausedRequiredAction(preserved_tool_evidence),
-                    defaultRecoveryDiagnostic(.request_limit_reached),
-                );
-                pending_auto_retry_status = null;
-                return;
-            }
+            // The provider-attempt budget is deliberately not a turn limit:
+            // transient failures keep recovering autonomously (throttled past
+            // the billable window, stall-stopped when nothing progresses, and
+            // always esc-cancellable). Only a lifecycle pause flag parks a turn.
+
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
@@ -7532,6 +7618,8 @@ fn processQueuedPromptLoop(
                     switch (evidence.cause) {
                         .transport_interrupted => .transport_interrupted,
                         .system_resumed => .system_resumed,
+                        .connectivity_lost => .connectivity_lost,
+                        .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
@@ -7579,6 +7667,22 @@ fn processQueuedPromptLoop(
                     pending_auto_retry_status = null;
                     return;
                 }
+                const failure_progress = stream_ctx.streamed_output_bytes;
+                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                const had_previous_progress = recovery_last_progress != null;
+                if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
+                    recovery_no_progress_streak += 1;
+                } else {
+                    recovery_no_progress_streak = 0;
+                }
+                recovery_last_progress = failure_progress;
+                const progress_evidence: model_response_recovery.Progress = if (recovery_no_progress_streak >= 2)
+                    .stalled
+                else if (had_previous_progress)
+                    .advancing
+                else
+                    .unknown;
+
                 var recovery_decision = if (network_failure) |evidence|
                     model_response_recovery.decide(.{
                         .cause = failure_cause,
@@ -7595,6 +7699,8 @@ fn processQueuedPromptLoop(
                             &stream_ctx,
                         ),
                         .cancelled = cancel_requested,
+                        .progress = progress_evidence,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
@@ -7607,7 +7713,7 @@ fn processQueuedPromptLoop(
                         .required_action = .inspect_uncertain_tool,
                     };
                 }
-                const will_auto_retry = recovery_decision.reserve_provider_attempt;
+                const will_auto_retry = recovery_decision.autoRecovers();
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -7745,6 +7851,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
+                    clearRecoveryCheckpointOnUserCancel(deps);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -7756,7 +7863,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         failure_cause,
                         recovery_decision.strategy,
-                        0,
+                        inFlightDelaySeconds(recovery_decision.delay_ns),
                         null,
                         failure_diagnostic,
                     );
@@ -7791,6 +7898,22 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
+                if (recovery_decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        failure_cause,
+                        consumed_attempts,
+                        semantic_limit,
+                        failure_diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
+                    return;
+                }
                 if (network_failure != null) {
                     const exhausted_retryable =
                         stream_ctx.interruption_source_or("").len == 0 and
@@ -7801,9 +7924,12 @@ fn processQueuedPromptLoop(
                             .kind = .terminal_provider_error,
                             .failed_attempt = consumed_attempts,
                             .attempt_limit = semantic_limit,
+                            .cause = checkpointCause(failure_cause),
+                            .required_action = recoveryRequiredAction(recovery_decision.required_action),
                             .diagnostic = failure_diagnostic,
                         });
                         pending_auto_retry_status = null;
+                        restorePromptAfterTerminalFailure(deps, job, config);
                     } else {
                         try pushUnsafeNoRetryStatus(
                             deps,
@@ -7813,15 +7939,19 @@ fn processQueuedPromptLoop(
                                 .assistant_output,
                             failure_diagnostic,
                         );
+                        restorePromptAfterTerminalFailure(deps, job, config);
                     }
                 } else if (semantic_attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
                         .failed_attempt = consumed_attempts,
                         .attempt_limit = semantic_limit,
+                        .cause = checkpointCause(failure_cause),
+                        .required_action = recoveryRequiredAction(recovery_decision.required_action),
                         .diagnostic = failure_diagnostic,
                     });
                     pending_auto_retry_status = null;
+                    restorePromptAfterTerminalFailure(deps, job, config);
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                 const failed_assistant_source = stream_ctx.interruption_source_or("");
@@ -8109,6 +8239,12 @@ fn processQueuedPromptLoop(
                     streamReplaySafe(&stream_ctx),
                     step_ctx,
                 );
+                // HTTP-status failures (5xx, 429) carry no stream progress, so
+                // they are exempt from the no-progress detector and keep
+                // retrying patiently. The billable retry window still applies:
+                // past it, the cadence throttles instead of hammering.
+                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -8122,6 +8258,7 @@ fn processQueuedPromptLoop(
                     ),
                     .retry_after_seconds = failure.retry_after_seconds,
                     .cancelled = config.cancel_flag.load(.seq_cst),
+                    .recovery_elapsed_ns = recovery_elapsed_ns,
                 });
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
@@ -8158,6 +8295,22 @@ fn processQueuedPromptLoop(
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
+                    return;
+                }
+                if (decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        cause,
+                        semantic_attempt + 1,
+                        semantic_limit,
+                        diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
                 if (decision.reserve_provider_attempt) {
@@ -8199,7 +8352,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );
@@ -8250,6 +8403,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8303,6 +8457,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
+                clearRecoveryCheckpointOnUserCancel(deps);
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8419,6 +8574,21 @@ fn processQueuedPromptLoop(
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
                 const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
+                // Interrupted streams and provider-error completions carry
+                // progress evidence; bare HTTP status failures (5xx, 429) and
+                // gateway timeout metadata are exempt from the stall detector.
+                const failure_progress = stream_ctx.streamed_output_bytes;
+                const track_progress = cause == .response_interrupted or
+                    (attempt_disposition == .provider_failure and cause == .provider_unavailable);
+                if (track_progress) {
+                    if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                    if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
+                        recovery_no_progress_streak += 1;
+                    } else {
+                        recovery_no_progress_streak = 0;
+                    }
+                    recovery_last_progress = failure_progress;
+                }
                 const decision = if (non_retryable)
                     model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
                 else
@@ -8434,6 +8604,11 @@ fn processQueuedPromptLoop(
                             &stream_ctx,
                         ),
                         .cancelled = config.cancel_flag.load(.seq_cst),
+                        .progress = if (track_progress and recovery_no_progress_streak >= 2)
+                            .stalled
+                        else
+                            .unknown,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
@@ -8494,8 +8669,25 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                if (decision.reserve_provider_attempt) {
-                    if (route_changed) {
+                if (decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        cause,
+                        semantic_attempt + 1,
+                        semantic_limit,
+                        diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
+                    return;
+                }
+                const decision_auto_recovers = decision.autoRecovers();
+                if (decision_auto_recovers) {
+                    if (route_changed and decision.reserve_provider_attempt) {
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
@@ -8533,7 +8725,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );
@@ -8542,7 +8734,9 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         );
-                        semantic_attempt += 1;
+                        // Probes and connectivity waits are not provider
+                        // attempts: nothing billable was sent.
+                        if (decision.reserve_provider_attempt) semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -8584,6 +8778,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8602,6 +8797,7 @@ fn processQueuedPromptLoop(
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
                         std.mem.trim(u8, failed_assistant_source, " \t\r\n").len > 0)
@@ -8633,6 +8829,7 @@ fn processQueuedPromptLoop(
                             diagnostic,
                         );
                     }
+                    restorePromptAfterTerminalFailure(deps, job, config);
                 }
 
                 if (finish_reason == .content_filter) {
@@ -8730,6 +8927,9 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
+                    recovery_started_at_ms = null;
+                    recovery_last_progress = null;
+                    recovery_no_progress_streak = 0;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -8897,6 +9097,9 @@ fn processQueuedPromptLoop(
         recovery_cause = .transport_interrupted;
         retry_pacing = .idle;
         preserved_tool_evidence = .none;
+        recovery_started_at_ms = null;
+        recovery_last_progress = null;
+        recovery_no_progress_streak = 0;
 
         if (deps.report_usage) |report_fn| {
             if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
@@ -9619,7 +9822,9 @@ fn processQueuedPromptLoop(
             silent_tool_steps += 1;
         }
 
-        var step_batch = runtime_tool_batch.StepBatchState{};
+        var step_batch = runtime_tool_batch.StepBatchState{
+            .identical_failure_escalation = &identical_failure_escalation,
+        };
         terminal_validation_retry.beginBatch();
         shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
@@ -9886,6 +10091,7 @@ fn processQueuedPromptLoop(
                             .status = .failure,
                             .model_output = failure_output,
                             .status_detail = "preflight failed",
+                            .failure_kind = .preflight,
                         };
                         precomputed_results[group_index] = failure;
                         continue;
@@ -10064,13 +10270,24 @@ fn processQueuedPromptLoop(
                 ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity != .valid) continue;
-                    try runtime_tool_admission.recordRejectedToolCall(
-                        deps,
-                        arena,
-                        parallel_call,
-                        execution.model_output,
-                        null,
-                    );
+                    // Results that failed the tool's own preflight/content
+                    // checks are tool failures, not permission rejections.
+                    switch (execution.failure_kind) {
+                        .preflight, .apply => try runtime_tool_admission.recordFailedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                        .none, .denied => try runtime_tool_admission.recordRejectedToolCall(
+                            deps,
+                            arena,
+                            parallel_call,
+                            execution.model_output,
+                            null,
+                        ),
+                    }
                 }
                 const cancelled_call = try runtime_tool_batch.assembleParallelToolResults(
                     arena,
@@ -11030,6 +11247,7 @@ fn processQueuedPromptLoop(
                     .status = .failure,
                     .model_output = failure_output,
                     .status_detail = "preflight failed",
+                    .failure_kind = .preflight,
                 };
                 const prepared_failure = try runtime_execution_memory.prepareToolModelOutput(
                     arena,
@@ -11061,7 +11279,9 @@ fn processQueuedPromptLoop(
                     prepared_failure.memory,
                     .{ .increment_error = true },
                 );
-                try runtime_tool_admission.recordRejectedToolCall(
+                // A permission-stage tool_failure ran the tool's preflight
+                // content checks and failed them; record a tool failure.
+                try runtime_tool_admission.recordFailedToolCall(
                     deps,
                     arena,
                     tool_call,

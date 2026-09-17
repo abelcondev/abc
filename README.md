@@ -122,15 +122,28 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
 
+In the interactive shell, MCP forms with a single select-one field and up to three
+options combine selection and submission in one prompt. You can decline, cancel,
+use a displayed default, or skip an optional field. Text inputs, numbers, booleans,
+and all other forms include a separate review step.
+
 ## Themes
 
 fx ships with built-in `fx-dark` and `fx-light` themes and follows your terminal's light or dark mode automatically. Set `FX_THEME=light` or `FX_THEME=dark` to pin a variant.
 
-Custom themes load from `~/.fx/themes/<name>.json` with `FX_THEME=<name>`:
+Custom themes load from `~/.fx/themes/<name>.json`. Pick one persistently in `~/.fx/settings.json`:
+
+```json
+{ "theme": "cursor-dark" }
+```
+
+or per launch with `FX_THEME=<name>`, which wins over the settings value:
 
 ```bash
 FX_THEME=cursor-dark fx
 ```
+
+The key also accepts `"light"` and `"dark"` to pin a built-in variant.
 
 A pinned theme follows your terminal's detected light or dark mode when a sibling variant exists: with `FX_THEME=cursor-dark` on a light terminal, fx loads `cursor-light` instead when `~/.fx/themes/cursor-light.json` is present (the `-dark`/`-light` or `_dark`/`_light` suffix convention). Without a sibling file, fx falls back to the built-in theme matching your terminal rather than washing out on the wrong background.
 
