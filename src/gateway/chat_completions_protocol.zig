@@ -170,6 +170,9 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.
     if (request.vision_mode != .unavailable) return error.UnsupportedVision;
+    // Verified snapshots only flow through the vision executor's structured
+    // request, which this protocol rejects above via response_format.
+    if (request.verified_images != null and request.verified_images.?.len != 0) return error.UnsupportedVision;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     for (request.messages) |message| {
         if (message.images.len != 0 and message.role != .user) return error.InvalidProviderPrompt;
@@ -454,7 +457,6 @@ fn write_user_content_parts(
     writer: *std.Io.Writer,
     alloc: Allocator,
     message: types.ChatMessage,
-    verified: ?[]const image_attachments.VerifiedSnapshot,
 ) !void {
     try writer.writeByte('[');
     var wrote_part = false;
@@ -466,28 +468,25 @@ fn write_user_content_parts(
             wrote_part = true;
         }
     }
-    if (verified) |snapshots| {
-        for (snapshots) |snapshot| {
-            if (wrote_part) try writer.writeByte(',');
-            try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
-            wrote_part = true;
-        }
-    } else {
-        for (message.images) |image| {
-            if (wrote_part) try writer.writeByte(',');
-            var snapshot = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch return error.ImageUnavailable;
-            defer snapshot.deinit(alloc);
-            try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
-            wrote_part = true;
-        }
+    for (message.images) |image| {
+        if (wrote_part) try writer.writeByte(',');
+        var snapshot = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch return error.ImageUnavailable;
+        defer snapshot.deinit(alloc);
+        try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
+        wrote_part = true;
     }
     try writer.writeByte(']');
 }
 
-/// Emits retained tool-result images as a user message following the tool
-/// message; chat-completions tool messages cannot carry image parts.
-fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMessage, images: []const types.ToolImage) !void {
-    const label = try std.fmt.allocPrint(alloc, "The tool \"{s}\" returned {d} image(s).", .{ message.tool_name orelse "unknown", images.len });
+/// Emits retained tool-result images as one user message after a contiguous
+/// run of tool messages; chat-completions tool messages cannot carry image
+/// parts, and strict providers require tool messages to stay adjacent to the
+/// assistant tool-call message they answer.
+fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, tool_names: []const []const u8, images: []const types.ToolImage) !void {
+    const label = if (tool_names.len == 1)
+        try std.fmt.allocPrint(alloc, "The tool \"{s}\" returned {d} image(s).", .{ tool_names[0], images.len })
+    else
+        try std.fmt.allocPrint(alloc, "Tool results returned {d} image(s).", .{images.len});
     defer alloc.free(label);
     try writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(label, .{}, writer);
@@ -499,74 +498,80 @@ fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, message:
     try writer.writeAll("]}");
 }
 
+fn flush_tool_image_follow_up(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    count: *usize,
+    pending_names: *std.ArrayList([]const u8),
+    pending_images: *std.ArrayList(types.ToolImage),
+) !void {
+    if (pending_images.items.len == 0) return;
+    if (count.* != 0) try writer.writeByte(',');
+    count.* += 1;
+    try write_tool_image_follow_up(writer, alloc, pending_names.items, pending_images.items);
+    pending_names.clearRetainingCapacity();
+    pending_images.clearRetainingCapacity();
+}
+
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
-    // Verified snapshots belong to the current user turn and attach to the
-    // last user message in the conversation lane.
-    const verified_images: ?[]const image_attachments.VerifiedSnapshot = if (request.verified_images) |images|
-        if (images.len != 0) images else null
-    else
-        null;
-    var verified_target: ?usize = null;
-    if (verified_images != null) {
-        var index = request.messages.len;
-        while (index > 0) {
-            index -= 1;
-            if (request.messages[index].role == .user) {
-                verified_target = index;
-                break;
-            }
-        }
-        if (verified_target == null) return error.InvalidProviderPrompt;
-    }
     var count: usize = 0;
-    for ([_][]const types.ChatMessage{ request.instructions, request.messages }, 0..) |lane, lane_index| for (lane, 0..) |message, message_index| {
-        // Source validation rejects empty assistants; only stripped replay can leave one here.
-        if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
-        if (count != 0) try writer.writeByte(',');
-        count += 1;
-        try writer.writeAll("{\"role\":");
-        try std.json.Stringify.value(@tagName(message.role), .{}, writer);
-        try writer.writeAll(",\"content\":");
-        const verified_here = lane_index == 1 and verified_target != null and message_index == verified_target.?;
-        if (message.role == .user and (message.images.len != 0 or verified_here)) {
-            try write_user_content_parts(writer, alloc, message, if (verified_here) verified_images.? else null);
-        } else {
-            try std.json.Stringify.value(message.content, .{}, writer);
-        }
-        try write_replay(writer, alloc, message);
-        if (message.role == .tool) {
-            try writer.writeAll(",\"tool_call_id\":");
-            try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
-        }
-        if (message.tool_calls.len != 0) {
-            try writer.writeAll(",\"tool_calls\":[");
-            for (message.tool_calls, 0..) |call, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writer.writeAll("{\"id\":");
-                try std.json.Stringify.value(projection.resolve(call.id), .{}, writer);
-                try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
-                try std.json.Stringify.value(call.name, .{}, writer);
-                try writer.writeAll(",\"arguments\":");
-                try std.json.Stringify.value(call.arguments_json, .{}, writer);
-                try writer.writeAll("}}");
+    // Images from tool results buffer across each contiguous tool-message run
+    // and flush as one user message when the run ends, so tool messages stay
+    // adjacent to the assistant tool-call message they answer.
+    var pending_names: std.ArrayList([]const u8) = .empty;
+    defer pending_names.deinit(alloc);
+    var pending_images: std.ArrayList(types.ToolImage) = .empty;
+    defer pending_images.deinit(alloc);
+    const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
+    for (lanes) |lane| {
+        for (lane) |message| {
+            // Source validation rejects empty assistants; only stripped replay can leave one here.
+            if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
+            if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
+            if (count != 0) try writer.writeByte(',');
+            count += 1;
+            try writer.writeAll("{\"role\":");
+            try std.json.Stringify.value(@tagName(message.role), .{}, writer);
+            try writer.writeAll(",\"content\":");
+            if (message.role == .user and message.images.len != 0) {
+                try write_user_content_parts(writer, alloc, message);
+            } else {
+                try std.json.Stringify.value(message.content, .{}, writer);
             }
-            try writer.writeByte(']');
-        }
-        try writer.writeByte('}');
-        // Chat completions has no image parts on tool messages, so retained
-        // tool images follow as a user message carrying the pixels.
-        if (message.role == .tool) {
-            const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
-            if (tool_images.len != 0 and !toolResultDenied(message)) {
-                try writer.writeByte(',');
-                count += 1;
-                try write_tool_image_follow_up(writer, alloc, message, tool_images);
+            try write_replay(writer, alloc, message);
+            if (message.role == .tool) {
+                try writer.writeAll(",\"tool_call_id\":");
+                try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
+            }
+            if (message.tool_calls.len != 0) {
+                try writer.writeAll(",\"tool_calls\":[");
+                for (message.tool_calls, 0..) |call, index| {
+                    if (index != 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"id\":");
+                    try std.json.Stringify.value(projection.resolve(call.id), .{}, writer);
+                    try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                    try std.json.Stringify.value(call.name, .{}, writer);
+                    try writer.writeAll(",\"arguments\":");
+                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
+                    try writer.writeAll("}}");
+                }
+                try writer.writeByte(']');
+            }
+            try writer.writeByte('}');
+            if (message.role == .tool) {
+                const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                if (tool_images.len != 0 and !toolResultDenied(message)) {
+                    try pending_names.append(alloc, message.tool_name orelse "unknown");
+                    try pending_images.appendSlice(alloc, tool_images);
+                }
             }
         }
-    };
+        // Lane boundary: flush before the next lane starts.
+        try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
+    }
     try writer.writeByte(']');
     if (functions.len != 0) {
         try writer.writeAll(",\"tools\":[");
@@ -1913,6 +1918,41 @@ test "chat completions serializes retained tool images as a follow up user messa
     const image_part = parts[1].object;
     try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,aGVsbG8", image_part.get("image_url").?.object.get("url").?.string);
+}
+
+test "chat completions merges parallel tool images into one follow up after the tool run" {
+    const alloc = std.testing.allocator;
+    const images_a = [_]types.ToolImage{.{ .data = @constCast("aGVsbG8"), .mime_type = @constCast("image/png") }};
+    const images_b = [_]types.ToolImage{.{ .data = @constCast("d29ybGQ"), .mime_type = @constCast("image/jpeg") }};
+    var request = test_tool_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = null, .tool_calls = &.{
+            .{ .id = "call-1", .name = "read_file", .arguments_json = "{}" },
+            .{ .id = "call-2", .name = "read_file", .arguments_json = "{}" },
+        } },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "image a", .tool_result_memory = .{ .tool_images = &images_a } },
+        .{ .role = .tool, .tool_call_id = "call-2", .tool_name = "read_file", .content = "image b", .tool_result_memory = .{ .tool_images = &images_b } },
+        .{ .role = .user, .content = "thanks" },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    // two instructions + user + assistant + tool + tool + merged follow-up + user
+    try std.testing.expectEqual(@as(usize, 8), messages.len);
+    try std.testing.expectEqualStrings("tool", messages[4].object.get("role").?.string);
+    try std.testing.expectEqualStrings("tool", messages[5].object.get("role").?.string);
+    const follow_up = messages[6].object;
+    try std.testing.expectEqualStrings("user", follow_up.get("role").?.string);
+    const parts = follow_up.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,aGVsbG8", parts[1].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("data:image/jpeg;base64,d29ybGQ", parts[2].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("user", messages[7].object.get("role").?.string);
+    try std.testing.expectEqualStrings("thanks", messages[7].object.get("content").?.string);
 }
 
 test "chat completions withholds images from denied tool results" {
