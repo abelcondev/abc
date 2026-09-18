@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -14692,9 +14693,28 @@ test "authoritative lifecycle can place a provisional row after the latest trans
         null,
     );
     defer alloc.free(full);
-    const notice_index = std.mem.find(u8, full, "Auto agent approved").?;
-    const completed_index = std.mem.find(u8, full, "Ran printf approved").?;
+    // Tool rows style the command verb; compare against plain text.
+    const plain = try plainTextForTest(alloc, full);
+    defer alloc.free(plain);
+    const notice_index = std.mem.find(u8, plain, "Auto agent approved").?;
+    const completed_index = std.mem.find(u8, plain, "Ran printf approved").?;
     try std.testing.expect(notice_index < completed_index);
+}
+
+fn plainTextForTest(alloc: std.mem.Allocator, styled: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < styled.len) {
+        const next = display_width.ansiSequenceEnd(styled, i);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        try out.append(alloc, styled[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 test "coalesced approval lifecycle reposition preserves an authoritative committed anchor" {
@@ -15302,7 +15322,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran true"),
+            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -15818,7 +15838,7 @@ fn checkCommandProcessTerminalAllocationFailuresImpl(alloc: Allocator) !void {
         try std.testing.expect(detail.command_output_entry_id == null);
         const status = runtime.toolStatusEntryLabel(entry_id).?;
         try std.testing.expect(std.mem.find(u8, status, "run_command") != null);
-        try std.testing.expect(std.mem.find(u8, status, "Ran true") == null);
+        try std.testing.expect(std.mem.find(u8, status, "\x1b[38;5;250mtrue\x1b[39m") == null);
         return err;
     };
 
@@ -16741,4 +16761,67 @@ test "finality candidates retain the global pin for an unidentified tool row" {
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), source.finality.tool_turn_floors.len);
     try std.testing.expect(source.finality.mutation_pin_start != null);
+}
+
+test "grouped completed command rows shell-highlight quoted strings over the row base" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-1" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "printf 'hello world'", "Ran");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf 'hello world'" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // The action label keeps the row's ambient style; the command verb and
+    // quoted string pick up syntax palette colors and return to the row base
+    // after their closes.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
+}
+
+test "multi-word command labels stay intact when a syntax token follows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-timeout" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "sleep 5", "Timed out");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Timed out sleep 5" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // A first-space split would open the base style between "Timed" and
+    // "out"; the recorded label keeps both words ahead of the base open.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") != null);
 }
