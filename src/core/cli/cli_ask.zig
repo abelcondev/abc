@@ -62,6 +62,7 @@ const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -1062,6 +1063,10 @@ const AskContext = struct {
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
+            },
+            .model_override_resolver = .{
+                .context = @ptrCast(self),
+                .resolve_fn = resolveModelOverride,
             },
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
@@ -2293,6 +2298,33 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
         model,
         ctx.cfg.provider_set.select(ctx.provider).fallbackModelCapabilities(model),
     );
+}
+
+/// Subagent model overrides resolve against the same catalog the capability
+/// path uses. The blocking resolve waits out a still-loading catalog; only
+/// cancellation or an unavailable catalog falls back to raw passthrough.
+fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const catalog_provider = bundle.model_catalog orelse return .no_catalog;
+    _ = ctx.capability_resolver.resolve(
+        ctx.alloc,
+        catalog_provider,
+        .{
+            .access = ctx.model_catalog_access,
+            .endpoint = ctx.cfg.gateway_models_path,
+            .cancel_flag = ctx.cancelFlag(),
+        },
+        raw_model,
+        bundle.fallbackModelCapabilities(raw_model),
+    ) catch return .no_catalog;
+    const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
+    var ids = try model_catalog.projectModelIds(alloc, entries);
+    defer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {

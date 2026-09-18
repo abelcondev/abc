@@ -338,6 +338,7 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
+            ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(app);
             return ctx;
         }
 

@@ -30,6 +30,8 @@ const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const result_store = @import("../session/result_store.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -441,6 +443,13 @@ pub fn Bindings(comptime App: type) type {
             return .{
                 .ctx = @ptrCast(app),
                 .resolve_fn = agentResolveModelCapabilities,
+            };
+        }
+
+        pub fn modelOverrideResolver(app: *App) subagent_tool_host.ModelOverrideResolver {
+            return .{
+                .context = @ptrCast(app),
+                .resolve_fn = resolveSubagentModelOverride,
             };
         }
 
@@ -897,6 +906,24 @@ pub fn Bindings(comptime App: type) type {
                 return app.isModelCacheFailed();
             }
             return false;
+        }
+
+        fn resolveSubagentModelOverride(ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
+            const app: *App = @ptrCast(@alignCast(ctx.?));
+            if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
+                // Wait out a still-loading catalog so early delegation does not
+                // skip matching. Only cancellation maps to passthrough.
+                _ = app.resolveModelCapabilitiesForRequest(raw_model) catch return .no_catalog;
+            }
+            if (comptime @hasDecl(App, "snapshotCachedModelIds")) {
+                var ids = (app.snapshotCachedModelIds(alloc) catch null) orelse return .no_catalog;
+                defer {
+                    for (ids.items) |id| alloc.free(id);
+                    ids.deinit(alloc);
+                }
+                return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
+            }
+            return .no_catalog;
         }
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

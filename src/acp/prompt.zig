@@ -39,6 +39,8 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
+const subagent_model_contract = @import("../core/subagent/model_contract.zig");
+const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -395,6 +397,10 @@ const AcpContext = struct {
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
+            },
+            .model_override_resolver = .{
+                .context = @ptrCast(self),
+                .resolve_fn = resolveModelOverride,
             },
             .interactive = false,
             .lifecycle_view = self.state.lifecycle_view,
@@ -1523,6 +1529,43 @@ fn resolveModelCapabilities(
         model,
         bundle.fallbackModelCapabilities(model),
     );
+}
+
+/// Subagent model overrides resolve against the same catalog the capability
+/// path uses. The blocking resolve waits out a still-loading catalog; only
+/// cancellation or an unavailable catalog falls back to raw passthrough.
+fn resolveModelOverride(
+    raw_ctx: ?*anyopaque,
+    alloc: Allocator,
+    raw_model: []const u8,
+) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
+    const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
+    const bundle = ctx.state.cfg.provider_set.select(session.provider);
+    const catalog_provider = bundle.model_catalog orelse return .no_catalog;
+    _ = ctx.state.capability_resolver.resolve(
+        ctx.state.alloc,
+        catalog_provider,
+        .{
+            .access = credentials.catalogAccessForCredentialAndAccount(
+                session.credential_source,
+                session.api_key,
+                ctx.state.gateway_team,
+                session.account_id,
+            ),
+            .endpoint = ctx.state.cfg.gateway_models_path,
+            .cancel_flag = &session.cancel_flag,
+        },
+        raw_model,
+        bundle.fallbackModelCapabilities(raw_model),
+    ) catch return .no_catalog;
+    const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
+    var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
+    defer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
 }
 
 fn availableModelCapabilities(

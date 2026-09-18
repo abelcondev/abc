@@ -3115,6 +3115,14 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
     } else "pending";
 }
 
+/// Some tools (notably subagent) encode failures in a successful tool result
+/// body (`{"ok":false, ...}`). The encoded marker sits at the start of the
+/// body, so even a truncated retained capture still carries it.
+fn toolCallReportedFailure(call: diagnostics.ToolCallMetric) bool {
+    if (call.outcome != .succeeded) return false;
+    return std.mem.find(u8, call.result(), "\"ok\":false") != null;
+}
+
 fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
     try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
     try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
@@ -3143,6 +3151,7 @@ noinline fn writeToolCallsSummary(
         var command_failed_count: u32 = 0;
         var tool_failed_count: u32 = 0;
         var runtime_failed_count: u32 = 0;
+        var reported_failure_count: u32 = 0;
         var total_ms: u64 = 0;
         for (buf[0..n]) |call| {
             switch (call.outcome) {
@@ -3152,6 +3161,7 @@ noinline fn writeToolCallsSummary(
                 .tool_failed => tool_failed_count += 1,
                 .runtime_failed => runtime_failed_count += 1,
             }
+            if (toolCallReportedFailure(call)) reported_failure_count += 1;
             total_ms += call.duration_ms;
         }
 
@@ -3180,10 +3190,16 @@ noinline fn writeToolCallsSummary(
         } else {
             try writer.writeAll("coverage: complete (window holds every recorded tool call)\n");
         }
-        if (succeeded_count != n) {
+        if (reported_failure_count > 0) {
+            try writer.print(
+                "tool_reported_failure={d} (executed but returned an encoded failure result)\n",
+                .{reported_failure_count},
+            );
+        }
+        if (succeeded_count != n or reported_failure_count > 0) {
             try writer.writeAll("non-successes first:\n");
             for (buf[0..n]) |call| {
-                if (call.outcome == .succeeded) continue;
+                if (call.outcome == .succeeded and !toolCallReportedFailure(call)) continue;
                 try writeToolCallCompact(writer, call);
                 try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
                 try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
@@ -3193,7 +3209,7 @@ noinline fn writeToolCallsSummary(
             try writer.writeAll("recent successes (compact):\n");
         }
         for (buf[0..n]) |call| {
-            if (call.outcome != .succeeded) continue;
+            if (call.outcome != .succeeded or toolCallReportedFailure(call)) continue;
             try writeToolCallCompact(writer, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
             try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);

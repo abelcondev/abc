@@ -1,10 +1,80 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const types = @import("../shared/types.zig");
+const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
 const max_error_code_bytes: usize = 64;
+
+/// Catalog candidates surfaced for ambiguous or unknown model overrides.
+pub const max_model_match_candidates: usize = 4;
+
+/// Outcome of matching a requested model override against the cached catalog.
+/// Returned slices are allocated from the allocator passed to
+/// `matchCatalogModel`; the caller owns them.
+pub const ModelCatalogMatch = union(enum) {
+    /// No catalog entries were available; the override passes through unchanged.
+    no_catalog,
+    /// Exactly one catalog entry is the best match.
+    matched: []const u8,
+    /// Several entries tie as the best confident match.
+    ambiguous: []const []const u8,
+    /// No confident match; carries close but inconclusive entries (may be empty).
+    unknown: []const []const u8,
+};
+
+/// fuzzyModelScore assigns at least 100 to substring matches. Weaker token or
+/// subsequence scores are only offered as suggestions, never silently resolved.
+const confident_model_score: i32 = 100;
+
+/// Matches a model override against catalog IDs using the same scoring as
+/// interactive `/model` selection. Exact (case-insensitive) IDs and unique
+/// confident matches resolve; confident ties and weak matches do not.
+pub fn matchCatalogModel(
+    alloc: Allocator,
+    ids: []const []const u8,
+    query: []const u8,
+) Allocator.Error!ModelCatalogMatch {
+    if (ids.len == 0) return .no_catalog;
+    for (ids) |id| {
+        if (std.ascii.eqlIgnoreCase(id, query)) {
+            return .{ .matched = try alloc.dupe(u8, id) };
+        }
+    }
+    var best_score: i32 = 0;
+    for (ids) |id| {
+        const score = session_commands.fuzzyModelScore(id, query);
+        if (score > best_score) best_score = score;
+    }
+    if (best_score == 0) return .{ .unknown = &.{} };
+    var best_count: usize = 0;
+    for (ids) |id| {
+        if (session_commands.fuzzyModelScore(id, query) == best_score) best_count += 1;
+    }
+    if (best_score >= confident_model_score and best_count == 1) {
+        for (ids) |id| {
+            if (session_commands.fuzzyModelScore(id, query) == best_score) {
+                return .{ .matched = try alloc.dupe(u8, id) };
+            }
+        }
+        unreachable;
+    }
+    const out = try alloc.alloc([]const u8, @min(best_count, max_model_match_candidates));
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (ids) |id| {
+        if (filled == out.len) break;
+        if (session_commands.fuzzyModelScore(id, query) != best_score) continue;
+        out[filled] = try alloc.dupe(u8, id);
+        filled += 1;
+    }
+    if (best_score >= confident_model_score) return .{ .ambiguous = out };
+    return .{ .unknown = out };
+}
 
 pub const Action = enum { run, message };
 
@@ -414,6 +484,47 @@ test "creation overrides validate and participate in operation identity" {
         error.InvalidEffort,
         validateRequest(alloc, .{ .run = .{ .task = "t", .effort = "not an effort!" } }),
     );
+}
+
+test "model override catalog matching resolves, rejects, and suggests" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{
+        "anthropic/claude-fable-5.1",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-terra-fast",
+        "openai/gpt-6-astra",
+    };
+
+    try std.testing.expectEqual(ModelCatalogMatch.no_catalog, try matchCatalogModel(alloc, &.{}, "terra"));
+
+    const exact = try matchCatalogModel(alloc, &ids, "OpenAI/GPT-6-ASTRA");
+    try std.testing.expectEqualStrings("openai/gpt-6-astra", exact.matched);
+    alloc.free(exact.matched);
+
+    const unique = try matchCatalogModel(alloc, &ids, "gpt-5.6-terra-fast");
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", unique.matched);
+    alloc.free(unique.matched);
+
+    const ambiguous = try matchCatalogModel(alloc, &ids, "terra");
+    try std.testing.expectEqual(@as(usize, 2), ambiguous.ambiguous.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra", ambiguous.ambiguous[0]);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", ambiguous.ambiguous[1]);
+    for (ambiguous.ambiguous) |item| alloc.free(item);
+    alloc.free(ambiguous.ambiguous);
+
+    const unknown = try matchCatalogModel(alloc, &ids, "skldjf");
+    try std.testing.expectEqual(@as(usize, 0), unknown.unknown.len);
+}
+
+test "model override catalog matching keeps weak matches as suggestions" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{ "openai/gpt-6-astra", "openai/gpt-5.6-terra" };
+    // Subsequence-only scores never resolve silently; they become suggestions.
+    const result = try matchCatalogModel(alloc, &ids, "ogpt");
+    try std.testing.expectEqual(@as(usize, 2), result.unknown.len);
+    try std.testing.expectEqualStrings("openai/gpt-6-astra", result.unknown[0]);
+    for (result.unknown) |item| alloc.free(item);
+    alloc.free(result.unknown);
 }
 
 test "persistent planning derives continuation steering and busy overlay changes" {
