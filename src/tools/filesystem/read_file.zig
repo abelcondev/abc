@@ -153,7 +153,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
 
     if (!text_utils.isModelSafeText(text)) {
-        if (try imageToolResult(ctx, rel, text, stat.size, truncated_by_size)) |result| return result;
+        if (try imageToolResult(ctx, rel, text, stat.size, truncated_by_size or actual_len != stat.size)) |result| return result;
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
         });
@@ -226,16 +226,16 @@ pub const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4
 
 /// Attaches supported image files to the tool result so models with image
 /// input receive the pixels inline through the normal tool-image pipeline.
-/// Returns null for non-image or size-truncated content, which falls back to
-/// the binary-omitted summary.
+/// Returns null for non-image or incompletely read content, which falls back
+/// to the binary-omitted summary.
 fn imageToolResult(
     ctx: tool_dispatch.DispatchContext,
     rel: []const u8,
     bytes: []const u8,
     file_size: u64,
-    truncated_by_size: bool,
+    incomplete_read: bool,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
-    if (truncated_by_size) return null;
+    if (incomplete_read) return null;
     const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
     const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
     if (encoded_len > image_data.max_encoded_image_bytes) {
