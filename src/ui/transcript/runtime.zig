@@ -2516,7 +2516,8 @@ test "nonzero streamed command reuses its active output block" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "printf lines; exit \x1b[38;5;250m7\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mprintf\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "lines; exit \x1b[38;5;250m7\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
 

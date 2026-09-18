@@ -39,6 +39,12 @@ pub fn highlight(
     errdefer styled.deinit(alloc);
     const palette = paletteForTheme(theme);
     if (base) |base_style| try styled.appendSlice(alloc, base_style);
+    // A theme can disable syntax highlighting entirely; the span then keeps
+    // only the caller's base, byte-identical to a token-free source.
+    if (!palette.enabled) {
+        try styled.appendSlice(alloc, source);
+        return styled.toOwnedSlice(alloc);
+    }
 
     var index: usize = 0;
     while (index < source.len) {
@@ -323,7 +329,25 @@ test "base style wraps the span and restores after each token" {
     defer alloc.free(styled);
 
     // The span opens with the base, and every token close re-establishes it.
-    try std.testing.expect(std.mem.startsWith(u8, styled, "<base>echo "));
+    try std.testing.expect(std.mem.startsWith(u8, styled, "<base>\x1b[38;5;252mecho\x1b[39m<base> "));
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m42\x1b[39m<base>") != null);
+}
+
+test "a theme with syntax disabled passes the source through" {
+    const alloc = std.testing.allocator;
+    var no_syntax = shared_theme.fx_dark;
+    no_syntax.syntax.enabled = false;
+
+    const previous = shared_theme.current();
+    defer shared_theme.activate(previous);
+    shared_theme.activate(no_syntax);
+
+    const plain = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("echo 'hi there' 42", plain);
+
+    const with_base = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, "<base>");
+    defer alloc.free(with_base);
+    try std.testing.expectEqualStrings("<base>echo 'hi there' 42", with_base);
 }

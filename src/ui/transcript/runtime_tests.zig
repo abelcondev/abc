@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -14692,9 +14693,28 @@ test "authoritative lifecycle can place a provisional row after the latest trans
         null,
     );
     defer alloc.free(full);
-    const notice_index = std.mem.find(u8, full, "Auto agent approved").?;
-    const completed_index = std.mem.find(u8, full, "Ran printf approved").?;
+    // Tool rows style the command verb; compare against plain text.
+    const plain = try plainTextForTest(alloc, full);
+    defer alloc.free(plain);
+    const notice_index = std.mem.find(u8, plain, "Auto agent approved").?;
+    const completed_index = std.mem.find(u8, plain, "Ran printf approved").?;
     try std.testing.expect(notice_index < completed_index);
+}
+
+fn plainTextForTest(alloc: std.mem.Allocator, styled: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < styled.len) {
+        const next = display_width.ansiSequenceEnd(styled, i);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        try out.append(alloc, styled[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 test "coalesced approval lifecycle reposition preserves an authoritative committed anchor" {
@@ -16768,9 +16788,10 @@ test "grouped completed command rows shell-highlight quoted strings over the row
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
 
-    // The action label keeps the row's ambient style; the quoted string picks
-    // up the syntax palette and returns to the row base after its close.
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245mprintf ") != null);
+    // The action label keeps the row's ambient style; the command verb and
+    // quoted string pick up syntax palette colors and return to the row base
+    // after their closes.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
 }
 

@@ -3444,9 +3444,14 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     const completed = try app.describeToolActionCompleted(arena, run_call);
 
     // The label and untokenized command text keep the muted tool-text base,
-    // while the quoted string picks up the syntax palette color and returns
-    // to the base after its close.
+    // while the command verb and quoted string pick up syntax palette colors
+    // and return to the base after their closes.
     try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        completed,
+        "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         completed,
@@ -3454,6 +3459,5 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
     // Plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "printf ") != null);
     try std.testing.expect(std.mem.indexOf(u8, completed, "| wc -c") != null);
 }

@@ -16,6 +16,9 @@ const io_mod = @import("io.zig");
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
 pub const SyntaxPalette = struct {
+    /// `syntax: false` in a native theme turns syntax highlighting off; the
+    /// style slots keep their defaults but the highlighter passes text through.
+    enabled: bool = true,
     keyword_style: []const u8,
     string_style: []const u8,
     number_style: []const u8,
@@ -526,8 +529,11 @@ fn parseNative(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
         }
     }
     if (root.get("syntax")) |syntax_value| {
-        if (syntax_value != .object) return error.InvalidTheme;
-        try applySyntax(&theme, alloc, syntax_value.object, options);
+        switch (syntax_value) {
+            .object => |syntax_object| try applySyntax(&theme, alloc, syntax_object, options),
+            .bool => |enabled| theme.syntax.enabled = enabled,
+            else => return error.InvalidTheme,
+        }
     }
     return theme;
 }
@@ -823,6 +829,7 @@ test "every theme slot is populated" {
         } else if (field.type == SyntaxPalette) {
             const syntax_fields = @typeInfo(SyntaxPalette).@"struct".fields;
             inline for (syntax_fields) |syntax_field| {
+                if (syntax_field.type != []const u8) continue;
                 try std.testing.expect(@field(fx_dark.syntax, syntax_field.name).len > 0);
                 try std.testing.expect(@field(fx_light.syntax, syntax_field.name).len > 0);
             }
@@ -947,6 +954,25 @@ test "parse resolves a native theme overlay on the matching builtin" {
     // Untouched slots inherit the builtin variant.
     try std.testing.expectEqualStrings(fx_dark.hint_style, theme.hint_style);
     try std.testing.expectEqualStrings(fx_dark.syntax.string_style, theme.syntax.string_style);
+}
+
+test "parse honors a native syntax boolean switch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const disabled = try parse(alloc, "{ \"name\": \"no-syntax\", \"syntax\": false }", .{ .truecolor = true });
+    try std.testing.expect(!disabled.syntax.enabled);
+    // Style slots keep the builtin defaults; the flag alone gates highlighting.
+    try std.testing.expectEqualStrings(fx_dark.syntax.keyword_style, disabled.syntax.keyword_style);
+
+    const enabled = try parse(alloc, "{ \"name\": \"yes-syntax\", \"syntax\": true }", .{ .truecolor = true });
+    try std.testing.expect(enabled.syntax.enabled);
+
+    const object = try parse(alloc, "{ \"name\": \"obj-syntax\", \"syntax\": { \"keyword\": \"#ff0000\" } }", .{ .truecolor = true });
+    try std.testing.expect(object.syntax.enabled);
+
+    try std.testing.expectError(error.InvalidTheme, parse(alloc, "{ \"syntax\": 3 }", .{ .truecolor = true }));
 }
 
 test "parse quantizes native themes for 256-color terminals" {

@@ -1470,7 +1470,7 @@ test "collapsed tool group keeps diff count accents" {
     );
 }
 
-test "grouped command lines keep numeric flags uncolored" {
+test "grouped command lines shell-highlight verbs and numeric flags" {
     const alloc = std.testing.allocator;
     const saved_added = ui_render.diff_added_marker_style;
     const saved_removed = ui_render.diff_removed_marker_style;
@@ -1496,7 +1496,7 @@ test "grouped command lines keep numeric flags uncolored" {
 
     try std.testing.expectEqualStrings(
         "● 3 tool calls · 1 write · 1 command\n" ++
-            "├ Ran cat log.txt | head -\x1b[38;5;250m80\x1b[39m\n" ++
+            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt | \x1b[38;5;252mhead\x1b[39m -\x1b[38;5;250m80\x1b[39m\n" ++
             "├ Wrote note.txt [G]+2\x1b[0m\n" ++
             "└ Wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
@@ -1657,9 +1657,9 @@ test "completed command rows shell-highlight quoted strings without coloring the
     defer projection.deinit(alloc);
     const row = projection.entry_actions.items[0].override.bytes;
 
-    // The header, connector, and action label stay uncolored; the quoted
-    // string picks up the syntax palette and closes again.
-    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran printf "));
+    // The header, connector, and action label stay uncolored; the command
+    // verb and quoted string pick up the syntax palette and close again.
+    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
     try std.testing.expect(std.mem.indexOf(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
@@ -1696,13 +1696,14 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    // The row carries styling (the command verb token), so the clip closes it.
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1748,7 +1749,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli && " ++ ("\x1b[38;5;252mprintf\x1b[39m relative-path " ** 6),
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1773,7 +1774,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
@@ -2526,7 +2527,7 @@ test "mixed group keeps the count header before every action" {
             "├ Read three.zig\n" ++
             "├ Read four.zig\n" ++
             "├ Read five.zig\n" ++
-            "└ Ran git -C /workspace status --short",
+            "└ Ran \x1b[38;5;252mgit\x1b[39m -C /workspace status --short",
         projection.entry_actions.items[0].override.bytes,
     );
 }
