@@ -916,7 +916,7 @@ pub fn Bindings(comptime App: type) type {
                 _ = app.resolveModelCapabilitiesForRequest(raw_model) catch return .no_catalog;
             }
             if (comptime @hasDecl(App, "snapshotCachedModelIds")) {
-                var ids = (app.snapshotCachedModelIds(alloc) catch null) orelse return .no_catalog;
+                var ids = (try app.snapshotCachedModelIds(alloc)) orelse return .no_catalog;
                 defer {
                     for (ids.items) |id| alloc.free(id);
                     ids.deinit(alloc);

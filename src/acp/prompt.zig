@@ -1532,8 +1532,8 @@ fn resolveModelCapabilities(
 }
 
 /// Subagent model overrides resolve against the same catalog the capability
-/// path uses. The blocking resolve waits out a still-loading catalog; only
-/// cancellation or an unavailable catalog falls back to raw passthrough.
+/// path uses. The resolve loads the catalog on first use; only cancellation
+/// or an unavailable catalog falls back to raw passthrough.
 fn resolveModelOverride(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,

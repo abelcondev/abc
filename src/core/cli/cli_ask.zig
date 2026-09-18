@@ -2301,8 +2301,8 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
 }
 
 /// Subagent model overrides resolve against the same catalog the capability
-/// path uses. The blocking resolve waits out a still-loading catalog; only
-/// cancellation or an unavailable catalog falls back to raw passthrough.
+/// path uses. The resolve loads the catalog on first use; only cancellation
+/// or an unavailable catalog falls back to raw passthrough.
 fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);

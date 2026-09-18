@@ -24,10 +24,6 @@ pub const ModelCatalogMatch = union(enum) {
     unknown: []const []const u8,
 };
 
-/// fuzzyModelScore assigns at least 100 to substring matches. Weaker token or
-/// subsequence scores are only offered as suggestions, never silently resolved.
-const confident_model_score: i32 = 100;
-
 /// Matches a model override against catalog IDs using the same scoring as
 /// interactive `/model` selection. Exact (case-insensitive) IDs and unique
 /// confident matches resolve; confident ties and weak matches do not.
@@ -42,38 +38,68 @@ pub fn matchCatalogModel(
             return .{ .matched = try alloc.dupe(u8, id) };
         }
     }
-    var best_score: i32 = 0;
+    // Confident matches contain the query verbatim (case-insensitive). Every
+    // fuzzyModelScore band that may resolve (prefix, substring, suffix after
+    // the provider slash) requires substring membership, while its weaker
+    // token and subsequence bands can reach the same numeric scores without
+    // it, so a score threshold alone would let scrambled paraphrases resolve.
+    var confident_best: i32 = 0;
+    var confident_count: usize = 0;
+    var confident_id: ?[]const u8 = null;
+    var weak_best: i32 = 0;
     for (ids) |id| {
         const score = session_commands.fuzzyModelScore(id, query);
-        if (score > best_score) best_score = score;
-    }
-    if (best_score == 0) return .{ .unknown = &.{} };
-    var best_count: usize = 0;
-    for (ids) |id| {
-        if (session_commands.fuzzyModelScore(id, query) == best_score) best_count += 1;
-    }
-    if (best_score >= confident_model_score and best_count == 1) {
-        for (ids) |id| {
-            if (session_commands.fuzzyModelScore(id, query) == best_score) {
-                return .{ .matched = try alloc.dupe(u8, id) };
+        if (containsIgnoreCase(id, query)) {
+            if (confident_id == null or score > confident_best) {
+                confident_best = score;
+                confident_count = 1;
+                confident_id = id;
+            } else if (score == confident_best) {
+                confident_count += 1;
             }
+        } else if (score > weak_best) {
+            weak_best = score;
         }
-        unreachable;
     }
-    const out = try alloc.alloc([]const u8, @min(best_count, max_model_match_candidates));
-    var filled: usize = 0;
+    if (confident_id) |id| {
+        if (confident_count == 1) return .{ .matched = try alloc.dupe(u8, id) };
+        return .{ .ambiguous = try collectScoredMatches(alloc, ids, query, confident_best, true) };
+    }
+    if (weak_best == 0) return .{ .unknown = &.{} };
+    return .{ .unknown = try collectScoredMatches(alloc, ids, query, weak_best, false) };
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Collects up to `max_model_match_candidates` IDs at the target score,
+/// optionally restricted to substring matches. Returned slices are owned by
+/// the caller.
+fn collectScoredMatches(
+    alloc: Allocator,
+    ids: []const []const u8,
+    query: []const u8,
+    target_score: i32,
+    require_substring: bool,
+) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
     errdefer {
-        for (out[0..filled]) |item| alloc.free(item);
-        alloc.free(out);
+        for (out.items) |item| alloc.free(item);
+        out.deinit(alloc);
     }
     for (ids) |id| {
-        if (filled == out.len) break;
-        if (session_commands.fuzzyModelScore(id, query) != best_score) continue;
-        out[filled] = try alloc.dupe(u8, id);
-        filled += 1;
+        if (out.items.len == max_model_match_candidates) break;
+        if (require_substring and !containsIgnoreCase(id, query)) continue;
+        if (session_commands.fuzzyModelScore(id, query) != target_score) continue;
+        try out.append(alloc, try alloc.dupe(u8, id));
     }
-    if (best_score >= confident_model_score) return .{ .ambiguous = out };
-    return .{ .unknown = out };
+    return out.toOwnedSlice(alloc);
 }
 
 pub const Action = enum { run, message };
@@ -514,6 +540,18 @@ test "model override catalog matching resolves, rejects, and suggests" {
 
     const unknown = try matchCatalogModel(alloc, &ids, "skldjf");
     try std.testing.expectEqual(@as(usize, 0), unknown.unknown.len);
+}
+
+test "model override catalog matching never resolves token-only paraphrases" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{ "openai/gpt-5.6-terra-fast", "anthropic/claude-fable-5.1" };
+    // Every query token appears in the target ID, but the query is not a
+    // substring of it: token-band scores must not resolve silently.
+    const result = try matchCatalogModel(alloc, &ids, "gpt 5.6 terra fast");
+    try std.testing.expectEqual(@as(usize, 1), result.unknown.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", result.unknown[0]);
+    for (result.unknown) |item| alloc.free(item);
+    alloc.free(result.unknown);
 }
 
 test "model override catalog matching keeps weak matches as suggestions" {
