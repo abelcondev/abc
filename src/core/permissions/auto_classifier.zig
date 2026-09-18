@@ -321,6 +321,9 @@ pub const ProviderInput = struct {
     account_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",
+    /// Resolved review-model override (`review_model` setting or
+    /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
+    reviewer_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
     usage: ?*session_usage.Usage = null,
     usage_allocator: std.mem.Allocator = std.heap.c_allocator,

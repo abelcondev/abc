@@ -7,6 +7,7 @@ const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const credential_authority = @import("../../core/auth/credential_authority.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
+const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -49,6 +50,16 @@ fn reviewGateway(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
+    // The review_model setting (or FX_REVIEW_MODEL) overrides the reviewer
+    // model. typesafeai/jev selects the TypeSafe System One reviewer; any
+    // other value stays on this gateway chat path with that model id. Every
+    // composition site selects this provider, so the override covers
+    // interactive, ask, and subagent reviews uniformly.
+    const selected = if (input.reviewer_model.len > 0) input.reviewer_model else reviewer_model;
+    if (typesafe_permission_reviewer.isJevModelId(selected)) {
+        debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
+        return typesafe_permission_reviewer.review(null, alloc, input, request);
+    }
     return reviewGatewayConfig(.{
         .api_key = if (input.credential_source == .host_managed) null else input.credential,
         .credential_source = input.credential_source,
@@ -57,13 +68,14 @@ fn reviewGateway(
         .cancel_flag = input.cancel_flag,
         .usage = input.usage,
         .usage_allocator = input.usage_allocator,
-    }, alloc, request);
+    }, alloc, request, selected);
 }
 
 fn reviewGatewayConfig(
     config: GatewayConfig,
     alloc: Allocator,
     request: permission_auto_classifier.ReviewRequest,
+    model: []const u8,
 ) !permission_auto_classifier.ParseOutcome {
     var local = config;
     return permission_auto_classifier.Reviewer.withTransportModel(
@@ -74,7 +86,7 @@ fn reviewGatewayConfig(
         },
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
-        reviewer_model,
+        model,
     ).review(alloc, request);
 }
 
@@ -349,6 +361,7 @@ const FakeOutcome = enum {
 const FakeStream = struct {
     outcomes: []const FakeOutcome,
     calls: usize = 0,
+    expected_model: []const u8 = reviewer_model,
     saw_single_attempt_only: bool = true,
     saw_expected_model_only: bool = true,
     saw_required_tool_payload: bool = true,
@@ -370,7 +383,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, reviewer_model);
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, self.expected_model);
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
@@ -466,10 +479,25 @@ fn testConfig(fake: *FakeStream, cancel_flag: ?*std.atomic.Value(bool)) GatewayC
     };
 }
 
+test "gateway reviewer transport carries the resolved review-model override" {
+    var fake = FakeStream{ .outcomes = &.{.valid}, .expected_model = "openai/gpt-5-alt" };
+    const config = testConfig(&fake, null);
+    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), "openai/gpt-5-alt");
+    defer outcome.deinit(std.testing.allocator);
+
+    switch (outcome) {
+        .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
+        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(fake.saw_expected_model_only);
+    try std.testing.expect(fake.saw_required_tool_payload);
+}
+
 test "gateway automatic reviewer transport is single-attempt" {
     var fake = FakeStream{ .outcomes = &.{.valid} };
     const config = testConfig(&fake, null);
-    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
+    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), reviewer_model);
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -496,7 +524,7 @@ test "gateway automatic reviewer records its generation in session usage" {
         .stream_fn = FakeStream.execute,
     };
 
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
+    var outcome = try reviewGatewayConfig(config, alloc, testRequest(), reviewer_model);
     defer outcome.deinit(alloc);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
@@ -523,7 +551,7 @@ test "pre-send automatic reviewer failure stays unbilled" {
         .stream_fn = FakeStream.execute,
     };
 
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
+    var outcome = try reviewGatewayConfig(config, alloc, testRequest(), reviewer_model);
     defer outcome.deinit(alloc);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
@@ -546,7 +574,7 @@ test "possibly sent automatic reviewer failure marks billing incomplete" {
         .stream_fn = FakeStream.execute,
     };
 
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
+    var outcome = try reviewGatewayConfig(config, alloc, testRequest(), reviewer_model);
     defer outcome.deinit(alloc);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
@@ -586,7 +614,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
         .stream_fn = FakeStream.execute,
     };
 
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
+    var outcome = try reviewGatewayConfig(config, alloc, testRequest(), reviewer_model);
     defer outcome.deinit(alloc);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
@@ -599,7 +627,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
 test "permission reviewer retries one transport failure with a fresh deadline" {
     var fake = FakeStream{ .outcomes = &.{ .transient_error, .malformed } };
     const config = testConfig(&fake, null);
-    const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
+    const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), reviewer_model);
 
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
@@ -616,7 +644,7 @@ test "permission reviewer retries one transport failure with a fresh deadline" {
 test "gateway automatic reviewer distinguishes transient and permanent HTTP failures" {
     var transient_fake = FakeStream{ .outcomes = &.{ .transient_http, .valid } };
     const transient_config = testConfig(&transient_fake, null);
-    var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest());
+    var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest(), reviewer_model);
     defer transient.deinit(std.testing.allocator);
     // Transient failures retry once and can recover.
     try std.testing.expectEqual(
@@ -631,7 +659,7 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_http, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);
-    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest());
+    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
@@ -684,7 +712,7 @@ test "gateway transport preserves cancellation timeout transient and permanent o
 test "gateway automatic reviewer distinguishes timeout permanent failure and cancellation" {
     var timeout_fake = FakeStream{ .outcomes = &.{.timeout} };
     const timeout_config = testConfig(&timeout_fake, null);
-    const timed_out = try reviewGatewayConfig(timeout_config, std.testing.allocator, testRequest());
+    const timed_out = try reviewGatewayConfig(timeout_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(timed_out),
@@ -698,7 +726,7 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_error, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);
-    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest());
+    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
@@ -713,7 +741,7 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     const cancelled_config = testConfig(&cancelled_fake, null);
     try std.testing.expectError(
         error.Cancelled,
-        reviewGatewayConfig(cancelled_config, std.testing.allocator, testRequest()),
+        reviewGatewayConfig(cancelled_config, std.testing.allocator, testRequest(), reviewer_model),
     );
     try std.testing.expectEqual(@as(usize, 1), cancelled_fake.calls);
 
@@ -722,7 +750,7 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     const pre_cancelled_config = testConfig(&pre_cancelled_fake, &cancel_flag);
     try std.testing.expectError(
         error.Cancelled,
-        reviewGatewayConfig(pre_cancelled_config, std.testing.allocator, testRequest()),
+        reviewGatewayConfig(pre_cancelled_config, std.testing.allocator, testRequest(), reviewer_model),
     );
     try std.testing.expectEqual(@as(usize, 0), pre_cancelled_fake.calls);
 }

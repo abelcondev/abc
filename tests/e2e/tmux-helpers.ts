@@ -330,6 +330,9 @@ export type FakeGatewayOptions = {
     generationId: string,
     request: Request,
   ) => Response | Promise<Response>;
+  // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
+  // the gateway). Defaults to a clear Jev decision.
+  evaluationResponse?: FakeGatewayResponse;
 };
 
 // Session title generation calls carry this instruction regardless of the
@@ -364,6 +367,7 @@ function serveFakeGateway(
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
+  const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
@@ -395,6 +399,36 @@ function serveFakeGateway(
         }
         return new Response("not found", { status: 404 });
       }
+      if (
+        req.method === "POST" &&
+        new URL(req.url).pathname === "/v4/ai/evaluation-model"
+      ) {
+        evaluationRequests.push({
+          body: await req.text(),
+          headers: new Headers(req.headers),
+        });
+        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
+        // usage and confidence under providerMetadata.typesafe.
+        const evaluationResponse = options.evaluationResponse ??
+          Response.json({
+            answers: {
+              decision: {
+                type: "choice",
+                choice: "clear",
+                probabilities: { clear: 0.99, caution: 0.01 },
+              },
+            },
+            rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+            usage: { inputTokens: 100, outputTokens: 10 },
+            warnings: [],
+            providerMetadata: {
+              typesafe: { confidence: { decision: 0.97 } },
+            },
+          });
+        return typeof evaluationResponse === "function"
+          ? await evaluationResponse(evaluationRequests[evaluationRequests.length - 1].body)
+          : evaluationResponse;
+      }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
       const headers = new Headers(req.headers);
@@ -419,6 +453,7 @@ function serveFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    evaluationRequests,
     titleRequests,
     generationRequests,
     modelRequests,

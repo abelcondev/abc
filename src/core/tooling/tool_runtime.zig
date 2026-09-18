@@ -132,6 +132,9 @@ pub const Context = struct {
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host_mod.SecretStore = host_mod.unavailable_secret_store,
     model: []const u8,
+    /// Resolved review-model override for automatic permission review. Empty
+    /// keeps the reviewer provider's compiled default.
+    reviewer_model: []const u8 = "",
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
@@ -300,6 +303,7 @@ pub const Context = struct {
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
+            .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
             .usage = &self.session.usage,
             .usage_allocator = self.session_allocator,
@@ -2420,6 +2424,7 @@ const TestRuntime = struct {
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     model: []const u8 = "",
+    reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
@@ -2491,6 +2496,7 @@ const TestRuntime = struct {
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,
             .model = self.model,
+            .reviewer_model = self.reviewer_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .agent_step_limit = 0,

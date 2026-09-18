@@ -59,6 +59,9 @@ pub const Settings = struct {
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
+    /// Optional review-model override for automatic permission review. Owned by
+    /// this Settings; freed in deinit. Null keeps the provider's default.
+    review_model: ?[]const u8 = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
@@ -73,6 +76,7 @@ pub const Settings = struct {
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
+        if (self.review_model) |value| alloc.free(value);
         if (self.theme) |value| alloc.free(value);
         self.* = .{};
     }
@@ -561,6 +565,17 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             };
         }
     }
+    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
+        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (settings_store.validateModel(trimmed)) |_| {
+                if (settings.review_model) |old| alloc.free(old);
+                settings.review_model = try alloc.dupe(u8, trimmed);
+            } else |_| {
+                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
+            }
+        }
+    }
 
     return .{
         .settings = settings,
@@ -661,6 +676,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "providers",
         "codex_model",
         "grok_model",
+        "review_model",
         "effort",
         "fast_mode",
         "fast_mode_model_bound",
@@ -1520,6 +1536,19 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("review_model")) |review_model_value| {
+        const value = review_model_value;
+        if (value != .string) return error.InvalidReviewModelType;
+        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+        if (trimmed.len > 0) {
+            settings_store.validateModel(trimmed) catch {
+                debug_trace.logf("core", "ignoring invalid review_model value", .{});
+                return error.InvalidReviewModelValue;
+            };
+            settings.review_model = try alloc.dupe(u8, trimmed);
+        }
+    }
+
     if (root.object.get("fast_mode")) |fast_mode_value| {
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
@@ -1690,6 +1719,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
+    if (incoming.review_model) |value| {
+        if (target.review_model) |old| alloc.free(old);
+        target.review_model = value;
+        incoming.review_model = null;
+    }
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
@@ -2368,6 +2402,43 @@ test "first_call_tool_choice ignores unknown strings and rejects invalid types" 
     try std.testing.expect(invalid_string.first_call_tool_choice == null);
 
     try std.testing.expectError(error.InvalidFirstCallToolChoiceType, parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":false}"));
+}
+
+test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.review_model == null);
+
+    var base = try parseSettingsJson(std.testing.allocator, "{\"review_model\":\"base/review\"}");
+    defer base.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("base/review", base.review_model.?);
+
+    var over = try parseSettingsJson(std.testing.allocator, "{\"review_model\":\" layer/review \"}");
+    defer over.deinit(std.testing.allocator);
+    try mergeSettings(&base, &over, std.testing.allocator);
+    try std.testing.expectEqualStrings("layer/review", base.review_model.?);
+    try std.testing.expect(over.review_model == null);
+
+    try std.testing.expectError(error.InvalidReviewModelType, parseSettingsJson(std.testing.allocator, "{\"review_model\":false}"));
+    try std.testing.expectError(error.InvalidReviewModelValue, parseSettingsJson(std.testing.allocator, "{\"review_model\":\"bad\\u0001review\"}"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"review_model\":\"profile/review\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_REVIEW_MODEL", "process/review");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
 }
 
 test "obsolete web_fetch worker model setting is ignored" {
@@ -3110,12 +3181,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3132,6 +3203,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(true, result.settings.prompt_history_enabled.?);
     try std.testing.expectEqual(false, result.settings.statusline_context.?);
     try std.testing.expectEqual(types.ToolChoice.none, result.settings.first_call_tool_choice.?);
+    try std.testing.expectEqualStrings("profile/review", result.settings.review_model.?);
     try std.testing.expectEqual(false, result.settings.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, result.settings.update_channel.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
@@ -3141,7 +3213,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3150,6 +3222,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "statusLine",
         "skill_match_fuzzy",
         "first_call_tool_choice",
+        "review_model",
         "auto_upgrade",
         "update_channel",
         "fast_mode",
