@@ -37,6 +37,13 @@ pub const Profile = struct {
     /// A dash at a word boundary opens a flag token (`-n`, `--json`) in the
     /// number color.
     dash_flags: bool = false,
+    /// The first word of each command (after start, a pipe or logical
+    /// operator, `;`, `&`, `$(`, or a control keyword) takes the keyword
+    /// color. Mirrors how the bash grammar scopes command words vs arguments.
+    command_words: bool = false,
+    /// When false, bare number arguments stay plain and only file
+    /// descriptors glued to a redirect take the number color.
+    bare_numbers: bool = true,
     keywords: []const []const u8 = &.{},
     literals: []const []const u8 = &.{},
     keyword_case: KeywordCase = .sensitive,
@@ -76,12 +83,13 @@ const profiles = [_]Profile{
         .label = "sh",
         .aliases = &.{ "sh", "bash", "zsh", "shell" },
         .line_comments = &.{"#"},
-        .quotes = shell_quotes,
-        .operators = "&|;<>",
+        // Backticks are code, not strings, in shell.
+        .quotes = double_single_quotes,
+        .operators = "&|;<>*",
         .dollar_vars = true,
         .dash_flags = true,
-        .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return", "echo", "printf", "cd", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "grep", "sed", "awk", "find", "xargs", "chmod", "git", "curl", "wget", "jq" },
-        .literals = &.{ "true", "false", "null" },
+        .command_words = true,
+        .bare_numbers = false,
         .detection = .shell_shebang,
     },
     .{

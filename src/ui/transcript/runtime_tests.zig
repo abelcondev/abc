@@ -14517,7 +14517,7 @@ test "visual epoch retains command output blocks and detail associations" {
     try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, id, true);
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Retained command complete" },
+        .outcome = .{ .kind = .completed, .summary = "Ran true" },
         .result = "retained command result\n",
         .result_memory = .{ .command_process_presentation = .{ .exit_code = 0 } },
     } });
@@ -14550,7 +14550,8 @@ test "visual epoch retains command output blocks and detail associations" {
             null,
         );
         defer alloc.free(full);
-        try std.testing.expect(std.mem.find(u8, full, "Retained command complete") != null);
+        // The row renders styled; assert on the command text inside it.
+        try std.testing.expect(std.mem.find(u8, full, "true") != null);
         try std.testing.expect(std.mem.find(u8, full, "retained command result") != null);
     }
     runtime.clearTranscript(alloc);
@@ -15322,7 +15323,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mtrue\x1b[39m"),
+            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -16823,5 +16824,7 @@ test "multi-word command labels stay intact when a syntax token follows" {
     // A first-space split would open the base style between "Timed" and
     // "out"; the recorded label keeps both words ahead of the base open.
     try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") != null);
+    // The command word colors; the bare number argument stays plain.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252msleep\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") == null);
 }

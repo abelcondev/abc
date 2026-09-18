@@ -678,6 +678,26 @@ fn reprojectTruncatedCommandPhrase(
 /// ambient style; only the command's syntax tokens pick up palette colors.
 /// `base_style` (the row's text style, when any) is re-established after every
 /// token close so untokenized text keeps the row's color.
+/// Multi-word status labels that can lead a command row when no label was
+/// recorded. Mirrors the terminal-outcome labels composed in
+/// tool_admission.permissionDeniedStatusLabel and the lifecycle rows.
+const known_multiword_labels = [_][]const u8{
+    "Denied by auto agent",
+    "Review evidence incomplete",
+    "Permission required",
+    "Safety caution",
+    "Review unavailable",
+    "Timed out",
+};
+
+fn knownLabelPrefix(phrase: []const u8) ?usize {
+    for (known_multiword_labels) |label| {
+        if (std.mem.startsWith(u8, phrase, label) and phrase.len > label.len and phrase[label.len] == ' ')
+            return label.len;
+    }
+    return null;
+}
+
 fn highlightCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
@@ -687,7 +707,8 @@ fn highlightCommandPhrase(
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
     // Prefer the recorded action label so multi-word labels ("Timed out")
-    // split at the true boundary; fall back to the first space.
+    // split at the true boundary. Rows without one (legacy, some fixtures)
+    // fall back to the known multi-word labels, then the first space.
     const label_end = if (record.command_action_label) |action|
         if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
             action.len
@@ -695,7 +716,7 @@ fn highlightCommandPhrase(
             null
     else
         null;
-    const split = label_end orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
+    const split = label_end orelse knownLabelPrefix(phrase) orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
     const command = phrase[split + 1 ..];
     if (command.len == 0) return null;
     const theme = shared_theme.current();
@@ -1385,7 +1406,7 @@ test "minimal tool group summary uses semantic category order and outcomes" {
         "● 3 tool calls · 1 read · 1 edit · 1 command · 1 failed\n" ++
             "├ Read runtime.zig\n" ++
             "├ Edited main.zig\n" ++
-            "└ Ran zig build",
+            "└ Ran \x1b[38;5;252mzig\x1b[39m build",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -1604,7 +1625,7 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
 
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
-            "├ Denied by auto agent zig build\n" ++
+            "├ Denied by auto agent \x1b[38;5;252mzig\x1b[39m build\n" ++
             "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -1666,9 +1687,9 @@ test "minimal command details expose running completed and failed process states
 
     try std.testing.expectEqualStrings(
         "● 3 tool calls · 3 commands · 1 failed\n" ++
-            "├ Running rg snapshot\n" ++
-            "├ Ran zig build\n" ++
-            "└ Ran zig build test",
+            "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "└ Ran \x1b[38;5;252mzig\x1b[39m build test",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1793,7 +1814,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m " ++ ("\x1b[38;5;252mprintf\x1b[39m relative-path " ** 6),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ (" relative-path printf" ** 5) ++ " relative-path ",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1870,11 +1891,11 @@ test "completed session and tty command rows reproject stored commands at the cu
     _ = narrow_lines.next(); // group header
     const narrow_tty = narrow_lines.next().?;
     const narrow_observe = narrow_lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran bun run pipeline-stage-"));
-    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…\x1b[0m"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
-    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed npm run dev-server-"));
-    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…\x1b[0m"));
     // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
 
@@ -1882,8 +1903,8 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Ran " ++ tty_command ++ "\n" ++
-            "└ Observed " ++ observe_command,
+            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10) ++ "\n" ++
+            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ ("dev-server-" ** 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -1912,13 +1933,13 @@ test "expanded group children reproject stored commands at the current width" {
     var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, .{}, null);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ ("pipeline-stage-" ** 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
     var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, .{}, null);
     defer narrow.deinit(alloc);
-    try std.testing.expect(std.mem.endsWith(u8, narrow.entry_actions.items[0].override.bytes, "…"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow.entry_actions.items[0].override.bytes, "…\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, narrow.entry_actions.items[0].override.bytes, "...") == null);
 }
 
@@ -1969,7 +1990,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
 
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 timed out\n" ++
-            "└ Timed out sleep \x1b[38;5;250m5\x1b[39m",
+            "└ Timed out \x1b[38;5;252msleep\x1b[39m 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2020,7 +2041,7 @@ test "tool-heavy groups render every canonical action" {
     try std.testing.expect(std.mem.find(u8, summary, "10 read") != null);
     try std.testing.expect(std.mem.find(u8, summary, "8 commands") != null);
     try std.testing.expect(std.mem.find(u8, summary, "1 failed") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Ran rg snapshot") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
     try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
     var lines = std.mem.splitScalar(u8, summary, '\n');
@@ -2052,7 +2073,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
-            "└ Cancelled sleep \x1b[38;5;250m30\x1b[39m\n\n" ++
+            "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
             "■ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -2128,8 +2149,8 @@ test "cancelled actions remain inside the message-delimited block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled second") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252mfirst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252msecond\x1b[39m") != null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
@@ -2215,8 +2236,8 @@ test "one presentation group keeps sibling tools in creation order across assist
 
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
+            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -2292,7 +2313,7 @@ test "legacy lifecycle records without group identity respect transcript boundar
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Running second",
+        "● 1 tool call · 1 command\n└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -2329,8 +2350,8 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
+            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
