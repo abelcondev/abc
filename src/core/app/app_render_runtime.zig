@@ -497,7 +497,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             app.pacer.rethemeInlineCode(light);
-            if (ui_render.explicitThemeName()) |name| {
+            if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
                 // Custom themes re-resolve on live flips: sibling swap or
                 // builtin fallback, same rule as startup.
                 const custom = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {

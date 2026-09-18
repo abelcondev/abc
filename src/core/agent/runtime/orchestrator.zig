@@ -2478,7 +2478,7 @@ fn resolveLiveToolAuthority(
             call,
             advertised_dynamic_tool_names,
         ) catch |err| {
-        const failure = (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call.name, err)) orelse return err;
+        const failure = (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call, err)) orelse return err;
         debug_trace.logf("permission", "event=live_authority_target_failure call_id={s} tool_name={s} err={s}", .{ call.id, call.name, @errorName(err) });
         return .{ .tool_failure = failure };
     };
@@ -3392,7 +3392,7 @@ fn appendRecoveryConversationContext(
 ) !void {
     const selected = strategy orelse return;
     const prompt = switch (selected) {
-        .retry_request, .pause, .stop => return,
+        .retry_request, .pause, .stop, .wait_for_connectivity, .probe_liveness => return,
         .continue_response => continue_response_recovery_prompt,
         .regenerate_tool => regenerate_tool_recovery_prompt,
         .continue_after_confirmed_tool => continue_after_confirmed_tool_recovery_prompt,
@@ -3592,6 +3592,7 @@ fn restoredRecoveryCause(
 ) model_response_recovery.FailureCause {
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
+        .connectivity_lost => .connectivity_lost,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3757,6 +3758,7 @@ fn checkpointCause(
 ) types.ModelRecoveryCause {
     return switch (cause) {
         .transport_interrupted => .network_interrupted,
+        .connectivity_lost => .connectivity_lost,
         .response_interrupted => .response_interrupted,
         .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
@@ -3778,6 +3780,8 @@ fn checkpointAction(
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
         .reconcile_tool => .reconciling_tool,
+        .wait_for_connectivity => .waiting_for_connectivity,
+        .probe_liveness => .checking_liveness,
         .pause, .stop => .paused,
     };
 }
@@ -3801,6 +3805,7 @@ fn recoveryRequiredAction(
         .continue_later => .continue_later,
         .inspect_uncertain_tool => .inspect_uncertain_tool,
         .change_request => .change_request,
+        .surface_stall => .surface_stall,
     };
 }
 
@@ -3920,7 +3925,7 @@ fn persist_compaction_source(
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = false,
     });
-    diagnostics.traceCompactionEvent(trace_ctx, "source_checkpointed", "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
+    diagnostics.traceCompactionEvent(trace_ctx, .source_checkpointed, "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
@@ -3940,6 +3945,8 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
             if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
             self.checkpoint = next;
         }
+
+        fn clear(_: *anyopaque) !void {}
     };
     var sink: Sink = .{};
     defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
@@ -3947,7 +3954,7 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     defer fake.deinit();
     var deps = fake.deps();
     deps.ctx = &sink;
-    deps.recovery_checkpoint = .{ .set = Sink.set };
+    deps.recovery_checkpoint = .{ .set = Sink.set, .clear = Sink.clear };
     var fixture: support.PromptFixture = .{};
     var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
         hooks.RuntimeView.empty(),
@@ -4654,6 +4661,7 @@ fn auto_retry_status(
         .attempt_limit = attempt_limit,
         .cause = switch (cause) {
             .transport_interrupted => .network_interrupted,
+            .connectivity_lost => .connectivity_lost,
             .response_interrupted => .response_interrupted,
             .provider_stream_timeout => .provider_stream_timeout,
             .provider_unavailable => .provider_unavailable,
@@ -4670,6 +4678,8 @@ fn auto_retry_status(
             .regenerate_tool => .regenerating_tool,
             .continue_after_confirmed_tool => .continuing_after_tool,
             .reconcile_tool => .reconciling_tool,
+            .wait_for_connectivity => .waiting_for_connectivity,
+            .probe_liveness => .checking_liveness,
             .pause => .paused,
             .stop => null,
         },
@@ -4677,6 +4687,15 @@ fn auto_retry_status(
         .retry_deadline = retry_deadline,
         .diagnostic = diagnostic,
     };
+}
+
+/// The status row must not change shape between the wait and the in-flight
+/// beat: when the countdown segment vanished, right-aligned footer content
+/// shifted with it. Mirror exactly what the wait row displayed (the segment
+/// appears only when the wait rendered one); the next failure or the
+/// recovered status replaces it.
+fn inFlightDelaySeconds(delay_ns: u64) u64 {
+    return delay_ns / std.time.ns_per_s;
 }
 
 fn pushAutoRetryStatus(
@@ -4783,6 +4802,47 @@ fn finishRecoveryPaused(
     finish_trace.finish("recovery_paused");
 }
 
+/// No-progress stop: the exchange kept failing at the same point, so the turn
+/// ends honestly (terminal, prompt restored) instead of pausing or restarting
+/// forever. Used when decide() returns stop + surface_stall.
+fn finishRecoveryStalled(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
+    arena: Allocator,
+    finish_trace: *PromptFinishTrace,
+    cause: model_response_recovery.FailureCause,
+    consumed_attempts: usize,
+    attempt_limit: usize,
+    diagnostic: ?types.ModelFailureDiagnostic,
+) !void {
+    try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
+        deps,
+        stream_ctx.alloc,
+        arena,
+        finalization.turn_id,
+        &.{},
+    );
+    try pushRouteRecoveryStatus(deps, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = consumed_attempts,
+        .attempt_limit = attempt_limit,
+        .cause = checkpointCause(cause),
+        .required_action = .surface_stall,
+        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
+    });
+    // A stall-stopped turn is terminally dead: without clearing the durable
+    // checkpoint, the next resume would auto-continue it and re-spend attempts
+    // on a turn the UI already called stopped.
+    if (deps.recovery_checkpoint) |effect| {
+        effect.clear(deps.ctx) catch |err| {
+            debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
+        };
+    }
+    try finalization.finish(.failed, null, null);
+    finish_trace.finish("recovery_stalled");
+}
+
 fn pushUnsafeNoRetryStatus(
     deps: *const AgentRuntimeDeps,
     reason: types.RouteRecoveryUnsafeReason,
@@ -4795,6 +4855,53 @@ fn pushUnsafeNoRetryStatus(
         },
         .diagnostic = diagnostic,
     });
+}
+
+// Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
+// negative under NTP correction; a backward step reads as zero elapsed,
+// never a trap.
+fn recoveryElapsedNs(recovery_started_at_ms: ?i64) ?u64 {
+    const started = recovery_started_at_ms orelse return null;
+    const delta_ms = io_mod.milliTimestamp() - started;
+    if (delta_ms <= 0) return 0;
+    return @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
+}
+
+test "recoveryElapsedNs clamps backward wall-clock steps" {
+    try std.testing.expectEqual(@as(?u64, null), recoveryElapsedNs(null));
+    try std.testing.expectEqual(@as(?u64, 0), recoveryElapsedNs(io_mod.milliTimestamp() + 60_000));
+    const elapsed = recoveryElapsedNs(io_mod.milliTimestamp() - 2_000).?;
+    try std.testing.expect(elapsed >= 1_500 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed <= 3_000 * std.time.ns_per_ms);
+}
+
+/// A turn that can never recover hands the user's prompt back to the composer
+/// so nothing typed is lost. Only genuine user turns restore: resumed recovery
+/// jobs and subagent turns keep their own state.
+fn restorePromptAfterTerminalFailure(
+    deps: *const AgentRuntimeDeps,
+    job: QueuedPrompt,
+    config: Config,
+) void {
+    if (config.origin != .root) return;
+    if (job.recovery_checkpoint != null) return;
+    const restore = deps.restore_failed_prompt orelse return;
+    const prompt = std.mem.trim(u8, job.prompt, " \t\r\n");
+    if (prompt.len == 0) return;
+    restore(deps.ctx, prompt) catch |err| {
+        debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
+    };
+}
+
+// A user-cancelled turn's durable checkpoint dies with it; otherwise the next
+// resume would auto-continue a turn the user explicitly stopped. Covers the
+// model-response cancel paths, including a cancel during an episode's first
+// retry wait; no-ops when no checkpoint exists.
+fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
@@ -6079,9 +6186,9 @@ pub fn compactContextTransaction(
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
         if (err == error.Cancelled) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+            diagnostics.traceCompactionEvent(request.trace_ctx, .transaction_failed, "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
         } else {
-            diagnostics.traceCompactionFailure(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+            diagnostics.traceCompactionFailure(request.trace_ctx, .transaction_failed, "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
         }
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
@@ -6100,7 +6207,7 @@ pub fn compactContextTransaction(
     if (initial_plan.decision == .no_op) {
         diagnostics.traceCompactionEvent(
             request.trace_ctx,
-            "skipped_no_op",
+            .skipped_no_op,
             "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6119,7 +6226,7 @@ pub fn compactContextTransaction(
     const accepted_tokens = plan.accepted_handoff_tokens orelse {
         diagnostics.traceCompactionFailure(
             request.trace_ctx,
-            "capacity_exceeded_at_plan",
+            .capacity_exceeded_at_plan,
             "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6137,7 +6244,7 @@ pub fn compactContextTransaction(
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
         diagnostics.traceCompactionFailure(
             request.trace_ctx,
-            "credential_unauthorized",
+            .credential_unauthorized,
             "trigger={s} provider={s} credential_source={s}",
             .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
         );
@@ -6192,7 +6299,7 @@ pub fn compactContextTransaction(
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
         diagnostics.traceCompactionEvent(
             request.trace_ctx,
-            "candidate_over_capacity",
+            .candidate_over_capacity,
             "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
             .{
                 @tagName(request.trigger),
@@ -6214,7 +6321,7 @@ pub fn compactContextTransaction(
     }, request.active_prefix, request.retained_from);
     diagnostics.traceCompactionEvent(
         request.trace_ctx,
-        "committed",
+        .committed,
         "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
         .{
             @tagName(request.trigger),
@@ -6751,6 +6858,12 @@ fn processQueuedPromptLoop(
     else
         restored_attempts;
     var retry_pacing: model_response_recovery.RetryPacingState = .idle;
+    // Wall-clock state for autonomous recovery: when this turn entered
+    // recovery (drives the billable-retry throttle), and the no-progress
+    // detector that stops identical-failure restart loops.
+    var recovery_started_at_ms: ?i64 = null;
+    var recovery_last_progress: ?usize = null;
+    var recovery_no_progress_streak: usize = 0;
     const response_language_expectation = if (config.enforce_response_language and
         config.origin == .root and
         job.recovery_checkpoint == null)
@@ -6793,6 +6906,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
+            clearRecoveryCheckpointOnUserCancel(deps);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -6950,41 +7064,11 @@ fn processQueuedPromptLoop(
                 pending_auto_retry_status = null;
                 return;
             }
-            if (semantic_attempt >= semantic_limit) {
-                recovery_cause = .request_limit_reached;
-                recovery_strategy = .pause;
-                try persistRecoveryCheckpoint(
-                    deps,
-                    finalization,
-                    job,
-                    within_turn_suffix.items,
-                    stream_ctx.interruption_source_or(""),
-                    gateway_model,
-                    selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
-                    false,
-                    recovery_cause,
-                    recovery_strategy,
-                    preserved_tool_evidence,
-                    step_ctx,
-                );
-                try finishRecoveryPaused(
-                    deps,
-                    finalization,
-                    &stream_ctx,
-                    arena,
-                    &finish_trace,
-                    recovery_cause,
-                    semantic_attempt,
-                    semantic_limit,
-                    pausedRequiredAction(preserved_tool_evidence),
-                    defaultRecoveryDiagnostic(.request_limit_reached),
-                );
-                pending_auto_retry_status = null;
-                return;
-            }
+            // The provider-attempt budget is deliberately not a turn limit:
+            // transient failures keep recovering autonomously (throttled past
+            // the billable window, stall-stopped when nothing progresses, and
+            // always esc-cancellable). Only a lifecycle pause flag parks a turn.
+
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
@@ -7071,8 +7155,14 @@ fn processQueuedPromptLoop(
                         );
                     },
                     .unavailable => switch (request_capabilities.image_input_support) {
-                        .unknown => return error.ModelImageCapabilityUnavailable,
-                        .non_native => return error.SubscriptionNativeImageUnavailable,
+                        .unknown => {
+                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                            return error.ModelImageCapabilityUnavailable;
+                        },
+                        .non_native => {
+                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
+                            return error.SubscriptionNativeImageUnavailable;
+                        },
                         .native => unreachable,
                     },
                 };
@@ -7206,7 +7296,7 @@ fn processQueuedPromptLoop(
                 diagnostics.traceCompactionEventIf(
                     projection_plan.decision != .no_op,
                     step_ctx,
-                    "decision",
+                    .decision,
                     "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
@@ -7225,12 +7315,12 @@ fn processQueuedPromptLoop(
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
-                        diagnostics.traceCompactionFailure(step_ctx, "overflow_without_compaction", "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
+                        diagnostics.traceCompactionFailure(step_ctx, .overflow_without_compaction, "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
-                                diagnostics.traceCompactionFailure(step_ctx, "no_compactable_context", "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
+                                diagnostics.traceCompactionFailure(step_ctx, .no_compactable_context, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -7261,10 +7351,10 @@ fn processQueuedPromptLoop(
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
                                     if (retention_target == 0) {
-                                        diagnostics.traceCompactionFailure(step_ctx, "retention_exhausted", "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        diagnostics.traceCompactionFailure(step_ctx, .retention_exhausted, "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
                                         return error.ContextCapacityExceeded;
                                     }
-                                    diagnostics.traceCompactionFailure(step_ctx, "retention_forced_zero", "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
+                                    diagnostics.traceCompactionFailure(step_ctx, .retention_forced_zero, "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -7395,7 +7485,7 @@ fn processQueuedPromptLoop(
                             }
                             diagnostics.traceCompactionEvent(
                                 step_ctx,
-                                "installed",
+                                .installed,
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
@@ -7436,7 +7526,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
-                diagnostics.traceCompactionFailure(step_ctx, "overflow_recovery_incomplete", "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
+                diagnostics.traceCompactionFailure(step_ctx, .overflow_recovery_incomplete, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
@@ -7534,6 +7624,8 @@ fn processQueuedPromptLoop(
                     switch (evidence.cause) {
                         .transport_interrupted => .transport_interrupted,
                         .system_resumed => .system_resumed,
+                        .connectivity_lost => .connectivity_lost,
+                        .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
@@ -7581,6 +7673,22 @@ fn processQueuedPromptLoop(
                     pending_auto_retry_status = null;
                     return;
                 }
+                const failure_progress = stream_ctx.streamed_output_bytes;
+                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                const had_previous_progress = recovery_last_progress != null;
+                if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
+                    recovery_no_progress_streak += 1;
+                } else {
+                    recovery_no_progress_streak = 0;
+                }
+                recovery_last_progress = failure_progress;
+                const progress_evidence: model_response_recovery.Progress = if (recovery_no_progress_streak >= 2)
+                    .stalled
+                else if (had_previous_progress)
+                    .advancing
+                else
+                    .unknown;
+
                 var recovery_decision = if (network_failure) |evidence|
                     model_response_recovery.decide(.{
                         .cause = failure_cause,
@@ -7597,6 +7705,8 @@ fn processQueuedPromptLoop(
                             &stream_ctx,
                         ),
                         .cancelled = cancel_requested,
+                        .progress = progress_evidence,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
@@ -7609,7 +7719,7 @@ fn processQueuedPromptLoop(
                         .required_action = .inspect_uncertain_tool,
                     };
                 }
-                const will_auto_retry = recovery_decision.reserve_provider_attempt;
+                const will_auto_retry = recovery_decision.autoRecovers();
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -7747,6 +7857,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
+                    clearRecoveryCheckpointOnUserCancel(deps);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -7758,7 +7869,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         failure_cause,
                         recovery_decision.strategy,
-                        0,
+                        inFlightDelaySeconds(recovery_decision.delay_ns),
                         null,
                         failure_diagnostic,
                     );
@@ -7793,6 +7904,22 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
+                if (recovery_decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        failure_cause,
+                        consumed_attempts,
+                        semantic_limit,
+                        failure_diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
+                    return;
+                }
                 if (network_failure != null) {
                     const exhausted_retryable =
                         stream_ctx.interruption_source_or("").len == 0 and
@@ -7803,9 +7930,12 @@ fn processQueuedPromptLoop(
                             .kind = .terminal_provider_error,
                             .failed_attempt = consumed_attempts,
                             .attempt_limit = semantic_limit,
+                            .cause = checkpointCause(failure_cause),
+                            .required_action = recoveryRequiredAction(recovery_decision.required_action),
                             .diagnostic = failure_diagnostic,
                         });
                         pending_auto_retry_status = null;
+                        restorePromptAfterTerminalFailure(deps, job, config);
                     } else {
                         try pushUnsafeNoRetryStatus(
                             deps,
@@ -7815,15 +7945,19 @@ fn processQueuedPromptLoop(
                                 .assistant_output,
                             failure_diagnostic,
                         );
+                        restorePromptAfterTerminalFailure(deps, job, config);
                     }
                 } else if (semantic_attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
                         .failed_attempt = consumed_attempts,
                         .attempt_limit = semantic_limit,
+                        .cause = checkpointCause(failure_cause),
+                        .required_action = recoveryRequiredAction(recovery_decision.required_action),
                         .diagnostic = failure_diagnostic,
                     });
                     pending_auto_retry_status = null;
+                    restorePromptAfterTerminalFailure(deps, job, config);
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                 const failed_assistant_source = stream_ctx.interruption_source_or("");
@@ -7992,7 +8126,7 @@ fn processQueuedPromptLoop(
                 )) {
                     diagnostics.traceCompactionEvent(
                         step_ctx,
-                        "provider_overflow_recovery",
+                        .provider_overflow_recovery,
                         "model={s} request_bytes={d} estimated_tokens={d}",
                         .{
                             gateway_model,
@@ -8111,6 +8245,12 @@ fn processQueuedPromptLoop(
                     streamReplaySafe(&stream_ctx),
                     step_ctx,
                 );
+                // HTTP-status failures (5xx, 429) carry no stream progress, so
+                // they are exempt from the no-progress detector and keep
+                // retrying patiently. The billable retry window still applies:
+                // past it, the cadence throttles instead of hammering.
+                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -8124,6 +8264,7 @@ fn processQueuedPromptLoop(
                     ),
                     .retry_after_seconds = failure.retry_after_seconds,
                     .cancelled = config.cancel_flag.load(.seq_cst),
+                    .recovery_elapsed_ns = recovery_elapsed_ns,
                 });
                 if (decision.strategy == .pause) {
                     try persistRecoveryCheckpoint(
@@ -8160,6 +8301,22 @@ fn processQueuedPromptLoop(
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
+                    return;
+                }
+                if (decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        cause,
+                        semantic_attempt + 1,
+                        semantic_limit,
+                        diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
                 if (decision.reserve_provider_attempt) {
@@ -8201,7 +8358,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );
@@ -8252,6 +8409,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8305,6 +8463,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
+                clearRecoveryCheckpointOnUserCancel(deps);
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8421,6 +8580,21 @@ fn processQueuedPromptLoop(
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
                 const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
+                // Interrupted streams and provider-error completions carry
+                // progress evidence; bare HTTP status failures (5xx, 429) and
+                // gateway timeout metadata are exempt from the stall detector.
+                const failure_progress = stream_ctx.streamed_output_bytes;
+                const track_progress = cause == .response_interrupted or
+                    (attempt_disposition == .provider_failure and cause == .provider_unavailable);
+                if (track_progress) {
+                    if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
+                    if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
+                        recovery_no_progress_streak += 1;
+                    } else {
+                        recovery_no_progress_streak = 0;
+                    }
+                    recovery_last_progress = failure_progress;
+                }
                 const decision = if (non_retryable)
                     model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
                 else
@@ -8436,6 +8610,11 @@ fn processQueuedPromptLoop(
                             &stream_ctx,
                         ),
                         .cancelled = config.cancel_flag.load(.seq_cst),
+                        .progress = if (track_progress and recovery_no_progress_streak >= 2)
+                            .stalled
+                        else
+                            .unknown,
+                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     });
                 if (attempt_disposition == .provider_failure or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
@@ -8496,8 +8675,25 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                if (decision.reserve_provider_attempt) {
-                    if (route_changed) {
+                if (decision.required_action == .surface_stall) {
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    try finishRecoveryStalled(
+                        deps,
+                        finalization,
+                        &stream_ctx,
+                        arena,
+                        &finish_trace,
+                        cause,
+                        semantic_attempt + 1,
+                        semantic_limit,
+                        diagnostic,
+                    );
+                    restorePromptAfterTerminalFailure(deps, job, config);
+                    return;
+                }
+                const decision_auto_recovers = decision.autoRecovers();
+                if (decision_auto_recovers) {
+                    if (route_changed and decision.reserve_provider_attempt) {
                         try persistRecoveryCheckpoint(
                             deps,
                             finalization,
@@ -8535,7 +8731,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             cause,
                             decision.strategy,
-                            0,
+                            inFlightDelaySeconds(decision.delay_ns),
                             null,
                             diagnostic,
                         );
@@ -8544,7 +8740,9 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         );
-                        semantic_attempt += 1;
+                        // Probes and connectivity waits are not provider
+                        // attempts: nothing billable was sent.
+                        if (decision.reserve_provider_attempt) semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -8586,6 +8784,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
+                        clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8604,6 +8803,7 @@ fn processQueuedPromptLoop(
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
                         std.mem.trim(u8, failed_assistant_source, " \t\r\n").len > 0)
@@ -8635,6 +8835,7 @@ fn processQueuedPromptLoop(
                             diagnostic,
                         );
                     }
+                    restorePromptAfterTerminalFailure(deps, job, config);
                 }
 
                 if (finish_reason == .content_filter) {
@@ -8732,6 +8933,9 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
+                    recovery_started_at_ms = null;
+                    recovery_last_progress = null;
+                    recovery_no_progress_streak = 0;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -8899,6 +9103,9 @@ fn processQueuedPromptLoop(
         recovery_cause = .transport_interrupted;
         retry_pacing = .idle;
         preserved_tool_evidence = .none;
+        recovery_started_at_ms = null;
+        recovery_last_progress = null;
+        recovery_no_progress_streak = 0;
 
         if (deps.report_usage) |report_fn| {
             if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {

@@ -36,6 +36,9 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 /// or serialize anything it retains, including when a save fails.
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+    /// Terminally dead turns clear the durable checkpoint so a later resume
+    /// cannot resurrect a turn the product already called stopped.
+    clear: *const fn (ctx: *anyopaque) anyerror!void,
 };
 
 /// Presentation only. Called outside history publication's worker critical section.
@@ -245,6 +248,9 @@ pub const AgentRuntimeDeps = struct {
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// A turn that can never recover hands the user's prompt back to the
+    /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
+    restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,

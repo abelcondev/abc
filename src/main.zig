@@ -854,10 +854,12 @@ const App = struct {
     }
 
     fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
+        var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream();
+        shutdown_trace.mark("stop_stream");
 
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -865,9 +867,11 @@ const App = struct {
         self.upgrader.stop();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
+        shutdown_trace.mark("background_stops_requested");
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        shutdown_trace.mark("worker_thread_joined");
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
@@ -882,6 +886,7 @@ const App = struct {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
         };
+        shutdown_trace.mark("persistence_finalized");
         const shutdown_failure = self.session_persistence.shutdown_failure;
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
@@ -909,6 +914,7 @@ const App = struct {
         for (self.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
+        shutdown_trace.mark("mcp_deinit");
         self.skills.deinit(std.heap.c_allocator);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
@@ -918,6 +924,7 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
+        shutdown_trace.mark("complete");
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
@@ -1268,6 +1275,10 @@ const App = struct {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
 
+    pub fn startSessionCatalogPreload(self: *App) void {
+        SessionAppRuntime.preloadSessionCatalog(self);
+    }
+
     pub fn loadMoreSessionPicker(self: *App) !bool {
         return SessionAppRuntime.loadMoreSessionPicker(self);
     }
@@ -1330,10 +1341,6 @@ const App = struct {
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
-    }
-
-    pub fn continuePausedRecovery(self: *App) !bool {
-        return SessionAppRuntime.continuePausedRecovery(self);
     }
 
     pub fn queueRecoveryCheckpoint(
@@ -2679,6 +2686,11 @@ const App = struct {
     fn nativeClearProbeEligible(self: *const App, byte: u8) bool {
         if (byte < 32 or byte == 127) return false;
         if (io_mod.getenv("TMUX") != null) return false;
+        // An alternate-screen surface (full transcript, approval review,
+        // catalog menu) owns the terminal cursor. The probe compares against
+        // the main-grid footer row, so any response from the alternate screen
+        // is a guaranteed false mismatch; never begin while one is active.
+        if (self.terminal.alternate_screen_owner != .none) return false;
         if (self.terminal_input_runtime.native_clear_probe.disabled() or
             self.terminal_input_runtime.native_clear_probe.active() or
             self.input_runtime.paste.active() or
@@ -2876,9 +2888,10 @@ const App = struct {
         const now_ms = io_mod.milliTimestamp();
         self.terminal_input_runtime.terminal_theme_monitor.poll(now_ms);
 
-        // FX_THEME=light|dark pins the variant; keep owning protocol bytes
-        // (monitor started) but never query or apply live theme updates.
-        // Custom theme files stay live: updates re-resolve the theme pair.
+        // A configured light|dark pin (FX_THEME or the settings "theme" key)
+        // locks the variant; keep owning protocol bytes (monitor started) but
+        // never query or apply live theme updates. Custom theme files stay
+        // live: updates re-resolve the theme pair.
         if (ui_render.themeInputLocked()) {
             _ = self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate();
             return;

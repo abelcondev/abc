@@ -1,57 +1,25 @@
-//! Bounded, always-on context-compaction breadcrumbs for the user-initiated
-//! /trace report. Records the same events that the `context_compaction`
-//! debug-trace scope emits so compaction decisions and failure reasons stay
-//! visible even when FX_TRACE is off. Callers supply internal counters, stage
-//! and enum names only, never user prompts or tool payloads; the one bounded
-//! provider error detail is secret-masked and control-byte neutralized at the
-//! capture site before it reaches the ring.
+//! Bounded, always-on model-catalog breadcrumbs for the user-initiated
+//! /trace report. Records catalog load outcomes, capability lookup misses, and
+//! image gate rejections so a shared trace explains why fx could not verify a
+//! model's capabilities even when FX_TRACE is off. Callers supply model slugs,
+//! enum names, and internal counters only, never credentials or user prompts.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 
-pub const ring_capacity = 64;
-const max_detail_bytes = 512;
+pub const ring_capacity = 32;
+const max_detail_bytes = 256;
 
 pub const Kind = enum {
-    log,
-    failed,
-    policy_selected,
-    provider_start,
-    summary_skipped,
-    user_capacity_retry,
-    provider_completed,
-    summary_cancelled,
-    summary_transport_failed,
-    summary_incomplete,
-    summary_tool_call_rejected,
-    summary_truncated,
-    summary_invalid_utf8,
-    empty_summary_retry,
-    summary_empty_exhausted,
-    source_checkpointed,
-    transaction_failed,
-    skipped_no_op,
-    capacity_exceeded_at_plan,
-    credential_unauthorized,
-    candidate_over_capacity,
-    committed,
-    decision,
-    overflow_without_compaction,
-    no_compactable_context,
-    retention_exhausted,
-    retention_forced_zero,
-    installed,
-    overflow_recovery_incomplete,
-    provider_overflow_recovery,
+    load,
+    lookup,
+    image_gate,
 };
 
 pub const Event = struct {
     sequence: u64 = 0,
     timestamp_ms: i64 = 0,
-    turn_id: u64 = 0,
-    step_id: u64 = 0,
-    subagent_id: u64 = 0,
     failed: bool = false,
-    kind: Kind = .log,
+    kind: Kind = .load,
     detail_len: u16 = 0,
     truncated: bool = false,
     detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
@@ -63,6 +31,12 @@ pub const Event = struct {
     pub fn detail(self: *const Event) []const u8 {
         return self.detail_buf[0..self.detail_len];
     }
+
+    fn matches(self: *const Event, kind: Kind, event_detail: []const u8, failed: bool) bool {
+        return self.failed == failed and
+            self.kind == kind and
+            std.mem.eql(u8, self.detail(), event_detail);
+    }
 };
 
 const Ring = struct {
@@ -71,12 +45,17 @@ const Ring = struct {
     stored: usize = 0,
     total: u64 = 0,
 
-    fn append(self: *Ring, event: *const Event) void {
+    fn append(self: *Ring, event: Event) void {
         self.total +|= 1;
-        self.events[self.head] = event.*;
+        self.events[self.head] = event;
         self.events[self.head].sequence = self.total;
         self.head = (self.head + 1) % ring_capacity;
         self.stored = @min(self.stored + 1, ring_capacity);
+    }
+
+    fn newest(self: *const Ring) ?*const Event {
+        if (self.stored == 0) return null;
+        return &self.events[(self.head + ring_capacity - 1) % ring_capacity];
     }
 
     fn snapshot(self: *const Ring, out: []Event) usize {
@@ -92,14 +71,12 @@ var mutex: std.Io.Mutex = .init;
 // Zero-initialized storage stays in .bss; unused slots are never read.
 var ring: Ring = std.mem.zeroes(Ring);
 
-// Keep format specialization at the caller while sharing ring mutation without
-// adding another Event-sized stack copy.
-pub inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
+/// Records one catalog event. Consecutive identical events collapse into the
+/// newest slot so a per-turn lookup miss cannot evict rarer load and rejection
+/// evidence from the bounded ring.
+pub fn record(kind: Kind, failed: bool, comptime fmt: []const u8, args: anytype) void {
     var event: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),
-        .turn_id = turn_id,
-        .step_id = step_id,
-        .subagent_id = subagent_id,
         .failed = failed,
         .kind = kind,
     };
@@ -108,13 +85,12 @@ pub inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, f
         event.truncated = true;
     };
     event.detail_len = @intCast(writer.buffered().len);
-    append_recorded_event(&event);
-}
-
-noinline fn append_recorded_event(event: *const Event) void {
     const io = io_mod.getIo();
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
+    if (ring.newest()) |last| {
+        if (last.matches(event.kind, event.detail(), event.failed)) return;
+    }
     ring.append(event);
 }
 
@@ -134,10 +110,10 @@ pub fn reset() void {
     ring.total = 0;
 }
 
-test "compaction diagnostic ring retains the newest events in order" {
+test "model catalog diagnostic ring retains the newest events in order" {
     var local: Ring = .{};
     for (0..ring_capacity + 3) |index| {
-        local.append(&.{ .timestamp_ms = @intCast(index) });
+        local.append(.{ .timestamp_ms = @intCast(index) });
     }
     var events: [ring_capacity]Event = undefined;
     try std.testing.expectEqual(ring_capacity, local.snapshot(&events));
@@ -150,26 +126,29 @@ test "compaction diagnostic ring retains the newest events in order" {
     try std.testing.expectEqual(@as(usize, 0), local.snapshot(&.{}));
 }
 
-test "compaction diagnostics stay bounded and reset without file tracing" {
+test "model catalog diagnostics stay bounded, dedup consecutive repeats, and reset" {
     reset();
     defer reset();
-    record(.decision, 7, 3, 0, false, "automatic_threshold tokens={d}/{d}", .{ 279466, 280000 });
-    const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
-    record(.retention_exhausted, 7, 4, 0, true, "{s}", .{oversized});
-    var events: [2]Event = undefined;
+    record(.lookup, true, "outcome=missing_entry model={s}", .{"provider/model-a"});
+    record(.lookup, true, "outcome=missing_entry model={s}", .{"provider/model-a"});
+    record(.image_gate, true, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"provider/model-a"});
+    var events: [4]Event = undefined;
     try std.testing.expectEqual(@as(usize, 2), snapshot(&events));
-    try std.testing.expectEqualStrings("decision", events[0].name());
-    try std.testing.expectEqualStrings("automatic_threshold tokens=279466/280000", events[0].detail());
-    try std.testing.expect(!events[0].failed);
-    try std.testing.expectEqual(@as(u64, 7), events[0].turn_id);
-    try std.testing.expectEqual(@as(u64, 3), events[0].step_id);
-    try std.testing.expectEqualStrings("retention_exhausted", events[1].name());
-    try std.testing.expect(events[1].failed);
-    try std.testing.expect(events[1].truncated);
-    try std.testing.expect(events[1].detail_len <= max_detail_bytes);
+    try std.testing.expectEqualStrings("lookup", events[0].name());
+    try std.testing.expect(events[0].failed);
+    try std.testing.expectEqualStrings("image_gate", events[1].name());
+    try std.testing.expect(events[1].detail().len > 0);
+
+    const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
+    record(.load, true, "{s}", .{oversized});
+    try std.testing.expectEqual(@as(usize, 3), snapshot(&events));
+    try std.testing.expect(events[2].truncated);
+    try std.testing.expect(events[2].detail_len <= max_detail_bytes);
+
     reset();
     try std.testing.expectEqual(@as(usize, 0), snapshot(&events));
-    record(.installed, 8, 0, 0, false, "kept_users={d}", .{3});
+    record(.load, false, "entries={d}", .{12});
     try std.testing.expectEqual(@as(usize, 1), snapshot(&events));
     try std.testing.expectEqual(@as(u64, 1), events[0].sequence);
+    try std.testing.expect(!events[0].failed);
 }

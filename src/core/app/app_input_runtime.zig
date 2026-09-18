@@ -1609,6 +1609,7 @@ pub fn Runtime(comptime App: type) type {
             );
             app.input_runtime.gestures = transition.next;
             if (transition.result == .activated) {
+                debug_trace.logf("shutdown", "ctrl_c_exit_activated", .{});
                 app_session_runtime.Runtime(App).requestResumeHandoff(app);
                 app.should_exit = true;
                 return;

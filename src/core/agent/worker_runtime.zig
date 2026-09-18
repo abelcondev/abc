@@ -519,6 +519,9 @@ pub const WorkerEvent = union(enum) {
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
+    /// A turn that can never recover hands the prompt back to the composer.
+    /// Owned by the event; the consumer frees it.
+    restore_failed_prompt: []u8,
 };
 
 pub const WorkerEventBatch = struct {
@@ -4058,6 +4061,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .error_text => |notice| .{ .error_text = try types.dupeSemanticNotice(alloc, notice) },
+        .restore_failed_prompt => |text| .{ .restore_failed_prompt = try alloc.dupe(u8, text) },
     };
 }
 
@@ -4109,6 +4113,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             alloc.free(grant.target_path);
         },
         .error_text => |notice| types.freeSemanticNotice(alloc, notice),
+        .restore_failed_prompt => |text| alloc.free(text),
         else => {},
     }
 }

@@ -3,8 +3,11 @@ const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const ui_render = @import("../render.zig");
+const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -598,10 +601,11 @@ fn formatGroupBlock(
             raw_phrase,
             detail,
         ) orelse raw_phrase;
+        const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
         static_index += 1;
         const last_static_row = !focused_in_group and static_index == static_count;
         const connector = if (last_static_row) "└" else "├";
-        const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
+        const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, display_phrase });
         const clipped = try clipSummary(scratch, child, cols);
         try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
         const accented = if (entryShowsDiffStats(detail))
@@ -669,6 +673,47 @@ fn reprojectTruncatedCommandPhrase(
     return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
+/// Shell-highlight the command portion of a command phrase ("Running <cmd>",
+/// "Ran <cmd>"). The leading action word and connector stay in the row's
+/// ambient style; only the command's syntax tokens pick up palette colors.
+/// `base_style` (the row's text style, when any) is re-established after every
+/// token close so untokenized text keeps the row's color.
+fn highlightCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+    base_style: []const u8,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .command) return null;
+    // Prefer the recorded action label so multi-word labels ("Timed out")
+    // split at the true boundary; fall back to the first space.
+    const label_end = if (record.command_action_label) |action|
+        if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
+            action.len
+        else
+            null
+    else
+        null;
+    const split = label_end orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
+    const command = phrase[split + 1 ..];
+    if (command.len == 0) return null;
+    const theme = shared_theme.current();
+    const profile = code_highlight_languages.resolve("sh") orelse return null;
+    const variant: code_highlight.Theme = if (theme.light) .light else .dark;
+    // Commands without tokens keep their exact plain bytes.
+    const plain = try code_highlight.highlight(scratch, command, profile, variant, null);
+    if (std.mem.eql(u8, plain, command)) return null;
+    const highlighted = try code_highlight.highlight(
+        scratch,
+        command,
+        profile,
+        variant,
+        if (base_style.len > 0) base_style else null,
+    );
+    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ phrase[0..split], highlighted });
+}
+
 fn formatExpandedChild(
     alloc: std.mem.Allocator,
     entry: TranscriptEntry,
@@ -688,7 +733,10 @@ fn formatExpandedChild(
         raw_phrase,
         detail,
     ) orelse raw_phrase;
-    const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
+    // Expanded rows carry no ambient text style, so tokens highlight over the
+    // terminal default foreground.
+    const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
+    const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, display_phrase });
     const clipped = try clipSummary(scratch, child, cols);
     const accented = if (entryShowsDiffStats(detail))
         try accentTrailingDiffStats(scratch, clipped, "")
@@ -1466,7 +1514,7 @@ test "collapsed tool group keeps diff count accents" {
     );
 }
 
-test "grouped command lines keep numeric flags uncolored" {
+test "grouped command lines shell-highlight verbs and numeric flags" {
     const alloc = std.testing.allocator;
     const saved_added = ui_render.diff_added_marker_style;
     const saved_removed = ui_render.diff_removed_marker_style;
@@ -1492,7 +1540,7 @@ test "grouped command lines keep numeric flags uncolored" {
 
     try std.testing.expectEqualStrings(
         "● 3 tool calls · 1 write · 1 command\n" ++
-            "├ Ran cat log.txt | head -80\n" ++
+            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt | \x1b[38;5;252mhead\x1b[39m -\x1b[38;5;250m80\x1b[39m\n" ++
             "├ Wrote note.txt [G]+2\x1b[0m\n" ++
             "└ Wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
@@ -1625,6 +1673,40 @@ test "minimal command details expose running completed and failed process states
     );
 }
 
+test "completed command rows shell-highlight quoted strings without coloring the action" {
+    const alloc = std.testing.allocator;
+    const command = "printf 'hello world'";
+    const arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf 'hello world'\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = true,
+        .activity_kind = .command,
+        .arguments_json = arguments_json,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Ran"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var projection = try build(alloc, &entries, &details, 240);
+    defer projection.deinit(alloc);
+    const row = projection.entry_actions.items[0].override.bytes;
+
+    // The header, connector, and action label stay uncolored; the command
+    // verb and quoted string pick up the syntax palette and close again.
+    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
+    try std.testing.expect(std.mem.indexOf(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
+}
+
 test "minimal completed command rows reproject stored arguments at the current width" {
     const alloc = std.testing.allocator;
     const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
@@ -1658,13 +1740,14 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    // The row carries styling (the command verb token), so the clip closes it.
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1710,7 +1793,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli && " ++ ("\x1b[38;5;252mprintf\x1b[39m relative-path " ** 6),
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1735,7 +1818,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ ("alpha-beta-gamma-delta-" ** 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
@@ -1886,7 +1969,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
 
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 timed out\n" ++
-            "└ Timed out sleep 5",
+            "└ Timed out sleep \x1b[38;5;250m5\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1969,7 +2052,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
-            "└ Cancelled sleep 30\n\n" ++
+            "└ Cancelled sleep \x1b[38;5;250m30\x1b[39m\n\n" ++
             "■ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -2488,7 +2571,7 @@ test "mixed group keeps the count header before every action" {
             "├ Read three.zig\n" ++
             "├ Read four.zig\n" ++
             "├ Read five.zig\n" ++
-            "└ Ran git -C /workspace status --short",
+            "└ Ran \x1b[38;5;252mgit\x1b[39m -C /workspace status --short",
         projection.entry_actions.items[0].override.bytes,
     );
 }

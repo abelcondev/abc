@@ -450,7 +450,7 @@ describe("fx ask presentation", () => {
       { name: "read_file", status: "error" },
       { name: "read_file", status: "success" },
     ]);
-    expect(gateway.requests[1]!.body).toContain("FileNotFound");
+    expect(gateway.requests[1]!.body).toContain("Path not found: missing.txt");
     expect(gateway.requests[2]!.body).toContain(recovery);
     expect(result.stderr).toContain("Reading missing.txt");
     expect(result.stderr).toContain("Reading fallback.txt");

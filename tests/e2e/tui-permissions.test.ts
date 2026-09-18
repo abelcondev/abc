@@ -1660,7 +1660,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const scrollback = await session.captureFullScrollback();
 
       expect(scrollback).toContain(
-        "Permission target resolution failed for grep_files: FileNotFound",
+        "Path not found: missing-map/behavior-index",
       );
       expect(scrollback).not.toContain("preflight failed");
       expect(settled).not.toContain(APPLY_QUESTION);

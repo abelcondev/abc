@@ -2124,6 +2124,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
@@ -3087,6 +3088,19 @@ fn setRecoveryCheckpoint(
         now_ms,
     );
     ctx.prompt_snapshot_committed = true;
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
+    );
 }
 
 fn flushAskSessionUsage(
@@ -4056,7 +4070,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
+            if (recovery.kind == .terminal_provider_error)
+                // A genuine lifecycle pause (action == .paused) is resumable; a
+                // terminal stop (no action) is not. JSON consumers need the
+                // distinction.
+                if (recovery.action == .paused) "paused" else "failed"
+            else if (recovery.isRecovered()) "recovered" else "active",
             .{},
             &out.writer,
         );
@@ -7976,7 +7995,7 @@ test "render final JSON reports the successful recovery attempt" {
     try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "✓ recovered · succeeded on attempt 3/10",
+        "✓ recovered · succeeded on attempt 3",
         recovery.get("message").?.string,
     );
     try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
@@ -8004,9 +8023,9 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
         recovery.get("message").?.string,
     );
 }
@@ -9206,7 +9225,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
     try std.testing.expect(parsed.value.object.get("recovery") == null);
     try std.testing.expectEqualStrings(
-        "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
+        "[notice] ⚠ Network interrupted · waiting for connection\n",
         stderr_capture.bytes.items,
     );
 }
@@ -9228,15 +9247,15 @@ test "fx ask JSON reports the consumed attempt after retry admission failure" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
     try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
     try std.testing.expectEqualStrings(
         "TestProviderSerializationFailed",
         parsed.value.object.get("error").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s · attempt 1/2") != null);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "recovery paused after 1/2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1 attempt") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {

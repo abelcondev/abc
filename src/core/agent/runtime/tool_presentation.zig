@@ -728,7 +728,7 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().dim_style, value });
+        return std.fmt.bufPrint(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().tool_stdout_style, value });
     }
     return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
 }
@@ -2468,7 +2468,7 @@ test "permission target preflight failure reports the actionable reason" {
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
     const hooks = capture.hooks();
-    const failure = "Permission target resolution failed for grep_files: FileNotFound";
+    const failure = "Path not found: /tmp/missing";
 
     try finishExecutedToolStatus(
         &hooks,
@@ -2496,7 +2496,7 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed grep_files: Permission target resolution failed for grep_files: FileNotFound",
+        "Failed grep_files: Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }

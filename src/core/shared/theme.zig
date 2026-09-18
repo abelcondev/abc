@@ -5,7 +5,7 @@
 //! rendering resolve their themed values from here. User themes load from
 //! `~/.fx/themes/<name>.json` (selected with FX_THEME=<name>) in either the
 //! native fx slot schema or the VS Code theme schema (`colors` +
-//! `tokenColors`), so editor themes like Cursor Dark or GitHub Dark apply
+//! `tokenColors`), so editor themes like GitHub Dark apply
 //! directly. Hex colors resolve to truecolor escapes when the terminal
 //! supports them, otherwise they quantize to the xterm-256 palette.
 
@@ -16,6 +16,9 @@ const io_mod = @import("io.zig");
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
 pub const SyntaxPalette = struct {
+    /// `syntax: false` in a native theme turns syntax highlighting off; the
+    /// style slots keep their defaults but the highlighter passes text through.
+    enabled: bool = true,
     keyword_style: []const u8,
     string_style: []const u8,
     number_style: []const u8,
@@ -154,6 +157,56 @@ pub fn current() Theme {
 
 pub fn activate(theme: Theme) void {
     active_theme = theme;
+}
+
+pub const ThemeChoice = union(enum) {
+    pin_light,
+    pin_dark,
+    custom: []const u8,
+};
+
+/// Classifies a configured theme value (FX_THEME or the settings "theme"
+/// key): light/dark pin the builtin variant, anything else names a theme file
+/// under ~/.fx/themes.
+pub fn classifyValue(value: []const u8) ?ThemeChoice {
+    if (value.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(value, "light")) return .pin_light;
+    if (std.ascii.eqlIgnoreCase(value, "dark")) return .pin_dark;
+    return .{ .custom = value };
+}
+
+/// Where the active theme came from: the configured custom theme file key (so
+/// live terminal flips can re-resolve it), and whether a light/dark variant is
+/// pinned by configuration. Recorded once at startup by the app lifecycle.
+/// The name is copied into bounded internal storage: callers never donate
+/// memory, and the bound matches loadNamed's validation.
+var source_name_buf: [64]u8 = undefined;
+var source_name_len: usize = 0;
+var source_name_set: bool = false;
+var variant_pinned: bool = false;
+
+pub fn setSource(name: ?[]const u8, pinned: bool) void {
+    source_name_set = false;
+    source_name_len = 0;
+    if (name) |value| {
+        if (value.len <= source_name_buf.len) {
+            @memcpy(source_name_buf[0..value.len], value);
+            source_name_len = value.len;
+            source_name_set = true;
+        } else {
+            debug_trace.logf("theme", "theme_source_name_too_long len={d}", .{value.len});
+        }
+    }
+    variant_pinned = pinned;
+}
+
+pub fn sourceName() ?[]const u8 {
+    if (!source_name_set) return null;
+    return source_name_buf[0..source_name_len];
+}
+
+pub fn variantPinned() bool {
+    return variant_pinned;
 }
 
 // --- Hex colors and terminal capability resolution ---
@@ -476,8 +529,11 @@ fn parseNative(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
         }
     }
     if (root.get("syntax")) |syntax_value| {
-        if (syntax_value != .object) return error.InvalidTheme;
-        try applySyntax(&theme, alloc, syntax_value.object, options);
+        switch (syntax_value) {
+            .object => |syntax_object| try applySyntax(&theme, alloc, syntax_object, options),
+            .bool => |enabled| theme.syntax.enabled = enabled,
+            else => return error.InvalidTheme,
+        }
     }
     return theme;
 }
@@ -680,7 +736,7 @@ pub const LoadError = error{ InvalidName, ThemeNotFound, InvalidTheme, OutOfMemo
 
 /// Returns the sibling variant name for the common `-dark` / `-light`
 /// (or `_dark` / `_light`) file naming convention, so a pinned theme can
-/// follow the terminal's detected mode: cursor-dark -> cursor-light.
+/// follow the terminal's detected mode: github-dark -> github-light.
 /// Returns null when the name carries no recognizable variant suffix.
 pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool) !?[]const u8 {
     const suffixes = [_][]const u8{ "-dark", "-light", "_dark", "_light" };
@@ -702,7 +758,7 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
 }
 
 /// Resolves the named theme for the terminal's detected mode: loads it, swaps
-/// to a sibling variant file (cursor-dark <-> cursor-light) when the variant
+/// to a sibling variant file (github-dark <-> github-light) when the variant
 /// mismatches, and returns null to signal the builtin variant when neither
 /// file fits. Used both at startup and on live terminal theme notifications.
 pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
@@ -773,6 +829,7 @@ test "every theme slot is populated" {
         } else if (field.type == SyntaxPalette) {
             const syntax_fields = @typeInfo(SyntaxPalette).@"struct".fields;
             inline for (syntax_fields) |syntax_field| {
+                if (syntax_field.type != []const u8) continue;
                 try std.testing.expect(@field(fx_dark.syntax, syntax_field.name).len > 0);
                 try std.testing.expect(@field(fx_light.syntax, syntax_field.name).len > 0);
             }
@@ -802,6 +859,9 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.user_card_accent_style);
     try std.testing.expectEqualStrings("\x1b[38;5;247m", fx_light.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.task_completed_open);
+    // Tool text stays the pre-theme gray in both variants (parity guard).
+    try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_light.tool_stdout_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_light.tool_stderr_style);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;5;243m", fx_light.syntax.comment_style);
 
@@ -894,6 +954,25 @@ test "parse resolves a native theme overlay on the matching builtin" {
     // Untouched slots inherit the builtin variant.
     try std.testing.expectEqualStrings(fx_dark.hint_style, theme.hint_style);
     try std.testing.expectEqualStrings(fx_dark.syntax.string_style, theme.syntax.string_style);
+}
+
+test "parse honors a native syntax boolean switch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const disabled = try parse(alloc, "{ \"name\": \"no-syntax\", \"syntax\": false }", .{ .truecolor = true });
+    try std.testing.expect(!disabled.syntax.enabled);
+    // Style slots keep the builtin defaults; the flag alone gates highlighting.
+    try std.testing.expectEqualStrings(fx_dark.syntax.keyword_style, disabled.syntax.keyword_style);
+
+    const enabled = try parse(alloc, "{ \"name\": \"yes-syntax\", \"syntax\": true }", .{ .truecolor = true });
+    try std.testing.expect(enabled.syntax.enabled);
+
+    const object = try parse(alloc, "{ \"name\": \"obj-syntax\", \"syntax\": { \"keyword\": \"#ff0000\" } }", .{ .truecolor = true });
+    try std.testing.expect(object.syntax.enabled);
+
+    try std.testing.expectError(error.InvalidTheme, parse(alloc, "{ \"syntax\": 3 }", .{ .truecolor = true }));
 }
 
 test "parse quantizes native themes for 256-color terminals" {
@@ -1026,4 +1105,33 @@ test "closingFor resets exactly what the open set" {
     try std.testing.expectEqualStrings("\x1b[39m\x1b[22m\x1b[23m", closingFor("\x1b[1;3;38;2;1;2;3m"));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m\x1b[22m", closingFor(fx_dark.approval_button_active_style));
     try std.testing.expectEqualStrings("\x1b[39m\x1b[49m", closingFor(fx_dark.approval_button_inactive_style));
+}
+
+test "classifyValue maps configured theme values" {
+    try std.testing.expect(classifyValue("") == null);
+    try std.testing.expect(classifyValue("light").? == .pin_light);
+    try std.testing.expect(classifyValue("Dark").? == .pin_dark);
+    try std.testing.expectEqualStrings("cursor-dark", classifyValue("cursor-dark").?.custom);
+}
+
+test "theme source copies the configured name and pin for live re-resolution" {
+    defer setSource(null, false);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(!variantPinned());
+
+    // The donor buffer may be freed right after setSource; the source state
+    // must not dangle (startup state is deinited before the event loop).
+    const donated = try std.testing.allocator.dupe(u8, "cursor-dark");
+    setSource(donated, false);
+    std.testing.allocator.free(donated);
+    try std.testing.expectEqualStrings("cursor-dark", sourceName().?);
+    try std.testing.expect(!variantPinned());
+
+    setSource(null, true);
+    try std.testing.expect(sourceName() == null);
+    try std.testing.expect(variantPinned());
+
+    const too_long = "x" ** 65;
+    setSource(too_long, false);
+    try std.testing.expect(sourceName() == null);
 }

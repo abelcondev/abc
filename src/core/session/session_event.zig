@@ -6,6 +6,7 @@ const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -213,7 +214,7 @@ pub fn validateConversationTransition(
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
         return error.OutOfOrderConversationEvent;
     if (envelope.seq != expected_seq) return error.OutOfOrderConversationEvent;
-    if (envelope.timestamp_ms < 0) return error.InvalidConversationEvent;
+    if (envelope.timestamp_ms < 0) return rejectInvalidConversationEvent("envelope-timestamp");
     try validateConversationEventShape(envelope.event, envelope.schema_version);
 
     switch (envelope.event) {
@@ -250,11 +251,19 @@ pub fn validateConversationTransition(
     }
 }
 
+/// Validation rejects with the same bare error at every site, which leaves
+/// persistence failures undiagnosable. Name the rule so the trace log (and
+/// /trace reports) identify the exact rejected invariant without content.
+fn rejectInvalidConversationEvent(comptime rule: []const u8) ConversationTransitionError {
+    debug_trace.logf("session", "conversation event rejected rule={s}", .{rule});
+    return error.InvalidConversationEvent;
+}
+
 fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
-            if (value.images.len > 128) return error.InvalidConversationEvent;
+            if (value.images.len > 128) return rejectInvalidConversationEvent("user-images-count");
             for (value.images) |image| {
                 if (image.path.len == 0 or
                     image.path.len > std.Io.Dir.max_path_bytes or
@@ -263,18 +272,18 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                     !std.unicode.utf8ValidateSlice(image.path) or
                     !std.unicode.utf8ValidateSlice(image.media_type))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("user-image-field");
                 }
             }
             if (value.work_id) |work_id| try validateConversationIdentity(work_id);
         },
         .assistant => |value| {
-            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return error.InvalidConversationEvent;
+            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return rejectInvalidConversationEvent("assistant-schema-v1");
             try validateOptionalConversationText(value.text);
             if (value.provider_replay) |replay| {
                 try validateConversationIdentity(replay.source.model);
                 if (replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
-                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidConversationEvent;
+                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return rejectInvalidConversationEvent("assistant-replay-parts");
             }
         },
         .steering => |value| try validateConversationText(value.text),
@@ -285,20 +294,20 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 call.arguments_json.len > max_conversation_arguments_bytes or
                 !std.unicode.utf8ValidateSlice(call.arguments_json))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-call-arguments");
             }
             if (call.provisional_id) |value| try validateConversationIdentity(value);
             if (call.provider_result) |value| {
                 if (value.len > max_conversation_arguments_bytes or
                     !std.unicode.utf8ValidateSlice(value))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("tool-call-provider-result");
                 }
             }
         },
         .tool_result => |result| {
             if (result.review_feedback and (result.status != .failure or result.provider_native)) {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-review-feedback");
             }
             try validateConversationIdentity(result.call_id);
             try validateConversationIdentity(result.tool_name);
@@ -306,19 +315,19 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 result.artifact_ref.len > max_conversation_identity_bytes or
                 !std.unicode.utf8ValidateSlice(result.artifact_ref))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-artifact-ref");
             }
             if (result.preview) |preview| {
                 if (preview.len > max_conversation_preview_bytes or
                     !std.unicode.utf8ValidateSlice(preview))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("tool-result-preview");
                 }
             }
             if (result.tool_image_handle) |handle| {
                 try validateConversationIdentity(handle);
             }
-            if (result.created_at_ms < 0) return error.InvalidConversationEvent;
+            if (result.created_at_ms < 0) return rejectInvalidConversationEvent("tool-result-created-at");
             for (result.permission_feedback) |feedback| {
                 try validateOptionalConversationText(feedback);
             }
@@ -340,7 +349,7 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-command-replay-pair");
             }
             if (result.command_replay_ref) |handle| {
                 try validateConversationIdentity(handle);
@@ -351,7 +360,7 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
             if ((interrupted.command_replay_ref == null) !=
                 (interrupted.command_replay_bytes == null))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("interrupted-command-replay-pair");
             }
             if (interrupted.command_replay_ref) |handle| {
                 try validateConversationIdentity(handle);
@@ -380,24 +389,24 @@ fn validateConversationPath(path: []const u8) ConversationTransitionError!void {
         path.len > std.Io.Dir.max_path_bytes or
         !std.unicode.utf8ValidateSlice(path))
     {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("file-path");
     }
 }
 
 fn validateConversationText(text: []const u8) ConversationTransitionError!void {
-    if (text.len == 0) return error.InvalidConversationEvent;
+    if (text.len == 0) return rejectInvalidConversationEvent("text-empty");
     return validateOptionalConversationText(text);
 }
 
 fn validateOptionalConversationText(text: []const u8) ConversationTransitionError!void {
     if (text.len > max_conversation_text_bytes or !std.unicode.utf8ValidateSlice(text)) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("text-field");
     }
 }
 
 fn validateConversationIdentity(value: []const u8) ConversationTransitionError!void {
     if (types.ConversationIdentity.invalidReason(value) != null) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("identity");
     }
 }
 
@@ -419,7 +428,7 @@ pub fn encodeConversationFrame(
         envelope.seq == 0 or
         envelope.timestamp_ms < 0)
     {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("envelope-header");
     }
     try validateConversationEventShape(envelope.event, envelope.schema_version);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -595,9 +604,9 @@ fn appendExecutionConversationEvents(
                 .artifact_ref = artifact_ref,
                 .tool_image_handle = result.tool_image_handle,
                 .output_bytes = std.math.cast(u64, result.output_bytes) orelse
-                    return error.InvalidConversationEvent,
+                    return rejectInvalidConversationEvent("tool-result-output-bytes"),
                 .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
-                    return error.InvalidConversationEvent,
+                    return rejectInvalidConversationEvent("tool-result-stored-bytes"),
                 .completeness = if (result.truncated) .partial else .complete,
                 .preview = result.preview orelse if (result.output.len <= max_conversation_preview_bytes)
                     result.output
@@ -623,7 +632,7 @@ fn appendExecutionConversationEvents(
         }
     }
     if (steering_index != execution.steering.len) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("steering-boundary");
     }
 }
 

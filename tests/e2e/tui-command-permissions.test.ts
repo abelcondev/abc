@@ -3444,7 +3444,7 @@ describe("effect-aware command permissions", () => {
         ],
         {
           classifierResponses: Array.from(
-            { length: 1 },
+            { length: 2 },
             () => new Response("provider unavailable", { status: 502 }),
           ),
         },
@@ -3467,9 +3467,10 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("provider failure handled");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain(

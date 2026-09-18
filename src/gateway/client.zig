@@ -7,6 +7,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
 
@@ -22,11 +23,32 @@ pub fn networkFailureEvidence(
 ) ?agent_stream_provider.NetworkFailureEvidence {
     const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
         .system_resumed
+    else if (err == error.StreamStalled)
+        .stream_stalled
+    else if (isConnectivityFailure(err))
+        .connectivity_lost
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
         return null;
     return .{ .cause = cause, .delivery = delivery };
+}
+
+/// Errors that prove the network path itself is down: nothing reached a
+/// server, so no request was sent and no generation exists. Distinct from
+/// connected-but-failed errors (reset mid-stream, closed connection), which
+/// carry delivery ambiguity and belong to the retry class.
+pub fn isConnectivityFailure(err: anyerror) bool {
+    return err == error.UnknownHostName or
+        err == error.NameServerFailure or
+        err == error.NoAddressReturned or
+        err == error.DetectingNetworkConfigurationFailed or
+        err == error.AddressUnavailable or
+        err == error.ConnectionRefused or
+        err == error.ConnectionTimedOut or
+        err == error.HostUnreachable or
+        err == error.NetworkUnreachable or
+        err == error.NetworkDown;
 }
 
 fn isRetryableAgentNetworkError(err: anyerror) bool {
@@ -99,23 +121,24 @@ test "native network failure evidence covers setup send read and resume failures
     const cases = [_]Cases{
         .{ .err = error.TlsInitializationFailed },
         .{ .err = error.ConnectionSetupTimedOut },
-        .{ .err = error.UnknownHostName },
-        .{ .err = error.NameServerFailure },
-        .{ .err = error.NoAddressReturned },
-        .{ .err = error.DetectingNetworkConfigurationFailed },
-        .{ .err = error.AddressUnavailable },
+        .{ .err = error.UnknownHostName, .cause = .connectivity_lost },
+        .{ .err = error.NameServerFailure, .cause = .connectivity_lost },
+        .{ .err = error.NoAddressReturned, .cause = .connectivity_lost },
+        .{ .err = error.DetectingNetworkConfigurationFailed, .cause = .connectivity_lost },
+        .{ .err = error.AddressUnavailable, .cause = .connectivity_lost },
         .{ .err = error.ConnectionPending },
-        .{ .err = error.ConnectionRefused },
+        .{ .err = error.ConnectionRefused, .cause = .connectivity_lost },
         .{ .err = error.ConnectionResetByPeer },
-        .{ .err = error.ConnectionTimedOut },
-        .{ .err = error.HostUnreachable },
-        .{ .err = error.NetworkUnreachable },
-        .{ .err = error.NetworkDown },
+        .{ .err = error.ConnectionTimedOut, .cause = .connectivity_lost },
+        .{ .err = error.HostUnreachable, .cause = .connectivity_lost },
+        .{ .err = error.NetworkUnreachable, .cause = .connectivity_lost },
+        .{ .err = error.NetworkDown, .cause = .connectivity_lost },
         .{ .err = error.Timeout },
         .{ .err = error.WouldBlock },
         .{ .err = error.HttpConnectionClosing },
         .{ .err = error.WriteFailed },
         .{ .err = error.ReadFailed },
+        .{ .err = error.StreamStalled, .cause = .stream_stalled },
         .{ .err = error.SystemResumed, .cause = .system_resumed },
     };
 
@@ -749,6 +772,15 @@ const ConnectionSetupTiming = struct {
 
 const ResponseHeadTiming = struct {
     timeout_ms: i64 = 120_000,
+    /// Patient head-wait (agent streaming path): a long-thinking model and a
+    /// hung gateway are byte-identical on the wire, and the gateway sends no
+    /// heartbeat. Never abort a sent request on head silence alone; only a dead
+    /// socket, cancellation, or a system resume ends the wait.
+    patient: bool = false,
+    /// Mid-stream stall watchdog: once the head has arrived, a stream that
+    /// produces no bytes for this long is treated as dead (positive evidence,
+    /// unlike silence before the head).
+    stall_timeout_ms: i64 = 60_000,
 };
 
 test "connection setup keeps the production timeout" {
@@ -761,6 +793,7 @@ test "response head wait keeps the production timeout" {
     const timing = ResponseHeadTiming{};
 
     try std.testing.expectEqual(@as(i64, 120_000), timing.timeout_ms);
+    try std.testing.expect(!timing.patient);
 }
 
 const ConnectionSetupEpoch = struct {
@@ -803,10 +836,16 @@ const ConnectedRequestWatch = struct {
         timed_out,
         cancelled,
         system_resumed,
+        stalled,
     };
 
     phase: std.atomic.Value(Phase) = .init(.sending),
     response_head_deadline: std.Io.Clock.Timestamp = undefined,
+    /// Last byte progress in the streaming phase (awake clock, ms). Written by
+    /// the consume loop, read by the watcher thread. wasm32-safe via the
+    /// project's portable atomic wrapper (wide atomics do not exist there);
+    /// millisecond precision is ample for second-scale stall thresholds.
+    last_progress_ms: atomic_value.Value(i64) = .init(0),
     timing: ResponseHeadTiming,
 
     fn init(timing: ResponseHeadTiming) ConnectedRequestWatch {
@@ -837,6 +876,7 @@ const ConnectedRequestWatch = struct {
             .seq_cst,
             .seq_cst,
         )) |winner| return phase_error(winner);
+        self.markStreamProgress();
         return null;
     }
 
@@ -892,10 +932,48 @@ const ConnectedRequestWatch = struct {
         ) == null;
     }
 
-    fn response_head_expired(
+    fn markStreamProgress(self: *ConnectedRequestWatch) void {
+        // Both writer and reader use the monotonic awake clock; mixing in the
+        // wall clock would make the elapsed subtraction permanently negative.
+        const now_ns = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.toNanoseconds();
+        self.last_progress_ms.store(@intCast(@divFloor(now_ns, std.time.ns_per_ms)), .seq_cst);
+    }
+
+    /// Positive-evidence stall: the head arrived, then the stream went silent
+    /// past the stall threshold. Wins `.stalled` so the caller can distinguish
+    /// it from a pre-head timeout (which stays patient).
+    fn stream_stall_expired(
         self: *const ConnectedRequestWatch,
         now: std.Io.Clock.Timestamp,
     ) bool {
+        if (self.phase.load(.seq_cst) != .streaming) return false;
+        const last = self.last_progress_ms.load(.seq_cst);
+        if (last == 0) return false;
+        const now_ms: i64 = @intCast(@divFloor(now.raw.toNanoseconds(), std.time.ns_per_ms));
+        const elapsed = now_ms - last;
+        return elapsed >= self.timing.stall_timeout_ms;
+    }
+
+    fn win_stall_timeout(self: *ConnectedRequestWatch) bool {
+        return self.phase.cmpxchgStrong(
+            .streaming,
+            .stalled,
+            .seq_cst,
+            .seq_cst,
+        ) == null;
+    }
+
+    fn response_head_expired(
+        self: *ConnectedRequestWatch,
+        now: std.Io.Clock.Timestamp,
+    ) bool {
+        if (self.timing.patient) {
+            // Patient head-wait never aborts. The wait ends only with data,
+            // a dead socket, cancel, or system resume.
+            if (self.phase.load(.seq_cst) != .awaiting_head) return false;
+            if (std.Io.Clock.Timestamp.compare(now, .lt, self.response_head_deadline)) return false;
+            return false;
+        }
         if (self.phase.load(.seq_cst) != .awaiting_head) return false;
         return !std.Io.Clock.Timestamp.compare(
             now,
@@ -907,7 +985,7 @@ const ConnectedRequestWatch = struct {
     fn is_active(phase: Phase) bool {
         return switch (phase) {
             .sending, .awaiting_head, .streaming => true,
-            .completed, .timed_out, .cancelled, .system_resumed => false,
+            .completed, .timed_out, .cancelled, .system_resumed, .stalled => false,
         };
     }
 
@@ -916,6 +994,7 @@ const ConnectedRequestWatch = struct {
             .timed_out => error.Timeout,
             .cancelled => error.Cancelled,
             .system_resumed => error.SystemResumed,
+            .stalled => error.StreamStalled,
             .sending, .awaiting_head, .streaming, .completed => null,
         };
     }
@@ -1378,8 +1457,27 @@ fn streamGatewayCompletionCore(
         cancel_flag,
         expected_provider_tool_name,
         watch_connected_socket,
-        .{},
+        .{
+            .response_head_timing = .{
+                // The agent path waits patiently for long-thinking models: head
+                // silence alone never aborts a sent request. Mid-stream stalls
+                // still get positive-evidence detection via the stall watchdog.
+                .patient = true,
+                .stall_timeout_ms = agent_stream_stall_timeout_ms,
+            },
+        },
     );
+}
+
+/// Mid-stream stall patience on the agent streaming path. The gateway sends no
+/// heartbeat while a model thinks, so silence is ambiguous for every model,
+/// not just known long-thinking classes: any model can go quiet for minutes on
+/// a hard prompt. Treat all models with the same ten-minute window instead of
+/// classifying by name.
+const agent_stream_stall_timeout_ms: i64 = 600_000;
+
+test "agent stream stall window gives every model ten minutes of silence" {
+    try std.testing.expectEqual(@as(i64, 600_000), agent_stream_stall_timeout_ms);
 }
 
 fn streamGatewayCompletionCoreWithOptions(
@@ -1665,6 +1763,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
             request.content_capture_limit,
+            active_connected_watch,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -2048,6 +2147,10 @@ const GatewayCancelWatcher = struct {
                     stream.shutdown(io_mod.getIo(), .both) catch {};
                     return;
                 }
+                if (watch.stream_stall_expired(now) and watch.win_stall_timeout()) {
+                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                    return;
+                }
                 if (watch.phase.load(.seq_cst) == .completed) return;
             }
             previous = current;
@@ -2221,6 +2324,27 @@ test "connected request watch disarms timeout at response head" {
     try std.testing.expect(watch.commit_response_head() == null);
     try std.testing.expect(!watch.win_response_head_timeout());
     try std.testing.expect(watch.finish() == null);
+}
+
+test "stream stall watchdog fires with production clocks" {
+    var watch = ConnectedRequestWatch.init(.{ .stall_timeout_ms = 50 });
+    // t0 precedes the progress mark, so elapsed never exceeds the synthetic
+    // gap regardless of millisecond-boundary rounding.
+    const t0 = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expect(watch.arm_response_head() == null);
+    try std.testing.expect(watch.commit_response_head() == null);
+    const before_expiry = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = t0.raw.addDuration(.fromMilliseconds(1)),
+    };
+    try std.testing.expect(!watch.stream_stall_expired(before_expiry));
+    const past_expiry = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = t0.raw.addDuration(.fromMilliseconds(100)),
+    };
+    try std.testing.expect(watch.stream_stall_expired(past_expiry));
+    try std.testing.expect(watch.win_stall_timeout());
+    try std.testing.expectEqual(error.StreamStalled, watch.finish().?);
 }
 
 test "production response head wait accepts slow headers and still expires" {
@@ -3320,7 +3444,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -3350,6 +3474,7 @@ pub fn consumeGatewaySseStream(
         null,
         null,
         content_capture_limit,
+        null,
     );
 }
 
@@ -3365,6 +3490,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
+    progress_watch: ?*ConnectedRequestWatch,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -3432,6 +3558,7 @@ fn consumeSseStreamTraced(
             traceSseTermination(resolved_model_trace, "eof_without_finish", finish_reason_holder);
             break;
         };
+        if (progress_watch) |watch| watch.markStreamProgress();
         if (std.mem.eql(u8, json_text, "[DONE]")) {
             traceSseTermination(resolved_model_trace, "done_without_finish", finish_reason_holder);
             break;

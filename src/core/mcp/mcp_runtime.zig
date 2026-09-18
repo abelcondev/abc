@@ -304,7 +304,9 @@ pub const McpRuntime = struct {
             self.discovery_thread = null;
             thread.join();
         }
-        for (self.servers.items) |server| self.destroyServer(server);
+        // Process-exit path: kill stdio children immediately rather than
+        // waiting out per-server grace windows.
+        for (self.servers.items) |server| self.destroyServer(server, .immediate);
         self.servers.deinit(self.alloc);
         for (self.workspace_diagnostics.items) |*diagnostic| {
             diagnostic.deinit(self.alloc);
@@ -314,7 +316,9 @@ pub const McpRuntime = struct {
         self.tool_aliases.deinit();
     }
 
-    fn destroyServer(self: *McpRuntime, server: *McpServer) void {
+    const ServerShutdownMode = enum { graceful, immediate };
+
+    fn destroyServer(self: *McpRuntime, server: *McpServer, shutdown_mode: ServerShutdownMode) void {
         server.lifetime.retire();
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         server.catalog_commit_lock.lockUncancelable(io_mod.getIo());
@@ -329,7 +333,10 @@ pub const McpRuntime = struct {
         var detached = server_connection.detachPublishedConnection(server);
         self.catalog_mutex.unlock(io_mod.getIo());
         server.catalog_commit_lock.unlock(io_mod.getIo());
-        detached.deinitGracefully(self.alloc);
+        switch (shutdown_mode) {
+            .graceful => detached.deinitGracefully(self.alloc),
+            .immediate => detached.deinitImmediate(self.alloc),
+        }
         server.deinit(self.alloc);
         server.connection_lock.unlock(io_mod.getIo());
         server.subscription_lifecycle_lock.unlock(io_mod.getIo());
@@ -800,7 +807,7 @@ pub const McpRuntime = struct {
         self.releaseServers(current);
         current_retained = false;
         for (previous.items) |server| {
-            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server);
+            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, .graceful);
         }
         previous.deinit(self.alloc);
         return null;
@@ -846,7 +853,7 @@ pub const McpRuntime = struct {
         }
         self.server_mutex.unlock(io_mod.getIo());
         self.catalog_mutex.unlock(io_mod.getIo());
-        for (retired.items) |server| self.destroyServer(server);
+        for (retired.items) |server| self.destroyServer(server, .graceful);
     }
 
     pub fn workspaceAuthorityReducedAgainstConfigs(
