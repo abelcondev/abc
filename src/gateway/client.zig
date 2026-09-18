@@ -1463,29 +1463,21 @@ fn streamGatewayCompletionCore(
                 // silence alone never aborts a sent request. Mid-stream stalls
                 // still get positive-evidence detection via the stall watchdog.
                 .patient = true,
-                .stall_timeout_ms = defaultStallTimeoutMs(request.model),
+                .stall_timeout_ms = agent_stream_stall_timeout_ms,
             },
         },
     );
 }
 
-/// Mid-stream stall patience by model class. Long-thinking models routinely
-/// produce multi-minute gaps between reasoning events, so their threshold is
-/// an order of magnitude wider than the default one-minute stall window.
-fn defaultStallTimeoutMs(model: []const u8) i64 {
-    const thinking_markers = [_][]const u8{ "-pro", "thinking", "o3", "o4", "opus", "-r1" };
-    for (thinking_markers) |marker| {
-        if (std.mem.find(u8, model, marker) != null) return 600_000;
-    }
-    return 60_000;
-}
+/// Mid-stream stall patience on the agent streaming path. The gateway sends no
+/// heartbeat while a model thinks, so silence is ambiguous for every model,
+/// not just known long-thinking classes: any model can go quiet for minutes on
+/// a hard prompt. Treat all models with the same ten-minute window instead of
+/// classifying by name.
+const agent_stream_stall_timeout_ms: i64 = 600_000;
 
-test "stall patience widens for long-thinking model classes" {
-    try std.testing.expectEqual(@as(i64, 60_000), defaultStallTimeoutMs("moonshotai/kimi-k3"));
-    try std.testing.expectEqual(@as(i64, 600_000), defaultStallTimeoutMs("openai/gpt-5.5-pro"));
-    try std.testing.expectEqual(@as(i64, 600_000), defaultStallTimeoutMs("anthropic/claude-opus-4.8"));
-    try std.testing.expectEqual(@as(i64, 600_000), defaultStallTimeoutMs("openai/gpt-5.1-thinking"));
-    try std.testing.expectEqual(@as(i64, 600_000), defaultStallTimeoutMs("deepseek/deepseek-r1"));
+test "agent stream stall window gives every model ten minutes of silence" {
+    try std.testing.expectEqual(@as(i64, 600_000), agent_stream_stall_timeout_ms);
 }
 
 fn streamGatewayCompletionCoreWithOptions(
