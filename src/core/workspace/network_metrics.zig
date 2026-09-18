@@ -105,15 +105,18 @@ var ring: [ring_capacity]NetworkCall = [_]NetworkCall{.{}} ** ring_capacity;
 var head: usize = 0;
 var stored: usize = 0;
 
-/// Process-wide totals. Unlike the ring, these never evict: the /trace report
-/// must answer "did anything fail all session" even after the window slides.
+/// Session-wide totals, reset on session transitions via
+/// `diagnostics.resetSession()`. Unlike the ring, these never evict: the
+/// /trace report must answer "did anything fail all session" even after the
+/// window slides.
 pub const LifetimeStats = struct {
     total_calls: u64 = 0,
     ok_calls: u64 = 0,
     error_calls: u64 = 0,
     total_duration_ms: u64 = 0,
-    first_started_at_ms: i64 = 0,
-    last_started_at_ms: i64 = 0,
+    /// Turn buckets dropped to make room for newer ones. Zero means the
+    /// rendered turns list covers every tagged turn in the session.
+    evicted_turns: u64 = 0,
 };
 
 /// Bounded per-turn accounting for model calls. Turn ids increase
@@ -127,7 +130,6 @@ pub const TurnRollup = struct {
     subagent_calls: u32 = 0,
     total_duration_ms: u64 = 0,
     first_started_at_ms: i64 = 0,
-    last_started_at_ms: i64 = 0,
 };
 
 var lifetime: LifetimeStats = .{};
@@ -148,23 +150,16 @@ fn recordLifetime(call: NetworkCall) void {
     lifetime.total_calls += 1;
     if (call.isError()) lifetime.error_calls += 1 else lifetime.ok_calls += 1;
     lifetime.total_duration_ms += call.duration_ms;
-    if (call.started_at_ms > 0) {
-        if (lifetime.first_started_at_ms == 0 or call.started_at_ms < lifetime.first_started_at_ms) {
-            lifetime.first_started_at_ms = call.started_at_ms;
-        }
-        lifetime.last_started_at_ms = @max(lifetime.last_started_at_ms, call.started_at_ms);
-    }
     if (call.turn_id == 0) return;
     const rollup = turnRollupFor(call.turn_id);
     rollup.calls += 1;
     if (call.isError()) rollup.error_calls += 1;
     if (call.subagent_id != 0) rollup.subagent_calls += 1;
     rollup.total_duration_ms += call.duration_ms;
-    if (call.started_at_ms > 0) {
-        if (rollup.first_started_at_ms == 0 or call.started_at_ms < rollup.first_started_at_ms) {
-            rollup.first_started_at_ms = call.started_at_ms;
-        }
-        rollup.last_started_at_ms = @max(rollup.last_started_at_ms, call.started_at_ms);
+    if (call.started_at_ms > 0 and
+        (rollup.first_started_at_ms == 0 or call.started_at_ms < rollup.first_started_at_ms))
+    {
+        rollup.first_started_at_ms = call.started_at_ms;
     }
 }
 
@@ -180,6 +175,7 @@ fn turnRollupFor(turn_id: u64) *TurnRollup {
         turn_rollups[turn_rollup_count] = .{ .turn_id = turn_id };
         return &turn_rollups[turn_rollup_count];
     }
+    lifetime.evicted_turns += 1;
     turn_rollups[oldest] = .{ .turn_id = turn_id };
     return &turn_rollups[oldest];
 }
@@ -269,7 +265,6 @@ test "lifetime stats cover evicted calls and reset clears them" {
     try std.testing.expectEqual(@as(u64, ring_capacity + 5), stats.total_calls);
     try std.testing.expect(stats.error_calls > 0);
     try std.testing.expectEqual(@as(u64, (ring_capacity + 5) * 10), stats.total_duration_ms);
-    try std.testing.expectEqual(@as(i64, 1000), stats.first_started_at_ms);
 
     var buf: [ring_capacity]NetworkCall = undefined;
     const n = snapshot(&buf);
@@ -304,18 +299,22 @@ test "turn rollups aggregate per turn and evict the coldest turn" {
     try std.testing.expectEqual(@as(u32, 1), out[0].subagent_calls);
     try std.testing.expectEqual(@as(u64, 60), out[0].total_duration_ms);
     try std.testing.expectEqual(@as(i64, 1000), out[0].first_started_at_ms);
-    try std.testing.expectEqual(@as(i64, 3000), out[0].last_started_at_ms);
     try std.testing.expectEqual(@as(u64, 9), out[1].turn_id);
     try std.testing.expectEqual(@as(u32, 1), out[1].calls);
+    try std.testing.expectEqual(@as(u64, 0), lifetimeStats().evicted_turns);
 
-    // Overflow the table: turn 2 must be evicted as the coldest.
+    // Overflow the table: turn 2 and turn 9 must be evicted as the coldest.
     var t: u64 = 100;
     while (t < 100 + turn_rollup_capacity) : (t += 1) {
         record(.{ .duration_ms = 1, .started_at_ms = 6000, .turn_id = t });
     }
     const m = snapshotTurnRollups(&out);
     try std.testing.expectEqual(turn_rollup_capacity, m);
-    for (out[0..m]) |rollup| try std.testing.expect(rollup.turn_id != 2);
+    for (out[0..m]) |rollup| {
+        try std.testing.expect(rollup.turn_id != 2);
+        try std.testing.expect(rollup.turn_id != 9);
+    }
+    try std.testing.expectEqual(@as(u64, 2), lifetimeStats().evicted_turns);
 }
 
 test "snapshot truncates to caller buffer" {

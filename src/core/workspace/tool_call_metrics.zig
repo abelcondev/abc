@@ -107,14 +107,14 @@ var ring: [ring_capacity]ToolCallMetric = std.mem.zeroes([ring_capacity]ToolCall
 var head: usize = 0;
 var stored: usize = 0;
 
-/// Process-wide totals. Unlike the ring, these never evict: the /trace report
-/// must answer "did anything fail all session" even after the window slides.
+/// Session-wide totals, reset on session transitions via
+/// `diagnostics.resetSession()`. Unlike the ring, these never evict: the
+/// /trace report must answer "did anything fail all session" even after the
+/// window slides.
 pub const LifetimeStats = struct {
     total_calls: u64 = 0,
     outcome_counts: [@typeInfo(ToolCallOutcome).@"enum".fields.len]u64 = @splat(0),
     total_duration_ms: u64 = 0,
-    first_started_at_ms: i64 = 0,
-    last_started_at_ms: i64 = 0,
 
     pub fn countFor(self: *const LifetimeStats, outcome: ToolCallOutcome) u64 {
         return self.outcome_counts[@intFromEnum(outcome)];
@@ -137,12 +137,6 @@ pub fn record(call: ToolCallMetric) void {
     lifetime.total_calls += 1;
     lifetime.outcome_counts[@intFromEnum(stored_call.outcome)] += 1;
     lifetime.total_duration_ms += stored_call.duration_ms;
-    if (stored_call.started_at_ms > 0) {
-        if (lifetime.first_started_at_ms == 0 or stored_call.started_at_ms < lifetime.first_started_at_ms) {
-            lifetime.first_started_at_ms = stored_call.started_at_ms;
-        }
-        lifetime.last_started_at_ms = @max(lifetime.last_started_at_ms, stored_call.started_at_ms);
-    }
 }
 
 pub fn lifetimeStats() LifetimeStats {
@@ -255,7 +249,6 @@ test "lifetime stats count every outcome and survive ring eviction" {
     try std.testing.expectEqual(@as(u64, total), stats.countFor(.succeeded) + stats.countFor(.rejected));
     try std.testing.expect(stats.countFor(.rejected) > 0);
     try std.testing.expectEqual(@as(u64, total * 5), stats.total_duration_ms);
-    try std.testing.expectEqual(@as(i64, 10_000), stats.first_started_at_ms);
 
     var buf: [ring_capacity]ToolCallMetric = undefined;
     const n = snapshot(&buf);

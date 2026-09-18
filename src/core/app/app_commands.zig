@@ -2893,22 +2893,22 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
     }
 }
 
-/// Renders process-wide totals, the per-turn model-call rollup, and an
+/// Renders session-wide totals, the per-turn model-call rollup, and an
 /// explicit coverage statement so a shared trace cannot be misread as
 /// describing the whole session when the ring has already evicted history.
 fn writeNetworkSessionTotals(writer: *std.Io.Writer, window: []const diagnostics.NetworkCall) !void {
     const lifetime = diagnostics.networkLifetimeStats();
     try writer.print(
-        "session: calls={d} ok={d} errors={d} model_time={d}s\n",
+        "session: calls={d} ok={d} errors={d} total_time={d}s\n",
         .{ lifetime.total_calls, lifetime.ok_calls, lifetime.error_calls, lifetime.total_duration_ms / 1000 },
     );
-    if (lifetime.total_calls > window.len) {
+    if (window.len > 0 and lifetime.total_calls > window.len) {
         try writer.print(
             "coverage: window holds only the last {d} of {d} calls, oldest retained ",
             .{ window.len, lifetime.total_calls },
         );
         try writeTraceTimestampUtc(writer, window[0].started_at_ms);
-        try writer.writeAll("; earlier history lives in the session directory\n");
+        try writer.writeAll("; run with FX_TRACE_LOG for a complete transport record\n");
     } else {
         try writer.writeAll("coverage: complete (window holds every recorded call)\n");
     }
@@ -2916,10 +2916,14 @@ fn writeNetworkSessionTotals(writer: *std.Io.Writer, window: []const diagnostics
     var rollups: [diagnostics.network_turn_rollup_capacity]diagnostics.NetworkTurnRollup = undefined;
     const rollup_n = diagnostics.snapshotNetworkTurnRollups(&rollups);
     if (rollup_n == 0) return;
-    try writer.writeAll("turns:\n");
+    if (lifetime.evicted_turns > 0) {
+        try writer.print("turns: most recent {d} shown, {d} older evicted\n", .{ rollup_n, lifetime.evicted_turns });
+    } else {
+        try writer.writeAll("turns:\n");
+    }
     for (rollups[0..rollup_n]) |rollup| {
         try writer.print(
-            "  turn {d}: calls={d} errors={d} model_time={d}s",
+            "  turn {d}: calls={d} errors={d} total_time={d}s",
             .{ rollup.turn_id, rollup.calls, rollup.error_calls, rollup.total_duration_ms / 1000 },
         );
         if (rollup.subagent_calls > 0) try writer.print(" subagent_calls={d}", .{rollup.subagent_calls});
@@ -3126,7 +3130,7 @@ noinline fn writeToolCallsSummary(
         );
         if (lifetime.total_calls > n) {
             try writer.print(
-                "coverage: window holds only the last {d} of {d} tool calls; earlier history lives in the session directory\n",
+                "coverage: window holds only the last {d} of {d} tool calls; full results persist in the session directory\n",
                 .{ n, lifetime.total_calls },
             );
         } else {
@@ -5065,6 +5069,50 @@ test "trace network section states complete coverage when nothing was evicted" {
 
     try std.testing.expect(std.mem.find(u8, text, "session: calls=1 ok=1 errors=0") != null);
     try std.testing.expect(std.mem.find(u8, text, "coverage: complete") != null);
+}
+
+test "trace tool section reports session totals and window coverage" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // More calls than the ring holds so the coverage line must admit eviction.
+    var i: u64 = 0;
+    while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
+        var call: diagnostics.ToolCallMetric = .{
+            .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
+            .duration_ms = 50,
+            .outcome = if (i == 0) .rejected else .succeeded,
+        };
+        call.setName("shell");
+        diagnostics.recordToolCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const history: []const types.HistoryTurn = &.{};
+    try writeToolCallsSummary(&out.writer, alloc, history);
+    const text = out.written();
+
+    const total = diagnostics.tool_call_ring_capacity + 2;
+    var expect_buf: [200]u8 = undefined;
+    const session_line = try std.fmt.bufPrint(
+        &expect_buf,
+        "session: calls={d} succeeded={d} rejected=1 command_failed=0 tool_failed=0 runtime_failed=0",
+        .{ total, total - 1 },
+    );
+    try std.testing.expect(std.mem.find(u8, text, session_line) != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
+
+    // Ring-complete sessions state full coverage instead.
+    diagnostics.resetForTest();
+    var ok_call: diagnostics.ToolCallMetric = .{ .started_at_ms = 9_000, .duration_ms = 5, .outcome = .succeeded };
+    ok_call.setName("read_file");
+    diagnostics.recordToolCall(ok_call);
+    var fresh: std.Io.Writer.Allocating = .init(alloc);
+    defer fresh.deinit();
+    try writeToolCallsSummary(&fresh.writer, alloc, history);
+    try std.testing.expect(std.mem.find(u8, fresh.written(), "coverage: complete") != null);
 }
 
 test "app_commands exposes active handler API surface" {
