@@ -222,7 +222,7 @@ fn readIntoBuffer(reader: *std.Io.Reader, buffer: []u8) !usize {
 }
 
 /// Raw image bytes that fit the encoded tool-image attach limit.
-pub const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4 * 3;
+const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4 * 3;
 
 /// Attaches supported image files to the tool result so models with image
 /// input receive the pixels inline through the normal tool-image pipeline.
