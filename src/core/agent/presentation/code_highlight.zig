@@ -82,6 +82,13 @@ pub fn highlight(
                 continue;
             }
         }
+        if (profile.dash_flags and source[index] == '-') {
+            if (flagEnd(source, index, profile.operators)) |end| {
+                try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
+                index = end;
+                continue;
+            }
+        }
         if (isOperatorChar(source[index], profile.operators)) {
             const end = operatorRunEnd(source, index, profile.operators);
             try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
@@ -201,6 +208,23 @@ fn dollarVarEnd(source: []const u8, start: usize) ?usize {
     }
     if (std.ascii.isDigit(b) or std.mem.findScalar(u8, "?#@*!$", b) != null) return next + 1;
     return null;
+}
+
+/// A dash opens a flag token only at a word boundary (after whitespace, an
+/// operator, or the start) with a letter, digit, or second dash next. Dashes
+/// inside words, like date suffixes in paths, stay plain.
+fn flagEnd(source: []const u8, start: usize, operators: []const u8) ?usize {
+    if (start > 0) {
+        const prev = source[start - 1];
+        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, operators)) return null;
+    }
+    const next = start + 1;
+    if (next >= source.len) return null;
+    const b = source[next];
+    if (!std.ascii.isAlphanumeric(b) and b != '-') return null;
+    var end = next;
+    while (end < source.len and (std.ascii.isAlphanumeric(source[end]) or source[end] == '-')) end += 1;
+    return end;
 }
 
 fn isIdentifierContinue(byte: u8) bool {
@@ -411,9 +435,10 @@ test "shell operators and variables take the keyword color" {
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
-    // Comments and numbers keep their own colors; a $ inside quotes stays string.
+    // Comments keep their color, flags take the number color as a unit, and
+    // a $ inside quotes stays string.
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-2\x1b[39m") != null);
 
     const quoted = try highlight(alloc, "echo '$HOME'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(quoted);
@@ -434,7 +459,30 @@ test "digit runs glued to words by a dash stay plain" {
     // as does the literal-looking "null" in /dev/null.
     try std.testing.expect(std.mem.indexOf(u8, styled, "build-20260918") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "/dev/null") != null);
-    // The numeric flags and the redirect fd still color.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m80\x1b[39m") != null);
+    // The numeric flag colors as a unit, and the redirect fd still colors.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-80\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+}
+
+test "dash flags color as units only at word boundaries" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "tail -8 --json && cat - < in", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-8\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m--json\x1b[39m") != null);
+    // A lone dash (stdin marker) stays plain between the verb and the
+    // redirect; "in" colors as the shell keyword it literally is.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252min\x1b[39m") != null);
+
+    // Flags after operators still count as boundaries.
+    const after_pipe = try highlight(alloc, "echo x | head -1", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(after_pipe);
+    try std.testing.expect(std.mem.indexOf(u8, after_pipe, "\x1b[38;5;250m-1\x1b[39m") != null);
+
+    // Other languages keep minus signs plain.
+    const zig_src = try highlight(alloc, "a - b", languages.resolve("zig").?, .dark, null);
+    defer alloc.free(zig_src);
+    try std.testing.expectEqualStrings("a - b", zig_src);
 }

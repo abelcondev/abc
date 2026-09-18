@@ -1540,7 +1540,7 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
 
     try std.testing.expectEqualStrings(
         "● 3 tool calls · 1 write · 1 command\n" ++
-            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m -\x1b[38;5;250m80\x1b[39m\n" ++
+            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
             "├ Wrote note.txt [G]+2\x1b[0m\n" ++
             "└ Wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
@@ -2571,7 +2571,7 @@ test "mixed group keeps the count header before every action" {
             "├ Read three.zig\n" ++
             "├ Read four.zig\n" ++
             "├ Read five.zig\n" ++
-            "└ Ran \x1b[38;5;252mgit\x1b[39m -C /workspace status --short",
+            "└ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
