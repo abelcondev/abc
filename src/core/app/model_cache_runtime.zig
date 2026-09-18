@@ -510,7 +510,7 @@ pub const Runtime = struct {
         self.requested_access = model_catalog.AccessMetadata.init(access);
         self.cancel_requested.store(false, .seq_cst);
         const entries = self.catalog.items.len;
-        diagnostics.recordModelCatalogEvent(false, "load", "outcome=adopted entries={d}", .{entries});
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=adopted entries={d}", .{entries});
     }
 
     pub fn isLoading(self: *Self) bool {
@@ -626,7 +626,7 @@ pub const Runtime = struct {
                     .{ if (metadata != null) "ready_hit" else "missing_entry", model },
                 );
                 if (metadata == null) {
-                    diagnostics.recordModelCatalogEvent(false, "lookup", "outcome=missing_entry model={s}", .{model});
+                    diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model={s}", .{model});
                 }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
@@ -640,7 +640,7 @@ pub const Runtime = struct {
                             "interactive model catalog lookup outcome=cancelled model={s}",
                             .{model},
                         );
-                        diagnostics.recordModelCatalogEvent(false, "lookup", "outcome=cancelled model={s}", .{model});
+                        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=cancelled model={s}", .{model});
                         return error.Cancelled;
                     }
                     io_mod.sleep(std.time.ns_per_ms);
@@ -651,7 +651,7 @@ pub const Runtime = struct {
                         "interactive model catalog lookup outcome={s} model={s}",
                         .{ if (state == .failed) "cache_failed" else "cache_unavailable", model },
                     );
-                    diagnostics.recordModelCatalogEvent(true, "lookup", "outcome={s} model={s}", .{
+                    diagnostics.recordModelCatalogEvent(true, .lookup, "outcome={s} model={s}", .{
                         if (state == .failed) "cache_failed" else "cache_unavailable",
                         model,
                     });
@@ -738,7 +738,7 @@ pub const Runtime = struct {
     }
 
     fn recordLoadReady(entries: usize, reused_previous: bool, provenance: model_catalog.Provenance) void {
-        diagnostics.recordModelCatalogEvent(false, "load", "outcome=ready entries={d} reused_previous={s} anonymous_fallback={s} fallback_failure={s}", .{
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d} reused_previous={s} anonymous_fallback={s} fallback_failure={s}", .{
             entries,
             boolLabel(reused_previous),
             boolLabel(provenance.anonymous_fallback_used),
@@ -752,7 +752,7 @@ pub const Runtime = struct {
         self.state = if (self.outcome.loaded != null and self.catalog.items.len > 0) .ready else .failed;
         const kept_previous = self.state == .ready;
         self.mutex.unlock(io_mod.getIo());
-        diagnostics.recordModelCatalogEvent(true, "load", "outcome=failed category={s} status={d} retryable={s} anonymous_fallback={s} kept_previous_catalog={s}", .{
+        diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d} retryable={s} anonymous_fallback={s} kept_previous_catalog={s}", .{
             @tagName(failure.failure.category),
             if (failure.failure.http_status) |status| @intFromEnum(status) else 0,
             boolLabel(failure.failure.retryable),

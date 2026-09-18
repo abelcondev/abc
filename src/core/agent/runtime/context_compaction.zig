@@ -137,9 +137,9 @@ pub fn compact(
         var stage: []const u8 = "plan";
         errdefer |err| {
             if (err == error.Cancelled) {
-                diagnostics.traceCompactionEvent(request.trace_ctx, "failed", "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
+                diagnostics.traceCompactionEvent(request.trace_ctx, .failed, "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
             } else {
-                diagnostics.traceCompactionFailure(request.trace_ctx, "failed", "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
+                diagnostics.traceCompactionFailure(request.trace_ctx, .failed, "stage={s} capacity_attempt={d} model={s} err={s}", .{ stage, capacity_attempt, request.model, @errorName(err) });
             }
         }
         const compactable = source_messages;
@@ -147,7 +147,7 @@ pub fn compact(
             try compaction_policy.prepare(scratch, compactable, request.result_storage, request.accepted_tokens, summary_reserve_tokens)
         else
             null;
-        if (policy) |prepared| diagnostics.traceCompactionEvent(request.trace_ctx, "policy_selected", "retained_users={d} summarized_users={d} fixed_tokens={d} source_messages={d}", .{ prepared.users.len, prepared.summarized_users, prepared.fixed_tokens, prepared.messages.len });
+        if (policy) |prepared| diagnostics.traceCompactionEvent(request.trace_ctx, .policy_selected, "retained_users={d} summarized_users={d} fixed_tokens={d} source_messages={d}", .{ prepared.users.len, prepared.summarized_users, prepared.fixed_tokens, prepared.messages.len });
 
         const semantic_messages = if (policy) |prepared| prepared.messages else try compaction_state.projectSemanticMessages(scratch, compactable);
         defer if (policy == null and semantic_messages.len > 0) scratch.free(semantic_messages);
@@ -182,7 +182,7 @@ pub fn compact(
         if (ranges.len > 0) {
             diagnostics.traceCompactionEvent(
                 request.trace_ctx,
-                "provider_start",
+                .provider_start,
                 "model={s} source_messages={d} chunks={d} fixed_handoff_tokens={d} summary_budget_tokens={d}",
                 .{
                     request.model,
@@ -195,7 +195,7 @@ pub fn compact(
         } else {
             diagnostics.traceCompactionEvent(
                 request.trace_ctx,
-                "summary_skipped",
+                .summary_skipped,
                 "reason=no_semantic_source source_messages={d} compactable_messages={d} fixed_handoff_tokens={d}",
                 .{ source_messages.len, compactable.len, fixed_handoff_tokens },
             );
@@ -229,7 +229,7 @@ pub fn compact(
                 if (policy) |prepared| {
                     const reserve = prepared.summary_reserve(handoff);
                     if (prepared.users.len > 0 and reserve < request.accepted_tokens) {
-                        diagnostics.traceCompactionEvent(request.trace_ctx, "user_capacity_retry", "retained_users={d} summary_reserve_tokens={d}", .{ prepared.users.len, reserve });
+                        diagnostics.traceCompactionEvent(request.trace_ctx, .user_capacity_retry, "retained_users={d} summary_reserve_tokens={d}", .{ prepared.users.len, reserve });
                         summary_reserve_tokens = reserve;
                         alloc.free(handoff);
                         continue;
@@ -241,7 +241,7 @@ pub fn compact(
         if (ranges.len > 0) {
             diagnostics.traceCompactionEvent(
                 request.trace_ctx,
-                "provider_completed",
+                .provider_completed,
                 "model={s} chunks={d} handoff_bytes={d} input_tokens={d} output_tokens={d}",
                 .{
                     request.model,
@@ -392,7 +392,7 @@ fn runSummaryCall(
     var usage: types.ToolUsage = .{};
     for (0..2) |attempt| {
         if (request.cancel_flag.load(.seq_cst)) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, "summary_cancelled", "phase=pre_stream attempt={d}", .{attempt});
+            diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=pre_stream attempt={d}", .{attempt});
             return error.Cancelled;
         }
         var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
@@ -429,7 +429,7 @@ fn runSummaryCall(
         );
         defer streamed.deinit(alloc);
         if (request.cancel_flag.load(.seq_cst)) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, "summary_cancelled", "phase=post_stream attempt={d}", .{attempt});
+            diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=post_stream attempt={d}", .{attempt});
             return error.Cancelled;
         }
         const completion = switch (streamed) {
@@ -442,7 +442,7 @@ fn runSummaryCall(
                 const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked_detail), 240);
                 diagnostics.traceCompactionFailure(
                     request.trace_ctx,
-                    "summary_transport_failed",
+                    .summary_transport_failed,
                     "model={s} attempt={d} kind={s} detail={s}",
                     .{ request.model, attempt, @tagName(failure.kind), safe_detail },
                 );
@@ -457,7 +457,7 @@ fn runSummaryCall(
         if (completion.finish_reason != .stop) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
-                "summary_incomplete",
+                .summary_incomplete,
                 "model={s} attempt={d} finish_reason={s} content_bytes={d}",
                 .{ request.model, attempt, if (completion.finish_reason) |reason| @tagName(reason) else "missing", capture.text.items.len },
             );
@@ -470,7 +470,7 @@ fn runSummaryCall(
         if (capture.saw_tool_call or completion.tool_calls.len > 0) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
-                "summary_tool_call_rejected",
+                .summary_tool_call_rejected,
                 "model={s} attempt={d} streamed_tool_call={} tool_calls={d}",
                 .{ request.model, attempt, capture.saw_tool_call, completion.tool_calls.len },
             );
@@ -479,7 +479,7 @@ fn runSummaryCall(
         if (capture.observed_bytes > capture.text.items.len) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
-                "summary_truncated",
+                .summary_truncated,
                 "model={s} attempt={d} observed_bytes={d} captured_bytes={d} limit_bytes={d}",
                 .{ request.model, attempt, capture.observed_bytes, capture.text.items.len, max_bytes },
             );
@@ -489,19 +489,19 @@ fn runSummaryCall(
         if (!std.unicode.utf8ValidateSlice(trimmed)) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
-                "summary_invalid_utf8",
+                .summary_invalid_utf8,
                 "model={s} attempt={d} captured_bytes={d}",
                 .{ request.model, attempt, trimmed.len },
             );
             return error.InvalidCompactionHandoff;
         }
         if (trimmed.len == 0) {
-            if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, "empty_summary_retry", "attempt=2 model={s}", .{request.model});
+            if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, .empty_summary_retry, "attempt=2 model={s}", .{request.model});
             continue;
         }
         return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
     }
-    diagnostics.traceCompactionFailure(request.trace_ctx, "summary_empty_exhausted", "model={s}", .{request.model});
+    diagnostics.traceCompactionFailure(request.trace_ctx, .summary_empty_exhausted, "model={s}", .{request.model});
     return error.InvalidCompactionHandoff;
 }
 

@@ -7,30 +7,34 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 
 pub const ring_capacity = 32;
-const max_name_bytes = 32;
 const max_detail_bytes = 256;
+
+pub const Kind = enum {
+    load,
+    lookup,
+    image_gate,
+};
 
 pub const Event = struct {
     sequence: u64 = 0,
     timestamp_ms: i64 = 0,
     failed: bool = false,
-    name_len: u8 = 0,
-    name_buf: [max_name_bytes]u8 = [_]u8{0} ** max_name_bytes,
+    kind: Kind = .load,
     detail_len: u16 = 0,
     truncated: bool = false,
     detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
 
     pub fn name(self: *const Event) []const u8 {
-        return self.name_buf[0..self.name_len];
+        return @tagName(self.kind);
     }
 
     pub fn detail(self: *const Event) []const u8 {
         return self.detail_buf[0..self.detail_len];
     }
 
-    fn matches(self: *const Event, event_name: []const u8, event_detail: []const u8, failed: bool) bool {
+    fn matches(self: *const Event, kind: Kind, event_detail: []const u8, failed: bool) bool {
         return self.failed == failed and
-            std.mem.eql(u8, self.name(), event_name) and
+            self.kind == kind and
             std.mem.eql(u8, self.detail(), event_detail);
     }
 };
@@ -70,13 +74,12 @@ var ring: Ring = std.mem.zeroes(Ring);
 /// Records one catalog event. Consecutive identical events collapse into the
 /// newest slot so a per-turn lookup miss cannot evict rarer load and rejection
 /// evidence from the bounded ring.
-pub fn record(name: []const u8, failed: bool, comptime fmt: []const u8, args: anytype) void {
+pub fn record(kind: Kind, failed: bool, comptime fmt: []const u8, args: anytype) void {
     var event: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),
         .failed = failed,
+        .kind = kind,
     };
-    event.name_len = @intCast(@min(name.len, max_name_bytes));
-    @memcpy(event.name_buf[0..event.name_len], name[0..event.name_len]);
     var writer: std.Io.Writer = .fixed(&event.detail_buf);
     writer.print(fmt, args) catch {
         event.truncated = true;
@@ -86,7 +89,7 @@ pub fn record(name: []const u8, failed: bool, comptime fmt: []const u8, args: an
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     if (ring.newest()) |last| {
-        if (last.matches(event.name(), event.detail(), event.failed)) return;
+        if (last.matches(event.kind, event.detail(), event.failed)) return;
     }
     ring.append(event);
 }
@@ -126,9 +129,9 @@ test "model catalog diagnostic ring retains the newest events in order" {
 test "model catalog diagnostics stay bounded, dedup consecutive repeats, and reset" {
     reset();
     defer reset();
-    record("lookup", true, "outcome=missing_entry model={s}", .{"provider/model-a"});
-    record("lookup", true, "outcome=missing_entry model={s}", .{"provider/model-a"});
-    record("image_gate", true, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"provider/model-a"});
+    record(.lookup, true, "outcome=missing_entry model={s}", .{"provider/model-a"});
+    record(.lookup, true, "outcome=missing_entry model={s}", .{"provider/model-a"});
+    record(.image_gate, true, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"provider/model-a"});
     var events: [4]Event = undefined;
     try std.testing.expectEqual(@as(usize, 2), snapshot(&events));
     try std.testing.expectEqualStrings("lookup", events[0].name());
@@ -137,14 +140,14 @@ test "model catalog diagnostics stay bounded, dedup consecutive repeats, and res
     try std.testing.expect(events[1].detail().len > 0);
 
     const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
-    record("load", true, "{s}", .{oversized});
+    record(.load, true, "{s}", .{oversized});
     try std.testing.expectEqual(@as(usize, 3), snapshot(&events));
     try std.testing.expect(events[2].truncated);
     try std.testing.expect(events[2].detail_len <= max_detail_bytes);
 
     reset();
     try std.testing.expectEqual(@as(usize, 0), snapshot(&events));
-    record("load", false, "entries={d}", .{12});
+    record(.load, false, "entries={d}", .{12});
     try std.testing.expectEqual(@as(usize, 1), snapshot(&events));
     try std.testing.expectEqual(@as(u64, 1), events[0].sequence);
     try std.testing.expect(!events[0].failed);

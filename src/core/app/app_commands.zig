@@ -4527,8 +4527,8 @@ test "trace compaction summary renders recorded events without file tracing" {
     try writeCompactionSummary(&empty.writer, alloc);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
 
-    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, "decision", "decision=compact estimated_tokens={d}", .{279466});
-    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, "retention_exhausted", "estimated_tokens={d}", .{59000});
+    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
+    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4539,7 +4539,7 @@ test "trace compaction summary renders recorded events without file tracing" {
 
     diagnostics.resetForTest();
     for (0..diagnostics.compaction_ring_capacity + 3) |index| {
-        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, "decision", "decision=compact index={d}", .{index});
+        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
     }
     var wrapped: std.Io.Writer.Allocating = .init(alloc);
     defer wrapped.deinit();
@@ -4560,10 +4560,10 @@ test "trace model catalog summary and problems render recorded events" {
     try writeModelCatalogSummary(&empty.writer, &stub);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Model Catalog\n(no catalog events recorded)\n") != null);
 
-    diagnostics.recordModelCatalogEvent(true, "load", "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
-    diagnostics.recordModelCatalogEvent(true, "lookup", "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
-    diagnostics.recordModelCatalogEvent(false, "load", "outcome=ready entries={d}", .{41});
-    diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    diagnostics.recordModelCatalogEvent(true, .lookup, "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d}", .{41});
+    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
