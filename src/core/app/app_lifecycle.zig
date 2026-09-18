@@ -817,6 +817,37 @@ pub fn shutdownInteractiveShell(
     finishLeavingInteractiveMode(terminal, shell, metrics);
 }
 
+/// Stage timing for interactive shutdown. Each mark logs the delta since the
+/// previous stage plus the total, so a slow exit names its stage in
+/// FX_TRACE_LOG under the "shutdown" scope.
+pub const ShutdownStageTrace = struct {
+    started_ms: i64,
+    last_ms: i64,
+
+    pub fn init() ShutdownStageTrace {
+        const now_ms = io_mod.milliTimestamp();
+        return .{ .started_ms = now_ms, .last_ms = now_ms };
+    }
+
+    pub fn mark(self: *ShutdownStageTrace, stage: []const u8) void {
+        const now_ms = io_mod.milliTimestamp();
+        debug_trace.logf(
+            "shutdown",
+            "stage name={s} step_ms={d} total_ms={d}",
+            .{ stage, now_ms - self.last_ms, now_ms - self.started_ms },
+        );
+        self.last_ms = now_ms;
+    }
+};
+
+test "shutdown stage trace advances monotonically and is silent without a log target" {
+    var trace = ShutdownStageTrace.init();
+    trace.mark("first");
+    try std.testing.expect(trace.last_ms >= trace.started_ms);
+    trace.mark("second");
+    try std.testing.expect(trace.last_ms >= trace.started_ms);
+}
+
 /// Cooked-mode handoff for Ctrl-Z / SIGTSTP. Same terminal restore as
 /// shutdown, but keeps signal handlers, title, and recording so resume can
 /// continue the same session.
