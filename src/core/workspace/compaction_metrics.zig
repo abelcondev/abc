@@ -9,8 +9,40 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 
 pub const ring_capacity = 64;
-const max_name_bytes = 48;
 const max_detail_bytes = 512;
+
+pub const Kind = enum {
+    log,
+    failed,
+    policy_selected,
+    provider_start,
+    summary_skipped,
+    user_capacity_retry,
+    provider_completed,
+    summary_cancelled,
+    summary_transport_failed,
+    summary_incomplete,
+    summary_tool_call_rejected,
+    summary_truncated,
+    summary_invalid_utf8,
+    empty_summary_retry,
+    summary_empty_exhausted,
+    source_checkpointed,
+    transaction_failed,
+    skipped_no_op,
+    capacity_exceeded_at_plan,
+    credential_unauthorized,
+    candidate_over_capacity,
+    committed,
+    decision,
+    overflow_without_compaction,
+    no_compactable_context,
+    retention_exhausted,
+    retention_forced_zero,
+    installed,
+    overflow_recovery_incomplete,
+    provider_overflow_recovery,
+};
 
 pub const Event = struct {
     sequence: u64 = 0,
@@ -19,14 +51,13 @@ pub const Event = struct {
     step_id: u64 = 0,
     subagent_id: u64 = 0,
     failed: bool = false,
-    name_len: u8 = 0,
-    name_buf: [max_name_bytes]u8 = [_]u8{0} ** max_name_bytes,
+    kind: Kind = .log,
     detail_len: u16 = 0,
     truncated: bool = false,
     detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
 
     pub fn name(self: *const Event) []const u8 {
-        return self.name_buf[0..self.name_len];
+        return @tagName(self.kind);
     }
 
     pub fn detail(self: *const Event) []const u8 {
@@ -63,16 +94,15 @@ var ring: Ring = std.mem.zeroes(Ring);
 
 // Keep format specialization at the caller while sharing ring mutation without
 // adding another Event-sized stack copy.
-pub inline fn record(name: []const u8, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
+pub inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
     var event: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),
         .turn_id = turn_id,
         .step_id = step_id,
         .subagent_id = subagent_id,
         .failed = failed,
+        .kind = kind,
     };
-    event.name_len = @intCast(@min(name.len, max_name_bytes));
-    @memcpy(event.name_buf[0..event.name_len], name[0..event.name_len]);
     var writer: std.Io.Writer = .fixed(&event.detail_buf);
     writer.print(fmt, args) catch {
         event.truncated = true;
@@ -123,9 +153,9 @@ test "compaction diagnostic ring retains the newest events in order" {
 test "compaction diagnostics stay bounded and reset without file tracing" {
     reset();
     defer reset();
-    record("decision", 7, 3, 0, false, "automatic_threshold tokens={d}/{d}", .{ 279466, 280000 });
+    record(.decision, 7, 3, 0, false, "automatic_threshold tokens={d}/{d}", .{ 279466, 280000 });
     const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
-    record("retention_exhausted", 7, 4, 0, true, "{s}", .{oversized});
+    record(.retention_exhausted, 7, 4, 0, true, "{s}", .{oversized});
     var events: [2]Event = undefined;
     try std.testing.expectEqual(@as(usize, 2), snapshot(&events));
     try std.testing.expectEqualStrings("decision", events[0].name());
@@ -139,7 +169,7 @@ test "compaction diagnostics stay bounded and reset without file tracing" {
     try std.testing.expect(events[1].detail_len <= max_detail_bytes);
     reset();
     try std.testing.expectEqual(@as(usize, 0), snapshot(&events));
-    record("installed", 8, 0, 0, false, "kept_users={d}", .{3});
+    record(.installed, 8, 0, 0, false, "kept_users={d}", .{3});
     try std.testing.expectEqual(@as(usize, 1), snapshot(&events));
     try std.testing.expectEqual(@as(u64, 1), events[0].sequence);
 }

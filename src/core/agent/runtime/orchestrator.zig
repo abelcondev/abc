@@ -3925,7 +3925,7 @@ fn persist_compaction_source(
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = false,
     });
-    diagnostics.traceCompactionEvent(trace_ctx, "source_checkpointed", "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
+    diagnostics.traceCompactionEvent(trace_ctx, .source_checkpointed, "tool_steps={d} source_messages={d}", .{ execution.tool_steps.len, current_turn_messages.len });
 }
 
 fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
@@ -6186,9 +6186,9 @@ pub fn compactContextTransaction(
     if (operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, stage);
     errdefer |err| {
         if (err == error.Cancelled) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+            diagnostics.traceCompactionEvent(request.trace_ctx, .transaction_failed, "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
         } else {
-            diagnostics.traceCompactionFailure(request.trace_ctx, "transaction_failed", "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
+            diagnostics.traceCompactionFailure(request.trace_ctx, .transaction_failed, "stage={s} trigger={s} err={s}", .{ @tagName(stage), @tagName(request.trigger), @errorName(err) });
         }
         if (operation_id) |id| {
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, stage, request.cancel_flag.load(.seq_cst)));
@@ -6207,7 +6207,7 @@ pub fn compactContextTransaction(
     if (initial_plan.decision == .no_op) {
         diagnostics.traceCompactionEvent(
             request.trace_ctx,
-            "skipped_no_op",
+            .skipped_no_op,
             "trigger={s} request_tokens={d} source_tokens={d} usable_tokens={any} high_water_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6226,7 +6226,7 @@ pub fn compactContextTransaction(
     const accepted_tokens = plan.accepted_handoff_tokens orelse {
         diagnostics.traceCompactionFailure(
             request.trace_ctx,
-            "capacity_exceeded_at_plan",
+            .capacity_exceeded_at_plan,
             "trigger={s} request_tokens={d} source_tokens={d} protected_tokens={d} newest_exchange_tokens={d} usable_tokens={any} high_water_tokens={any} session_target_tokens={any}",
             .{
                 @tagName(request.trigger),
@@ -6244,7 +6244,7 @@ pub fn compactContextTransaction(
     if (!model_provider.authorizesCredential(request.provider, request.credential_source)) {
         diagnostics.traceCompactionFailure(
             request.trace_ctx,
-            "credential_unauthorized",
+            .credential_unauthorized,
             "trigger={s} provider={s} credential_source={s}",
             .{ @tagName(request.trigger), @tagName(request.provider), if (request.credential_source) |source| @tagName(source) else "none" },
         );
@@ -6299,7 +6299,7 @@ pub fn compactContextTransaction(
     if (candidate_cost.estimated_input_tokens > fixed_cost.estimated_input_tokens +| accepted_tokens) {
         diagnostics.traceCompactionEvent(
             request.trace_ctx,
-            "candidate_over_capacity",
+            .candidate_over_capacity,
             "trigger={s} candidate_tokens={d} fixed_tokens={d} accepted_tokens={d} handoff_bytes={d}",
             .{
                 @tagName(request.trigger),
@@ -6321,7 +6321,7 @@ pub fn compactContextTransaction(
     }, request.active_prefix, request.retained_from);
     diagnostics.traceCompactionEvent(
         request.trace_ctx,
-        "committed",
+        .committed,
         "trigger={s} removed_turns={d} compaction_count={d} handoff_bytes={d} accepted_tokens={d}",
         .{
             @tagName(request.trigger),
@@ -7156,11 +7156,11 @@ fn processQueuedPromptLoop(
                     },
                     .unavailable => switch (request_capabilities.image_input_support) {
                         .unknown => {
-                            diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
                             return error.ModelImageCapabilityUnavailable;
                         },
                         .non_native => {
-                            diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
+                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
                             return error.SubscriptionNativeImageUnavailable;
                         },
                         .native => unreachable,
@@ -7296,7 +7296,7 @@ fn processQueuedPromptLoop(
                 diagnostics.traceCompactionEventIf(
                     projection_plan.decision != .no_op,
                     step_ctx,
-                    "decision",
+                    .decision,
                     "decision={s} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} max_output_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
@@ -7315,12 +7315,12 @@ fn processQueuedPromptLoop(
                 );
                 switch (projection_plan.decision) {
                     .no_op => if (context_overflow_recovery == .pending) {
-                        diagnostics.traceCompactionFailure(step_ctx, "overflow_without_compaction", "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
+                        diagnostics.traceCompactionFailure(step_ctx, .overflow_without_compaction, "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, projection_plan.usable_input_tokens });
                         return error.ContextCapacityExceeded;
                     } else if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
-                                diagnostics.traceCompactionFailure(step_ctx, "no_compactable_context", "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
+                                diagnostics.traceCompactionFailure(step_ctx, .no_compactable_context, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, usable_tokens });
                                 return error.ContextCapacityExceeded;
                             }
                         }
@@ -7351,10 +7351,10 @@ fn processQueuedPromptLoop(
                             if (window.source.len == 0) {
                                 if (context_overflow_recovery == .pending or request_cost.estimated_input_tokens > (runtime_prompt_context.usableInputTokens(request_capabilities) orelse std.math.maxInt(usize))) {
                                     if (retention_target == 0) {
-                                        diagnostics.traceCompactionFailure(step_ctx, "retention_exhausted", "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
+                                        diagnostics.traceCompactionFailure(step_ctx, .retention_exhausted, "estimated_tokens={d}", .{request_cost.estimated_input_tokens});
                                         return error.ContextCapacityExceeded;
                                     }
-                                    diagnostics.traceCompactionFailure(step_ctx, "retention_forced_zero", "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
+                                    diagnostics.traceCompactionFailure(step_ctx, .retention_forced_zero, "estimated_tokens={d} retention_target={d}", .{ request_cost.estimated_input_tokens, retention_target });
                                     retention_target = 0;
                                     continue :compact_attempt;
                                 }
@@ -7485,7 +7485,7 @@ fn processQueuedPromptLoop(
                             }
                             diagnostics.traceCompactionEvent(
                                 step_ctx,
-                                "installed",
+                                .installed,
                                 "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
                                 .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                             );
@@ -7526,7 +7526,7 @@ fn processQueuedPromptLoop(
                 }
             }
             if (context_overflow_recovery == .pending) {
-                diagnostics.traceCompactionFailure(step_ctx, "overflow_recovery_incomplete", "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
+                diagnostics.traceCompactionFailure(step_ctx, .overflow_recovery_incomplete, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
@@ -8126,7 +8126,7 @@ fn processQueuedPromptLoop(
                 )) {
                     diagnostics.traceCompactionEvent(
                         step_ctx,
-                        "provider_overflow_recovery",
+                        .provider_overflow_recovery,
                         "model={s} request_bytes={d} estimated_tokens={d}",
                         .{
                             gateway_model,
