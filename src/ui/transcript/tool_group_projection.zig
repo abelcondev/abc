@@ -603,7 +603,8 @@ fn formatGroupBlock(
         ) orelse raw_phrase;
         const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
         static_index += 1;
-        const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
+        const last_static_row = !focused_in_group and static_index == static_count;
+        const connector = if (last_static_row) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, display_phrase });
         const clipped = try clipSummary(scratch, child, cols);
         try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
@@ -616,7 +617,11 @@ fn formatGroupBlock(
         try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
         if (subagentStatusContinuation(entry, detail)) |continuation| {
-            const continuation_row = try std.fmt.allocPrint(scratch, "  {s}", .{continuation});
+            const continuation_row = try std.fmt.allocPrint(
+                scratch,
+                "{s}{s}",
+                .{ if (last_static_row) "  " else "│ ", continuation },
+            );
             const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
             try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
             try out.writer.writeByte('\n');
@@ -738,7 +743,11 @@ fn formatExpandedChild(
     else
         clipped;
     const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
-    const continuation_row = try std.fmt.allocPrint(scratch, "  {s}", .{continuation});
+    const continuation_row = try std.fmt.allocPrint(
+        scratch,
+        "{s}{s}",
+        .{ if (std.mem.eql(u8, connector, "└")) "  " else "│ ", continuation },
+    );
     return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ accented, try clipSummary(scratch, continuation_row, cols) });
 }
 
@@ -760,6 +769,13 @@ test "expanded subagent row preserves status continuation" {
     try std.testing.expectEqualStrings(
         "└ reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%",
         row,
+    );
+
+    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├", 120);
+    defer alloc.free(middle_row);
+    try std.testing.expectEqualStrings(
+        "├ reviewer working · inspect auth\n│ gpt-5.5 · high · 12k/256k 4%",
+        middle_row,
     );
 }
 
@@ -1375,6 +1391,34 @@ test "minimal tool group summary uses semantic category order and outcomes" {
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expectEqual(types.ToolActivityKind.read, details[0].activity_kind.?);
+}
+
+test "grouped subagent status keeps the vertical continuation for middle rows" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 4, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 4 tool calls · 4 subagent\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
+        projection.entry_actions.items[0].override.bytes,
+    );
 }
 
 test "small minimal tool groups surface canonical action targets" {
