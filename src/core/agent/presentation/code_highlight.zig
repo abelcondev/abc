@@ -91,9 +91,12 @@ pub fn highlight(
         if (isIdentifierStart(source[index])) {
             const end = identifierEnd(source, index);
             const token = source[index..end];
-            if (inList(token, profile.keywords, profile.keyword_case)) {
+            // A word glued to a path separator is a path segment, not syntax:
+            // /dev/null keeps "null" plain.
+            const after_separator = index > 0 and source[index - 1] == '/';
+            if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.keyword_style, token, base);
-            } else if (inList(token, profile.literals, profile.keyword_case)) {
+            } else if (!after_separator and inList(token, profile.literals, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.number_style, token, base);
             } else {
                 try styled.appendSlice(alloc, token);
@@ -155,7 +158,14 @@ fn quotedEnd(source: []const u8, start: usize) usize {
 }
 
 fn isNumberStart(source: []const u8, index: usize) bool {
-    return std.ascii.isDigit(source[index]) and (index == 0 or !isIdentifierContinue(source[index - 1]));
+    if (!std.ascii.isDigit(source[index])) return false;
+    if (index == 0) return true;
+    const prev = source[index - 1];
+    if (isIdentifierContinue(prev)) return false;
+    // A digit run glued to a word by a dash is a name segment, not a number:
+    // paths like build-20260918 stay plain while flags like -80 still color.
+    if (prev == '-' and index >= 2 and isIdentifierContinue(source[index - 2])) return false;
+    return true;
 }
 
 fn numberEnd(source: []const u8, start: usize) usize {
@@ -413,4 +423,18 @@ test "shell operators and variables take the keyword color" {
     const zig_src = try highlight(alloc, "a < b", languages.resolve("zig").?, .dark, null);
     defer alloc.free(zig_src);
     try std.testing.expectEqualStrings("a < b", zig_src);
+}
+
+test "digit runs glued to words by a dash stay plain" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "cd build-20260918 && head -80 2>/dev/null", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    // The date suffix in the path is a name segment and keeps the plain text,
+    // as does the literal-looking "null" in /dev/null.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "build-20260918") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "/dev/null") != null);
+    // The numeric flags and the redirect fd still color.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m80\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
 }
