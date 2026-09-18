@@ -9,6 +9,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -819,10 +820,22 @@ pub fn shutdownInteractiveShell(
 
 /// Stage timing for interactive shutdown. Each mark logs the delta since the
 /// previous stage plus the total, so a slow exit names its stage in
-/// FX_TRACE_LOG under the "shutdown" scope.
+/// FX_TRACE_LOG under the "shutdown" scope. Stages are also recorded in
+/// memory and persisted at exit, so the next session's /trace report shows
+/// the last shutdown breakdown without any flag.
 pub const ShutdownStageTrace = struct {
+    pub const max_recorded_stages = 16;
+
+    pub const Stage = struct {
+        name: []const u8,
+        step_ms: i64,
+        total_ms: i64,
+    };
+
     started_ms: i64,
     last_ms: i64,
+    stages: [max_recorded_stages]Stage = undefined,
+    stages_len: usize = 0,
 
     pub fn init() ShutdownStageTrace {
         const now_ms = io_mod.milliTimestamp();
@@ -831,21 +844,97 @@ pub const ShutdownStageTrace = struct {
 
     pub fn mark(self: *ShutdownStageTrace, stage: []const u8) void {
         const now_ms = io_mod.milliTimestamp();
+        const step_ms = now_ms - self.last_ms;
+        const total_ms = now_ms - self.started_ms;
         debug_trace.logf(
             "shutdown",
             "stage name={s} step_ms={d} total_ms={d}",
-            .{ stage, now_ms - self.last_ms, now_ms - self.started_ms },
+            .{ stage, step_ms, total_ms },
         );
         self.last_ms = now_ms;
+        if (self.stages_len < max_recorded_stages) {
+            self.stages[self.stages_len] = .{ .name = stage, .step_ms = step_ms, .total_ms = total_ms };
+            self.stages_len += 1;
+        }
+    }
+
+    pub fn recordedStages(self: *const ShutdownStageTrace) []const Stage {
+        return self.stages[0..self.stages_len];
+    }
+
+    pub fn totalMs(self: *const ShutdownStageTrace) i64 {
+        return self.last_ms - self.started_ms;
     }
 };
 
-test "shutdown stage trace advances monotonically and is silent without a log target" {
+/// Persists the shutdown breakdown for the next session's /trace report.
+/// Best-effort: a diagnostics write failure must never fail exit.
+pub fn writeLastShutdownReport(alloc: Allocator, trace: *const ShutdownStageTrace) void {
+    writeLastShutdownReportInner(alloc, trace) catch |err| {
+        debug_trace.logf("shutdown", "last shutdown report write failed err={s}", .{@errorName(err)});
+    };
+}
+
+fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTrace) !void {
+    const home = io_mod.getenv("HOME") orelse return;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"version\":1,\"recorded_at_ms\":");
+    try out.writer.print("{d}", .{io_mod.milliTimestamp()});
+    try out.writer.writeAll(",\"total_ms\":");
+    try out.writer.print("{d}", .{trace.totalMs()});
+    try out.writer.writeAll(",\"stages\":[");
+    for (trace.recordedStages(), 0..) |stage, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.print(
+            "{{\"name\":\"{s}\",\"step_ms\":{d},\"total_ms\":{d}}}",
+            .{ stage.name, stage.step_ms, stage.total_ms },
+        );
+    }
+    try out.writer.writeAll("]}");
+
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+    };
+    defer home_dir.close();
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    defer fx_dir.close();
+    var diagnostics = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
+    defer diagnostics.close();
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &diagnostics,
+        profile_paths.last_shutdown_report_file_name,
+        out.writer.buffered(),
+    );
+}
+
+/// Reads the persisted shutdown breakdown for the /trace report. Returns the
+/// owned file contents; caller frees. Missing or unreadable file is null.
+pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
+    const home = io_mod.getenv("HOME") orelse return null;
+    const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
+    defer alloc.free(path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, 64 * 1024) catch null;
+}
+
+test "shutdown stage trace advances monotonically and records stages" {
     var trace = ShutdownStageTrace.init();
     trace.mark("first");
     try std.testing.expect(trace.last_ms >= trace.started_ms);
     trace.mark("second");
     try std.testing.expect(trace.last_ms >= trace.started_ms);
+    try std.testing.expectEqual(@as(usize, 2), trace.recordedStages().len);
+    try std.testing.expectEqualStrings("first", trace.recordedStages()[0].name);
+}
+
+test "shutdown stage trace bounds recorded stages" {
+    var trace = ShutdownStageTrace.init();
+    for (0..ShutdownStageTrace.max_recorded_stages + 4) |_| trace.mark("stage");
+    try std.testing.expectEqual(ShutdownStageTrace.max_recorded_stages, trace.recordedStages().len);
 }
 
 /// Cooked-mode handoff for Ctrl-Z / SIGTSTP. Same terminal restore as
