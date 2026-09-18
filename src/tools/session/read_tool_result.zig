@@ -129,7 +129,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         };
         errdefer @import("../../core/shared/types.zig").freeToolImages(ctx.allocator, images);
         return .{ .rich = .{
-            .text = try ctx.allocator.dupe(u8, "Stored tool images loaded."),
+            .text = try ctx.allocator.dupe(u8, "Stored tool images attached to this result. They are sent to the model with your next request when this model accepts image input; when they cannot be sent, that request notes why and what to do instead."),
             .images = images,
             .is_error = false,
         } };

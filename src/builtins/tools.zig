@@ -39,7 +39,7 @@ const glob_files_description =
 const grep_files_description =
     "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
 const read_file_description =
-    "Read one UTF-8 text file with bounded line-numbered output and optional start_line/line_count range. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code. When NOT to use: list directories, search many files, read binary data, or bypass dedicated search tools.";
+    "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
@@ -933,7 +933,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "f22369b30518c28caadeb5275297ada8655741986eb8125086e01665f1288a41",
+        "fa5ae1b64d69e6d1f0c509184a47097e473188f8bb89977b82372c617f1a230d",
         &actual_hex,
     );
 }

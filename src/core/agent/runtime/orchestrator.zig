@@ -6853,6 +6853,7 @@ fn processQueuedPromptLoop(
     else
         selected_fast_mode;
     var fast_unavailable_notified = false;
+    var tool_image_strip_notified = false;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -7223,7 +7224,21 @@ fn processQueuedPromptLoop(
                 }
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
-            const request_messages = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support == .native, config.max_tool_result_bytes);
+            const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
+            const request_messages = image_projection.messages;
+            // Tool images withheld because the catalog could not confirm image
+            // input are invisible in the transcript otherwise. Tell the user
+            // once per turn, and only when the catalog itself is known to be
+            // down; a confirmed model without image input relies on the
+            // model-facing notice instead.
+            if (image_projection.stripped and !tool_image_strip_notified and
+                request_capabilities.image_input_support == .unknown and
+                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
+            {
+                tool_image_strip_notified = true;
+                try deps.push_text(deps.ctx, .{ .operational = "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers." });
+                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
