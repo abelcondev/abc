@@ -6418,11 +6418,9 @@ fn containsIgnoringSgr(haystack: []const u8, needle: []const u8) bool {
     var n: usize = 0;
     var i: usize = 0;
     while (i < haystack.len and n < plain_buf.len) {
-        if (haystack[i] == 0x1b and i + 1 < haystack.len and haystack[i + 1] == '[') {
-            var j = i + 2;
-            while (j < haystack.len and haystack[j] != 'm') j += 1;
-            if (j == haystack.len) break;
-            i = j + 1;
+        const next = display_width.ansiSequenceEnd(haystack, i);
+        if (next != i) {
+            i = next;
             continue;
         }
         plain_buf[n] = haystack[i];

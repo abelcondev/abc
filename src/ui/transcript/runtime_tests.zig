@@ -16773,3 +16773,34 @@ test "grouped completed command rows shell-highlight quoted strings over the row
     try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245mprintf ") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
 }
+
+test "multi-word command labels stay intact when a syntax token follows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-timeout" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "sleep 5", "Timed out");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Timed out sleep 5" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // A first-space split would open the base style between "Timed" and
+    // "out"; the recorded label keeps both words ahead of the base open.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") != null);
+}
