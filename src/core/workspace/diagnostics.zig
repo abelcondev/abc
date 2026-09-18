@@ -13,9 +13,13 @@ const debug_trace = @import("../shared/debug_trace.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
+pub const NetworkLifetimeStats = network_metrics.LifetimeStats;
+pub const NetworkTurnRollup = network_metrics.TurnRollup;
+pub const network_turn_rollup_capacity = network_metrics.turn_rollup_capacity;
 pub const ToolCallMetric = tool_call_metrics.ToolCallMetric;
 pub const ToolCallRecord = tool_call_metrics.ToolCallRecord;
 pub const ToolCallOutcome = tool_call_metrics.ToolCallOutcome;
+pub const ToolCallLifetimeStats = tool_call_metrics.LifetimeStats;
 pub const network_ring_capacity = network_metrics.ring_capacity;
 pub const tool_call_ring_capacity = tool_call_metrics.ring_capacity;
 pub const RenderEvent = render_metrics.Event;
@@ -76,6 +80,14 @@ pub fn snapshotNetworkCalls(out: []NetworkCall) usize {
     return network_metrics.snapshot(out);
 }
 
+pub fn networkLifetimeStats() NetworkLifetimeStats {
+    return network_metrics.lifetimeStats();
+}
+
+pub fn snapshotNetworkTurnRollups(out: []NetworkTurnRollup) usize {
+    return network_metrics.snapshotTurnRollups(out);
+}
+
 pub fn recordToolCall(call: ToolCallMetric) void {
     tool_call_metrics.record(call);
 }
@@ -96,6 +108,10 @@ pub fn recordToolCallResult(input: ToolCallRecord) void {
 
 pub fn snapshotToolCalls(out: []ToolCallMetric) usize {
     return tool_call_metrics.snapshot(out);
+}
+
+pub fn toolCallLifetimeStats() ToolCallLifetimeStats {
+    return tool_call_metrics.lifetimeStats();
 }
 
 pub fn resetSession() void {
