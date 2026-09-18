@@ -167,7 +167,7 @@ function firstCallToolResponses(args: {
 
 function startFakeGateway(
   responses: GatewayResponse[],
-  options: { classifierDecision?: "clear" | "caution" } = {},
+  options: { classifierDecision?: "clear" | "caution"; modelTags?: string[] } = {},
 ) {
   const requests: GatewayRequest[] = [];
   const classifierRequests: GatewayRequest[] = [];
@@ -177,7 +177,7 @@ function startFakeGateway(
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         return Response.json({
-          data: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+          data: [{ id: MODEL, type: "language", tags: options.modelTags ?? ["tool-use"] }],
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
@@ -345,6 +345,80 @@ async function runTerminalToolScenario(args: {
 }
 
 describe("filesystem path handling", () => {
+  for (const supportsImages of [true, false]) {
+    test(
+      supportsImages
+        ? "read_file attaches a workspace image inline for a vision model"
+        : "read_file image is withheld with guidance for a text-only model",
+      async () => {
+        const root = createIsolatedRoot();
+        const pngBase64 =
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        const gateway = startFakeGateway(
+          [
+            toolCall("read_image_1", "read_file", { path: "pixel.png" }),
+            finalText("image inspected"),
+          ],
+          {
+            modelTags: supportsImages
+              ? ["tool-use", "vision", "file-input"]
+              : ["tool-use"],
+          },
+        );
+        try {
+          writeFileSync(
+            join(root.workspace, "pixel.png"),
+            Buffer.from(pngBase64, "base64"),
+          );
+          const result = await runFx(
+            ["ask", "--auto", "--json", "--no-save", "Read pixel.png once, then stop."],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+          expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+          expect(gateway.requests).toHaveLength(2);
+          const request = JSON.parse(gateway.requests[1].body) as {
+            prompt: Array<{ content?: unknown }>;
+          };
+          const part = request.prompt
+            .flatMap((message) =>
+              Array.isArray(message.content) ? message.content : []
+            )
+            .find((value) =>
+              (value as Record<string, unknown>).type === "tool-result" &&
+              (value as Record<string, unknown>).toolCallId === "read_image_1"
+            ) as Record<string, unknown> | undefined;
+          expect(part).toBeDefined();
+          const output = part!.output as Record<string, unknown>;
+          if (supportsImages) {
+            expect(output.type).toBe("content");
+            const value = output.value as Array<Record<string, unknown>>;
+            const image = value.find((entry) => entry.type === "image-data");
+            expect(image).toBeDefined();
+            expect(image!.mediaType).toBe("image/png");
+            expect(image!.data).toBe(pngBase64);
+            expect(contentText(output)).toContain("image attached");
+            expect(contentText(output)).not.toContain("binary or non-utf8");
+          } else {
+            expect(output.type).toBe("text");
+            expect(contentText(output)).toContain(
+              "not sent: this model receives image input through the vision tool",
+            );
+            expect(JSON.stringify(output)).not.toContain(pngBase64.slice(0, 32));
+          }
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "empty optional search paths use the workspace root",
     async () => {

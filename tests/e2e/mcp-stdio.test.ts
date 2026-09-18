@@ -2059,7 +2059,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         expect(part.output.value.find((value: { type: string }) => value.type === "text").text).not.toContain("iVBORw0KGgo");
       } else {
         expect(part.output.type).toBe("text");
-        expect(part.output.value).toContain("not sent because this model does not support image input");
+        expect(part.output.value).toContain("not sent: this model receives image input through the vision tool");
         expect(part.output.value).not.toContain("iVBORw0KGgo");
       }
       await expectFixtureProcessesExited(readWire(root.wireLogPath));

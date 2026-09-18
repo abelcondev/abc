@@ -2,10 +2,13 @@ const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
+const io_mod = @import("../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,6 +37,7 @@ pub const Error = error{
     InvalidToolName,
     InvalidToolArguments,
     InvalidToolHistory,
+    ImageUnavailable,
     RequiredToolMissing,
     UnexpectedToolCall,
     InvalidChunk,
@@ -163,10 +167,12 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     const options = request.provider_options;
     if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
-    if (request.vision_mode != .unavailable or (request.verified_images != null and request.verified_images.?.len != 0)) return error.UnsupportedVision;
+    // The vision tool runs through a separate provider request; inline image
+    // content on user and tool-result messages serializes natively below.
+    if (request.vision_mode != .unavailable) return error.UnsupportedVision;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     for (request.messages) |message| {
-        if (message.images.len != 0) return error.UnsupportedVision;
+        if (message.images.len != 0 and message.role != .user) return error.InvalidProviderPrompt;
         if (message.provider_replay != null and message.role != .assistant) return error.InvalidProviderState;
         if (message.role != .assistant and message.tool_calls.len != 0) return error.InvalidToolHistory;
         if (message.role != .tool and message.tool_call_id != null) return error.InvalidToolHistory;
@@ -405,18 +411,118 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
     defer out.deinit();
     write_request(&out.writer, alloc, request, options, functions.items, &projection) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep => |failure| return failure,
+        error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep, error.ImageUnavailable, error.InvalidProviderPrompt => |failure| return failure,
         else => return error.InvalidToolSchema,
     };
     return out.toOwnedSlice();
+}
+
+fn toolResultDenied(message: types.ChatMessage) bool {
+    const failed = if (message.tool_result_status) |status|
+        status == .failure
+    else
+        false;
+    return failed and tool_result_errors.toolPermissionDenialReason(message.content orelse "") != null;
+}
+
+/// Writes one OpenAI-style image_url part. `base64_data` is already encoded.
+fn write_image_url_part_encoded(writer: *std.Io.Writer, media_type: []const u8, base64_data: []const u8) !void {
+    try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    try writer.writeAll(media_type);
+    try writer.writeAll(";base64,");
+    try writer.writeAll(base64_data);
+    try writer.writeAll("\"}}");
+}
+
+/// Writes one OpenAI-style image_url part from raw bytes, encoding in chunks.
+fn write_image_url_part_raw(writer: *std.Io.Writer, media_type: []const u8, bytes: []const u8) !void {
+    try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    try writer.writeAll(media_type);
+    try writer.writeAll(";base64,");
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + 3 * 1024, bytes.len);
+        try std.base64.standard.Encoder.encodeWriter(writer, bytes[offset..end]);
+        offset = end;
+    }
+    try writer.writeAll("\"}}");
+}
+
+/// User messages carry image attachments as content parts instead of a plain
+/// string so vision-capable chat-completions models receive the pixels.
+fn write_user_content_parts(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    message: types.ChatMessage,
+    verified: ?[]const image_attachments.VerifiedSnapshot,
+) !void {
+    try writer.writeByte('[');
+    var wrote_part = false;
+    if (message.content) |content| {
+        if (content.len > 0) {
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(content, .{}, writer);
+            try writer.writeByte('}');
+            wrote_part = true;
+        }
+    }
+    if (verified) |snapshots| {
+        for (snapshots) |snapshot| {
+            if (wrote_part) try writer.writeByte(',');
+            try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
+            wrote_part = true;
+        }
+    } else {
+        for (message.images) |image| {
+            if (wrote_part) try writer.writeByte(',');
+            var snapshot = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch return error.ImageUnavailable;
+            defer snapshot.deinit(alloc);
+            try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
+            wrote_part = true;
+        }
+    }
+    try writer.writeByte(']');
+}
+
+/// Emits retained tool-result images as a user message following the tool
+/// message; chat-completions tool messages cannot carry image parts.
+fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMessage, images: []const types.ToolImage) !void {
+    const label = try std.fmt.allocPrint(alloc, "The tool \"{s}\" returned {d} image(s).", .{ message.tool_name orelse "unknown", images.len });
+    defer alloc.free(label);
+    try writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(label, .{}, writer);
+    try writer.writeByte('}');
+    for (images) |image| {
+        try writer.writeByte(',');
+        try write_image_url_part_encoded(writer, image.mime_type, image.data);
+    }
+    try writer.writeAll("]}");
 }
 
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
+    // Verified snapshots belong to the current user turn and attach to the
+    // last user message in the conversation lane.
+    const verified_images: ?[]const image_attachments.VerifiedSnapshot = if (request.verified_images) |images|
+        if (images.len != 0) images else null
+    else
+        null;
+    var verified_target: ?usize = null;
+    if (verified_images != null) {
+        var index = request.messages.len;
+        while (index > 0) {
+            index -= 1;
+            if (request.messages[index].role == .user) {
+                verified_target = index;
+                break;
+            }
+        }
+        if (verified_target == null) return error.InvalidProviderPrompt;
+    }
     var count: usize = 0;
-    for ([_][]const types.ChatMessage{ request.instructions, request.messages }) |lane| for (lane) |message| {
+    for ([_][]const types.ChatMessage{ request.instructions, request.messages }, 0..) |lane, lane_index| for (lane, 0..) |message, message_index| {
         // Source validation rejects empty assistants; only stripped replay can leave one here.
         if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
         if (count != 0) try writer.writeByte(',');
@@ -424,7 +530,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         try writer.writeAll("{\"role\":");
         try std.json.Stringify.value(@tagName(message.role), .{}, writer);
         try writer.writeAll(",\"content\":");
-        try std.json.Stringify.value(message.content, .{}, writer);
+        const verified_here = lane_index == 1 and verified_target != null and message_index == verified_target.?;
+        if (message.role == .user and (message.images.len != 0 or verified_here)) {
+            try write_user_content_parts(writer, alloc, message, if (verified_here) verified_images.? else null);
+        } else {
+            try std.json.Stringify.value(message.content, .{}, writer);
+        }
         try write_replay(writer, alloc, message);
         if (message.role == .tool) {
             try writer.writeAll(",\"tool_call_id\":");
@@ -445,6 +556,16 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeByte(']');
         }
         try writer.writeByte('}');
+        // Chat completions has no image parts on tool messages, so retained
+        // tool images follow as a user message carrying the pixels.
+        if (message.role == .tool) {
+            const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+            if (tool_images.len != 0 and !toolResultDenied(message)) {
+                try writer.writeByte(',');
+                count += 1;
+                try write_tool_image_follow_up(writer, alloc, message, tool_images);
+            }
+        }
     };
     try writer.writeByte(']');
     if (functions.len != 0) {
@@ -1764,6 +1885,100 @@ test "chat completions tool choice controls and deliberate basic option mapping"
     defer required.deinit();
     try test_accept(&required, test_text);
     try std.testing.expectError(error.RequiredToolMissing, test_finish(&required, test_stop));
+}
+
+test "chat completions serializes retained tool images as a follow up user message" {
+    const alloc = std.testing.allocator;
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("aGVsbG8"), .mime_type = @constCast("image/png") }};
+    var request = test_tool_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = null, .tool_calls = &.{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }} },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "image attached", .tool_result_memory = .{ .tool_images = &tool_images } },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const tool_message = messages[messages.len - 2].object;
+    try std.testing.expectEqualStrings("tool", tool_message.get("role").?.string);
+    try std.testing.expectEqualStrings("image attached", tool_message.get("content").?.string);
+    const follow_up = messages[messages.len - 1].object;
+    try std.testing.expectEqualStrings("user", follow_up.get("role").?.string);
+    const parts = follow_up.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
+    try std.testing.expect(std.mem.find(u8, parts[0].object.get("text").?.string, "read_file") != null);
+    const image_part = parts[1].object;
+    try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,aGVsbG8", image_part.get("image_url").?.object.get("url").?.string);
+}
+
+test "chat completions withholds images from denied tool results" {
+    const alloc = std.testing.allocator;
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("aGVsbG8"), .mime_type = @constCast("image/png") }};
+    var request = test_tool_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = null, .tool_calls = &.{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }} },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"user_denied\"}}", .tool_result_status = .failure, .tool_result_memory = .{ .tool_images = &tool_images } },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    // two instructions + user + assistant + tool — no image follow-up for a denied call.
+    try std.testing.expectEqual(@as(usize, 5), messages.len);
+    for (messages) |message| {
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            const part_type = part.object.get("type") orelse continue;
+            try std.testing.expect(!std.mem.eql(u8, part_type.string, "image_url"));
+        }
+    }
+}
+
+test "chat completions serializes user message images as content parts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const png_size = try std.base64.standard.Decoder.calcSizeForSlice(png_b64);
+    const png = try alloc.alloc(u8, png_size);
+    defer alloc.free(png);
+    try std.base64.standard.Decoder.decode(png, png_b64);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pixel.png", .data = png });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const abs = try io_mod.dirRealpathAlloc(arena, tmp.dir, "pixel.png");
+    const snapshot_dir = std.fs.path.dirname(abs).?;
+    var attachment: types.ImageAttachment = .{
+        .id = 1,
+        .path = try arena.dupe(u8, abs),
+        .media_type = try arena.dupe(u8, "image/png"),
+    };
+    try image_attachments.captureImageSnapshot(arena, &attachment, snapshot_dir);
+
+    var request = test_request();
+    request.messages = &.{.{ .role = .user, .content = "what is this", .images = &.{attachment} }};
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const user = messages[messages.len - 1].object;
+    const parts = user.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("what is this", parts[0].object.get("text").?.string);
+    const image_part = parts[1].object;
+    try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, image_part.get("image_url").?.object.get("url").?.string, "data:image/png;base64,"));
 }
 
 test "chat completions rejects unsupported requests and ambiguous selection" {
