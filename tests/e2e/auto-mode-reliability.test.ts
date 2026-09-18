@@ -404,6 +404,44 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a transient reviewer transport failure retries once and clears",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "review-retried.txt");
+      const gateway = startGateway(
+        [
+          commandCall(`printf 'ran\\n' > ${JSON.stringify(marker)}`, "needs_review"),
+          fakeGatewayFinalText("review recovered"),
+        ],
+        [
+          new Response("classifier upstream unavailable", { status: 500 }),
+          fakeGatewayPermissionDecision("clear", "retry_clear"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the review retry probe."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, result.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("ran\n");
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
     "configured wildcard commands cannot absorb shell operators or substitutions",
     async () => {
       const root = createIsolatedRoot();
@@ -1827,7 +1865,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "repeated exact unavailable reviews are attempted once without blocking a safe replan",
+    "an unavailable review retries transport once per attempt without blocking a safe replan",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "repeated-unavailable-must-not-run");
@@ -1849,6 +1887,7 @@ describe("lean auto mode reliability", () => {
         ],
         [
           () => new Response("reviewer unavailable", { status: 502 }),
+          () => new Response("reviewer unavailable", { status: 502 }),
           fakeGatewayPermissionDecision("clear", "must_not_retry_reviewer"),
         ],
       );
@@ -1869,11 +1908,13 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(existsSync(marker)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      // One review attempt: a first send plus one transport retry.
+      expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace).toContain("fallback_reason=transport_transient");
     },
     TIMEOUT,
