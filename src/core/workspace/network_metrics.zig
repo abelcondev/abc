@@ -194,11 +194,15 @@ pub fn snapshotTurnRollups(out: []TurnRollup) usize {
     defer mutex.unlock(zio);
     var all: [turn_rollup_capacity]TurnRollup = turn_rollups;
     const count = turn_rollup_count;
-    std.mem.sort(TurnRollup, all[0..count], {}, struct {
-        fn lessThan(_: void, a: TurnRollup, b: TurnRollup) bool {
-            return a.turn_id < b.turn_id;
+    var index: usize = 1;
+    while (index < count) : (index += 1) {
+        const candidate = all[index];
+        var insertion = index;
+        while (insertion > 0 and candidate.turn_id < all[insertion - 1].turn_id) : (insertion -= 1) {
+            all[insertion] = all[insertion - 1];
         }
-    }.lessThan);
+        all[insertion] = candidate;
+    }
     const n = @min(count, out.len);
     @memcpy(out[0..n], all[count - n .. count]);
     return n;
@@ -314,7 +318,16 @@ test "turn rollups aggregate per turn and evict the coldest turn" {
         try std.testing.expect(rollup.turn_id != 2);
         try std.testing.expect(rollup.turn_id != 9);
     }
+    for (out[1..m], 1..) |rollup, index| {
+        try std.testing.expect(out[index - 1].turn_id < rollup.turn_id);
+    }
     try std.testing.expectEqual(@as(u64, 2), lifetimeStats().evicted_turns);
+
+    var recent: [3]TurnRollup = undefined;
+    try std.testing.expectEqual(@as(usize, recent.len), snapshotTurnRollups(&recent));
+    try std.testing.expectEqual(@as(u64, 113), recent[0].turn_id);
+    try std.testing.expectEqual(@as(u64, 114), recent[1].turn_id);
+    try std.testing.expectEqual(@as(u64, 115), recent[2].turn_id);
 }
 
 test "snapshot truncates to caller buffer" {
