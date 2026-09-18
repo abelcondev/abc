@@ -34,6 +34,9 @@ pub const Profile = struct {
     operators: []const u8 = &.{},
     /// `$name`-style variables take the keyword color.
     dollar_vars: bool = false,
+    /// A dash at a word boundary opens a flag token (`-n`, `--json`) in the
+    /// number color.
+    dash_flags: bool = false,
     keywords: []const []const u8 = &.{},
     literals: []const []const u8 = &.{},
     keyword_case: KeywordCase = .sensitive,
@@ -76,6 +79,7 @@ const profiles = [_]Profile{
         .quotes = shell_quotes,
         .operators = "&|;<>",
         .dollar_vars = true,
+        .dash_flags = true,
         .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return", "echo", "printf", "cd", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "grep", "sed", "awk", "find", "xargs", "chmod", "git", "curl", "wget", "jq" },
         .literals = &.{ "true", "false", "null" },
         .detection = .shell_shebang,
