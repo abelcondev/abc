@@ -30,6 +30,10 @@ pub const Profile = struct {
     line_comments: []const []const u8 = &.{},
     block_comment: ?BlockComment = null,
     quotes: []const u8 = &.{},
+    /// Characters colored as operator runs in the keyword color.
+    operators: []const u8 = &.{},
+    /// `$name`-style variables take the keyword color.
+    dollar_vars: bool = false,
     keywords: []const []const u8 = &.{},
     literals: []const []const u8 = &.{},
     keyword_case: KeywordCase = .sensitive,
@@ -70,6 +74,8 @@ const profiles = [_]Profile{
         .aliases = &.{ "sh", "bash", "zsh", "shell" },
         .line_comments = &.{"#"},
         .quotes = shell_quotes,
+        .operators = "&|;<>",
+        .dollar_vars = true,
         .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return", "echo", "printf", "cd", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "grep", "sed", "awk", "find", "xargs", "chmod", "git", "curl", "wget", "jq" },
         .literals = &.{ "true", "false", "null" },
         .detection = .shell_shebang,

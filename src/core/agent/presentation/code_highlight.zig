@@ -75,12 +75,28 @@ pub fn highlight(
             index = end;
             continue;
         }
+        if (profile.dollar_vars and source[index] == '$') {
+            if (dollarVarEnd(source, index)) |end| {
+                try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+                index = end;
+                continue;
+            }
+        }
+        if (isOperatorChar(source[index], profile.operators)) {
+            const end = operatorRunEnd(source, index, profile.operators);
+            try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+            index = end;
+            continue;
+        }
         if (isIdentifierStart(source[index])) {
             const end = identifierEnd(source, index);
             const token = source[index..end];
-            if (inList(token, profile.keywords, profile.keyword_case)) {
+            // A word glued to a path separator is a path segment, not syntax:
+            // /dev/null keeps "null" plain.
+            const after_separator = index > 0 and source[index - 1] == '/';
+            if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.keyword_style, token, base);
-            } else if (inList(token, profile.literals, profile.keyword_case)) {
+            } else if (!after_separator and inList(token, profile.literals, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.number_style, token, base);
             } else {
                 try styled.appendSlice(alloc, token);
@@ -142,7 +158,14 @@ fn quotedEnd(source: []const u8, start: usize) usize {
 }
 
 fn isNumberStart(source: []const u8, index: usize) bool {
-    return std.ascii.isDigit(source[index]) and (index == 0 or !isIdentifierContinue(source[index - 1]));
+    if (!std.ascii.isDigit(source[index])) return false;
+    if (index == 0) return true;
+    const prev = source[index - 1];
+    if (isIdentifierContinue(prev)) return false;
+    // A digit run glued to a word by a dash is a name segment, not a number:
+    // paths like build-20260918 stay plain while flags like -80 still color.
+    if (prev == '-' and index >= 2 and isIdentifierContinue(source[index - 2])) return false;
+    return true;
 }
 
 fn numberEnd(source: []const u8, start: usize) usize {
@@ -153,6 +176,31 @@ fn numberEnd(source: []const u8, start: usize) usize {
 
 fn isIdentifierStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_' or byte == '$';
+}
+
+fn isOperatorChar(byte: u8, operators: []const u8) bool {
+    return std.mem.findScalar(u8, operators, byte) != null;
+}
+
+fn operatorRunEnd(source: []const u8, start: usize, operators: []const u8) usize {
+    var end = start;
+    while (end < source.len and isOperatorChar(source[end], operators)) end += 1;
+    return end;
+}
+
+/// "$" opens a variable when a name, positional digit, or special parameter
+/// follows; a bare "$" stays plain text.
+fn dollarVarEnd(source: []const u8, start: usize) ?usize {
+    const next = start + 1;
+    if (next >= source.len) return null;
+    const b = source[next];
+    if (std.ascii.isAlphabetic(b) or b == '_') {
+        var end = next;
+        while (end < source.len and isIdentifierContinue(source[end])) end += 1;
+        return end;
+    }
+    if (std.ascii.isDigit(b) or std.mem.findScalar(u8, "?#@*!$", b) != null) return next + 1;
+    return null;
 }
 
 fn isIdentifierContinue(byte: u8) bool {
@@ -350,4 +398,43 @@ test "a theme with syntax disabled passes the source through" {
     const with_base = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, "<base>");
     defer alloc.free(with_base);
     try std.testing.expectEqualStrings("<base>echo 'hi there' 42", with_base);
+}
+
+test "shell operators and variables take the keyword color" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "cd /tmp && echo $HOME | head -2 > out; echo $? # done", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m>\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
+    // Comments and numbers keep their own colors; a $ inside quotes stays string.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+
+    const quoted = try highlight(alloc, "echo '$HOME'", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(quoted);
+    try std.testing.expect(std.mem.indexOf(u8, quoted, "\x1b[38;5;250m'$HOME'\x1b[39m") != null);
+
+    // Other languages do not pick up shell operators.
+    const zig_src = try highlight(alloc, "a < b", languages.resolve("zig").?, .dark, null);
+    defer alloc.free(zig_src);
+    try std.testing.expectEqualStrings("a < b", zig_src);
+}
+
+test "digit runs glued to words by a dash stay plain" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "cd build-20260918 && head -80 2>/dev/null", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    // The date suffix in the path is a name segment and keeps the plain text,
+    // as does the literal-looking "null" in /dev/null.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "build-20260918") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "/dev/null") != null);
+    // The numeric flags and the redirect fd still color.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m80\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
 }
