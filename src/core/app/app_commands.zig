@@ -2841,7 +2841,7 @@ fn lastInterruptedTurn(items: []const types.HistoryTurn) ?types.InterruptedHisto
 const trace_tool_args_max_bytes: usize = 1200;
 
 fn networkCallIsError(call: diagnostics.NetworkCall) bool {
-    return call.errorName().len > 0 or (call.status != 0 and call.status >= 400);
+    return call.isError();
 }
 
 fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall) !void {
@@ -2887,8 +2887,51 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
     const avg_ms: u64 = if (n > 0) total_ms / n else 0;
 
     try writer.print("\n## Network Calls\nlast={d} ok={d} errors={d} avg={d}ms min={d}ms max={d}ms\n", .{ n, ok_count, error_count, avg_ms, min_ms, max_ms });
+    try writeNetworkSessionTotals(writer, buf[0..n]);
     for (buf[0..n]) |call| {
         try writeNetworkCallCompact(writer, call);
+    }
+}
+
+/// Renders session-wide totals, the per-turn model-call rollup, and an
+/// explicit coverage statement so a shared trace cannot be misread as
+/// describing the whole session when the ring has already evicted history.
+fn writeNetworkSessionTotals(writer: *std.Io.Writer, window: []const diagnostics.NetworkCall) !void {
+    const lifetime = diagnostics.networkLifetimeStats();
+    try writer.print(
+        "session: calls={d} ok={d} errors={d} total_time={d}s\n",
+        .{ lifetime.total_calls, lifetime.ok_calls, lifetime.error_calls, lifetime.total_duration_ms / 1000 },
+    );
+    if (window.len > 0 and lifetime.total_calls > window.len) {
+        try writer.print(
+            "coverage: window holds only the last {d} of {d} calls, oldest retained ",
+            .{ window.len, lifetime.total_calls },
+        );
+        try writeTraceTimestampUtc(writer, window[0].started_at_ms);
+        try writer.writeAll("; run with FX_TRACE_LOG for a complete transport record\n");
+    } else {
+        try writer.writeAll("coverage: complete (window holds every recorded call)\n");
+    }
+
+    var rollups: [diagnostics.network_turn_rollup_capacity]diagnostics.NetworkTurnRollup = undefined;
+    const rollup_n = diagnostics.snapshotNetworkTurnRollups(&rollups);
+    if (rollup_n == 0) return;
+    if (lifetime.evicted_turns > 0) {
+        try writer.print("turns: most recent {d} shown, {d} older evicted\n", .{ rollup_n, lifetime.evicted_turns });
+    } else {
+        try writer.writeAll("turns:\n");
+    }
+    for (rollups[0..rollup_n]) |rollup| {
+        try writer.print(
+            "  turn {d}: calls={d} errors={d} total_time={d}s",
+            .{ rollup.turn_id, rollup.calls, rollup.error_calls, rollup.total_duration_ms / 1000 },
+        );
+        if (rollup.subagent_calls > 0) try writer.print(" subagent_calls={d}", .{rollup.subagent_calls});
+        if (rollup.first_started_at_ms > 0) {
+            try writer.writeAll(" started ");
+            try writeTraceTimestampUtc(writer, rollup.first_started_at_ms);
+        }
+        try writer.writeByte('\n');
     }
 }
 
@@ -3072,6 +3115,27 @@ noinline fn writeToolCallsSummary(
             "last={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total={d}ms\n",
             .{ n, succeeded_count, rejected_count, command_failed_count, tool_failed_count, runtime_failed_count, total_ms },
         );
+        const lifetime = diagnostics.toolCallLifetimeStats();
+        try writer.print(
+            "session: calls={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total_time={d}s\n",
+            .{
+                lifetime.total_calls,
+                lifetime.countFor(.succeeded),
+                lifetime.countFor(.rejected),
+                lifetime.countFor(.command_failed),
+                lifetime.countFor(.tool_failed),
+                lifetime.countFor(.runtime_failed),
+                lifetime.total_duration_ms / 1000,
+            },
+        );
+        if (lifetime.total_calls > n) {
+            try writer.print(
+                "coverage: window holds only the last {d} of {d} tool calls; full results persist in the session directory\n",
+                .{ n, lifetime.total_calls },
+            );
+        } else {
+            try writer.writeAll("coverage: complete (window holds every recorded tool call)\n");
+        }
         if (succeeded_count != n) {
             try writer.writeAll("non-successes first:\n");
             for (buf[0..n]) |call| {
@@ -4463,8 +4527,8 @@ test "trace compaction summary renders recorded events without file tracing" {
     try writeCompactionSummary(&empty.writer, alloc);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
 
-    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, "decision", "decision=compact estimated_tokens={d}", .{279466});
-    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, "retention_exhausted", "estimated_tokens={d}", .{59000});
+    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
+    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4475,7 +4539,7 @@ test "trace compaction summary renders recorded events without file tracing" {
 
     diagnostics.resetForTest();
     for (0..diagnostics.compaction_ring_capacity + 3) |index| {
-        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, "decision", "decision=compact index={d}", .{index});
+        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
     }
     var wrapped: std.Io.Writer.Allocating = .init(alloc);
     defer wrapped.deinit();
@@ -4496,10 +4560,10 @@ test "trace model catalog summary and problems render recorded events" {
     try writeModelCatalogSummary(&empty.writer, &stub);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Model Catalog\n(no catalog events recorded)\n") != null);
 
-    diagnostics.recordModelCatalogEvent(true, "load", "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
-    diagnostics.recordModelCatalogEvent(true, "lookup", "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
-    diagnostics.recordModelCatalogEvent(false, "load", "outcome=ready entries={d}", .{41});
-    diagnostics.recordModelCatalogEvent(true, "image_gate", "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    diagnostics.recordModelCatalogEvent(true, .lookup, "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d}", .{41});
+    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4956,6 +5020,99 @@ test "trace renders gateway schema diagnostics without raw payload content" {
     try std.testing.expect(std.mem.find(u8, text, "gateway_schema=\"path=prompt.0.content expected=string received=array\"") != null);
     try std.testing.expect(std.mem.find(u8, text, "request_shape=\"bytes=123 prompt_count=1 prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
+}
+
+test "trace network section reports session totals and window coverage" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // More calls than the ring holds so the coverage line must admit eviction.
+    var i: u64 = 0;
+    while (i < diagnostics.network_ring_capacity + 2) : (i += 1) {
+        var call: diagnostics.NetworkCall = .{
+            .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 1_000,
+            .duration_ms = 100,
+            .status = if (i == 0) 500 else 200,
+            .turn_id = if (i < 2) 1 else 2,
+        };
+        call.setModel("openai/gpt-5.6-sol");
+        diagnostics.recordNetworkCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    const total = diagnostics.network_ring_capacity + 2;
+    var expect_buf: [160]u8 = undefined;
+    const session_line = try std.fmt.bufPrint(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
+    try std.testing.expect(std.mem.find(u8, text, session_line) != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turns:\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn 1: calls=2 errors=1") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn 2: calls=32 errors=0") != null);
+}
+
+test "trace network section states complete coverage when nothing was evicted" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 5_000, .duration_ms = 10, .status = 200, .turn_id = 3 });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "session: calls=1 ok=1 errors=0") != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: complete") != null);
+}
+
+test "trace tool section reports session totals and window coverage" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // More calls than the ring holds so the coverage line must admit eviction.
+    var i: u64 = 0;
+    while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
+        var call: diagnostics.ToolCallMetric = .{
+            .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
+            .duration_ms = 50,
+            .outcome = if (i == 0) .rejected else .succeeded,
+        };
+        call.setName("shell");
+        diagnostics.recordToolCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const history: []const types.HistoryTurn = &.{};
+    try writeToolCallsSummary(&out.writer, alloc, history);
+    const text = out.written();
+
+    const total = diagnostics.tool_call_ring_capacity + 2;
+    var expect_buf: [200]u8 = undefined;
+    const session_line = try std.fmt.bufPrint(
+        &expect_buf,
+        "session: calls={d} succeeded={d} rejected=1 command_failed=0 tool_failed=0 runtime_failed=0",
+        .{ total, total - 1 },
+    );
+    try std.testing.expect(std.mem.find(u8, text, session_line) != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
+
+    // Ring-complete sessions state full coverage instead.
+    diagnostics.resetForTest();
+    var ok_call: diagnostics.ToolCallMetric = .{ .started_at_ms = 9_000, .duration_ms = 5, .outcome = .succeeded };
+    ok_call.setName("read_file");
+    diagnostics.recordToolCall(ok_call);
+    var fresh: std.Io.Writer.Allocating = .init(alloc);
+    defer fresh.deinit();
+    try writeToolCallsSummary(&fresh.writer, alloc, history);
+    try std.testing.expect(std.mem.find(u8, fresh.written(), "coverage: complete") != null);
 }
 
 test "app_commands exposes active handler API surface" {

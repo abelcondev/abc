@@ -580,7 +580,8 @@ test "possibly sent automatic reviewer failure marks billing incomplete" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    // The transient failure is retried once, so two possibly-sent attempts settle.
+    try std.testing.expectEqual(@as(u64, 2), snapshot.settled_through_sequence);
 }
 
 test "terminal checkpoint failure releases automatic reviewer stream" {
@@ -623,7 +624,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
     try std.testing.expectEqual(@as(usize, 2), checkpoint.calls);
 }
 
-test "permission reviewer owns a single-send budget" {
+test "permission reviewer retries one transport failure with a fresh deadline" {
     var fake = FakeStream{ .outcomes = &.{ .transient_error, .malformed } };
     const config = testConfig(&fake, null);
     const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), reviewer_model);
@@ -632,10 +633,12 @@ test "permission reviewer owns a single-send budget" {
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(outcome),
     );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    // One transport retry, then one malformed-completion retry.
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
     try std.testing.expect(fake.deadlines[0] != null);
-    try std.testing.expect(fake.deadlines[1] == null);
+    try std.testing.expect(fake.deadlines[1] != null);
+    try std.testing.expect(fake.deadlines[1].?.raw.nanoseconds > fake.deadlines[0].?.raw.nanoseconds);
 }
 
 test "gateway automatic reviewer distinguishes transient and permanent HTTP failures" {
@@ -643,15 +646,16 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
     const transient_config = testConfig(&transient_fake, null);
     var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest(), reviewer_model);
     defer transient.deinit(std.testing.allocator);
+    // Transient failures retry once and can recover.
     try std.testing.expectEqual(
-        std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
+        std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
         std.meta.activeTag(transient),
     );
     try std.testing.expectEqual(
-        permission_auto_classifier.InvalidReason.transport_transient,
-        transient.invalid,
+        permission_auto_classifier.Decision.clear,
+        transient.valid.decision,
     );
-    try std.testing.expectEqual(@as(usize, 1), transient_fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), transient_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_http, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);
@@ -717,7 +721,8 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
         permission_auto_classifier.InvalidReason.transport_timed_out,
         timed_out.invalid,
     );
-    try std.testing.expectEqual(@as(usize, 1), timeout_fake.calls);
+    // The timeout is retried once before the review is declared unavailable.
+    try std.testing.expectEqual(@as(usize, 2), timeout_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_error, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);

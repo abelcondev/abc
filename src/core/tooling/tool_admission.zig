@@ -1313,7 +1313,7 @@ fn requestPermissionOutcomeResolved(
     const permission_name = try permissionNameForCall(input, arena, call);
     const target_kind = try permissionTargetKindForCall(input, arena, call);
     var targets = permissionTargetsForCall(input, arena, call) catch |err| {
-        if (try permissionTargetResolutionFailureMessage(arena, call.name, err)) |failure| {
+        if (try permissionTargetResolutionFailureMessage(arena, call, err)) |failure| {
             return .{ .tool_failure = failure };
         }
         return err;
@@ -2391,29 +2391,57 @@ fn noninteractivePermissionRequired(call: ToolCall, reason: []const u8) ToolPerm
 
 pub fn permissionTargetResolutionFailureMessage(
     arena: Allocator,
-    tool_name: []const u8,
+    call: ToolCall,
     err: anyerror,
 ) !?[]const u8 {
-    return switch (err) {
-        error.PathOutsideWorkspace,
-        error.FileNotFound,
-        error.NotDir,
+    const reason: ?[]const u8 = switch (err) {
+        error.FileNotFound => "Path not found",
+        error.NotDir => "Path is not a directory",
+        error.AccessDenied, error.PermissionDenied => "Access denied for path",
+        error.PathOutsideWorkspace => "Path is outside the workspace",
         error.SymLinkLoop,
-        error.AccessDenied,
-        error.PermissionDenied,
         error.NameTooLong,
         error.BadPathName,
         error.InputOutput,
         error.HomeNotSet,
         error.InvalidPath,
         error.WorkspaceUnavailable,
-        => try std.fmt.allocPrint(
-            arena,
-            "Permission target resolution failed for {s}: {s}",
-            .{ tool_name, @errorName(err) },
-        ),
-        else => null,
+        => null,
+        else => return null,
     };
+    const path_arg = try targetPathForFailureMessage(arena, call);
+    if (reason) |text| {
+        return if (path_arg) |path|
+            try std.fmt.allocPrint(arena, "{s}: {s}", .{ text, path })
+        else
+            try arena.dupe(u8, text);
+    }
+    return if (path_arg) |path|
+        try std.fmt.allocPrint(arena, "Cannot resolve path \"{s}\": {s}", .{ path, @errorName(err) })
+    else
+        try std.fmt.allocPrint(arena, "Cannot resolve tool target path: {s}", .{@errorName(err)});
+}
+
+/// Best-effort extraction of the path the caller asked for, so the failure
+/// names the exact argument the model can correct. Falls back to no path when
+/// the arguments do not carry one; the base message still applies. File tools
+/// resolve their `path` argument, command tools resolve `cwd`; each prefers
+/// its own key so a stray extra key cannot misname the argument that failed.
+fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const is_file_tool = permissions.allowsExternalPath(call.name);
+    const primary_key: []const u8 = if (is_file_tool) "path" else "cwd";
+    const secondary_key: []const u8 = if (is_file_tool) "cwd" else "path";
+    if (tool_args.optionalStringArg(args, primary_key)) |primary| {
+        if (primary.len > 0) return primary;
+    }
+    if (tool_args.optionalStringArg(args, secondary_key)) |secondary| {
+        if (secondary.len > 0) return secondary;
+    }
+    return null;
 }
 
 fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !permissions.PermissionCallTargets {
@@ -2543,23 +2571,73 @@ fn isAvailableDynamicTool(input: Input, name: []const u8) bool {
 }
 
 test "permission target resolution reports a missing home" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     const failure = (try permissionTargetResolutionFailureMessage(
-        std.testing.allocator,
-        "read_file",
+        arena,
+        .{ .id = "read_missing_home", .name = "read_file", .arguments_json = "{\"path\":\"~/missing\"}" },
         error.HomeNotSet,
     )).?;
-    defer std.testing.allocator.free(failure);
     try std.testing.expect(std.mem.find(u8, failure, "HomeNotSet") != null);
+    try std.testing.expect(std.mem.find(u8, failure, "~/missing") != null);
 }
 
-test "permission target failures preserve filesystem causes without hiding runtime errors" {
-    for ([_]anyerror{ error.FileNotFound, error.NotDir, error.SymLinkLoop, error.AccessDenied, error.PermissionDenied, error.NameTooLong }) |err| {
-        const failure = (try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err)) orelse return error.TestExpectedToolFailure;
-        defer std.testing.allocator.free(failure);
-        try std.testing.expect(std.mem.find(u8, failure, @errorName(err)) != null);
+test "permission target failures name the unresolved path without hiding runtime errors" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "grep_missing",
+        .name = "grep_files",
+        .arguments_json = "{\"pattern\":\"x\",\"path\":\"missing/dir\"}",
+    };
+    const not_found = (try permissionTargetResolutionFailureMessage(arena, call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: missing/dir", not_found);
+
+    const arm_cases = [_]struct { err: anyerror, expected: []const u8 }{
+        .{ .err = error.NotDir, .expected = "Path is not a directory: missing/dir" },
+        .{ .err = error.AccessDenied, .expected = "Access denied for path: missing/dir" },
+        .{ .err = error.PermissionDenied, .expected = "Access denied for path: missing/dir" },
+        .{ .err = error.PathOutsideWorkspace, .expected = "Path is outside the workspace: missing/dir" },
+        .{ .err = error.SymLinkLoop, .expected = "Cannot resolve path \"missing/dir\": SymLinkLoop" },
+        .{ .err = error.NameTooLong, .expected = "Cannot resolve path \"missing/dir\": NameTooLong" },
+    };
+    for (arm_cases) |case| {
+        const failure = (try permissionTargetResolutionFailureMessage(arena, call, case.err)) orelse return error.TestExpectedToolFailure;
+        try std.testing.expectEqualStrings(case.expected, failure);
     }
+
+    const command_call: ToolCall = .{
+        .id = "command_missing_cwd",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"ls\",\"cwd\":\"gone/dir\"}",
+    };
+    const cwd_failure = (try permissionTargetResolutionFailureMessage(arena, command_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: gone/dir", cwd_failure);
+
+    const mixed_command_call: ToolCall = .{
+        .id = "command_both_keys",
+        .name = "shell",
+        .arguments_json = "{\"command\":\"ls\",\"path\":\"decoy\",\"cwd\":\"gone/dir\"}",
+    };
+    const mixed_command_failure = (try permissionTargetResolutionFailureMessage(arena, mixed_command_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: gone/dir", mixed_command_failure);
+
+    const mixed_file_call: ToolCall = .{
+        .id = "file_both_keys",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"missing/dir\",\"cwd\":\"decoy\"}",
+    };
+    const mixed_file_failure = (try permissionTargetResolutionFailureMessage(arena, mixed_file_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: missing/dir", mixed_file_failure);
+
+    const no_path_call: ToolCall = .{ .id = "no_path", .name = "grep_files", .arguments_json = "{\"pattern\":\"x\"}" };
+    const bare_failure = (try permissionTargetResolutionFailureMessage(arena, no_path_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found", bare_failure);
+
     for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.HostAuthorityUnavailable }) |err| {
-        try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(std.testing.allocator, "grep_files", err));
+        try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(arena, call, err));
     }
 }
 

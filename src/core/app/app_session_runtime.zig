@@ -2108,6 +2108,36 @@ pub fn Runtime(comptime App: type) type {
             return openSessionPickerWithScope(app, .current_workspace);
         }
 
+        /// Warms the session catalog in the background right after interactive
+        /// startup, so the first picker open can paint from memory instead of
+        /// waiting for a scan. Runs only when a persisted catalog exists: a
+        /// profile that has never listed sessions has nothing worth warming.
+        /// A picker opened while the preload is in flight adopts that scan as
+        /// its own; the completed scan lands in the in-memory catalog cache
+        /// through the ordinary poll path.
+        pub fn preloadSessionCatalog(app: *App) void {
+            const persistence = &app.session_persistence;
+            if (persistence.session_picker.active) return;
+            const loader = &persistence.session_picker_load;
+            if (loader.task != null or loader.pending != null) return;
+            const store = if (persistence.store) |*value| value else return;
+            if (!session_catalog_cache.catalogFileExists(store.canonical_root.sessions)) return;
+            const active_id = if (persistence.writable) |*loaded| loaded.active_id else null;
+            const cache = &persistence.session_picker_cache;
+            if (cache.matches(active_id) and cache.isFresh()) return;
+            const request = SessionPickerLoad.PageRequest.init(
+                loader.allocateGeneration(),
+                active_id,
+            ) catch return;
+            loader.schedule(store, request) catch |err| {
+                debug_trace.logf(
+                    "core",
+                    "session catalog preload unavailable err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+
         pub fn openAllSessionPicker(app: *App) !void {
             return openSessionPickerWithScope(app, .all_workspaces);
         }
@@ -2446,7 +2476,7 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
                 turn,
-                .strict,
+                .finished_prompt,
                 finished.snapshot_file_ownership,
             );
         }
@@ -2634,6 +2664,11 @@ pub fn Runtime(comptime App: type) type {
         const AppendHistoryMode = enum {
             strict,
             visual_epoch,
+            /// A rendered, user-visible finished turn. A validation or commit
+            /// failure must not take the session down: commit in memory, warn,
+            /// and keep the process alive. `SessionPersistenceUncertain` still
+            /// propagates, because the write may have partially landed.
+            finished_prompt,
         };
 
         fn appendHistoryTurnWithPendingPresentation(
@@ -2758,7 +2793,9 @@ pub fn Runtime(comptime App: type) type {
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
                 return switch (mode) {
-                    .strict => err,
+                    // In-memory preparation failure (out of memory) cannot be
+                    // degraded: the in-memory commit needs the prepared copy.
+                    .strict, .finished_prompt => err,
                     .visual_epoch => .uncommitted,
                 };
             };
@@ -2796,34 +2833,56 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const first_work = app.session_persistence.remember_fresh_session and !hasDurableUserWork(loaded);
-            try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            _ = loaded.appendEvent(
-                app.alloc,
-                .{ .history_turn_committed = .{
-                    .conversation_language = app.session.languageSnapshot(),
-                    .total_input_tokens = app.total_input_tokens,
-                    .total_output_tokens = app.total_output_tokens,
-                    .turn = prepared,
-                } },
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                if (err == error.SessionPersistenceUncertain) {
-                    if (snapshot_file_ownership) |ownership| ownership.transfer();
-                    return err;
-                }
-                return switch (mode) {
-                    .strict => err,
-                    .visual_epoch => blk: {
-                        debug_trace.logf(
-                            "session",
-                            "visual epoch history not committed err={s}",
-                            .{@errorName(err)},
-                        );
-                        break :blk .uncommitted;
-                    },
-                };
+            var persistence_failure: ?anyerror = null;
+            loaded.prepareHistoryTurnForCommit(app.alloc, &prepared) catch |err| {
+                if (mode == .finished_prompt and err != error.SessionPersistenceUncertain) {
+                    persistence_failure = err;
+                } else return err;
             };
-            if (first_work) {
+            if (persistence_failure == null) {
+                _ = loaded.appendEvent(
+                    app.alloc,
+                    .{ .history_turn_committed = .{
+                        .conversation_language = app.session.languageSnapshot(),
+                        .total_input_tokens = app.total_input_tokens,
+                        .total_output_tokens = app.total_output_tokens,
+                        .turn = prepared,
+                    } },
+                    io_mod.milliTimestamp(),
+                ) catch |err| {
+                    if (err == error.SessionPersistenceUncertain) {
+                        if (snapshot_file_ownership) |ownership| ownership.transfer();
+                        return err;
+                    }
+                    switch (mode) {
+                        .strict => return err,
+                        .visual_epoch => {
+                            debug_trace.logf(
+                                "session",
+                                "visual epoch history not committed err={s}",
+                                .{@errorName(err)},
+                            );
+                            return .uncommitted;
+                        },
+                        .finished_prompt => persistence_failure = err,
+                    }
+                };
+            }
+            if (persistence_failure) |err| {
+                // The turn already rendered. Keep the session alive and coherent
+                // in memory, record the failure for shutdown reporting, and warn
+                // instead of taking the process down.
+                recordShutdownFailure(app, err);
+                if (comptime @hasDecl(App, "writeDomainNotice")) {
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                        .{@errorName(err)},
+                    );
+                    defer app.alloc.free(body);
+                    app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                }
+            } else if (first_work) {
                 app.session_persistence.remember_fresh_session = false;
                 remember_failure = rememberSession(app, loaded.active_id);
             }
@@ -9677,6 +9736,80 @@ test "appendFinishedPrompt does not transfer snapshot ownership when history ins
     try std.testing.expectEqual(@as(usize, 0), probe.transfers);
 }
 
+test "appendFinishedPrompt keeps the session alive when the turn cannot be saved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // A finished turn whose file evidence carries an empty path: the
+    // conversation validator rejects the write with InvalidConversationEvent.
+    var evidence = [_]types.FileEvidence{.{
+        .path = @constCast(""),
+        .tool_call_id = @constCast("call_poison"),
+        .tool_name = @constCast("grep_files"),
+        .action = .search,
+        .status = .success,
+    }};
+    const poisoned = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("done"),
+        .execution = .{ .files = evidence[0..] },
+    } };
+
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = poisoned });
+
+    // The turn stays in memory and the process keeps running.
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    // The failure is latched for shutdown reporting.
+    try std.testing.expectEqual(
+        @as(?anyerror, error.InvalidConversationEvent),
+        app.session_persistence.shutdown_failure,
+    );
+    // The user sees a warning instead of a disappearing process.
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, app.notices.items[0], "could not save") != null);
+
+    // Nothing of the rejected turn reached the journal.
+    {
+        var loaded = try app.session_persistence.store.?.loadReadOnly(
+            alloc,
+            app.session_persistence.writable.?.active_id,
+        );
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), loaded.history.len);
+    }
+
+    // A later clean turn still persists; the writer is not latched shut.
+    const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
+    defer session_runtime.freeHistoryTurn(alloc, clean);
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = clean });
+
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    var loaded = try app.session_persistence.store.?.loadReadOnly(
+        alloc,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try std.testing.expectEqualStrings("next", loaded.history[0].assistant.user.text);
+}
+
 test "visual epoch history append reports committed without persistence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -10177,6 +10310,125 @@ test "session picker cold open paints the persisted catalog before revalidation"
     // Revalidation scheduling is best-effort: thread spawn can fail under
     // load, so the scheduling contract is covered by the not-fresh state and
     // the loading-state tests rather than by observing the task handle here.
+}
+
+test "session catalog preload feeds the picker open without a second scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history = [_]session_runtime.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    try writeSessionFixture(alloc, app.session_persistence.store.?, "preloaded-session", &history, 0);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // The preload only runs for picker-known profiles: seed the persisted
+    // catalog once, as a previous picker open would.
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
+
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    const loader = &app.session_persistence.session_picker_load;
+    const preloaded = loader.task orelse return error.TestExpectedEqual;
+
+    // A picker opened mid-preload adopts the in-flight scan instead of
+    // scheduling a second one.
+    try Runtime(TestApp).openSessionPicker(&app);
+    try std.testing.expect(loader.task == preloaded);
+    try std.testing.expectEqual(
+        preloaded.request.generation,
+        app.session_persistence.session_picker.generation,
+    );
+
+    // The picker may already read ready from the persisted catalog, so drain
+    // the loader rather than the load state: the preload is installed into the
+    // in-memory catalog only through the poll path.
+    try waitForSessionPickerPrewarm(&app);
+    const picker = &app.session_persistence.session_picker;
+    try std.testing.expectEqual(.ready, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqualStrings("preloaded-session", picker.summaries.items[0].id);
+
+    // Once the preload lands, a reopen within the freshness window paints from
+    // memory and schedules nothing.
+    Runtime(TestApp).cancelSessionPicker(&app);
+    try Runtime(TestApp).openSessionPicker(&app);
+    try std.testing.expectEqual(.ready, picker.load_state);
+    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expect(loader.task == null);
+    try std.testing.expect(loader.pending == null);
+}
+
+test "session catalog preload is best-effort and never duplicates an in-flight scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    // Without a session store there is nothing to scan; preload is a no-op.
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // A profile that has never listed sessions has no catalog to warm; the
+    // preload stays off until one exists.
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
+
+    const store = app.session_persistence.store.?;
+    var writer = (try session_catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var seeded = try subagent_resume_admission.listActionableCatalog(
+        store,
+        alloc,
+        app.session_persistence.writable.?.active_id,
+        &stopped,
+        &writer,
+    );
+    defer seeded.deinit(alloc);
+    app.session_persistence.session_picker_cache.deinit();
+
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    const loader = &app.session_persistence.session_picker_load;
+    const first = loader.task orelse return error.TestExpectedEqual;
+    Runtime(TestApp).preloadSessionCatalog(&app);
+    try std.testing.expect(loader.task == first);
+    try std.testing.expect(loader.pending == null);
+    try waitForSessionPickerPrewarm(&app);
 }
 
 test "session picker current mode filters workspace and all mode includes every workspace" {

@@ -70,7 +70,7 @@ const profiles = [_]Profile{
         .aliases = &.{ "sh", "bash", "zsh", "shell" },
         .line_comments = &.{"#"},
         .quotes = shell_quotes,
-        .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return" },
+        .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return", "echo", "printf", "cd", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "grep", "sed", "awk", "find", "xargs", "chmod", "git", "curl", "wget", "jq" },
         .literals = &.{ "true", "false", "null" },
         .detection = .shell_shebang,
     },
