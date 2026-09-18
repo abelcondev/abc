@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_lifecycle = @import("app_lifecycle.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -2176,6 +2177,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
+    try writeLastShutdownSection(&out.writer, app.alloc);
     try writeCompactionSummary(&out.writer, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
@@ -2438,6 +2440,48 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
             auth_view.gatewayTeamStatus().label(),
         },
     );
+}
+
+fn writeLastShutdownSection(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    try writer.writeAll("\n## Last Shutdown\n");
+    const contents = app_lifecycle.readLastShutdownReport(alloc) orelse {
+        try writer.writeAll("(none recorded)\n");
+        return;
+    };
+    defer alloc.free(contents);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, contents, .{}) catch {
+        try writer.writeAll("(last shutdown report unreadable)\n");
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const total_ms = if (root.get("total_ms")) |value| value.integer else -1;
+    try writer.print("total_ms={d}", .{total_ms});
+    if (root.get("recorded_at_ms")) |value| {
+        if (value.integer >= 0) {
+            const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(value.integer, 1000)) };
+            const day_seconds = epoch_secs.getDaySeconds();
+            const year_day = epoch_secs.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            try writer.print(" recorded={d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+            });
+        }
+    }
+    try writer.writeByte('\n');
+    if (root.get("stages")) |stages_value| {
+        for (stages_value.array.items) |stage_value| {
+            const stage = stage_value.object;
+            const name = if (stage.get("name")) |v| v.string else "?";
+            const step_ms = if (stage.get("step_ms")) |v| v.integer else -1;
+            try writer.print("- {s} step_ms={d}\n", .{ name, step_ms });
+        }
+    }
 }
 
 fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {

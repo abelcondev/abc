@@ -1568,6 +1568,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         expect(tree(home)).toEqual([
           ".fx",
+          ".fx/diagnostics",
+          ".fx/diagnostics/last-shutdown.json",
           ".fx/history.jsonl",
           ".fx/history.lock",
           ".fx/sessions",
@@ -1575,6 +1577,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           ".fx/settings.lock",
         ]);
         expect(statSync(join(home, ".fx")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "diagnostics")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "diagnostics", "last-shutdown.json")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "history.jsonl")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "history.lock")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.json")).mode & 0o777).toBe(0o600);

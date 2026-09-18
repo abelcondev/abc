@@ -855,6 +855,10 @@ const App = struct {
 
     fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
+        // Only real interactive sessions earn a shutdown report; failed
+        // startups (no TTY, too small) reach deinit through errdefer and must
+        // not write to the profile directory.
+        const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
@@ -925,6 +929,7 @@ const App = struct {
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         shutdown_trace.mark("complete");
+        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
