@@ -3458,6 +3458,7 @@ test "app agent runtime highlights shell command rows over the tool text base" {
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
-    // Plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "| wc -c") != null);
+    // The pipe takes the keyword color; plain bytes are intact beneath it.
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "wc -c") != null);
 }

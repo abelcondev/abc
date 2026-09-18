@@ -75,6 +75,19 @@ pub fn highlight(
             index = end;
             continue;
         }
+        if (profile.dollar_vars and source[index] == '$') {
+            if (dollarVarEnd(source, index)) |end| {
+                try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+                index = end;
+                continue;
+            }
+        }
+        if (isOperatorChar(source[index], profile.operators)) {
+            const end = operatorRunEnd(source, index, profile.operators);
+            try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+            index = end;
+            continue;
+        }
         if (isIdentifierStart(source[index])) {
             const end = identifierEnd(source, index);
             const token = source[index..end];
@@ -153,6 +166,31 @@ fn numberEnd(source: []const u8, start: usize) usize {
 
 fn isIdentifierStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_' or byte == '$';
+}
+
+fn isOperatorChar(byte: u8, operators: []const u8) bool {
+    return std.mem.findScalar(u8, operators, byte) != null;
+}
+
+fn operatorRunEnd(source: []const u8, start: usize, operators: []const u8) usize {
+    var end = start;
+    while (end < source.len and isOperatorChar(source[end], operators)) end += 1;
+    return end;
+}
+
+/// "$" opens a variable when a name, positional digit, or special parameter
+/// follows; a bare "$" stays plain text.
+fn dollarVarEnd(source: []const u8, start: usize) ?usize {
+    const next = start + 1;
+    if (next >= source.len) return null;
+    const b = source[next];
+    if (std.ascii.isAlphabetic(b) or b == '_') {
+        var end = next;
+        while (end < source.len and isIdentifierContinue(source[end])) end += 1;
+        return end;
+    }
+    if (std.ascii.isDigit(b) or std.mem.findScalar(u8, "?#@*!$", b) != null) return next + 1;
+    return null;
 }
 
 fn isIdentifierContinue(byte: u8) bool {
@@ -350,4 +388,29 @@ test "a theme with syntax disabled passes the source through" {
     const with_base = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, "<base>");
     defer alloc.free(with_base);
     try std.testing.expectEqualStrings("<base>echo 'hi there' 42", with_base);
+}
+
+test "shell operators and variables take the keyword color" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "cd /tmp && echo $HOME | head -2 > out; echo $? # done", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m>\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
+    // Comments and numbers keep their own colors; a $ inside quotes stays string.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+
+    const quoted = try highlight(alloc, "echo '$HOME'", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(quoted);
+    try std.testing.expect(std.mem.indexOf(u8, quoted, "\x1b[38;5;250m'$HOME'\x1b[39m") != null);
+
+    // Other languages do not pick up shell operators.
+    const zig_src = try highlight(alloc, "a < b", languages.resolve("zig").?, .dark, null);
+    defer alloc.free(zig_src);
+    try std.testing.expectEqualStrings("a < b", zig_src);
 }
