@@ -209,7 +209,8 @@ test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", asyn
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was generated", async () => {
-  const root = createFixtureRoot("tui-trace-failed");  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+  const root = createFixtureRoot("tui-trace-failed");
+  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
     titleResponses: [fakeGatewayFinalText("\n  \n")],
   });
@@ -296,6 +297,13 @@ test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes 
     await tui.waitForText("update ready: ctrl+g to reload", 60_000);
     await tui.sendHexBytes(["07"]);
     await tui.waitForStableComposer(15000);
+
+    // Pin the resume leg: the relaunch must resume the same session, not start
+    // a fresh one (a fresh session would title on the first prompt anyway).
+    const sessionId = readdirSync(join(root.home, ".fx", "sessions"))
+      .filter(name => name !== "latest")[0]!;
+    const relaunchArgv = readFileSync(argvLogPath, "utf8").trim().split("\n");
+    expect(relaunchArgv).toContain(`${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`);
 
     await tui.sendText("refactor the renderer loop to fix the crash");
     await tui.waitForText("MAIN_ANSWER_OK", 20000);
