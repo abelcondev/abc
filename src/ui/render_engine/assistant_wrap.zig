@@ -1765,3 +1765,17 @@ test "wrapLiteralCommandOutput preserves and rows a pathological zero width run"
     try std.testing.expectEqual(combining_count, std.mem.count(u8, out, "\xcc\x81"));
     try std.testing.expect(std.mem.count(u8, out, "\n") > 1);
 }
+
+test "a link opening a guttered row keeps its theme color" {
+    const alloc = std.testing.allocator;
+    const link_style = shared_theme.current().link_style;
+    const input = try std.fmt.allocPrint(alloc, "\x1b]8;id=fx-1;https://example.com\x1b\\{s}\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\", .{link_style});
+    defer alloc.free(input);
+    const out = try wrapAssistantTextWithBaseGutter(alloc, input, 40, 2, false, false, null, null, null);
+    defer alloc.free(out);
+    // Pre-content escapes are not copied verbatim into a guttered row; the
+    // row-start restore must re-emit the link color with the underline.
+    try std.testing.expect(std.mem.indexOf(u8, out, link_style) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "docs") != null);
+}

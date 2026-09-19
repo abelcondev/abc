@@ -23,6 +23,12 @@ pub const SyntaxPalette = struct {
     string_style: []const u8,
     number_style: []const u8,
     comment_style: []const u8,
+    /// Command words (the grammar's variable.function).
+    function_style: []const u8,
+    /// `$VAR`, `${VAR}`, and `~` references.
+    variable_style: []const u8,
+    /// `&&`, `|`, redirects, glob stars.
+    operator_style: []const u8,
 };
 
 pub const Theme = struct {
@@ -61,6 +67,7 @@ pub const Theme = struct {
     task_completed_open: []const u8,
     tool_stdout_style: []const u8,
     tool_stderr_style: []const u8,
+    link_style: []const u8,
     syntax: SyntaxPalette,
 };
 
@@ -95,11 +102,15 @@ pub const fx_dark: Theme = .{
     .task_completed_open = "\x1b[38;5;252m",
     .tool_stdout_style = "\x1b[38;5;245m",
     .tool_stderr_style = "\x1b[38;5;252m",
+    .link_style = "\x1b[38;5;75m",
     .syntax = .{
         .keyword_style = "\x1b[38;5;252m",
         .string_style = "\x1b[38;5;250m",
         .number_style = "\x1b[38;5;250m",
         .comment_style = "\x1b[38;5;245m",
+        .function_style = "\x1b[38;5;252m",
+        .variable_style = "\x1b[38;5;252m",
+        .operator_style = "\x1b[38;5;252m",
     },
 };
 
@@ -131,6 +142,7 @@ pub const fx_light: Theme = .{
     .user_card_marker_style = "\x1b[38;5;235m",
     .user_card_accent_style = "\x1b[38;5;238m",
     .inline_code_open = "\x1b[38;5;247m",
+    .link_style = "\x1b[38;5;25m",
     .task_completed_open = "\x1b[38;5;238m",
     .tool_stdout_style = "\x1b[38;5;245m",
     .tool_stderr_style = "\x1b[38;5;252m",
@@ -139,6 +151,9 @@ pub const fx_light: Theme = .{
         .string_style = "\x1b[38;5;241m",
         .number_style = "\x1b[38;5;241m",
         .comment_style = "\x1b[38;5;243m",
+        .function_style = "\x1b[38;5;238m",
+        .variable_style = "\x1b[38;5;238m",
+        .operator_style = "\x1b[38;5;238m",
     },
 };
 
@@ -551,6 +566,12 @@ fn applySyntax(theme: *Theme, alloc: std.mem.Allocator, syntax: std.json.ObjectM
             theme.syntax.number_style = resolved;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "comment")) {
             theme.syntax.comment_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "function")) {
+            theme.syntax.function_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "variable")) {
+            theme.syntax.variable_style = resolved;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "operator")) {
+            theme.syntax.operator_style = resolved;
         }
     }
 }
@@ -575,6 +596,8 @@ const vscode_slot_map = [_]VsCodeSlot{
     .{ .key = "system_notice_label", .sources = &.{ "editor.foreground", "foreground" }, .bold = true },
     .{ .key = "system_notice_text", .sources = &.{ "editor.foreground", "foreground" } },
     .{ .key = "dim", .sources = &.{ "editorLineNumber.foreground", "editor.foreground", "foreground" } },
+    // No foreground fallbacks: a link that matches body text stops reading as a link.
+    .{ .key = "link", .sources = &.{"textLink.foreground"} },
     .{ .key = "warning", .sources = &.{ "editorWarning.foreground", "terminal.ansiYellow" } },
     .{ .key = "green", .sources = &.{"terminal.ansiGreen"} },
     .{ .key = "red", .sources = &.{"terminal.ansiRed"} },
@@ -599,6 +622,9 @@ const vscode_syntax_scopes = [_]struct { slot: []const u8, scope: []const u8 }{
     .{ .slot = "string", .scope = "string" },
     .{ .slot = "number", .scope = "constant.numeric" },
     .{ .slot = "comment", .scope = "comment" },
+    .{ .slot = "function", .scope = "entity.name.function" },
+    .{ .slot = "variable", .scope = "variable" },
+    .{ .slot = "operator", .scope = "keyword.operator" },
 };
 
 fn vscodeColor(colors: ?std.json.ObjectMap, sources: []const []const u8, bg: Rgb) ?Rgb {
@@ -1134,4 +1160,53 @@ test "theme source copies the configured name and pin for live re-resolution" {
     const too_long = "x" ** 65;
     setSource(too_long, false);
     try std.testing.expect(sourceName() == null);
+}
+
+test "parse maps the link color and split syntax scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const vscode_doc =
+        \\{
+        \\  "type": "dark",
+        \\  "colors": { "textLink.foreground": "#58A6FF" },
+        \\  "tokenColors": [
+        \\    { "scope": "keyword", "settings": { "foreground": "#82D2CE" } },
+        \\    { "scope": "entity.name.function", "settings": { "foreground": "#D2A8FF" } },
+        \\    { "scope": "variable.other", "settings": { "foreground": "#FFA657" } },
+        \\    { "scope": "keyword.operator", "settings": { "foreground": "#FF7B72" } }
+        \\  ]
+        \\}
+    ;
+    const vscode = try parse(alloc, vscode_doc, .{ .truecolor = true });
+    try std.testing.expectEqualStrings("\x1b[38;2;88;166;255m", vscode.link_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;210;168;255m", vscode.syntax.function_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;255;166;87m", vscode.syntax.variable_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;255;123;114m", vscode.syntax.operator_style);
+    // Keyword keeps its own scope, not keyword.operator's.
+    try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", vscode.syntax.keyword_style);
+
+    const native = try parse(alloc, "{ \"colors\": { \"link\": \"#58A6FF\" }, \"syntax\": { \"function\": \"#D2A8FF\", \"variable\": \"#FFA657\", \"operator\": \"#FF7B72\" } }", .{ .truecolor = true });
+    try std.testing.expectEqualStrings("\x1b[38;2;88;166;255m", native.link_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;210;168;255m", native.syntax.function_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;255;166;87m", native.syntax.variable_style);
+    try std.testing.expectEqualStrings("\x1b[38;2;255;123;114m", native.syntax.operator_style);
+
+    // A VS Code theme without textLink keeps the builtin link color.
+    const no_link = try parse(alloc, "{ \"type\": \"dark\", \"colors\": {} }", .{ .truecolor = true });
+    try std.testing.expectEqualStrings(fx_dark.link_style, no_link.link_style);
+}
+
+test "builtin themes pin the new slot bytes" {
+    try std.testing.expectEqualStrings("\x1b[38;5;75m", fx_dark.link_style);
+    try std.testing.expectEqualStrings("\x1b[38;5;25m", fx_light.link_style);
+    // The split slots default to the keyword color so default rendering is
+    // byte-identical to before the split.
+    for ([_][]const u8{ fx_dark.syntax.function_style, fx_dark.syntax.variable_style, fx_dark.syntax.operator_style }) |style| {
+        try std.testing.expectEqualStrings(fx_dark.syntax.keyword_style, style);
+    }
+    for ([_][]const u8{ fx_light.syntax.function_style, fx_light.syntax.variable_style, fx_light.syntax.operator_style }) |style| {
+        try std.testing.expectEqualStrings(fx_light.syntax.keyword_style, style);
+    }
 }
