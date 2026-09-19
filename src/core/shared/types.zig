@@ -1265,6 +1265,89 @@ pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]To
     return copies;
 }
 
+/// Deep-copies every slice-bearing field of a ToolResultMemory so the caller's
+/// copy is independent of the source's backing allocations. Use when the
+/// source memory is owned by a shorter-lived scope (for example a parallel
+/// tool attempt whose run result is deinitialized after assembly).
+pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) !ToolResultMemory {
+    var copy = memory;
+    copy.tool_images = try dupeToolImages(alloc, memory.tool_images);
+    errdefer freeToolImages(alloc, copy.tool_images);
+    copy.tool_image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (copy.tool_image_handle) |handle| alloc.free(handle);
+    copy.output_handle = if (memory.output_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (copy.output_handle) |handle| alloc.free(handle);
+    copy.preview = if (memory.preview) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (copy.preview) |value| alloc.free(value);
+    copy.committed_file_presentation = if (memory.committed_file_presentation) |presentation|
+        try dupeCommittedFilePresentation(alloc, presentation)
+    else
+        null;
+    errdefer if (copy.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
+    copy.command_output_replay = if (memory.command_output_replay) |replay|
+        try dupeCommandOutputReplay(alloc, replay)
+    else
+        null;
+    errdefer if (copy.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    return copy;
+}
+
+test "dupeToolResultMemory copies survive teardown of every source allocation" {
+    const alloc = std.testing.allocator;
+    const source_images = try alloc.alloc(ToolImage, 1);
+    source_images[0] = .{
+        .data = try alloc.dupe(u8, "aW1hZ2UtZGF0YQ=="),
+        .mime_type = try alloc.dupe(u8, "image/png"),
+    };
+    const source: ToolResultMemory = .{
+        .review_feedback = true,
+        .tool_images = source_images,
+        .tool_image_handle = try alloc.dupe(u8, "image-result-1"),
+        .output_handle = try alloc.dupe(u8, "result-1"),
+        .preview = try alloc.dupe(u8, "preview text"),
+        .output_bytes = 128,
+        .stored_output_bytes = 64,
+        .truncated = true,
+        .model_view_covers_full_file = false,
+        .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
+        .command_process_presentation = .{ .exit_code = 3 },
+    };
+    const copy = try dupeToolResultMemory(alloc, source);
+    // Tear down every source allocation; the testing allocator scribbles
+    // freed memory, so an aliased copy reads garbage below.
+    freeToolImages(alloc, source_images);
+    alloc.free(source.tool_image_handle.?);
+    alloc.free(source.output_handle.?);
+    alloc.free(source.preview.?);
+    freeCommandOutputReplay(alloc, source.command_output_replay.?);
+
+    try std.testing.expect(copy.review_feedback);
+    try std.testing.expectEqual(@as(usize, 1), copy.tool_images.len);
+    try std.testing.expectEqualStrings("aW1hZ2UtZGF0YQ==", copy.tool_images[0].data);
+    try std.testing.expectEqualStrings("image/png", copy.tool_images[0].mime_type);
+    try std.testing.expectEqualStrings("image-result-1", copy.tool_image_handle.?);
+    try std.testing.expectEqualStrings("result-1", copy.output_handle.?);
+    try std.testing.expectEqualStrings("preview text", copy.preview.?);
+    try std.testing.expectEqual(@as(usize, 128), copy.output_bytes);
+    try std.testing.expectEqual(@as(usize, 64), copy.stored_output_bytes);
+    try std.testing.expect(copy.truncated);
+    try std.testing.expectEqual(@as(?bool, false), copy.model_view_covers_full_file);
+    switch (copy.command_output_replay.?) {
+        .available => |descriptor| {
+            try std.testing.expectEqualStrings("cmd-replay-1", descriptor.handle);
+            try std.testing.expectEqual(@as(usize, 42), descriptor.framed_bytes);
+        },
+        .unavailable => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(copy.command_process_presentation.? == .exit_code);
+
+    freeToolImages(alloc, copy.tool_images);
+    alloc.free(copy.tool_image_handle.?);
+    alloc.free(copy.output_handle.?);
+    alloc.free(copy.preview.?);
+    freeCommandOutputReplay(alloc, copy.command_output_replay.?);
+}
+
 /// A cut in the active context, not a second persisted history.
 pub const ContextHistoryCut = struct {
     turns: usize = 0,

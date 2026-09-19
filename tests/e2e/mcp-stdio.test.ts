@@ -2055,8 +2055,16 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(part).toBeDefined();
       if (supportsImages) {
         expect(part.output.type).toBe("content");
-        expect(part.output.value.some((value: { type: string; mediaType?: string }) => value.type === "image-data" && value.mediaType === "image/png")).toBe(true);
+        expect(part.output.value.every((value: { type: string }) => value.type === "text")).toBe(true);
         expect(part.output.value.find((value: { type: string }) => value.type === "text").text).not.toContain("iVBORw0KGgo");
+        const imageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+          message.role === "user" && Array.isArray(message.content) &&
+          (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+        expect(imageMessage).toBeDefined();
+        const filePart = (imageMessage.content as Array<Record<string, unknown>>).find((entry) => entry.type === "file")!;
+        expect(filePart.mediaType).toBe("image/png");
+        expect((filePart.data as Record<string, unknown>).type).toBe("data");
+        expect(typeof (filePart.data as Record<string, unknown>).data).toBe("string");
       } else {
         expect(part.output.type).toBe("text");
         expect(part.output.value).toContain("not sent: this model receives image input through the vision tool");
@@ -2083,12 +2091,20 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000,
       });
       expect(result.code, result.stderr || result.stdout).toBe(0);
-      const part = JSON.parse(gateway.requests[1]!.body).prompt
+      const request = JSON.parse(gateway.requests[1]!.body);
+      const part = request.prompt
         .flatMap((message: { content?: unknown[] }) => message.content ?? [])
         .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "feature_image");
       expect(part.output.type, JSON.stringify(part.output)).toBe("content");
-      expect(part.output.value.some((part: { type?: string; mediaType?: string }) => part.type === "image-data" && part.mediaType === "image/png")).toBe(true);
+      expect(part.output.value.every((part: { type?: string }) => part.type === "text")).toBe(true);
       expect(part.output.value.filter((part: { type?: string }) => part.type === "text").map((part: { text: string }) => part.text).join("\n")).not.toContain("iVBORw0KGgo");
+      const imageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+        message.role === "user" && Array.isArray(message.content) &&
+        (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+      expect(imageMessage).toBeDefined();
+      const filePart = (imageMessage.content as Array<Record<string, unknown>>).find((entry) => entry.type === "file")!;
+      expect(filePart.mediaType).toBe("image/png");
+      expect((filePart.data as Record<string, unknown>).type).toBe("data");
       const wire = readWire(root.wireLogPath);
       expect(wire.filter((entry) => entry.message.method === (action === "resource_read" ? "resources/read" : "prompts/get"))).toHaveLength(1);
       await expectFixtureProcessesExited(wire);
@@ -2123,12 +2139,19 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     const result = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
       .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "saved_image");
     expect(result.output.type).toBe("content");
-    expect(result.output.value.some((part: { type?: string }) => part.type === "image-data")).toBe(true);
-    const loaded = JSON.parse(gateway.requests[1]!.body).prompt
+    const savedImageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+      message.role === "user" && Array.isArray(message.content) &&
+      (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+    expect(savedImageMessage).toBeDefined();
+    const secondRequest = JSON.parse(gateway.requests[1]!.body);
+    const loaded = secondRequest.prompt
       .flatMap((message: { content?: unknown[] }) => message.content ?? [])
       .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "load_saved_image");
     expect(loaded.output.type).toBe("content");
-    expect(loaded.output.value.some((part: { type?: string }) => part.type === "image-data")).toBe(true);
+    const loadedImageMessage = secondRequest.prompt.find((message: { role?: string; content?: unknown[] }) =>
+      message.role === "user" && Array.isArray(message.content) &&
+      (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+    expect(loadedImageMessage).toBeDefined();
     const wire = readWire(root.wireLogPath);
     expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
     await expectFixtureProcessesExited(wire);

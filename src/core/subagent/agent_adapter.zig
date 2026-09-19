@@ -444,9 +444,17 @@ fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabili
     return model_capabilities.capabilitiesForModel(model);
 }
 
-fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    // Prefer the host's shared resolver: it waits for the provider catalog and
+    // merges the loaded model cache, so gateway-hosted children resolve the
+    // same capabilities as the parent. The provider bundle's synchronous
+    // lookup is empty for providers that only fetch asynchronously (gateway),
+    // which previously left every gateway child at "unknown" support.
+    if (context.config.tool_context.model_capability_resolver) |resolver| {
+        return resolver.resolve(arena, model);
+    }
     return availableModelCapabilities(raw, model);
 }
 
@@ -457,6 +465,7 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     const Fixture = struct {
         fetches: usize = 0,
         lookups: usize = 0,
+        resolutions: usize = 0,
 
         fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
             return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
@@ -470,6 +479,11 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.lookups += 1;
             return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
+        }
+        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolutions += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
         }
         fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
     };
@@ -550,10 +564,16 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
     try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
+    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
     const lookups = fixture.lookups;
     cancel.store(true, .seq_cst);
     try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 

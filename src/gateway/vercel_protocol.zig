@@ -343,6 +343,7 @@ fn buildGatewayRequestBodyValidated(
             const results = tool_result_prefix(messages[i..]);
             try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
             i += results.len;
+            try write_tool_image_user_message(&out.writer, results, budget);
             if (budget) |active| try active.check();
             continue;
         }
@@ -636,6 +637,40 @@ fn write_tool_result_group(
     try writer.writeAll("]}");
 }
 
+const tool_image_followup_text = "Attached image(s) from the tool result.";
+
+// Retained tool images ride in a user message following the contiguous tool
+// run: user-position file parts are the one image position every gateway
+// provider route renders as vision input, while tool-result-position images
+// are ignored by several routes (and the legacy "image-data" part type was
+// removed from the gateway spec). Writes nothing when the run has no images.
+fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMessage, budget: ?BuildBudget) !void {
+    var has_images = false;
+    for (results) |result| {
+        const memory = result.tool_result_memory orelse continue;
+        if (memory.tool_images.len > 0) {
+            has_images = true;
+            break;
+        }
+    }
+    if (!has_images) return;
+    try writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
+    try writer.writeByte('}');
+    for (results) |result| {
+        const memory = result.tool_result_memory orelse continue;
+        for (memory.tool_images) |image| {
+            if (budget) |active| try active.check();
+            try writer.writeAll(",{\"type\":\"file\",\"mediaType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data\":{\"type\":\"data\",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeAll("}}");
+        }
+    }
+    try writer.writeAll("]}");
+}
+
 fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
     try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
@@ -649,23 +684,16 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
     const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
     const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
     if (tool_images.len > 0 and !denied) {
+        // Retained tool images are delivered in a follow-up user message (see
+        // write_tool_image_user_message). Tool-result-position image parts are
+        // ignored by several gateway provider routes, so only the text
+        // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
         const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
-        if (text.len > 0) {
-            try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text, .{}, writer);
-            try writer.writeByte('}');
-        }
-        for (tool_images, 0..) |image, index| {
-            if (index > 0 or text.len > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"type\":\"image-data\",\"data\":");
-            try std.json.Stringify.value(image.data, .{}, writer);
-            try writer.writeAll(",\"mediaType\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}}");
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, writer);
+        try writer.writeAll("}]}}");
         return;
     }
     if (denied) {
@@ -1832,7 +1860,7 @@ test "grouped tool results retain images and individual error status" {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer parsed.deinit();
         const prompt = parsed.value.object.get("prompt").?.array.items;
-        try std.testing.expectEqual(@as(usize, 2), prompt.len);
+        try std.testing.expectEqual(@as(usize, 3), prompt.len);
         const results = prompt[1].object.get("content").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), results.len);
         const projected_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
@@ -1844,15 +1872,23 @@ test "grouped tool results retain images and individual error status" {
         const media = results[0].object.get("output").?.object;
         try std.testing.expectEqualStrings("content", media.get("type").?.string);
         const parts = media.get("value").?.array.items;
-        try std.testing.expectEqual(@as(usize, 2), parts.len);
+        try std.testing.expectEqual(@as(usize, 1), parts.len);
         try std.testing.expectEqualStrings(if (status == .failure) "Tool error: capture" else "capture", parts[0].object.get("text").?.string);
-        try std.testing.expectEqualStrings("image-data", parts[1].object.get("type").?.string);
-        try std.testing.expectEqualStrings(images[0].data, parts[1].object.get("data").?.string);
-        try std.testing.expectEqualStrings("image/png", parts[1].object.get("mediaType").?.string);
         try std.testing.expectEqualStrings("labels", results[1].object.get("toolCallId").?.string);
         const plain = results[1].object.get("output").?.object;
         try std.testing.expectEqualStrings("text", plain.get("type").?.string);
         try std.testing.expectEqualStrings("labels", plain.get("value").?.string);
+        const followup = prompt[2].object;
+        try std.testing.expectEqualStrings("user", followup.get("role").?.string);
+        const followup_parts = followup.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), followup_parts.len);
+        try std.testing.expectEqualStrings(tool_image_followup_text, followup_parts[0].object.get("text").?.string);
+        const file_part = followup_parts[1].object;
+        try std.testing.expectEqualStrings("file", file_part.get("type").?.string);
+        try std.testing.expectEqualStrings("image/png", file_part.get("mediaType").?.string);
+        const data = file_part.get("data").?.object;
+        try std.testing.expectEqualStrings("data", data.get("type").?.string);
+        try std.testing.expectEqualStrings(images[0].data, data.get("data").?.string);
     }
 }
 
