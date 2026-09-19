@@ -106,7 +106,6 @@
     {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}
   ],
   "verification_scenarios": [
-    {"name": "verify-prompt-cache-stability", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-cache-stability.test.ts"], "test_file": "prompt-cache-stability.test.ts", "requires_tmux": false},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-review-model-override", "argv": ["bun", "test", "--max-concurrency", "1", "./review-model-override.test.ts"], "test_file": "review-model-override.test.ts", "requires_tmux": false},
     {"name": "verify-configured-providers", "argv": ["bun", "test", "--max-concurrency", "1", "./configured-providers.test.ts"], "test_file": "configured-providers.test.ts", "requires_tmux": false},
@@ -127,6 +126,7 @@
     {"name": "verify-tui-slash-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-menu.test.ts"], "test_file": "tui-slash-menu.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"}
+    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
+    {"name": "verify-prompt-cache-stability", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-cache-stability.test.ts"], "test_file": "prompt-cache-stability.test.ts", "requires_tmux": false}
   ]
 }
