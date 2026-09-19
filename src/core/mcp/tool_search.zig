@@ -2,6 +2,7 @@ const server_views = @import("server_views.zig");
 const std = @import("std");
 const server_connection = @import("server_connection.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const selected_schema = @import("selected_schema.zig");
 const tool_names = @import("tool_names.zig");
 const tool_catalog = @import("tool_catalog.zig");
@@ -74,7 +75,7 @@ pub fn search(
     const documents = try alloc.alloc(capability_retrieval.Document, candidate_capacity);
     defer alloc.free(documents);
     var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer identity_scratch_state.deinit();
+    defer mem_utils.deinit_arena(identity_scratch_state);
     const identity_scratch = identity_scratch_state.allocator();
     var candidate_count: usize = 0;
     for (server_handles) |server| {

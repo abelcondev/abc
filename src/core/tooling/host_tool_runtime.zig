@@ -1,5 +1,6 @@
 const std = @import("std");
 const stream_provider = @import("../agent/stream_provider.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set = @import("tool_set.zig");
 
@@ -35,7 +36,7 @@ pub const Runtime = struct {
         const arena = try backing.create(std.heap.ArenaAllocator);
         errdefer backing.destroy(arena);
         arena.* = std.heap.ArenaAllocator.init(backing);
-        errdefer arena.deinit();
+        errdefer mem_utils.deinit_arena(arena.*);
         const alloc = arena.allocator();
 
         const tools = try alloc.alloc(tool_dispatch.Tool, tools_value.array.items.len);
@@ -111,7 +112,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         if (self.arena) |arena| {
             const backing = self.backing.?;
-            arena.deinit();
+            mem_utils.deinit_arena(arena.*);
             backing.destroy(arena);
         }
         self.* = .{};

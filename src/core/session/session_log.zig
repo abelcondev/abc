@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session = @import("session.zig");
@@ -145,7 +146,7 @@ pub const ConversationWriter = struct {
         const frames = source orelse &log_source;
         if (source == null) frames.reset();
         var frame_arena = std.heap.ArenaAllocator.init(alloc);
-        defer frame_arena.deinit();
+        defer mem_utils.deinit_arena(frame_arena);
         var offset: u64 = 0;
         var open_turn_offset: ?u64 = null;
         var open_turn_prior_seq: u64 = 0;
@@ -367,7 +368,7 @@ pub const ConversationWriter = struct {
         retained_from: ?types.ContextHistoryCut,
     ) !void {
         var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
+        defer mem_utils.deinit_arena(arena);
         // A checkpoint can have already committed the recent execution prefix.
         // Finalization supplies that prefix for model history; append only its
         // not-yet-written suffix to the conversation log.
@@ -718,7 +719,7 @@ fn writeConversationRecoveryState(
 ) !void {
     if (recovery_checkpoint) |checkpoint| {
         var projection_arena = std.heap.ArenaAllocator.init(alloc);
-        defer projection_arena.deinit();
+        defer mem_utils.deinit_arena(projection_arena);
         const projected = try spillRecoveryCheckpointOutputs(
             projection_arena.allocator(),
             dir,
@@ -1744,7 +1745,7 @@ fn replayConversationHistory(
     var turn = ConversationTurnBuilder.init(alloc);
     defer turn.deinit();
     var frame_arena = std.heap.ArenaAllocator.init(alloc);
-    defer frame_arena.deinit();
+    defer mem_utils.deinit_arena(frame_arena);
     if (window.checkpoint_offset) |checkpoint_offset| {
         const frame = (try source.readAtLogOffset(frame_arena.allocator(), checkpoint_offset)) orelse return error.InvalidConversationFrame;
         const summary = try alloc.dupe(u8, frame.envelope.event.context_checkpoint.summary);
@@ -1970,7 +1971,7 @@ fn load_conversation_archive_from_source(
     var raw_turn_count: usize = 0;
     var compaction_count: usize = 0;
     var frame_arena = std.heap.ArenaAllocator.init(alloc);
-    defer frame_arena.deinit();
+    defer mem_utils.deinit_arena(frame_arena);
     source.reset();
     while (true) {
         const frame = source.next(frame_arena.allocator()) catch |err| switch (err) {
@@ -2087,7 +2088,7 @@ const ConversationReplayScan = struct {
             window.prior_turn_count = 0;
             source.reset();
             var frame_arena = std.heap.ArenaAllocator.init(alloc);
-            defer frame_arena.deinit();
+            defer mem_utils.deinit_arena(frame_arena);
             while (true) {
                 const frame = (try source.next(frame_arena.allocator())) orelse break;
                 if (frame.envelope.seq > window.coverage) break;
@@ -2114,7 +2115,7 @@ fn findConversationReplayWindow(
     var scan: ConversationReplayScan = .{};
     source.reset();
     var frame_arena = std.heap.ArenaAllocator.init(alloc);
-    defer frame_arena.deinit();
+    defer mem_utils.deinit_arena(frame_arena);
     while (true) {
         const frame = source.next(frame_arena.allocator()) catch |err| switch (err) {
             error.TruncatedEventFrame => break,

@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
+const mem_utils = @import("../core/shared/mem_utils.zig");
 const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
@@ -3498,7 +3499,7 @@ fn consumeSseStreamTraced(
     defer replay.deinit();
     // Reuse event storage instead of pinning old response buffers in the caller's arena.
     var event_arena = std.heap.ArenaAllocator.init(alloc);
-    defer event_arena.deinit();
+    defer mem_utils.deinit_arena(event_arena);
 
     var streamed_tool_inputs: std.ArrayList(SseStreamedToolInput) = .empty;
     defer {

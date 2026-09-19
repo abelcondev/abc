@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const result_store = @import("../../session/result_store.zig");
@@ -132,7 +133,7 @@ pub fn compact(
     var summary_reserve_tokens: ?usize = null;
     for (0..2) |capacity_attempt| {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
+        defer mem_utils.deinit_arena(arena_state);
         const scratch = arena_state.allocator();
         var stage: []const u8 = "plan";
         errdefer |err| {
