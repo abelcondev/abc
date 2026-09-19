@@ -707,8 +707,9 @@ fn highlightCommandPhrase(
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
     // Prefer the recorded action label so multi-word labels ("Timed out")
-    // split at the true boundary. Rows without one (legacy, some fixtures)
-    // fall back to the known multi-word labels, then the first space.
+    // split at the true boundary. Otherwise trust the stored command text:
+    // prose-prefixed rows ("Reading project instructions before continuing:
+    // <cmd>") end with it. Then known multi-word labels, then first space.
     const label_end = if (record.command_action_label) |action|
         if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
             action.len
@@ -716,7 +717,13 @@ fn highlightCommandPhrase(
             null
     else
         null;
-    const split = label_end orelse knownLabelPrefix(phrase) orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
+    const display_end = if (record.command_display) |display| blk: {
+        if (display.len == 0 or phrase.len <= display.len + 1) break :blk null;
+        if (!std.mem.endsWith(u8, phrase, display)) break :blk null;
+        const split_at = phrase.len - display.len - 1;
+        break :blk if (phrase[split_at] == ' ') split_at else null;
+    } else null;
+    const split = label_end orelse display_end orelse knownLabelPrefix(phrase) orelse std.mem.indexOfScalar(u8, phrase, ' ') orelse return null;
     const command = phrase[split + 1 ..];
     if (command.len == 0) return null;
     const theme = shared_theme.current();
@@ -2804,4 +2811,42 @@ test "many presentation groups perform a bounded number of indexed detail lookup
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(projection.entry_actions.items[tool_count - 1] == .override);
     try std.testing.expect(stats.detail_lookups <= tool_count * 4);
+}
+
+test "prose-prefixed command rows highlight only the trailing stored command" {
+    const alloc = std.testing.allocator;
+    const command = "cat AGENTS.md && printf done";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran echo ok\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Reading project instructions before continuing: cat AGENTS.md && printf done\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .command_display = @constCast("echo ok"),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"command\":\"cat AGENTS.md && printf done\"}"),
+            .command_display = @constCast(command),
+            .outcome = .deferred,
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 200);
+    defer projection.deinit(alloc);
+    const rows = projection.entry_actions.items[0].override.bytes;
+
+    // The prose prefix stays plain in full; the trailing command highlights.
+    try std.testing.expect(std.mem.indexOf(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }
