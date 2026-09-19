@@ -587,7 +587,7 @@ tmuxTest(
       role: string;
       content: Array<{ type: string; text?: string }>;
     }>;
-    const finalUser = messages[messages.length - 1];
+    const finalUser = messages[lastConversationUserIndex(messages)];
     expect(finalUser?.role).toBe("user");
     expect(finalUser?.content[0]?.text).toBe(prompt);
 
