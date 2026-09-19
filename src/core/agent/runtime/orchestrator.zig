@@ -8079,15 +8079,17 @@ fn processQueuedPromptLoop(
                 agent.observeUsage(completion.usage);
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
-                // Events take c_allocator ownership; the callback frees after
-                // handling.
+                // The push_event callback takes ownership of the payload on
+                // every outcome, including error returns, so this scope never
+                // frees `owned` after the call.
                 if (completion.resolved_provider) |provider| {
                     if (std.heap.c_allocator.dupe(u8, provider)) |owned| {
                         deps.push_event(deps.ctx, .{ .provider_resolved = owned }) catch |err| {
-                            std.heap.c_allocator.free(owned);
                             debug_trace.logf("agent", "provider_resolved event dropped err={s}", .{@errorName(err)});
                         };
-                    } else |_| {}
+                    } else |_| {
+                        debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
+                    }
                 }
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,

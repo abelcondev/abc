@@ -1745,7 +1745,8 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
     if (root.object.get("provider_order")) |order_value| {
         if (order_value != .array) return error.InvalidProviderOrderType;
         const items = order_value.array.items;
-        if (items.len == 0 or items.len > settings_store.max_provider_order_entries) {
+        // An empty array explicitly clears an inherited routing list.
+        if (items.len > settings_store.max_provider_order_entries) {
             return error.InvalidProviderOrderValue;
         }
         var order = try alloc.alloc([]const u8, items.len);
@@ -2296,6 +2297,34 @@ test "provider routing project defaults apply when profile is silent" {
     try std.testing.expectEqualStrings("azure", order[0]);
     try std.testing.expectEqualStrings("openai", order[1]);
     try std.testing.expectEqual(true, settings.provider_strict.?);
+}
+
+test "provider routing empty list clears an inherited order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"provider_order\":[\"bedrock\"],\"workspaces\":{{\"{s}\":{{\"provider_order\":[]}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), order.len);
 }
 
 test "parseProviderOrderList validates trims and deduplicates slugs" {

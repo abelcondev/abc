@@ -1931,7 +1931,8 @@ fn validateKnownSettingsObject(
         _ = context_limits.parseJsonObject(value) catch return error.InvalidSettingsFormat;
     }
     if (object.get("provider_order")) |value| {
-        if (value != .array or value.array.items.len == 0 or value.array.items.len > max_provider_order_entries) {
+        // An empty array explicitly clears an inherited routing list.
+        if (value != .array or value.array.items.len > max_provider_order_entries) {
             return error.InvalidSettingsFormat;
         }
         for (value.array.items, 0..) |item, index| {

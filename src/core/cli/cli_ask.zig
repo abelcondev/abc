@@ -1043,6 +1043,8 @@ const AskContext = struct {
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
             .effort = self.effort,
+            .provider_order = if (self.provider == .gateway) self.provider_order else &.{},
+            .provider_strict = self.provider == .gateway and self.provider_strict,
             .first_call_tool_choice = self.first_call_tool_choice,
             .permission_mode = self.permission_mode,
             .permission_grants = &.{},

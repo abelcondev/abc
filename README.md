@@ -88,10 +88,10 @@ Both keys also work in a committed project `.fx.json`, and per launch:
 ```bash
 fx --provider-order azure,openai --provider-strict
 fx ask --provider-order bedrock "review this change"
-FX_PROVIDER_ORDER=vertex fx
+FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 fx
 ```
 
-Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). Routing applies to gateway requests only; custom model connections ignore it.
+Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
 
 ## Themes
 
