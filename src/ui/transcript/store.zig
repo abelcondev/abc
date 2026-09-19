@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -3674,11 +3675,15 @@ pub fn streamAssistantChunk(
 pub fn retintEntriesForTheme(
     self: anytype,
     alloc: Allocator,
-    from_light: bool,
-    to_light: bool,
+    from: shared_theme.Theme,
+    to: shared_theme.Theme,
 ) !void {
-    if (from_light == to_light) return;
+    if (from.light == to.light) return;
     try self.assertCanMutateTranscript();
+
+    var token_buf: [80]ThemeToken = undefined;
+    const tokens = retintTokens(from, to, &token_buf);
+    if (tokens.len == 0) return;
 
     var shadow = try cloneMutationState(self, alloc);
     var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
@@ -3692,13 +3697,13 @@ pub fn retintEntriesForTheme(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(alloc, raw.bytes, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(alloc, raw.bytes, tokens)) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(alloc, assistant.segments.text.items, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(alloc, assistant.segments.text.items, tokens)) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
@@ -3761,14 +3766,57 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
     };
 }
 
+/// Build the escape rewrite map between two themes. Builtin-to-builtin flips
+/// keep the hand-pinned token table; any custom theme involved gets a dynamic
+/// map pairing every slot's old escape with its new one, longest first so
+/// combined forms match before their fg-only equivalents.
+fn retintTokens(
+    from: shared_theme.Theme,
+    to: shared_theme.Theme,
+    buf: *[80]ThemeToken,
+) []const ThemeToken {
+    const from_builtin = std.mem.eql(u8, from.name, shared_theme.fx_dark.name) or std.mem.eql(u8, from.name, shared_theme.fx_light.name);
+    const to_builtin = std.mem.eql(u8, to.name, shared_theme.fx_dark.name) or std.mem.eql(u8, to.name, shared_theme.fx_light.name);
+    if (from_builtin and to_builtin) {
+        const tokens = if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
+        const n = @min(tokens.len, buf.len);
+        @memcpy(buf[0..n], tokens[0..n]);
+        return buf[0..n];
+    }
+
+    var n: usize = 0;
+    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
+        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
+            n = appendTokenPair(buf, n, @field(from, field.name), @field(to, field.name));
+        }
+    }
+    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
+        if (field.type == []const u8) {
+            n = appendTokenPair(buf, n, @field(from.syntax, field.name), @field(to.syntax, field.name));
+        }
+    }
+    std.mem.sort(ThemeToken, buf[0..n], {}, tokenLongerFromFirst);
+    return buf[0..n];
+}
+
+fn appendTokenPair(buf: *[80]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
+    if (from.len == 0 or std.mem.eql(u8, from, to) or n >= buf.len) return n;
+    for (buf[0..n]) |existing| {
+        if (std.mem.eql(u8, existing.from, from)) return n;
+    }
+    buf[n] = .{ .from = from, .to = to };
+    return n + 1;
+}
+
+fn tokenLongerFromFirst(_: void, a: ThemeToken, b: ThemeToken) bool {
+    return a.from.len > b.from.len;
+}
+
 fn retintThemeBytes(
     alloc: Allocator,
     bytes: []const u8,
-    from_light: bool,
-    to_light: bool,
+    tokens: []const ThemeToken,
 ) !?[]u8 {
-    if (from_light == to_light) return null;
-    const tokens = if (to_light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
