@@ -140,6 +140,15 @@ export function stripRuntimeOverlay<T extends { role?: unknown; content?: unknow
   return prompt.filter((message) => !isRuntimeOverlayMessage(message));
 }
 
+// For protocols that serialize content as plain strings (chat completions),
+// strip only the contiguous trailing overlay run so conversation order checks
+// like at(-2) keep working against the semantic tail.
+export function stripTrailingRuntimeOverlay<T extends { role?: unknown; content?: unknown }>(messages: T[]): T[] {
+  let end = messages.length;
+  while (end > 0 && isRuntimeOverlayMessage(messages[end - 1]!)) end--;
+  return messages.slice(0, end);
+}
+
 export function canonicalToolName(name: string): string {
   if (
     name === "exa_search" ||

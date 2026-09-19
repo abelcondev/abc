@@ -711,6 +711,7 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     try expectGatewayPromptTextCount(&gateway, 2, "FX logo", 1);
     try expectGatewayPromptTailText(&gateway, 2, .user, "runtime context over vision tail");
     try expectGatewayPromptTextCount(&gateway, 3, "Continue from the preceding tool result.", 1);
+    try expectBodyContainsInOrder(&gateway, 3, &.{ "FX logo", "Continue from the preceding tool result.", "runtime context over vision tail" });
     try expectGatewayPromptTailText(&gateway, 3, .user, "runtime context over vision tail");
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
@@ -4531,7 +4532,7 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
     }
 }
 
-test "processQueuedPrompt places transient overlay before history and current prompt" {
+test "processQueuedPrompt places transient overlay after history and current prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "No" }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -5222,7 +5223,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
     }
 }
 
-test "processQueuedPrompt keeps completed history before the final current user prompt" {
+test "processQueuedPrompt keeps completed history before the current user prompt" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("prior user structural needle") },

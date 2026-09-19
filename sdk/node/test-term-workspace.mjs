@@ -115,7 +115,11 @@ function textResponse(value) {
 }
 
 // The volatile runtime context rides the message tail as trailing user
-// messages; locate the last conversation user message instead.
+// messages; locate the last conversation user message instead. Mirrors
+// isRuntimeOverlayMessage in tests/e2e/conditional-guidance-oracle.ts (the
+// source of truth for the markers); plain node here cannot import the TS
+// oracle, and the subagent-delivery and explicit-skill markers do not occur
+// in this fixture's traffic.
 function lastConversationUserIndex(prompt) {
   for (let index = prompt.length - 1; index >= 0; index -= 1) {
     const message = prompt[index];

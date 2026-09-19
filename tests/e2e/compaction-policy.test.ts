@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
-	const { isRuntimeOverlayMessage, lastConversationUserIndex } = await import("./conditional-guidance-oracle");
+const { isRuntimeOverlayMessage, lastConversationUserIndex } = await import("./conditional-guidance-oracle");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 

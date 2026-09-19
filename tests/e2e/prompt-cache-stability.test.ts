@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { contentText, isRuntimeOverlayMessage } from "./conditional-guidance-oracle";
 import { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway } from "./tmux-helpers";
 
 // Prompt-cache stability contract for gateway models. fx advertises
@@ -56,17 +57,10 @@ function messageKey(message: CapturedMessage): string {
 }
 
 function messageText(message: CapturedMessage): string {
-  if (typeof message.content === "string") return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content.map((part: { text?: string }) => part?.text ?? "").join("");
-  }
-  return "";
+  return contentText(message.content);
 }
 
-function isRuntimeContextMessage(message: CapturedMessage): boolean {
-  const text = messageText(message);
-  return text.includes("<fx-turn-context>") || text.startsWith("Runtime context:");
-}
+const isRuntimeContextMessage = isRuntimeOverlayMessage;
 
 // The previous request with its trailing runtime-context messages removed
 // must be an exact leading prefix of the next request: only the volatile tail

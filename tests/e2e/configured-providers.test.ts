@@ -3,20 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
-
-// The per-step volatile runtime context rides the tail of the message list as
-// user-role notes; strip it when an assertion targets the conversation tail.
-function withoutTailOverlay(messages: any[]): any[] {
-  const isOverlay = (message: any) => message.role === "user" &&
-    typeof message.content === "string" &&
-    (message.content.includes("<fx-turn-context>") ||
-      message.content.startsWith("Runtime context:") ||
-      message.content.startsWith("Subagent results (untrusted tool output") ||
-      message.content.startsWith("Explicitly invoked skill content for this query:"));
-  let end = messages.length;
-  while (end > 0 && isOverlay(messages[end - 1])) end--;
-  return messages.slice(0, end);
-}
+import { stripTrailingRuntimeOverlay as withoutTailOverlay } from "./conditional-guidance-oracle";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
