@@ -1270,26 +1270,50 @@ pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]To
 /// source memory is owned by a shorter-lived scope (for example a parallel
 /// tool attempt whose run result is deinitialized after assembly).
 pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) !ToolResultMemory {
-    var copy = memory;
-    copy.tool_images = try dupeToolImages(alloc, memory.tool_images);
-    errdefer freeToolImages(alloc, copy.tool_images);
-    copy.tool_image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (copy.tool_image_handle) |handle| alloc.free(handle);
-    copy.output_handle = if (memory.output_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (copy.output_handle) |handle| alloc.free(handle);
-    copy.preview = if (memory.preview) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (copy.preview) |value| alloc.free(value);
-    copy.committed_file_presentation = if (memory.committed_file_presentation) |presentation|
+    const tool_images = try dupeToolImages(alloc, memory.tool_images);
+    errdefer freeToolImages(alloc, tool_images);
+    const tool_image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const output_handle = if (memory.output_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (output_handle) |handle| alloc.free(handle);
+    const preview = if (memory.preview) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (preview) |value| alloc.free(value);
+    const committed_file_presentation = if (memory.committed_file_presentation) |presentation|
         try dupeCommittedFilePresentation(alloc, presentation)
     else
         null;
-    errdefer if (copy.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
-    copy.command_output_replay = if (memory.command_output_replay) |replay|
+    errdefer if (committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
+    const command_output_replay = if (memory.command_output_replay) |replay|
         try dupeCommandOutputReplay(alloc, replay)
     else
         null;
-    errdefer if (copy.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
-    return copy;
+    errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    return .{
+        .review_feedback = memory.review_feedback,
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
+        .output_handle = output_handle,
+        .preview = preview,
+        .output_bytes = memory.output_bytes,
+        .stored_output_bytes = memory.stored_output_bytes,
+        .truncated = memory.truncated,
+        .model_view_covers_full_file = memory.model_view_covers_full_file,
+        .committed_file_presentation = committed_file_presentation,
+        .command_output_replay = command_output_replay,
+        .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
+    };
+}
+
+/// Frees the slice-bearing fields of a ToolResultMemory owned by the caller,
+/// as produced by dupeToolResultMemory.
+pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) void {
+    freeToolImages(alloc, memory.tool_images);
+    if (memory.tool_image_handle) |handle| alloc.free(handle);
+    if (memory.output_handle) |handle| alloc.free(handle);
+    if (memory.preview) |value| alloc.free(value);
+    if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
+    if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -1341,11 +1365,25 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
     }
     try std.testing.expect(copy.command_process_presentation.? == .exit_code);
 
-    freeToolImages(alloc, copy.tool_images);
-    alloc.free(copy.tool_image_handle.?);
-    alloc.free(copy.output_handle.?);
-    alloc.free(copy.preview.?);
-    freeCommandOutputReplay(alloc, copy.command_output_replay.?);
+    freeToolResultMemory(alloc, copy);
+}
+
+test "dupeToolResultMemory frees only its own copies on allocation failure" {
+    const source: ToolResultMemory = .{
+        .tool_images = &.{.{ .data = @constCast("aW1hZ2U="), .mime_type = @constCast("image/png") }},
+        .tool_image_handle = "image-result-1",
+        .output_handle = "result-1",
+        .preview = "preview",
+        .command_output_replay = .{ .available = .{ .handle = "cmd-replay-1", .framed_bytes = 7 } },
+    };
+    // Every allocation failure point must leave the source's slices untouched
+    // and release exactly what the partial copy allocated.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(alloc: std.mem.Allocator) !void {
+            const copy = try dupeToolResultMemory(alloc, source);
+            freeToolResultMemory(alloc, copy);
+        }
+    }.check, .{});
 }
 
 /// A cut in the active context, not a second persisted history.
