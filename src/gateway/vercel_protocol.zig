@@ -648,16 +648,21 @@ fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMe
     var has_images = false;
     for (results) |result| {
         const memory = result.tool_result_memory orelse continue;
-        if (memory.tool_images.len > 0) {
-            has_images = true;
-            break;
-        }
+        if (memory.tool_images.len == 0) continue;
+        const failed = if (result.tool_result_status) |status| status == .failure else false;
+        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
+        has_images = true;
+        break;
     }
     if (!has_images) return;
     try writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
     try writer.writeByte('}');
     for (results) |result| {
+        // Mirror the tool-result gate: images from permission-denied results
+        // never leave the process.
+        const failed = if (result.tool_result_status) |status| status == .failure else false;
+        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
         const memory = result.tool_result_memory orelse continue;
         for (memory.tool_images) |image| {
             if (budget) |active| try active.check();
