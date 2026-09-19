@@ -8866,7 +8866,7 @@ test "command tool rows reclip to live width across lifecycle states" {
 
     // The active row reclips to the live width and keeps its own label.
     try expectGridContains(&h, "Running " ++ command);
-    try expectGridLacks(&h, frozen_command);
+    try expectGridNotContains(&h, frozen_command);
 
     // Settled success: the frozen "Ran" phrase reclips the same way.
     _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
@@ -8877,7 +8877,7 @@ test "command tool rows reclip to live width across lifecycle states" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     try expectGridContains(&h, "Ran " ++ command);
-    try expectGridLacks(&h, frozen_command);
+    try expectGridNotContains(&h, frozen_command);
 
     // Settled with a nonzero exit: the settled label carries the exit code,
     // which the start-time predicted label ("Ran") cannot know.
@@ -8898,27 +8898,13 @@ test "command tool rows reclip to live width across lifecycle states" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     try expectGridContains(&h, "Exited 1 " ++ command);
-    try expectGridLacks(&h, frozen_command);
+    try expectGridNotContains(&h, frozen_command);
 
     // Reclipped rows still respect the live width: narrow them and the row
     // folds to the width with the single-cell clip marker, not the frozen
     // generation marker.
     try h.driveResize(90, 30, 4, true);
-    try expectGridLacks(&h, full_tail);
+    try expectGridNotContains(&h, full_tail);
     try h.driveResize(200, 30, 4, true);
     try expectGridContains(&h, "Exited 1 " ++ command);
-}
-
-fn expectGridLacks(h: *Harness, needle: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(h.alloc);
-    var r: u16 = 1;
-    while (r <= h.vt.rows) : (r += 1) {
-        buf.clearRetainingCapacity();
-        try h.vt.rowText(r, &buf);
-        if (std.mem.find(u8, buf.items, needle) != null) {
-            std.debug.print("grid unexpectedly contained '{s}' in row {d}: '{s}'\n", .{ needle, r, buf.items });
-            return error.TestUnexpectedGridContent;
-        }
-    }
 }
