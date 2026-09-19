@@ -2741,7 +2741,7 @@ fn settleFailedContextGate(
     original_error: anyerror,
 ) anyerror {
     var settlement_arena_state = std.heap.ArenaAllocator.init(provisional_alloc);
-    defer settlement_arena_state.deinit();
+    defer mem_utils.deinit_arena(settlement_arena_state);
     const settlement_arena = settlement_arena_state.allocator();
     for (calls) |call| {
         _ = provisional_statuses.settleAdmittedCall(
@@ -3843,7 +3843,7 @@ fn persistRecoveryCheckpoint(
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer scratch.deinit();
+    defer mem_utils.deinit_arena(scratch);
     const arena = scratch.allocator();
     const execution = try runtime_execution_memory.buildExecutionMemory(
         arena,
@@ -5193,7 +5193,7 @@ fn processQueuedPromptInner(
     agent: *runtime_agent.Agent,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var job = borrowed_job;
     job.account_id = if (borrowed_job.account_id) |account_id|
@@ -5261,7 +5261,7 @@ fn processQueuedPromptInner(
     // The overlay arena is reset for every model step so refreshed env,
     // background snapshots do not accumulate for the whole turn.
     var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer overlay_arena_state.deinit();
+    defer mem_utils.deinit_arena(overlay_arena_state);
 
     var local_grants: std.ArrayList(PermissionGrant) = .empty;
     defer local_grants.deinit(arena);
@@ -11031,7 +11031,7 @@ fn processQueuedPromptLoop(
             if (is_file_mutation) {
                 file_call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             }
-            defer if (is_file_mutation) file_call_arena_state.deinit();
+            defer if (is_file_mutation) mem_utils.deinit_arena(file_call_arena_state);
             const call_allocator = if (is_file_mutation)
                 file_call_arena_state.allocator()
             else

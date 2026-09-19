@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -501,7 +502,7 @@ pub const Store = struct {
 
             const original_fingerprint = fingerprintOptional(existing);
             var arena_state = std.heap.ArenaAllocator.init(alloc);
-            defer arena_state.deinit();
+            defer mem_utils.deinit_arena(arena_state);
             const arena = arena_state.allocator();
 
             var root = if (existing) |bytes|

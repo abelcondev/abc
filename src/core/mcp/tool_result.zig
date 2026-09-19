@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -139,7 +140,7 @@ pub fn protocol_diagnostic_alloc(
     data_json: ?[]const u8,
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(scratch);
     try write_protocol_diagnostic(
@@ -157,7 +158,7 @@ pub fn format_protocol_error(
     protocol_error: protocol_negotiation.ProtocolError,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(arena);
 
@@ -238,7 +239,7 @@ fn render_owned_protocol_error(
     max_tool_result_bytes: usize,
 ) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(scratch);
     try write_protocol_diagnostic(
@@ -310,7 +311,7 @@ fn serialize_capped(
     max_tool_result_bytes: usize,
 ) ![]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
+    defer mem_utils.deinit_arena(arena_impl);
     const arena = arena_impl.allocator();
 
     var full = std.Io.Writer.Allocating.init(arena);

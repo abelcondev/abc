@@ -11,6 +11,7 @@ const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -3521,7 +3522,7 @@ pub fn Runtime(comptime App: type) type {
                 /// session label so resumed rows reclip to the live width.
                 fn attachSessionCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
                     var scratch_state = std.heap.ArenaAllocator.init(self.projection.alloc);
-                    defer scratch_state.deinit();
+                    defer mem_utils.deinit_arena(scratch_state);
                     const scratch = scratch_state.allocator();
                     const label = tooling_presentation.terminalSessionCompletedActionLabel(
                         scratch,
@@ -3908,7 +3909,7 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) Allocator.Error!void {
             var scratch_state = std.heap.ArenaAllocator.init(app.alloc);
-            defer scratch_state.deinit();
+            defer mem_utils.deinit_arena(scratch_state);
             const scratch = scratch_state.allocator();
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return;
             const command = tool_args.optionalStringArg(args, "command") orelse return;
@@ -4174,7 +4175,7 @@ pub fn Runtime(comptime App: type) type {
             labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
+            defer mem_utils.deinit_arena(action_arena);
             const action = try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
@@ -4319,7 +4320,7 @@ pub fn Runtime(comptime App: type) type {
             const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
+            defer mem_utils.deinit_arena(action_arena);
             const session_target = historicalSessionTarget(action_arena.allocator(), labels, call);
             const command_decision = if (is_command)
                 try tool_presentation.commandOutcomeDecision(
@@ -4571,7 +4572,7 @@ pub fn Runtime(comptime App: type) type {
             errdefer if (owns_payload) diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
+            defer mem_utils.deinit_arena(action_arena);
             const base = try app.describeToolActionCompletedWithAdvertised(
                 action_arena.allocator(),
                 call,
@@ -4616,7 +4617,7 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "writeHistoricalQuestionResolution")) return false;
 
             var answer_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer answer_arena.deinit();
+            defer mem_utils.deinit_arena(answer_arena);
             const answers = (try question_answer.decodeJson(
                 answer_arena.allocator(),
                 result.output,

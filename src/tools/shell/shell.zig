@@ -7,6 +7,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
 const terminal_action_executor = @import("../../core/terminal/action_executor.zig");
@@ -110,7 +111,7 @@ fn decode_input(
     args_json: []const u8,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolInput {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -181,7 +182,7 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
 // Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     if (args_json.len > 16 * 1024) {
         return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
@@ -465,7 +466,7 @@ pub fn validate(
 ) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(OwnedInput).value;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     return switch (input.action) {
         .run => validateRun(ctx, arena, input),
@@ -534,7 +535,7 @@ fn callRun(
     };
     const command = input.command orelse return unavailable(ctx);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer request_arena_state.deinit();
+    defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     const cwd = resolveCwd(request_arena, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -687,7 +688,7 @@ fn callTtyRun(
     };
     defer ctx.allocator.free(@constCast(cwd));
     var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer shell_arena_state.deinit();
+    defer mem_utils.deinit_arena(shell_arena_state);
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|

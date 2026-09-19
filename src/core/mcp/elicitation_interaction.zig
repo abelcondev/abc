@@ -1,6 +1,7 @@
 const std = @import("std");
 const elicitation = @import("elicitation.zig");
 const mrtr = @import("mrtr.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -514,7 +515,7 @@ fn answerCompactField(
     questioner: Questioner,
 ) Error!FieldAnswer {
     var arena: std.heap.ArenaAllocator = .init(alloc);
-    defer arena.deinit();
+    defer mem_utils.deinit_arena(arena);
     const temp = arena.allocator();
     const display_name = try terminalSafeAlloc(temp, field.displayName());
     const description = try terminalSafeAlloc(temp, field.description orelse "");

@@ -26,6 +26,7 @@ const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -136,7 +137,7 @@ pub fn run(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);

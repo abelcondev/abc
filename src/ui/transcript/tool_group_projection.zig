@@ -3,6 +3,7 @@ const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const ui_render = @import("../render.zig");
@@ -578,7 +579,7 @@ fn formatGroupBlock(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -750,7 +751,7 @@ fn formatExpandedChild(
     cols: u16,
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     const raw_phrase = switch (entry) {
         .raw_bytes => |raw| try normalizeStatusPhrase(scratch, raw.bytes),

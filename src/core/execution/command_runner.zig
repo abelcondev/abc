@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -606,7 +607,7 @@ pub fn executeCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -629,7 +630,7 @@ pub fn executeCommandInEnvironment(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -1861,7 +1862,7 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 
     try writer.print("<{s}>\n", .{label});
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     if (preview.total_bytes <= preview.max_bytes) {

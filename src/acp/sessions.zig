@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const mem_utils = @import("../core/shared/mem_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
@@ -1058,7 +1059,7 @@ fn handleLoadFailure(
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     var params_arena = std.heap.ArenaAllocator.init(alloc);
-    defer params_arena.deinit();
+    defer mem_utils.deinit_arena(params_arena);
     const params = parseListSessionsParams(params_arena.allocator(), msg) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1312,7 +1313,7 @@ fn sendExecutionHistory(
 ) !void {
     if (execution.isEmpty()) return;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const frames = try planExecutionReplay(
         arena_state.allocator(),
         tool_call_presentation.activeToolRegistry(state),
