@@ -64,6 +64,26 @@ pub const ProgressSink = struct {
     }
 };
 
+/// Resolves a creation-time model override against the host's model catalog.
+/// Returned slices are allocated from the passed allocator and must remain
+/// valid for the duration of the `executeManaged` call.
+pub const ModelOverrideResolver = struct {
+    context: ?*anyopaque = null,
+    resolve_fn: *const fn (
+        ?*anyopaque,
+        Allocator,
+        []const u8,
+    ) Allocator.Error!model_contract.ModelCatalogMatch,
+
+    pub fn resolve(
+        self: ModelOverrideResolver,
+        alloc: Allocator,
+        raw_model: []const u8,
+    ) Allocator.Error!model_contract.ModelCatalogMatch {
+        return self.resolve_fn(self.context, alloc, raw_model);
+    }
+};
+
 pub const ExecuteOptions = struct {
     caller_id: []const u8,
     invocation_id: []const u8,
@@ -79,6 +99,7 @@ pub const ExecuteOptions = struct {
     steering_worker: ?*worker_runtime.WorkerRuntime = null,
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
+    model_override_resolver: ?ModelOverrideResolver = null,
 };
 
 pub const ManagedExecutionResult = struct {
@@ -243,6 +264,10 @@ pub const Runtime = struct {
                         .error_code = "caller_unavailable",
                     });
                 }
+                const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, request.override(), options)) {
+                    .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
+                    .accepted => |model| model,
+                };
                 var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer admission_arena.deinit();
                 var queued_receipt: ?ManagedExecutionResult = null;
@@ -262,6 +287,7 @@ pub const Runtime = struct {
                         request.*,
                         operation_id,
                         options,
+                        resolved_model,
                     );
                     defer admitted.deinit(admission_alloc);
                     switch (admitted) {
@@ -310,7 +336,7 @@ pub const Runtime = struct {
                                 alloc,
                                 ready.child_id,
                                 operation_id,
-                                effectiveDefaults(options.defaults, request.override()),
+                                effectiveDefaults(options.defaults, request.override(), resolved_model),
                                 options.progress,
                                 options.cancel_flag,
                                 options.steering_worker,
@@ -328,6 +354,76 @@ pub const Runtime = struct {
                 }
             },
         };
+    }
+
+    const OverrideModelResolution = union(enum) {
+        /// Resolved canonical catalog ID, or null to keep the raw override.
+        accepted: ?[]const u8,
+        rejected: model_contract.Result,
+    };
+
+    /// Resolves a creation-time model override against the model catalog before
+    /// any child session exists, so an unknown or ambiguous name fails fast
+    /// with actionable guidance instead of dying in the child after a wasted
+    /// gateway request. Without a resolver (or a ready catalog) the raw
+    /// override passes through and the gateway remains the final arbiter.
+    fn resolveOverrideModel(
+        alloc: Allocator,
+        override: model_contract.Override,
+        options: ExecuteOptions,
+    ) !OverrideModelResolution {
+        const raw_model = override.model orelse return .{ .accepted = null };
+        // Only the gateway catalog is an authoritative model list. Configured
+        // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
+        // so overrides for those children pass through to the provider.
+        if (options.defaults.provider != .gateway) {
+            debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
+            return .{ .accepted = null };
+        }
+        const resolver = options.model_override_resolver orelse {
+            debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
+            return .{ .accepted = null };
+        };
+        switch (try resolver.resolve(alloc, raw_model)) {
+            .no_catalog => {
+                debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_catalog", .{raw_model});
+                return .{ .accepted = null };
+            },
+            .matched => |id| {
+                if (!std.mem.eql(u8, id, raw_model)) {
+                    debug_trace.logf(
+                        "subagent",
+                        "model override resolved raw={s} resolved={s}",
+                        .{ raw_model, id },
+                    );
+                }
+                return .{ .accepted = id };
+            },
+            .ambiguous => |candidates| {
+                debug_trace.logf(
+                    "subagent",
+                    "model override rejected raw={s} code=ambiguous_model candidates={d}",
+                    .{ raw_model, candidates.len },
+                );
+                return .{ .rejected = .{
+                    .ok = false,
+                    .error_code = "ambiguous_model",
+                    .result = try modelOverrideFailureMessage(alloc, .ambiguous, raw_model, candidates),
+                } };
+            },
+            .unknown => |candidates| {
+                debug_trace.logf(
+                    "subagent",
+                    "model override rejected raw={s} code=unknown_model candidates={d}",
+                    .{ raw_model, candidates.len },
+                );
+                return .{ .rejected = .{
+                    .ok = false,
+                    .error_code = "unknown_model",
+                    .result = try modelOverrideFailureMessage(alloc, .unknown, raw_model, candidates),
+                } };
+            },
+        }
     }
 
     fn managedOwnerValue(self: *Runtime) managed_owner.Owner {
@@ -386,13 +482,14 @@ pub const Runtime = struct {
         request: model_contract.Request,
         operation_id: []const u8,
         options: ExecuteOptions,
+        resolved_model: ?[]const u8,
     ) !ManagedAdmission {
         // A running registry entry must not be exposed before its Slot exists.
         // Release the registry lock before taking the managed-owner lock.
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
-        var admitted = try self.admitManagedWork(alloc, request, operation_id, options);
+        var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
@@ -412,9 +509,10 @@ pub const Runtime = struct {
         request: model_contract.Request,
         operation_id: []const u8,
         options: ExecuteOptions,
+        resolved_model: ?[]const u8,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
-        const defaults = effectiveDefaults(options.defaults, request.override());
+        const defaults = effectiveDefaults(options.defaults, request.override(), resolved_model);
         debug_trace.logf(
             "subagent",
             "admission requested operation={s} action={s} agent={s} override={s}",
@@ -1368,7 +1466,7 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     };
     const work_id = try operationIdAlloc(alloc, options.invocation_id, options.identity_epoch);
     defer alloc.free(work_id);
-    var admitted = try runtime.admitManagedWork(alloc, request, work_id, options);
+    var admitted = try runtime.admitManagedWork(alloc, request, work_id, options, null);
     defer admitted.deinit(alloc);
     const child_id = admitted.ready.child_id;
     try runtime.retainYielded(child_id, work_id, options.max_result_bytes, 64);
@@ -1486,20 +1584,217 @@ test "creation defaults keep parent values unless the request overrides them" {
         .effort = .auto,
         .conversation_language = session.ConversationLanguage.default(),
     };
-    const inherited = effectiveDefaults(parent, .{});
+    const inherited = effectiveDefaults(parent, .{}, null);
     try std.testing.expectEqualStrings("parent-model", inherited.model);
     try std.testing.expect(inherited.effort.isDefault());
     const overridden = effectiveDefaults(parent, .{
         .model = "gpt-5.6-sol-fast",
         .effort = types.ReasoningEffort.parse("medium"),
-    });
+    }, null);
     try std.testing.expectEqualStrings("gpt-5.6-sol-fast", overridden.model);
     try std.testing.expectEqualStrings("medium", overridden.effort.label());
     try std.testing.expectEqual(parent.provider, overridden.provider);
     // Model-only and effort-only overrides leave the other value inherited.
-    const model_only = effectiveDefaults(parent, .{ .model = "other-model" });
+    const model_only = effectiveDefaults(parent, .{ .model = "other-model" }, null);
     try std.testing.expectEqualStrings("other-model", model_only.model);
     try std.testing.expect(model_only.effort.isDefault());
+    // A catalog-resolved model wins over the raw override text.
+    const resolved = effectiveDefaults(parent, .{ .model = "terra-fast" }, "openai/gpt-5.6-terra-fast");
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", resolved.model);
+    // Without an override there is nothing to resolve.
+    const no_override = effectiveDefaults(parent, .{}, "openai/gpt-5.6-terra-fast");
+    try std.testing.expectEqualStrings("parent-model", no_override.model);
+}
+
+const OverrideResolverFixture = struct {
+    runs: usize = 0,
+    observed_model: ?[]u8 = null,
+    catalog: []const []const u8 = &.{ "openai/gpt-5.6-terra", "openai/gpt-5.6-terra-fast", "openai/gpt-6-astra" },
+
+    fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+        return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+    }
+
+    fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.runs += 1;
+        self.observed_model = std.testing.allocator.dupe(u8, turn.loaded.state.preferences.model) catch return error.ProviderFailed;
+        if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
+        turn.commit(turn.active_work_id.?, .{ .assistant = .{
+            .user = .{ .text = message.content },
+            .assistant = @constCast("CHILD_OK"),
+        } }, 0, 0, 2) catch return error.ProviderFailed;
+        return .completed;
+    }
+
+    fn resolveModel(raw: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!model_contract.ModelCatalogMatch {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        return model_contract.matchCatalogModel(alloc, self.catalog, raw_model);
+    }
+};
+
+fn overrideResolverFixtureRuntime(
+    alloc: Allocator,
+    fixture: *OverrideResolverFixture,
+    sessions: *session_store.Store,
+) !*Runtime {
+    return Runtime.create(alloc, sessions, "override-parent", .{ .resolve_fn = OverrideResolverFixture.resolve }, .{ .context = fixture, .run_fn = OverrideResolverFixture.run });
+}
+
+test "model override resolves against the catalog before child creation" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("override-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    defer runtime.deinit();
+
+    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra-fast" } });
+    defer request.deinit(alloc);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = "override-parent",
+        .invocation_id = "override-resolve",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    });
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.find(u8, result.body, "CHILD_OK") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", fixture.observed_model.?);
+}
+
+test "unknown and ambiguous model overrides reject before any child session" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("override-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    defer runtime.deinit();
+
+    const options = ExecuteOptions{
+        .caller_id = "override-parent",
+        .invocation_id = "override-reject",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    };
+
+    var unknown = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "skldjf" } });
+    defer unknown.deinit(alloc);
+    const unknown_result = try runtime.executeManaged(arena, &unknown, options);
+    try std.testing.expect(!unknown_result.success);
+    try std.testing.expect(std.mem.find(u8, unknown_result.body, "\"error_code\":\"unknown_model\"") != null);
+    try std.testing.expect(std.mem.find(u8, unknown_result.body, "skldjf") != null);
+    try std.testing.expect(std.mem.find(u8, unknown_result.body, "omit model to inherit") != null);
+
+    var ambiguous = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra" } });
+    defer ambiguous.deinit(alloc);
+    const ambiguous_result = try runtime.executeManaged(arena, &ambiguous, options);
+    try std.testing.expect(!ambiguous_result.success);
+    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "\"error_code\":\"ambiguous_model\"") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra-fast") != null);
+
+    // Rejections never created or ran a child.
+    try std.testing.expectEqual(@as(usize, 0), fixture.runs);
+    var lock = try runtime.managed.state_store.acquireLock(alloc);
+    defer lock.release();
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), registry.children.len);
+}
+
+test "model override passes through for non-gateway providers" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("override-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    defer runtime.deinit();
+
+    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "unknown-model" } });
+    defer request.deinit(alloc);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = "override-parent",
+        .invocation_id = "override-non-gateway",
+        .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    });
+
+    // The configured provider accepts arbitrary model IDs, so the raw override
+    // reaches the child even though the gateway catalog lacks it.
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
@@ -1662,15 +1957,55 @@ fn assistantTextForWork(
     return null;
 }
 
-/// Resolves the defaults used to seed a new child session. The returned value
-/// borrows `override.model` from the request; both the request and the
-/// original defaults must outlive the result.
+/// Builds the parent-facing guidance for a rejected model override.
+fn modelOverrideFailureMessage(
+    alloc: Allocator,
+    comptime kind: enum { ambiguous, unknown },
+    raw_model: []const u8,
+    candidates: []const []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    switch (kind) {
+        .ambiguous => {
+            try writer.print("model override '{s}' matches multiple catalog models: ", .{raw_model});
+            for (candidates, 0..) |candidate, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writer.writeAll(candidate);
+            }
+            try writer.writeAll(". Retry with an exact catalog model ID.");
+        },
+        .unknown => {
+            try writer.print("unknown model override '{s}'", .{raw_model});
+            if (candidates.len > 0) {
+                try writer.writeAll(". Closest catalog matches: ");
+                for (candidates, 0..) |candidate, index| {
+                    if (index > 0) try writer.writeAll(", ");
+                    try writer.writeAll(candidate);
+                }
+                try writer.writeByte('.');
+            } else {
+                try writer.writeAll("; no catalog model names match it.");
+            }
+            try writer.writeAll(" Use an exact catalog model ID, or omit model to inherit the parent's model.");
+        },
+    }
+    return out.toOwnedSlice();
+}
+
+/// Resolves the defaults used to seed a new child session. When the override
+/// passed catalog resolution, `resolved_model` is the canonical catalog ID and
+/// wins over the raw override text. The returned value borrows the override or
+/// resolved model; the request, the resolved model, and the original defaults
+/// must outlive the result.
 fn effectiveDefaults(
     defaults: Defaults,
     override: model_contract.Override,
+    resolved_model: ?[]const u8,
 ) Defaults {
     var resolved = defaults;
-    if (override.model) |model| resolved.model = model;
+    if (override.model) |model| resolved.model = resolved_model orelse model;
     if (override.effort) |effort| resolved.effort = effort;
     return resolved;
 }
