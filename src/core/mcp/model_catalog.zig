@@ -57,17 +57,13 @@ pub const PromptSection = struct {
 
 /// A catalog snapshot paired with an optional model-visible note describing
 /// how server availability changed since the previously reported snapshot.
-/// Callers using a request arena may skip `deinit` and let the arena retain
-/// both values, matching the `render` convention.
+/// Ownership follows the `render` convention: callers using a request arena
+/// may skip deinit and let the arena retain both values; a caller that frees
+/// the snapshot itself must keep `change_notice` alive for as long as the
+/// request messages reference it.
 pub const Report = struct {
     snapshot: Snapshot,
     change_notice: ?[]u8 = null,
-
-    pub fn deinit(self: *Report, alloc: Allocator) void {
-        self.snapshot.deinit(alloc);
-        if (self.change_notice) |notice| alloc.free(notice);
-        self.* = undefined;
-    }
 };
 
 /// One server's availability as previously shown to the model. Names are
@@ -75,7 +71,6 @@ pub const Report = struct {
 pub const BaselineEntry = struct {
     name: []u8,
     availability: Availability,
-    tool_count: ?usize = null,
 };
 
 const max_change_notice_transitions: usize = 8;
@@ -444,7 +439,7 @@ test "render cleans up every partial allocation" {
 test "renderChangeNotice stays silent when availability is unchanged" {
     const alloc = std.testing.allocator;
     const baseline = [_]BaselineEntry{
-        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+        .{ .name = @constCast("linear"), .availability = .ready },
     };
     const current = [_]ServerSummary{
         .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 12 },
@@ -474,7 +469,7 @@ test "renderChangeNotice reports authentication recovery with tool count" {
 test "renderChangeNotice reports added and removed servers" {
     const alloc = std.testing.allocator;
     const baseline = [_]BaselineEntry{
-        .{ .name = @constCast("slack"), .availability = .ready, .tool_count = 3 },
+        .{ .name = @constCast("slack"), .availability = .ready },
     };
     const current = [_]ServerSummary{
         .{ .name = @constCast("notion"), .availability = .failed },

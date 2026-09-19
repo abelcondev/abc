@@ -1923,7 +1923,6 @@ pub const State = struct {
             next[index] = .{
                 .name = try baseline_alloc.dupe(u8, server.name),
                 .availability = server.availability,
-                .tool_count = server.tool_count,
             };
             initialized += 1;
         }
