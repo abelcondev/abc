@@ -241,6 +241,8 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
                 .effort = agent_settings.effort,
+                .provider_order = if (selected_provider == .gateway) agent_settings.provider_order else &.{},
+                .provider_strict = selected_provider == .gateway and agent_settings.provider_strict,
                 .first_call_tool_choice = agent_settings.first_call_tool_choice,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .subagent_host = if (comptime @hasField(App, "session_persistence"))
@@ -1319,6 +1321,8 @@ pub fn Runtime(comptime App: type) type {
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .effort = job.agent_settings.effort,
+                .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
+                .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = app.workspace_root,
                 .access_scope = appAccessScope(app),

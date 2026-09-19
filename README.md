@@ -71,6 +71,28 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
+## Gateway provider routing
+
+When the active model goes through the Vercel AI Gateway, one model is often served by several providers (for example Anthropic directly, AWS Bedrock, or Google Vertex). fx can tell the gateway which providers to use, in what order:
+
+```jsonc
+// ~/.fx/settings.json
+{
+  "provider_order": ["bedrock", "anthropic"], // try Bedrock first, then Anthropic
+  "provider_strict": false                     // true restricts requests to only these providers
+}
+```
+
+Both keys also work in a committed project `.fx.json`, and per launch:
+
+```bash
+fx --provider-order azure,openai --provider-strict
+fx ask --provider-order bedrock "review this change"
+FX_PROVIDER_ORDER=vertex fx
+```
+
+Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). Routing applies to gateway requests only; custom model connections ignore it.
+
 ## Themes
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
