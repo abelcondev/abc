@@ -47,75 +47,186 @@ pub fn highlight(
     }
 
     var index: usize = 0;
+    // Command-position state, used only by command_words profiles (shell):
+    // the next word is a command name unless a token says otherwise.
+    var command_position = profile.command_words;
     while (index < source.len) {
-        if (source[index] == '\n') {
+        const byte = source[index];
+        if (byte == '\n') {
             try styled.append(alloc, '\n');
+            command_position = profile.command_words;
             index += 1;
             continue;
         }
         if (blockCommentEnd(source, index, profile.block_comment)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
+            command_position = false;
             index = end;
             continue;
         }
         if (lineCommentEnd(source, index, profile.line_comments)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
+            command_position = false;
             index = end;
             continue;
         }
-        if (isQuote(source[index], profile.quotes)) {
+        if (isQuote(byte, profile.quotes)) {
             const end = quotedEnd(source, index);
-            try appendStyled(alloc, &styled, palette.string_style, source[index..end], base);
+            if (byte == '"' and profile.dollar_vars) {
+                try appendDoubleQuoted(alloc, &styled, palette, source[index..end], base);
+            } else {
+                try appendStyled(alloc, &styled, palette.string_style, source[index..end], base);
+            }
+            command_position = false;
             index = end;
             continue;
         }
         if (isNumberStart(source, index)) {
             const end = numberEnd(source, index);
-            try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
+            // Shell: bare number arguments stay plain (a run id is not a
+            // literal); only file descriptors glued to a redirect color.
+            if (profile.bare_numbers or fdContext(source, index, end)) {
+                try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
+            } else {
+                try styled.appendSlice(alloc, source[index..end]);
+            }
+            command_position = false;
             index = end;
             continue;
         }
-        if (profile.dollar_vars and source[index] == '$') {
+        if (profile.dollar_vars and byte == '$') {
+            // Command substitution reopens command position for its contents.
+            if (index + 1 < source.len and source[index + 1] == '(') {
+                try appendStyled(alloc, &styled, palette.keyword_style, "$(", base);
+                command_position = true;
+                index += 2;
+                continue;
+            }
             if (dollarVarEnd(source, index)) |end| {
                 try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+                command_position = false;
                 index = end;
                 continue;
             }
         }
-        if (profile.dash_flags and source[index] == '-') {
+        if (profile.dollar_vars and byte == '~' and tildeStart(source, index, profile.operators)) {
+            try appendStyled(alloc, &styled, palette.keyword_style, "~", base);
+            command_position = false;
+            index += 1;
+            continue;
+        }
+        if (profile.dash_flags and byte == '-') {
             if (flagEnd(source, index, profile.operators)) |end| {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
+                command_position = false;
                 index = end;
                 continue;
             }
         }
-        if (isOperatorChar(source[index], profile.operators)) {
+        if (isOperatorChar(byte, profile.operators)) {
             const end = operatorRunEnd(source, index, profile.operators);
-            try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+            const run = source[index..end];
+            try appendStyled(alloc, &styled, palette.keyword_style, run, base);
+            // Redirect targets are paths, not commands; `2>&1`-style runs too.
+            command_position = std.mem.findScalar(u8, run, '<') == null and
+                std.mem.findScalar(u8, run, '>') == null;
             index = end;
             continue;
         }
-        if (isIdentifierStart(source[index])) {
+        if (profile.command_words and byte == '`') {
+            // Backticks parse as code; their contents reopen command position.
+            try styled.append(alloc, byte);
+            command_position = true;
+            index += 1;
+            continue;
+        }
+        if (isIdentifierStart(byte)) {
             const end = identifierEnd(source, index);
             const token = source[index..end];
             // A word glued to a path separator is a path segment, not syntax:
             // /dev/null keeps "null" plain.
             const after_separator = index > 0 and source[index - 1] == '/';
-            if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
+            var styled_word = false;
+            if (profile.command_words) {
+                if (command_position and !after_separator) {
+                    try appendStyled(alloc, &styled, palette.keyword_style, token, base);
+                    styled_word = true;
+                }
+            } else if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.keyword_style, token, base);
+                styled_word = true;
             } else if (!after_separator and inList(token, profile.literals, profile.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.number_style, token, base);
-            } else {
-                try styled.appendSlice(alloc, token);
+                styled_word = true;
+            }
+            if (!styled_word) try styled.appendSlice(alloc, token);
+            // Control keywords are followed by the command they govern; an
+            // ordinary command word is followed by its arguments.
+            if (profile.command_words) {
+                command_position = styled_word and command_position and
+                    inList(token, &command_prefixes, .sensitive);
             }
             index = end;
             continue;
         }
-        try styled.append(alloc, source[index]);
+        try styled.append(alloc, byte);
+        if (!std.ascii.isWhitespace(byte)) command_position = false;
         index += 1;
     }
 
     return styled.toOwnedSlice(alloc);
+}
+
+/// Control keywords after which the next word is again a command.
+const command_prefixes = [_][]const u8{ "if", "then", "elif", "else", "while", "until", "do" };
+
+/// File descriptors glued to a redirect keep the number color when bare
+/// number arguments stay plain: the 2 in `2>` and the 1 in `>&1`.
+fn fdContext(source: []const u8, start: usize, end: usize) bool {
+    if (end < source.len and (source[end] == '>' or source[end] == '<')) return true;
+    if (start > 0 and (source[start - 1] == '>' or source[start - 1] == '<')) return true;
+    if (start > 1 and source[start - 1] == '&' and (source[start - 2] == '>' or source[start - 2] == '<')) return true;
+    return false;
+}
+
+/// A tilde opens a home path at a word boundary when a path or name follows.
+fn tildeStart(source: []const u8, index: usize, operators: []const u8) bool {
+    if (index > 0) {
+        const prev = source[index - 1];
+        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, operators) and prev != '(' and prev != '`') return false;
+    }
+    const next = index + 1;
+    return next < source.len and
+        (source[next] == '/' or isIdentifierStart(source[next]) or std.ascii.isDigit(source[next]));
+}
+
+/// Double-quoted spans interpolate in shell: `$name`, `${name}`, and `$(`
+/// take the keyword color while the rest keeps the string color.
+fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palette, text: []const u8, base: ?[]const u8) !void {
+    const inner_end = text.len - 1;
+    // The opening quote rides the first text chunk so the pair stays one span.
+    var chunk_start: usize = 0;
+    var i: usize = 1;
+    while (i < inner_end) {
+        if (text[i] == '$' and (i == 0 or text[i - 1] != '\\')) {
+            var var_end: ?usize = null;
+            if (i + 1 < inner_end and text[i + 1] == '(') {
+                var_end = i + 2;
+            } else if (dollarVarEndWithin(text, i, inner_end)) |end| {
+                var_end = end;
+            }
+            if (var_end) |end| {
+                if (chunk_start < i) try appendStyled(alloc, out, palette.string_style, text[chunk_start..i], base);
+                try appendStyled(alloc, out, palette.keyword_style, text[i..end], base);
+                i = end;
+                chunk_start = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if (chunk_start < inner_end) try appendStyled(alloc, out, palette.string_style, text[chunk_start..inner_end], base);
+    try appendStyled(alloc, out, palette.string_style, text[inner_end..], base);
 }
 
 fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8, base: ?[]const u8) !void {
@@ -195,15 +306,23 @@ fn operatorRunEnd(source: []const u8, start: usize, operators: []const u8) usize
     return end;
 }
 
-/// "$" opens a variable when a name, positional digit, or special parameter
-/// follows; a bare "$" stays plain text.
+/// "$" opens a variable when a name, braced name, positional digit, or
+/// special parameter follows; a bare "$" stays plain text.
 fn dollarVarEnd(source: []const u8, start: usize) ?usize {
+    return dollarVarEndWithin(source, start, source.len);
+}
+
+fn dollarVarEndWithin(source: []const u8, start: usize, limit: usize) ?usize {
     const next = start + 1;
-    if (next >= source.len) return null;
+    if (next >= limit) return null;
     const b = source[next];
+    if (b == '{') {
+        const close = std.mem.findScalarPos(u8, source, next + 1, '}') orelse return null;
+        return if (close < limit) close + 1 else null;
+    }
     if (std.ascii.isAlphabetic(b) or b == '_') {
         var end = next;
-        while (end < source.len and isIdentifierContinue(source[end])) end += 1;
+        while (end < limit and isIdentifierContinue(source[end])) end += 1;
         return end;
     }
     if (std.ascii.isDigit(b) or std.mem.findScalar(u8, "?#@*!$", b) != null) return next + 1;
@@ -403,7 +522,8 @@ test "base style wraps the span and restores after each token" {
     // The span opens with the base, and every token close re-establishes it.
     try std.testing.expect(std.mem.startsWith(u8, styled, "<base>\x1b[38;5;252mecho\x1b[39m<base> "));
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m42\x1b[39m<base>") != null);
+    // Bare number arguments stay plain in shell.
+    try std.testing.expect(std.mem.endsWith(u8, styled, "<base> 42"));
 }
 
 test "a theme with syntax disabled passes the source through" {
@@ -472,9 +592,8 @@ test "dash flags color as units only at word boundaries" {
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-8\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m--json\x1b[39m") != null);
     // A lone dash (stdin marker) stays plain between the verb and the
-    // redirect; "in" colors as the shell keyword it literally is.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252min\x1b[39m") != null);
+    // redirect, and the redirect target is an argument, not a keyword.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m in") != null);
 
     // Flags after operators still count as boundaries.
     const after_pipe = try highlight(alloc, "echo x | head -1", languages.resolve("sh").?, .dark, null);
@@ -485,4 +604,71 @@ test "dash flags color as units only at word boundaries" {
     const zig_src = try highlight(alloc, "a - b", languages.resolve("zig").?, .dark, null);
     defer alloc.free(zig_src);
     try std.testing.expectEqualStrings("a - b", zig_src);
+}
+
+test "command position colors any command word and only command words" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "gh run list | xargs echo > out.txt", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    // Unknown binaries color in command position, matching the bash grammar's
+    // variable.function; a builtin used as an argument stays plain, and the
+    // redirect target is a path, not a command.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mgh\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mxargs\x1b[39m") != null);
+    // echo is an argument here and stays plain; the redirect target too.
+    try std.testing.expect(std.mem.indexOf(u8, styled, " echo \x1b[38;5;252m>\x1b[39m out.txt") != null);
+
+    // Control keywords hand command position to the command they govern.
+    const chain = try highlight(alloc, "if cd /x; then echo hi; fi", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(chain);
+    for ([_][]const u8{ "if", "cd", "then", "echo", "fi" }) |word| {
+        const wrapped = try std.fmt.allocPrint(alloc, "\x1b[38;5;252m{s}\x1b[39m", .{word});
+        defer alloc.free(wrapped);
+        try std.testing.expect(std.mem.indexOf(u8, chain, wrapped) != null);
+    }
+}
+
+test "bare number arguments stay plain but redirect fds color" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "sleep 5; exit 7 2>&1", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, " 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, " 7 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m1\x1b[39m") != null);
+}
+
+test "braced variables tildes globs and substitution parse like the grammar" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "cp ${SRC}/*.log ~/out && echo $(date +%F)", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m${SRC}\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m*\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m~\x1b[39m/out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$(\x1b[39m") != null);
+    // The substitution contents open in command position.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mdate\x1b[39m") != null);
+
+    // Backtick contents parse as code rather than one flat string.
+    const ticks = try highlight(alloc, "echo `uname -s`", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(ticks);
+    try std.testing.expect(std.mem.indexOf(u8, ticks, "`\x1b[38;5;252muname\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ticks, "\x1b[38;5;250m-s\x1b[39m") != null);
+}
+
+test "double quotes interpolate variables inside the string color" {
+    const alloc = std.testing.allocator;
+    const styled = try highlight(alloc, "echo \"hi $USER from ${HOME}\"", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m\"hi \x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$USER\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m${HOME}\x1b[39m") != null);
+    // Single quotes do not interpolate.
+    const single = try highlight(alloc, "echo '$USER'", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(single);
+    try std.testing.expect(std.mem.indexOf(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
 }

@@ -2254,7 +2254,8 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, active, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, active, "▸") == null);
     try std.testing.expect(std.mem.find(u8, active, "Running") != null);
-    try std.testing.expect(std.mem.find(u8, active, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, active, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, active, " build") != null);
 
     const completed = try app.describeToolActionCompleted(arena, run_call);
     try std.testing.expect(std.mem.find(u8, completed, "● ") != null);
@@ -2262,11 +2263,13 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, completed, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, completed, "▸") == null);
     try std.testing.expect(std.mem.find(u8, completed, "Ran") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, " build") != null);
 
     const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
     try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
-    try std.testing.expect(std.mem.find(u8, denied, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, denied, " build") != null);
 
     const malformed_registered: ToolCall = .{
         .id = "malformed_registered",
@@ -3459,8 +3462,9 @@ test "app agent runtime highlights shell command rows over the tool text base" {
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
-    // The pipe takes the keyword color and the flag the number color; plain
-    // bytes are intact beneath the styling.
+    // The pipe and the command after it take the keyword color, the flag the
+    // number color; plain bytes are intact beneath the styling.
     try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "wc \x1b[38;5;250m-c\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

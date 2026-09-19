@@ -2400,7 +2400,7 @@ test "nonzero command remains Ran in the current compact projection" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mfalse\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mfalse\x1b[39m") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ exit code 7"));
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
@@ -2518,7 +2518,8 @@ test "nonzero streamed command reuses its active output block" {
     defer source.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mprintf\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252m;\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "exit \x1b[38;5;250m7\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mexit\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m7\x1b[39m") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
 
@@ -3079,7 +3080,7 @@ test "historical nonzero command keeps replay ownership outside compact sideband
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ "));
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;250mfalse\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mfalse\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ exit code 7") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ … 2 lines more") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ five") == null);
@@ -3380,7 +3381,7 @@ test "command output consolidation preserves current compact ownership" {
     var completed = try runtime.prepareTranscriptSource(alloc, null);
     defer completed.deinit(alloc);
 
-    const status_pos = std.mem.indexOf(u8, completed.bytes, "Ran stream") orelse
+    const status_pos = std.mem.indexOf(u8, completed.bytes, "stream") orelse
         return error.MissingCommandStatus;
     try std.testing.expect(std.mem.indexOf(u8, completed.bytes, "STREAM 001") == null);
     try std.testing.expect(status_pos < completed.bytes.len);
@@ -3926,9 +3927,9 @@ test "command output consolidation keeps compact tool order" {
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
 
-    const first_status = std.mem.indexOf(u8, compact.bytes, "Ran first") orelse
+    const first_status = std.mem.indexOf(u8, compact.bytes, "first") orelse
         return error.MissingFirstStatus;
-    const second_status = std.mem.indexOf(u8, compact.bytes, "Ran second") orelse
+    const second_status = std.mem.indexOf(u8, compact.bytes, "second") orelse
         return error.MissingSecondStatus;
 
     try std.testing.expect(first_status < second_status);
