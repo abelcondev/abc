@@ -122,13 +122,19 @@ const gateway = createServer((request, response) => {
       return;
     }
     if (imageMode) {
-      const parts = JSON.parse(body).prompt.flatMap((message) => message.content ?? []);
+      const prompt = JSON.parse(body).prompt;
+      const parts = prompt.flatMap((message) => message.content ?? []);
       const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "mcp_1");
       assert.equal(result?.output.type, "content", JSON.stringify(result?.output));
-      assert.deepEqual(result.output.value.find((part) => part.type === "image-data"), { type: "image-data", data: imageData, mediaType: "image/png" });
-      if (imageOnly) assert.ok(result.output.value.every((part) => part.type === "image-data"));
+      assert.ok(result.output.value.every((part) => part.type === "text"));
+      if (imageOnly) assert.equal(result.output.value.length, 1);
       else assert.ok(result.output.value.some((part) => part.type === "text" && part.text.includes("screenshot")));
       if (imageError) assert.ok(result.output.value.some((part) => part.type === "text" && part.text.includes("Tool error")));
+      const files = prompt
+        .filter((message) => message.role === "user" && Array.isArray(message.content))
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === "file");
+      assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: imageData } }]);
     } else assert.ok(body.includes("mcp:hello"));
     response.end('data: {"type":"text-delta","delta":"done"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n');
   });

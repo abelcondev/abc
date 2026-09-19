@@ -3208,6 +3208,10 @@ fn finishPendingParallelCancelled(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
+            // Same ownership transfer as assembleParallelToolResults: the
+            // parallel run is deinitialized after this scope, while history
+            // keeps prepared.memory.
+            prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
             try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,

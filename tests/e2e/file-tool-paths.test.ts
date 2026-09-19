@@ -167,7 +167,7 @@ function firstCallToolResponses(args: {
 
 function startFakeGateway(
   responses: GatewayResponse[],
-  options: { classifierDecision?: "clear" | "caution"; modelTags?: string[] } = {},
+  options: { classifierDecision?: "clear" | "caution"; modelTags?: string[]; contextWindow?: number } = {},
 ) {
   const requests: GatewayRequest[] = [];
   const classifierRequests: GatewayRequest[] = [];
@@ -177,7 +177,7 @@ function startFakeGateway(
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         return Response.json({
-          data: [{ id: MODEL, type: "language", tags: options.modelTags ?? ["tool-use"] }],
+          data: [{ id: MODEL, type: "language", tags: options.modelTags ?? ["tool-use"], ...(options.contextWindow ? { context_window: options.contextWindow } : {}) }],
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
@@ -396,13 +396,31 @@ describe("filesystem path handling", () => {
           const output = part!.output as Record<string, unknown>;
           if (supportsImages) {
             expect(output.type).toBe("content");
-            const value = output.value as Array<Record<string, unknown>>;
-            const image = value.find((entry) => entry.type === "image-data");
-            expect(image).toBeDefined();
-            expect(image!.mediaType).toBe("image/png");
-            expect(image!.data).toBe(pngBase64);
             expect(contentText(output)).toContain("image attached");
             expect(contentText(output)).not.toContain("binary or non-utf8");
+            expect(JSON.stringify(output)).not.toContain(pngBase64.slice(0, 32));
+            const followup = request.prompt.find(
+              (message) =>
+                Array.isArray(message.content) &&
+                (message.content as Array<Record<string, unknown>>).some(
+                  (entry) => entry.type === "file",
+                ),
+            );
+            expect(followup).toBeDefined();
+            const followupContent = followup!.content as Array<Record<string, unknown>>;
+            const image = followupContent.find((entry) => entry.type === "file");
+            expect(image).toBeDefined();
+            expect(image!.mediaType).toBe("image/png");
+            expect((image!.data as Record<string, unknown>).type).toBe("data");
+            expect((image!.data as Record<string, unknown>).data).toBe(pngBase64);
+            const toolIndex = request.prompt.indexOf(
+              request.prompt.find((message) =>
+                Array.isArray(message.content)
+                  ? (message.content as Array<Record<string, unknown>>).includes(part!)
+                  : false,
+              )!,
+            );
+            expect(request.prompt.indexOf(followup!)).toBe(toolIndex + 1);
           } else {
             expect(output.type).toBe("text");
             expect(contentText(output)).toContain(
@@ -418,6 +436,161 @@ describe("filesystem path handling", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "parallel read_file image calls keep their pixels through batch assembly",
+    async () => {
+      const root = createIsolatedRoot();
+      // Payloads larger than the turn arena's chunk size force dedicated
+      // allocations, which ArenaAllocator.free genuinely reclaims when the
+      // parallel run result is deinitialized after assembly. On the buggy
+      // path the retained history slices pointed at that freed memory and
+      // the next request build crashed or serialized garbage.
+      const pngHeader = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        "base64",
+      );
+      const bytesA = Buffer.concat([pngHeader, Buffer.alloc(1_500_000, 7)]);
+      const bytesB = Buffer.concat([pngHeader, Buffer.alloc(1_500_000, 9)]);
+      const base64A = bytesA.toString("base64");
+      const base64B = bytesB.toString("base64");
+      const gateway = startFakeGateway(
+        [
+          sse([
+            { type: "tool-call", toolCallId: "read_a", toolName: "read_file", input: { path: "a.png" } },
+            { type: "tool-call", toolCallId: "read_b", toolName: "read_file", input: { path: "b.png" } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          finalText("both images inspected"),
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"], contextWindow: 4_000_000 },
+      );
+      try {
+        writeFileSync(join(root.workspace, "a.png"), bytesA);
+        writeFileSync(join(root.workspace, "b.png"), bytesB);
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read a.png and b.png once, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        expect(result.code, result.stderr).toBe(0);
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+        ]);
+        expect(gateway.requests).toHaveLength(2);
+        const request = JSON.parse(gateway.requests[1].body) as {
+          prompt: Array<{ role?: string; content?: unknown }>;
+        };
+        const results = request.prompt
+          .flatMap((message) =>
+            Array.isArray(message.content) ? message.content : []
+          )
+          .filter((value) =>
+            (value as Record<string, unknown>).type === "tool-result"
+          ) as Array<Record<string, unknown>>;
+        expect(results).toHaveLength(2);
+        for (const part of results) {
+          const output = part.output as Record<string, unknown>;
+          expect(output.type).toBe("content");
+          expect(contentText(output)).toContain("image attached");
+          expect(JSON.stringify(output)).not.toContain(base64A.slice(0, 64));
+          expect(JSON.stringify(output)).not.toContain(base64B.slice(0, 64));
+        }
+        const followup = request.prompt.find(
+          (message) =>
+            message.role === "user" &&
+            Array.isArray(message.content) &&
+            (message.content as Array<Record<string, unknown>>).some(
+              (entry) => entry.type === "file",
+            ),
+        );
+        expect(followup).toBeDefined();
+        const files = (followup!.content as Array<Record<string, unknown>>)
+          .filter((entry) => entry.type === "file");
+        expect(files).toHaveLength(2);
+        const delivered = files.map((entry) =>
+          ((entry.data as Record<string, unknown>).data as string)
+        );
+        expect(delivered).toContain(base64A);
+        expect(delivered).toContain(base64B);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "corrupted stored tool image degrades to an explicit notice on resume",
+    async () => {
+      const root = createIsolatedRoot();
+      const pngBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+      const firstGateway = startFakeGateway(
+        [
+          toolCall("read_image_1", "read_file", { path: "pixel.png" }),
+          finalText("image stored"),
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"], contextWindow: 4_000_000 },
+      );
+      let sessionId = "";
+      let handle = "";
+      try {
+        writeFileSync(
+          join(root.workspace, "pixel.png"),
+          Buffer.from(pngBase64, "base64"),
+        );
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Read pixel.png once, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, firstGateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        expect(first.code, first.stderr).toBe(0);
+        sessionId = parseFxJson(first).session_id;
+        expect(sessionId).not.toBe("");
+        handle = firstGateway.requests[1].body.match(/image-result-[\w-]+\.txt/)?.[0] ?? "";
+        expect(handle).not.toBe("");
+      } finally {
+        firstGateway.stop();
+      }
+      const artifact = join(root.home, ".fx", "sessions", sessionId, "tool-results", handle);
+      expect(existsSync(artifact)).toBe(true);
+      writeFileSync(artifact, "this is not valid stored image json");
+
+      const secondGateway = startFakeGateway(
+        [finalText("looked for the earlier image")],
+        { modelTags: ["tool-use", "vision", "file-input"], contextWindow: 4_000_000 },
+      );
+      try {
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "What did the earlier image show?"],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, secondGateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        expect(resumed.code, resumed.stderr).toBe(0);
+        expect(secondGateway.requests.length).toBeGreaterThan(0);
+        const body = secondGateway.requests[0].body;
+        expect(body).toContain("Stored tool image unavailable");
+        expect(body).not.toContain(pngBase64);
+      } finally {
+        secondGateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "empty optional search paths use the workspace root",

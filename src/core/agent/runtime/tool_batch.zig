@@ -187,6 +187,12 @@ pub fn assembleParallelToolResults(
             &prepared.memory,
             execution.tool_result_memory,
         );
+        // The parallel run's attempts are deinitialized when this scope exits,
+        // but history keeps prepared.memory. ArenaAllocator.free genuinely
+        // reclaims most-recent and dedicated-chunk allocations, so the
+        // attempt-owned slices must be transferred into the history arena
+        // before that deinit runs.
+        prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
         if (precomputed == null) {
