@@ -238,6 +238,55 @@ fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, te
     if (base) |base_style| try out.appendSlice(alloc, base_style);
 }
 
+/// Line-oriented diff painting: `+`/`-` lines take the caller's
+/// capability-resolved diff marker colors, `@@` hunks the keyword color, and
+/// file metadata lines the comment color. Honors the theme's syntax switch.
+pub fn highlightDiff(
+    alloc: Allocator,
+    source: []const u8,
+    theme: Theme,
+    added: []const u8,
+    removed: []const u8,
+) ![]u8 {
+    var styled: std.ArrayList(u8) = .empty;
+    errdefer styled.deinit(alloc);
+    const palette = paletteForTheme(theme);
+    if (!palette.enabled) {
+        try styled.appendSlice(alloc, source);
+        return styled.toOwnedSlice(alloc);
+    }
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const style: ?[]const u8 = if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---"))
+            palette.comment_style
+        else if (std.mem.startsWith(u8, line, "+"))
+            added
+        else if (std.mem.startsWith(u8, line, "-"))
+            removed
+        else if (std.mem.startsWith(u8, line, "@@"))
+            palette.keyword_style
+        else if (std.mem.startsWith(u8, line, "diff ") or
+            std.mem.startsWith(u8, line, "index ") or
+            std.mem.startsWith(u8, line, "new file") or
+            std.mem.startsWith(u8, line, "deleted file") or
+            std.mem.startsWith(u8, line, "similarity") or
+            std.mem.startsWith(u8, line, "rename "))
+            palette.comment_style
+        else
+            null;
+        if (style) |line_style| {
+            try styled.appendSlice(alloc, line_style);
+            try styled.appendSlice(alloc, line);
+            try styled.appendSlice(alloc, shared_theme.closingFor(line_style));
+        } else {
+            try styled.appendSlice(alloc, line);
+        }
+        if (lines.peek() != null) try styled.append(alloc, '\n');
+    }
+    return styled.toOwnedSlice(alloc);
+}
+
 fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.BlockComment) ?usize {
     const comment = block_comment orelse return null;
     if (!std.mem.startsWith(u8, source[index..], comment.start)) return null;
@@ -671,4 +720,38 @@ test "double quotes interpolate variables inside the string color" {
     const single = try highlight(alloc, "echo '$USER'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(single);
     try std.testing.expect(std.mem.indexOf(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
+}
+
+test "diff lines paint with the caller's marker colors" {
+    const alloc = std.testing.allocator;
+    const patch = "diff --git a/f b/f\nindex 111..222 100644\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context";
+    const styled = try highlightDiff(alloc, patch, .dark, "<added>", "<removed>");
+    defer alloc.free(styled);
+
+    try std.testing.expect(std.mem.indexOf(u8, styled, "<added>+new line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "<removed>-old line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m@@ -1,2 +1,2 @@\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m--- a/f\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245mdiff --git a/f b/f\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\n context") != null);
+
+    var no_syntax = shared_theme.fx_dark;
+    no_syntax.syntax.enabled = false;
+    const previous = shared_theme.current();
+    defer shared_theme.activate(previous);
+    shared_theme.activate(no_syntax);
+    const plain = try highlightDiff(alloc, patch, .dark, "<added>", "<removed>");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(patch, plain);
+}
+
+test "text blocks stay byte-identical and markdown colors inline code" {
+    const alloc = std.testing.allocator;
+    const text = try highlight(alloc, "plain prose with 42 numbers and # no comment", languages.resolve("text").?, .dark, null);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("plain prose with 42 numbers and # no comment", text);
+
+    const md = try highlight(alloc, "run `fx upgrade` to update", languages.resolve("md").?, .dark, null);
+    defer alloc.free(md);
+    try std.testing.expect(std.mem.indexOf(u8, md, "\x1b[38;5;250m`fx upgrade`\x1b[39m") != null);
 }
