@@ -690,6 +690,10 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    // Keep the volatile runtime overlay present so the recovery classifier is
+    // exercised against the real request shape: the vision tool result is the
+    // semantic conversation tail, no longer the last request message.
+    hooks.runtime_context_text = "runtime context over vision tail";
     defer hooks.deinit();
     var vision_runtime = VisionAgentToolRuntime{ .alloc = alloc };
     defer vision_runtime.deinit();
@@ -705,13 +709,9 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try expectGatewayPromptTextCount(&gateway, 2, "FX logo", 1);
-    try expectGatewayPromptTailText(&gateway, 2, .tool, "FX logo");
-    try expectGatewayPromptTailText(
-        &gateway,
-        3,
-        .user,
-        "Continue from the preceding tool result.",
-    );
+    try expectGatewayPromptTailText(&gateway, 2, .user, "runtime context over vision tail");
+    try expectGatewayPromptTextCount(&gateway, 3, "Continue from the preceding tool result.", 1);
+    try expectGatewayPromptTailText(&gateway, 3, .user, "runtime context over vision tail");
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
 }

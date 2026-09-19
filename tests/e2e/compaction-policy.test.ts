@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
+	const { isRuntimeOverlayMessage, lastConversationUserIndex } = await import("./conditional-guidance-oracle");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
@@ -25,7 +26,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     bodies.push(body);
     if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
       summaryCalls++;
-      const sourceMessages = request.prompt.filter((message: { role: string }) => message.role === "user");
+      const sourceMessages = request.prompt.filter((message: { role: string }) => message.role === "user" && !isRuntimeOverlayMessage(message));
       expect(sourceMessages).toHaveLength(1);
       expect(sourceMessages[0].content).toHaveLength(1);
       const source = sourceMessages[0].content[0].text;
@@ -65,7 +66,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     const seed = await ask([], "seed", originalUser);
     expect(summaryCalls).toBe(0);
     const seededRequest = JSON.parse(bodies[0]!);
-    const seededUser = seededRequest.prompt.findLast((message: { role: string }) => message.role === "user");
+    const seededUser = seededRequest.prompt[lastConversationUserIndex(seededRequest.prompt)];
     expect(seededUser.content[0].text).toBe(originalUser);
     const sessionDir = join(home, ".fx/sessions", seed.session_id), log = join(sessionDir, "events.jsonl"), before = readFileSync(log);
     phase = "continue";

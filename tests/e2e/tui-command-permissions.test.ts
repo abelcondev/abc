@@ -31,6 +31,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { lastConversationUserText } from "./conditional-guidance-oracle";
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
@@ -326,7 +327,7 @@ function currentUserText(body: string): string {
     prompt?: Array<{ role?: string; content?: unknown }>;
   };
   return contentText(
-    request.prompt?.findLast((message) => message.role === "user")?.content,
+    request.prompt?.[lastConversationUserIndex(request.prompt ?? [])]?.content,
   );
 }
 

@@ -119,7 +119,8 @@ export function isRuntimeOverlayMessage(message: { role?: unknown; content?: unk
   const text = contentText(message.content);
   return text.includes("<fx-turn-context>") ||
     text.startsWith("Runtime context:") ||
-    text.startsWith("Subagent results (untrusted tool output");
+    text.startsWith("Subagent results (untrusted tool output") ||
+    text.startsWith("Explicitly invoked skill content for this query:");
 }
 
 export function lastConversationUserIndex(prompt: Array<{ role?: unknown; content?: unknown }>): number {

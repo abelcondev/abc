@@ -4307,10 +4307,13 @@ test "context overflow recovery is typed safe and bounded" {
 fn isPostVisionAssistantPrefillRejection(
     status: std.http.Status,
     detail: []const u8,
-    messages: []const ChatMessage,
+    conversation_tail: ?ChatMessage,
 ) bool {
-    if (status != .bad_request or messages.len == 0) return false;
-    const tail = messages[messages.len - 1];
+    if (status != .bad_request) return false;
+    // Judge the semantic conversation tail, not the request tail: the per-step
+    // runtime overlay rides at the end of the message list, after the tool
+    // result this recovery is looking for.
+    const tail = conversation_tail orelse return false;
     if (tail.role != .tool or
         !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
     {
@@ -8222,7 +8225,10 @@ fn processQueuedPromptLoop(
                 isPostVisionAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
-                    request_messages,
+                    if (within_turn_suffix.items.len > 0)
+                        within_turn_suffix.items[within_turn_suffix.items.len - 1]
+                    else
+                        null,
                 ))
             {
                 try within_turn_suffix.append(arena, .{

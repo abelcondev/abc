@@ -20,6 +20,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 import {
   assertPaneContains,
   assertSingleFooter,
@@ -1731,7 +1732,7 @@ tmuxTest(
       role: string;
       content: Array<{ type: string; text?: string }>;
     }>;
-    const user = request.findLast((message) => message.role === "user");
+    const user = request[lastConversationUserIndex(request)];
     expect(user?.content[0]?.text).toBe(submission);
 
     const transcript = await active.capturePaneEscapes();
