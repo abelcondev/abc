@@ -13,6 +13,7 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
+const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -952,7 +953,10 @@ fn renderCodeBlockForTranscriptWithTheme(
     else
         "";
     const styled_code = if (profile) |resolved|
-        try code_highlight.highlight(alloc, block.code, resolved, theme, null)
+        if (resolved.diff_lines)
+            try code_highlight.highlightDiff(alloc, block.code, theme, ui_render.diff_added_marker_style, ui_render.diff_removed_marker_style)
+        else
+            try code_highlight.highlight(alloc, block.code, resolved, theme, null)
     else
         null;
     defer if (styled_code) |code| alloc.free(code);
