@@ -110,6 +110,35 @@ export function contentText(content: unknown): string {
   return "";
 }
 
+// Per-step volatile runtime context (turn context, permission mode, subagent
+// deliveries) rides the message tail as user-role entries so a mid-turn change
+// never invalidates the cached conversation prefix. Use these helpers to skip
+// that overlay when locating conversation user messages in captured requests.
+export function isRuntimeOverlayMessage(message: { role?: unknown; content?: unknown }): boolean {
+  if (message.role !== "user") return false;
+  const text = contentText(message.content);
+  return text.includes("<fx-turn-context>") ||
+    text.startsWith("Runtime context:") ||
+    text.startsWith("Subagent results (untrusted tool output");
+}
+
+export function lastConversationUserIndex(prompt: Array<{ role?: unknown; content?: unknown }>): number {
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    const message = prompt[i]!;
+    if (message.role === "user" && !isRuntimeOverlayMessage(message)) return i;
+  }
+  return -1;
+}
+
+export function lastConversationUserText(prompt: Array<{ role?: unknown; content?: unknown }>): string {
+  const index = lastConversationUserIndex(prompt);
+  return index < 0 ? "" : contentText(prompt[index]!.content);
+}
+
+export function stripRuntimeOverlay<T extends { role?: unknown; content?: unknown }>(prompt: T[]): T[] {
+  return prompt.filter((message) => !isRuntimeOverlayMessage(message));
+}
+
 export function canonicalToolName(name: string): string {
   if (
     name === "exa_search" ||

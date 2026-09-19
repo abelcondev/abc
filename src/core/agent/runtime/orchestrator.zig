@@ -2848,7 +2848,7 @@ fn appendPreparedParentTurnContext(
     if (prepared.content.len == 0) return .{};
     try messages.ensureUnusedCapacity(arena, 1);
     messages.appendAssumeCapacity(.{
-        .role = .system,
+        .role = .user,
         .content = prepared.content,
     });
     return .{ .acknowledgements = prepared.acknowledgements };
@@ -3472,19 +3472,19 @@ fn build_provider_prompt_with_response_language_control(
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
-    const effective_overlay = if (enforce_response_language and origin == .root) blk: {
-        const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
-        @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
-        projected[ephemeral_overlay.len] = .{
+    const effective_prefix = if (enforce_response_language and origin == .root) blk: {
+        const projected = try alloc.alloc(ChatMessage, stable_prefix.len + 1);
+        @memcpy(projected[0..stable_prefix.len], stable_prefix);
+        projected[stable_prefix.len] = .{
             .role = .system,
             .content = response_language_control,
         };
         break :blk projected;
-    } else ephemeral_overlay;
+    } else stable_prefix;
     var prompt = try buildProviderPromptForCompactionWindow(
         alloc,
-        stable_prefix,
-        effective_overlay,
+        effective_prefix,
+        ephemeral_overlay,
         durable_history,
         current_user_message,
         within_turn_suffix,
@@ -3513,7 +3513,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
     var projected = try build_provider_prompt_with_response_language_control(
         std.testing.allocator,
         &.{.{ .role = .system, .content = "stable" }},
-        &.{.{ .role = .system, .content = "overlay" }},
+        &.{.{ .role = .user, .content = "overlay" }},
         &.{.{ .role = .user, .content = "removed history" }},
         .{ .role = .user, .content = "pending prompt" },
         &.{
@@ -3530,14 +3530,14 @@ test "compacted request keeps the pending user prompt after the handoff" {
     defer projected.instructions.deinit(std.testing.allocator);
     defer projected.messages.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), projected.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), projected.instructions.items.len);
     try std.testing.expectEqualStrings("stable", projected.instructions.items[0].content.?);
-    try std.testing.expectEqualStrings("overlay", projected.instructions.items[1].content.?);
     const expected = [_][]const u8{
         "handoff",
         "retained tail",
         "pending prompt",
         "new suffix",
+        "overlay",
     };
     try std.testing.expectEqual(expected.len, projected.messages.items.len);
     for (expected, projected.messages.items) |content, message| {
@@ -6943,7 +6943,7 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
+            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .user, .content = section.text });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(

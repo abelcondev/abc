@@ -1538,7 +1538,7 @@ fn appendTestTransientContext(input: context_contract.TransientContextInput, all
         "provider transient:{s}:{s}",
         .{ input.workspace_root, @tagName(input.permission_mode) },
     );
-    try messages.append(alloc, .{ .role = .system, .content = content });
+    try messages.append(alloc, .{ .role = .user, .content = content });
 }
 
 const test_context_provider = context_contract.Provider{
