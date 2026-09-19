@@ -23,6 +23,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 
 const HAS_TMUX = tmuxAvailable();
 const tmuxTest = test.skipIf(!HAS_TMUX);
@@ -1858,7 +1859,7 @@ describe("@ file picker", () => {
       await active.waitForStableComposer(TIMEOUT);
       expect(gateway?.requests).toHaveLength(1);
       const request = JSON.parse(gateway!.requests[0]!.body);
-      expect(request.prompt.at(-1)).toEqual({
+      expect(request.prompt[lastConversationUserIndex(request.prompt)]).toEqual({
         role: "user",
         content: [{ type: "text", text: "@~/home-target.txt Reply with the words SHORTCUT, FLOW, and OK joined by underscores." }],
       });
@@ -1987,7 +1988,7 @@ describe("@ file picker", () => {
       const request = JSON.parse(gateway!.requests[0]!.body) as {
         prompt: Array<{ role: string; content: unknown }>;
       };
-      expect(request.prompt.at(-1)).toEqual({
+      expect(request.prompt[lastConversationUserIndex(request.prompt)]).toEqual({
         role: "user",
         content: [{
           type: "text",
