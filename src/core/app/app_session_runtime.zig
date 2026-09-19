@@ -2664,19 +2664,43 @@ pub fn Runtime(comptime App: type) type {
                     app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                     defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
                     const loaded = if (app.session_persistence.writable) |*value| value else return null;
-                    if (!loaded.conversation_writer.turn_open) return null;
-                    const checkpoint = loaded.state.recovery_checkpoint orelse break :blk .wait;
-                    break :blk .{ .ready = try checkpoint.dupe(alloc) };
+                    if (!loaded.conversation_writer.turn_open) {
+                        loaded.boundary_wedged = false;
+                        return null;
+                    }
+                    if (loaded.state.recovery_checkpoint) |checkpoint| {
+                        loaded.boundary_wedged = false;
+                        break :blk .{ .ready = try checkpoint.dupe(alloc) };
+                    }
+                    // A wedged boundary (a stop path that never commits the
+                    // close) already paid the wait once; fail fast after that.
+                    if (loaded.boundary_wedged) return error.InvalidRecoveryCheckpoint;
+                    break :blk .wait;
                 };
                 switch (probe) {
                     .ready => |value| return value,
                     .wait => {},
+                }
+                // A cancelled or shutting-down worker must not hold the send
+                // (or the worker-thread join at shutdown) for the full wait.
+                if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested")) {
+                    if (app.worker.isCancelRequested()) {
+                        debug_trace.logf("session", "event=fresh_prompt_boundary_aborted reason=cancel_requested", .{});
+                        return error.InvalidRecoveryCheckpoint;
+                    }
                 }
                 if (!waiting_logged) {
                     debug_trace.logf("session", "event=fresh_prompt_boundary_waiting reason=open_turn_without_checkpoint", .{});
                     waiting_logged = true;
                 }
                 if (io_mod.milliTimestamp() >= deadline_ms) {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    if (app.session_persistence.writable) |*loaded| {
+                        if (loaded.conversation_writer.turn_open and loaded.state.recovery_checkpoint == null) {
+                            loaded.boundary_wedged = true;
+                        }
+                    }
+                    app.session_persistence.write_mutex.unlock(io_mod.getIo());
                     debug_trace.logf("session", "event=fresh_prompt_boundary_timeout reason=open_turn_without_checkpoint wait_ms={d}", .{wait_ms});
                     return error.InvalidRecoveryCheckpoint;
                 }
@@ -5678,10 +5702,15 @@ const FakeWorker = struct {
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
     active_prompt_is_root_authority: bool = false,
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn isCancelRequested(self: *const FakeWorker) bool {
+        return self.cancel_requested.load(.seq_cst);
     }
 
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
@@ -11878,4 +11907,82 @@ test "fresh prompt boundary waits out the cancel finalization window" {
     }.run, .{&app});
     defer closer.join();
     try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 10_000) == null);
+}
+
+test "fresh prompt boundary fails fast after the first wedged timeout" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    // The wedge is latched: later sends fail fast instead of re-waiting.
+    const latched_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - latched_ms < 150);
+
+    // The latch clears when the turn closes...
+    app.session_persistence.writable.?.conversation_writer.turn_open = false;
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200) == null);
+    // ...and a later open turn earns a full wait again.
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const reopened_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - reopened_ms >= 150);
+}
+
+test "fresh prompt boundary aborts the wait when cancellation lands" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const canceller = try std.Thread.spawn(.{}, struct {
+        fn run(app_ptr: *TestApp) void {
+            io_mod.sleep(150 * std.time.ns_per_ms);
+            app_ptr.worker.cancel_requested.store(true, .seq_cst);
+        }
+    }.run, .{&app});
+    defer canceller.join();
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms >= 150);
+    try std.testing.expect(elapsed_ms < 5_000);
 }

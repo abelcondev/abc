@@ -2989,6 +2989,10 @@ pub const LoadedWritableSession = struct {
     conversation_writer: ConversationWriter,
     log: WritableSessionDir,
     freshly_started: bool = false,
+    /// Runtime-only latch set when an open turn without a recovery checkpoint
+    /// outlived the fresh-prompt boundary wait: some stop paths never commit
+    /// the close in-process, so later sends fail fast instead of re-waiting.
+    boundary_wedged: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     position: CommitPosition,
     migration_source_schema_version: ?u8 = null,
