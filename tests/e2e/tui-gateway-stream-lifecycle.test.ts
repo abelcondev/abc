@@ -6016,4 +6016,48 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "a markdown link opening the answer row keeps its theme color",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-link-start-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const linkGateway = startFakeGateway([
+        fakeGatewayFinalText("[fx docs](https://fx.sh/docs)"),
+      ]);
+      gateway = linkGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 100,
+        height: 30,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-link-start-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: linkGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: linkGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: linkGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("link please");
+      await session.waitForText("fx docs", TIMEOUT);
+      const escapes = await session.captureFullScrollbackEscapes();
+      const line = escapes.split("\n").find((l) => l.includes("fx docs")) ?? "";
+      // The default dark theme's link color must survive the row-start
+      // restore when the link is the row's first content.
+      expect(line).toContain("\x1b[38;5;75m");
+      expect(line).toContain("\x1b[4m");
+    },
+    TIMEOUT,
+  );
 });

@@ -4,6 +4,7 @@ const ansi = @import("ansi.zig");
 const tu = @import("text_util.zig");
 const unicode_classes = @import("unicode_classes.zig");
 const payload = @import("payload.zig");
+const shared_theme = @import("../../shared/theme.zig");
 
 /// Renders heading content: emphasis is resolved normally, but bold tags are
 /// suppressed because the heading style already owns bold.
@@ -528,6 +529,9 @@ fn emitInlineLink(
     try out.appendSlice(alloc, link.destination_prefix);
     try out.appendSlice(alloc, link.url);
     try out.appendSlice(alloc, "\x1b\\");
+    // Link text carries the theme's link color in addition to the underline.
+    const link_style = shared_theme.current().link_style;
+    try out.appendSlice(alloc, link_style);
     try out.appendSlice(alloc, ansi.underline_open);
     if (visible_prefix) |prefix| try out.appendSlice(alloc, prefix);
     const visible_text = if (link.text.len == 0 and visible_prefix != null) "image" else link.text;
@@ -536,6 +540,7 @@ fn emitInlineLink(
         .literal => try out.appendSlice(alloc, visible_text),
     }
     try out.appendSlice(alloc, ansi.underline_close);
+    try out.appendSlice(alloc, shared_theme.closingFor(link_style));
     try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
     if (restore_underline_after_link) try out.appendSlice(alloc, ansi.underline_open);
 }

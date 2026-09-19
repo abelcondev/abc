@@ -97,20 +97,20 @@ pub fn highlight(
         if (profile.dollar_vars and byte == '$') {
             // Command substitution reopens command position for its contents.
             if (index + 1 < source.len and source[index + 1] == '(') {
-                try appendStyled(alloc, &styled, palette.keyword_style, "$(", base);
+                try appendStyled(alloc, &styled, palette.operator_style, "$(", base);
                 command_position = true;
                 index += 2;
                 continue;
             }
             if (dollarVarEnd(source, index)) |end| {
-                try appendStyled(alloc, &styled, palette.keyword_style, source[index..end], base);
+                try appendStyled(alloc, &styled, palette.variable_style, source[index..end], base);
                 command_position = false;
                 index = end;
                 continue;
             }
         }
         if (profile.dollar_vars and byte == '~' and tildeStart(source, index, profile.operators)) {
-            try appendStyled(alloc, &styled, palette.keyword_style, "~", base);
+            try appendStyled(alloc, &styled, palette.variable_style, "~", base);
             command_position = false;
             index += 1;
             continue;
@@ -126,7 +126,7 @@ pub fn highlight(
         if (isOperatorChar(byte, profile.operators)) {
             const end = operatorRunEnd(source, index, profile.operators);
             const run = source[index..end];
-            try appendStyled(alloc, &styled, palette.keyword_style, run, base);
+            try appendStyled(alloc, &styled, palette.operator_style, run, base);
             // Redirect targets are paths, not commands; `2>&1`-style runs too.
             command_position = std.mem.findScalar(u8, run, '<') == null and
                 std.mem.findScalar(u8, run, '>') == null;
@@ -149,7 +149,13 @@ pub fn highlight(
             var styled_word = false;
             if (profile.command_words) {
                 if (command_position and !after_separator) {
-                    try appendStyled(alloc, &styled, palette.keyword_style, token, base);
+                    // Control keywords read as keywords; other command words
+                    // as functions, matching the grammar's scopes.
+                    const style = if (inList(token, &command_prefixes, .sensitive))
+                        palette.keyword_style
+                    else
+                        palette.function_style;
+                    try appendStyled(alloc, &styled, style, token, base);
                     styled_word = true;
                 }
             } else if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
@@ -217,7 +223,7 @@ fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palett
             }
             if (var_end) |end| {
                 if (chunk_start < i) try appendStyled(alloc, out, palette.string_style, text[chunk_start..i], base);
-                try appendStyled(alloc, out, palette.keyword_style, text[i..end], base);
+                try appendStyled(alloc, out, palette.variable_style, text[i..end], base);
                 i = end;
                 chunk_start = end;
                 continue;
@@ -754,4 +760,28 @@ test "text blocks stay byte-identical and markdown colors inline code" {
     const md = try highlight(alloc, "run `fx upgrade` to update", languages.resolve("md").?, .dark, null);
     defer alloc.free(md);
     try std.testing.expect(std.mem.indexOf(u8, md, "\x1b[38;5;250m`fx upgrade`\x1b[39m") != null);
+}
+
+test "split slots let themes color commands variables and operators apart" {
+    const alloc = std.testing.allocator;
+    var themed = shared_theme.fx_dark;
+    themed.syntax.function_style = "\x1b[38;5;201m";
+    themed.syntax.variable_style = "\x1b[38;5;202m";
+    themed.syntax.operator_style = "\x1b[38;5;203m";
+    themed.syntax.keyword_style = "\x1b[38;5;204m";
+
+    const previous = shared_theme.current();
+    defer shared_theme.activate(previous);
+    shared_theme.activate(themed);
+
+    const styled = try highlight(alloc, "while true; do echo $HOME | head -2; done", languages.resolve("sh").?, .dark, null);
+    defer alloc.free(styled);
+
+    // Control keywords keep the keyword color; command words take the
+    // function color; variables and operators take their own.
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;204mwhile\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;201mtrue\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;201mecho\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;202m$HOME\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;203m|\x1b[39m") != null);
 }

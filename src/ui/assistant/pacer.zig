@@ -53,9 +53,10 @@ pub const SgrState = struct {
     underline: bool = false,
     strike: bool = false,
     code_fg: CodeForeground = .none,
+    link_fg: bool = false,
 
     pub fn isActive(self: SgrState) bool {
-        return self.bold or self.dim or self.italic or self.underline or self.strike or self.code_fg != .none;
+        return self.bold or self.dim or self.italic or self.underline or self.strike or self.code_fg != .none or self.link_fg;
     }
 
     /// Update based on a complete ANSI sequence (including `\x1b[` prefix and
@@ -80,10 +81,15 @@ pub const SgrState = struct {
             self.dim = false;
         } else if (std.mem.eql(u8, body, "23")) self.italic = false else if (std.mem.eql(u8, body, "24")) self.underline = false else if (std.mem.eql(u8, body, "29")) self.strike = false else if (std.mem.eql(u8, body, "39")) {
             self.code_fg = .none;
+            self.link_fg = false;
         } else if (std.mem.eql(u8, body, "38;5;245")) self.code_fg = .dark else if (std.mem.eql(u8, body, "38;5;247")) self.code_fg = .light else if (std.mem.eql(u8, seq, shared_theme.current().inline_code_open)) {
             // Theme-supplied inline-code opens track as the themed variant and
             // re-emit whatever the active theme holds at restore time.
             self.code_fg = .themed;
+        } else if (std.mem.eql(u8, seq, shared_theme.current().link_style)) {
+            // The themed link color tracks the same way, so a link that opens
+            // a row still carries its color after the row-start restore.
+            self.link_fg = true;
         }
     }
 
@@ -114,6 +120,7 @@ pub const SgrState = struct {
             .light => append(buf, &n, "\x1b[38;5;247m"),
             .themed => append(buf, &n, shared_theme.current().inline_code_open),
         }
+        if (self.link_fg) append(buf, &n, shared_theme.current().link_style);
         return n;
     }
 };
@@ -1077,4 +1084,24 @@ test "tick on empty pacer without deferred finish is a no-op" {
     try pacer.tick(alloc, 1_000_000_000, cap.callbacks());
     try std.testing.expectEqual(@as(usize, 0), cap.emitted.items.len);
     try std.testing.expectEqual(@as(usize, 0), cap.finish_count);
+}
+
+test "link color is tracked and restored like the themed inline-code color" {
+    const link_open = shared_theme.current().link_style;
+    var sgr: SgrState = .{};
+    sgr.apply("\x1b[4m");
+    sgr.apply(link_open);
+    try std.testing.expect(sgr.link_fg);
+    try std.testing.expect(sgr.isActive());
+
+    var opens: [96]u8 = undefined;
+    const opens_len = sgr.writeOpens(&opens);
+    const serialized = opens[0..opens_len];
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\x1b[4m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, link_open) != null);
+
+    sgr.apply("\x1b[39m");
+    try std.testing.expect(!sgr.link_fg);
+    sgr.apply("\x1b[24m");
+    try std.testing.expect(!sgr.isActive());
 }
