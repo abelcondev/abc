@@ -3,6 +3,7 @@ const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -623,7 +624,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         else
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count" });
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
-        errdefer alloc.free(summary);
+        errdefer mem_utils.free(alloc, summary);
         const root_user_messages: [][]u8 = if (has_root_user_messages)
             try parseDurableBytesArray(
                 alloc,
@@ -663,7 +664,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
-        errdefer alloc.free(assistant);
+        errdefer mem_utils.free(alloc, assistant);
         const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
         errdefer session.freeExecutionMemory(alloc, execution);
         const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
@@ -687,16 +688,16 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        defer if (legacy_assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| mem_utils.free(alloc, owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        defer alloc.free(log_path);
+        defer mem_utils.free(alloc, log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        defer if (url) |owned| alloc.free(owned);
+        defer if (url) |owned| mem_utils.free(alloc, owned);
         _ = try requireBool(object, "expect_url");
         _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
         const assistant = try formatLegacyBackgroundAssistant(
@@ -727,7 +728,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
-        errdefer if (assistant) |owned| alloc.free(owned);
+        errdefer if (assistant) |owned| mem_utils.free(alloc, owned);
         const tool_call = try parseOptionalToolCall(alloc, object.get("tool_call") orelse return error.InvalidSessionFormat);
         errdefer if (tool_call) |call| session.freeToolCall(alloc, call);
         const completed_tool_names = try parseDurableBytesArray(
@@ -1055,20 +1056,20 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     try expectToken(try json_reader.next(), .object_begin);
     try expectKey(&json_reader, alloc, "id");
     const id = try readStringOwned(&json_reader, alloc, 255);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     try expectKey(&json_reader, alloc, "origin_workspace_root");
     const origin_workspace_root = try readStringOwned(&json_reader, alloc, std.Io.Dir.max_path_bytes);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     try expectKey(&json_reader, alloc, "workspace_root");
     const workspace_root = try readStringOwned(&json_reader, alloc, std.Io.Dir.max_path_bytes);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     try expectKey(&json_reader, alloc, "created_at_ms");
     const created_at_ms = try readI64(&json_reader, alloc);
     try expectKey(&json_reader, alloc, "updated_at_ms");
     const updated_at_ms = try readI64(&json_reader, alloc);
     try expectKey(&json_reader, alloc, "conversation_language");
     const language_raw = try readStringOwned(&json_reader, alloc, session.ConversationLanguage.max_len);
-    defer alloc.free(language_raw);
+    defer mem_utils.free(alloc, language_raw);
     const conversation_language = try parseConversationLanguage(language_raw);
 
     try expectKey(&json_reader, alloc, "preferences");
@@ -1091,7 +1092,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var history: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
         for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
-        history.deinit(alloc);
+        mem_utils.deinitList(alloc, &history);
     }
     while (try json_reader.peekNextTokenType() != .array_end) {
         if (history.items.len == limits.max_history_turns) return error.InvalidSessionFormat;
@@ -1121,14 +1122,14 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
-    errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
+    errdefer if (last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
     var subagent_child = false;
     var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
-        defer alloc.free(key);
+        defer mem_utils.free(alloc, key);
         if (std.mem.eql(u8, key, "context_history_start")) {
             if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
@@ -1157,7 +1158,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 session_usage.max_snapshot_bytes,
             );
             const parse_buffer = try alloc.alloc(u8, parse_limit);
-            defer alloc.free(parse_buffer);
+            defer mem_utils.free(alloc, parse_buffer);
             var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
             const value = try std.json.Value.jsonParse(fixed.allocator(), &json_reader, .{
                 .max_value_len = parse_limit,
@@ -1769,19 +1770,19 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     else
         try exactObject(value, &.{ "text", "images", "work_id" });
     const text = try parseRequiredDurableBytes(alloc, object, "text");
-    errdefer alloc.free(text);
+    errdefer mem_utils.free(alloc, text);
     const work_id = if (object.get("work_id")) |_|
         try alloc.dupe(u8, try requireString(object, "work_id"))
     else
         null;
-    errdefer if (work_id) |id| alloc.free(id);
+    errdefer if (work_id) |id| mem_utils.free(alloc, id);
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
     if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id };
 
     const images = try alloc.alloc(session.ImageAttachment, images_value.array.items.len);
-    errdefer alloc.free(images);
+    errdefer mem_utils.free(alloc, images);
     var parsed_count: usize = 0;
     errdefer {
         for (images[0..parsed_count]) |image| {
@@ -1791,19 +1792,19 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     for (images_value.array.items, 0..) |image_value, i| {
         const image = try imageAttachmentObject(image_value);
         const path = try parseRequiredDurableBytes(alloc, image, "path");
-        errdefer alloc.free(path);
+        errdefer mem_utils.free(alloc, path);
         const media_type = try parseRequiredDurableBytes(alloc, image, "media_type");
-        errdefer alloc.free(media_type);
+        errdefer mem_utils.free(alloc, media_type);
         const snapshot_path = try parseOptionalDurableBytes(
             alloc,
             image.get("snapshot_path") orelse .null,
         );
-        errdefer if (snapshot_path) |path_bytes| alloc.free(path_bytes);
+        errdefer if (snapshot_path) |path_bytes| mem_utils.free(alloc, path_bytes);
         const snapshot_sha256 = try parseOptionalDurableBytes(
             alloc,
             image.get("snapshot_sha256") orelse .null,
         );
-        errdefer if (snapshot_sha256) |sha256_bytes| alloc.free(sha256_bytes);
+        errdefer if (snapshot_sha256) |sha256_bytes| mem_utils.free(alloc, sha256_bytes);
         if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
         images[i] = .{
             .id = try requireUsize(image, "id"),
@@ -1977,10 +1978,10 @@ fn parseToolSteps(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const steps = try alloc.alloc(session.ToolExecutionStep, value.array.items.len);
-    errdefer alloc.free(steps);
+    errdefer mem_utils.free(alloc, steps);
     var parsed_count: usize = 0;
     errdefer for (steps[0..parsed_count]) |step| {
-        if (step.assistant) |assistant| alloc.free(assistant);
+        if (step.assistant) |assistant| mem_utils.free(alloc, assistant);
         if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
         session.freeToolCallSlice(alloc, step.tool_calls);
         session.freePersistedToolResults(alloc, step.tool_results);
@@ -1991,7 +1992,7 @@ fn parseToolSteps(
         else
             try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
-        errdefer if (assistant) |owned| alloc.free(owned);
+        errdefer if (assistant) |owned| mem_utils.free(alloc, owned);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parseToolResults(
@@ -2031,7 +2032,7 @@ fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);
-    errdefer alloc.free(calls);
+    errdefer mem_utils.free(alloc, calls);
     var parsed_count: usize = 0;
     errdefer for (calls[0..parsed_count]) |call| session.freeToolCall(alloc, call);
     for (value.array.items, 0..) |call_value, i| {
@@ -2049,15 +2050,15 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
         "provider_result",
     });
     const id = try parseRequiredDurableBytes(alloc, object, "id");
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const name = try parseRequiredDurableBytes(alloc, object, "name");
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
-    errdefer alloc.free(arguments_json);
+    errdefer mem_utils.free(alloc, arguments_json);
     const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
-        alloc.free(arguments_json);
+        mem_utils.free(alloc, arguments_json);
         arguments_json = safe_arguments;
     }
     const provider_result = try parseOptionalDurableBytes(
@@ -2094,16 +2095,16 @@ fn parseToolResults(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const results = try alloc.alloc(session.PersistedToolResult, value.array.items.len);
-    errdefer alloc.free(results);
+    errdefer mem_utils.free(alloc, results);
     var parsed_count: usize = 0;
     errdefer for (results[0..parsed_count]) |result| {
-        alloc.free(result.tool_call_id);
-        alloc.free(result.tool_name);
-        alloc.free(result.output);
+        mem_utils.free(alloc, result.tool_call_id);
+        mem_utils.free(alloc, result.tool_name);
+        mem_utils.free(alloc, result.output);
         types.freeToolImages(alloc, result.tool_images);
-        if (result.tool_image_handle) |handle| alloc.free(handle);
-        if (result.output_handle) |handle| alloc.free(handle);
-        if (result.preview) |preview| alloc.free(preview);
+        if (result.tool_image_handle) |handle| mem_utils.free(alloc, handle);
+        if (result.output_handle) |handle| mem_utils.free(alloc, handle);
+        if (result.preview) |preview| mem_utils.free(alloc, preview);
         types.freePermissionFeedback(alloc, result.permission_feedback);
         if (result.committed_file_presentation) |presentation| {
             types.freeCommittedFilePresentation(alloc, presentation);
@@ -2232,21 +2233,21 @@ fn parseToolResult(
     const review_feedback = if (schema_version >= 10) try requireBool(object, "review_feedback") else false;
     if (review_feedback and (status != .failure or provider_native)) return error.InvalidSessionFormat;
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     var output = try parseRequiredDurableBytes(alloc, object, "output");
-    errdefer alloc.free(output);
+    errdefer mem_utils.free(alloc, output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
         object.get("output_handle") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (output_handle) |owned| alloc.free(owned);
+    errdefer if (output_handle) |owned| mem_utils.free(alloc, owned);
     const preview = try parseOptionalDurableBytes(
         alloc,
         object.get("preview") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (preview) |owned| alloc.free(owned);
+    errdefer if (preview) |owned| mem_utils.free(alloc, owned);
     const permission_feedback: [][]u8 = if (schema_version == 1)
         &.{}
     else
@@ -2288,20 +2289,20 @@ fn parseToolResult(
     else
         null;
     const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
-    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    errdefer if (tool_image_handle) |handle| mem_utils.free(alloc, handle);
     const tool_images = if (object.get("tool_images")) |images| images: {
         if (images != .array) return error.InvalidSessionFormat;
         const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
-            alloc.free(output);
+            mem_utils.free(alloc, output);
             output = notice;
             break :images try alloc.alloc(types.ToolImage, 0);
         };
         if (parsed_images.len != images.array.items.len) {
             types.freeToolImages(alloc, parsed_images);
             const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
-            alloc.free(output);
+            mem_utils.free(alloc, output);
             output = notice;
             break :images try alloc.alloc(types.ToolImage, 0);
         }
@@ -2460,7 +2461,7 @@ fn parseCommittedFilePresentation(
         "lifecycle_id",
     });
     const path = try parseRequiredDurableBytes(alloc, object, "path");
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(
         alloc,
         object.get("lines") orelse return error.InvalidSessionFormat,
@@ -2470,17 +2471,17 @@ fn parseCommittedFilePresentation(
         alloc,
         object.get("previous_content") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (previous_content) |content| alloc.free(content);
+    errdefer if (previous_content) |content| mem_utils.free(alloc, content);
     const after_content = try parseOptionalDurableBytes(
         alloc,
         object.get("after_content") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (after_content) |content| alloc.free(content);
+    errdefer if (after_content) |content| mem_utils.free(alloc, content);
     const lifecycle_id = try parseOptionalToolLifecycleId(
         alloc,
         object.get("lifecycle_id") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (lifecycle_id) |id| alloc.free(id.call_id);
+    errdefer if (lifecycle_id) |id| mem_utils.free(alloc, id.call_id);
     return .{
         .path = path,
         .kind = std.meta.stringToEnum(
@@ -2506,13 +2507,13 @@ fn parseCommittedFilePresentationLines(
     const lines = try alloc.alloc(types.CommittedFilePresentationLine, value.array.items.len);
     var parsed_count: usize = 0;
     errdefer {
-        for (lines[0..parsed_count]) |line| alloc.free(@constCast(line.text));
-        alloc.free(lines);
+        for (lines[0..parsed_count]) |line| mem_utils.free(alloc, @constCast(line.text));
+        mem_utils.free(alloc, lines);
     }
     for (value.array.items, 0..) |line_value, index| {
         const object = try exactObject(line_value, &.{ "kind", "old_line", "new_line", "text" });
         const text = try parseRequiredDurableBytes(alloc, object, "text");
-        errdefer alloc.free(text);
+        errdefer mem_utils.free(alloc, text);
         lines[index] = .{
             .kind = std.meta.stringToEnum(
                 types.CommittedFilePresentationLineKind,
@@ -2531,8 +2532,8 @@ fn freeCommittedFilePresentationLines(
     alloc: Allocator,
     lines: []const types.CommittedFilePresentationLine,
 ) void {
-    for (lines) |line| alloc.free(@constCast(line.text));
-    if (lines.len > 0) alloc.free(@constCast(lines));
+    for (lines) |line| mem_utils.free(alloc, @constCast(line.text));
+    if (lines.len > 0) mem_utils.free(alloc, @constCast(lines));
 }
 
 fn parseOptionalToolLifecycleId(
@@ -2544,7 +2545,7 @@ fn parseOptionalToolLifecycleId(
         .object => {
             const object = try exactObject(value, &.{ "turn_id", "call_id" });
             const call_id = try parseRequiredDurableBytes(alloc, object, "call_id");
-            errdefer alloc.free(call_id);
+            errdefer mem_utils.free(alloc, call_id);
             return .{
                 .turn_id = try requireU64(object, "turn_id"),
                 .call_id = call_id,
@@ -2558,13 +2559,13 @@ fn parseFiles(alloc: Allocator, value: std.json.Value) ![]session.FileEvidence {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const files = try alloc.alloc(session.FileEvidence, value.array.items.len);
-    errdefer alloc.free(files);
+    errdefer mem_utils.free(alloc, files);
     var parsed_count: usize = 0;
     errdefer for (files[0..parsed_count]) |file| {
-        alloc.free(file.path);
-        if (file.new_path) |new_path| alloc.free(new_path);
-        alloc.free(file.tool_call_id);
-        alloc.free(file.tool_name);
+        mem_utils.free(alloc, file.path);
+        if (file.new_path) |new_path| mem_utils.free(alloc, new_path);
+        mem_utils.free(alloc, file.tool_call_id);
+        mem_utils.free(alloc, file.tool_name);
     };
     for (value.array.items, 0..) |file_value, i| {
         files[i] = try parseFile(alloc, file_value);
@@ -2585,16 +2586,16 @@ fn parseFile(alloc: Allocator, value: std.json.Value) !session.FileEvidence {
         "stale",
     });
     const path = try parseRequiredDurableBytes(alloc, object, "path");
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const new_path = try parseOptionalDurableBytes(
         alloc,
         object.get("new_path") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (new_path) |owned| alloc.free(owned);
+    errdefer if (new_path) |owned| mem_utils.free(alloc, owned);
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     return .{
         .path = path,
         .new_path = new_path,
