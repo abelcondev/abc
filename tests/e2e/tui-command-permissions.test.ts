@@ -31,7 +31,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { lastConversationUserText } from "./conditional-guidance-oracle";
+import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
