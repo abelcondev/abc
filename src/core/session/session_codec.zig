@@ -1,4 +1,5 @@
 const std = @import("std");
+const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
@@ -1468,6 +1469,12 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeSnapshotLocator(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
+        // Inline image bytes appear only for sessions without a filesystem
+        // snapshot backend, so durable sessions keep their exact format.
+        if (image.inline_data) |inline_data| {
+            try writer.writeAll(",\"inline_data\":");
+            try writeDurableBytes(writer, inline_data);
+        }
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -1852,13 +1859,24 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
             image.get("snapshot_sha256") orelse .null,
         );
         errdefer if (snapshot_sha256) |sha256_bytes| mem_utils.free(alloc, sha256_bytes);
-        if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
+        const inline_data = try parseOptionalDurableBytes(
+            alloc,
+            image.get("inline_data") orelse .null,
+        );
+        errdefer if (inline_data) |inline_bytes| mem_utils.free(alloc, inline_bytes);
+        if (inline_data) |inline_bytes| {
+            // Inline images carry their own bytes: no snapshot file, but the
+            // digest stays so request-time verification is unchanged.
+            if (snapshot_path != null or snapshot_sha256 == null) return error.InvalidSessionFormat;
+            try validateInlineImageBytes(inline_bytes, media_type);
+        } else if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
         images[i] = .{
             .id = try requireUsize(image, "id"),
             .path = path,
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .inline_data = inline_data,
         };
         parsed_count += 1;
     }
@@ -1879,7 +1897,8 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
         } else if (std.mem.eql(u8, entry.key_ptr.*, "media_type")) {
             has_media_type = true;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
-            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256"))
+            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
+            std.mem.eql(u8, entry.key_ptr.*, "inline_data"))
         {
             continue;
         } else {
@@ -1888,6 +1907,19 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
     }
     if (!has_id or !has_path or !has_media_type) return error.InvalidSessionFormat;
     return value.object;
+}
+
+/// Format-level validation for image bytes embedded in a checkpoint or host
+/// session: bounded, non-empty, and sniffing to the declared media type.
+/// Content integrity beyond the payload envelope is verified at request time
+/// by `loadVerifiedSnapshot`.
+fn validateInlineImageBytes(bytes: []const u8, media_type: []const u8) !void {
+    if (bytes.len == 0 or bytes.len > image_attachments.max_image_bytes) {
+        return error.InvalidSessionFormat;
+    }
+    const detected = image_data.detectMediaTypeFromBytes(bytes) orelse
+        return error.InvalidSessionFormat;
+    if (!std.mem.eql(u8, detected, media_type)) return error.InvalidSessionFormat;
 }
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
@@ -4492,6 +4524,7 @@ fn expectUserTurnEqual(expected: session.UserTurn, actual: session.UserTurn) !vo
         try std.testing.expectEqualSlices(u8, image.media_type, got.media_type);
         try expectOptionalBytesEqual(image.snapshot_path, got.snapshot_path);
         try expectOptionalBytesEqual(image.snapshot_sha256, got.snapshot_sha256);
+        try expectOptionalBytesEqual(image.inline_data, got.inline_data);
     }
 }
 
@@ -4535,6 +4568,90 @@ test "durable image snapshots serialize as session-relative locators" {
         encoded.written(),
         "\"snapshot_path\":\"images/image-1-deadbeef.bin\"",
     ) != null);
+}
+
+test "inline image bytes round trip through the history turn codec" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-bytes";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(png, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]session.ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("inline://image-2"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(&digest_hex),
+        .inline_data = @constCast(png),
+    }};
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("look [Image #2]"), .images = &images },
+        .assistant = @constCast("done"),
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+
+    try writeHistoryTurn(&encoded.writer, turn);
+    // Inline bytes are embedded base64; no filesystem locator appears.
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\":{") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"snapshot_path\":null") != null);
+
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed_value.deinit();
+    const decoded = try parseHistoryTurn(alloc, parsed_value.value);
+    defer types.freeHistoryTurn(alloc, decoded);
+    try expectUserTurnEqual(turn.assistant.user, decoded.assistant.user);
+}
+
+test "inline image parsing rejects missing digest and mismatched bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-bytes";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(png, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const wrong_digest = "0" ** (Sha256.digest_length * 2);
+
+    const Template = struct {
+        snapshot_sha256: ?[]const u8,
+        media_type: []const u8,
+        bytes: []const u8,
+    };
+    const cases = [_]Template{
+        // Inline bytes without their digest cannot be verified at request time.
+        .{ .snapshot_sha256 = null, .media_type = "image/png", .bytes = png },
+        // Bytes must sniff to the declared media type.
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/jpeg", .bytes = png },
+        // Empty and un sniffable payloads are not images.
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "" },
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "plain text" },
+        // A digest mismatch alone does not fail the codec parse (the payload
+        // envelope covers integrity), but the bytes must stay image-shaped.
+        .{ .snapshot_sha256 = wrong_digest, .media_type = "image/png", .bytes = png },
+    };
+    const expect_failure = [_]bool{ true, true, true, true, false };
+    for (cases, expect_failure) |case, should_fail| {
+        var images = [_]session.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("inline://image-1"),
+            .media_type = @constCast(case.media_type),
+            .snapshot_sha256 = if (case.snapshot_sha256) |value| @constCast(value) else null,
+            .inline_data = @constCast(case.bytes),
+        }};
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("[Image #1]"), .images = &images },
+            .assistant = @constCast("done"),
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed_value.deinit();
+        if (should_fail) {
+            try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed_value.value));
+        } else {
+            const decoded = try parseHistoryTurn(alloc, parsed_value.value);
+            types.freeHistoryTurn(alloc, decoded);
+        }
+    }
 }
 
 test "codec structural helpers enforce exact objects and required strings" {
