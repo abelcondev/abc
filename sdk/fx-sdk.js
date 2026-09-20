@@ -57,6 +57,16 @@ function normalizeEffort(value) {
   return value;
 }
 
+// Mirrors the CLI's --fast/--no-fast toggle: a strict boolean, with undefined
+// leaving the model default in place.
+function normalizeFast(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new TypeError("fast must be a boolean");
+  }
+  return value;
+}
+
 function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
@@ -68,6 +78,7 @@ function normalizeAgentOptions(value) {
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   options.model = boundedString(options.model, "model", maxModelBytes, false);
   options.effort = normalizeEffort(options.effort);
+  options.fast = normalizeFast(options.fast);
   validateGatewayChatUrl(options.gatewayChatUrl);
   return options;
 }
@@ -77,16 +88,21 @@ function agentEnvironment(options) {
     AI_GATEWAY_API_KEY: options.apiKey,
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
+    ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
 }
 
-// The kernel rejects an unsupported effort during initialize; both messages
-// originate only from that validation, so the rejection is safe to retype.
+// The kernel rejects an unsupported effort or fast lane during initialize;
+// these messages originate only from that validation, so the rejection is
+// safe to retype.
 function agentBootstrapError(error) {
   if (error instanceof Error &&
     (error.message === "Invalid reasoning effort" || error.message.startsWith("Reasoning effort"))) {
     error.code ??= "LIBFX_UNSUPPORTED_EFFORT";
+  }
+  if (error instanceof Error && error.message.startsWith("Fast mode")) {
+    error.code ??= "LIBFX_UNSUPPORTED_FAST";
   }
   return error;
 }
