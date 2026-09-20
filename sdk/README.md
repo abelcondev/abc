@@ -73,7 +73,9 @@ blocks. It returns an async iterable of normalized events:
 
 - `text_delta`
 - `reasoning_delta` when supplied by the provider
-- `tool_start`
+- `tool_start` with `id`, `name`, and the tool's `input` object. Inputs over
+  64 KiB of JSON arrive as an `inputPreview` string prefix plus
+  `inputTruncated: true` instead; the tool still receives complete arguments.
 - `tool_end`
 
 Consume the turn while it runs, then await `turn.result`. Output is lossless and
