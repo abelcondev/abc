@@ -4013,6 +4013,9 @@ fn writeNetworkRecordBody(
             if (completed.completion.generation_id) |generation_id| {
                 try writer.print(" · generation: {s}", .{generation_id});
             }
+            if (completed.completion.resolved_provider) |resolved| {
+                try writer.print(" · served-by: {s}", .{resolved});
+            }
             try writeUsageTokens(writer, completed.completion.usage);
         },
         .failed => |*failure| {
@@ -6082,6 +6085,8 @@ pub fn prepareManualCompactionContinuation(
     );
     var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, config.effort, config.fast_mode);
     provider_options.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+    provider_options.provider_order = config.provider_order;
+    provider_options.provider_strict = config.provider_strict;
     return .{
         .request = .{
             .model = model,
@@ -7247,6 +7252,8 @@ fn processQueuedPromptLoop(
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+            provider_opts.provider_order = config.provider_order;
+            provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
@@ -8073,6 +8080,20 @@ fn processQueuedPromptLoop(
             }
             if (streamCompletionPtr(&stream_result)) |completion| {
                 agent.observeUsage(completion.usage);
+                // The completion buffer is step-scoped, so no cross-step
+                // dedupe: each completion reports its serving provider once.
+                // The push_event callback takes ownership of the payload on
+                // every outcome, including error returns, so this scope never
+                // frees `owned` after the call.
+                if (completion.resolved_provider) |provider| {
+                    if (std.heap.c_allocator.dupe(u8, provider)) |owned| {
+                        deps.push_event(deps.ctx, .{ .provider_resolved = owned }) catch |err| {
+                            debug_trace.logf("agent", "provider_resolved event dropped err={s}", .{@errorName(err)});
+                        };
+                    } else |_| {
+                        debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
+                    }
+                }
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,

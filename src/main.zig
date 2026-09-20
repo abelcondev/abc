@@ -674,6 +674,8 @@ const App = struct {
                 .model = launch.modifiers.model_override,
                 .effort = launch.modifiers.effort_override,
                 .fast = launch.modifiers.fast_override,
+                .provider_order = launch.modifiers.provider_order_override,
+                .provider_strict = launch.modifiers.provider_strict_override,
             },
         );
         errdefer app.deinit();
