@@ -4567,61 +4567,15 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return null;
-            if (loaded.childCapability()) |capability| {
-                const pack = result_store.loadDiffContentManaged(app.alloc, capability, handle) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "resume diff content load failed call_id={s} err={s}; rendering preview only",
-                        .{ call_id, @errorName(err) },
-                    );
-                    return null;
-                };
+            const capability = loaded.childCapability() catch |err| {
                 debug_trace.logf(
                     "session",
-                    "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d} route=managed",
-                    .{
-                        call_id,
-                        if (pack.previous_content) |content| content.len else 0,
-                        if (pack.after_content) |content| content.len else 0,
-                    },
-                );
-                return pack;
-            } else |_| {}
-            // Sessions without an attached child capability read through the
-            // same tool-results route the persistence writer spilled into.
-            const base = io_mod.dirRealpathAlloc(app.alloc, loaded.log.dir.dir, ".") catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "resume diff content route unavailable call_id={s} err={s}",
+                    "resume diff content capability unavailable call_id={s} err={s}",
                     .{ call_id, @errorName(err) },
                 );
                 return null;
             };
-            defer app.alloc.free(base);
-            const result_dir = std.fs.path.join(app.alloc, &.{ base, "tool-results" }) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "resume diff content route unavailable call_id={s} err={s}",
-                    .{ call_id, @errorName(err) },
-                );
-                return null;
-            };
-            defer app.alloc.free(result_dir);
-            var capability = session_child_store.SessionChildCapability.initLegacyRoute(
-                app.alloc,
-                result_dir,
-                .tool_results,
-                .read_only,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "resume diff content route unavailable call_id={s} err={s}",
-                    .{ call_id, @errorName(err) },
-                );
-                return null;
-            };
-            defer capability.deinit();
-            const pack = result_store.loadDiffContentManaged(app.alloc, &capability, handle) catch |err| {
+            const pack = result_store.loadDiffContentManaged(app.alloc, capability, handle) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume diff content load failed call_id={s} err={s}; rendering preview only",
@@ -4631,7 +4585,7 @@ pub fn Runtime(comptime App: type) type {
             };
             debug_trace.logf(
                 "session",
-                "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d} route=legacy",
+                "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d}",
                 .{
                     call_id,
                     if (pack.previous_content) |content| content.len else 0,

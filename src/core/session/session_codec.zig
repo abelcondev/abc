@@ -1740,8 +1740,12 @@ fn writeCommittedFilePresentation(
     } else {
         try writer.writeAll("null");
     }
-    try writer.writeAll(",\"content_handle\":");
-    try writeOptionalDurableBytes(writer, presentation.content_handle);
+    // Omit the key entirely when unspilled so non-spilled records keep the
+    // shipped 9-key shape older builds can still parse.
+    if (presentation.content_handle) |handle| {
+        try writer.writeAll(",\"content_handle\":");
+        try writeDurableBytes(writer, handle);
+    }
     try writer.writeByte('}');
 }
 
@@ -2451,7 +2455,7 @@ fn parseCommittedFilePresentation(
     alloc: Allocator,
     value: std.json.Value,
 ) !types.CommittedFilePresentation {
-    const object = try exactObject(value, &.{
+    const presentation_legacy_keys = [_][]const u8{
         "path",
         "kind",
         "lines",
@@ -2461,8 +2465,13 @@ fn parseCommittedFilePresentation(
         "previous_content",
         "after_content",
         "lifecycle_id",
-        "content_handle",
-    });
+    };
+    const presentation_extended_keys = presentation_legacy_keys ++ [_][]const u8{"content_handle"};
+    const object = (try exactVariantObject(
+        value,
+        &presentation_legacy_keys,
+        &presentation_extended_keys,
+    )).object;
     const path = try parseRequiredDurableBytes(alloc, object, "path");
     errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(
@@ -3736,6 +3745,77 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expectError(
         error.InvalidSessionFormat,
         parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
+}
+
+test "committed file presentation codec reads shipped and spilled shapes" {
+    const alloc = std.testing.allocator;
+
+    // Shipped shape: every record written by released fx has exactly these
+    // nine keys, with the snapshots inline and no content_handle key.
+    const shipped =
+        "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[{\"kind\":\"addition\",\"old_line\":null,\"new_line\":1,\"text\":\"line\"}],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":\"line\\n\",\"lifecycle_id\":{\"turn_id\":9,\"call_id\":\"call_write\"}}";
+    var shipped_parsed = try std.json.parseFromSlice(std.json.Value, alloc, shipped, .{});
+    defer shipped_parsed.deinit();
+    const shipped_presentation = try parseCommittedFilePresentation(alloc, shipped_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, shipped_presentation);
+    try std.testing.expectEqualStrings("note.txt", shipped_presentation.path);
+    try std.testing.expectEqualStrings("line\n", shipped_presentation.after_content.?);
+    try std.testing.expect(shipped_presentation.content_handle == null);
+
+    // Spilled shape: snapshots live in the result store and the record
+    // carries only the handle.
+    const spilled =
+        "{\"path\":\"note.txt\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"}";
+    var spilled_parsed = try std.json.parseFromSlice(std.json.Value, alloc, spilled, .{});
+    defer spilled_parsed.deinit();
+    const spilled_presentation = try parseCommittedFilePresentation(alloc, spilled_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, spilled_presentation);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        spilled_presentation.content_handle.?,
+    );
+    try std.testing.expect(spilled_presentation.previous_content == null);
+    try std.testing.expect(spilled_presentation.after_content == null);
+
+    // Unknown keys still fail closed.
+    const unknown_key =
+        "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"surprise\":true}";
+    var unknown_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unknown_key, .{});
+    defer unknown_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseCommittedFilePresentation(alloc, unknown_parsed.value),
+    );
+
+    // The writer omits content_handle for unspilled presentations, keeping
+    // the shipped 9-key shape readable by older builds.
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeCommittedFilePresentation(&out.writer, shipped_presentation);
+    try std.testing.expect(std.mem.find(u8, out.written(), "content_handle") == null);
+    var roundtrip_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer roundtrip_parsed.deinit();
+    const roundtrip = try parseCommittedFilePresentation(alloc, roundtrip_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, roundtrip);
+    try std.testing.expectEqualStrings("line\n", roundtrip.after_content.?);
+    try std.testing.expect(roundtrip.content_handle == null);
+
+    // The writer emits the handle only when present, and it roundtrips.
+    out.clearRetainingCapacity();
+    try writeCommittedFilePresentation(&out.writer, spilled_presentation);
+    try std.testing.expect(std.mem.find(
+        u8,
+        out.written(),
+        "\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"",
+    ) != null);
+    var spilled_roundtrip_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer spilled_roundtrip_parsed.deinit();
+    const spilled_roundtrip = try parseCommittedFilePresentation(alloc, spilled_roundtrip_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, spilled_roundtrip);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        spilled_roundtrip.content_handle.?,
     );
 }
 
