@@ -34,6 +34,9 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    /// Raw reasoning-effort override using the kernel's ReasoningEffort.parse
+    /// vocabulary. Borrowed; must outlive the server run.
+    effort_override: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
