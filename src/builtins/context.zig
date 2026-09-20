@@ -2994,15 +2994,15 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
             "{s}\nRuntime context: this is a noninteractive run without live question UI; when a user-owned decision remains after inspection, stop and surface a concrete blocker in freeform text with the available options. Do not recommend or label one option as preferred.",
             .{turn_context},
         );
-    try messages.append(arena, .{ .role = .user, .content = content });
+    try messages.append(arena, .{ .role = .system, .content = content });
     try appendWorkspaceAccessContext(input.access_scope, arena, messages);
-    try messages.append(arena, .{ .role = .user, .content = permissionModeContext(input.permission_mode) });
+    try messages.append(arena, .{ .role = .system, .content = permissionModeContext(input.permission_mode) });
     if (input.stale_shell_handles) try messages.append(arena, .{
-        .role = .user,
+        .role = .system,
         .content = stale_shell_handles_context,
     });
     if (input.interactive) try messages.append(arena, .{
-        .role = .user,
+        .role = .system,
         .content = "Runtime context: if this turn changes files, choose focused verification from the touched areas first. Use changed paths in tool calls and results to select checks; avoid generic or expensive verification unless those paths justify it or the user requested it. Tests under tests/evals can be deterministic; do not assume they require live models. Preserve exact verification evidence in the final summary.",
     });
 }
@@ -3030,7 +3030,7 @@ fn appendWorkspaceAccessContext(
         try model_context_encoding.writeScalar(&note.writer, entry.path);
         try note.writer.writeByte('\n');
     }
-    try messages.append(arena, .{ .role = .user, .content = try note.toOwnedSlice() });
+    try messages.append(arena, .{ .role = .system, .content = try note.toOwnedSlice() });
 }
 
 const PromptContextFixture = struct {
@@ -3108,7 +3108,7 @@ test "runtime context composes exact auto mode with noninteractive blockers" {
     try expectContains(messages.items[0].content.?, "Do not recommend or label one option as preferred");
     try expectNotContains(messages.items[0].content.?, "ask_user_question");
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);
     try std.testing.expectEqualStrings(
         "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic safe-tool authority, fx sends each unresolved action to a narrow safety reviewer. A clear result authorizes only that exact action. A caution or unavailable result holds only that action and returns advice without opening a permission screen, disabling tools, or ending the turn. Exact cautions are reused for this turn; choose a materially different safe action or explain why no safe path remains. Tool admission and exact live revalidation remain authoritative.",
         messages.items[1].content.?,

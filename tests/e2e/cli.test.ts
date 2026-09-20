@@ -32,7 +32,6 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
-import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 
 const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
@@ -4065,9 +4064,7 @@ describe("cli: ask success", () => {
           const request = JSON.parse(gateway.requests[index]!.body) as {
             prompt: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
           };
-          // The volatile runtime context rides the message tail; the submitted
-          // prompt is the last non-overlay user message.
-          const user = request.prompt[lastConversationUserIndex(request.prompt)];
+          const user = request.prompt.findLast((message) => message.role === "user");
           expect(user?.content.find((part) => part.type === "text")?.text).toBe(prompt);
         }
 

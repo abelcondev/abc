@@ -31,7 +31,6 @@ import {
   tmuxAvailable,
   tmuxRawPasteFlags,
 } from "./tmux-helpers";
-import { lastConversationUserText } from "./conditional-guidance-oracle";
 import {
   findActiveFileApprovalBlock,
   findFooterBlocks,
@@ -876,9 +875,10 @@ async function waitForSubmittedUserText(
       content?: Array<{ type: string; text?: string }>;
     }>;
   };
-  // The volatile runtime context rides the message tail; the submitted prompt
-  // is the last conversation user message before it.
-  return lastConversationUserText(request.prompt) || undefined;
+  return [...request.prompt]
+    .reverse()
+    .find((message) => message.role === "user")
+    ?.content?.find((part) => part.type === "text")?.text;
 }
 
 async function waitForGatewayRequestCount(
