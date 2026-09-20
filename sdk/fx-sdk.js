@@ -28,9 +28,8 @@ const maxPromptImagesBytes = 8 * 1024 * 1024;
 // envelope allowance covers the method key and request id.
 const maxPromptFrameBytes = 8 * 1024 * 1024;
 const promptFrameEnvelopeBytes = 128;
-// Tool inputs ride control frames that the kernel's own request budget already
-// bounds near 8 MiB, so a tool_start event caps its preview at the SDK's
-// existing 64 KiB display bound and marks the truncation instead of dropping it.
+// tool_start events carry a bounded preview of the tool input; larger inputs
+// are marked truncated instead of dropped or sent whole.
 const maxToolStartInputBytes = 64 * 1024;
 
 function boundedString(value, name, maxBytes, required) {
@@ -1666,28 +1665,15 @@ export async function createFxAgent(options = {}) {
     return result;
   }
 
-  // The input object rides the event when it fits the control-frame budget;
-  // oversized inputs become a bounded JSON prefix plus an explicit marker.
+  // The input object rides the event when it fits the preview budget; larger
+  // inputs become a bounded JSON prefix plus an explicit marker.
   function toolStartInput(rawInput) {
     if (rawInput === undefined || rawInput === null) return {};
     const serialized = JSON.stringify(rawInput);
     if (serialized === undefined) return {};
-    if (encoder.encode(serialized).length <= maxToolStartInputBytes) return { input: rawInput };
-    return { inputTruncated: true, inputPreview: jsonPrefixByBytes(serialized, maxToolStartInputBytes) };
-  }
-
-  // Longest prefix of text whose UTF-8 encoding fits maxBytes; never splits a
-  // code point, so the preview stays valid UTF-8.
-  function jsonPrefixByBytes(text, maxBytes) {
-    let end = 0;
-    let bytes = 0;
-    for (const char of text) {
-      const width = encoder.encode(char).length;
-      if (bytes + width > maxBytes) break;
-      bytes += width;
-      end += char.length;
-    }
-    return text.slice(0, end);
+    const bytes = encoder.encode(serialized);
+    if (bytes.length <= maxToolStartInputBytes) return { input: rawInput };
+    return { inputTruncated: true, inputPreview: decoder.decode(utf8Prefix(bytes, maxToolStartInputBytes)) };
   }
 
   function startTurn(input, promptOptions) {

@@ -78,9 +78,9 @@ blocks. It returns an async iterable of normalized events:
   `inputTruncated: true` instead; the tool still receives complete arguments.
 - `tool_end`
 
-Consume the turn while it runs, then await `turn.result`. Output is lossless and
-backpressured: a slow reader pauses production instead of growing an unlimited
-event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+Consume the turn while it runs, then await `turn.result`. Streamed text and
+tool results are lossless and backpressured: a slow reader pauses production
+instead of growing an unlimited event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
 If you only need the result, explicitly discard events:
 
 ```js
