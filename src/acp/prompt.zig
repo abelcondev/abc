@@ -3274,9 +3274,9 @@ test "captureImagesInline retains validated bytes on the attachment" {
     try std.testing.expect(image.snapshot_path == null);
     var verified = try image_attachments.loadVerifiedSnapshot(alloc, image, .{});
     defer verified.deinit(alloc);
-    const expected = try alloc.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(png_b64) catch unreachable);
+    const expected = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(png_b64));
     defer alloc.free(expected);
-    std.base64.standard.Decoder.decode(expected, png_b64) catch unreachable;
+    try std.base64.standard.Decoder.decode(expected, png_b64);
     try std.testing.expectEqualStrings(expected, verified.bytes);
 
     parsed.retainImageSnapshots();
