@@ -28,6 +28,9 @@ const maxPromptImagesBytes = 8 * 1024 * 1024;
 // envelope allowance covers the method key and request id.
 const maxPromptFrameBytes = 8 * 1024 * 1024;
 const promptFrameEnvelopeBytes = 128;
+// tool_start events carry a bounded preview of the tool input; larger inputs
+// are marked truncated instead of dropped or sent whole.
+const maxToolStartInputBytes = 64 * 1024;
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -1611,6 +1614,7 @@ export async function createFxAgent(options = {}) {
           type: "tool_start",
           id: update.toolCallId,
           name: toolNames.get(update.toolCallId),
+          ...toolStartInput(update.rawInput),
         };
       }
       if (update.sessionUpdate === "tool_call_update" &&
@@ -1659,6 +1663,17 @@ export async function createFxAgent(options = {}) {
     if (Number.isSafeInteger(usage?.cacheWriteTokens)) result.cacheWriteTokens = usage.cacheWriteTokens;
     if (Number.isSafeInteger(usage?.reasoningTokens)) result.reasoningTokens = usage.reasoningTokens;
     return result;
+  }
+
+  // The input object rides the event when it fits the preview budget; larger
+  // inputs become a bounded JSON prefix plus an explicit marker.
+  function toolStartInput(rawInput) {
+    if (rawInput === undefined || rawInput === null) return {};
+    const serialized = JSON.stringify(rawInput);
+    if (serialized === undefined) return {};
+    const bytes = encoder.encode(serialized);
+    if (bytes.length <= maxToolStartInputBytes) return { input: rawInput };
+    return { inputTruncated: true, inputPreview: decoder.decode(utf8Prefix(bytes, maxToolStartInputBytes)) };
   }
 
   function startTurn(input, promptOptions) {

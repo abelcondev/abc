@@ -30,6 +30,7 @@ const scripts = [
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
   "test-agent-images.mjs",
+  "test-agent-tool-start.mjs",
   "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {

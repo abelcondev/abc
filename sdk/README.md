@@ -73,12 +73,14 @@ blocks. It returns an async iterable of normalized events:
 
 - `text_delta`
 - `reasoning_delta` when supplied by the provider
-- `tool_start`
+- `tool_start` with `id`, `name`, and the tool's `input` object. Inputs over
+  64 KiB of JSON arrive as an `inputPreview` string prefix plus
+  `inputTruncated: true` instead; the tool still receives complete arguments.
 - `tool_end`
 
-Consume the turn while it runs, then await `turn.result`. Output is lossless and
-backpressured: a slow reader pauses production instead of growing an unlimited
-event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+Consume the turn while it runs, then await `turn.result`. Streamed text and
+tool results are lossless and backpressured: a slow reader pauses production
+instead of growing an unlimited event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
 If you only need the result, explicitly discard events:
 
 ```js
