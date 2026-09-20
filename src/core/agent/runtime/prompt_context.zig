@@ -472,15 +472,10 @@ pub fn buildProviderPrompt(
     errdefer messages.deinit(alloc);
 
     try instructions.appendSlice(alloc, stable_prefix);
+    try instructions.appendSlice(alloc, ephemeral_overlay);
     try messages.appendSlice(alloc, durable_history);
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
-    // The overlay carries per-step volatile runtime context (date, git state,
-    // permission mode, subagent deliveries). Provider prompt caching reuses the
-    // longest unchanged leading span, so the overlay rides at the very end of
-    // the message list: a mid-turn change then discards only the overlay
-    // instead of invalidating the entire conversation history behind it.
-    try messages.appendSlice(alloc, ephemeral_overlay);
     return .{
         .instructions = instructions,
         .messages = messages,
@@ -494,7 +489,7 @@ test "buildProviderPrompt separates instructions from chronological messages" {
         .{ .role = .system, .content = "stable project context" },
     };
     const overlay = [_]ChatMessage{
-        .{ .role = .user, .content = "volatile runtime overlay" },
+        .{ .role = .system, .content = "volatile runtime overlay" },
     };
     const history = [_]ChatMessage{
         .{ .role = .user, .content = "history user prompt" },
@@ -508,17 +503,15 @@ test "buildProviderPrompt separates instructions from chronological messages" {
     var prompt = try buildProviderPrompt(alloc, &stable_prefix, &overlay, &history, current, &suffix);
     defer prompt.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), prompt.instructions.items.len);
-    try std.testing.expectEqual(@as(usize, 5), prompt.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), prompt.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), prompt.messages.items.len);
     try std.testing.expectEqualStrings("stable system prompt", prompt.instructions.items[0].content.?);
     try std.testing.expectEqualStrings("stable project context", prompt.instructions.items[1].content.?);
+    try std.testing.expectEqualStrings("volatile runtime overlay", prompt.instructions.items[2].content.?);
     try std.testing.expectEqualStrings("history user prompt", prompt.messages.items[0].content.?);
     try std.testing.expectEqualStrings("history assistant answer", prompt.messages.items[1].content.?);
     try std.testing.expectEqualStrings("current user prompt", prompt.messages.items[2].content.?);
     try std.testing.expectEqualStrings("within turn assistant", prompt.messages.items[3].content.?);
-    // The volatile overlay rides the message tail so a mid-turn change does
-    // not invalidate the cacheable prefix that covers all prior history.
-    try std.testing.expectEqualStrings("volatile runtime overlay", prompt.messages.items[4].content.?);
 }
 
 test "buildProviderPrompt keeps compacted session context out of instructions" {
@@ -587,7 +580,7 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
         .{ .role = .system, .content = "stable system prompt" },
         .{ .role = .system, .content = "stable project context" },
     };
-    const overlay = [_]ChatMessage{.{ .role = .user, .content = "ephemeral overlay" }};
+    const overlay = [_]ChatMessage{.{ .role = .system, .content = "ephemeral overlay" }};
     const current = ChatMessage{ .role = .user, .content = "current portable prompt" };
     const suffix = [_]ChatMessage{.{ .role = .assistant, .content = "within-turn suffix" }};
     var prompt = try buildProviderPrompt(
@@ -631,9 +624,8 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
     try std.testing.expectEqual(@as(usize, 1), late_summary_count);
     try std.testing.expectEqual(@as(usize, 1), file_evidence_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
-    try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 3].content.?);
-    try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 2].content.?);
-    try std.testing.expectEqualStrings("ephemeral overlay", prompt.messages.items[prompt.messages.items.len - 1].content.?);
+    try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 2].content.?);
+    try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 1].content.?);
 }
 
 test "provider request measurement includes serialized structure" {

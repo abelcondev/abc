@@ -121,8 +121,8 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         const body = gateway.request_bodies.items[0];
         const runtime_idx = std.mem.indexOf(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
         const current_idx = std.mem.indexOf(u8, body, text) orelse return error.TestExpectedEqual;
-        try std.testing.expect(current_idx < runtime_idx);
-        try expectGatewayPromptFinalUserText(&gateway, 0, "runtime context unique");
+        try std.testing.expect(runtime_idx < current_idx);
+        try expectGatewayPromptFinalUserText(&gateway, 0, text);
         try expectBodyContains(&gateway, 0, "\"name\":\"read_file\"");
         try expectBodyNotContains(&gateway, 0, removed_direct_question_guidance);
         try expectBodyNotContains(&gateway, 0, removed_resume_guidance);

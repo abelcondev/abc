@@ -114,35 +114,26 @@ function textResponse(value) {
   ]);
 }
 
-// The volatile runtime context rides the message tail as trailing user
-// messages; locate the last conversation user message instead. Mirrors
-// isRuntimeOverlayMessage in tests/e2e/conditional-guidance-oracle.ts (the
-// source of truth for the markers); plain node here cannot import the TS
-// oracle, and the subagent-delivery and explicit-skill markers do not occur
-// in this fixture's traffic.
-function lastConversationUserIndex(prompt) {
-  for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    const message = prompt[index];
-    if (message.role !== "user") continue;
-    const text = JSON.stringify(message.content);
-    if (text.includes("<fx-turn-context>") || text.includes('"Runtime context:')) continue;
-    return index;
-  }
-  return -1;
-}
-
 function toolResult(body, id) {
   const prompt = body.prompt || [];
-  const lastUser = lastConversationUserIndex(prompt);
+  let lastUser = -1;
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    if (prompt[index].role === "user") {
+      lastUser = index;
+      break;
+    }
+  }
   return prompt.slice(lastUser + 1)
     .flatMap((message) => Array.isArray(message.content) ? message.content : [])
     .find((part) => part.type === "tool-result" && part.toolCallId === id);
 }
 
 function latestUserText(body) {
-  const prompt = body.prompt || [];
-  const index = lastConversationUserIndex(prompt);
-  return index < 0 ? "" : JSON.stringify(prompt[index].content);
+  for (let index = (body.prompt || []).length - 1; index >= 0; index -= 1) {
+    const message = body.prompt[index];
+    if (message.role === "user") return JSON.stringify(message.content);
+  }
+  return "";
 }
 
 function requireResult(body, id, expected) {

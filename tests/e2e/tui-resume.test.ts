@@ -34,7 +34,6 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 import { readTapeFrames } from "./render-lab/tape";
 
 const TIMEOUT = 30_000;
@@ -2804,7 +2803,7 @@ test.skipIf(!tmuxAvailable())(
         role: string;
         content: Array<{ type: string; text?: string }>;
       }>;
-      const finalUser = messages[lastConversationUserIndex(messages)];
+      const finalUser = messages[messages.length - 1];
       expect(finalUser?.role).toBe("user");
       expect(finalUser?.content[0]?.text).toBe(fullViewDraft);
       const afterSubmit = await active.capturePane();

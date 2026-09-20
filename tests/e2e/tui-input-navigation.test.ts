@@ -20,7 +20,6 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 import {
   assertPaneContains,
   assertSingleFooter,
@@ -587,7 +586,7 @@ tmuxTest(
       role: string;
       content: Array<{ type: string; text?: string }>;
     }>;
-    const finalUser = messages[lastConversationUserIndex(messages)];
+    const finalUser = messages[messages.length - 1];
     expect(finalUser?.role).toBe("user");
     expect(finalUser?.content[0]?.text).toBe(prompt);
 
@@ -1732,7 +1731,7 @@ tmuxTest(
       role: string;
       content: Array<{ type: string; text?: string }>;
     }>;
-    const user = request[lastConversationUserIndex(request)];
+    const user = request.findLast((message) => message.role === "user");
     expect(user?.content[0]?.text).toBe(submission);
 
     const transcript = await active.capturePaneEscapes();

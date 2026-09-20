@@ -21,7 +21,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
-import { stripRuntimeOverlay } from "./conditional-guidance-oracle";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -542,7 +541,7 @@ function textFromContent(content: unknown): string {
 
 function lastUserText(body: string): string {
   const parsed = JSON.parse(body) as { prompt: Array<{ role?: string; content?: unknown }> };
-  const users = stripRuntimeOverlay(parsed.prompt.filter((entry) => entry.role === "user"));
+  const users = parsed.prompt.filter((entry) => entry.role === "user");
   expect(users.length).toBeGreaterThan(0);
   return textFromContent(users[users.length - 1].content);
 }
@@ -779,8 +778,8 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(4);
 
         const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
-        expect(stripRuntimeOverlay(rejectedPrompt).at(-1)).toMatchObject({ role: "tool" });
-        const retryPrompt = stripRuntimeOverlay(JSON.parse(gateway.chatRequests[3].body).prompt);
+        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
+        const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
         expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
         expect(JSON.stringify(retryPrompt.at(-1))).toContain(
           "Continue from the preceding tool result.",
