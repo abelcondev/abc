@@ -7231,7 +7231,7 @@ test "resume projection stores reflow metadata for session action rows" {
     }
 }
 
-test "resume projection restores session action rows against the live root after a workspace move" {
+test "resume projection restores session action rows with labels seeded from the live root" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
     defer app.deinit();
