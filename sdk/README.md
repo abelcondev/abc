@@ -183,6 +183,11 @@ schemas, cancellation, results, and events are used by N-API and WebAssembly.
 Cancelling a prompt aborts its tools' signals and stops waiting for their
 callbacks. Late results and rejections are ignored. Tools remain responsible
 for stopping their own work when their signal is aborted.
+
+A host tool may use any name, including the kernel's builtin names such as
+`write_file` and `edit_file`: the kernel routes by the registered executor, so
+a host-defined `write_file` calls the host's `execute()` rather than the
+builtin file mutation.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system
