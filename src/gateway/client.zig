@@ -3278,7 +3278,16 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
+}
+
+fn parseSseTokenDetail(usage_value: std.json.Value, section: []const u8, key: []const u8) ?u64 {
+    const section_value = usage_value.object.get(section) orelse return null;
+    if (section_value != .object) return null;
+    const detail = section_value.object.get(key) orelse return null;
+    if (detail != .integer or detail.integer < 0) return null;
+    return @intCast(detail.integer);
 }
 
 fn parseSseTokenTotal(usage_value: std.json.Value, key: []const u8) ?u64 {
@@ -4268,6 +4277,43 @@ test "consumeSseStream captures exact terminal billing" {
     try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
     try std.testing.expectEqual(@as(u64, 5), billing.reasoning_tokens.?);
     try std.testing.expectEqual(@as(u64, 2), billing.billable_web_search_calls);
+}
+
+test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
+
+    const malformed =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"outputTokens\":{\"total\":25,\"reasoning\":\"5\"}}}\n\n";
+    var malformed_reader = std.Io.Reader.fixed(malformed);
+    var malformed_completion = try consumeSseStream(
+        std.testing.allocator,
+        &malformed_reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &malformed_completion);
+    try std.testing.expectEqual(@as(?u64, null), malformed_completion.usage.reasoning_tokens);
 }
 
 test "consumeSseStream ignores malformed finish usage totals" {

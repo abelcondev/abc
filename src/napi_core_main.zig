@@ -28,6 +28,8 @@ const max_fetch_request_frame_bytes = std.base64.standard.Encoder.calcSize(max_f
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
+// Matches types.ReasoningEffort.max_name_bytes.
+const max_effort_bytes = 64;
 const max_path_bytes = 16 * 1024;
 const max_url_bytes = 16 * 1024;
 const max_active_runtimes = 64;
@@ -481,6 +483,7 @@ const Runtime = struct {
     output: OutputQueue = .{},
     credential: []u8,
     model: ?[]u8,
+    effort: ?[]u8,
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
@@ -543,6 +546,7 @@ const Runtime = struct {
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
                 .model_override = self.model,
+                .effort_override = self.effort,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
@@ -577,6 +581,7 @@ const Runtime = struct {
         self.output.deinit(self.alloc);
         self.alloc.free(self.credential);
         if (self.model) |model| self.alloc.free(model);
+        if (self.effort) |effort| self.alloc.free(effort);
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
         self.alloc.free(self.gateway_chat_url);
@@ -711,6 +716,7 @@ const CreateError = error{
     TooManyRuntimes,
     InvalidApiKey,
     InvalidModel,
+    InvalidEffort,
     InvalidHome,
     InvalidWorkspaceRoot,
     InvalidGatewayUrl,
@@ -736,6 +742,12 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
+    const effort = getNamedString(env, options, "effort", alloc, max_effort_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidEffort,
+    };
+    errdefer if (effort) |value| alloc.free(value);
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -768,6 +780,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .alloc = alloc,
         .credential = api_key,
         .model = model,
+        .effort = effort,
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
@@ -793,6 +806,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
+        error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
         error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),

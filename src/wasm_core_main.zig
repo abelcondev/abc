@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .model_override = io_mod.getenv("FX_MODEL"),
+        .effort_override = io_mod.getenv("FX_EFFORT"),
         .workspace_root_override = "/",
         .allow_acp_mcp = false,
         .allow_native_tools = false,

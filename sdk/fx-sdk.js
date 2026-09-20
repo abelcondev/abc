@@ -10,6 +10,8 @@ const workspaceOutputLimit = 64 * 1024;
 const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
 const maxModelBytes = 1024;
+// Matches the kernel's ReasoningEffort.max_name_bytes.
+const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
@@ -44,6 +46,17 @@ function validateGatewayChatUrl(value) {
   }
 }
 
+// Mirrors the kernel's ReasoningEffort.parse: "auto"/"adaptive"/"default" pick
+// the model default; anything else must be a bounded effort name.
+function normalizeEffort(value) {
+  if (value === undefined) return undefined;
+  boundedString(value, "effort", maxEffortBytes, false);
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new TypeError('effort must use only letters, digits, ".", "-", or "_"');
+  }
+  return value;
+}
+
 function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
@@ -54,6 +67,7 @@ function normalizeAgentOptions(value) {
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   options.model = boundedString(options.model, "model", maxModelBytes, false);
+  options.effort = normalizeEffort(options.effort);
   validateGatewayChatUrl(options.gatewayChatUrl);
   return options;
 }
@@ -62,8 +76,19 @@ function agentEnvironment(options) {
   return {
     AI_GATEWAY_API_KEY: options.apiKey,
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
+    ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
+}
+
+// The kernel rejects an unsupported effort during initialize; both messages
+// originate only from that validation, so the rejection is safe to retype.
+function agentBootstrapError(error) {
+  if (error instanceof Error &&
+    (error.message === "Invalid reasoning effort" || error.message.startsWith("Reasoning effort"))) {
+    error.code ??= "LIBFX_UNSUPPORTED_EFFORT";
+  }
+  return error;
 }
 
 async function cancelResponseBody(response) {
@@ -1490,7 +1515,7 @@ export async function createFxAgent(options = {}) {
     try { runtime.abortHostEffects(); } catch {}
     try { runtime.closeStdin(); } catch {}
     try { await runtime.exited; } catch {}
-    throw error;
+    throw agentBootstrapError(error);
   }
 
   const agent = {
