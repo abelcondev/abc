@@ -769,6 +769,137 @@ fn writeConversationRecoveryState(
 /// carries their content-addressed handle instead.
 const recovery_checkpoint_inline_output_max_bytes: usize = result_store.preview_bytes;
 
+/// Inline budget for committed-edit previous/after snapshots inside durable
+/// records (conversation log, recovery checkpoint). Larger contents move to a
+/// result-store artifact and the record carries its content-addressed handle.
+const file_presentation_inline_max_bytes: usize = result_store.preview_bytes;
+
+fn presentationNeedsSpill(presentation: types.CommittedFilePresentation) bool {
+    if (presentation.content_handle != null) return false;
+    const previous_bytes = if (presentation.previous_content) |content| content.len else 0;
+    const after_bytes = if (presentation.after_content) |content| content.len else 0;
+    return previous_bytes +| after_bytes > file_presentation_inline_max_bytes;
+}
+
+/// Spills one result's oversized diff snapshots into the session result
+/// store, returning a copy whose presentation carries only the handle. Store
+/// or path failures keep the presentation inline so a hiccup cannot block the
+/// enclosing commit. `result_dir` is resolved lazily and reused across calls.
+fn spillResultFilePresentation(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    result_dir: *?[]const u8,
+    result: types.PersistedToolResult,
+) !types.PersistedToolResult {
+    const presentation = result.committed_file_presentation orelse return result;
+    if (!presentationNeedsSpill(presentation)) return result;
+    if (result_dir.* == null) {
+        const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
+                .{@errorName(err)},
+            );
+            return result;
+        };
+        result_dir.* = std.fs.path.join(alloc, &.{ base, "tool-results" }) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
+                .{@errorName(err)},
+            );
+            return result;
+        };
+    }
+    const handle = result_store.storeDiffContent(
+        alloc,
+        result_dir.*.?,
+        result.tool_call_id,
+        presentation.previous_content,
+        presentation.after_content,
+    ) catch |err| {
+        debug_trace.logf(
+            "session",
+            "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline",
+            .{ result.tool_call_id, @errorName(err) },
+        );
+        return result;
+    };
+    debug_trace.logf(
+        "session",
+        "event=diff_content_spilled call_id={s} previous_bytes={d} after_bytes={d}",
+        .{
+            result.tool_call_id,
+            if (presentation.previous_content) |content| content.len else 0,
+            if (presentation.after_content) |content| content.len else 0,
+        },
+    );
+    var projected = result;
+    var projected_presentation = presentation;
+    projected_presentation.previous_content = null;
+    projected_presentation.after_content = null;
+    projected_presentation.content_handle = handle;
+    projected.committed_file_presentation = projected_presentation;
+    return projected;
+}
+
+/// Returns a copy of `turn` whose oversized committed-edit snapshots are
+/// spilled to the session result store. Untouched payloads keep borrowing the
+/// source turn; spilled handles and projected slices are allocated from
+/// `alloc`, which the caller releases in bulk after the append. Only OOM
+/// propagates; store failures keep the offending presentation inline.
+fn spillHistoryTurnFilePresentations(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    turn: types.HistoryTurn,
+) !types.HistoryTurn {
+    const execution = switch (turn) {
+        .assistant => |entry| entry.execution,
+        .interrupted => |entry| entry.execution,
+        .compacted_summary => return turn,
+    };
+    var needs_spill = false;
+    scan: for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            if (result.committed_file_presentation) |presentation| {
+                if (presentationNeedsSpill(presentation)) {
+                    needs_spill = true;
+                    break :scan;
+                }
+            }
+        }
+    }
+    if (!needs_spill) return turn;
+
+    var result_dir: ?[]const u8 = null;
+    const steps = try alloc.alloc(types.ToolExecutionStep, execution.tool_steps.len);
+    for (execution.tool_steps, 0..) |step, index| {
+        steps[index] = step;
+        var step_needs_spill = false;
+        for (step.tool_results) |result| {
+            if (result.committed_file_presentation) |presentation| {
+                if (presentationNeedsSpill(presentation)) {
+                    step_needs_spill = true;
+                    break;
+                }
+            }
+        }
+        if (!step_needs_spill) continue;
+        const results = try alloc.alloc(types.PersistedToolResult, step.tool_results.len);
+        for (step.tool_results, 0..) |result, result_index| {
+            results[result_index] = try spillResultFilePresentation(alloc, dir, &result_dir, result);
+        }
+        steps[index].tool_results = results;
+    }
+    var projected = turn;
+    switch (projected) {
+        .assistant => |*entry| entry.execution.tool_steps = steps,
+        .interrupted => |*entry| entry.execution.tool_steps = steps,
+        .compacted_summary => {},
+    }
+    return projected;
+}
+
 /// Returns a copy of the checkpoint whose oversized tool-result outputs are
 /// spilled to the session result store and replaced by their handle. The
 /// source checkpoint is borrowed; the projection owns only its own
@@ -781,13 +912,19 @@ fn spillRecoveryCheckpointOutputs(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !session_codec.RecoveryCheckpoint {
     var spills = false;
-    for (checkpoint.execution.tool_steps) |step| {
+    scan: for (checkpoint.execution.tool_steps) |step| {
         for (step.tool_results) |result| {
             if (result.output_handle != null or
                 result.output.len > recovery_checkpoint_inline_output_max_bytes)
             {
                 spills = true;
-                break;
+                break :scan;
+            }
+            if (result.committed_file_presentation) |presentation| {
+                if (presentationNeedsSpill(presentation)) {
+                    spills = true;
+                    break :scan;
+                }
             }
         }
     }
@@ -804,6 +941,12 @@ fn spillRecoveryCheckpointOutputs(
             {
                 results_changed = true;
                 break;
+            }
+            if (result.committed_file_presentation) |presentation| {
+                if (presentationNeedsSpill(presentation)) {
+                    results_changed = true;
+                    break;
+                }
             }
         }
         if (!results_changed) continue;
@@ -859,7 +1002,7 @@ fn projectRecoveryResult(
         }
         projected.output = "";
     }
-    return projected;
+    return spillResultFilePresentation(alloc, dir, result_dir, projected);
 }
 
 fn loadConversationPermissionState(
@@ -1523,7 +1666,14 @@ fn openConversationWritableSession(
             // prompt can replace the recovery slot. Sequence binding makes a
             // crash after this append safe even if sidecar cleanup did not run.
             const timestamp = io_mod.milliTimestamp();
-            try conversation_writer.appendHistoryTurn(alloc, timestamp, checkpoint.interruptedTurn());
+            var spill_arena = std.heap.ArenaAllocator.init(alloc);
+            defer mem_utils.deinit_arena(spill_arena);
+            const restored_turn = try spillHistoryTurnFilePresentations(
+                spill_arena.allocator(),
+                &writable.dir,
+                checkpoint.interruptedTurn(),
+            );
+            try conversation_writer.appendHistoryTurn(alloc, timestamp, restored_turn);
             writeConversationRecoveryState(alloc, &writable.dir, null, conversation_writer.last_seq) catch |err| {
                 debug_trace.logf("session", "compaction source committed but recovery cleanup failed err={s}", .{@errorName(err)});
             };
@@ -3122,11 +3272,21 @@ pub const LoadedWritableSession = struct {
             null;
         defer if (prepared) |turn| session.freeHistoryTurn(alloc, turn);
         if (prepared) |*turn| try self.prepareHistoryTurnForCommit(alloc, turn);
+        var spill_arena = std.heap.ArenaAllocator.init(alloc);
+        defer mem_utils.deinit_arena(spill_arena);
+        const append_prefix: ?types.AssistantHistoryTurn = if (prepared) |turn| blk: {
+            const projected = try spillHistoryTurnFilePresentations(
+                spill_arena.allocator(),
+                &self.log.dir,
+                turn,
+            );
+            break :blk projected.assistant;
+        } else null;
         try self.conversation_writer.appendContextCompaction(
             alloc,
             timestamp_ms,
             summary,
-            if (prepared) |turn| turn.assistant else null,
+            append_prefix,
             retained_from,
         );
         if (prepared) |turn| self.writeFirstConversationTitle(alloc, turn);
@@ -3149,10 +3309,17 @@ pub const LoadedWritableSession = struct {
         else
             null;
         errdefer if (work_id) |value| mem_utils.free(alloc, value);
+        var spill_arena = std.heap.ArenaAllocator.init(alloc);
+        defer mem_utils.deinit_arena(spill_arena);
+        const turn = try spillHistoryTurnFilePresentations(
+            spill_arena.allocator(),
+            &self.log.dir,
+            payload.turn,
+        );
         try self.conversation_writer.appendHistoryTurn(
             alloc,
             timestamp_ms,
-            payload.turn,
+            turn,
         );
         self.writeFirstConversationTitle(alloc, payload.turn);
         if (self.conversation_writer.failure) |err| return err;
@@ -6070,6 +6237,261 @@ test "tool-result spill keeps an over-cap checkpoint persistable and resumable" 
             try std.testing.expectEqual(@as(u8, @intCast('a' + index)), result.output[0]);
             try std.testing.expectEqual(@as(u8, @intCast('a' + index)), result.output[output_len - 1]);
         }
+    }
+}
+
+test "committed edit diff snapshots spill out of the conversation log" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-diff-spill", 10);
+    defer initial.deinit(alloc);
+
+    const previous = try alloc.alloc(u8, 3000);
+    defer alloc.free(previous);
+    @memset(previous, 'o');
+    @memcpy(previous[previous.len - 9 ..], "OLDMARKER");
+    const after = try alloc.alloc(u8, 3000);
+    defer alloc.free(after);
+    @memset(after, 'n');
+    @memcpy(after[after.len - 9 ..], "NEWMARKER");
+
+    var diff_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 1, .text = @constCast("old line") },
+        .{ .kind = .addition, .new_line = 1, .text = @constCast("new line") },
+    };
+    var calls = [_]types.ToolCall{.{ .id = "call-edit", .name = "edit_file", .arguments_json = "{\"path\":\"src/a.zig\"}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_handle = @constCast("result-edit_file-aaaa1111.txt"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = @constCast("src/a.zig"),
+            .kind = .edited,
+            .lines = &diff_lines,
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = previous,
+            .after_content = after,
+            .lifecycle_id = .{ .turn_id = 1, .call_id = @constCast("call-edit") },
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const turn = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("change the file") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps },
+    } };
+
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = turn,
+        } }, 20);
+
+        // The log frame references the artifact; the snapshots stay out of it.
+        const log_bytes = try readManagedFileAlloc(alloc, &loaded.log.dir, events_file, 1024 * 1024);
+        defer alloc.free(log_bytes);
+        try std.testing.expect(std.mem.find(u8, log_bytes, "\"content_handle\":\"diff-") != null);
+        try std.testing.expect(std.mem.find(u8, log_bytes, "OLDMARKER") == null);
+        try std.testing.expect(std.mem.find(u8, log_bytes, "NEWMARKER") == null);
+    }
+
+    // Resume restores the handle, not the inline contents.
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    const restored = resumed.state.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    const presentation = restored.committed_file_presentation orelse
+        return error.TestExpectedPresentation;
+    const handle = presentation.content_handle orelse return error.TestExpectedHandle;
+    try std.testing.expect(result_store.isDiffContentHandle(handle));
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
+
+    // The artifact resolves back to the exact snapshots.
+    const session_base = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
+    defer alloc.free(session_base);
+    const result_dir = try std.fs.path.join(alloc, &.{ session_base, "tool-results" });
+    defer alloc.free(result_dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .read_only,
+    );
+    defer capability.deinit();
+    var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+    defer pack.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, pack.previous_content.?);
+    try std.testing.expectEqualStrings(after, pack.after_content.?);
+}
+
+test "small committed edit snapshots stay inline in the conversation log" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-diff-inline", 10);
+    defer initial.deinit(alloc);
+
+    var diff_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = @constCast("new line") },
+    };
+    var calls = [_]types.ToolCall{.{ .id = "call-edit", .name = "edit_file", .arguments_json = "{\"path\":\"src/a.zig\"}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_handle = @constCast("result-edit_file-bbbb2222.txt"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = @constCast("src/a.zig"),
+            .kind = .edited,
+            .lines = &diff_lines,
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = @constCast("small old"),
+            .after_content = @constCast("small new"),
+            .lifecycle_id = .{ .turn_id = 1, .call_id = @constCast("call-edit") },
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const turn = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("change the file") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps },
+    } };
+
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = turn,
+        } }, 20);
+
+        const log_bytes = try readManagedFileAlloc(alloc, &loaded.log.dir, events_file, 1024 * 1024);
+        defer alloc.free(log_bytes);
+        try std.testing.expect(std.mem.find(u8, log_bytes, "small old") != null);
+        try std.testing.expect(std.mem.find(u8, log_bytes, "\"content_handle\":null") != null);
+    }
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    const presentation = resumed.state.history[0].assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation orelse
+        return error.TestExpectedPresentation;
+    try std.testing.expect(presentation.content_handle == null);
+    try std.testing.expectEqualStrings("small old", presentation.previous_content.?);
+    try std.testing.expectEqualStrings("small new", presentation.after_content.?);
+}
+
+test "recovery checkpoint spills diff snapshots into the result store" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "conversation-recovery-diff-spill", 10);
+    defer initial.deinit(alloc);
+
+    const previous = try alloc.alloc(u8, 3000);
+    defer alloc.free(previous);
+    @memset(previous, 'o');
+    @memcpy(previous[previous.len - 9 ..], "OLDMARKER");
+    const after = try alloc.alloc(u8, 3000);
+    defer alloc.free(after);
+    @memset(after, 'n');
+    @memcpy(after[after.len - 9 ..], "NEWMARKER");
+
+    var diff_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = @constCast("new line") },
+    };
+    var calls = [_]types.ToolCall{.{ .id = "call-edit", .name = "edit_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = @constCast("src/a.zig"),
+            .kind = .edited,
+            .lines = &diff_lines,
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = previous,
+            .after_content = after,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("call-edit") },
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        const bytes = try readManagedFileAlloc(
+            alloc,
+            &loaded.log.dir,
+            recovery_checkpoint_file,
+            session_codec.max_recovery_checkpoint_bytes + 128,
+        );
+        defer alloc.free(bytes);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"content_handle\":\"diff-") != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "OLDMARKER") == null);
+        try std.testing.expect(std.mem.find(u8, bytes, "NEWMARKER") == null);
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        const restored = resumed.state.recovery_checkpoint.?.execution.tool_steps[0].tool_results[0];
+        const presentation = restored.committed_file_presentation orelse
+            return error.TestExpectedPresentation;
+        const handle = presentation.content_handle orelse return error.TestExpectedHandle;
+        try std.testing.expect(presentation.previous_content == null);
+        const session_base = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
+        defer alloc.free(session_base);
+        const result_dir = try std.fs.path.join(alloc, &.{ session_base, "tool-results" });
+        defer alloc.free(result_dir);
+        var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+            alloc,
+            result_dir,
+            .tool_results,
+            .read_only,
+        );
+        defer capability.deinit();
+        var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+        defer pack.deinit(alloc);
+        try std.testing.expectEqualStrings(previous, pack.previous_content.?);
+        try std.testing.expectEqualStrings(after, pack.after_content.?);
     }
 }
 

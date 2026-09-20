@@ -1740,6 +1740,8 @@ fn writeCommittedFilePresentation(
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"content_handle\":");
+    try writeOptionalDurableBytes(writer, presentation.content_handle);
     try writer.writeByte('}');
 }
 
@@ -2459,6 +2461,7 @@ fn parseCommittedFilePresentation(
         "previous_content",
         "after_content",
         "lifecycle_id",
+        "content_handle",
     });
     const path = try parseRequiredDurableBytes(alloc, object, "path");
     errdefer mem_utils.free(alloc, path);
@@ -2482,6 +2485,12 @@ fn parseCommittedFilePresentation(
         object.get("lifecycle_id") orelse return error.InvalidSessionFormat,
     );
     errdefer if (lifecycle_id) |id| mem_utils.free(alloc, id.call_id);
+    // Older records predate externalized diff snapshots and carry no key.
+    const content_handle = if (object.get("content_handle")) |handle_value|
+        try parseOptionalDurableBytes(alloc, handle_value)
+    else
+        null;
+    errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
     return .{
         .path = path,
         .kind = std.meta.stringToEnum(
@@ -2495,6 +2504,7 @@ fn parseCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
 }
 

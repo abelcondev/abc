@@ -16,7 +16,17 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
-pub const conversation_schema_version: u8 = 2;
+// Version 3 adds CommittedFilePresentation.content_handle on tool_result
+// frames: previous/after snapshots may live in a result-store artifact with
+// only the handle inline. Version 1 and 2 frames never carry the field and
+// remain readable.
+pub const conversation_schema_version: u8 = 3;
+
+/// Every historical frame version a reader must still accept. Writers always
+/// emit conversation_schema_version.
+pub fn supportedConversationSchema(version: u8) bool {
+    return version >= 1 and version <= conversation_schema_version;
+}
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
@@ -208,7 +218,7 @@ pub fn validateConversationTransition(
     state: ConversationStateView,
     envelope: ConversationEnvelope,
 ) ConversationTransitionError!void {
-    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
+    if (!supportedConversationSchema(envelope.schema_version)) {
         return error.UnsupportedConversationSchema;
     }
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
@@ -345,6 +355,9 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 if (presentation.lifecycle_id) |lifecycle_id| {
                     try validateConversationIdentity(lifecycle_id.call_id);
                 }
+                if (presentation.content_handle) |handle| {
+                    try validateConversationIdentity(handle);
+                }
             }
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
@@ -454,7 +467,7 @@ pub fn decodeConversationFrame(
         else => return error.InvalidConversationFrame,
     };
     errdefer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
+    if (!supportedConversationSchema(parsed.value.schema_version) or
         parsed.value.seq == 0 or
         parsed.value.timestamp_ms < 0)
     {
@@ -3338,10 +3351,10 @@ test "conversation cancellation provenance preserves ordinary frame bytes" {
     });
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings(
-        "{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}}}\n",
+        "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}}}\n",
         encoded,
     );
-    for ([_]u8{ 1, 2 }) |version| {
+    for ([_]u8{ 1, 2, 3 }) |version| {
         for (std.enums.values(session.InterruptedTerminalReason)) |reason| {
             const old = try std.fmt.allocPrint(alloc, "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"{s}\"}}}}}}\n", .{ version, @tagName(reason) });
             defer alloc.free(old);
@@ -3529,6 +3542,48 @@ test "review feedback conversation metadata defaults old records and omits false
     }
 }
 
+test "conversation frame carries a spilled diff content handle" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeConversationFrame(alloc, .{
+        .seq = 3,
+        .timestamp_ms = 7,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result-edit_file-aaaa.txt",
+            .stored_bytes = 6,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{.{ .kind = .addition, .new_line = 1, .text = "new line" }},
+                .additions = 1,
+                .deletions = 0,
+                .truncated = false,
+                .lifecycle_id = .{ .turn_id = 1, .call_id = "call-edit" },
+                .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+            },
+        } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"content_handle\":\"diff-") != null);
+
+    var decoded = try decodeConversationFrame(alloc, encoded);
+    defer decoded.deinit();
+    const presentation = decoded.value.event.tool_result.committed_file_presentation.?;
+    try std.testing.expectEqualStrings("diff-0123456789abcdef-0123456789abcdef.json", presentation.content_handle.?);
+    try std.testing.expect(presentation.previous_content == null);
+}
+
+test "conversation frame rejects an oversized diff content handle" {
+    const alloc = std.testing.allocator;
+    const oversized = "diff-0123456789abcdef-0123456789abcdef.json" ++ ("x" ** 300);
+    const frame = try std.fmt.allocPrint(alloc, "{{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\",\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"committed_file_presentation\":{{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"{s}\"}}}}}}}}}}\n", .{oversized});
+    defer alloc.free(frame);
+    try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, frame));
+}
+
 test "conversation frame round trips an external tool result reference" {
     const alloc = std.testing.allocator;
     const encoded = try encodeConversationFrame(alloc, .{
@@ -3572,7 +3627,7 @@ test "conversation frame reads old records and preserves new reasoning-only assi
     defer alloc.free(encoded);
     var current = try decodeConversationFrame(alloc, encoded);
     defer current.deinit();
-    try std.testing.expectEqual(@as(u8, 2), current.value.schema_version);
+    try std.testing.expectEqual(conversation_schema_version, current.value.schema_version);
     try std.testing.expectEqualStrings(replay.parts_json, current.value.event.assistant.provider_replay.?.parts_json);
     try validateConversationTransition(.{ .last_seq = 1 }, current.value);
 }

@@ -4554,6 +4554,93 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Loads spilled previous/after snapshots for a replayed presentation.
+        /// A missing or corrupt artifact degrades to the inline preview, never
+        /// to a resume failure; the full-diff expansion is simply absent.
+        fn loadResumeDiffContent(
+            app: *App,
+            call_id: []const u8,
+            handle: []const u8,
+        ) ?result_store.DiffContentPack {
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return null;
+            if (loaded.childCapability()) |capability| {
+                const pack = result_store.loadDiffContentManaged(app.alloc, capability, handle) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "resume diff content load failed call_id={s} err={s}; rendering preview only",
+                        .{ call_id, @errorName(err) },
+                    );
+                    return null;
+                };
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d} route=managed",
+                    .{
+                        call_id,
+                        if (pack.previous_content) |content| content.len else 0,
+                        if (pack.after_content) |content| content.len else 0,
+                    },
+                );
+                return pack;
+            } else |_| {}
+            // Sessions without an attached child capability read through the
+            // same tool-results route the persistence writer spilled into.
+            const base = io_mod.dirRealpathAlloc(app.alloc, loaded.log.dir.dir, ".") catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "resume diff content route unavailable call_id={s} err={s}",
+                    .{ call_id, @errorName(err) },
+                );
+                return null;
+            };
+            defer app.alloc.free(base);
+            const result_dir = std.fs.path.join(app.alloc, &.{ base, "tool-results" }) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "resume diff content route unavailable call_id={s} err={s}",
+                    .{ call_id, @errorName(err) },
+                );
+                return null;
+            };
+            defer app.alloc.free(result_dir);
+            var capability = session_child_store.SessionChildCapability.initLegacyRoute(
+                app.alloc,
+                result_dir,
+                .tool_results,
+                .read_only,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "resume diff content route unavailable call_id={s} err={s}",
+                    .{ call_id, @errorName(err) },
+                );
+                return null;
+            };
+            defer capability.deinit();
+            const pack = result_store.loadDiffContentManaged(app.alloc, &capability, handle) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "resume diff content load failed call_id={s} err={s}; rendering preview only",
+                    .{ call_id, @errorName(err) },
+                );
+                return null;
+            };
+            debug_trace.logf(
+                "session",
+                "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d} route=legacy",
+                .{
+                    call_id,
+                    if (pack.previous_content) |content| content.len else 0,
+                    if (pack.after_content) |content| content.len else 0,
+                },
+            );
+            return pack;
+        }
+
         fn writeCommittedFilePresentation(
             app: *App,
             sink: anytype,
@@ -4567,7 +4654,20 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
-            const payload = app.preparePersistedFileDiff(presentation) catch |err| {
+            var resolved = presentation;
+            var content_pack: result_store.DiffContentPack = .{};
+            defer content_pack.deinit(app.alloc);
+            if (presentation.content_handle) |handle| {
+                if (presentation.previous_content == null or presentation.after_content == null) {
+                    if (loadResumeDiffContent(app, result.tool_call_id, handle)) |pack| {
+                        content_pack = pack;
+                        resolved.previous_content = content_pack.previous_content;
+                        resolved.after_content = content_pack.after_content;
+                    }
+                }
+            }
+
+            const payload = app.preparePersistedFileDiff(resolved) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume committed file presentation unavailable call_id={s} err={s}",
