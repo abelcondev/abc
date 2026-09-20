@@ -606,6 +606,45 @@ pub fn captureInlineImageBytes(
     return attachment;
 }
 
+/// Captures caller-supplied image bytes for sessions without a filesystem
+/// snapshot backend (libfx kernel sessions on native and wasm). Applies the
+/// same size, media-type, and digest validation as the filesystem capture,
+/// but retains the decoded bytes on the attachment itself so request building
+/// and checkpoint serialization never touch a filesystem.
+/// The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytesInMemory(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes or !fitsEncodedLimit(bytes.len)) return error.ImageTooLarge;
+    const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
+
+    const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
+    errdefer alloc.free(owned_path);
+    const owned_media_type = try alloc.dupe(u8, declared_media_type);
+    errdefer alloc.free(owned_media_type);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    const digest_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    errdefer alloc.free(digest_hex);
+    const owned_bytes = try alloc.dupe(u8, bytes);
+    return .{
+        .id = image_id,
+        .path = owned_path,
+        .media_type = owned_media_type,
+        .snapshot_sha256 = digest_hex,
+        .inline_data = owned_bytes,
+    };
+}
+
+pub const inline_image_path_prefix = "inline://image-";
+
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
     attachment: *types.ImageAttachment,
@@ -1142,6 +1181,23 @@ pub fn loadVerifiedSnapshot(
     attachment: types.ImageAttachment,
     budget: CaptureBudget,
 ) !VerifiedSnapshot {
+    if (attachment.inline_data) |inline_bytes| {
+        const expected_inline = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
+        if (expected_inline.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+        try budget.check();
+        if (inline_bytes.len > max_image_bytes) return error.ImageTooLarge;
+        var actual: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(inline_bytes, &actual, .{});
+        const actual_hex = std.fmt.bytesToHex(actual, .lower);
+        if (!std.mem.eql(u8, actual_hex[0..], expected_inline)) return error.ImageSnapshotCorrupt;
+        const detected = detectMediaTypeFromBytes(inline_bytes) orelse
+            return error.UnsupportedImageType;
+        if (!std.mem.eql(u8, detected, attachment.media_type)) return error.ImageSnapshotMediaTypeMismatch;
+        return .{
+            .bytes = try alloc.dupe(u8, inline_bytes),
+            .media_type = detected,
+        };
+    }
     const path = attachment.snapshot_path orelse return error.MissingImageSnapshot;
     const expected = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
     if (expected.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
@@ -3983,4 +4039,63 @@ test "review image replay observes cancellation between base64 chunks" {
     ));
     try std.testing.expect(writer.total_written > 3 * 1024);
     try std.testing.expect(writer.total_written < 16 * 1024);
+}
+
+test "in-memory inline capture validates and retains image bytes without a filesystem" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 3, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    try std.testing.expectEqual(@as(usize, 3), attachment.id);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqualStrings("inline://image-3", attachment.path);
+    try std.testing.expectEqual(@as(?[]const u8, null), attachment.snapshot_path);
+    try std.testing.expectEqualStrings(png, attachment.inline_data.?);
+    try std.testing.expectEqual(@as(usize, snapshot_digest_hex_len), attachment.snapshot_sha256.?.len);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings(png, verified.bytes);
+    try std.testing.expectEqualStrings("image/png", verified.media_type);
+}
+
+test "in-memory inline capture rejects invalid input before retaining bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+
+    try std.testing.expectError(error.InvalidImageId, captureInlineImageBytesInMemory(alloc, 0, "image/png", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", ""));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", "not an image"));
+    try std.testing.expectError(
+        error.ImageSnapshotMediaTypeMismatch,
+        captureInlineImageBytesInMemory(alloc, 1, "image/jpeg", png),
+    );
+    const oversized = try alloc.alloc(u8, max_image_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[0..8], "\x89PNG\r\n\x1a\n");
+    try std.testing.expectError(error.ImageTooLarge, captureInlineImageBytesInMemory(alloc, 1, "image/png", oversized));
+}
+
+test "inline snapshot verification rejects corrupted retained bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    var corrupted = attachment;
+    corrupted.inline_data = try alloc.dupe(u8, attachment.inline_data.?);
+    defer alloc.free(corrupted.inline_data.?);
+    corrupted.inline_data.?[9] ^= 1;
+    try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, corrupted, .{}));
+
+    var wrong_type = attachment;
+    wrong_type.media_type = @constCast("image/jpeg");
+    try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, loadVerifiedSnapshot(alloc, wrong_type, .{}));
+
+    var missing_digest = attachment;
+    missing_digest.snapshot_sha256 = null;
+    try std.testing.expectError(error.MissingImageSnapshot, loadVerifiedSnapshot(alloc, missing_digest, .{}));
 }

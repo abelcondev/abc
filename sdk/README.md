@@ -68,8 +68,8 @@ request metadata, and failures. Credentials and raw headers are never included.
 libfx makes at most one automatic retry after a retryable transport failure and
 only before model output or tool effects escape. Cancellation prevents a retry.
 
-`prompt(input, { signal? })` accepts a string or text/resource blocks. It
-returns an async iterable of normalized events:
+`prompt(input, { signal? })` accepts a string or text, image, and resource
+blocks. It returns an async iterable of normalized events:
 
 - `text_delta`
 - `reasoning_delta` when supplied by the provider
@@ -97,6 +97,27 @@ backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
 that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
+
+Image blocks use ACP's content shape and carry canonical base64 (no line
+wrapping) of a PNG, JPEG, GIF, or WebP payload:
+
+```js
+const turn = agent.prompt([
+  { type: "text", text: "What does this screenshot show?" },
+  { type: "image", data: base64Png, mimeType: "image/png" },
+]);
+```
+
+A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
+with at most 8 MiB of image data per prompt; the SDK rejects larger input with
+typed `RangeError`s before any request. The kernel then validates the decoded
+bytes against the declared `mimeType` and fails the turn with
+`Invalid image prompt block` on a mismatch. Images are routed only to models
+that advertise image input; for any other model the turn fails with
+`Image prompts are unavailable for the selected model` and no image bytes
+leave the process. Prompt images are retained in checkpoints within the
+existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
+images on either backend.
 
 Only one prompt may run at a time. `checkpoint()` is idle-only and returns
 opaque, bounded, versioned bytes. Restore them only when creating a fresh

@@ -18,6 +18,16 @@ const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
 const maxUnreadEventBytes = 1024 * 1024;
 const maxUnreadEvents = 256;
+// Prompt image limits mirror the host tool result image contract: the kernel
+// validates content, the SDK bounds the frame before it reaches the core.
+const maxPromptImages = 8;
+const maxPromptImageDataBytes = 5 * 1024 * 1024;
+const maxPromptImagesBytes = 8 * 1024 * 1024;
+// The core's ACP reader drops frames over 8 MiB without a request id to answer
+// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
+// envelope allowance covers the method key and request id.
+const maxPromptFrameBytes = 8 * 1024 * 1024;
+const promptFrameEnvelopeBytes = 128;
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -1223,9 +1233,30 @@ export async function createFxTerminal(options) {
 function normalizePromptInput(input) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
+  let imageCount = 0;
+  let imageBytes = 0;
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
-    if (block.type === "image") throw new TypeError("image prompt blocks are unsupported");
+    if (block.type === "image") {
+      if (typeof block.data !== "string" || block.data.length === 0) {
+        throw new TypeError(`image prompt block ${index} requires base64 data`);
+      }
+      if (typeof block.mimeType !== "string" || block.mimeType.length === 0 || block.mimeType.length > 128) {
+        throw new TypeError(`image prompt block ${index} requires a mimeType`);
+      }
+      if (block.data.length > maxPromptImageDataBytes) {
+        throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
+      }
+      imageCount += 1;
+      if (imageCount > maxPromptImages) {
+        throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
+      }
+      imageBytes += block.data.length;
+      if (imageBytes > maxPromptImagesBytes) {
+        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+      }
+      return { type: "image", data: block.data, mimeType: block.mimeType };
+    }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
       return { type: "text", text: block.text };
@@ -1632,6 +1663,9 @@ export async function createFxAgent(options = {}) {
 
   function startTurn(input, promptOptions) {
     const prompt = normalizePromptInput(input);
+    if (encoder.encode(JSON.stringify({ sessionId: "", prompt })).length + promptFrameEnvelopeBytes > maxPromptFrameBytes) {
+      throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+    }
     const signal = promptOptions.signal;
     if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
     const queue = [];
