@@ -6255,6 +6255,189 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "resume compacts a legacy log with inline diff snapshots",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-log-compact-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+
+    // A live session writes a 400-line file; the commit spills the snapshots
+    // into the result store.
+    const spilledLines = Array.from(
+      { length: 400 },
+      (_, index) => `COMPACT_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
+    );
+    const completion = "COMPACT_DIFF_COMPLETE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("write-compact-diff", "write_file", {
+        path: "compact-diff.md",
+        content: `${spilledLines.join("\n")}\n`,
+      }),
+      fakeGatewayFinalText(completion),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: { ...gatewayEnv(home, gateway), FX_RECORD: join(root, "initial.fxtape") },
+        stderrPath,
+        width: 120,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Create the compact diff fixture file.");
+      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.sendKeys("1");
+      await active.sendKeys("Enter");
+      const live = await waitForScrollback(active, completion);
+      expect(live).toContain("Wrote compact-diff.md +400");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // Rewrite the log into the legacy shape: inline snapshots, no handle,
+      // no artifact. This is the on-disk shape pre-spill builds wrote.
+      const sessionId = sessionIdFromHome(home);
+      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const eventsPath = join(sessionDir, "events.jsonl");
+      const frames = readFileSync(eventsPath, "utf8")
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line));
+      const toolResultFrame = frames.find(
+        (frame) => frame.event?.tool_result?.committed_file_presentation,
+      );
+      const presentation = toolResultFrame.event.tool_result.committed_file_presentation;
+      const originalHandle = presentation.content_handle as string;
+      expect(originalHandle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
+      rmSync(join(sessionDir, "tool-results", originalHandle));
+      const legacyLines = Array.from(
+        { length: 12000 },
+        (_, index) => `LEGACY_INLINE_PAYLOAD_${String(index).padStart(4, "0")}`,
+      );
+      const legacyBlob = `${legacyLines.join("\n")}\n`;
+      // A created file's legacy shape: no previous content, full after inline.
+      // (Identical previous/after would produce an empty diff in full detail.)
+      presentation.previous_content = null;
+      presentation.after_content = legacyBlob;
+      delete presentation.content_handle;
+      writeFileSync(eventsPath, `${frames.map((frame) => JSON.stringify(frame)).join("\n")}\n`);
+      const fatBytes = statSync(eventsPath).size;
+      expect(fatBytes).toBeGreaterThan(256 * 1024);
+
+      // Resume compacts the log before the transcript hydrates.
+      const tracePath = join(root, "resume.trace.log");
+      const resumedGateway = startFakeGateway([]);
+      try {
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: {
+            ...gatewayEnv(home, resumedGateway),
+            FX_RECORD: join(root, "resumed.fxtape"),
+            FX_TRACE_LOG: tracePath,
+          },
+          stderrPath,
+          width: 120,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        const resumed = await waitForScrollback(active, completion);
+        expect(resumed).toContain("Wrote compact-diff.md +400");
+        expect(resumed).not.toContain("LEGACY_INLINE_PAYLOAD_4000");
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        // The log is compact again: snapshots moved to a fresh artifact, the
+        // frame carries a handle, and the freshness marker is recorded.
+        const compactedBytes = statSync(eventsPath).size;
+        expect(compactedBytes).toBeLessThan(fatBytes / 4);
+        const compacted = readFileSync(eventsPath, "utf8");
+        expect(compacted).not.toContain("LEGACY_INLINE_PAYLOAD_4000");
+        expect(compacted).toContain('"content_handle":"diff-');
+        expect(existsSync(join(sessionDir, "events-compaction.marker"))).toBe(true);
+        const compactedFrames = compacted
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line));
+        const compactedPresentation = compactedFrames.find(
+          (frame) => frame.event?.tool_result?.committed_file_presentation,
+        ).event.tool_result.committed_file_presentation;
+        const newHandle = compactedPresentation.content_handle as string;
+        expect(newHandle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
+        const artifact = readFileSync(join(sessionDir, "tool-results", newHandle), "utf8");
+        expect(artifact).toContain("LEGACY_INLINE_PAYLOAD_4000");
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain("event=session_log_compacted");
+        expect(trace).toContain("event=session_log_compaction_verified");
+
+        // A second resume replays the compacted log and its rebuilt cache;
+        // the full detail reloads the snapshots through the new handle.
+        const secondGateway = startFakeGateway([]);
+        try {
+          active = await TmuxSession.create({
+            cmd: `${FX_BIN} --resume-${sessionId}`,
+            cwd: realpathSync(workspace),
+            env: { ...gatewayEnv(home, secondGateway), FX_RECORD: join(root, "second.fxtape") },
+            stderrPath,
+            width: 120,
+            height: 32,
+          });
+          await active.waitForComposer(TIMEOUT);
+          const second = await waitForScrollback(active, completion);
+          expect(second).toContain("Wrote compact-diff.md +400");
+          await active.sendKeys("C-o");
+          await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+          await active.waitForText("LEGACY_INLINE_PAYLOAD_11999", TIMEOUT);
+          await active.sendKeys("C-o");
+          await active.waitForComposer(TIMEOUT);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          await active.sendText("/quit");
+          expect(await active.waitForSessionEnd()).toBe(true);
+          await active.kill();
+          active = null;
+        } finally {
+          if (active) {
+            try {
+              await active.sendText("/quit");
+            } catch {}
+            await active.kill();
+          }
+          secondGateway.stop();
+        }
+      } finally {
+        if (active) {
+          try {
+            await active.sendText("/quit");
+          } catch {}
+          await active.kill();
+        }
+        resumedGateway.stop();
+      }
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  120_000,
+);
+
+test.skipIf(!tmuxAvailable())(
   "command output folding survives flag and picker resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-command-output-")));

@@ -8,6 +8,7 @@ const model_provider = @import("../config/model_provider.zig");
 const session = @import("session.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
+const session_compaction = @import("session_compaction.zig");
 const types = @import("../shared/types.zig");
 const session_event = @import("session_event.zig");
 const history_snapshot = @import("history_snapshot.zig");
@@ -4059,6 +4060,13 @@ pub const Root = struct {
         errdefer writable.deinit(alloc);
         if (!try hasConversationMetadata(alloc, &writable.dir)) {
             return error.SessionMigrationRequired;
+        }
+        // Compact legacy fat logs (inline diff snapshots) before the open
+        // scan replays them. A compaction hiccup must never block resume: the
+        // original log is still intact and the open path reads it as-is.
+        if (session_compaction.compactIfNeeded(alloc, &writable.dir, writable.session_id, .{})) |_| {} else |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("session", "event=session_log_compaction_degraded id={s} err={s}; resuming from original log", .{ writable.session_id, @errorName(err) });
         }
         return openConversationWritableSession(alloc, &writable);
     }
