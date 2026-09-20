@@ -1524,6 +1524,14 @@ fn handleKernelSteer(
             },
         });
     };
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    try update.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &update.writer);
+    try update.writer.writeAll(",\"update\":");
+    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
+    try update.writer.writeByte('}');
+    try state.writer.writeNotification(alloc, "session/update", update.written());
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 

@@ -1810,6 +1810,10 @@ export async function createFxAgent(options = {}) {
         try {
           if (typeof runtime.steer === "function") {
             runtime.steer(text);
+            void turn.push({
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text },
+            });
             accepted = Promise.resolve();
           } else {
             accepted = request("libfx/steer", { sessionId, text });
@@ -1817,10 +1821,7 @@ export async function createFxAgent(options = {}) {
         } catch (error) {
           return Promise.reject(error);
         }
-        return accepted.then(() => turn.push({
-          sessionUpdate: "user_message_chunk",
-          content: { type: "text", text },
-        }));
+        return accepted;
       },
       cancel() {
         if (finished || cancelled) return;
