@@ -43,12 +43,18 @@ const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const libfx_steering = @import("libfx_steering.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const legacy_url_completion_timeout_ms: i64 = 10 * 60 * 1000;
+const libfx_provider_tools = [_]tool_dispatch.Tool{
+    host_tool_runtime.providerProjection(builtin_tools.web_search),
+};
+const libfx_provider_tool_registry = tool_dispatch.Registry{ .tools = &libfx_provider_tools };
 
 const AcpMethod = enum {
     request_cancel,
@@ -66,6 +72,7 @@ const AcpMethod = enum {
     libfx_checkpoint,
     libfx_restore,
     libfx_new,
+    libfx_steer,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -84,6 +91,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
+        if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         return .unknown;
     }
 
@@ -98,6 +106,7 @@ const AcpMethod = enum {
             .session_resume,
             .session_close,
             .libfx_new,
+            .libfx_steer,
             => false,
             .session_list,
             .session_remove,
@@ -112,7 +121,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
             else => false,
         };
     }
@@ -209,6 +218,7 @@ pub const ActiveSessionState = struct {
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
+    steering: libfx_steering.Runtime = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -633,6 +643,7 @@ fn destroyActiveSession(state: *ServerState) void {
     }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
+    active.steering.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -1288,6 +1299,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
             .libfx_restore => handleKernelRestore(state, alloc, msg),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+            .libfx_steer => handleKernelSteer(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1307,6 +1319,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+        .libfx_steer => handleKernelSteer(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1379,6 +1392,15 @@ fn activeLibfxSession(
     const active = if (state.active_session) |*session| session else return null;
     if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
     return active;
+}
+
+pub fn takeLibfxSteering(
+    state: *ServerState,
+    result_alloc: Allocator,
+    close_if_empty: bool,
+) Allocator.Error![][]u8 {
+    const active = if (state.active_session) |*session| session else return &.{};
+    return active.steering.takeAll(state.alloc, result_alloc, close_if_empty);
 }
 
 fn handleKernelCheckpoint(
@@ -1463,6 +1485,56 @@ fn handleKernelRestore(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+fn handleKernelSteer(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx steer params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const text = parsed.value.object.get("text") orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing steering text",
+        });
+    if (text != .string) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid steering text",
+    });
+    active.steering.enqueue(state.alloc, text.string) catch |err| {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = switch (err) {
+                error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
+                else => ErrorCode.invalid_params,
+            },
+            .message = switch (err) {
+                error.EmptySteeringMessage => "Steering text cannot be empty",
+                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
+                error.SteeringQueueFull => "Steering queue is full",
+                error.SteeringNotActive => "No prompt is running",
+                error.OutOfMemory => "Failed to queue steering text",
+            },
+        });
+    };
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    try update.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &update.writer);
+    try update.writer.writeAll(",\"update\":");
+    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
+    try update.writer.writeByte('}');
+    try state.writer.writeNotification(alloc, "session/update", update.written());
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
@@ -1478,6 +1550,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
     session.cancel_flag.store(false, .seq_cst);
+    if (state.cfg.minimal_kernel) session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
@@ -1576,6 +1649,9 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             .message = @errorName(err),
         },
     };
+    if (active.state.active_session) |*session| {
+        if (active.state.cfg.minimal_kernel) session.steering.close(active.state.alloc, "turn_finished");
+    }
     active.reapable.store(true, .seq_cst);
     publishPromptOutcome(active, outcome) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
@@ -1684,9 +1760,10 @@ fn parseInitializeRequest(
     if (allow_libfx) {
         if (capabilities.object.get("libfx")) |libfx| {
             if (libfx != .object) return error.InvalidInitializeParams;
-            request.host_tools = try host_tool_runtime.Runtime.init(
+            request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
                 alloc,
                 libfx.object.get("tools"),
+                libfx_provider_tool_registry,
             );
             errdefer request.host_tools.deinit();
             if (libfx.object.get("instructions")) |instructions| {
@@ -1712,6 +1789,21 @@ test "ACP initialize owns libfx tools and instructions" {
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
     try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+}
+
+test "ACP initialize accepts registered provider-executed libfx tools" {
+    const alloc = std.testing.allocator;
+    var request = try parseInitializeRequest(
+        alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"web_search","providerExecuted":true}]}}}
+    ,
+        true,
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), request.host_tools.dynamic_tools.len);
+    try std.testing.expect(request.host_tools.tools[0].provider_executed);
+    try std.testing.expect(request.host_tools.tools[0].write_provider_advertisement_fn != null);
 }
 
 test "ordinary ACP ignores private libfx capabilities" {
@@ -2181,6 +2273,7 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
+        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -2758,10 +2851,12 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
     try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
+    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
@@ -2776,6 +2871,7 @@ test "ACP prompt gate policy keeps lifecycle interruption responsive" {
     try std.testing.expect(AcpMethod.session_prompt.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.session_set_config_option.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_set_mode.waitsForActivePrompt());
+    try std.testing.expect(!AcpMethod.libfx_steer.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.unknown.waitsForActivePrompt());
 }
 
