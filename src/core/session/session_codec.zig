@@ -1049,6 +1049,157 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     });
 }
 
+const DecodedStateTail = struct {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    context_history_start: usize,
+    permission_state: session_permission_state.State,
+    usage: ?session_usage.Snapshot,
+    last_subagent_work_id: ?[]u8,
+    subagent_child: bool,
+    recovery_checkpoint: ?RecoveryCheckpoint,
+
+    fn deinit(self: *DecodedStateTail, alloc: Allocator) void {
+        if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+        if (self.last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
+        if (self.usage) |*snapshot| snapshot.deinit(alloc);
+        self.permission_state.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn decodeHistory(
+    alloc: Allocator,
+    json_reader: *std.json.Reader,
+    limits: DecodeLimits,
+) ![]session.HistoryTurn {
+    try expectKey(json_reader, alloc, "history");
+    try expectToken(try json_reader.next(), .array_begin);
+    var history: std.ArrayList(session.HistoryTurn) = .empty;
+    errdefer {
+        for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
+        mem_utils.deinitList(alloc, &history);
+    }
+    while (try json_reader.peekNextTokenType() != .array_end) {
+        if (history.items.len == limits.max_history_turns) {
+            return error.InvalidSessionFormat;
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+            .max_value_len = limits.max_value_bytes,
+            .allocate = .alloc_always,
+            .parse_numbers = false,
+        });
+        const turn = try parseHistoryTurn(alloc, value);
+        errdefer session.freeHistoryTurn(alloc, turn);
+        try history.append(alloc, turn);
+    }
+    try expectToken(try json_reader.next(), .array_end);
+    return history.toOwnedSlice(alloc);
+}
+
+fn decodeStateTail(
+    alloc: Allocator,
+    json_reader: *std.json.Reader,
+    limits: DecodeLimits,
+    legacy_usage: bool,
+) !DecodedStateTail {
+    try expectKey(json_reader, alloc, "total_input_tokens");
+    const total_input_tokens = try readU64(json_reader, alloc);
+    try expectKey(json_reader, alloc, "total_output_tokens");
+    const total_output_tokens = try readU64(json_reader, alloc);
+    var context_history_start: usize = 0;
+    var context_seen = false;
+    var permission_state: session_permission_state.State = .{};
+    errdefer permission_state.deinit(alloc);
+    var permission_state_seen = false;
+    var usage: ?session_usage.Snapshot = null;
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+    var usage_seen = false;
+    var last_subagent_work_id: ?[]u8 = null;
+    errdefer if (last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
+    var recovery_checkpoint: ?RecoveryCheckpoint = null;
+    errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    while (try json_reader.peekNextTokenType() != .object_end) {
+        const key = try readStringOwned(json_reader, alloc, 64);
+        defer mem_utils.free(alloc, key);
+        if (std.mem.eql(u8, key, "context_history_start")) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
+                return error.InvalidSessionFormat;
+            }
+            const raw = try readU64(json_reader, alloc);
+            context_history_start = std.math.cast(usize, raw) orelse
+                return error.InvalidSessionFormat;
+            context_seen = true;
+        } else if (std.mem.eql(u8, key, "permission_state")) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
+                return error.InvalidSessionFormat;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            permission_state = try parsePermissionState(alloc, value);
+            permission_state_seen = true;
+        } else if (std.mem.eql(u8, key, "usage")) {
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            const parse_limit = @min(
+                limits.max_value_bytes,
+                session_usage.max_snapshot_bytes,
+            );
+            const parse_buffer = try alloc.alloc(u8, parse_limit);
+            defer mem_utils.free(alloc, parse_buffer);
+            var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
+            const value = try std.json.Value.jsonParse(fixed.allocator(), json_reader, .{
+                .max_value_len = parse_limit,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            usage = if (legacy_usage)
+                try session_usage.parseLegacySnapshotValue(alloc, value)
+            else
+                try session_usage.parseSnapshotValue(alloc, value);
+            usage_seen = true;
+        } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            last_subagent_work_id = try readStringOwned(json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
+        } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
+            if (recovery_checkpoint != null) return error.InvalidSessionFormat;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
+        } else return error.InvalidSessionFormat;
+    }
+    try expectToken(try json_reader.next(), .object_end);
+    try expectToken(try json_reader.next(), .end_of_document);
+    return .{
+        .total_input_tokens = total_input_tokens,
+        .total_output_tokens = total_output_tokens,
+        .context_history_start = context_history_start,
+        .permission_state = permission_state,
+        .usage = usage,
+        .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
+        .recovery_checkpoint = recovery_checkpoint,
+    };
+}
+
 fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
     var json_reader = std.json.Reader.init(alloc, source);
     defer json_reader.deinit();
@@ -1087,114 +1238,10 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     };
     errdefer preferences.deinit(alloc);
 
-    try expectKey(&json_reader, alloc, "history");
-    try expectToken(try json_reader.next(), .array_begin);
-    var history: std.ArrayList(session.HistoryTurn) = .empty;
-    errdefer {
-        for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
-        mem_utils.deinitList(alloc, &history);
-    }
-    while (try json_reader.peekNextTokenType() != .array_end) {
-        if (history.items.len == limits.max_history_turns) return error.InvalidSessionFormat;
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-            .max_value_len = limits.max_value_bytes,
-            .allocate = .alloc_always,
-            .parse_numbers = false,
-        });
-        const turn = try parseHistoryTurn(alloc, value);
-        errdefer session.freeHistoryTurn(alloc, turn);
-        try history.append(alloc, turn);
-    }
-    try expectToken(try json_reader.next(), .array_end);
-
-    try expectKey(&json_reader, alloc, "total_input_tokens");
-    const total_input_tokens = try readU64(&json_reader, alloc);
-    try expectKey(&json_reader, alloc, "total_output_tokens");
-    const total_output_tokens = try readU64(&json_reader, alloc);
-    var context_history_start: usize = 0;
-    var context_seen = false;
-    var permission_state: session_permission_state.State = .{};
-    errdefer permission_state.deinit(alloc);
-    var permission_state_seen = false;
-    var usage: ?session_usage.Snapshot = null;
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
-    var usage_seen = false;
-    var last_subagent_work_id: ?[]u8 = null;
-    errdefer if (last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
-    var subagent_child = false;
-    var subagent_child_seen = false;
-    var recovery_checkpoint: ?RecoveryCheckpoint = null;
-    errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    while (try json_reader.peekNextTokenType() != .object_end) {
-        const key = try readStringOwned(&json_reader, alloc, 64);
-        defer mem_utils.free(alloc, key);
-        if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
-                return error.InvalidSessionFormat;
-            }
-            const raw = try readU64(&json_reader, alloc);
-            context_history_start = std.math.cast(usize, raw) orelse
-                return error.InvalidSessionFormat;
-            context_seen = true;
-        } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
-                return error.InvalidSessionFormat;
-            }
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-                .max_value_len = limits.max_value_bytes,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            permission_state = try parsePermissionState(alloc, value);
-            permission_state_seen = true;
-        } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
-            const parse_limit = @min(
-                limits.max_value_bytes,
-                session_usage.max_snapshot_bytes,
-            );
-            const parse_buffer = try alloc.alloc(u8, parse_limit);
-            defer mem_utils.free(alloc, parse_buffer);
-            var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
-            const value = try std.json.Value.jsonParse(fixed.allocator(), &json_reader, .{
-                .max_value_len = parse_limit,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            usage = if (legacy_usage)
-                try session_usage.parseLegacySnapshotValue(alloc, value)
-            else
-                try session_usage.parseSnapshotValue(alloc, value);
-            usage_seen = true;
-        } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
-            last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
-        } else if (std.mem.eql(u8, key, "subagent_child")) {
-            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
-            subagent_child = try readBool(&json_reader);
-            if (!subagent_child) return error.InvalidDurableField;
-            subagent_child_seen = true;
-        } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
-            if (recovery_checkpoint != null) return error.InvalidSessionFormat;
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-                .max_value_len = limits.max_value_bytes,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
-        } else return error.InvalidSessionFormat;
-    }
-    try expectToken(try json_reader.next(), .object_end);
-    try expectToken(try json_reader.next(), .end_of_document);
-
-    const owned_history = try history.toOwnedSlice(alloc);
-    errdefer session.freeHistoryTurnSlice(alloc, owned_history);
+    const history = try decodeHistory(alloc, &json_reader, limits);
+    errdefer session.freeHistoryTurnSlice(alloc, history);
+    var tail = try decodeStateTail(alloc, &json_reader, limits, legacy_usage);
+    errdefer tail.deinit(alloc);
     const state = DurableSessionState{
         .id = id,
         .origin_workspace_root = origin_workspace_root,
@@ -1203,15 +1250,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .updated_at_ms = updated_at_ms,
         .conversation_language = conversation_language,
         .preferences = preferences,
-        .history = owned_history,
-        .context_history_start = context_history_start,
-        .total_input_tokens = total_input_tokens,
-        .total_output_tokens = total_output_tokens,
-        .permission_state = permission_state,
-        .last_subagent_work_id = last_subagent_work_id,
-        .subagent_child = subagent_child,
-        .usage = usage,
-        .recovery_checkpoint = recovery_checkpoint,
+        .history = history,
+        .context_history_start = tail.context_history_start,
+        .total_input_tokens = tail.total_input_tokens,
+        .total_output_tokens = tail.total_output_tokens,
+        .permission_state = tail.permission_state,
+        .last_subagent_work_id = tail.last_subagent_work_id,
+        .subagent_child = tail.subagent_child,
+        .usage = tail.usage,
+        .recovery_checkpoint = tail.recovery_checkpoint,
     };
     try validateStateWithPermissionMigration(state, true);
     return state;
@@ -2232,11 +2279,69 @@ fn parseToolResult(
     const provider_native = try requireBool(object, "provider_native");
     const review_feedback = if (schema_version >= 10) try requireBool(object, "review_feedback") else false;
     if (review_feedback and (status != .failure or provider_native)) return error.InvalidSessionFormat;
+    var text = try parseToolResultText(alloc, object, schema_version);
+    errdefer text.deinit(alloc);
+    var presentations = try parseToolResultPresentations(
+        alloc,
+        object,
+        schema_version,
+        result_shape.extended,
+    );
+    errdefer presentations.deinit(alloc);
+    var images = try parseToolResultImages(alloc, object, &text.output);
+    errdefer images.deinit(alloc);
+    return .{
+        .tool_images = images.items,
+        .tool_image_handle = images.handle,
+        .tool_call_id = text.tool_call_id,
+        .tool_name = text.tool_name,
+        .status = status,
+        .output = text.output,
+        .output_handle = text.output_handle,
+        .preview = text.preview,
+        .output_bytes = try requireUsize(object, "output_bytes"),
+        .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
+        .truncated = try requireBool(object, "truncated"),
+        .provider_native = provider_native,
+        .review_feedback = review_feedback,
+        .created_at_ms = try requireI64(object, "created_at_ms"),
+        .permission_feedback = text.permission_feedback,
+        .committed_file_presentation = presentations.committed_file,
+        .command_output_replay = presentations.command_output_replay,
+        .command_process_presentation = presentations.command_process,
+        .terminal_action_presentation = presentations.terminal_action,
+    };
+}
+
+const ParsedToolResultText = struct {
+    tool_call_id: []u8,
+    tool_name: []u8,
+    output: []u8,
+    output_handle: ?[]u8,
+    preview: ?[]u8,
+    permission_feedback: [][]u8,
+
+    fn deinit(self: *ParsedToolResultText, alloc: Allocator) void {
+        types.freePermissionFeedback(alloc, self.permission_feedback);
+        if (self.preview) |preview| mem_utils.free(alloc, preview);
+        if (self.output_handle) |handle| mem_utils.free(alloc, handle);
+        mem_utils.free(alloc, self.output);
+        mem_utils.free(alloc, self.tool_name);
+        mem_utils.free(alloc, self.tool_call_id);
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultText(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    schema_version: u64,
+) !ParsedToolResultText {
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
     errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
     errdefer mem_utils.free(alloc, tool_name);
-    var output = try parseRequiredDurableBytes(alloc, object, "output");
+    const output = try parseRequiredDurableBytes(alloc, object, "output");
     errdefer mem_utils.free(alloc, output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
@@ -2255,15 +2360,47 @@ fn parseToolResult(
             alloc,
             object.get("permission_feedback") orelse return error.InvalidSessionFormat,
         );
-    errdefer types.freePermissionFeedback(alloc, permission_feedback);
-    const committed_file_presentation = if (result_shape.extended)
+    return .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .output = output,
+        .output_handle = output_handle,
+        .preview = preview,
+        .permission_feedback = permission_feedback,
+    };
+}
+
+const ParsedToolResultPresentations = struct {
+    committed_file: ?types.CommittedFilePresentation,
+    command_output_replay: ?types.CommandOutputReplay,
+    command_process: ?types.CommandProcessPresentation,
+    terminal_action: ?types.TerminalActionPresentation,
+
+    fn deinit(self: *ParsedToolResultPresentations, alloc: Allocator) void {
+        if (self.command_output_replay) |replay| {
+            types.freeCommandOutputReplay(alloc, replay);
+        }
+        if (self.committed_file) |presentation| {
+            types.freeCommittedFilePresentation(alloc, presentation);
+        }
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultPresentations(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    schema_version: u64,
+    extended: bool,
+) !ParsedToolResultPresentations {
+    const committed_file = if (extended)
         try parseOptionalCommittedFilePresentation(
             alloc,
             object.get("committed_file_presentation") orelse return error.InvalidSessionFormat,
         )
     else
         null;
-    errdefer if (committed_file_presentation) |presentation| {
+    errdefer if (committed_file) |presentation| {
         types.freeCommittedFilePresentation(alloc, presentation);
     };
     const command_output_replay = if (schema_version >= 3)
@@ -2276,60 +2413,72 @@ fn parseToolResult(
     errdefer if (command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     };
-    const command_process_presentation = if (schema_version >= 3)
-        try parseOptionalCommandProcessPresentation(
-            object.get("command_process_presentation") orelse return error.InvalidSessionFormat,
-        )
-    else
-        null;
-    const terminal_action_presentation = if (schema_version >= 4)
-        try parseOptionalTerminalActionPresentation(
-            object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
-        )
-    else
-        null;
-    const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
-    errdefer if (tool_image_handle) |handle| mem_utils.free(alloc, handle);
-    const tool_images = if (object.get("tool_images")) |images| images: {
-        if (images != .array) return error.InvalidSessionFormat;
-        const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
-            mem_utils.free(alloc, output);
-            output = notice;
-            break :images try alloc.alloc(types.ToolImage, 0);
-        };
-        if (parsed_images.len != images.array.items.len) {
-            types.freeToolImages(alloc, parsed_images);
-            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
-            mem_utils.free(alloc, output);
-            output = notice;
-            break :images try alloc.alloc(types.ToolImage, 0);
-        }
-        break :images parsed_images;
-    } else try alloc.alloc(types.ToolImage, 0);
-    errdefer types.freeToolImages(alloc, tool_images);
     return .{
-        .tool_images = tool_images,
-        .tool_image_handle = tool_image_handle,
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .status = status,
-        .output = output,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = try requireUsize(object, "output_bytes"),
-        .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
-        .truncated = try requireBool(object, "truncated"),
-        .provider_native = provider_native,
-        .review_feedback = review_feedback,
-        .created_at_ms = try requireI64(object, "created_at_ms"),
-        .permission_feedback = permission_feedback,
-        .committed_file_presentation = committed_file_presentation,
+        .committed_file = committed_file,
         .command_output_replay = command_output_replay,
-        .command_process_presentation = command_process_presentation,
-        .terminal_action_presentation = terminal_action_presentation,
+        .command_process = if (schema_version >= 3)
+            try parseOptionalCommandProcessPresentation(
+                object.get("command_process_presentation") orelse return error.InvalidSessionFormat,
+            )
+        else
+            null,
+        .terminal_action = if (schema_version >= 4)
+            try parseOptionalTerminalActionPresentation(
+                object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
+            )
+        else
+            null,
     };
+}
+
+const ParsedToolResultImages = struct {
+    handle: ?[]u8,
+    items: []types.ToolImage,
+
+    fn deinit(self: *ParsedToolResultImages, alloc: Allocator) void {
+        types.freeToolImages(alloc, self.items);
+        if (self.handle) |handle| mem_utils.free(alloc, handle);
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultImages(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    output: *[]u8,
+) !ParsedToolResultImages {
+    const handle = if (object.get("tool_image_handle")) |value|
+        try parseOptionalDurableBytes(alloc, value)
+    else
+        null;
+    errdefer if (handle) |owned| mem_utils.free(alloc, owned);
+    const items = if (object.get("tool_images")) |images| items: {
+        if (images != .array) return error.InvalidSessionFormat;
+        const parsed = image_data.parseToolImages(alloc, images.array.items) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const notice = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n[Saved tool image unavailable: {s}]",
+                .{ output.*, @errorName(err) },
+            );
+            mem_utils.free(alloc, output.*);
+            output.* = notice;
+            break :items try alloc.alloc(types.ToolImage, 0);
+        };
+        if (parsed.len != images.array.items.len) {
+            types.freeToolImages(alloc, parsed);
+            const notice = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n[Saved tool image unavailable: unsupported content]",
+                .{output.*},
+            );
+            mem_utils.free(alloc, output.*);
+            output.* = notice;
+            break :items try alloc.alloc(types.ToolImage, 0);
+        }
+        break :items parsed;
+    } else try alloc.alloc(types.ToolImage, 0);
+    return .{ .handle = handle, .items = items };
 }
 
 fn parseOptionalCommandOutputReplay(
