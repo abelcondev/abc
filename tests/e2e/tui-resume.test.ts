@@ -7616,7 +7616,7 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
             tool_call_id: "call-long",
             tool_name: "shell",
             status: "success",
-            output: "ok",
+            output: JSON.stringify({ session_id: "shell-1", state: "running", backend: "captured", persistence: "process" }),
             output_handle: null,
             preview: null,
             output_bytes: 2,
@@ -7624,6 +7624,28 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
             truncated: false,
             provider_native: false,
             created_at_ms: 2,
+            permission_feedback: [],
+          }],
+        }, {
+          assistant: null,
+          tool_calls: [{
+            id: "call-observe",
+            name: "shell",
+            arguments_json: JSON.stringify({ action: "interact", session_id: "shell-1", yield_time_ms: 1_000 }),
+            provider_result: null,
+          }],
+          tool_results: [{
+            tool_call_id: "call-observe",
+            tool_name: "shell",
+            status: "success",
+            output: JSON.stringify({ session_id: "shell-1", state: "completed", backend: "captured", persistence: "process" }),
+            output_handle: null,
+            preview: null,
+            output_bytes: 2,
+            stored_output_bytes: 2,
+            truncated: false,
+            provider_native: false,
+            created_at_ms: 3,
             permission_feedback: [],
           }],
         }],
@@ -7654,6 +7676,10 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     expect(row).toBeDefined();
     expect(row!).toContain(tail);
     expect(row!).not.toContain("...");
+    // Session-action rows resolve the launch command through the live root
+    // instead of falling back to the raw session id.
+    expect(scrollback).toContain("Observed cd ./alpha");
+    expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
     active = null;

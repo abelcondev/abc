@@ -2014,15 +2014,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
 
-            const resume_workspace_root = if (std.mem.eql(
-                u8,
-                state.origin_workspace_root,
-                state.workspace_root,
-            ))
-                state.workspace_root
-            else
-                "";
-            var historical_labels = HistoricalSessionLabels{ .workspace_root = resume_workspace_root };
+            var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
 
             if (comptime @hasDecl(App, "beginResumeProjection")) {
@@ -3572,13 +3564,9 @@ pub fn Runtime(comptime App: type) type {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     }
-                    // Use the app's live workspace root, not the sink's: the
-                    // sink root is blanked whenever the session moved
-                    // workspaces, which is the right policy for terminal
-                    // session labels (they fall back to the raw session id)
-                    // but must not withhold reclip metadata here. The replayed
-                    // status phrases are generated with the app root too, so
-                    // this keeps both halves of the row consistent.
+                    // Use the app's live workspace root: the replayed status
+                    // phrases are generated with that same root, so this keeps
+                    // both halves of the row consistent.
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
@@ -7243,6 +7231,81 @@ test "resume projection stores reflow metadata for session action rows" {
     }
 }
 
+test "resume projection restores session action rows against the live root after a workspace move" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    // Resume always seeds the labels root from the app's live workspace root;
+    // the origin root only records where the session was created.
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var first_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+    var observe_calls = [_]types.ToolCall{.{
+        .id = "call_observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-4\",\"chars\":\"\"}",
+    }};
+    var observe_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_observe"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var second_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = observe_calls[0..],
+        .tool_results = observe_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = first_steps[0..] }, &labels);
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = second_steps[0..] }, &labels);
+
+    // The observe row resolves the recorded launch command through the live
+    // root instead of falling back to the raw session id.
+    var observed_metadata = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const action = detail.command_action_label orelse continue;
+        if (std.mem.eql(u8, action, "Observed")) {
+            const display = detail.command_display.?;
+            try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
+            try std.testing.expect(display.len > 120);
+            observed_metadata = true;
+        }
+    }
+    try std.testing.expect(observed_metadata);
+}
+
 test "resume projection stores reflow metadata after the session moved workspaces" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7252,10 +7315,9 @@ test "resume projection stores reflow metadata after the session moved workspace
     defer source_runtime.deinit(alloc);
     var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
     defer projection.deinit();
-    // A session whose origin and current workspace roots differ blanks the
-    // replay root for terminal-session labels. Command reclip metadata must
-    // still resolve against the app's live root: the replayed status phrases
-    // are generated with that same root, and withholding the metadata would
+    // Command reclip metadata resolves against the app's live root even when
+    // the sink labels root is empty: the replayed status phrases are
+    // generated with that same root, and withholding the metadata would
     // freeze every absolute-path command row at the compact activity bound.
     var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
     defer labels.deinit(app.alloc);
