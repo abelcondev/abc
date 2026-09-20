@@ -10876,7 +10876,12 @@ fn processQueuedPromptLoop(
                     },
                 }
             }
-            const is_file_mutation = file_mutation_contract.isToolName(tool_call.name);
+            const is_file_mutation = file_mutation_contract.isToolName(tool_call.name) and
+                // A host tool may reuse a reserved file-mutation name; it owns
+                // its own execution and never enters the builtin contract. A
+                // missing registry entry keeps the contract's own failure path.
+                (deps.tool_registry.lookup(tool_call.name) == null or
+                    deps.tool_registry.lookup(tool_call.name).?.executor_kind != .host);
             var prepared_file_mutation: ?tooling_tool_admission.PreparedFileMutationCall = null;
             defer if (prepared_file_mutation) |*prepared| prepared.deinit(arena);
 
@@ -10904,6 +10909,9 @@ fn processQueuedPromptLoop(
                 };
                 switch (admission) {
                     .tool_failure => break :fresh false,
+                    // A host tool reuses a reserved mutation name; it has no
+                    // builtin mutation targets to keep fresh.
+                    .not_file_mutation => break :fresh false,
                     .prepared => |prepared| {
                         prepared_file_mutation = prepared;
                         break :fresh preparedFileMutationTargetMatches(
