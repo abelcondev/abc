@@ -484,6 +484,7 @@ const Runtime = struct {
     credential: []u8,
     model: ?[]u8,
     effort: ?[]u8,
+    fast: ?bool,
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
@@ -547,6 +548,7 @@ const Runtime = struct {
                 .credential_override = self.credential,
                 .model_override = self.model,
                 .effort_override = self.effort,
+                .fast_override = self.fast,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
@@ -706,6 +708,29 @@ fn getNamedString(
     return try stringArg(env, value, alloc, max_len);
 }
 
+fn getNamedBool(
+    env: c.napi_env,
+    object: c.napi_value,
+    name: [*:0]const u8,
+) !?bool {
+    var present = false;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    if (!present) return null;
+    var value: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_boolean) return error.InvalidArgument;
+    var result = false;
+    if (c.napi_get_value_bool(env, value, &result) != c.napi_ok) return error.InvalidArgument;
+    return result;
+}
+
 fn exceptionPending(env: c.napi_env) bool {
     var pending = false;
     return c.napi_is_exception_pending(env, &pending) == c.napi_ok and pending;
@@ -717,6 +742,7 @@ const CreateError = error{
     InvalidApiKey,
     InvalidModel,
     InvalidEffort,
+    InvalidFast,
     InvalidHome,
     InvalidWorkspaceRoot,
     InvalidGatewayUrl,
@@ -748,6 +774,10 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidEffort,
     };
     errdefer if (effort) |value| alloc.free(value);
+    const fast = getNamedBool(env, options, "fast") catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        else => return error.InvalidFast,
+    };
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -781,6 +811,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .credential = api_key,
         .model = model,
         .effort = effort,
+        .fast = fast,
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
@@ -807,6 +838,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
+        error.InvalidFast => throw(env, "LIBFX_INVALID_ARGUMENT", "fast must be a boolean"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
         error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),

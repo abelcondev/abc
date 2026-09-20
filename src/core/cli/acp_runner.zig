@@ -37,6 +37,9 @@ pub const Config = struct {
     /// Raw reasoning-effort override using the kernel's ReasoningEffort.parse
     /// vocabulary. Borrowed; must outlive the server run.
     effort_override: ?[]const u8 = null,
+    /// Fast-lane override matching --fast/--no-fast. Null leaves the startup
+    /// and session defaults untouched.
+    fast_override: ?bool = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,

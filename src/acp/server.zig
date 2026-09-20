@@ -1955,6 +1955,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (!try applyEffortOverride(state, alloc, msg, effort)) return;
     }
 
+    if (state.cfg.fast_override) |fast| {
+        if (!try applyFastOverride(state, alloc, msg, fast)) return;
+    }
+
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
@@ -1990,8 +1994,8 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
     if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // libfx cores skip the startup catalog resolve; an explicit effort
-        // override is the one creation-time consumer that needs it.
+        // libfx cores skip the startup catalog resolve; explicit effort and
+        // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
         var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
@@ -2090,6 +2094,87 @@ test "effortOverrideRejection reports models without advertised efforts" {
     const rejection = (try effortOverrideRejection(alloc, .{}, .literal("high"), "provider/plain")).?;
     defer alloc.free(rejection);
     try std.testing.expectEqualStrings("Reasoning effort is unavailable for the active model", rejection);
+}
+
+/// Applies a host-supplied fast-lane override to sessions created after
+/// initialize. Enabling fast mode requires the selected model to offer a fast
+/// path whenever the catalog resolves; a catalog outage leaves the override in
+/// place, matching turn-time capability fallback. Disabling is always
+/// accepted. Returns false after writing the rejection response.
+fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, fast: bool) !bool {
+    state.fast_mode = fast;
+    if (!fast) return true;
+
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const fallback = bundle.fallbackModelCapabilities(state.selected_model);
+    var capabilities: model_capabilities.Capabilities = undefined;
+    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+        // Shares the effort override's one-shot catalog resolve: creation is
+        // the only point that can reject before any turn runs.
+        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        }, state.selected_model, fallback);
+    } else {
+        capabilities = state.capability_resolver.available(state.selected_model, fallback);
+    }
+    // A failed catalog lookup cannot confirm a fast path; the turn-time
+    // capability gate remains the backstop.
+    if (state.capability_resolver.state == .failed) return true;
+
+    const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to validate fast mode",
+        });
+        return false;
+    };
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+        });
+        return false;
+    }
+    return true;
+}
+
+/// Pure decision for a host-supplied fast override: returns an owned rejection
+/// message naming the model, or null when the model offers a fast path. An
+/// intrinsically fast model already satisfies the request. Caller frees the
+/// returned slice.
+fn fastOverrideRejection(
+    alloc: Allocator,
+    capabilities: model_capabilities.Capabilities,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
+    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+}
+
+test "fastOverrideRejection accepts models with a fast path" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .supports_fast_mode = true }, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .intrinsic_fast = true }, "provider/model-fast"));
+}
+
+test "fastOverrideRejection names models without a fast path" {
+    const alloc = std.testing.allocator;
+    const rejection = (try fastOverrideRejection(alloc, .{}, "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
