@@ -2032,7 +2032,6 @@ pub fn Runtime(comptime App: type) type {
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
-                    .workspace_root = resume_workspace_root,
                     .labels = &historical_labels,
                 };
                 try writeResumeNotice(app, &sink, display, notice);
@@ -3508,7 +3507,6 @@ pub fn Runtime(comptime App: type) type {
             return struct {
                 app: *App,
                 projection: *Projection,
-                workspace_root: []const u8,
                 labels: *const HistoricalSessionLabels,
 
                 const Self = @This();
@@ -3574,10 +3572,17 @@ pub fn Runtime(comptime App: type) type {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     }
+                    // Use the app's live workspace root, not the sink's: the
+                    // sink root is blanked whenever the session moved
+                    // workspaces, which is the right policy for terminal
+                    // session labels (they fall back to the raw session id)
+                    // but must not withhold reclip metadata here. The replayed
+                    // status phrases are generated with the app root too, so
+                    // this keeps both halves of the row consistent.
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
-                        self.workspace_root,
+                        self.app.workspace_root,
                         tooling_presentation.max_run_command_reflow_bytes,
                     ) catch |err| blk: {
                         debug_trace.logf(
@@ -4158,7 +4163,6 @@ pub fn Runtime(comptime App: type) type {
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
-                .workspace_root = app.workspace_root,
                 .labels = &labels,
             };
             return replayHistoryToSinkIncremental(
@@ -7161,7 +7165,6 @@ test "resume projection stores reflow metadata for session action rows" {
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,
         .projection = &projection,
-        .workspace_root = app.workspace_root,
         .labels = &labels,
     };
 
@@ -7238,6 +7241,64 @@ test "resume projection stores reflow metadata for session action rows" {
         const display = detail.command_display orelse continue;
         try std.testing.expect(std.mem.find(u8, display, "shell-9") == null);
     }
+}
+
+test "resume projection stores reflow metadata after the session moved workspaces" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    // A session whose origin and current workspace roots differ blanks the
+    // replay root for terminal-session labels. Command reclip metadata must
+    // still resolve against the app's live root: the replayed status phrases
+    // are generated with that same root, and withholding the metadata would
+    // freeze every absolute-path command row at the compact activity bound.
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    const command = "cd /workspace/packages/cli && " ++ ("printf relative-path " ** 6);
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    var stored = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const display = detail.command_display orelse continue;
+        if (std.mem.eql(u8, detail.command_action_label orelse "", "Ran")) {
+            // Abbreviated against the live root, full length, never the
+            // compact-bound frozen form.
+            try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
+            try std.testing.expect(display.len > 120);
+            stored = true;
+        }
+    }
+    try std.testing.expect(stored);
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {
