@@ -12,6 +12,10 @@ const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
     struct {};
+const js_host_steering = if (host_target.is_wasm)
+    @import("../core/hosts/js_host_steering.zig")
+else
+    struct {};
 const io_mod = @import("../core/shared/io.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -256,14 +260,20 @@ const AcpContext = struct {
         return owned_id;
     }
 
-    fn sendProviderTerminal(self: *AcpContext, tool_call_id: []const u8, outcome: types.ToolOutcome) !void {
+    fn sendProviderTerminal(
+        self: *AcpContext,
+        tool_call_id: []const u8,
+        outcome: types.ToolOutcome,
+        result: ?[]const u8,
+    ) !void {
         const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
         if (publication.* != .pending) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
+        const detail = if (self.state.cfg.minimal_kernel) result else null;
         switch (status) {
-            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, "Web search completed", null),
-            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, "Web search failed", null),
+            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, detail orelse "Web search completed", null),
+            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
             .pending, .in_progress => unreachable,
         }
         const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
@@ -1423,6 +1433,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = if (ctx.state.cfg.minimal_kernel) takeLibfxSteeringBoundary else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -1470,6 +1481,25 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
+}
+
+fn takeLibfxSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    _: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const close_if_empty = kind == .finalizing;
+    const messages = if (comptime host_target.is_wasm)
+        try js_host_steering.takeAll(arena)
+    else
+        try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
+    if (messages.len > 0) return .{ .continue_turn = messages };
+    if (comptime host_target.is_wasm) {
+        if (close_if_empty) js_host_steering.close();
+    }
+    return if (kind == .cancelled) .interrupt else .none;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2329,7 +2359,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .arguments_json = started.arguments_json orelse "{}",
             });
         },
-        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome),
+        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result),
         .progress, .turn_finished => {},
     }
 }

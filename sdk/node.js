@@ -407,6 +407,7 @@ function createNativeCoreRuntime(addon, options) {
       if (response.body) {
         for await (const chunk of response.body) {
           const buffer = Buffer.from(chunk);
+          options.onTransportChunk?.(buffer.length);
           let offset = 0;
           while (offset < buffer.length) {
             const end = Math.min(offset + 64 * 1024, buffer.length);

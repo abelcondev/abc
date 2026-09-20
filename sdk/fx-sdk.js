@@ -16,6 +16,7 @@ const maxUrlBytes = 16 * 1024;
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
+const transportActivityIntervalMs = 250;
 const maxUnreadEventBytes = 1024 * 1024;
 const maxUnreadEvents = 256;
 // Prompt image limits mirror the host tool result image contract: the kernel
@@ -28,6 +29,9 @@ const maxPromptImagesBytes = 8 * 1024 * 1024;
 // envelope allowance covers the method key and request id.
 const maxPromptFrameBytes = 8 * 1024 * 1024;
 const promptFrameEnvelopeBytes = 128;
+const maxSteeringMessageBytes = 64 * 1024;
+const maxSteeringMessages = 64;
+const maxSteeringQueueBytes = 1024 * 1024;
 // tool_start events carry a bounded preview of the tool input; larger inputs
 // are marked truncated instead of dropped or sent whole.
 const maxToolStartInputBytes = 64 * 1024;
@@ -444,6 +448,9 @@ function createRuntime(options) {
   const stdin = new ByteQueue();
   const streams = new Map();
   const httpRequests = new Set();
+  const steering = [];
+  let steeringBytes = 0;
+  let steeringOpen = false;
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -656,6 +663,7 @@ function createRuntime(options) {
       state.readResult = null;
       if (done) return 0;
       if (!value?.length) return null;
+      options.onTransportChunk?.(value.length);
       return copy(value);
     };
     const immediate = consume();
@@ -707,6 +715,36 @@ function createRuntime(options) {
       controller.signal.removeEventListener("abort", onAbort);
       httpRequests.delete(controller);
     });
+  }
+
+  function clearSteering() {
+    steering.length = 0;
+    steeringBytes = 0;
+  }
+
+  function queueSteering(text) {
+    if (!steeringOpen) throw new Error("no prompt is running");
+    const value = encoder.encode(text);
+    if (value.length === 0) throw new TypeError("steering text cannot be empty");
+    if (value.length > maxSteeringMessageBytes) {
+      throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+    }
+    if (steering.length >= maxSteeringMessages || value.length > maxSteeringQueueBytes - steeringBytes) {
+      throw new Error("steering queue is full");
+    }
+    steering.push(value);
+    steeringBytes += value.length;
+  }
+
+  function steeringTake(outputPtr, outputCap) {
+    const value = steering[0];
+    if (!value) return 0;
+    const output = checkedBytes(outputPtr, outputCap);
+    if (!output || value.length > output.length) return -1;
+    output.subarray(0, value.length).set(value);
+    steering.shift();
+    steeringBytes -= value.length;
+    return value.length;
   }
 
   let pendingHostToolResult = null;
@@ -1078,6 +1116,8 @@ function createRuntime(options) {
       return chunk.length;
     },
     fx_host_tool_result_release() { pendingHostToolResult = null; },
+    fx_steering_take: steeringTake,
+    fx_steering_close() { steeringOpen = false; clearSteering(); },
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -1105,7 +1145,10 @@ function createRuntime(options) {
     setInstance(value) { instance = value; },
     write(data) { stdin.push(typeof data === "string" ? encoder.encode(data) : data); },
     wake() { stdin.wake(); },
-    closeStdin() { stdin.close(); },
+    closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
+    openSteering() { clearSteering(); steeringOpen = true; },
+    steer: queueSteering,
+    closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
     abort(error) {
       aborted = true;
@@ -1274,19 +1317,42 @@ function normalizePromptInput(input) {
   });
 }
 
+function normalizeSteeringInput(input) {
+  const blocks = normalizePromptInput(input);
+  if (blocks.some((block) => block.type !== "text")) {
+    throw new TypeError("steering accepts only text blocks");
+  }
+  const text = blocks.map((block) => block.text).join("\n");
+  if (text.length === 0) throw new TypeError("steering text cannot be empty");
+  if (encoder.encode(text).length > maxSteeringMessageBytes) {
+    throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+  }
+  return text;
+}
+
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   if (!Array.isArray(value)) throw new TypeError("tools must be an array");
   if (value.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
   const descriptors = [];
   const executors = new Map();
+  const names = new Set();
   for (const [index, tool] of value.entries()) {
     if (!tool || typeof tool !== "object") throw new TypeError(`tool ${index} must be an object`);
-    const { name, description, inputSchema, execute } = tool;
+    const { name, description, inputSchema, execute, providerExecuted } = tool;
     if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
       throw new TypeError(`tool ${index} has an invalid name`);
     }
-    if (executors.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    if (names.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    names.add(name);
+    if (providerExecuted !== undefined && typeof providerExecuted !== "boolean") {
+      throw new TypeError(`tool ${name} providerExecuted must be a boolean`);
+    }
+    if (providerExecuted === true) {
+      if (execute !== undefined) throw new TypeError(`provider-executed tool ${name} must not define execute()`);
+      descriptors.push({ name, providerExecuted: true });
+      continue;
+    }
     if (typeof description !== "string") throw new TypeError(`tool ${name} requires a description`);
     if (typeof execute !== "function") throw new TypeError(`tool ${name} requires execute()`);
     if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
@@ -1392,6 +1458,10 @@ export async function createFxAgent(options = {}) {
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
+      if (activeTurn) {
+        activeTurn.transportBytes = 0;
+        activeTurn.lastTransportActivityAt = null;
+      }
       emit("transport.start", { attempt, method, endpoint, model: options.model });
       try {
         if (activeTurn?.cancelled) {
@@ -1481,6 +1551,19 @@ export async function createFxAgent(options = {}) {
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
+    onTransportChunk(byteLength) {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;
+      turn.transportBytes += byteLength;
+      const now = performance.now();
+      if (turn.lastTransportActivityAt !== null && now - turn.lastTransportActivityAt < transportActivityIntervalMs) return;
+      turn.lastTransportActivityAt = now;
+      emit("transport.activity", {
+        attempt: turn.transportAttempts,
+        chunkBytes: byteLength,
+        totalBytes: turn.transportBytes,
+      });
+    },
   };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
@@ -1606,6 +1689,9 @@ export async function createFxAgent(options = {}) {
         const delta = update.content?.text;
         return delta ? { type: "reasoning_delta", delta } : null;
       }
+      if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
+        return { type: "user_message", text: update.content.text };
+      }
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
         if (started.has(update.toolCallId)) return null;
@@ -1637,6 +1723,7 @@ export async function createFxAgent(options = {}) {
     void result.catch(() => {});
     return {
       cancel() { rawTurn.cancel(); },
+      steer(input) { return rawTurn.steer(normalizeSteeringInput(input)); },
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
           for await (const update of rawTurn) {
@@ -1712,10 +1799,33 @@ export async function createFxAgent(options = {}) {
       },
       toolControllers,
       transportAttempts: 0,
+      transportBytes: 0,
+      lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
+      steer(text) {
+        if (finished || cancelled || activeTurn !== turn) {
+          return Promise.reject(new Error("no prompt is running"));
+        }
+        let accepted;
+        try {
+          if (typeof runtime.steer === "function") {
+            runtime.steer(text);
+            accepted = Promise.resolve();
+          } else {
+            accepted = request("libfx/steer", { sessionId, text });
+          }
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return accepted.then(() => turn.push({
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text },
+        }));
+      },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
+        runtime.closeSteering?.();
         resumeOutput?.();
         resumeOutput = null;
         send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
@@ -1748,6 +1858,7 @@ export async function createFxAgent(options = {}) {
       return turn;
     }
     activeTurn = turn;
+    runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
     turn.result = request("session/prompt", { sessionId, prompt })
@@ -1763,6 +1874,7 @@ export async function createFxAgent(options = {}) {
         resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
+        runtime.closeSteering?.();
         toolControllers.clear();
         if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
         for (const waiter of waiters.splice(0)) {

@@ -32,6 +32,8 @@ const scripts = [
   "test-agent-images.mjs",
   "test-agent-tool-start.mjs",
   "test-agent-reserved-tool-names.mjs",
+  "test-agent-provider-tools.mjs",
+  "test-agent-steering.mjs",
   "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {

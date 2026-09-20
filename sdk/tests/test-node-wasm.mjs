@@ -25,6 +25,8 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-images.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-tool-start.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-reserved-tool-names.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-provider-tools.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-steering.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-instruction-limits.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", "--expose-gc", fileURLToPath(new URL("test-wasm-module-cache.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-request-context.mjs", import.meta.url)), "wasm"]],
