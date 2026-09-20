@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { stripTrailingRuntimeOverlay as withoutTailOverlay } from "./conditional-guidance-oracle";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -27,7 +28,7 @@ describe("configured providers", () => {
       const toolTurn = f.requests[1].body.messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length);
       expect(toolTurn[field]).toBe("Inspect note first.");
       expect(toolTurn._tool_call_ids).toBeUndefined();
-      expect(f.requests[1].body.messages.at(-1).content).toContain("fixture contents");
+      expect(withoutTailOverlay(f.requests[1].body.messages).at(-1).content).toContain("fixture contents");
       const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue the saved task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
       expect(JSON.parse(resumed.stdout).output).toBe("resumed reply");
@@ -53,7 +54,7 @@ describe("configured providers", () => {
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(JSON.parse(result.stdout).output).toBe("The two files were read.");
       expect(f.requests).toHaveLength(4);
-      const messages = f.requests[3].body.messages;
+      const messages = withoutTailOverlay(f.requests[3].body.messages);
       expect(messages.at(-1).content).toBe("Summarize what you just did.");
       expect(messages.at(-2).reasoning_content).toBe("Both files have been read.");
       expect(messages.at(-2).tool_calls).toBeUndefined();
@@ -81,7 +82,7 @@ describe("configured providers", () => {
       expect(toolTurn.reasoning_details).toEqual([firstDetail, secondDetail]);
       expect(toolTurn.tool_calls[0].id).toBe(callId);
       expect(toolTurn._tool_call_ids).toBeUndefined();
-      expect(f.requests[1].body.messages.at(-1).tool_call_id).toBe(callId);
+      expect(withoutTailOverlay(f.requests[1].body.messages).at(-1).tool_call_id).toBe(callId);
       const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue the saved task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
       expect(f.requests).toHaveLength(3);
@@ -253,7 +254,7 @@ describe("configured providers", () => {
     let callId = 0;
     const f = fixture(body => {
       if (!body.tools?.some((tool: any) => tool.function?.name === "subagent")) return completion(body.model, "child reply");
-      if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
+      if (withoutTailOverlay(body.messages).at(-1)?.role === "tool") return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
     });
     f.settings.models.local = "shared-model";
@@ -268,7 +269,7 @@ describe("configured providers", () => {
       expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024]);
       const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
-      const resumedResult = f.requests.at(-1)!.body.messages.at(-1).content;
+      const resumedResult = withoutTailOverlay(f.requests.at(-1)!.body.messages).at(-1).content;
       if (!JSON.parse(resumedResult).ok) throw new Error(resumedResult);
       expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 512, 1024, 512]);
       expect(f.requests[3].authorization).toBeNull();
@@ -280,7 +281,7 @@ describe("configured providers", () => {
       if (rebound.code !== 0) throw new Error(rebound.stdout + rebound.stderr);
       expect(f.requests).toHaveLength(8);
       expect(f.requests.slice(6).every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
-      expect(f.requests[7].body.messages.at(-1).content).toContain("child_failed");
+      expect(withoutTailOverlay(f.requests[7].body.messages).at(-1).content).toContain("child_failed");
     } finally { f.close(); }
   }, 100000);
 
@@ -295,7 +296,7 @@ describe("configured providers", () => {
         }
         return completion(body.model, "child reply", Math.ceil(JSON.stringify(body).length / 4));
       }
-      if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
+      if (withoutTailOverlay(body.messages).at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns} ` + "detail ".repeat(2000), ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
     });
@@ -307,7 +308,7 @@ describe("configured providers", () => {
         const result = await runFx(["ask", "--json", ...(id ? ["--resume", id] : []), "Continue the child context"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
         if (result.code !== 0) throw new Error(result.stdout + result.stderr);
         id = JSON.parse(result.stdout).session_id;
-        const returned = f.requests.filter(request => request.body.model === "local-model").at(-1)!.body.messages.at(-1).content;
+        const returned = withoutTailOverlay(f.requests.filter(request => request.body.model === "local-model").at(-1)!.body.messages).at(-1).content;
         if (!JSON.parse(returned).ok) throw new Error(returned);
         expect(JSON.parse(returned).ok).toBe(true);
       }

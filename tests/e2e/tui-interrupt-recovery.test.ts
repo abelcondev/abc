@@ -24,6 +24,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { isRuntimeOverlayMessage } from "./conditional-guidance-oracle";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -590,7 +591,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       );
       expect(
         followUpRequest.prompt
-          .filter((entry) => entry.role !== "system")
+          .filter((entry) => entry.role !== "system" && !isRuntimeOverlayMessage(entry))
           .map((entry) => entry.role),
       ).toEqual([
         "user",

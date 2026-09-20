@@ -21,6 +21,8 @@ import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
+  lastConversationUserIndex,
+  lastConversationUserText,
   parseGatewayRequest,
   serializedToolNames,
   toolShapesWithoutDescriptions,
@@ -78,7 +80,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
       const request = JSON.parse(raw), child = !raw.includes('"name":"subagent"');
       if (child) {
         childCalls++;
-        const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
+        const latest = lastConversationUserText(request.prompt);
         if (lateFeedback && latest.includes("CHILD_FEEDBACK_TOKEN")) {
           expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
           followupDone = true;
@@ -112,7 +114,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
         expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
         return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
       }
-      const latestParent = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
+      const latestParent = lastConversationUserText(request.prompt);
       if ((raw.includes("CHILD_STEERING_ORIGINAL_DONE") || latestParent.includes("FOLLOWUP_AFTER_CANCELLATION")) && !followup) {
         followup = true; return fakeGatewayToolCall("child-steering-follow", "subagent",
           { request: { action: "message", agent: "reviewer", message: "FOLLOW_SAME_CHILD: retain the original work and feedback." } });
@@ -4149,9 +4151,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const continuedRequest = JSON.parse(continuedBody) as {
         prompt: Array<{ role?: string; content?: unknown }>;
       };
-      const continuedUser = continuedRequest.prompt.filter((message) =>
-        message.role === "user"
-      ).at(-1);
+      const continuedUser = continuedRequest.prompt[
+        lastConversationUserIndex(continuedRequest.prompt)
+      ];
       expect(continuedUser).toBeDefined();
       expect(Array.isArray(continuedUser!.content)).toBe(true);
       const continuedParts = continuedUser!.content as Array<Record<string, unknown>>;
@@ -4443,9 +4445,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const steeringRequest = JSON.parse(steeringBody) as {
         prompt: Array<{ role?: string; content?: unknown }>;
       };
-      const steeringUser = steeringRequest.prompt.filter((message) =>
-        message.role === "user"
-      ).at(-1);
+      const steeringUser = steeringRequest.prompt[
+        lastConversationUserIndex(steeringRequest.prompt)
+      ];
       expect(steeringUser).toBeDefined();
       expect(Array.isArray(steeringUser!.content)).toBe(true);
       const steeringParts = steeringUser!.content as Array<Record<string, unknown>>;
@@ -5629,7 +5631,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const request = JSON.parse(body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
-        const user = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        const user = lastConversationUserText(request.prompt);
         const stage = user.match(/HANDOFF_(SEED|CANCEL|NEXT|AGAIN)/)?.[1];
         if (!stage) throw new Error("missing handoff request stage");
         if (user.startsWith("CHILD_HANDOFF_")) {
@@ -5735,7 +5737,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const childGates = tasks.map(() => new Promise<void>((resolve) => releases.push(resolve)));
       const rowGateway = startDynamicFakeGateway(async (body) => {
         const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
-        const userText = contentText(request.prompt?.findLast((message) => message.role === "user")?.content);
+        const userText = lastConversationUserText(request.prompt ?? []);
         const child = tasks.findIndex((task) => userText.includes(task));
         if (child >= 0 && !userText.includes(rootPrompt)) {
           await childGates[child];

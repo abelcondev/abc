@@ -22,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { lastConversationUserIndex } from "./conditional-guidance-oracle";
 
 const HAS_TMUX = tmuxAvailable();
 const tmuxTest = test.skipIf(!HAS_TMUX);
@@ -211,7 +212,7 @@ function userParts(requestIndex = 0): Array<{
       content: Array<{ type: string; text?: string }>;
     }>;
   };
-  const message = body.prompt.findLast((entry) => entry.role === "user");
+  const message = body.prompt[lastConversationUserIndex(body.prompt)];
   return message?.content ?? [];
 }
 

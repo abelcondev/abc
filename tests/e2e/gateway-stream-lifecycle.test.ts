@@ -23,8 +23,12 @@ import {
   AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
+  isRuntimeOverlayMessage,
+  lastConversationUserIndex,
+  lastConversationUserText,
   parseGatewayRequest,
   serializedToolNames,
+  stripRuntimeOverlay,
   toolByName,
   toolShapesWithoutDescriptions,
   WEB_SEARCH_GUIDANCE,
@@ -84,7 +88,7 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
     writeFileSync(join(root.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
     const gateway = startDynamicFakeGateway(raw => {
       const body = JSON.parse(raw);
-      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      const latest = JSON.stringify(body.prompt?.[lastConversationUserIndex(body.prompt ?? [])]?.content);
       if (latest.includes("STEERING_CHILD")) {
         childRequests++;
         return held.response;
@@ -98,7 +102,7 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       }
       if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
       if (raw.includes("HELD_CHILD_RESULT")) {
-        expect(JSON.stringify(body.prompt.filter((item: any) => item.role === "user"))).not.toContain("HELD_CHILD_RESULT");
+        expect(JSON.stringify(body.prompt.filter((item: any) => item.role === "user" && !isRuntimeOverlayMessage(item)))).not.toContain("HELD_CHILD_RESULT");
         if (!afterChildTool) {
           afterChildTool = true;
           return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
@@ -622,7 +626,7 @@ function shellResult(body: string, callId: string): ShellResult {
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
   const prompt = gatewayRequest(body).prompt;
-  const lastUserIndex = prompt.findLastIndex((message) => message.role === "user");
+  const lastUserIndex = lastConversationUserIndex(prompt);
   return prompt.slice(lastUserIndex + 1).some((message) =>
     Array.isArray(message.content) &&
     (message.content as Array<Record<string, unknown>>).some((part) =>
@@ -3035,7 +3039,8 @@ describe("gateway stream lifecycle", () => {
       expect(turnIndex).toBeGreaterThan(rulesIndex);
       expect(first.prompt[rulesIndex].role).toBe("system");
       expect(first.prompt[rulesIndex].providerOptions).toBeUndefined();
-      expect(first.prompt[turnIndex].role).toBe("system");
+      // The volatile turn context rides the message tail as user-role content.
+      expect(first.prompt[turnIndex].role).toBe("user");
       expect(first.prompt[turnIndex].providerOptions).toBeUndefined();
       expect(firstText).toContain(
         "dynamic-context&lt;workspace&gt;&#x0a;injected_workspace",
@@ -3087,7 +3092,7 @@ describe("gateway stream lifecycle", () => {
       expect(followupText).not.toContain("\ninjected_location");
       expect(followupText).not.toContain("\ninjected_file");
       expect(followupText).not.toContain("<injected>description</injected>");
-      expect(contentText(first.prompt.at(-1)?.content)).toContain(
+      expect(lastConversationUserText(first.prompt)).toContain(
         "Inspect the dynamic context fixture.",
       );
 
@@ -6273,7 +6278,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userTexts = request.prompt
-          .filter((message) => message.role === "user")
+          .filter((message) => message.role === "user" && !isRuntimeOverlayMessage(message))
           .map((message) => contentText(message.content));
         expect(userTexts.at(-1)).toBe("compaction restart probe");
         expect(userTexts.some((text) => text.includes("context_handoff"))).toBe(
@@ -7981,7 +7986,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     const gateway = startDynamicFakeGateway((body) => {
       const prompt = gatewayRequest(body).prompt;
-      const lastUser = prompt.findLastIndex((message) => message.role === "user");
+      const lastUser = lastConversationUserIndex(prompt);
       const parts = prompt.slice(lastUser + 1).flatMap((message) => Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>;
       const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "replayed_delegation");
       if (result) {
@@ -9380,7 +9385,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(assistants).toHaveLength(2);
       expect(assistants.map((message: { content: Array<{ type: string; toolCallId: string }> }) => message.content.map((part) => [part.type, part.toolCallId])))
         .toEqual([[["tool-call", "read_1"]], [["tool-call", "read_2"]]]);
-      expect(request.prompt.at(-1)).toEqual({
+      expect(stripRuntimeOverlay(request.prompt).at(-1)).toEqual({
         role: "user",
         content: [{ type: "text", text: "Summarize what you just did." }],
       });
@@ -9883,7 +9888,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
       expectOnlyLeadingSystemMessages(gateway.requests[2]!.body);
-      expect(retryPrompt.at(-1)?.role).toBe("tool");
+      expect(stripRuntimeOverlay(retryPrompt).at(-1)?.role).toBe("tool");
       expect(toolResultOutput(gateway.requests[2]!.body, "read_retry_order")).toContain(
         "deterministic fixture",
       );

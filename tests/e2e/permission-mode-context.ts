@@ -15,7 +15,11 @@ export function expectPermissionModeContext(
   };
   const messages = request.prompt.map((message) => ({
     role: message.role,
-    text: typeof message.content === "string" ? message.content : "",
+    text: typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.map((part: { text?: string }) => part?.text ?? "").join("")
+        : "",
   }));
   const expected = permissionModeContext[mode];
   const matching = messages.filter((message) => message.text === expected);
@@ -25,5 +29,7 @@ export function expectPermissionModeContext(
     if (candidateMode === mode) continue;
     expect(messages.some((message) => message.text === context)).toBe(false);
   }
-  expect(matching[0]!.role).toBe("system");
+  // Runtime context rides the message tail as user-role content so mid-turn
+  // changes preserve the cached conversation prefix.
+  expect(matching[0]!.role).toBe("user");
 }

@@ -556,31 +556,31 @@ pub fn writeEntrypointLayoutSnapshot(writer: *std.Io.Writer) !void {
         \\model_visible_layout:
         \\- entrypoint: interactive
         \\  static_context_refresh: one applicable snapshot before enqueue; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: live terminal approvals and clarification UI
         \\- entrypoint: fx ask
         \\  static_context_refresh: one applicable snapshot before the prompt; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and empty or saved history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and empty or saved history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: approval-required actions become noninteractive blockers
         \\- entrypoint: ACP
         \\  static_context_refresh: one applicable snapshot per ACP prompt including accepted local resource targets; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and ACP session history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and ACP session history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: ACP protocol maps prompts, refusals, and updates to JSON-RPC session messages
         \\- entrypoint: subagent
         \\  static_context_refresh: the launching surface's snapshot with empty child delivery state; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and canonical child session history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and canonical child session history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: separate child session history, parent-projected approvals, and bounded parent/child delivery
         \\
     );
@@ -714,31 +714,31 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
         \\model_visible_layout:
         \\- entrypoint: interactive
         \\  static_context_refresh: one applicable snapshot before enqueue; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: live terminal approvals and clarification UI
         \\- entrypoint: fx ask
         \\  static_context_refresh: one applicable snapshot before the prompt; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and empty or saved history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and empty or saved history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: approval-required actions become noninteractive blockers
         \\- entrypoint: ACP
         \\  static_context_refresh: one applicable snapshot per ACP prompt including accepted local resource targets; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and ACP session history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and ACP session history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: ACP protocol maps prompts, refusals, and updates to JSON-RPC session messages
         \\- entrypoint: subagent
         \\  static_context_refresh: the launching surface's snapshot with empty child delivery state; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
+        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and canonical child session history
+        \\  per_step_tail_overlay_order: explicit_skill_chunks, transient_runtime_context, optional_prepared_parent_turn_delivery_context
+        \\  user_prompt_position: after stable system context and canonical child session history; per-step volatile tail overlay rides the message tail as user-role context so mid-turn changes never invalidate the cached conversation prefix
         \\  intentional_difference: separate child session history, parent-projected approvals, and bounded parent/child delivery
         \\
     ,
