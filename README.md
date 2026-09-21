@@ -117,6 +117,9 @@ computer. The HTTPS callback at fx.sh returns the authorization to the CLI;
 PKCE state and the verifier stay in memory. The companion web bridge must be
 deployed and configured first.
 
+After the CLI saves the installation, the browser returns to an fx.sh confirmation
+page. You can close that tab or refresh it after the command exits.
+
 `fx slack status --json` reports local installation metadata without tokens.
 `fx slack refresh` rotates the local bot credentials when needed. Credentials
 live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
