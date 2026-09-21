@@ -96,7 +96,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         var cancelled: std.atomic.Value(bool) = .init(false);
         while (accepted == null) {
             if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
-            accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, origin);
+            accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, null, origin);
         }
         if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
         if (accepted.?.callback.denied) return error.SlackAuthorizationDenied;

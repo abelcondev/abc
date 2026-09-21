@@ -209,6 +209,8 @@ function startAuthFixture(
     omitScopes?: boolean;
     rejectDiscoveryWithoutChallenge?: boolean;
     rejectDiscoveryWithRestAuthorizationDocument?: boolean;
+    slackBridgeClientId?: string;
+    rejectCodeExchange?: boolean;
   } = {},
 ) {
   const transport = options.transport ?? "http";
@@ -253,6 +255,13 @@ function startAuthFixture(
       const resource = `${origin}${resourcePath}`;
       const protectedRoute = url.pathname === resourcePath ||
         (transport === "sse" && url.pathname === "/messages");
+
+      if (url.pathname === "/api/slack/install/config" && options.slackBridgeClientId) {
+        return Response.json({
+          client_id: options.slackBridgeClientId,
+          redirect_uri: "https://fx.sh/api/slack/oauth/callback",
+        });
+      }
 
       if (protectedRoute) {
         const bearer = request.headers.get("authorization");
@@ -517,6 +526,10 @@ function startAuthFixture(
           });
         }
         tokenExchanges += 1;
+        if (options.slackBridgeClientId === "fx-mcp-auth-test") {
+          expect(form.get("redirect_uri")).toBe("https://fx.sh/api/slack/oauth/callback");
+        }
+        if (options.rejectCodeExchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
         expect(form.get("grant_type")).toBe("authorization_code");
         expect(form.get("code")).toBe("fixture-code");
         const verifier = form.get("code_verifier") ?? "";
@@ -849,7 +862,125 @@ async function preserveAuthTuiFailure(
   throw new Error(`fx ${label} failed; retained artifacts: ${root.root}`);
 }
 
+async function authorizePersonalFixture(activeAuth: AuthFixture, start: URL) {
+  const authorize = new URL("/authorize", activeAuth.url);
+  authorize.search = new URLSearchParams({
+    client_id: start.searchParams.get("client_id")!, resource: activeAuth.url, response_type: "code",
+    redirect_uri: "https://fx.sh/api/slack/oauth/callback", scope: start.searchParams.get("scope")!,
+    state: start.searchParams.get("state")!, code_challenge: start.searchParams.get("challenge")!, code_challenge_method: "S256",
+  }).toString();
+  const issued = await fetch(authorize, { redirect: "manual" });
+  return new URL(issued.headers.get("location")!).searchParams;
+}
+
 describe("MCP remote authentication lifecycle", () => {
+  for (const scenario of ["success", "reauth", "denied", "issuer", "exchange", "save"] as const) {
+    test(`personal Slack HTTPS bridge completes after persistence: ${scenario}`, async () => {
+      const succeeds = scenario === "success" || scenario === "reauth";
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test", rejectCodeExchange: scenario === "exchange", rotateAuthorizationToken: scenario === "reauth" });
+      const root = createRoot(auth, true, "http", auth.url, false);
+      if (scenario === "reauth") seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+      const bridgeOrigin = new URL(auth.url).origin;
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.callback_port = Number(new URL(auth.url).port);
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
+      const authentication = runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
+      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
+      const start = new URL(readFileSync(root.openLog, "utf8").trim());
+      expect(start.origin).toBe(bridgeOrigin);
+      expect([...start.searchParams.keys()].sort()).toEqual(["challenge", "client_id", "port", "scope", "state"]);
+      expect(start.searchParams.get("scope")).toBe("tools.read offline_access");
+      const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
+      const body = await authorizePersonalFixture(auth, start);
+      const postCallback = (fields: URLSearchParams, origin = bridgeOrigin) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
+      expect((await postCallback(body, "https://evil.example")).status).toBe(404);
+      const wrong = new URLSearchParams(body);
+      wrong.set("state", "wrong-state");
+      expect((await postCallback(wrong)).status).toBe(404);
+      expect(auth.tokenExchanges).toBe(0);
+      if (scenario === "denied") { body.delete("code"); body.set("error", "access_denied"); }
+      if (scenario === "issuer") body.set("iss", "https://wrong.example");
+      const credentialDir = join(root.home, ".fx", "mcp-credentials");
+      const credentialPath = join(credentialDir, "credentials.json");
+      if (scenario === "save") writeFileSync(credentialDir, "blocked persistence", { mode: 0o600 });
+      const response = await postCallback(body);
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toBe(`${bridgeOrigin}/api/slack/auth/complete?result=${succeeds ? "success" : "failed"}`);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(await response.text()).toBe("");
+      expect(existsSync(credentialPath)).toBe(succeeds);
+      const result = await authentication;
+      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
+      expect(auth.tokenExchanges).toBe(["success", "reauth", "exchange", "save"].includes(scenario) ? 1 : 0);
+      for (const secret of ["fixture-code", ACCESS_INITIAL, REFRESH_INITIAL, ACCESS_REFRESHED, REFRESH_ROTATED]) {
+        expect(result.stdout + result.stderr + JSON.stringify([...response.headers])).not.toContain(secret);
+      }
+      expect(JSON.stringify([...response.headers])).not.toContain(body.get("state")!);
+      expect(existsSync(join(root.home, ".fx", "slack", "installation.json"))).toBe(false);
+      if (succeeds) {
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(result.stdout).toContain("Authenticated MCP server 'fixture'");
+        const credentials = JSON.parse(readFileSync(credentialPath, "utf8")).credentials;
+        expect(credentials).toHaveLength(1);
+        expect(credentials[0].access_token).toBe(scenario === "reauth" ? ACCESS_REFRESHED : ACCESS_INITIAL);
+        expect(credentials[0].refresh_token).toBe(scenario === "reauth" ? REFRESH_ROTATED : REFRESH_INITIAL);
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+      } else {
+        expect(result.stdout).not.toContain("Authenticated MCP server");
+      }
+      expect(await postCallback(body).catch(() => null)).toBe(null);
+    }, 20_000);
+  }
+
+  test("another Slack client keeps its direct callback", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: "other-slack-client" });
+    const root = createRoot(auth);
+    const result = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+    });
+    expect(result.code).toBe(0);
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.pathname).toBe("/authorize");
+    expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 20_000);
+
+  test.skipIf(!tmuxAvailable())("in-session personal Slack HTTPS auth reconnects after saving", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test" });
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const bridgeOrigin = new URL(auth.url).origin;
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 34,
+      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp auth fixture --open");
+    expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
+    const start = new URL(readFileSync(root.openLog, "utf8").trim());
+    const body = await authorizePersonalFixture(auth, start);
+    const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
+      method: "POST", headers: { origin: bridgeOrigin }, body, redirect: "manual",
+    });
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe(`${bridgeOrigin}/api/slack/auth/complete?result=success`);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(true);
+    const pane = await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+    expect(pane).not.toContain(ACCESS_INITIAL);
+    expect(tui.paneStatus().dead).toBe(false);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText("auth=authenticated", 10_000);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 40_000);
+
   test("top-level MCP auth accepts a manual callback when browser launch fails", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);

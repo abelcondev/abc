@@ -125,7 +125,19 @@ page. You can close that tab or refresh it after the command exits.
 live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
 or background refresh service is created. An expired refresh token requires
 installation again. This workspace operation is separate from each employee's
-existing MCP user authorization. Bot installation does not establish whether
+MCP user authorization. Employees connect their own account with
+`/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
+For `https://mcp.slack.com/mcp`, when the configured Client ID matches the fx app
+published by the web bridge, personal login also uses the HTTPS callback. It
+opens an ephemeral loopback listener instead of the configured `callback_port`,
+keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
+saving to the existing MCP credential store. Other MCP providers and different
+Slack app Client IDs retain their direct callback behavior. Deploy the web
+personal-authorization routes before releasing this CLI. Keep the registered
+localhost callback for older clients until they have upgraded. Slack workspace
+approval requirements still apply to personal authorization.
+
+Bot installation does not establish whether
 Slack will display a hoverable “Sent using @fx” attribution; that requires a
 live message test.
 

@@ -707,6 +707,8 @@ pub fn authenticate(
     };
     defer source.challenge.deinit(alloc);
     defer if (source.previous_scope) |value| alloc.free(value);
+    var completion: mcp_auth.InteractiveCompletion = .{};
+    defer completion.finish(false);
     var credentials = switch (try mcp_auth.authorizeInteractive(alloc, .{
         .endpoint = try server.config.remoteUrl(),
         .challenge = source.challenge,
@@ -724,6 +726,7 @@ pub fn authenticate(
         .open_url = open_url,
         .cancel_flag = cancel_flag,
         .lifecycle_cancel_flag = server.cancellation(),
+        .completion = &completion,
     })) {
         .credentials => |credentials| credentials,
         .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
@@ -751,6 +754,7 @@ pub fn authenticate(
         server.pending_auth_challenge = null;
         server.auth_challenge_present.store(false, .release);
     }
+    completion.finish(true);
     return .{ .authenticated = .{ .repaired_entries = repaired_entries } };
 }
 
