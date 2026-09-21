@@ -6306,8 +6306,8 @@ test.skipIf(!tmuxAvailable())(
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      // Rewrite the log into the legacy shape: inline snapshots, no handle,
-      // no artifact. This is the on-disk shape pre-spill builds wrote.
+      // Rewrite the log into the actual schema-v2 legacy shape: inline
+      // snapshots, no handle, no artifact. Version 3 introduced the handle.
       const sessionId = sessionIdFromHome(home);
       const sessionDir = join(home, ".fx", "sessions", sessionId);
       const eventsPath = join(sessionDir, "events.jsonl");
@@ -6332,6 +6332,7 @@ test.skipIf(!tmuxAvailable())(
       presentation.previous_content = null;
       presentation.after_content = legacyBlob;
       delete presentation.content_handle;
+      for (const frame of frames) frame.schema_version = 2;
       writeFileSync(eventsPath, `${frames.map((frame) => JSON.stringify(frame)).join("\n")}\n`);
       const fatBytes = statSync(eventsPath).size;
       expect(fatBytes).toBeGreaterThan(256 * 1024);
@@ -6370,6 +6371,7 @@ test.skipIf(!tmuxAvailable())(
         expect(compacted).not.toContain("LEGACY_INLINE_PAYLOAD_4000");
         expect(compacted).toContain('"content_handle":"diff-');
         expect(existsSync(join(sessionDir, "events-compaction.marker"))).toBe(true);
+        expect(existsSync(join(sessionDir, "events-compaction.pending"))).toBe(false);
         const compactedFrames = compacted
           .split("\n")
           .filter((line) => line.length > 0)

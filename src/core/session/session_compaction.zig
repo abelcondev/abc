@@ -18,35 +18,45 @@
 //!   presentation spills are re-encoded, so unmodified history keeps its exact
 //!   bytes. A torn tail (crash mid-write) is dropped the same way the open
 //!   scan would truncate it, so compaction never preserves a partial frame.
-//! * Compaction failure never blocks resume. Mid-pass errors delete the tmp
-//!   file and resume proceeds with the original log; only OOM propagates.
+//! * Pre-rename failure never blocks resume. Mid-pass errors delete the tmp
+//!   file and resume proceeds with the original log; OOM propagates. Failure
+//!   to sync the directory after rename is persistence-uncertain and blocks a
+//!   writable resume rather than appending to a possibly non-durable inode.
 //! * A freshness marker records the compacted log's length and tail CRC. A log
 //!   unchanged since the last pass is skipped without being parsed; a log that
 //!   grew is re-scanned, which is cheap because new commits already write
 //!   handle-based frames.
 //! * Read-only loads never compact; the writer lock in `resumeForWrite` is the
 //!   single entry point.
+//!
+//! Temporary compatibility machinery: remove this module, its marker sidecar,
+//! wiring, and migration tests once the supported upgrade window excludes all
+//! builds that wrote inline diff snapshots and format-convergence evidence
+//! shows no remaining legacy payloads in active session stores.
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const result_store = @import("result_store.zig");
 const session_event = @import("session_event.zig");
+const session_replay = @import("session_replay.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 const events_file = "events.jsonl";
 const tmp_file = "events.jsonl.compact-tmp";
+const pending_file = "events-compaction.pending";
 const marker_file = "events-compaction.marker";
 const legacy_tmp_files = [_][]const u8{ "events.compact-tmp", "events.jsonl.tmp" };
 
-/// Logs smaller than this cannot hold meaningful inline payload; the pass
-/// never opens them.
-const min_log_bytes: u64 = 256 * 1024;
 /// Inline previous/after snapshot bytes above this budget spill to the result
 /// store. Mirrors the commit-time budget in session_log.
 const inline_budget_bytes: usize = result_store.preview_bytes;
+/// A complete log no larger than the inline budget cannot contain a spillable
+/// presentation. Every larger log is scanned once so all legacy shapes can
+/// converge, including small sessions with one oversized edit.
+const min_log_bytes: u64 = inline_budget_bytes + 1;
 const marker_max_bytes: usize = 128;
 const copy_buffer_bytes: usize = 64 * 1024;
 /// The freshness pin hashes this many bytes from the log's tail. Append-only
@@ -59,13 +69,35 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 pub const Outcome = enum {
     compacted,
+    deferred,
     skipped_small_log,
     skipped_fresh,
     no_inline_payloads,
 };
 
+pub const TestControls = struct {
+    context: ?*anyopaque = null,
+    before_rename_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    before_spill_fn: ?*const fn (?*anyopaque, usize) anyerror!void = null,
+    sync_dir_fn: ?*const fn (?*anyopaque, std.Io.Dir) anyerror!void = null,
+
+    fn beforeRename(self: TestControls) !void {
+        if (self.before_rename_fn) |callback| try callback(self.context);
+    }
+
+    fn beforeSpill(self: TestControls, spill_count: usize) !void {
+        if (self.before_spill_fn) |callback| try callback(self.context, spill_count);
+    }
+
+    fn syncDir(self: TestControls, dir: std.Io.Dir) !void {
+        if (self.sync_dir_fn) |callback| return callback(self.context, dir);
+        return io_mod.syncVerifiedDir(dir);
+    }
+};
+
 pub const Options = struct {
     force: bool = false,
+    test_controls: TestControls = .{},
 };
 
 const Marker = struct {
@@ -76,9 +108,16 @@ const Marker = struct {
 const Stats = struct {
     frames_seen: usize = 0,
     frames_reencoded: usize = 0,
+    spill_failures: usize = 0,
+    intentionally_inline: usize = 0,
     spilled_bytes: usize = 0,
     input_bytes: u64 = 0,
     output_bytes: u64 = 0,
+};
+
+const RewriteResult = struct {
+    changed: bool,
+    unresolved: bool,
 };
 
 const LogLine = struct {
@@ -95,18 +134,18 @@ const SpillCandidate = struct {
 
 /// Compacts the session's event log when it holds inline diff snapshots.
 /// Runs under the session writer lock during `resumeForWrite`, before the
-/// open scan. Non-OOM errors degrade to "keep the original log" at the call
-/// site; the trace names each reason.
+/// open scan. Pre-rename non-OOM errors degrade to "keep the original log" at
+/// the call site. Post-rename sync failure reports persistence uncertainty.
 pub fn compactIfNeeded(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     session_id: []const u8,
     options: Options,
 ) !Outcome {
-    cleanupStaleArtifacts(dir, session_id);
+    try cleanupStaleArtifacts(dir, session_id);
 
     const zio = io_mod.getIo();
-    var event_file = dir.dir.openFile(zio, events_file, .{ .mode = .read_only }) catch |err| switch (err) {
+    var event_file = openRegularFile(dir, events_file, .read_only) catch |err| switch (err) {
         error.FileNotFound => return .no_inline_payloads,
         else => return err,
     };
@@ -128,25 +167,56 @@ pub fn compactIfNeeded(
     }
 
     var stats: Stats = .{};
-    const wrote = try rewriteLog(alloc, dir, session_id, event_file, log_len, &stats);
-    if (!wrote) {
+    const rewrite = try rewriteLog(
+        alloc,
+        dir,
+        session_id,
+        event_file,
+        log_len,
+        options.test_controls,
+        &stats,
+    );
+    var temp_pending = rewrite.changed;
+    defer if (temp_pending) deleteIfPresent(dir, tmp_file);
+    if (!rewrite.changed) {
+        if (rewrite.unresolved) {
+            debug_trace.logf("session", "event=session_log_compaction_deferred id={s} spill_failures={d}; retrying on next resume", .{ session_id, stats.spill_failures });
+            return .deferred;
+        }
         // Nothing spilled: pin the current log so later resumes skip the
         // scan until the log changes.
-        try writeMarker(alloc, dir, .{ .log_len = log_len, .tail_crc = tail_crc });
-        debug_trace.logf("session", "event=session_log_compaction_skipped id={s} reason=no_inline_payloads frames={d}", .{ session_id, stats.frames_seen });
+        try writeMarkerBestEffort(alloc, dir, session_id, .{ .log_len = log_len, .tail_crc = tail_crc });
+        debug_trace.logf(
+            "session",
+            "event=session_log_compaction_skipped id={s} reason={s} frames={d} intentionally_inline={d}",
+            .{
+                session_id,
+                if (stats.intentionally_inline > 0) "no_spillable_payloads" else "no_inline_payloads",
+                stats.frames_seen,
+                stats.intentionally_inline,
+            },
+        );
         return .no_inline_payloads;
     }
 
     try validateCompactedLog(alloc, dir, session_id);
 
     const renamed_len = stats.output_bytes;
-    try renameCompactedLog(dir);
-    syncSessionDir(dir);
-    try writeMarker(alloc, dir, .{ .log_len = renamed_len, .tail_crc = try tailPin(alloc, dir, renamed_len) });
+    try options.test_controls.beforeRename();
+    try renameCompactedLog(alloc, dir, session_id, options.test_controls);
+    temp_pending = false;
+    if (!rewrite.unresolved) {
+        try writeMarkerBestEffort(
+            alloc,
+            dir,
+            session_id,
+            .{ .log_len = renamed_len, .tail_crc = try tailPin(alloc, dir, renamed_len) },
+        );
+    }
     debug_trace.logf(
         "session",
-        "event=session_log_compacted id={s} frames={d} reencoded={d} spilled_bytes={d} before_bytes={d} after_bytes={d}",
-        .{ session_id, stats.frames_seen, stats.frames_reencoded, stats.spilled_bytes, stats.input_bytes, stats.output_bytes },
+        "event=session_log_compacted id={s} frames={d} reencoded={d} spill_failures={d} intentionally_inline={d} spilled_bytes={d} before_bytes={d} after_bytes={d}",
+        .{ session_id, stats.frames_seen, stats.frames_reencoded, stats.spill_failures, stats.intentionally_inline, stats.spilled_bytes, stats.input_bytes, stats.output_bytes },
     );
     return .compacted;
 }
@@ -160,14 +230,11 @@ fn rewriteLog(
     session_id: []const u8,
     event_file: std.Io.File,
     log_len: u64,
+    test_controls: TestControls,
     stats: *Stats,
-) !bool {
+) !RewriteResult {
     const zio = io_mod.getIo();
-    var tmp = try dir.dir.createFile(zio, tmp_file, .{
-        .read = true,
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
+    var tmp = try createPrivateTempFile(dir);
     var tmp_open = true;
     var keep_tmp = false;
     defer {
@@ -178,6 +245,7 @@ fn rewriteLog(
     var result_dir: ?[]const u8 = null;
     defer if (result_dir) |path| alloc.free(path);
     var spill_path_failed = false;
+    var unresolved = false;
 
     var reader_buffer: [copy_buffer_bytes]u8 = undefined;
     var reader = event_file.reader(zio, &reader_buffer);
@@ -185,6 +253,7 @@ fn rewriteLog(
     var pending_offset: u64 = 0;
     var complete_end: u64 = 0;
     var tmp_len: u64 = 0;
+    var spill_attempts: usize = 0;
     var any_spill = false;
 
     while (true) {
@@ -207,31 +276,62 @@ fn rewriteLog(
         complete_end = line.next_offset;
 
         const spill = spillablePresentation(parsed.value.event) orelse continue;
-        if (spill_path_failed) continue;
+        if (spill_path_failed) {
+            unresolved = true;
+            stats.spill_failures += 1;
+            continue;
+        }
         if (result_dir == null) {
-            const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| {
-                debug_trace.logf("session", "event=session_log_compaction_spill_unavailable id={s} err={s}; keeping presentations inline", .{ session_id, @errorName(err) });
-                spill_path_failed = true;
-                continue;
+            const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=session_log_compaction_spill_unavailable id={s} err={s}; keeping presentations inline", .{ session_id, @errorName(err) });
+                    spill_path_failed = true;
+                    unresolved = true;
+                    stats.spill_failures += 1;
+                    continue;
+                },
             };
             defer alloc.free(base);
-            result_dir = std.fs.path.join(alloc, &.{ base, "tool-results" }) catch |err| {
-                debug_trace.logf("session", "event=session_log_compaction_spill_unavailable id={s} err={s}; keeping presentations inline", .{ session_id, @errorName(err) });
-                spill_path_failed = true;
-                continue;
+            result_dir = std.fs.path.join(alloc, &.{ base, "tool-results" }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
             };
         }
+        spill_attempts += 1;
+        test_controls.beforeSpill(spill_attempts) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("session", "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline", .{ spill.result.call_id, @errorName(err) });
+                unresolved = true;
+                stats.spill_failures += 1;
+                continue;
+            },
+        };
         const handle = result_store.storeDiffContent(
             alloc,
             result_dir.?,
             spill.result.call_id,
             spill.presentation.previous_content,
             spill.presentation.after_content,
-        ) catch |err| {
-            // Store hiccups mirror the commit-time rule: keep this frame
-            // inline and continue with the rest of the log.
-            debug_trace.logf("session", "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline", .{ spill.result.call_id, @errorName(err) });
-            continue;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DiffContentTooLarge => {
+                // A valid event frame can exceed the stricter artifact-pack
+                // limit. It must remain inline permanently, but it must not
+                // force every future resume to retry the impossible spill.
+                debug_trace.logf("session", "event=diff_content_spill_skipped call_id={s} reason=artifact_too_large inline_bytes={d}", .{ spill.result.call_id, spill.inline_bytes });
+                stats.intentionally_inline += 1;
+                continue;
+            },
+            else => {
+                // Store hiccups mirror the commit-time rule: keep this frame
+                // inline and continue with the rest of the log. Do not publish
+                // a freshness marker: the next resume must retry this spill.
+                debug_trace.logf("session", "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline", .{ spill.result.call_id, @errorName(err) });
+                unresolved = true;
+                stats.spill_failures += 1;
+                continue;
+            },
         };
         defer alloc.free(handle);
 
@@ -247,7 +347,7 @@ fn rewriteLog(
         any_spill = true;
     }
 
-    if (!any_spill) return false;
+    if (!any_spill) return .{ .changed = false, .unresolved = unresolved };
     try copyLogRange(event_file, &tmp, &copy_buffer, pending_offset, complete_end);
     tmp_len += complete_end - pending_offset;
     stats.input_bytes = log_len;
@@ -256,7 +356,7 @@ fn rewriteLog(
     tmp.close(zio);
     tmp_open = false;
     keep_tmp = true;
-    return true;
+    return .{ .changed = true, .unresolved = unresolved };
 }
 
 fn spillablePresentation(event: session_event.ConversationEvent) ?SpillCandidate {
@@ -296,44 +396,17 @@ fn encodeSpilledFrame(
     });
 }
 
-/// Reads one newline-terminated frame. Mirrors the open scan's truncation
-/// semantics: a torn final line reports TruncatedEventFrame so the caller can
-/// end the compacted log at the last complete frame.
+/// Adds the starting offset needed by the rewrite to the canonical bounded
+/// session-line reader used by discovery and replay.
 fn readLogLine(alloc: Allocator, reader: *std.Io.File.Reader, max_end: u64) !?LogLine {
-    if (reader.logicalPos() >= max_end) return null;
     const start_offset = reader.logicalPos();
-    var line: std.ArrayList(u8) = .empty;
-    errdefer line.deinit(alloc);
-    while (reader.logicalPos() < max_end) {
-        if (reader.interface.bufferedLen() == 0) {
-            const buffer = reader.interface.buffer;
-            reader.interface = std.Io.File.Reader.initInterface(buffer[0..@intCast(@min(
-                buffer.len,
-                max_end - reader.logicalPos(),
-            ))]);
-            defer reader.interface.buffer = buffer;
-            reader.interface.fill(1) catch |err| switch (err) {
-                error.EndOfStream => {
-                    if (line.items.len == 0) return null;
-                    return error.TruncatedEventFrame;
-                },
-                error.ReadFailed => return reader.err orelse error.ReadFailed,
-            };
-        }
-        const buffered = reader.interface.buffered();
-        const bytes = buffered[0..@intCast(@min(buffered.len, max_end - reader.logicalPos()))];
-        const newline = std.mem.findScalar(u8, bytes, '\n');
-        const count = if (newline) |end| end + 1 else bytes.len;
-        try line.appendSlice(alloc, bytes[0..count]);
-        reader.interface.toss(count);
-        if (line.items.len > session_event.event_frame_max_bytes) return error.EventFrameTooLarge;
-        if (newline != null) return .{
-            .bytes = try line.toOwnedSlice(alloc),
-            .start_offset = start_offset,
-            .next_offset = reader.logicalPos(),
-        };
-    }
-    return error.TruncatedEventFrame;
+    const read = (try session_replay.readBufferedLine(alloc, reader, max_end, null)) orelse
+        return null;
+    return .{
+        .bytes = read.bytes,
+        .start_offset = start_offset,
+        .next_offset = read.next_offset,
+    };
 }
 
 /// Streams `source[start..end)` into `dest` in bounded chunks via positional
@@ -363,7 +436,7 @@ fn copyLogRange(
 /// interrupted, so any truncation error fails validation.
 fn validateCompactedLog(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !void {
     const zio = io_mod.getIo();
-    var file = try dir.dir.openFile(zio, tmp_file, .{ .mode = .read_only });
+    var file = try openRegularFile(dir, tmp_file, .read_only);
     defer file.close(zio);
     const len = try file.length(zio);
     var reader_buffer: [copy_buffer_bytes]u8 = undefined;
@@ -450,15 +523,55 @@ fn trackPendingToolCall(
     }
 }
 
-fn renameCompactedLog(dir: *io_mod.VerifiedDir) !void {
-    const zio = io_mod.getIo();
-    try dir.dir.rename(tmp_file, dir.dir, events_file, zio);
+fn openRegularFile(
+    dir: *io_mod.VerifiedDir,
+    name: []const u8,
+    mode: std.Io.Dir.OpenFileOptions.Mode,
+) !std.Io.File {
+    return io_mod.openExistingRegularFile(dir.dir, name, mode);
 }
 
-fn syncSessionDir(dir: *io_mod.VerifiedDir) void {
-    io_mod.syncVerifiedDir(dir.dir) catch |err| {
-        debug_trace.logf("session", "session compaction dir sync failed err={s}", .{@errorName(err)});
+fn createPrivateTempFile(dir: *io_mod.VerifiedDir) !std.Io.File {
+    const zio = io_mod.getIo();
+    var file = dir.dir.createFile(zio, tmp_file, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+        .permissions = private_file_permissions,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.IsDir, error.NotDir, error.SymLinkLoop, error.PathAlreadyExists => return error.DurablePathUnsafe,
+        else => return err,
     };
+    errdefer file.close(zio);
+    file.setPermissions(zio, private_file_permissions) catch
+        return error.PrivateStatePermissionsUnsupported;
+    try io_mod.verifyOpenedRegularFile(try file.stat(zio), .read_write);
+    return file;
+}
+
+fn renameCompactedLog(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    test_controls: TestControls,
+) !void {
+    const zio = io_mod.getIo();
+    var temp = try openRegularFile(dir, tmp_file, .read_only);
+    temp.close(zio);
+    var current = try openRegularFile(dir, events_file, .read_only);
+    current.close(zio);
+
+    // The durable pending fence survives a post-rename sync failure. A later
+    // writer must resolve it before opening events.jsonl, making whichever
+    // atomic rename state is visible durable before new events can append.
+    try io_mod.durableReplaceVerified(alloc, dir, pending_file, "1\n");
+    try dir.dir.rename(tmp_file, dir.dir, events_file, zio);
+    test_controls.syncDir(dir.dir) catch |err| {
+        debug_trace.logf("session", "event=session_log_compaction_durability_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
+        return error.SessionCompactionPersistenceUncertain;
+    };
+    clearPendingFenceBestEffort(dir, session_id);
 }
 
 /// CRC32 over the log's trailing bytes; combined with the length it pins the
@@ -467,7 +580,7 @@ fn syncSessionDir(dir: *io_mod.VerifiedDir) void {
 fn tailPin(alloc: Allocator, dir: *io_mod.VerifiedDir, log_len: u64) !u32 {
     if (log_len == 0) return 0;
     const zio = io_mod.getIo();
-    var file = try dir.dir.openFile(zio, events_file, .{ .mode = .read_only });
+    var file = try openRegularFile(dir, events_file, .read_only);
     defer file.close(zio);
     const tail_bytes: u64 = @min(log_len, tail_pin_bytes);
     const start = log_len - tail_bytes;
@@ -484,7 +597,7 @@ fn tailPin(alloc: Allocator, dir: *io_mod.VerifiedDir, log_len: u64) !u32 {
 
 fn readMarker(dir: *io_mod.VerifiedDir) !?Marker {
     const zio = io_mod.getIo();
-    var file = dir.dir.openFile(zio, marker_file, .{ .mode = .read_only }) catch |err| switch (err) {
+    var file = openRegularFile(dir, marker_file, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -499,46 +612,90 @@ fn readMarker(dir: *io_mod.VerifiedDir) !?Marker {
     return .{ .log_len = log_len, .tail_crc = tail_crc };
 }
 
-fn writeMarker(alloc: Allocator, dir: *io_mod.VerifiedDir, marker: Marker) !void {
+fn writeMarkerBestEffort(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    marker: Marker,
+) !void {
     const text = try std.fmt.allocPrint(alloc, "{d}\n{d}\n", .{ marker.log_len, marker.tail_crc });
     defer alloc.free(text);
-    const zio = io_mod.getIo();
-    var file = try dir.dir.createFile(zio, marker_file, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(zio);
-    try file.writeStreamingAll(zio, text);
-    try file.sync(zio);
+    io_mod.durableReplaceVerified(alloc, dir, marker_file, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => debug_trace.logf("session", "event=session_log_compaction_marker_unavailable id={s} err={s}; future resume will rescan", .{ session_id, @errorName(err) }),
+    };
+}
+
+fn deleteRegularIfPresent(dir: *io_mod.VerifiedDir, name: []const u8) !bool {
+    const stat = dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    try dir.dir.deleteFile(io_mod.getIo(), name);
+    return true;
 }
 
 fn deleteIfPresent(dir: *io_mod.VerifiedDir, name: []const u8) void {
-    dir.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf("session", "session compaction cleanup failed name={s} err={s}", .{ name, @errorName(err) }),
+    _ = deleteRegularIfPresent(dir, name) catch |err| {
+        debug_trace.logf("session", "session compaction cleanup failed name={s} err={s}", .{ name, @errorName(err) });
     };
 }
 
-/// Removes tmp files left by an interrupted earlier pass (including names from
-/// superseded compaction builds) so a crash never accumulates strays.
-fn cleanupStaleArtifacts(dir: *io_mod.VerifiedDir, session_id: []const u8) void {
+fn clearPendingFenceBestEffort(dir: *io_mod.VerifiedDir, session_id: []const u8) void {
+    const removed = deleteRegularIfPresent(dir, pending_file) catch |err| {
+        debug_trace.logf("session", "event=session_log_compaction_fence_retained id={s} err={s}", .{ session_id, @errorName(err) });
+        return;
+    };
+    if (!removed) return;
+    io_mod.syncVerifiedDir(dir.dir) catch |err| {
+        debug_trace.logf("session", "event=session_log_compaction_fence_cleanup_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
+    };
+}
+
+fn recoverPendingReplacement(dir: *io_mod.VerifiedDir, session_id: []const u8) !void {
+    const stat = dir.dir.statFile(io_mod.getIo(), pending_file, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            debug_trace.logf("session", "event=session_log_compaction_recovery_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
+            return error.SessionCompactionPersistenceUncertain;
+        },
+    };
+    if (stat.kind != .file or stat.nlink != 1) {
+        debug_trace.logf("session", "event=session_log_compaction_recovery_uncertain id={s} err=unsafe_pending_fence", .{session_id});
+        return error.SessionCompactionPersistenceUncertain;
+    }
+
+    // First make the currently visible atomic-rename state durable. Only then
+    // may the fence and any pre-rename temp be removed.
+    io_mod.syncVerifiedDir(dir.dir) catch |err| {
+        debug_trace.logf("session", "event=session_log_compaction_recovery_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
+        return error.SessionCompactionPersistenceUncertain;
+    };
+    _ = deleteRegularIfPresent(dir, tmp_file) catch
+        return error.SessionCompactionPersistenceUncertain;
+    _ = deleteRegularIfPresent(dir, pending_file) catch
+        return error.SessionCompactionPersistenceUncertain;
+    io_mod.syncVerifiedDir(dir.dir) catch |err| {
+        debug_trace.logf("session", "event=session_log_compaction_recovery_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
+        return error.SessionCompactionPersistenceUncertain;
+    };
+    debug_trace.logf("session", "event=session_log_compaction_recovered id={s}", .{session_id});
+}
+
+/// Resolves a post-rename uncertainty fence, then removes tmp files left by an
+/// interrupted earlier pass (including names from superseded builds).
+fn cleanupStaleArtifacts(dir: *io_mod.VerifiedDir, session_id: []const u8) !void {
+    try recoverPendingReplacement(dir, session_id);
     var removed: usize = 0;
-    deleteIfPresentLogged(dir, tmp_file, &removed);
-    for (legacy_tmp_files) |name| deleteIfPresentLogged(dir, name, &removed);
+    if (try deleteRegularIfPresent(dir, tmp_file)) removed += 1;
+    for (legacy_tmp_files) |name| {
+        if (try deleteRegularIfPresent(dir, name)) removed += 1;
+    }
     if (removed > 0) {
         debug_trace.logf("session", "event=session_log_compaction_cleanup id={s} stale_tmp_files={d}", .{ session_id, removed });
     }
-}
-
-fn deleteIfPresentLogged(dir: *io_mod.VerifiedDir, name: []const u8, removed: *usize) void {
-    dir.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => {
-            debug_trace.logf("session", "session compaction cleanup failed name={s} err={s}", .{ name, @errorName(err) });
-            return;
-        },
-    };
-    removed.* += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +703,18 @@ fn deleteIfPresentLogged(dir: *io_mod.VerifiedDir, name: []const u8, removed: *u
 // ---------------------------------------------------------------------------
 
 const test_session_id = "0123456789abcdef0123456789abcdef";
+
+fn failBeforeRename(_: ?*anyopaque) !void {
+    return error.TestBeforeRename;
+}
+
+fn failDirectorySync(_: ?*anyopaque, _: std.Io.Dir) !void {
+    return error.TestDirectorySync;
+}
+
+fn failSecondSpill(_: ?*anyopaque, spill_count: usize) !void {
+    if (spill_count == 2) return error.TestSpillUnavailable;
+}
 
 fn appendFixtureFrame(
     alloc: Allocator,
@@ -614,10 +783,61 @@ fn writeFatSessionLog(alloc: Allocator, dir: *io_mod.VerifiedDir, fat: []const u
     try file.sync(std.testing.io);
 }
 
+fn writeMixedSizeSessionLog(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    unspillable: []const u8,
+    spillable: []const u8,
+) !void {
+    var file = try dir.dir.createFile(std.testing.io, events_file, .{ .truncate = true });
+    defer file.close(std.testing.io);
+    try appendFixtureFrame(alloc, &file, 1, .{ .user = .{ .text = "seed" } });
+    try appendFixtureFrame(alloc, &file, 2, .{ .tool_call = .{
+        .call_id = "call-too-large",
+        .tool_name = "edit_file",
+        .arguments_json = "{}",
+    } });
+    try appendFixtureFrame(alloc, &file, 3, .{ .tool_result = .{
+        .call_id = "call-too-large",
+        .tool_name = "edit_file",
+        .status = .success,
+        .artifact_ref = "large.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = fixtureFatPresentation(unspillable),
+    } });
+    try appendFixtureFrame(alloc, &file, 4, .{ .tool_call = .{
+        .call_id = "call-spillable",
+        .tool_name = "edit_file",
+        .arguments_json = "{}",
+    } });
+    try appendFixtureFrame(alloc, &file, 5, .{ .tool_result = .{
+        .call_id = "call-spillable",
+        .tool_name = "edit_file",
+        .status = .success,
+        .artifact_ref = "small.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = fixtureFatPresentation(spillable),
+    } });
+    try appendFixtureFrame(alloc, &file, 6, .{ .assistant = .{ .text = "done" } });
+    try appendFixtureFrame(alloc, &file, 7, .{ .turn_completed = .{} });
+    try file.sync(std.testing.io);
+}
+
 fn readLogText(alloc: Allocator, dir: *io_mod.VerifiedDir) ![]u8 {
     var file = try dir.dir.openFile(std.testing.io, events_file, .{ .mode = .read_only });
     defer file.close(std.testing.io);
     return io_mod.readFileToEnd(alloc, &file, 64 * 1024 * 1024);
+}
+
+fn lineAt(text: []const u8, target: usize) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    var index: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index == target) return line;
+    }
+    return null;
 }
 
 fn fixtureFatContent() []const u8 {
@@ -646,6 +866,9 @@ test "compaction spills inline snapshots and preserves every frame" {
     try std.testing.expect(after.len < before.len / 2);
     try std.testing.expect(std.mem.find(u8, after, "FIXTURE_DIFF_LINE") == null);
     try std.testing.expect(std.mem.find(u8, after, "\"content_handle\":\"diff-") != null);
+    for ([_]usize{ 0, 1, 3, 5, 6 }) |index| {
+        try std.testing.expectEqualStrings(lineAt(before, index).?, lineAt(after, index).?);
+    }
 
     // Every surviving frame decodes and replays in order; only the
     // tool_result frame changed shape, by moving snapshots behind a handle.
@@ -676,6 +899,7 @@ test "compaction spills inline snapshots and preserves every frame" {
     // The marker pins the exact post-compaction log state: length and tail
     // CRC must match the file on disk, or the next resume re-scans needlessly.
     const marker = (try readMarker(&dir)).?;
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, pending_file, .{}));
     try std.testing.expectEqual(@as(u64, after.len), marker.log_len);
     try std.testing.expectEqual(try tailPin(alloc, &dir, @intCast(after.len)), marker.tail_crc);
 
@@ -693,6 +917,29 @@ test "compaction spills inline snapshots and preserves every frame" {
     // no-op before the marker is even consulted.
     const second = try compactIfNeeded(alloc, &dir, test_session_id, .{});
     try std.testing.expectEqual(Outcome.skipped_small_log, second);
+}
+
+test "compaction migrates small logs that can hold spillable payloads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    const small_spill = "SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n" ** 128;
+    try writeFatSessionLog(alloc, &dir, small_spill);
+    const before = try readLogText(alloc, &dir);
+    defer alloc.free(before);
+    try std.testing.expect(before.len < 256 * 1024);
+    try std.testing.expect(before.len > inline_budget_bytes);
+
+    try std.testing.expectEqual(
+        Outcome.compacted,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    const after = try readLogText(alloc, &dir);
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.find(u8, after, "SMALL_LEGACY_INLINE_PAYLOAD") == null);
+    try std.testing.expect(std.mem.find(u8, after, "\"content_handle\":\"diff-") != null);
 }
 
 test "compaction keeps a clean log byte-identical and pins it" {
@@ -739,12 +986,177 @@ test "compaction keeps the original log when the store cannot spill" {
     blocker.close(std.testing.io);
 
     const outcome = try compactIfNeeded(alloc, &dir, test_session_id, .{});
-    try std.testing.expectEqual(Outcome.no_inline_payloads, outcome);
+    try std.testing.expectEqual(Outcome.deferred, outcome);
     const after = try readLogText(alloc, &dir);
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
-    // No tmp file may survive a failed pass.
+    // No tmp file or freshness marker may survive a failed pass: once the
+    // transient blocker disappears, the next resume must retry.
     try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, tmp_file, .{}));
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, marker_file, .{}));
+    try dir.dir.deleteFile(std.testing.io, "tool-results");
+    const retried = try compactIfNeeded(alloc, &dir, test_session_id, .{});
+    try std.testing.expectEqual(Outcome.compacted, retried);
+}
+
+test "compaction publishes successful spills and retries only unresolved frames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    try writeFatSessionLog(alloc, &dir, fixtureFatContent());
+    const before = try readLogText(alloc, &dir);
+    defer alloc.free(before);
+    try std.testing.expectEqual(
+        Outcome.compacted,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{
+            .test_controls = .{ .before_spill_fn = failSecondSpill },
+        }),
+    );
+    const partial = try readLogText(alloc, &dir);
+    defer alloc.free(partial);
+    try std.testing.expect(partial.len < before.len);
+    try std.testing.expect(std.mem.find(u8, partial, "FIXTURE_DIFF_LINE") != null);
+    try std.testing.expect(std.mem.find(u8, partial, "\"content_handle\":\"diff-") != null);
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, marker_file, .{}));
+
+    try std.testing.expectEqual(
+        Outcome.compacted,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    const converged = try readLogText(alloc, &dir);
+    defer alloc.free(converged);
+    try std.testing.expect(std.mem.find(u8, converged, "FIXTURE_DIFF_LINE") == null);
+    try dir.dir.access(std.testing.io, marker_file, .{});
+}
+
+test "compaction leaves permanently oversized packs inline without retrying forever" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    const huge_len = result_store.diff_content_max_bytes / 2 + 4096;
+    const huge = try alloc.alloc(u8, huge_len);
+    defer alloc.free(huge);
+    @memset(huge, 'H');
+    try writeMixedSizeSessionLog(alloc, &dir, huge, fixtureFatContent());
+
+    try std.testing.expectEqual(
+        Outcome.compacted,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    const after = try readLogText(alloc, &dir);
+    defer alloc.free(after);
+    try std.testing.expect(after.len > result_store.diff_content_max_bytes);
+    try std.testing.expect(std.mem.find(u8, after, "FIXTURE_DIFF_LINE") == null);
+    try std.testing.expect(std.mem.find(u8, after, "\"content_handle\":\"diff-") != null);
+    try std.testing.expectEqual(
+        Outcome.skipped_fresh,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+}
+
+test "compaction preserves the original log when interrupted before rename" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    try writeFatSessionLog(alloc, &dir, fixtureFatContent());
+    const before = try readLogText(alloc, &dir);
+    defer alloc.free(before);
+    try std.testing.expectError(
+        error.TestBeforeRename,
+        compactIfNeeded(alloc, &dir, test_session_id, .{
+            .test_controls = .{ .before_rename_fn = failBeforeRename },
+        }),
+    );
+    const after = try readLogText(alloc, &dir);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, tmp_file, .{}));
+}
+
+test "compaction reports persistence uncertainty after rename sync failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    try writeFatSessionLog(alloc, &dir, fixtureFatContent());
+    try std.testing.expectError(
+        error.SessionCompactionPersistenceUncertain,
+        compactIfNeeded(alloc, &dir, test_session_id, .{
+            .test_controls = .{ .sync_dir_fn = failDirectorySync },
+        }),
+    );
+    const after = try readLogText(alloc, &dir);
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.find(u8, after, "FIXTURE_DIFF_LINE") == null);
+    try std.testing.expect(std.mem.find(u8, after, "\"content_handle\":\"diff-") != null);
+    try dir.dir.access(std.testing.io, pending_file, .{});
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, marker_file, .{}));
+
+    // A later writable resume resolves the durable fence before it can skip
+    // the now-small log or append any new event.
+    try std.testing.expectEqual(
+        Outcome.skipped_small_log,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, pending_file, .{}));
+}
+
+test "compaction removes a regular stale temp before retrying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    try writeFatSessionLog(alloc, &dir, fixtureFatContent());
+    var stale = try dir.dir.createFile(std.testing.io, tmp_file, .{});
+    try stale.writeStreamingAll(std.testing.io, "stale");
+    stale.close(std.testing.io);
+    try std.testing.expectEqual(
+        Outcome.compacted,
+        try compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, tmp_file, .{}));
+}
+
+test "compaction never follows root session symlinks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+
+    var victim = try dir.dir.createFile(std.testing.io, "outside-marker", .{});
+    try victim.writeStreamingAll(std.testing.io, "keep-me");
+    victim.close(std.testing.io);
+    try dir.dir.symLink(std.testing.io, "outside-marker", marker_file, .{});
+    try writeMarkerBestEffort(alloc, &dir, test_session_id, .{ .log_len = 1, .tail_crc = 2 });
+    var unchanged = try dir.dir.openFile(std.testing.io, "outside-marker", .{ .mode = .read_only });
+    defer unchanged.close(std.testing.io);
+    const bytes = try io_mod.readFileToEnd(alloc, &unchanged, 16);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("keep-me", bytes);
+
+    try dir.dir.deleteFile(std.testing.io, marker_file);
+    try dir.dir.symLink(std.testing.io, "outside-marker", pending_file, .{});
+    try std.testing.expectError(
+        error.SessionCompactionPersistenceUncertain,
+        compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
+    try dir.dir.deleteFile(std.testing.io, pending_file);
+
+    try writeFatSessionLog(alloc, &dir, fixtureFatContent());
+    try dir.dir.rename(events_file, dir.dir, "outside-events", std.testing.io);
+    try dir.dir.symLink(std.testing.io, "outside-events", events_file, .{});
+    try std.testing.expectError(
+        error.DurablePathUnsafe,
+        compactIfNeeded(alloc, &dir, test_session_id, .{}),
+    );
 }
 
 test "compaction drops a torn tail the way the open scan truncates it" {

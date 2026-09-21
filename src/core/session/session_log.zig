@@ -3041,6 +3041,7 @@ pub const TestControls = struct {
     context: ?*anyopaque = null,
     boundary_fn: ?*const fn (?*anyopaque, Boundary) anyerror!void = null,
     lock_fn: ?*const fn (?*anyopaque, LockKind) void = null,
+    compaction: session_compaction.TestControls = .{},
 
     pub fn boundary(self: TestControls, point: Boundary) !void {
         if (self.boundary_fn) |callback| try callback(self.context, point);
@@ -4062,10 +4063,17 @@ pub const Root = struct {
             return error.SessionMigrationRequired;
         }
         // Compact legacy fat logs (inline diff snapshots) before the open
-        // scan replays them. A compaction hiccup must never block resume: the
-        // original log is still intact and the open path reads it as-is.
-        if (session_compaction.compactIfNeeded(alloc, &writable.dir, writable.session_id, .{})) |_| {} else |err| {
+        // scan replays them. Pre-rename failures keep the original log intact
+        // and do not block resume. A post-rename directory-sync failure is
+        // persistence-uncertain and must stop the writer from appending to an
+        // inode whose directory entry is not known durable.
+        if (session_compaction.compactIfNeeded(alloc, &writable.dir, writable.session_id, .{
+            .test_controls = options.test_controls.compaction,
+        })) |_| {} else |err| {
             if (err == error.OutOfMemory) return err;
+            if (err == error.SessionCompactionPersistenceUncertain) {
+                return error.SessionPersistenceUncertain;
+            }
             debug_trace.logf("session", "event=session_log_compaction_degraded id={s} err={s}; resuming from original log", .{ writable.session_id, @errorName(err) });
         }
         return openConversationWritableSession(alloc, &writable);
@@ -4743,6 +4751,72 @@ test "writable resume releases ownership when metadata allocation fails" {
     var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
     defer resumed.deinit(alloc);
     try std.testing.expectEqualStrings(initial.id, resumed.active_id);
+}
+
+test "writable resume degrades before rename and blocks post-rename uncertainty" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "resume-compaction-policy", 10);
+    defer initial.deinit(alloc);
+    var started = try temp.root.startConversationSession(alloc, initial, .{});
+    const fat = "RESUME_COMPACTION_INLINE_0123456789abcdef\n" ** 128;
+    _ = try started.conversation_writer.append(alloc, 11, .{ .user = .{ .text = "seed" } });
+    _ = try started.conversation_writer.append(alloc, 12, .{ .tool_call = .{
+        .call_id = "call-edit",
+        .tool_name = "edit_file",
+        .arguments_json = "{}",
+    } });
+    _ = try started.conversation_writer.append(alloc, 13, .{ .tool_result = .{
+        .call_id = "call-edit",
+        .tool_name = "edit_file",
+        .status = .success,
+        .artifact_ref = "result.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = fat,
+            .after_content = fat,
+        },
+    } });
+    _ = try started.conversation_writer.append(alloc, 14, .{ .assistant = .{ .text = "done" } });
+    _ = try started.conversation_writer.append(alloc, 15, .{ .turn_completed = .{} });
+    started.deinit(alloc);
+
+    const Faults = struct {
+        fn beforeRename(_: ?*anyopaque) !void {
+            return error.TestBeforeRename;
+        }
+
+        fn syncDir(_: ?*anyopaque, _: std.Io.Dir) !void {
+            return error.TestDirectorySync;
+        }
+    };
+
+    // A pre-rename failure leaves the original log authoritative, so resume
+    // proceeds through the normal scan.
+    var degraded = try temp.root.resumeForWrite(alloc, initial.id, .{
+        .test_controls = .{ .compaction = .{ .before_rename_fn = Faults.beforeRename } },
+    });
+    degraded.deinit(alloc);
+
+    // A post-rename sync failure blocks the writer. The next resume resolves
+    // the durable pending fence before opening the compacted log for append.
+    try std.testing.expectError(
+        error.SessionPersistenceUncertain,
+        temp.root.resumeForWrite(alloc, initial.id, .{
+            .test_controls = .{ .compaction = .{ .sync_dir_fn = Faults.syncDir } },
+        }),
+    );
+    var recovered = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, recovered.active_id);
 }
 
 test "committed conversation language survives reopening" {
