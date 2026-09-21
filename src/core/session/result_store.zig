@@ -313,6 +313,182 @@ pub fn storeLargeResultManaged(
     return handle;
 }
 
+/// Bound on one serialized diff content pack (previous + after snapshots of
+/// a committed file edit). Oversized packs stay inline and the enclosing
+/// record's own size guard covers them.
+pub const diff_content_max_bytes: usize = 2 * stored_text_max_bytes;
+
+/// Restored previous/after contents of a committed file presentation.
+/// The caller owns both slices; release with deinit.
+pub const DiffContentPack = struct {
+    previous_content: ?[]u8 = null,
+    after_content: ?[]u8 = null,
+
+    pub fn deinit(self: *DiffContentPack, alloc: Allocator) void {
+        if (self.previous_content) |content| alloc.free(content);
+        if (self.after_content) |content| alloc.free(content);
+        self.* = undefined;
+    }
+};
+
+const diff_content_handle_prefix = "diff-";
+const diff_content_handle_suffix = ".json";
+const diff_content_digest_hex_bytes = 16;
+const diff_content_handle_bytes = diff_content_handle_prefix.len +
+    diff_content_digest_hex_bytes + 1 + diff_content_digest_hex_bytes +
+    diff_content_handle_suffix.len;
+
+fn isLowerHex(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+    }
+    return true;
+}
+
+pub fn isDiffContentHandle(handle: []const u8) bool {
+    if (handle.len != diff_content_handle_bytes or
+        !std.mem.startsWith(u8, handle, diff_content_handle_prefix) or
+        !std.mem.endsWith(u8, handle, diff_content_handle_suffix))
+    {
+        return false;
+    }
+    const call_start = diff_content_handle_prefix.len;
+    const call_end = call_start + diff_content_digest_hex_bytes;
+    const content_start = call_end + 1;
+    const content_end = content_start + diff_content_digest_hex_bytes;
+    return handle[call_end] == '-' and
+        isLowerHex(handle[call_start..call_end]) and
+        isLowerHex(handle[content_start..content_end]);
+}
+
+pub fn diffContentHandleMatchesCall(
+    handle: []const u8,
+    tool_call_id: []const u8,
+) bool {
+    if (!isDiffContentHandle(handle)) return false;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tool_call_id, &digest, .{});
+    const expected = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    const start = diff_content_handle_prefix.len;
+    return std.mem.eql(
+        u8,
+        handle[start .. start + diff_content_digest_hex_bytes],
+        &expected,
+    );
+}
+
+pub fn diffContentHandleMatchesContentDigest(
+    handle: []const u8,
+    digest: [32]u8,
+) bool {
+    return isDiffContentHandle(handle) and
+        artifact_digest.handleMatchesContentDigest(
+            handle,
+            diff_content_handle_suffix,
+            digest,
+        );
+}
+
+/// Persists one edit's previous/after snapshots as a single content-addressed
+/// artifact in the session result store and returns its handle. Keeping the
+/// snapshots out of the event log and recovery checkpoint keeps those records
+/// small; readers resolve the handle on demand.
+pub fn storeDiffContent(
+    alloc: Allocator,
+    result_dir: []const u8,
+    tool_call_id: []const u8,
+    previous_content: ?[]const u8,
+    after_content: ?[]const u8,
+) ![]u8 {
+    const pack = try encodeDiffContentPack(alloc, previous_content, after_content);
+    defer alloc.free(pack);
+    const handle = try makeDiffContentHandle(alloc, tool_call_id, pack);
+    errdefer alloc.free(handle);
+    try storeLargeResultAtHandle(alloc, result_dir, handle, pack);
+    return handle;
+}
+
+/// Loads and digest-verifies a pack written by storeDiffContent.
+pub fn loadDiffContentManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    tool_call_id: []const u8,
+    handle: []const u8,
+) !DiffContentPack {
+    if (!diffContentHandleMatchesCall(handle, tool_call_id)) {
+        return error.InvalidResultHandle;
+    }
+    var reader = try openReaderManaged(alloc, capability, handle);
+    defer reader.deinit();
+    if (reader.size > diff_content_max_bytes) return error.ResultTooLarge;
+    const bytes = try reader.readPage(alloc, 0, diff_content_max_bytes);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    if (!diffContentHandleMatchesContentDigest(handle, digest)) {
+        return error.DiffContentArtifactChanged;
+    }
+    const Wire = struct {
+        previous_content: ?[]const u8 = null,
+        after_content: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Wire, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .max_value_len = diff_content_max_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidDiffContentArtifact,
+    };
+    defer parsed.deinit();
+    var pack: DiffContentPack = .{};
+    errdefer pack.deinit(alloc);
+    if (parsed.value.previous_content) |content| {
+        pack.previous_content = try alloc.dupe(u8, content);
+    }
+    if (parsed.value.after_content) |content| {
+        pack.after_content = try alloc.dupe(u8, content);
+    }
+    return pack;
+}
+
+fn encodeDiffContentPack(
+    alloc: Allocator,
+    previous_content: ?[]const u8,
+    after_content: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll("{\"previous_content\":") catch return error.OutOfMemory;
+    writeOptionalPackString(&out.writer, previous_content) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"after_content\":") catch return error.OutOfMemory;
+    writeOptionalPackString(&out.writer, after_content) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    if (out.written().len > diff_content_max_bytes) return error.DiffContentTooLarge;
+    return try out.toOwnedSlice();
+}
+
+fn writeOptionalPackString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |text| {
+        try std.json.Stringify.value(text, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn makeDiffContentHandle(alloc: Allocator, tool_call_id: []const u8, pack: []const u8) ![]u8 {
+    var content_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(pack, &content_digest, .{});
+    const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
+    var call_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tool_call_id, &call_digest, .{});
+    const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "diff-{s}-{s}.json",
+        .{ &call_hex, &content_hex },
+    );
+}
+
 fn storeLargeResultAtHandleManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -514,6 +690,11 @@ fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const u8,
     );
 }
 
+pub fn isStoredTextHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "result-") and
+        std.mem.endsWith(u8, handle, ".txt");
+}
+
 pub fn handleMatchesContentDigest(
     handle: []const u8,
     digest: [32]u8,
@@ -588,6 +769,100 @@ test "large result storage creates stable handle and bounded preview" {
     defer alloc.free(@constCast(again.memory.output_handle.?));
     defer alloc.free(@constCast(again.memory.preview.?));
     try std.testing.expectEqualStrings(prepared.memory.output_handle.?, again.memory.output_handle.?);
+}
+
+test "diff content packs round trip, bound, and reject tampering" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const handle = try storeDiffContent(alloc, dir, "call-edit-1", "line one\nline two\n", "line one\nline 2\n");
+    defer alloc.free(handle);
+    try std.testing.expect(isDiffContentHandle(handle));
+    try std.testing.expect(!isDiffContentHandle("result-shell.txt"));
+
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+    var pack = try loadDiffContentManaged(
+        alloc,
+        &capability,
+        "call-edit-1",
+        handle,
+    );
+    defer pack.deinit(alloc);
+    try std.testing.expectEqualStrings("line one\nline two\n", pack.previous_content.?);
+    try std.testing.expectEqualStrings("line one\nline 2\n", pack.after_content.?);
+    try std.testing.expectError(
+        error.InvalidResultHandle,
+        loadDiffContentManaged(alloc, &capability, "call-edit-2", handle),
+    );
+
+    // Null snapshots survive the round trip.
+    const partial = try storeDiffContent(alloc, dir, "call-edit-2", null, "created\n");
+    defer alloc.free(partial);
+    var partial_pack = try loadDiffContentManaged(
+        alloc,
+        &capability,
+        "call-edit-2",
+        partial,
+    );
+    defer partial_pack.deinit(alloc);
+    try std.testing.expect(partial_pack.previous_content == null);
+    try std.testing.expectEqualStrings("created\n", partial_pack.after_content.?);
+
+    // A tampered artifact fails the content digest check.
+    var rewritten = try capability.atomicReplace(alloc, .tool_results, handle, "{\"previous_content\":\"forged\",\"after_content\":null}");
+    rewritten.deinit(alloc);
+    try std.testing.expectError(
+        error.DiffContentArtifactChanged,
+        loadDiffContentManaged(alloc, &capability, "call-edit-1", handle),
+    );
+
+    // Handles from other artifact families are rejected before any read.
+    try std.testing.expectError(
+        error.InvalidResultHandle,
+        loadDiffContentManaged(
+            alloc,
+            &capability,
+            "call-edit-1",
+            "result-shell.txt",
+        ),
+    );
+}
+
+test "diff content encoding propagates every allocation failure" {
+    const backing = std.testing.allocator;
+    const previous = "before\n" ** 800;
+    const after = "after\n" ** 800;
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    const encoded = try encodeDiffContentPack(
+        probe.allocator(),
+        previous,
+        after,
+    );
+    probe.allocator().free(encoded);
+    const allocation_count = probe.alloc_index;
+    try std.testing.expect(allocation_count > 1);
+
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            backing,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            encodeDiffContentPack(failing.allocator(), previous, after),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "saved preparation externalizes small results" {
@@ -1110,6 +1385,9 @@ test "managed result handles authenticate stored content" {
     defer alloc.free(handle);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    try std.testing.expect(isStoredTextHandle(handle));
+    try std.testing.expect(!isStoredTextHandle("image-result-shell-0123456789abcdef.txt"));
+    try std.testing.expect(!isStoredTextHandle("other-0123456789abcdef.txt"));
     try std.testing.expect(handleMatchesContentDigest(handle, digest));
     std.crypto.hash.sha2.Sha256.hash("xuthenticated result", &digest, .{});
     try std.testing.expect(!handleMatchesContentDigest(handle, digest));

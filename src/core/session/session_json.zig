@@ -227,6 +227,9 @@ fn writeCommittedFilePresentationJson(
     writer: *std.Io.Writer,
     presentation: types.CommittedFilePresentation,
 ) !void {
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"path\":");
     try std.json.Stringify.value(presentation.path, .{}, writer);
     try writer.writeAll(",\"kind\":");
@@ -260,6 +263,8 @@ fn writeCommittedFilePresentationJson(
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"content_handle\":");
+    try writeOptionalStringJson(writer, presentation.content_handle);
     try writer.writeByte('}');
 }
 
@@ -1005,7 +1010,9 @@ fn parseCommittedFilePresentation(
     errdefer if (after_content) |content| mem_utils.free(alloc, content);
     const lifecycle_id = try parseOptionalLifecycleId(alloc, object.get("lifecycle_id"));
     errdefer if (lifecycle_id) |id| mem_utils.free(alloc, @constCast(id.call_id));
-    return .{
+    const content_handle = try optionalStringDup(alloc, object.get("content_handle"));
+    errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
+    const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = try parseCommittedFilePresentationKind(try requireString(object, "kind")),
         .lines = lines,
@@ -1015,7 +1022,12 @@ fn parseCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
+    return presentation;
 }
 
 fn parseCommittedFilePresentationLines(

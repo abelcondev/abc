@@ -38,7 +38,10 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 pub const file_name = "history-cache.bin";
 
 const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
-const format_version: u16 = 1;
+// Version 2: ConversationToolResult carries CommittedFilePresentation
+// .content_handle (spilled diff snapshots). The schema binding on
+// conversation_schema_version already discards version-1 caches.
+const format_version: u16 = 2;
 /// Frames carry 32-bit lengths; a single log line can be large (embedded tool
 /// output), so the cap stays generous. Anything larger is a corrupt cache.
 const max_frame_bytes: u32 = 1024 * 1024 * 1024;

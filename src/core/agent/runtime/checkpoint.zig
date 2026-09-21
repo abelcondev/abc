@@ -39,8 +39,10 @@ pub fn encode(
     payload.writer.writeAll("{\"history\":[") catch return error.OutOfMemory;
     for (history, 0..) |turn, index| {
         if (index > 0) payload.writer.writeByte(',') catch return error.OutOfMemory;
-        session_codec.writeHistoryTurn(&payload.writer, turn) catch
-            return error.OutOfMemory;
+        session_codec.writeHistoryTurn(&payload.writer, turn) catch |err| switch (err) {
+            error.InvalidSessionFormat => return error.InvalidCheckpoint,
+            else => return error.OutOfMemory,
+        };
         if (payload.written().len > max_checkpoint_bytes - header_bytes) {
             return error.CheckpointTooLarge;
         }
@@ -128,6 +130,36 @@ test "kernel checkpoint round trips history and usage" {
     try std.testing.expectEqualStrings("hello", decoded.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(?u64, 3), decoded.usage.input_tokens);
+}
+
+test "kernel checkpoint reports invalid presentation authority" {
+    const alloc = std.testing.allocator;
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("edit-1"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = "before",
+            .after_content = "after",
+            .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_results = &results }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("edit") },
+        .assistant = @constCast("edited"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.expectError(error.InvalidCheckpoint, encode(alloc, &history, .{}));
 }
 
 test "kernel checkpoint round trips inline prompt images" {

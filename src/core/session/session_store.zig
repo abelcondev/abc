@@ -3695,40 +3695,32 @@ pub const Store = struct {
         try copyRecoveredImageSnapshots(
             alloc,
             recovered.history,
+            if (recovered.recovery_checkpoint) |*checkpoint| checkpoint else null,
             staged_target_images,
         );
         try rebaseRecoveredImageSnapshots(
             alloc,
             recovered.history,
+            if (recovered.recovery_checkpoint) |*checkpoint| checkpoint else null,
             staged_target_images,
             target_images,
         );
         const contains_unverified_artifacts = try copyRecoveredManagedChildren(
             alloc,
             recovered.history,
+            if (recovered.recovery_checkpoint) |*checkpoint| checkpoint else null,
             &source_children,
             target.child_capability orelse
                 return error.SessionChildStoreFailed,
         );
+        try canonicalizeRecoveredCheckpointFilePresentations(
+            alloc,
+            &recovered,
+            target.state,
+        );
         if (current_boundary) |boundary| {
             try session_log.copy_conversation_recovery_prefix(alloc, &source.dir, &target.log.dir, boundary);
             if (metadata.?.value.title) |title| _ = try target.renameConversation(alloc, title);
-        }
-        if (!try session_log.durableStatesEqual(target.state, recovered)) {
-            const disposition = discardRecoveryStagedSession(
-                &staging_root,
-                alloc,
-                &target,
-            );
-            target_owned = false;
-            if (disposition != .discarded) {
-                debug_trace.logf(
-                    "session",
-                    "event=session_recovery_staged_target_cleanup disposition={s}",
-                    .{@tagName(disposition)},
-                );
-            }
-            return error.SessionRecoveryIndeterminate;
         }
         const promotion = self.promoteRecoveryStagedSession(
             &staging_root,
@@ -3805,9 +3797,40 @@ const RecoveryPromotionStatus = enum {
     indeterminate,
 };
 
+fn copyRecoveredImageSlice(
+    alloc: Allocator,
+    images: []core_types.ImageAttachment,
+    target_images: []const u8,
+) !void {
+    for (images) |*image| {
+        if (image.snapshot_path == null) continue;
+        const copied = image_attachments.copyVerifiedImageAttachmentToDir(
+            alloc,
+            image.*,
+            image.id,
+            target_images,
+        ) catch |err| switch (err) {
+            error.FileNotFound,
+            error.InvalidImageId,
+            error.MissingImageSnapshot,
+            error.InvalidImageSnapshotDigest,
+            error.NotRegularFile,
+            error.ImageTooLarge,
+            error.ImageSnapshotCorrupt,
+            error.UnsupportedImageType,
+            error.ImageSnapshotMediaTypeMismatch,
+            => return error.SessionRecoveryBoundaryInvalid,
+            else => return err,
+        };
+        core_types.freeImageAttachment(alloc, image.*);
+        image.* = copied;
+    }
+}
+
 fn copyRecoveredImageSnapshots(
     alloc: Allocator,
     history: []session.HistoryTurn,
+    recovery_checkpoint: ?*session_codec.RecoveryCheckpoint,
     target_images: []const u8,
 ) !void {
     for (history) |*turn| {
@@ -3816,35 +3839,40 @@ fn copyRecoveredImageSnapshots(
             .assistant => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
-        for (images) |*image| {
-            if (image.snapshot_path == null) continue;
-            const copied = image_attachments.copyVerifiedImageAttachmentToDir(
-                alloc,
-                image.*,
-                image.id,
-                target_images,
-            ) catch |err| switch (err) {
-                error.FileNotFound,
-                error.InvalidImageId,
-                error.MissingImageSnapshot,
-                error.InvalidImageSnapshotDigest,
-                error.NotRegularFile,
-                error.ImageTooLarge,
-                error.ImageSnapshotCorrupt,
-                error.UnsupportedImageType,
-                error.ImageSnapshotMediaTypeMismatch,
-                => return error.SessionRecoveryBoundaryInvalid,
-                else => return err,
-            };
-            core_types.freeImageAttachment(alloc, image.*);
-            image.* = copied;
+        try copyRecoveredImageSlice(alloc, images, target_images);
+    }
+    if (recovery_checkpoint) |checkpoint| {
+        try copyRecoveredImageSlice(alloc, checkpoint.user.images, target_images);
+    }
+}
+
+fn rebaseRecoveredImageSlice(
+    alloc: Allocator,
+    images: []core_types.ImageAttachment,
+    staged_images: []const u8,
+    target_images: []const u8,
+) !void {
+    for (images) |*image| {
+        const staged_path = image.snapshot_path orelse continue;
+        const parent = std.fs.path.dirname(staged_path) orelse
+            return error.SessionRecoveryBoundaryInvalid;
+        if (!std.mem.eql(u8, parent, staged_images)) {
+            return error.SessionRecoveryBoundaryInvalid;
         }
+        const leaf = std.fs.path.basename(staged_path);
+        const target_path = try std.fs.path.join(
+            alloc,
+            &.{ target_images, leaf },
+        );
+        alloc.free(staged_path);
+        image.snapshot_path = target_path;
     }
 }
 
 fn rebaseRecoveredImageSnapshots(
     alloc: Allocator,
     history: []session.HistoryTurn,
+    recovery_checkpoint: ?*session_codec.RecoveryCheckpoint,
     staged_images: []const u8,
     target_images: []const u8,
 ) !void {
@@ -3854,20 +3882,196 @@ fn rebaseRecoveredImageSnapshots(
             .assistant => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
-        for (images) |*image| {
-            const staged_path = image.snapshot_path orelse continue;
-            const parent = std.fs.path.dirname(staged_path) orelse
-                return error.SessionRecoveryBoundaryInvalid;
-            if (!std.mem.eql(u8, parent, staged_images)) {
-                return error.SessionRecoveryBoundaryInvalid;
+        try rebaseRecoveredImageSlice(alloc, images, staged_images, target_images);
+    }
+    if (recovery_checkpoint) |checkpoint| {
+        try rebaseRecoveredImageSlice(
+            alloc,
+            checkpoint.user.images,
+            staged_images,
+            target_images,
+        );
+    }
+}
+
+fn committedFilePresentationIdentityEqual(
+    first: core_types.CommittedFilePresentation,
+    second: core_types.CommittedFilePresentation,
+) bool {
+    if (!std.mem.eql(u8, first.path, second.path) or
+        first.kind != second.kind or
+        first.additions != second.additions or
+        first.deletions != second.deletions or
+        first.truncated != second.truncated or
+        first.lines.len != second.lines.len or
+        (first.lifecycle_id == null) != (second.lifecycle_id == null))
+    {
+        return false;
+    }
+    for (first.lines, second.lines) |first_line, second_line| {
+        if (first_line.kind != second_line.kind or
+            first_line.old_line != second_line.old_line or
+            first_line.new_line != second_line.new_line or
+            !std.mem.eql(u8, first_line.text, second_line.text))
+        {
+            return false;
+        }
+    }
+    if (first.lifecycle_id) |first_lifecycle| {
+        const second_lifecycle = second.lifecycle_id.?;
+        if (first_lifecycle.turn_id != second_lifecycle.turn_id or
+            !std.mem.eql(u8, first_lifecycle.call_id, second_lifecycle.call_id))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn canonicalizeRecoveredExecutionFilePresentations(
+    alloc: Allocator,
+    recovered: *core_types.ExecutionMemory,
+    target: core_types.ExecutionMemory,
+) !void {
+    if (recovered.tool_steps.len != target.tool_steps.len) {
+        return error.SessionRecoveryIndeterminate;
+    }
+    for (recovered.tool_steps, target.tool_steps) |*recovered_step, target_step| {
+        if (recovered_step.tool_results.len != target_step.tool_results.len) {
+            return error.SessionRecoveryIndeterminate;
+        }
+        for (recovered_step.tool_results, target_step.tool_results) |*recovered_result, target_result| {
+            if (!std.mem.eql(u8, recovered_result.tool_call_id, target_result.tool_call_id) or
+                (recovered_result.committed_file_presentation == null) !=
+                    (target_result.committed_file_presentation == null))
+            {
+                return error.SessionRecoveryIndeterminate;
             }
-            const leaf = std.fs.path.basename(staged_path);
-            const target_path = try std.fs.path.join(
-                alloc,
-                &.{ target_images, leaf },
-            );
-            alloc.free(staged_path);
-            image.snapshot_path = target_path;
+            const target_presentation = target_result.committed_file_presentation orelse continue;
+            const recovered_presentation = &recovered_result.committed_file_presentation.?;
+            if (!committedFilePresentationIdentityEqual(
+                recovered_presentation.*,
+                target_presentation,
+            )) {
+                return error.SessionRecoveryIndeterminate;
+            }
+            const target_handle = target_presentation.content_handle orelse continue;
+            const owned_handle = try alloc.dupe(u8, target_handle);
+            if (recovered_presentation.previous_content) |content| alloc.free(content);
+            if (recovered_presentation.after_content) |content| alloc.free(content);
+            if (recovered_presentation.content_handle) |handle| alloc.free(handle);
+            recovered_presentation.previous_content = null;
+            recovered_presentation.after_content = null;
+            recovered_presentation.content_handle = owned_handle;
+        }
+    }
+}
+
+fn canonicalizeRecoveredCheckpointFilePresentations(
+    alloc: Allocator,
+    recovered: *session_codec.DurableSessionState,
+    target: session_codec.DurableSessionState,
+) !void {
+    if ((recovered.recovery_checkpoint == null) != (target.recovery_checkpoint == null)) {
+        return error.SessionRecoveryIndeterminate;
+    }
+    if (recovered.recovery_checkpoint) |*checkpoint| {
+        try canonicalizeRecoveredExecutionFilePresentations(
+            alloc,
+            &checkpoint.execution,
+            target.recovery_checkpoint.?.execution,
+        );
+    }
+}
+
+const RecoveredArtifactContract = enum {
+    tool_output,
+    tool_images,
+    diff_content,
+    command_replay,
+    command_log,
+};
+
+fn isCommandLogHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "fx-command-") and
+        std.mem.endsWith(u8, handle, ".log");
+}
+
+fn recoveredCommandArtifactIsAuthenticated(
+    contract: RecoveredArtifactContract,
+    handle: []const u8,
+) bool {
+    return switch (contract) {
+        .command_replay => command_replay_store.isReplayHandle(handle) and
+            command_replay_store.hasContentDigest(handle),
+        .command_log => isCommandLogHandle(handle) and
+            artifact_digest.hasContentDigest(handle, ".log"),
+        else => false,
+    };
+}
+
+fn recoveredArtifactKind(
+    contract: RecoveredArtifactContract,
+) session_child_store.ManagedChildKind {
+    return switch (contract) {
+        .tool_output, .tool_images, .diff_content => .tool_results,
+        .command_replay, .command_log => .command_artifacts,
+    };
+}
+
+fn copyRecoveredExecutionManagedChildren(
+    alloc: Allocator,
+    execution: *core_types.ExecutionMemory,
+    source: *session_child_store.SessionChildCapability,
+    target: *session_child_store.SessionChildCapability,
+    contains_unverified_artifacts: *bool,
+) !void {
+    for (execution.tool_steps) |*step| {
+        for (step.tool_results) |*result| {
+            if (result.tool_image_handle) |handle| {
+                try copyRecoveredManagedChild(
+                    alloc,
+                    source,
+                    target,
+                    .tool_images,
+                    handle,
+                    null,
+                    null,
+                );
+            }
+            if (result.output_handle) |handle| {
+                try copyRecoveredManagedChild(
+                    alloc,
+                    source,
+                    target,
+                    .tool_output,
+                    handle,
+                    null,
+                    result.stored_output_bytes,
+                );
+            }
+            if (result.committed_file_presentation) |presentation| {
+                if (presentation.content_handle) |handle| {
+                    try copyRecoveredManagedChild(
+                        alloc,
+                        source,
+                        target,
+                        .diff_content,
+                        handle,
+                        result.tool_call_id,
+                        null,
+                    );
+                }
+            }
+            if (result.command_output_replay) |replay| {
+                contains_unverified_artifacts.* =
+                    (try copyRecoveredCommandReplay(
+                        alloc,
+                        source,
+                        target,
+                        replay,
+                    )) or contains_unverified_artifacts.*;
+            }
         }
     }
 }
@@ -3875,6 +4079,7 @@ fn rebaseRecoveredImageSnapshots(
 fn copyRecoveredManagedChildren(
     alloc: Allocator,
     history: []session.HistoryTurn,
+    recovery_checkpoint: ?*session_codec.RecoveryCheckpoint,
     source: *session_child_store.SessionChildCapability,
     target: *session_child_store.SessionChildCapability,
 ) !bool {
@@ -3885,39 +4090,13 @@ fn copyRecoveredManagedChildren(
             .assistant => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
         };
-        for (execution.tool_steps) |*step| {
-            for (step.tool_results) |*result| {
-                if (result.tool_image_handle) |handle| {
-                    try copyRecoveredManagedChild(
-                        alloc,
-                        source,
-                        target,
-                        .tool_results,
-                        handle,
-                        null,
-                    );
-                }
-                if (result.output_handle) |handle| {
-                    try copyRecoveredManagedChild(
-                        alloc,
-                        source,
-                        target,
-                        .tool_results,
-                        handle,
-                        result.stored_output_bytes,
-                    );
-                }
-                if (result.command_output_replay) |replay| {
-                    contains_unverified_artifacts =
-                        (try copyRecoveredCommandReplay(
-                            alloc,
-                            source,
-                            target,
-                            replay,
-                        )) or contains_unverified_artifacts;
-                }
-            }
-        }
+        try copyRecoveredExecutionManagedChildren(
+            alloc,
+            execution,
+            source,
+            target,
+            &contains_unverified_artifacts,
+        );
         if (turn.* == .interrupted) {
             const presentation = if (turn.interrupted.cancelled_command) |*value|
                 value
@@ -3933,21 +4112,31 @@ fn copyRecoveredManagedChildren(
                     )) or contains_unverified_artifacts;
             }
             if (presentation.command_artifact_handle) |handle| {
-                const authenticated = artifact_digest.hasContentDigest(
+                const authenticated = recoveredCommandArtifactIsAuthenticated(
+                    .command_log,
                     handle,
-                    ".log",
                 );
                 try copyRecoveredManagedChild(
                     alloc,
                     source,
                     target,
-                    .command_artifacts,
+                    .command_log,
                     handle,
+                    null,
                     null,
                 );
                 if (!authenticated) contains_unverified_artifacts = true;
             }
         }
+    }
+    if (recovery_checkpoint) |checkpoint| {
+        try copyRecoveredExecutionManagedChildren(
+            alloc,
+            &checkpoint.execution,
+            source,
+            target,
+            &contains_unverified_artifacts,
+        );
     }
     return contains_unverified_artifacts;
 }
@@ -3960,15 +4149,17 @@ fn copyRecoveredCommandReplay(
 ) !bool {
     switch (replay) {
         .available => |descriptor| {
-            const authenticated = command_replay_store.hasContentDigest(
+            const authenticated = recoveredCommandArtifactIsAuthenticated(
+                .command_replay,
                 descriptor.handle,
             );
             try copyRecoveredManagedChild(
                 alloc,
                 source,
                 target,
-                .command_artifacts,
+                .command_replay,
                 descriptor.handle,
+                null,
                 descriptor.framed_bytes,
             );
             var reader = command_replay_store.Reader.open(
@@ -3990,10 +4181,19 @@ fn copyRecoveredManagedChild(
     alloc: Allocator,
     source: *session_child_store.SessionChildCapability,
     target: *session_child_store.SessionChildCapability,
-    kind: session_child_store.ManagedChildKind,
+    contract: RecoveredArtifactContract,
     handle: []const u8,
+    expected_call_id: ?[]const u8,
     expected_bytes: ?usize,
 ) !void {
+    const kind = recoveredArtifactKind(contract);
+    if (contract == .diff_content) {
+        const call_id = expected_call_id orelse
+            return error.SessionRecoveryBoundaryInvalid;
+        if (!result_store.diffContentHandleMatchesCall(handle, call_id)) {
+            return error.SessionRecoveryBoundaryInvalid;
+        }
+    }
     var source_file = source.openFileReadOnly(
         alloc,
         kind,
@@ -4004,6 +4204,11 @@ fn copyRecoveredManagedChild(
     };
     defer source_file.deinit();
     const source_stat = try source_file.stat();
+    if (contract == .diff_content and
+        source_stat.size > result_store.diff_content_max_bytes)
+    {
+        return error.SessionRecoveryBoundaryInvalid;
+    }
     if (expected_bytes) |expected| {
         const expected_u64 = std.math.cast(u64, expected) orelse
             return error.SessionRecoveryBoundaryInvalid;
@@ -4035,10 +4240,18 @@ fn copyRecoveredManagedChild(
                 return error.SessionRecoveryBoundaryInvalid;
             }
             try validateRecoveredManagedChildDigest(
-                kind,
+                contract,
                 handle,
+                expected_call_id,
                 expected_bytes,
                 source_digest,
+            );
+            try validateRecoveredManagedChildContent(
+                alloc,
+                contract,
+                expected_call_id,
+                target,
+                handle,
             );
             return;
         },
@@ -4073,10 +4286,18 @@ fn copyRecoveredManagedChild(
     var source_digest: [32]u8 = undefined;
     source_hasher.final(&source_digest);
     try validateRecoveredManagedChildDigest(
-        kind,
+        contract,
         handle,
+        expected_call_id,
         expected_bytes,
         source_digest,
+    );
+    try validateRecoveredManagedChildContent(
+        alloc,
+        contract,
+        expected_call_id,
+        target,
+        handle,
     );
     var target_reader = try target.openFileReadOnly(alloc, kind, handle);
     defer target_reader.deinit();
@@ -4136,6 +4357,110 @@ fn recoveryArtifactReadError(err: anyerror) anyerror {
     };
 }
 
+fn validateRecoveredManagedChildContent(
+    alloc: Allocator,
+    contract: RecoveredArtifactContract,
+    expected_call_id: ?[]const u8,
+    target: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+) !void {
+    if (contract != .diff_content) return;
+    const call_id = expected_call_id orelse
+        return error.SessionRecoveryBoundaryInvalid;
+    var pack = result_store.loadDiffContentManaged(
+        alloc,
+        target,
+        call_id,
+        handle,
+    ) catch |err| switch (err) {
+        error.InvalidResultHandle,
+        error.ResultHandleNotFound,
+        error.ResultTooLarge,
+        error.DiffContentArtifactChanged,
+        error.InvalidDiffContentArtifact,
+        => return error.SessionRecoveryBoundaryInvalid,
+        else => return err,
+    };
+    pack.deinit(alloc);
+}
+
+test "recovery rejects digest-matching handles from the wrong artifact family" {
+    const alloc = std.testing.allocator;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("stored output", &digest, .{});
+    const content_hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    const foreign_handle = try std.fmt.allocPrint(
+        alloc,
+        "other-{s}.txt",
+        .{&content_hex},
+    );
+    defer alloc.free(foreign_handle);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        validateRecoveredManagedChildDigest(
+            .tool_output,
+            foreign_handle,
+            null,
+            null,
+            digest,
+        ),
+    );
+    const foreign_replay = try std.fmt.allocPrint(
+        alloc,
+        "other-{s}.bin",
+        .{&content_hex},
+    );
+    defer alloc.free(foreign_replay);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        validateRecoveredManagedChildDigest(
+            .command_replay,
+            foreign_replay,
+            null,
+            1,
+            digest,
+        ),
+    );
+    const foreign_log = try std.fmt.allocPrint(
+        alloc,
+        "other-{s}.log",
+        .{&content_hex},
+    );
+    defer alloc.free(foreign_log);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        validateRecoveredManagedChildDigest(
+            .command_log,
+            foreign_log,
+            null,
+            null,
+            digest,
+        ),
+    );
+    try validateRecoveredManagedChildDigest(
+        .command_replay,
+        "fx-command-replay-legacy.bin",
+        null,
+        1,
+        digest,
+    );
+    try validateRecoveredManagedChildDigest(
+        .command_log,
+        "fx-command-legacy.log",
+        null,
+        null,
+        digest,
+    );
+    try std.testing.expect(!recoveredCommandArtifactIsAuthenticated(
+        .command_replay,
+        "fx-command-replay-legacy.bin",
+    ));
+    try std.testing.expect(!recoveredCommandArtifactIsAuthenticated(
+        .command_log,
+        "fx-command-legacy.log",
+    ));
+}
+
 test "recovery artifact errors distinguish damaged bytes from operational failures" {
     for ([_]anyerror{ error.FileNotFound, error.InvalidReplayHeader, error.ReplaySizeMismatch, error.ReplayTooLarge, error.ReplayOffsetTooLarge, error.UnexpectedEndOfReplay, error.EndOfStream, error.TruncatedReplayFrame, error.InvalidReplayStream, error.EmptyReplayFrame, error.ReplayFrameTooLarge, error.Overflow }) |err| {
         try std.testing.expectEqual(error.SessionRecoveryBoundaryInvalid, recoveryArtifactReadError(err));
@@ -4146,38 +4471,64 @@ test "recovery artifact errors distinguish damaged bytes from operational failur
 }
 
 fn validateRecoveredManagedChildDigest(
-    kind: session_child_store.ManagedChildKind,
+    contract: RecoveredArtifactContract,
     handle: []const u8,
+    expected_call_id: ?[]const u8,
     expected_bytes: ?usize,
     digest: [32]u8,
 ) !void {
-    switch (kind) {
-        .tool_results => if (!result_store.handleMatchesContentDigest(
-            handle,
-            digest,
-        )) return error.SessionRecoveryBoundaryInvalid,
-        .command_artifacts => {
-            if (expected_bytes != null and
-                command_replay_store.hasContentDigest(handle) and
-                !command_replay_store.handleMatchesContentDigest(
-                    handle,
-                    digest,
-                ))
+    switch (contract) {
+        .tool_output => {
+            if (!result_store.isStoredTextHandle(handle) or
+                !result_store.handleMatchesContentDigest(handle, digest))
             {
                 return error.SessionRecoveryBoundaryInvalid;
             }
-            if (expected_bytes == null and
-                artifact_digest.hasContentDigest(handle, ".log") and
-                !artifact_digest.handleMatchesContentDigest(
+        },
+        .tool_images => {
+            if (!result_store.isImageHandle(handle) or
+                !result_store.handleMatchesContentDigest(handle, digest))
+            {
+                return error.SessionRecoveryBoundaryInvalid;
+            }
+        },
+        .diff_content => {
+            const call_id = expected_call_id orelse
+                return error.SessionRecoveryBoundaryInvalid;
+            if (!result_store.diffContentHandleMatchesCall(handle, call_id) or
+                !result_store.diffContentHandleMatchesContentDigest(
                     handle,
-                    ".log",
                     digest,
                 ))
             {
                 return error.SessionRecoveryBoundaryInvalid;
             }
         },
-        else => return error.SessionRecoveryBoundaryInvalid,
+        .command_replay => {
+            if (expected_bytes == null or
+                !command_replay_store.isReplayHandle(handle) or
+                (command_replay_store.hasContentDigest(handle) and
+                    !command_replay_store.handleMatchesContentDigest(
+                        handle,
+                        digest,
+                    )))
+            {
+                return error.SessionRecoveryBoundaryInvalid;
+            }
+        },
+        .command_log => {
+            if (expected_bytes != null or
+                !isCommandLogHandle(handle) or
+                (artifact_digest.hasContentDigest(handle, ".log") and
+                    !artifact_digest.handleMatchesContentDigest(
+                        handle,
+                        ".log",
+                        digest,
+                    )))
+            {
+                return error.SessionRecoveryBoundaryInvalid;
+            }
+        },
     }
 }
 
@@ -4719,6 +5070,188 @@ test "recovery no-op validates supporting state before advising normal resume" {
         try std.testing.expectError(expected_error, ctx.store.loadReadOnly(alloc, initial.id));
         try std.testing.expectError(expected_error, ctx.store.recoverSessionCopy(alloc, initial.id, .{}));
     }
+}
+
+test "recovery copy preserves spilled diff artifacts end to end" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var initial = try testDurableState(
+        alloc,
+        "recovery-spilled-diff",
+        ctx.workspace,
+    );
+    defer initial.deinit(alloc);
+
+    const previous = "RECOVERY_PREVIOUS_0123456789abcdef\n" ** 180;
+    const after = "RECOVERY_AFTER_0123456789abcdef\n" ** 180;
+    const output = "edited source.zig";
+    const output_handle = try testStoredResultHandle(
+        alloc,
+        "recovery-edit",
+        "edit_file",
+        output,
+    );
+    defer alloc.free(output_handle);
+    var calls = [_]core_types.ToolCall{.{
+        .id = "recovery-edit",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recovery-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast(output),
+        .output_handle = output_handle,
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+        .committed_file_presentation = .{
+            .path = "source.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = previous,
+            .after_content = after,
+        },
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("edit source.zig") },
+        .assistant = @constCast("edit finished"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    initial.history = try session.snapshotOwnedContextHistory(
+        alloc,
+        &history,
+        0,
+        0,
+    );
+
+    var source = try ctx.store.startWritableSession(alloc, initial);
+    var source_owned = true;
+    defer if (source_owned) source.deinit(alloc);
+    var output_artifact = try (try source.childCapability()).atomicReplace(
+        alloc,
+        .tool_results,
+        output_handle,
+        output,
+    );
+    output_artifact.deinit(alloc);
+    const source_handle = try alloc.dupe(
+        u8,
+        source.state.history[0].assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation.?.content_handle.?,
+    );
+    defer alloc.free(source_handle);
+    source.deinit(alloc);
+    source_owned = false;
+
+    const source_dir = try sessionDirPath(
+        alloc,
+        ctx.store.sessions_dir,
+        initial.id,
+    );
+    defer alloc.free(source_dir);
+    const source_events_path = try std.fs.path.join(
+        alloc,
+        &.{ source_dir, "events.jsonl" },
+    );
+    defer alloc.free(source_events_path);
+    {
+        var events = try std.Io.Dir.openFileAbsolute(
+            io_mod.getIo(),
+            source_events_path,
+            .{ .mode = .read_write },
+        );
+        defer events.close(io_mod.getIo());
+        const stat = try events.stat(io_mod.getIo());
+        try events.writePositionalAll(
+            io_mod.getIo(),
+            "invalid recovery tail\n",
+            stat.size,
+        );
+        try events.sync(io_mod.getIo());
+    }
+    const source_before = before: {
+        var file = try std.Io.Dir.openFileAbsolute(
+            io_mod.getIo(),
+            source_events_path,
+            .{},
+        );
+        defer file.close(io_mod.getIo());
+        break :before try io_mod.readFileToEnd(
+            alloc,
+            &file,
+            16 * 1024 * 1024,
+        );
+    };
+    defer alloc.free(source_before);
+
+    var recovery = try ctx.store.recoverSessionCopy(
+        alloc,
+        initial.id,
+        .{},
+    );
+    defer recovery.deinit(alloc);
+    try std.testing.expectEqual(store_types.SessionRecoveryStatus.recovered, recovery.status);
+    const source_after = after_recovery: {
+        var file = try std.Io.Dir.openFileAbsolute(
+            io_mod.getIo(),
+            source_events_path,
+            .{},
+        );
+        defer file.close(io_mod.getIo());
+        break :after_recovery try io_mod.readFileToEnd(
+            alloc,
+            &file,
+            16 * 1024 * 1024,
+        );
+    };
+    defer alloc.free(source_after);
+    try std.testing.expectEqualStrings(source_before, source_after);
+
+    var recovered = try ctx.store.loadReadOnly(
+        alloc,
+        recovery.recovered_session_id,
+    );
+    defer recovered.deinit(alloc);
+    const recovered_result = recovered.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    const recovered_handle = recovered_result.committed_file_presentation.?.content_handle.?;
+    try std.testing.expectEqualStrings(source_handle, recovered_handle);
+    const recovered_dir = try sessionDirPath(
+        alloc,
+        ctx.store.sessions_dir,
+        recovery.recovered_session_id,
+    );
+    defer alloc.free(recovered_dir);
+    const recovered_result_dir = try std.fs.path.join(
+        alloc,
+        &.{ recovered_dir, "tool-results" },
+    );
+    defer alloc.free(recovered_result_dir);
+    var recovered_children = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        recovered_result_dir,
+        .tool_results,
+        .read_only,
+    );
+    defer recovered_children.deinit();
+    var pack = try result_store.loadDiffContentManaged(
+        alloc,
+        &recovered_children,
+        recovered_result.tool_call_id,
+        recovered_handle,
+    );
+    defer pack.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, pack.previous_content.?);
+    try std.testing.expectEqualStrings(after, pack.after_content.?);
 }
 
 fn makeRawSessionsEntry(store: Store, name: []const u8) !void {
@@ -6744,6 +7277,43 @@ test "doctor ignores legacy task records" {
     try std.testing.expect(!found);
 }
 
+fn testStoredResultHandle(
+    alloc: Allocator,
+    call_id: []const u8,
+    tool_name: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    var call_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(call_id, &call_digest, .{});
+    const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
+    var content_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &content_digest, .{});
+    const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "result-{s}-{s}-{s}.txt",
+        .{ tool_name, &call_hex, &content_hex },
+    );
+}
+
+fn testDiffContentHandle(
+    alloc: Allocator,
+    call_id: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    var call_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(call_id, &call_digest, .{});
+    const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
+    var content_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &content_digest, .{});
+    const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "diff-{s}-{s}.json",
+        .{ &call_hex, &content_hex },
+    );
+}
+
 test "recovery command replay allocation failures propagate without changing source" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6775,6 +7345,36 @@ test "recovery command replay allocation failures propagate without changing sou
         }
     }.check, .{ &source, &target, replay });
     try std.testing.expectEqual(before, try managedFileDigest(&source_file, replay.available.framed_bytes));
+
+    const legacy_handle = "fx-command-replay-legacy.bin";
+    const replay_bytes = try alloc.alloc(u8, replay.available.framed_bytes);
+    defer alloc.free(replay_bytes);
+    try std.testing.expectEqual(
+        replay_bytes.len,
+        try source_file.readRangeInto(0, replay_bytes),
+    );
+    {
+        var legacy_file = try source.createExclusiveFile(
+            alloc,
+            .command_artifacts,
+            legacy_handle,
+        );
+        defer legacy_file.deinit();
+        try legacy_file.writeAll(replay_bytes);
+        try legacy_file.sync();
+    }
+    defer source.delete(.command_artifacts, legacy_handle) catch {};
+    const legacy_replay: core_types.CommandOutputReplay = .{ .available = .{
+        .handle = @constCast(legacy_handle),
+        .framed_bytes = replay_bytes.len,
+    } };
+    try std.testing.expect(try copyRecoveredCommandReplay(
+        alloc,
+        &source,
+        &target,
+        legacy_replay,
+    ));
+    defer target.delete(.command_artifacts, legacy_handle) catch {};
 }
 
 test "recovery authenticates content-addressed command artifacts" {
@@ -6791,11 +7391,16 @@ test "recovery authenticates content-addressed command artifacts" {
     defer alloc.free(handle);
 
     try validateRecoveredManagedChildDigest(
-        .command_artifacts,
+        .command_log,
         handle,
+        null,
         null,
         digest,
     );
+    try std.testing.expect(recoveredCommandArtifactIsAuthenticated(
+        .command_log,
+        handle,
+    ));
     std.crypto.hash.sha2.Sha256.hash(
         "interrupted command artifacX",
         &digest,
@@ -6804,10 +7409,351 @@ test "recovery authenticates content-addressed command artifacts" {
     try std.testing.expectError(
         error.SessionRecoveryBoundaryInvalid,
         validateRecoveredManagedChildDigest(
-            .command_artifacts,
+            .command_log,
             handle,
             null,
+            null,
             digest,
+        ),
+    );
+}
+
+test "recovery rejects unloadable diff artifacts before promotion" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source");
+    defer alloc.free(source_path);
+    const target_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target");
+    defer alloc.free(target_path);
+    var source = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        source_path,
+        .tool_results,
+        .writable,
+    );
+    defer source.deinit();
+    var target = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        target_path,
+        .tool_results,
+        .writable,
+    );
+    defer target.deinit();
+
+    const call_id = "malformed-edit";
+    const malformed = "[]";
+    const malformed_handle = try testDiffContentHandle(
+        alloc,
+        call_id,
+        malformed,
+    );
+    defer alloc.free(malformed_handle);
+    var malformed_file = try source.atomicReplace(
+        alloc,
+        .tool_results,
+        malformed_handle,
+        malformed,
+    );
+    malformed_file.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        copyRecoveredManagedChild(
+            alloc,
+            &source,
+            &target,
+            .diff_content,
+            malformed_handle,
+            call_id,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        target.openFileReadOnly(alloc, .tool_results, malformed_handle),
+    );
+
+    const oversized = try alloc.alloc(
+        u8,
+        result_store.diff_content_max_bytes + 1,
+    );
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    const oversized_handle = try testDiffContentHandle(
+        alloc,
+        call_id,
+        oversized,
+    );
+    defer alloc.free(oversized_handle);
+    var oversized_file = try source.atomicReplace(
+        alloc,
+        .tool_results,
+        oversized_handle,
+        oversized,
+    );
+    oversized_file.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        copyRecoveredManagedChild(
+            alloc,
+            &source,
+            &target,
+            .diff_content,
+            oversized_handle,
+            call_id,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        target.openFileReadOnly(alloc, .tool_results, oversized_handle),
+    );
+}
+
+test "recovery canonicalizes inline diff snapshots to the persisted handle" {
+    const alloc = std.testing.allocator;
+    const content = "recovered-inline-snapshot\n" ** 180;
+    var inline_results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recover-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = content,
+            .after_content = content,
+        },
+    }};
+    var inline_steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &inline_results }};
+    var recovered = try core_types.dupeExecutionMemory(alloc, .{ .tool_steps = &inline_steps });
+    defer core_types.freeExecutionMemory(alloc, recovered);
+
+    var target_results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recover-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+        },
+    }};
+    var target_steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &target_results }};
+    try canonicalizeRecoveredExecutionFilePresentations(
+        alloc,
+        &recovered,
+        .{ .tool_steps = &target_steps },
+    );
+    const presentation = recovered.tool_steps[0].tool_results[0].committed_file_presentation.?;
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        presentation.content_handle.?,
+    );
+
+    var mismatched_presentation = target_results[0].committed_file_presentation.?;
+    mismatched_presentation.path = "src/other.zig";
+    var mismatched_results = [_]core_types.PersistedToolResult{target_results[0]};
+    mismatched_results[0].committed_file_presentation = mismatched_presentation;
+    var mismatched_steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &mismatched_results }};
+    var mismatched_recovered = try core_types.dupeExecutionMemory(
+        alloc,
+        .{ .tool_steps = &inline_steps },
+    );
+    defer session.freeExecutionMemory(alloc, mismatched_recovered);
+    try std.testing.expectError(
+        error.SessionRecoveryIndeterminate,
+        canonicalizeRecoveredExecutionFilePresentations(
+            alloc,
+            &mismatched_recovered,
+            .{ .tool_steps = &mismatched_steps },
+        ),
+    );
+
+    const inline_checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &inline_steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    const target_checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &target_steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    var recovered_state = try testDurableState(alloc, "recovered", "/tmp");
+    defer recovered_state.deinit(alloc);
+    recovered_state.recovery_checkpoint = try inline_checkpoint.dupe(alloc);
+    var target_state = try testDurableState(alloc, "target", "/tmp");
+    defer target_state.deinit(alloc);
+    target_state.recovery_checkpoint = try target_checkpoint.dupe(alloc);
+    try canonicalizeRecoveredCheckpointFilePresentations(
+        alloc,
+        &recovered_state,
+        target_state,
+    );
+    const checkpoint_presentation = recovered_state.recovery_checkpoint.?.execution.tool_steps[0].tool_results[0].committed_file_presentation.?;
+    try std.testing.expect(checkpoint_presentation.previous_content == null);
+    try std.testing.expect(checkpoint_presentation.after_content == null);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        checkpoint_presentation.content_handle.?,
+    );
+}
+
+test "recovery copies diff content artifacts and rejects changed content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source");
+    defer alloc.free(source_path);
+    const target_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target");
+    defer alloc.free(target_path);
+    var source = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, source_path, .tool_results, .writable);
+    defer source.deinit();
+    var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .tool_results, .writable);
+    defer target.deinit();
+    const previous = "before\n" ** 800;
+    const after = "after\n" ** 800;
+    const handle = try result_store.storeDiffContent(
+        alloc,
+        source_path,
+        "recovered-edit",
+        previous,
+        after,
+    );
+    defer alloc.free(handle);
+    var source_artifact = try source.openFileReadOnly(alloc, .tool_results, handle);
+    defer source_artifact.deinit();
+    const source_artifact_stat = try source_artifact.stat();
+    const source_digest = try managedFileDigest(&source_artifact, source_artifact_stat.size);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        validateRecoveredManagedChildDigest(
+            .tool_output,
+            handle,
+            null,
+            null,
+            source_digest,
+        ),
+    );
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recovered-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited source.zig"),
+        .output_bytes = 17,
+        .stored_output_bytes = 17,
+        .committed_file_presentation = .{
+            .path = "source.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .content_handle = handle,
+        },
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &results }};
+    var history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Edit source.zig.") },
+        .assistant = @constCast("Edited."),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+
+    results[0].tool_call_id = @constCast("other-edit");
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        copyRecoveredManagedChildren(alloc, &history, null, &source, &target),
+    );
+    results[0].tool_call_id = @constCast("recovered-edit");
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, null, &source, &target));
+    var copied = try result_store.loadDiffContentManaged(
+        alloc,
+        &target,
+        "recovered-edit",
+        handle,
+    );
+    defer copied.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, copied.previous_content.?);
+    try std.testing.expectEqualStrings(after, copied.after_content.?);
+    try target.delete(.tool_results, handle);
+
+    var checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("Edit source.zig.") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    var no_history = [_]session.HistoryTurn{};
+    try std.testing.expect(!try copyRecoveredManagedChildren(
+        alloc,
+        &no_history,
+        &checkpoint,
+        &source,
+        &target,
+    ));
+    var checkpoint_copied = try result_store.loadDiffContentManaged(
+        alloc,
+        &target,
+        "recovered-edit",
+        handle,
+    );
+    defer checkpoint_copied.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, checkpoint_copied.previous_content.?);
+    try std.testing.expectEqualStrings(after, checkpoint_copied.after_content.?);
+    try target.delete(.tool_results, handle);
+    var changed = try source.atomicReplace(alloc, .tool_results, handle, "{}");
+    changed.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        copyRecoveredManagedChildren(
+            alloc,
+            &no_history,
+            &checkpoint,
+            &source,
+            &target,
         ),
     );
 }
@@ -6847,16 +7793,16 @@ test "recovery copies tool image artifacts and rejects changed content" {
         .assistant = @constCast("Captured."),
         .execution = .{ .tool_steps = &steps },
     } }};
-    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, null, &source, &target));
     const copied = try result_store.loadToolImages(alloc, &target, handle);
     defer core_types.freeToolImages(alloc, copied);
     try std.testing.expectEqual(@as(usize, 1), copied.len);
     try std.testing.expectEqualStrings(png, copied[0].data);
-    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, null, &source, &target));
     try target.delete(.tool_results, handle);
     var changed = try source.atomicReplace(alloc, .tool_results, handle, "[]");
     changed.deinit(alloc);
-    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, copyRecoveredManagedChildren(alloc, &history, null, &source, &target));
 }
 
 test "session store schema v3 facade accepts dotted session IDs" {
@@ -8779,6 +9725,66 @@ test "history page allocation failure sweep frees replay and page ownership" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "recovery copies and rebases checkpoint-only image snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source-images");
+    try tmp.dir.createDirPath(std.testing.io, "staged-images");
+    try tmp.dir.createDirPath(std.testing.io, "target-images");
+    const source_images = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source-images");
+    defer alloc.free(source_images);
+    const staged_images = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "staged-images");
+    defer alloc.free(staged_images);
+    const target_images = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target-images");
+    defer alloc.free(target_images);
+    const image = try image_attachments.captureInlineImageBytes(
+        alloc,
+        7,
+        "image/png",
+        "\x89PNG\r\n\x1a\ncheckpoint",
+        source_images,
+    );
+    var images = [_]session.ImageAttachment{image};
+    defer core_types.freeImageAttachment(alloc, images[0]);
+    var checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("recover"), .images = &images },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    var no_history = [_]session.HistoryTurn{};
+    try copyRecoveredImageSnapshots(
+        alloc,
+        &no_history,
+        &checkpoint,
+        staged_images,
+    );
+    try std.testing.expectEqualStrings(
+        staged_images,
+        std.fs.path.dirname(images[0].snapshot_path.?).?,
+    );
+    var verified = try image_attachments.loadVerifiedSnapshot(alloc, images[0], .{});
+    verified.deinit(alloc);
+    try rebaseRecoveredImageSnapshots(
+        alloc,
+        &no_history,
+        &checkpoint,
+        staged_images,
+        target_images,
+    );
+    try std.testing.expectEqualStrings(
+        target_images,
+        std.fs.path.dirname(images[0].snapshot_path.?).?,
+    );
 }
 
 test "recovery checkpoint images resolve on read-only and writable resume" {

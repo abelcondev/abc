@@ -1011,7 +1011,25 @@ pub const CommittedFilePresentation = struct {
     previous_content: ?[]const u8 = null,
     after_content: ?[]const u8 = null,
     lifecycle_id: ?ToolLifecycleId = null,
+    /// Content-addressed artifact handle holding the previous/after content
+    /// pack in the session result store. When present, the durable record
+    /// omits the inline contents and readers load them through the handle.
+    /// In-memory live-turn presentations keep contents inline and leave this
+    /// null; only the persistence projection sets it.
+    content_handle: ?[]const u8 = null,
 };
+
+/// Rejects competing or wrongly typed durable content authorities. A
+/// preview-only presentation may have neither inline snapshots nor a handle.
+pub fn committedFilePresentationContentSourceValid(
+    presentation: CommittedFilePresentation,
+) bool {
+    const handle = presentation.content_handle orelse return true;
+    return presentation.previous_content == null and
+        presentation.after_content == null and
+        std.mem.startsWith(u8, handle, "diff-") and
+        std.mem.endsWith(u8, handle, ".json");
+}
 
 pub const PersistedToolResult = struct {
     tool_images: []ToolImage = &.{},
@@ -2862,6 +2880,11 @@ pub fn dupeCommittedFilePresentation(
         .call_id = try alloc.dupe(u8, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const content_handle = if (presentation.content_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (content_handle) |handle| alloc.free(handle);
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -2872,6 +2895,7 @@ pub fn dupeCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
 }
 
@@ -2885,6 +2909,7 @@ pub fn freeCommittedFilePresentation(
     if (presentation.previous_content) |content| alloc.free(@constCast(content));
     if (presentation.after_content) |content| alloc.free(@constCast(content));
     if (presentation.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    if (presentation.content_handle) |handle| alloc.free(@constCast(handle));
 }
 
 fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) !PersistedToolResult {

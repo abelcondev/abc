@@ -180,6 +180,11 @@ fn dupeCommittedFilePresentation(
         .call_id = try durableIdentifier(alloc, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const content_handle = if (presentation.content_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (content_handle) |handle| alloc.free(handle);
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -190,6 +195,7 @@ fn dupeCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
 }
 

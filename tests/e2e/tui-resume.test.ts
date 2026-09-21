@@ -6016,6 +6016,245 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "spilled diff snapshots stay out of events.jsonl and reload on resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-diff-spill-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+
+    // 400 lines x ~32 chars is about 12.8 KB, past the 4 KB inline budget.
+    const spilledLines = Array.from(
+      { length: 400 },
+      (_, index) => `SPILLED_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
+    );
+    const completion = "SPILLED_DIFF_COMPLETE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("write-spilled-diff", "write_file", {
+        path: "spilled-diff.md",
+        content: `${spilledLines.join("\n")}\n`,
+      }),
+      fakeGatewayFinalText(completion),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: { ...gatewayEnv(home, gateway), FX_RECORD: join(root, "initial.fxtape") },
+        stderrPath,
+        width: 120,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Create the spilled diff fixture file.");
+      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.sendKeys("1");
+      await active.sendKeys("Enter");
+      const live = await waitForScrollback(active, completion);
+      expect(live).toContain("Wrote spilled-diff.md +400");
+      expect(readFileSync(join(workspace, "spilled-diff.md"), "utf8")).toBe(
+        `${spilledLines.join("\n")}\n`,
+      );
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // The log frame carries only the artifact reference; the snapshots live
+      // in the session result store.
+      const sessionId = sessionIdFromHome(home);
+      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
+      const toolResultFrame = eventsJsonl
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line))
+        .find((frame) => frame.event?.tool_result);
+      const presentation = toolResultFrame?.event?.tool_result?.committed_file_presentation;
+      expect(presentation).toBeDefined();
+      expect(presentation.previous_content).toBeNull();
+      expect(presentation.after_content).toBeNull();
+      expect(presentation.content_handle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
+      // The elided middle of the file is nowhere in the result frame; only
+      // the bounded preview lines stay inline. (The write arguments in the
+      // tool_call frame legitimately carry the full content.)
+      expect(JSON.stringify(toolResultFrame)).not.toContain("SPILLED_DIFF_LINE_200_");
+      const storedArtifact = readFileSync(
+        join(sessionDir, "tool-results", presentation.content_handle),
+        "utf8",
+      );
+      expect(storedArtifact).toContain("SPILLED_DIFF_LINE_200_");
+      expect(storedArtifact).toContain("SPILLED_DIFF_LINE_400");
+
+      // Resume renders the compact row from the inline preview lines and the
+      // full diff reloads the spilled snapshots through the handle.
+      const resumedGateway = startFakeGateway([]);
+      try {
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: join(root, "resumed.fxtape") },
+          stderrPath,
+          width: 120,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        const resumed = await waitForScrollback(active, completion);
+        expect(resumed).toContain("Wrote spilled-diff.md +400");
+        expect(resumed).not.toContain("SPILLED_DIFF_LINE_001_");
+
+        await active.sendKeys("C-o");
+        await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+        await active.waitForText("SPILLED_DIFF_LINE_400", TIMEOUT);
+        const full = await active.capturePane();
+        expect(full).toContain("SPILLED_DIFF_LINE_400");
+        await active.sendKeys("C-o");
+        await active.waitForComposer(TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+      } finally {
+        if (active) {
+          try {
+            await active.sendText("/quit");
+          } catch {}
+          await active.kill();
+        }
+        resumedGateway.stop();
+      }
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  90_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "missing diff artifact degrades to the inline preview on resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-diff-missing-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+
+    const spilledLines = Array.from(
+      { length: 400 },
+      (_, index) => `MISSING_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
+    );
+    const completion = "MISSING_DIFF_COMPLETE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("write-missing-diff", "write_file", {
+        path: "missing-diff.md",
+        content: `${spilledLines.join("\n")}\n`,
+      }),
+      fakeGatewayFinalText(completion),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: { ...gatewayEnv(home, gateway), FX_RECORD: join(root, "initial.fxtape") },
+        stderrPath,
+        width: 120,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Create the missing diff fixture file.");
+      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.sendKeys("1");
+      await active.sendKeys("Enter");
+      const live = await waitForScrollback(active, completion);
+      expect(live).toContain("Wrote missing-diff.md +400");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // Delete the spilled artifact; resume must degrade to the inline
+      // preview instead of failing.
+      const sessionId = sessionIdFromHome(home);
+      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
+      const toolResultFrame = eventsJsonl
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line))
+        .find((frame) => frame.event?.tool_result);
+      const handle =
+        toolResultFrame?.event?.tool_result?.committed_file_presentation?.content_handle;
+      expect(handle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
+      rmSync(join(sessionDir, "tool-results", handle));
+
+      const resumedGateway = startFakeGateway([]);
+      try {
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: join(root, "resumed.fxtape") },
+          stderrPath,
+          width: 120,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        const resumed = await waitForScrollback(active, completion);
+        expect(resumed).toContain("Wrote missing-diff.md +400");
+
+        // Full detail renders the inline preview lines; the spilled middle
+        // content is unavailable and nothing crashes.
+        await active.sendKeys("C-o");
+        await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+        await active.waitForText("MISSING_DIFF_LINE_001_", TIMEOUT);
+        const full = await active.capturePane();
+        expect(full).toContain("MISSING_DIFF_LINE_001_");
+        expect(full).not.toContain("MISSING_DIFF_LINE_200_");
+        await active.sendKeys("C-o");
+        await active.waitForComposer(TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+      } finally {
+        if (active) {
+          try {
+            await active.sendText("/quit");
+          } catch {}
+          await active.kill();
+        }
+        resumedGateway.stop();
+      }
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  90_000,
+);
+
+test.skipIf(!tmuxAvailable())(
   "command output folding survives flag and picker resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-command-output-")));
