@@ -20,6 +20,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -42,12 +43,18 @@ const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const libfx_steering = @import("libfx_steering.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const legacy_url_completion_timeout_ms: i64 = 10 * 60 * 1000;
+const libfx_provider_tools = [_]tool_dispatch.Tool{
+    host_tool_runtime.providerProjection(builtin_tools.web_search),
+};
+const libfx_provider_tool_registry = tool_dispatch.Registry{ .tools = &libfx_provider_tools };
 
 const AcpMethod = enum {
     request_cancel,
@@ -65,6 +72,7 @@ const AcpMethod = enum {
     libfx_checkpoint,
     libfx_restore,
     libfx_new,
+    libfx_steer,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -83,6 +91,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
+        if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         return .unknown;
     }
 
@@ -97,6 +106,7 @@ const AcpMethod = enum {
             .session_resume,
             .session_close,
             .libfx_new,
+            .libfx_steer,
             => false,
             .session_list,
             .session_remove,
@@ -111,7 +121,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
             else => false,
         };
     }
@@ -208,6 +218,7 @@ pub const ActiveSessionState = struct {
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
+    steering: libfx_steering.Runtime = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -632,6 +643,7 @@ fn destroyActiveSession(state: *ServerState) void {
     }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
+    active.steering.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -1287,6 +1299,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
             .libfx_restore => handleKernelRestore(state, alloc, msg),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+            .libfx_steer => handleKernelSteer(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1306,6 +1319,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+        .libfx_steer => handleKernelSteer(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1378,6 +1392,15 @@ fn activeLibfxSession(
     const active = if (state.active_session) |*session| session else return null;
     if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
     return active;
+}
+
+pub fn takeLibfxSteering(
+    state: *ServerState,
+    result_alloc: Allocator,
+    close_if_empty: bool,
+) Allocator.Error![][]u8 {
+    const active = if (state.active_session) |*session| session else return &.{};
+    return active.steering.takeAll(state.alloc, result_alloc, close_if_empty);
 }
 
 fn handleKernelCheckpoint(
@@ -1462,6 +1485,56 @@ fn handleKernelRestore(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+fn handleKernelSteer(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx steer params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const text = parsed.value.object.get("text") orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing steering text",
+        });
+    if (text != .string) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid steering text",
+    });
+    active.steering.enqueue(state.alloc, text.string) catch |err| {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = switch (err) {
+                error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
+                else => ErrorCode.invalid_params,
+            },
+            .message = switch (err) {
+                error.EmptySteeringMessage => "Steering text cannot be empty",
+                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
+                error.SteeringQueueFull => "Steering queue is full",
+                error.SteeringNotActive => "No prompt is running",
+                error.OutOfMemory => "Failed to queue steering text",
+            },
+        });
+    };
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    try update.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &update.writer);
+    try update.writer.writeAll(",\"update\":");
+    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
+    try update.writer.writeByte('}');
+    try state.writer.writeNotification(alloc, "session/update", update.written());
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
@@ -1477,6 +1550,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
     session.cancel_flag.store(false, .seq_cst);
+    if (state.cfg.minimal_kernel) session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
@@ -1575,6 +1649,9 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             .message = @errorName(err),
         },
     };
+    if (active.state.active_session) |*session| {
+        if (active.state.cfg.minimal_kernel) session.steering.close(active.state.alloc, "turn_finished");
+    }
     active.reapable.store(true, .seq_cst);
     publishPromptOutcome(active, outcome) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
@@ -1683,9 +1760,10 @@ fn parseInitializeRequest(
     if (allow_libfx) {
         if (capabilities.object.get("libfx")) |libfx| {
             if (libfx != .object) return error.InvalidInitializeParams;
-            request.host_tools = try host_tool_runtime.Runtime.init(
+            request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
                 alloc,
                 libfx.object.get("tools"),
+                libfx_provider_tool_registry,
             );
             errdefer request.host_tools.deinit();
             if (libfx.object.get("instructions")) |instructions| {
@@ -1711,6 +1789,21 @@ test "ACP initialize owns libfx tools and instructions" {
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
     try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+}
+
+test "ACP initialize accepts registered provider-executed libfx tools" {
+    const alloc = std.testing.allocator;
+    var request = try parseInitializeRequest(
+        alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"web_search","providerExecuted":true}]}}}
+    ,
+        true,
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), request.host_tools.dynamic_tools.len);
+    try std.testing.expect(request.host_tools.tools[0].provider_executed);
+    try std.testing.expect(request.host_tools.tools[0].write_provider_advertisement_fn != null);
 }
 
 test "ordinary ACP ignores private libfx capabilities" {
@@ -1945,6 +2038,19 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         );
     }
 
+    if (state.cfg.effort_override) |raw| {
+        const effort = types.ReasoningEffort.parse(raw) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        if (!try applyEffortOverride(state, alloc, msg, effort)) return;
+    }
+
+    if (state.cfg.fast_override) |fast| {
+        if (!try applyFastOverride(state, alloc, msg, fast)) return;
+    }
+
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
@@ -1967,10 +2073,207 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// Applies a host-supplied reasoning effort override to sessions created after
+/// initialize. A non-default effort must be one of the selected model's
+/// advertised efforts whenever the catalog resolves; a catalog outage leaves
+/// the override in place, matching turn-time capability fallback. Returns
+/// false after writing the rejection response.
+fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, effort: types.ReasoningEffort) !bool {
+    state.effort = effort;
+    if (effort.isDefault()) return true;
+
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const fallback = bundle.fallbackModelCapabilities(state.selected_model);
+    var capabilities: model_capabilities.Capabilities = undefined;
+    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+        // libfx cores skip the startup catalog resolve; explicit effort and
+        // fast overrides are the creation-time consumers that need it.
+        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        }, state.selected_model, fallback);
+    } else {
+        capabilities = state.capability_resolver.available(state.selected_model, fallback);
+    }
+    // A failed catalog lookup cannot name the supported set; the turn-time
+    // capability check remains the backstop.
+    if (state.capability_resolver.state == .failed) return true;
+
+    const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to validate reasoning effort",
+        });
+        return false;
+    };
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+        });
+        return false;
+    }
+    return true;
+}
+
+/// Pure decision for a host-supplied effort override: returns an owned
+/// rejection message naming the model's advertised efforts, or null when the
+/// effort is usable. Caller frees the returned slice.
+fn effortOverrideRejection(
+    alloc: Allocator,
+    capabilities: model_capabilities.Capabilities,
+    effort: types.ReasoningEffort,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (model_capabilities.reasoningEffortSupported(capabilities, effort)) return null;
+    if (capabilities.reasoning_efforts.len == 0) {
+        return try alloc.dupe(u8, "Reasoning effort is unavailable for the active model");
+    }
+    var set: std.ArrayList(u8) = .empty;
+    defer set.deinit(alloc);
+    for (capabilities.reasoning_efforts.slice(), 0..) |option, index| {
+        if (index > 0) try set.appendSlice(alloc, ", ");
+        try set.appendSlice(alloc, option.label());
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
+        .{ effort.label(), model, set.items },
+    );
+}
+
+test "effortOverrideRejection accepts default and advertised efforts" {
+    const alloc = std.testing.allocator;
+    const capabilities = model_capabilities.Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .auto, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .literal("high"), "provider/model"));
+}
+
+test "effortOverrideRejection names the advertised set" {
+    const alloc = std.testing.allocator;
+    const capabilities = model_capabilities.Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    const rejection = (try effortOverrideRejection(alloc, capabilities, .literal("max"), "provider/model")).?;
+    defer alloc.free(rejection);
+    try std.testing.expect(std.mem.find(u8, rejection, "\"max\"") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "provider/model") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "low, high") != null);
+}
+
+test "effortOverrideRejection reports models without advertised efforts" {
+    const alloc = std.testing.allocator;
+    const rejection = (try effortOverrideRejection(alloc, .{}, .literal("high"), "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Reasoning effort is unavailable for the active model", rejection);
+}
+
+/// Applies a host-supplied fast-lane override to sessions created after
+/// initialize. Enabling fast mode requires the selected model to offer a fast
+/// path whenever the catalog resolves; a catalog outage leaves the override in
+/// place, matching turn-time capability fallback. Disabling is always
+/// accepted. Returns false after writing the rejection response.
+fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, fast: bool) !bool {
+    state.fast_mode = fast;
+    if (!fast) return true;
+
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const fallback = bundle.fallbackModelCapabilities(state.selected_model);
+    var capabilities: model_capabilities.Capabilities = undefined;
+    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+        // Shares the effort override's one-shot catalog resolve: creation is
+        // the only point that can reject before any turn runs.
+        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        }, state.selected_model, fallback);
+    } else {
+        capabilities = state.capability_resolver.available(state.selected_model, fallback);
+    }
+    // A failed catalog lookup cannot confirm a fast path; the turn-time
+    // capability gate remains the backstop.
+    if (state.capability_resolver.state == .failed) return true;
+
+    const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to validate fast mode",
+        });
+        return false;
+    };
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+        });
+        return false;
+    }
+    return true;
+}
+
+/// Pure decision for a host-supplied fast override: returns an owned rejection
+/// message naming the model, or null when the model offers a fast path. An
+/// intrinsically fast model already satisfies the request. Caller frees the
+/// returned slice.
+fn fastOverrideRejection(
+    alloc: Allocator,
+    capabilities: model_capabilities.Capabilities,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
+    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+}
+
+test "fastOverrideRejection accepts models with a fast path" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .supports_fast_mode = true }, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .intrinsic_fast = true }, "provider/model-fast"));
+}
+
+test "fastOverrideRejection names models without a fast path" {
+    const alloc = std.testing.allocator;
+    const rejection = (try fastOverrideRejection(alloc, .{}, "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
+}
+
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
+        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -2548,10 +2851,12 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
     try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
+    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
@@ -2566,6 +2871,7 @@ test "ACP prompt gate policy keeps lifecycle interruption responsive" {
     try std.testing.expect(AcpMethod.session_prompt.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.session_set_config_option.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_set_mode.waitsForActivePrompt());
+    try std.testing.expect(!AcpMethod.libfx_steer.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.unknown.waitsForActivePrompt());
 }
 

@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const collections = @import("../shared/collections.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
@@ -891,7 +892,7 @@ pub const McpRuntime = struct {
                 server.config.source != .workspace or
                 server.config.workspace_admission != .pending) continue;
             const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
-            errdefer alloc.free(owned_name);
+            errdefer mem_utils.free(alloc, owned_name);
             try names.append(alloc, owned_name);
         }
         return names.toOwnedSlice(alloc);
@@ -1193,11 +1194,11 @@ pub const McpRuntime = struct {
         }
         for (snapshot.servers, 0..) |observed, index| {
             const name = try alloc.dupe(u8, observed.identity());
-            errdefer alloc.free(name);
+            errdefer mem_utils.free(alloc, name);
             const server = self.acquireServer(observed.identity());
             defer if (server) |value| value.lifetime.release(io_mod.getIo());
             const command = try alloc.dupe(u8, if (server) |value| value.config.command orelse "" else "");
-            errdefer alloc.free(command);
+            errdefer mem_utils.free(alloc, command);
             items[index] = .{
                 .name = name,
                 .command = command,
@@ -1775,9 +1776,9 @@ pub const McpRuntime = struct {
         features_visible: bool,
     ) !access_policy.View {
         const owned_owner = try alloc.dupe(u8, owner_id);
-        errdefer alloc.free(owned_owner);
+        errdefer mem_utils.free(alloc, owned_owner);
         const owned_parent = try alloc.dupe(u8, parent_id);
-        errdefer alloc.free(owned_parent);
+        errdefer mem_utils.free(alloc, owned_parent);
         var servers: std.ArrayList(access_policy.ServerIdentity) = .empty;
         errdefer {
             for (servers.items) |*server| server.deinit(alloc);
@@ -2369,7 +2370,7 @@ pub const McpRuntime = struct {
             ),
             else => return err,
         };
-        errdefer alloc.free(model_output);
+        errdefer mem_utils.free(alloc, model_output);
         if (model_output.len > options.output_limit_bytes) {
             return error.McpFeatureOutputLimitExceeded;
         }

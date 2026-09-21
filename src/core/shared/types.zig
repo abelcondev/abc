@@ -1417,6 +1417,11 @@ pub const ImageAttachment = struct {
     media_type: []u8,
     snapshot_path: ?[]u8 = null,
     snapshot_sha256: ?[]u8 = null,
+    /// Owned decoded image bytes for sessions without a filesystem snapshot
+    /// backend (libfx kernel sessions on native and wasm). When set, the
+    /// attachment loads from memory instead of `snapshot_path`, and durable
+    /// serializers embed the bytes so checkpoint/restore round-trips them.
+    inline_data: ?[]u8 = null,
 };
 
 pub const UserTurn = struct {
@@ -3243,12 +3248,19 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
             try alloc.dupe(u8, value)
         else
             null;
+        errdefer if (snapshot_sha256) |value| alloc.free(value);
+
+        const inline_data = if (attachment.inline_data) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
         copy[i] = .{
             .id = attachment.id,
             .path = path,
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .inline_data = inline_data,
         };
         copied += 1;
     }
@@ -3261,6 +3273,7 @@ pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
     alloc.free(attachment.media_type);
     if (attachment.snapshot_path) |path| alloc.free(path);
     if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
+    if (attachment.inline_data) |data| alloc.free(data);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {

@@ -1026,9 +1026,9 @@ pub const FakeAgentRuntimeDeps = struct {
             const index = @min(self.runtime_context_index, self.runtime_context_texts.len - 1);
             const text = self.runtime_context_texts[index];
             self.runtime_context_index += 1;
-            try messages.append(arena, .{ .role = .user, .content = try arena.dupe(u8, text) });
+            try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         } else if (self.runtime_context_text) |text| {
-            try messages.append(arena, .{ .role = .user, .content = try arena.dupe(u8, text) });
+            try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }
 

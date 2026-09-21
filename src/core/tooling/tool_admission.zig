@@ -312,11 +312,19 @@ fn hashIdentityField(value: []const u8) types.ContentHash {
 pub const FileMutationPreparation = union(enum) {
     prepared: PreparedFileMutationCall,
     tool_failure: []const u8,
+    /// The name matches the file-mutation contract but the registered tool is
+    /// a host-supplied executor (e.g. an embedder's own `write_file`), so the
+    /// builtin mutation contract does not apply and the caller must fall back
+    /// to ordinary dispatch.
+    not_file_mutation,
 };
 
 const FileMutationDecodeResult = union(enum) {
     input: file_mutation_contract.FileMutationInput,
     failure: []const u8,
+    /// Registered, but executed by the host rather than the builtin file
+    /// mutation implementation.
+    not_file_mutation,
 };
 
 var file_mutation_decode_count: usize = 0;
@@ -336,6 +344,9 @@ fn decodeFileMutationInput(
     const kind: file_mutation_contract.Kind = switch (tool.executor_kind) {
         .write_file => .write,
         .edit_file => .edit,
+        // A host tool may reuse the reserved names; it is not the builtin
+        // mutation, so the contract steps aside instead of failing the call.
+        .host => return .not_file_mutation,
         else => return .{ .failure = try arena.dupe(
             u8,
             "unsupported file mutation tool",
@@ -386,6 +397,7 @@ pub fn prepareFileMutationCall(
         call,
     )) {
         .failure => |reason| return .{ .tool_failure = reason },
+        .not_file_mutation => return .not_file_mutation,
         .input => |value| value,
     };
     var input_owned = true;
@@ -586,6 +598,9 @@ pub fn preflightFileMutation(
         .workspace_root = request.workspace_root,
     })) {
         .tool_failure => |reason| return .{ .tool_failure = reason },
+        // The preflight contract only exists for the builtin file mutations;
+        // a host tool that reused the name cannot be preflighted through it.
+        .not_file_mutation => return .{ .tool_failure = "file mutation preflight is unavailable for host tools" },
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);
@@ -1293,7 +1308,14 @@ fn requestPermissionOutcomeResolved(
     permission_mode: PermissionMode,
     local_grants: []const PermissionGrant,
 ) !command_admission.PermissionOutcome {
-    if (file_mutation_contract.isToolName(call.name)) {
+    if (file_mutation_contract.isToolName(call.name) and
+        // A host tool that reuses a reserved name executes through the host
+        // executor, not the builtin file mutation, so it follows the ordinary
+        // registered-tool permission path. A missing registry entry keeps the
+        // contract's own failure handling.
+        (input.tool_registry.lookup(call.name) == null or
+            input.tool_registry.lookup(call.name).?.executor_kind != .host))
+    {
         return requestFileMutationPermissionOutcome(
             input,
             arena,
@@ -2203,6 +2225,9 @@ pub fn preparePermissionStateAction(
         .access_scope = input.access_scope,
     })) {
         .prepared => |prepared| prepared,
+        // A host tool that reuses a reserved name never reaches this site
+        // through the file-mutation contract; treat it as unpreparable.
+        .not_file_mutation => return error.PermissionStatePreparationFailed,
         .tool_failure => return error.PermissionStatePreparationFailed,
     };
     defer prepared_call.deinit(arena);
@@ -2469,6 +2494,14 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         };
         return .{ .items = items };
     }
+    // A host tool that reuses a reserved file-mutation name has no typed
+    // mutation target; its permission target is its own name.
+    if (tool.executor_kind == .host) {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        errdefer arena.free(items);
+        items[0] = .{ .role = "target", .path = try arena.dupe(u8, call.name) };
+        return .{ .items = items };
+    }
     var permission_call = call;
     if (std.mem.eql(u8, permission_call.name, "shell")) {
         permission_call.name = "shell";
@@ -2512,6 +2545,9 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
     if (try isRunCommandCall(input, arena, call)) {
         return commandPermissionTarget(input, arena, call);
     }
+    // A host tool that reuses a reserved file-mutation name has no typed
+    // mutation target; its permission target is its own name.
+    if (tool.executor_kind == .host) return arena.dupe(u8, call.name);
     return permissions.permissionTargetForCallInScope(
         arena,
         accessScope(input),
@@ -3135,6 +3171,7 @@ test "prepared file mutation admission decodes and resolves exactly once without
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);
@@ -3201,6 +3238,7 @@ test "external file action identity is canonical across call IDs and distinguish
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer first.deinit(arena);
@@ -3213,6 +3251,7 @@ test "external file action identity is canonical across call IDs and distinguish
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer equivalent.deinit(arena);
@@ -3225,6 +3264,7 @@ test "external file action identity is canonical across call IDs and distinguish
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer changed.deinit(arena);
@@ -3271,6 +3311,7 @@ test "prepared file mutation rejects a changed call without decoding or resolvin
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);
@@ -3336,6 +3377,7 @@ test "file mutation preparation returns semantic failures before permission eval
     });
     const reason = switch (missing_edit) {
         .tool_failure => |value| value,
+        .not_file_mutation => return error.TestExpectedToolFailure,
         .prepared => return error.TestExpectedToolFailure,
     };
     try std.testing.expectEqualStrings(
@@ -3356,6 +3398,7 @@ fn checkFileMutationPreparationAllocationFailures(alloc: Allocator, workspace: [
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(alloc);
@@ -3544,6 +3587,7 @@ test "file mutation kind comes from the registered executor kind, not the tool n
             file_mutation_contract.Kind.edit,
             std.meta.activeTag(input),
         ),
+        .not_file_mutation => return error.TestExpectedDecodedInput,
         .failure => return error.TestExpectedDecodedInput,
     }
 }
@@ -3567,8 +3611,78 @@ test "file mutation decode accepts a registered tool under any name" {
             file_mutation_contract.Kind.write,
             std.meta.activeTag(input),
         ),
+        .not_file_mutation => return error.TestExpectedDecodedInput,
         .failure => return error.TestExpectedDecodedInput,
     }
+}
+
+test "file mutation decode steps aside for a host tool reusing a reserved name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const HostRaw = struct {
+        json: []u8,
+    };
+    const Hooks = struct {
+        fn deinit(raw: *anyopaque, alloc: Allocator) void {
+            const input: *HostRaw = @ptrCast(@alignCast(raw));
+            alloc.free(input.json);
+            alloc.destroy(input);
+        }
+        fn decode(
+            ctx: tool_dispatch.DispatchContext,
+            arguments_json: []const u8,
+        ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+            const input = try ctx.allocator.create(HostRaw);
+            errdefer ctx.allocator.destroy(input);
+            input.* = .{ .json = try ctx.allocator.dupe(u8, arguments_json) };
+            return .{ .input = .{ .ptr = input, .deinit_fn = deinit } };
+        }
+        fn call(
+            _: tool_dispatch.DispatchContext,
+            _: tool_dispatch.ToolInput,
+        ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+            return error.InvalidToolArguments;
+        }
+        fn readsOnly(_: tool_dispatch.ToolInput) bool {
+            return false;
+        }
+        fn irreversible(_: tool_dispatch.ToolInput) bool {
+            return false;
+        }
+    };
+
+    // A host tool registered under the reserved name must not enter the
+    // builtin mutation contract at all.
+    const host_tool = tool_dispatch.Tool{
+        .name = "write_file",
+        .description = "",
+        .model_schema = .{ .name = "write_file", .description = "" },
+        .model_visible = false,
+        .executor_kind = .host,
+        .activity_kind = .command,
+        .action_label = "Running",
+        .completed_action_label = "Ran",
+        .decode = Hooks.decode,
+        .call = Hooks.call,
+        .reads_only_fn = Hooks.readsOnly,
+        .irreversible_fn = Hooks.irreversible,
+    };
+    const tools = [_]tool_dispatch.Tool{host_tool};
+    const decoded = try decodeFileMutationInput(arena, .{ .tools = tools[0..] }, .{
+        .id = "host-write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
+    });
+    try std.testing.expect(decoded == .not_file_mutation);
+
+    const prepared = try prepareFileMutationCall(arena, .{
+        .id = "host-write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
+    }, .{ .tool_registry = .{ .tools = tools[0..] }, .workspace_root = "/tmp" });
+    try std.testing.expect(prepared == .not_file_mutation);
 }
 
 test "file mutation decode rejects a registered tool that is not a mutation" {
@@ -3584,6 +3698,7 @@ test "file mutation decode rejects a registered tool that is not a mutation" {
     });
     const reason = switch (decoded) {
         .failure => |value| value,
+        .not_file_mutation => return error.TestExpectedToolFailure,
         .input => return error.TestExpectedToolFailure,
     };
     try std.testing.expectEqualStrings("unsupported file mutation tool", reason);

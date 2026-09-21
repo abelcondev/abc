@@ -1547,7 +1547,7 @@ fn appendTestTransientContext(input: context_contract.TransientContextInput, all
         "provider transient:{s}:{s}",
         .{ input.workspace_root, @tagName(input.permission_mode) },
     );
-    try messages.append(alloc, .{ .role = .user, .content = content });
+    try messages.append(alloc, .{ .role = .system, .content = content });
 }
 
 const test_context_provider = context_contract.Provider{
@@ -2078,6 +2078,7 @@ test "interactive app prepared file mutation callback applies app permission pol
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);

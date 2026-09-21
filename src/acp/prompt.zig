@@ -12,6 +12,10 @@ const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
     struct {};
+const js_host_steering = if (host_target.is_wasm)
+    @import("../core/hosts/js_host_steering.zig")
+else
+    struct {};
 const io_mod = @import("../core/shared/io.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -256,14 +260,20 @@ const AcpContext = struct {
         return owned_id;
     }
 
-    fn sendProviderTerminal(self: *AcpContext, tool_call_id: []const u8, outcome: types.ToolOutcome) !void {
+    fn sendProviderTerminal(
+        self: *AcpContext,
+        tool_call_id: []const u8,
+        outcome: types.ToolOutcome,
+        result: ?[]const u8,
+    ) !void {
         const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
         if (publication.* != .pending) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
+        const detail = if (self.state.cfg.minimal_kernel) result else null;
         switch (status) {
-            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, "Web search completed", null),
-            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, "Web search failed", null),
+            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, detail orelse "Web search completed", null),
+            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
             .pending, .in_progress => unreachable,
         }
         const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
@@ -686,18 +696,25 @@ pub fn handlePrompt(
         return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
-        if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
-        var temporary_snapshot_dir: ?[]u8 = null;
-        defer if (temporary_snapshot_dir) |path| alloc.free(path);
-        const snapshot_dir = try session_store.imageSnapshotStorageDir(
-            alloc,
-            if (session.store) |store| store.sessions_dir else null,
-            if (session.store != null) session.session_id else null,
-            &temporary_snapshot_dir,
-        );
-        defer alloc.free(snapshot_dir);
-        prompt_input.captureImages(alloc, snapshot_dir) catch |err|
-            return promptInputFailure(err);
+        if (session.store == null and session.wasm_state == null) {
+            // libfx kernel session: images stay in memory and ride the kernel
+            // checkpoint, so no filesystem snapshot backend is needed.
+            prompt_input.captureImagesInline(alloc) catch |err|
+                return promptInputFailure(err);
+        } else {
+            if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
+            var temporary_snapshot_dir: ?[]u8 = null;
+            defer if (temporary_snapshot_dir) |path| alloc.free(path);
+            const snapshot_dir = try session_store.imageSnapshotStorageDir(
+                alloc,
+                if (session.store) |store| store.sessions_dir else null,
+                if (session.store != null) session.session_id else null,
+                &temporary_snapshot_dir,
+            );
+            defer alloc.free(snapshot_dir);
+            prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+                return promptInputFailure(err);
+        }
     }
     const prompt_text = prompt_input.text;
 
@@ -1144,6 +1161,31 @@ const ParsedPromptInput = struct {
         self.images = images;
     }
 
+    /// libfx kernel sessions have no filesystem snapshot backend on either
+    /// host (native or wasm), so their prompt images keep validated bytes on
+    /// the attachment itself and serialize through the kernel checkpoint.
+    fn captureImagesInline(self: *ParsedPromptInput, alloc: Allocator) !void {
+        if (self.pending_images.len == 0) return;
+        const images = try alloc.alloc(types.ImageAttachment, self.pending_images.len);
+        var captured: usize = 0;
+        errdefer {
+            for (images[0..captured]) |attachment| {
+                types.freeImageAttachment(alloc, attachment);
+            }
+            alloc.free(images);
+        }
+        for (self.pending_images, 0..) |pending, index| {
+            images[index] = try image_attachments.captureInlineImageBytesInMemory(
+                alloc,
+                pending.id,
+                pending.media_type,
+                pending.bytes,
+            );
+            captured += 1;
+        }
+        self.images = images;
+    }
+
     fn retainImageSnapshots(self: *ParsedPromptInput) void {
         self.retain_image_snapshots = true;
     }
@@ -1391,6 +1433,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = if (ctx.state.cfg.minimal_kernel) takeLibfxSteeringBoundary else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -1438,6 +1481,25 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
+}
+
+fn takeLibfxSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    _: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const close_if_empty = kind == .finalizing;
+    const messages = if (comptime host_target.is_wasm)
+        try js_host_steering.takeAll(arena)
+    else
+        try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
+    if (messages.len > 0) return .{ .continue_turn = messages };
+    if (comptime host_target.is_wasm) {
+        if (close_if_empty) js_host_steering.close();
+    }
+    return if (kind == .cancelled) .interrupt else .none;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2297,7 +2359,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .arguments_json = started.arguments_json orelse "{}",
             });
         },
-        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome),
+        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result),
         .progress, .turn_finished => {},
     }
 }
@@ -3224,6 +3286,40 @@ test "parsePromptInput accepts image blocks as owned pending images" {
     try std.testing.expectEqual(@as(usize, 7), parsed.pending_images[0].id);
     try std.testing.expectEqualStrings("hello", parsed.pending_images[0].bytes);
     try std.testing.expectEqualStrings("image/png", parsed.pending_images[0].media_type);
+}
+
+test "captureImagesInline retains validated bytes on the attachment" {
+    const alloc = std.testing.allocator;
+    const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
+    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/png\"}]}";
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4);
+    defer parsed.deinit(alloc);
+
+    try parsed.captureImagesInline(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
+    const image = parsed.images[0];
+    try std.testing.expectEqual(@as(usize, 4), image.id);
+    try std.testing.expectEqualStrings("image/png", image.media_type);
+    try std.testing.expect(image.inline_data != null);
+    try std.testing.expect(image.snapshot_path == null);
+    var verified = try image_attachments.loadVerifiedSnapshot(alloc, image, .{});
+    defer verified.deinit(alloc);
+    const expected = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(png_b64));
+    defer alloc.free(expected);
+    try std.base64.standard.Decoder.decode(expected, png_b64);
+    try std.testing.expectEqualStrings(expected, verified.bytes);
+
+    parsed.retainImageSnapshots();
+}
+
+test "captureImagesInline rejects a declared media type that contradicts the bytes" {
+    const alloc = std.testing.allocator;
+    const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
+    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/jpeg\"}]}";
+    var parsed = try parsePromptInput(alloc, params);
+    defer parsed.deinit(alloc);
+    try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, parsed.captureImagesInline(alloc));
+    try std.testing.expectEqual(@as(usize, 0), parsed.images.len);
 }
 
 test "parsePromptInput rejects malformed base64 image data" {

@@ -21,7 +21,6 @@ import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
-  lastConversationUserIndex,
   parseGatewayRequest,
   serializedToolNames,
   toolShapesWithoutDescriptions,
@@ -2386,7 +2385,7 @@ describe("acp: model-independent", () => {
           prompt: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
         };
         expect(request.maxOutputTokens).toBe(64_000);
-        const user = request.prompt[lastConversationUserIndex(request.prompt)];
+        const user = request.prompt.findLast((message) => message.role === "user");
         expect(user?.content.find((part) => part.type === "text")?.text).toBe(submitted);
         expect(client.stderr).toBe("");
       } finally {

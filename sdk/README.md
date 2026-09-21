@@ -1,8 +1,8 @@
 # libfx
 
 `libfx` is the small fx agent kernel for JavaScript hosts. One agent is one
-in-memory conversation with three operations: `prompt`, `checkpoint`, and
-`close`.
+in-memory conversation with `prompt`, `checkpoint`, and `close` operations,
+plus mid-turn steering on each running turn.
 
 ```sh
 npm install libfx
@@ -41,28 +41,52 @@ await agent.close();
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
 
+`effort` sets the reasoning effort for models that advertise effort levels. It
+uses the same vocabulary as the fx CLI's `--effort` flag: `"default"` leaves
+the choice to the model, and named levels such as `"low"`, `"medium"`,
+`"high"`, or `"xhigh"` request a specific level. A named level is validated
+against the selected model's advertised levels at creation; an unsupported
+level rejects with an error (code `LIBFX_UNSUPPORTED_EFFORT`) naming the
+supported set. When `effort` is omitted or `"default"`, the model default
+applies.
+
+`fast` enables the fast lane for models that advertise one, matching the fx
+CLI's `--fast` flag. Enabling it is validated against the selected model at
+creation; a model without a fast path rejects with an error (code
+`LIBFX_UNSUPPORTED_FAST`). When `fast` is omitted or `false`, the model
+default applies.
+
 The host selects the model. Agent creation does not fetch the Gateway model
-catalog. Prompting can resolve model capabilities and context capacity through
-the supplied `fetch`; fx caches that metadata for the agent.
+catalog unless `effort` requests a named level or `fast` is enabled. Prompting
+can resolve model capabilities and context capacity through the supplied
+`fetch`; fx caches that metadata for the agent.
 
 `onEvent` receives runtime diagnostics separately from model output. Transport
 events report request start, response status and elapsed time, safe Gateway
-request metadata, and failures. Credentials and raw headers are never included.
+request metadata, failures, and throttled `transport.activity` liveness while a
+response body is streaming. Activity events include the attempt, current chunk
+bytes, and cumulative response bytes. They call the host directly at most once
+per 250 ms rather than entering the normalized turn queue, so an unread turn
+cannot accumulate heartbeat events. Credentials and raw headers are never
+included.
 
 libfx makes at most one automatic retry after a retryable transport failure and
 only before model output or tool effects escape. Cancellation prevents a retry.
 
-`prompt(input, { signal? })` accepts a string or text/resource blocks. It
-returns an async iterable of normalized events:
+`prompt(input, { signal? })` accepts a string or text, image, and resource
+blocks. It returns an async iterable of normalized events:
 
 - `text_delta`
 - `reasoning_delta` when supplied by the provider
-- `tool_start`
+- `tool_start` with `id`, `name`, and the tool's `input` object. Inputs over
+  64 KiB of JSON arrive as an `inputPreview` string prefix plus
+  `inputTruncated: true` instead; the tool still receives complete arguments.
 - `tool_end`
+- `user_message` with `text` when accepted mid-turn steering enters the turn
 
-Consume the turn while it runs, then await `turn.result`. Output is lossless and
-backpressured: a slow reader pauses production instead of growing an unlimited
-event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+Consume the turn while it runs, then await `turn.result`. Streamed text and
+tool results are lossless and backpressured: a slow reader pauses production
+instead of growing an unlimited event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
 If you only need the result, explicitly discard events:
 
 ```js
@@ -82,9 +106,50 @@ that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
 
-Only one prompt may run at a time. `checkpoint()` is idle-only and returns
-opaque, bounded, versioned bytes. Restore them only when creating a fresh
-agent:
+Image blocks use ACP's content shape and carry canonical base64 (no line
+wrapping) of a PNG, JPEG, GIF, or WebP payload:
+
+```js
+const turn = agent.prompt([
+  { type: "text", text: "What does this screenshot show?" },
+  { type: "image", data: base64Png, mimeType: "image/png" },
+]);
+```
+
+A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
+with at most 8 MiB of image data per prompt; the SDK rejects larger input with
+typed `RangeError`s before any request. The kernel then validates the decoded
+bytes against the declared `mimeType` and fails the turn with
+`Invalid image prompt block` on a mismatch. Images are routed only to models
+that advertise image input; for any other model the turn fails with
+`Image prompts are unavailable for the selected model` and no image bytes
+leave the process. Prompt images are retained in checkpoints within the
+existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
+images on either backend.
+
+Only one top-level prompt may run at a time. While it runs,
+`await turn.steer(text)` appends guidance at the next safe model boundary
+without discarding the in-flight response or completed tool work. Steering also
+accepts an array of text blocks; image and resource steering blocks are rejected.
+Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
+queued steering text. Accepted steering appears as a `user_message` event before
+the model's continued output. Calling `steer()` after the turn settles rejects
+with `no prompt is running`.
+
+```js
+const turn = agent.prompt("Build the feature.");
+for await (const event of turn) {
+  if (event.type === "tool_end" && event.name === "read_file") {
+    await turn.steer("Keep the public API backward compatible.");
+  }
+}
+```
+
+Cancelling a steered turn drops any guidance that has not reached a safe
+boundary and releases its queue. Applied guidance is part of the same history
+turn, so an idle `checkpoint()` includes the full steered conversation.
+`checkpoint()` returns opaque, bounded, versioned bytes. Restore them only when
+creating a fresh agent:
 
 ```js
 const restored = await createFxAgent({ apiKey, model, checkpoint });
@@ -95,7 +160,10 @@ or a history change. The next prompt can run normally.
 
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records.
+MCP clients, and skill records. Reasoning effort and fast mode are
+agent-creation options and are not stored in a checkpoint: recreate the agent
+with new `effort` or `fast` values to change them, the same path as switching
+models.
 
 ## Models
 
@@ -136,11 +204,35 @@ const agent = await createFxAgent({
 });
 ```
 
-The JavaScript host is the authority for tool effects. The same descriptors,
-schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Gateway web search can run at the provider instead of in the JavaScript host.
+Mark its canonical tool name with `providerExecuted: true` and omit `execute`:
+
+```js
+const agent = await createFxAgent({
+  apiKey,
+  tools: [{ name: "web_search", providerExecuted: true }],
+});
+```
+
+The kernel supplies the canonical schema and Gateway advertisement. Currently
+`web_search` is the supported provider-executed descriptor; unknown or local
+names reject agent creation. Provider-executed tools do not
+call host code or require a separate provider key; their `tool_start` and
+`tool_end` events, results, and checkpoint history use the same turn contract.
+Their built-in permission policy is enforced when the request is projected, as
+there is no local call-time effect to approve.
+
+For ordinary tools, the JavaScript host is the authority for effects. The same
+descriptors, schemas, cancellation, results, and events are used by N-API and
+WebAssembly.
 Cancelling a prompt aborts its tools' signals and stops waiting for their
 callbacks. Late results and rejections are ignored. Tools remain responsible
 for stopping their own work when their signal is aborted.
+
+A host tool may use any name, including the kernel's builtin names such as
+`write_file` and `edit_file`: the kernel routes by the registered executor, so
+a host-defined `write_file` calls the host's `execute()` rather than the
+builtin file mutation.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system

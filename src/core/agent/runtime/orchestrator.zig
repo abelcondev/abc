@@ -2848,7 +2848,7 @@ fn appendPreparedParentTurnContext(
     if (prepared.content.len == 0) return .{};
     try messages.ensureUnusedCapacity(arena, 1);
     messages.appendAssumeCapacity(.{
-        .role = .user,
+        .role = .system,
         .content = prepared.content,
     });
     return .{ .acknowledgements = prepared.acknowledgements };
@@ -3472,19 +3472,19 @@ fn build_provider_prompt_with_response_language_control(
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
-    const effective_prefix = if (enforce_response_language and origin == .root) blk: {
-        const projected = try alloc.alloc(ChatMessage, stable_prefix.len + 1);
-        @memcpy(projected[0..stable_prefix.len], stable_prefix);
-        projected[stable_prefix.len] = .{
+    const effective_overlay = if (enforce_response_language and origin == .root) blk: {
+        const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
+        @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
+        projected[ephemeral_overlay.len] = .{
             .role = .system,
             .content = response_language_control,
         };
         break :blk projected;
-    } else stable_prefix;
+    } else ephemeral_overlay;
     var prompt = try buildProviderPromptForCompactionWindow(
         alloc,
-        effective_prefix,
-        ephemeral_overlay,
+        stable_prefix,
+        effective_overlay,
         durable_history,
         current_user_message,
         within_turn_suffix,
@@ -3513,7 +3513,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
     var projected = try build_provider_prompt_with_response_language_control(
         std.testing.allocator,
         &.{.{ .role = .system, .content = "stable" }},
-        &.{.{ .role = .user, .content = "overlay" }},
+        &.{.{ .role = .system, .content = "overlay" }},
         &.{.{ .role = .user, .content = "removed history" }},
         .{ .role = .user, .content = "pending prompt" },
         &.{
@@ -3530,14 +3530,14 @@ test "compacted request keeps the pending user prompt after the handoff" {
     defer projected.instructions.deinit(std.testing.allocator);
     defer projected.messages.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), projected.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 2), projected.instructions.items.len);
     try std.testing.expectEqualStrings("stable", projected.instructions.items[0].content.?);
+    try std.testing.expectEqualStrings("overlay", projected.instructions.items[1].content.?);
     const expected = [_][]const u8{
         "handoff",
         "retained tail",
         "pending prompt",
         "new suffix",
-        "overlay",
     };
     try std.testing.expectEqual(expected.len, projected.messages.items.len);
     for (expected, projected.messages.items) |content, message| {
@@ -4310,13 +4310,10 @@ test "context overflow recovery is typed safe and bounded" {
 fn isPostVisionAssistantPrefillRejection(
     status: std.http.Status,
     detail: []const u8,
-    conversation_tail: ?ChatMessage,
+    messages: []const ChatMessage,
 ) bool {
-    if (status != .bad_request) return false;
-    // Judge the semantic conversation tail, not the request tail: the per-step
-    // runtime overlay rides at the end of the message list, after the tool
-    // result this recovery is looking for.
-    const tail = conversation_tail orelse return false;
+    if (status != .bad_request or messages.len == 0) return false;
+    const tail = messages[messages.len - 1];
     if (tail.role != .tool or
         !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
     {
@@ -6949,7 +6946,7 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .user, .content = section.text });
+            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(
@@ -8244,10 +8241,7 @@ fn processQueuedPromptLoop(
                 isPostVisionAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
-                    if (within_turn_suffix.items.len > 0)
-                        within_turn_suffix.items[within_turn_suffix.items.len - 1]
-                    else
-                        null,
+                    request_messages,
                 ))
             {
                 try within_turn_suffix.append(arena, .{
@@ -10882,7 +10876,12 @@ fn processQueuedPromptLoop(
                     },
                 }
             }
-            const is_file_mutation = file_mutation_contract.isToolName(tool_call.name);
+            const is_file_mutation = file_mutation_contract.isToolName(tool_call.name) and
+                // A host tool may reuse a reserved file-mutation name; it owns
+                // its own execution and never enters the builtin contract. A
+                // missing registry entry keeps the contract's own failure path.
+                (deps.tool_registry.lookup(tool_call.name) == null or
+                    deps.tool_registry.lookup(tool_call.name).?.executor_kind != .host);
             var prepared_file_mutation: ?tooling_tool_admission.PreparedFileMutationCall = null;
             defer if (prepared_file_mutation) |*prepared| prepared.deinit(arena);
 
@@ -10910,6 +10909,9 @@ fn processQueuedPromptLoop(
                 };
                 switch (admission) {
                     .tool_failure => break :fresh false,
+                    // A host tool reuses a reserved mutation name; it has no
+                    // builtin mutation targets to keep fresh.
+                    .not_file_mutation => break :fresh false,
                     .prepared => |prepared| {
                         prepared_file_mutation = prepared;
                         break :fresh preparedFileMutationTargetMatches(

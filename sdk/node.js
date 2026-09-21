@@ -345,12 +345,14 @@ export async function getBackendInfo(value = {}) {
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const { apiKey, model, gatewayChatUrl } = options;
+  const { apiKey, model, effort, fast, gatewayChatUrl } = options;
   const core = addon.createCore({
     apiKey,
     home: options.home ?? homedir(),
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(fast === undefined ? {} : { fast }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
   });
   let readyFd;
@@ -405,6 +407,7 @@ function createNativeCoreRuntime(addon, options) {
       if (response.body) {
         for await (const chunk of response.body) {
           const buffer = Buffer.from(chunk);
+          options.onTransportChunk?.(buffer.length);
           let offset = 0;
           while (offset < buffer.length) {
             const end = Math.min(offset + 64 * 1024, buffer.length);
