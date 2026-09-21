@@ -336,6 +336,14 @@ pub fn isDiffContentHandle(handle: []const u8) bool {
         std.mem.endsWith(u8, handle, ".json");
 }
 
+pub fn diffContentHandleMatchesContentDigest(
+    handle: []const u8,
+    digest: [32]u8,
+) bool {
+    return isDiffContentHandle(handle) and
+        artifact_digest.handleMatchesContentDigest(handle, ".json", digest);
+}
+
 /// Persists one edit's previous/after snapshots as a single content-addressed
 /// artifact in the session result store and returns its handle. Keeping the
 /// snapshots out of the event log and recovery checkpoint keeps those records
@@ -369,7 +377,7 @@ pub fn loadDiffContentManaged(
     defer alloc.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    if (!artifact_digest.handleMatchesContentDigest(handle, ".json", digest)) {
+    if (!diffContentHandleMatchesContentDigest(handle, digest)) {
         return error.DiffContentArtifactChanged;
     }
     const Wire = struct {

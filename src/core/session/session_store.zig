@@ -3907,6 +3907,18 @@ fn copyRecoveredManagedChildren(
                         result.stored_output_bytes,
                     );
                 }
+                if (result.committed_file_presentation) |presentation| {
+                    if (presentation.content_handle) |handle| {
+                        try copyRecoveredManagedChild(
+                            alloc,
+                            source,
+                            target,
+                            .tool_results,
+                            handle,
+                            null,
+                        );
+                    }
+                }
                 if (result.command_output_replay) |replay| {
                     contains_unverified_artifacts =
                         (try copyRecoveredCommandReplay(
@@ -4152,10 +4164,13 @@ fn validateRecoveredManagedChildDigest(
     digest: [32]u8,
 ) !void {
     switch (kind) {
-        .tool_results => if (!result_store.handleMatchesContentDigest(
-            handle,
-            digest,
-        )) return error.SessionRecoveryBoundaryInvalid,
+        .tool_results => {
+            const matches = if (result_store.isDiffContentHandle(handle))
+                result_store.diffContentHandleMatchesContentDigest(handle, digest)
+            else
+                result_store.handleMatchesContentDigest(handle, digest);
+            if (!matches) return error.SessionRecoveryBoundaryInvalid;
+        },
         .command_artifacts => {
             if (expected_bytes != null and
                 command_replay_store.hasContentDigest(handle) and
@@ -6809,6 +6824,68 @@ test "recovery authenticates content-addressed command artifacts" {
             null,
             digest,
         ),
+    );
+}
+
+test "recovery copies diff content artifacts and rejects changed content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "source");
+    defer alloc.free(source_path);
+    const target_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target");
+    defer alloc.free(target_path);
+    var source = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, source_path, .tool_results, .writable);
+    defer source.deinit();
+    var target = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, target_path, .tool_results, .writable);
+    defer target.deinit();
+    const previous = "before\n" ** 800;
+    const after = "after\n" ** 800;
+    const handle = try result_store.storeDiffContent(
+        alloc,
+        source_path,
+        "recovered-edit",
+        previous,
+        after,
+    );
+    defer alloc.free(handle);
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recovered-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited source.zig"),
+        .output_bytes = 17,
+        .stored_output_bytes = 17,
+        .committed_file_presentation = .{
+            .path = "source.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .content_handle = handle,
+        },
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_results = &results }};
+    var history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Edit source.zig.") },
+        .assistant = @constCast("Edited."),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+
+    try std.testing.expect(!try copyRecoveredManagedChildren(alloc, &history, &source, &target));
+    var copied = try result_store.loadDiffContentManaged(alloc, &target, handle);
+    defer copied.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, copied.previous_content.?);
+    try std.testing.expectEqualStrings(after, copied.after_content.?);
+    try target.delete(.tool_results, handle);
+    var changed = try source.atomicReplace(alloc, .tool_results, handle, "{}");
+    changed.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionRecoveryBoundaryInvalid,
+        copyRecoveredManagedChildren(alloc, &history, &source, &target),
     );
 }
 
