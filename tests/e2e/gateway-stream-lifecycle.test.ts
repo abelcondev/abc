@@ -46,7 +46,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "moonshotai/kimi-k3";
+const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -1258,7 +1258,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
+  test("ask keeps Grok 4.7 as the default model with fast mode enabled", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
