@@ -609,7 +609,7 @@ fn appendTerminalSafeSingleLine(
     text: []const u8,
     width: usize,
 ) !void {
-    var encoded = try text_utils.encodeTerminalSafe(alloc, text, 4096);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, text, 4096);
     defer encoded.deinit(alloc);
     try row_text.appendSingleLineEllipsized(alloc, row, encoded.bytes, width);
 }
@@ -659,6 +659,24 @@ test "MCP menu catalog text cannot inject terminal control sequences" {
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]0;owned") == null);
     try std.testing.expect(std.mem.find(u8, row.items, "\\x1b") != null);
+}
+
+test "MCP menu catalog text flattens line breaks into single-line rows" {
+    const tools = [_][]const u8{"mcp_multi\nline\tname"};
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .load_state = .ready,
+        },
+        .tools = &tools,
+    };
+    const rows = menuRowCount(projection, 100, 10);
+    var row = try composeMcpMenuRow(std.testing.allocator, projection, 2, 100, rows);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "mcp_multi line name") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\\x0a") == null);
+    try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
 }
 
 test "MCP menu keeps selection visible when the terminal has one body row" {
