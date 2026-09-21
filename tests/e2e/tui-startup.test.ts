@@ -199,10 +199,11 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 30,
         });
 
-        await session.waitForPane(
+        const initial = await session.waitForPane(
           (pane) => pane.includes("status-root") && pane.includes("initial-branch"),
           10_000,
         );
+        expect(initial).not.toContain("⚡︎");
 
         writeFileSync(headPath, "ref: refs/heads/refreshed-branch\n");
         await session.resizeWindow(101, 30);
@@ -217,7 +218,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
         await session.resizeWindow(50, 30);
         const narrow = await session.waitForPane(
-          (pane) => pane.includes("s-root") && pane.includes("detached:"),
+          (pane) => pane.includes("s-root") && pane.includes("detached"),
           5_000,
         );
         expect(narrow).not.toContain("initial-branch");

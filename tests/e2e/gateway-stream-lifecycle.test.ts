@@ -46,7 +46,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "moonshotai/kimi-k3";
+const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -1258,7 +1258,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
+  test("ask uses Grok 4.7 as the default model", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
@@ -1267,8 +1267,8 @@ describe("gateway stream lifecycle", () => {
         models: [{
           id: DEFAULT_MODEL,
           type: "language",
-          tags: ["tool-use"],
-          fast_options: [{ type: "toggle" }],
+          tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
+          reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
         }],
       },
     );
@@ -1298,8 +1298,9 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
       expect(request).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
+        providerOptions: { gateway: { caching: "auto" } },
       });
     } finally {
       gateway.stop();
@@ -1313,21 +1314,13 @@ describe("gateway stream lifecycle", () => {
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("FLAG_OVERRIDES_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use", "reasoning"],
-            fast_options: [{ type: "toggle" }],
-            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
       },
     );
 
@@ -1371,26 +1364,18 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask --model without --fast drops the compiled-default fast mode", async () => {
-    const root = createFixtureRoot("ask-model-override-drops-fast");
+  test("ask --model without --fast keeps fast mode off", async () => {
+    const root = createFixtureRoot("ask-model-override-no-fast");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("MODEL_ONLY_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          fast_options: [{ type: "toggle" }],
+        }],
       },
     );
 
@@ -1435,8 +1420,8 @@ describe("gateway stream lifecycle", () => {
           {
             id: DEFAULT_MODEL,
             type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
+            tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
           },
           {
             id: MODEL,
@@ -1494,8 +1479,9 @@ describe("gateway stream lifecycle", () => {
       );
       const restoredRequest = JSON.parse(gateway.requests[2]!.body);
       expect(restoredRequest).not.toHaveProperty("reasoning");
+      expect(restoredRequest).not.toHaveProperty("providerOptions.gateway.speed");
       expect(restoredRequest).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
+        providerOptions: { gateway: { caching: "auto" } },
       });
     } finally {
       gateway.stop();
