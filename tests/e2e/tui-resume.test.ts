@@ -7583,57 +7583,84 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
 
   // The session was created in a workspace that no longer applies, then later
   // lived in `workspace`: origin and current roots differ, which used to
-  // blank the replay root and withhold every absolute-path command's reclip
-  // metadata.
+  // blank the replay root and withhold session labels and reclip metadata for
+  // every absolute-path command. Written in the modern durable format
+  // (schema-4 metadata plus events.jsonl frames); the legacy single-file
+  // format cannot express diverging roots because its loader never reads
+  // origin_workspace_root.
   const oldWorkspace = join(root, "old-workspace");
   const tail = "a".repeat(60);
   const command = `cd ${workspace}/alpha && printf '${tail}' && printf 'done'`;
+
+  const resultBody = (state: string) =>
+    JSON.stringify({ session_id: "shell-1", state, backend: "captured", persistence: "process" });
+  const artifactRef = (callId: string, body: string) => {
+    const callHex = createHash("sha256").update(callId).digest("hex").slice(0, 16);
+    const contentHex = createHash("sha256").update(body).digest("hex").slice(0, 16);
+    return `result-shell-${callHex}-${contentHex}.txt`;
+  };
+  const toolCallEvent = (callId: string, args: Record<string, unknown>) => ({
+    tool_call: {
+      call_id: callId,
+      tool_name: "shell",
+      arguments_json: JSON.stringify(args),
+      argument_integrity: "valid",
+      provisional_id: null,
+      provider_result: null,
+      final_identity: "valid",
+      provenance: "fx_local",
+    },
+  });
+  const toolResultEvent = (callId: string, body: string, createdAt: number) => ({
+    tool_result: {
+      call_id: callId,
+      tool_name: "shell",
+      status: "success",
+      artifact_ref: artifactRef(callId, body),
+      tool_image_handle: null,
+      output_bytes: body.length,
+      stored_bytes: body.length,
+      completeness: "complete",
+      preview: body,
+      provider_native: false,
+      created_at_ms: createdAt,
+      permission_feedback: [],
+    },
+  });
+
+  const runBody = resultBody("running");
+  const observeBody = resultBody("completed");
+  const resultsDir = join(sessionDir, "tool-results");
+  mkdirSync(resultsDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(resultsDir, artifactRef("call-long", runBody)), runBody, { mode: 0o600 });
+  writeFileSync(join(resultsDir, artifactRef("call-observe", observeBody)), observeBody, { mode: 0o600 });
+
   writeFileSync(join(sessionDir, "session.json"), JSON.stringify({
-    schema_version: 2,
+    schema_version: 4,
     id: sessionId,
-    created_at_ms: 1,
-    updated_at_ms: 2,
     origin_workspace_root: oldWorkspace,
     workspace_root: workspace,
-    conversation_language: "en",
-    history_len: 1,
-    context_history_start: 0,
-    history: [{
-      kind: "assistant",
-      user: { text: "RECLIP_MOVED_REQUEST", images: [] },
-      assistant: "RECLIP_MOVED_REPLY",
-      execution: {
-        schema_version: 2,
-        tool_steps: [{
-          assistant: null,
-          tool_calls: [{
-            id: "call-long",
-            name: "shell",
-            arguments_json: JSON.stringify({ action: "run", command, yield_time_ms: 30_000 }),
-            provider_result: null,
-          }],
-          tool_results: [{
-            tool_call_id: "call-long",
-            tool_name: "shell",
-            status: "success",
-            output: "ok",
-            output_handle: null,
-            preview: null,
-            output_bytes: 2,
-            stored_output_bytes: 2,
-            truncated: false,
-            provider_native: false,
-            created_at_ms: 2,
-            permission_feedback: [],
-          }],
-        }],
-        files: [],
-        steering: [],
-      },
-    }],
-    total_input_tokens: 0,
-    total_output_tokens: 0,
+    created_at_ms: 1,
+    updated_at_ms: 2,
+    conversation_language: "und-Latn",
+    provider: "gateway",
+    model: "test/model",
+    effort: "max",
+    fast_mode: false,
+    subagent_child: false,
   }) + "\n", { mode: 0o600 });
+
+  const frame = (seq: number, event: Record<string, unknown>) =>
+    JSON.stringify({ schema_version: 2, seq, timestamp_ms: 1_700_000_000_000 + seq, event });
+  writeFileSync(join(sessionDir, "events.jsonl"), [
+    frame(1, { user: { text: "RECLIP_MOVED_REQUEST" } }),
+    frame(2, toolCallEvent("call-long", { action: "run", command, yield_time_ms: 30_000 })),
+    frame(3, toolResultEvent("call-long", runBody, 2)),
+    frame(4, toolCallEvent("call-observe", { action: "interact", session_id: "shell-1", yield_time_ms: 1_000 })),
+    frame(5, toolResultEvent("call-observe", observeBody, 3)),
+    frame(6, { assistant: { text: "RECLIP_MOVED_REPLY" } }),
+    frame(7, { turn_completed: { files: [] } }),
+  ].join("\n") + "\n", { mode: 0o600 });
 
   const gateway = startFakeGateway([fakeGatewayFinalText("UNUSED")]);
   const stderrPath = join(root, "stderr.log");
@@ -7654,6 +7681,10 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     expect(row).toBeDefined();
     expect(row!).toContain(tail);
     expect(row!).not.toContain("...");
+    // Session-action rows resolve the launch command through the live root
+    // instead of falling back to the raw session id.
+    expect(scrollback).toContain("Observed cd ./alpha");
+    expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
     active = null;
