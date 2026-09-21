@@ -76,14 +76,17 @@ const RecoveryAutoContinue = enum {
 };
 
 /// Whether a paused recovery continues on its own after a restart or resume.
-/// A leftover owner marker means the previous process died mid-recovery, so
-/// the turn that may have killed it is the user's to retry, not fx's to
-/// re-spend.
+/// A leftover owner marker means the previous process died mid-recovery, and
+/// a leftover asked marker means a prior resume already suppressed this
+/// checkpoint without the user resolving it. Either way the turn is the
+/// user's to retry, not fx's to re-spend.
 fn recoveryAutoContinueDecision(
     checkpoint: session_codec.RecoveryCheckpoint,
     previous_owner_died: bool,
+    recovery_asked_before: bool,
 ) RecoveryAutoContinue {
     if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
+    if (recovery_asked_before) return .ask_after_unclean_exit;
     if (previous_owner_died) return .ask_after_unclean_exit;
     return .auto_continue;
 }
@@ -2044,6 +2047,16 @@ pub fn Runtime(comptime App: type) type {
             var historical_labels = HistoricalSessionLabels{ .workspace_root = resume_workspace_root };
             defer historical_labels.deinit(app.alloc);
 
+            // Decide before rendering: the checkpoint replay below must not
+            // promise an automatic continuation the gate is about to suppress.
+            const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
+                if (state.recovery_checkpoint) |checkpoint|
+                    recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
+                else
+                    null
+            else
+                null;
+
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
@@ -2056,7 +2069,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -2076,23 +2089,23 @@ pub fn Runtime(comptime App: type) type {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
-            // A paused recovery resumes on its own after every restart or
-            // resume; the user never re-runs a manual continuation. Harnesses
-            // without a real worker queue opt out via the decl check. A
-            // compaction_prepared checkpoint records completed source, not a
-            // turn waiting to run; the compaction flow owns it. A checkpoint
-            // left behind by an unclean exit is different: the interrupted
-            // turn may be what killed the process, so the user decides
-            // whether to retry it instead of fx re-spending the turn on its
-            // own.
+            // A paused recovery resumes on its own after a clean restart or
+            // resume. Harnesses without a real worker queue opt out via the
+            // decl check. A compaction_prepared checkpoint records completed
+            // source, not a turn waiting to run; the compaction flow owns it.
+            // A checkpoint left behind by an unclean exit is different: the
+            // interrupted turn may be what killed the process, so the user
+            // decides whether to retry it instead of fx re-spending the turn
+            // on its own, and that suppression stays sticky until the turn
+            // is resolved.
             if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
                 if (state.recovery_checkpoint) |checkpoint| {
-                    switch (recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app))) {
+                    switch (recovery_decision.?) {
                         .skip_compaction_owned => debug_trace.logf(
                             "session",
                             "event=auto_continue_skipped cause=compaction_prepared",
@@ -2104,6 +2117,11 @@ pub fn Runtime(comptime App: type) type {
                                 "event=auto_continue_suppressed reason=unclean_exit turn_id={d}",
                                 .{checkpoint.turn_id},
                             );
+                            if (comptime @hasField(App, "session_persistence")) {
+                                if (app.session_persistence.writable) |*loaded| {
+                                    session_log.markRecoveryAsked(app.alloc, &loaded.log.dir);
+                                }
+                            }
                             try app.writeDomainNotice(.{
                                 .topic = "recovery",
                                 .tone = .warning,
@@ -2145,6 +2163,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return false;
             const loaded = if (app.session_persistence.writable) |*value| value else return false;
             return loaded.log.previous_owner_died;
+        }
+
+        fn recoveryAskedBefore(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return session_log.recoveryWasAsked(&loaded.log.dir);
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -4134,6 +4158,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
             labels: *HistoricalSessionLabels,
+            recovery_decision: ?RecoveryAutoContinue,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -4155,8 +4180,14 @@ pub fn Runtime(comptime App: type) type {
             }
             // A compaction_prepared checkpoint records completed source owned by
             // the compaction flow, not a turn waiting to run; it gets no recovery
-            // notice and no automatic continuation.
-            if (checkpoint.cause != .compaction_prepared) {
+            // notice and no automatic continuation. Only a checkpoint the gate
+            // will actually auto-continue may promise one; a suppressed
+            // checkpoint gets the gate's own notice below.
+            const recovery_notice_suppressed = if (recovery_decision) |decision|
+                decision != .auto_continue
+            else
+                checkpoint.cause == .compaction_prepared;
+            if (!recovery_notice_suppressed) {
                 // No attempt counts: there is no budget to count against.
                 const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
                     "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
@@ -11844,13 +11875,16 @@ test "recovery auto-continue asks after an unclean exit instead of restarting" {
     const alloc = std.testing.allocator;
     var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
     defer interrupted.deinit(alloc);
-    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false));
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true));
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
+    // Suppression stays sticky: a clean quit without a resolution still asks.
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
 
     var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
     defer compaction.deinit(alloc);
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false));
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true));
 }
 
 test "fresh prompt boundary waits out the cancel finalization window" {

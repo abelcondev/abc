@@ -1019,6 +1019,38 @@ while :; do sleep 1; done
       expect(retryGateway.requests).toHaveLength(0);
       const resumedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
       expect(resumedScrollback).toContain("fx quit unexpectedly while this response was recovering");
+      expect(resumedScrollback).not.toContain("continues automatically");
+
+      // Quitting without choosing keeps the suppression sticky: the next
+      // resume asks again instead of silently re-arming the turn.
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      expect(existsSync(join(sessionDir, "owner.live"))).toBe(false);
+      expect(existsSync(join(sessionDir, "recovery.asked"))).toBe(true);
+      expect(readFileSync(join(root, "stderr-resume.log"), "utf8")).toBe("");
+      await session.kill();
+      session = null;
+
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${sessionId}`,
+        cwd: realpathSync(workspace),
+        stderrPath: join(root, "stderr-resume2.log"),
+        width: 120,
+        height: 40,
+        isolated: true,
+        env: {
+          ...baseEnv,
+          FX_GATEWAY_BASE_URL: retryGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: retryGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: retryGateway.chatUrl,
+          FX_TRACE_LOG: join(root, "trace-resume2.log"),
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      await Bun.sleep(1_500);
+      expect(retryGateway.requests).toHaveLength(0);
+      const reaskedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
+      expect(reaskedScrollback).toContain("fx quit unexpectedly while this response was recovering");
 
       await session.sendText("continue");
       await session.waitForText("RECOVERY_RETRY_COMPLETE", TIMEOUT);
@@ -1027,7 +1059,9 @@ while :; do sleep 1; done
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
       expect(existsSync(join(sessionDir, "owner.live"))).toBe(false);
-      expect(readFileSync(join(root, "stderr-resume.log"), "utf8")).toBe("");
+      expect(existsSync(join(sessionDir, "recovery.asked"))).toBe(false);
+      expect(existsSync(join(sessionDir, "recovery.json"))).toBe(false);
+      expect(readFileSync(join(root, "stderr-resume2.log"), "utf8")).toBe("");
     },
     TIMEOUT * 3,
   );

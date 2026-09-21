@@ -31,6 +31,10 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
+/// Written when resume suppresses a checkpoint's auto-continue after an
+/// unclean exit. Cleared with the checkpoint so suppression stays sticky
+/// until the user resolves the turn instead of re-arming after a clean quit.
+const recovery_asked_file = "recovery.asked";
 /// Liveness marker naming the live writable owner; also consulted by
 /// session_store.only_unpublished_creation, which ignores it.
 pub const owner_live_file = "owner.live";
@@ -758,13 +762,47 @@ fn writeConversationRecoveryState(
             recovery_checkpoint_file,
             bound_bytes,
         );
+        // A fresh checkpoint is a new recovery state; any prior suppression
+        // belonged to the turn it replaces.
+        clearRecoveryAsked(dir);
     } else {
         dir.dir.deleteFile(io_mod.getIo(), recovery_checkpoint_file) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
+        clearRecoveryAsked(dir);
         try io_mod.syncVerifiedDir(dir.dir);
     }
+}
+
+fn clearRecoveryAsked(dir: *io_mod.VerifiedDir) void {
+    dir.dir.deleteFile(io_mod.getIo(), recovery_asked_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => debug_trace.logf("session", "recovery ask marker clear failed err={s}", .{@errorName(err)}),
+    };
+}
+
+/// Records that resume suppressed this checkpoint's auto-continue once.
+/// Advisory like owner.live: write failures degrade to a single suppression
+/// instead of blocking the resume.
+pub fn markRecoveryAsked(alloc: Allocator, dir: *io_mod.VerifiedDir) void {
+    const body = std.fmt.allocPrint(alloc, "{{\"asked_at_ms\":{d}}}\n", .{io_mod.milliTimestamp()}) catch |err| {
+        debug_trace.logf("session", "recovery ask marker allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer alloc.free(body);
+    io_mod.durableReplaceVerified(alloc, dir, recovery_asked_file, body) catch |err| {
+        debug_trace.logf("session", "recovery ask marker write failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// True when a prior resume already suppressed this checkpoint. Read at
+/// decision time; the marker is written mid-session, after the open.
+pub fn recoveryWasAsked(dir: *io_mod.VerifiedDir) bool {
+    return entryExists(dir, recovery_asked_file) catch |err| blk: {
+        debug_trace.logf("session", "recovery ask marker probe failed err={s}", .{@errorName(err)});
+        break :blk false;
+    };
 }
 
 /// Inline tool-result output budget for the durable recovery checkpoint.
@@ -5896,6 +5934,53 @@ test "cache-free recovery checkpoint resumes and clears independently" {
     var cleared = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer cleared.deinit(alloc);
     try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), cleared.recovery_checkpoint);
+}
+
+test "recovery ask marker stays sticky across resumes and follows the checkpoint lifecycle" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "recovery-ask-marker", 10);
+    defer initial.deinit(alloc);
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        try std.testing.expect(!recoveryWasAsked(&loaded.log.dir));
+        markRecoveryAsked(alloc, &loaded.log.dir);
+        try std.testing.expect(recoveryWasAsked(&loaded.log.dir));
+    }
+    // The marker survives a clean close: a later resume still sees it.
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expect(recoveryWasAsked(&resumed.log.dir));
+        // A fresh checkpoint resets the suppression.
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 30);
+        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
+        // Clearing the checkpoint clears the marker.
+        markRecoveryAsked(alloc, &resumed.log.dir);
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_cleared = .{},
+        }, 31);
+        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
+    }
 }
 
 test "recovery checkpoint spills oversized tool outputs and reload restores them" {
