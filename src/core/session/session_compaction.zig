@@ -704,6 +704,13 @@ fn cleanupStaleArtifacts(dir: *io_mod.VerifiedDir, session_id: []const u8) !void
 
 const test_session_id = "0123456789abcdef0123456789abcdef";
 
+fn openTestDir(tmp: *std.testing.TmpDir) !io_mod.VerifiedDir {
+    return .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) };
+}
+
 fn failBeforeRename(_: ?*anyopaque) !void {
     return error.TestBeforeRename;
 }
@@ -850,7 +857,8 @@ test "compaction spills inline snapshots and preserves every frame" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     const fat = fixtureFatContent();
     try writeFatSessionLog(alloc, &dir, fat);
@@ -923,7 +931,8 @@ test "compaction migrates small logs that can hold spillable payloads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     const small_spill = "SMALL_LEGACY_INLINE_PAYLOAD_0123456789abcdef\n" ** 128;
     try writeFatSessionLog(alloc, &dir, small_spill);
@@ -946,7 +955,8 @@ test "compaction keeps a clean log byte-identical and pins it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     var file = try dir.dir.createFile(std.testing.io, events_file, .{ .truncate = true });
     {
@@ -973,7 +983,8 @@ test "compaction keeps the original log when the store cannot spill" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     const fat = fixtureFatContent();
     try writeFatSessionLog(alloc, &dir, fat);
@@ -1003,7 +1014,8 @@ test "compaction publishes successful spills and retries only unresolved frames"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     try writeFatSessionLog(alloc, &dir, fixtureFatContent());
     const before = try readLogText(alloc, &dir);
@@ -1035,7 +1047,8 @@ test "compaction leaves permanently oversized packs inline without retrying fore
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     const huge_len = result_store.diff_content_max_bytes / 2 + 4096;
     const huge = try alloc.alloc(u8, huge_len);
@@ -1062,7 +1075,8 @@ test "compaction preserves the original log when interrupted before rename" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     try writeFatSessionLog(alloc, &dir, fixtureFatContent());
     const before = try readLogText(alloc, &dir);
@@ -1083,7 +1097,8 @@ test "compaction reports persistence uncertainty after rename sync failure" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     try writeFatSessionLog(alloc, &dir, fixtureFatContent());
     try std.testing.expectError(
@@ -1112,7 +1127,8 @@ test "compaction removes a regular stale temp before retrying" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     try writeFatSessionLog(alloc, &dir, fixtureFatContent());
     var stale = try dir.dir.createFile(std.testing.io, tmp_file, .{});
@@ -1129,7 +1145,8 @@ test "compaction never follows root session symlinks" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     var victim = try dir.dir.createFile(std.testing.io, "outside-marker", .{});
     try victim.writeStreamingAll(std.testing.io, "keep-me");
@@ -1163,7 +1180,8 @@ test "compaction drops a torn tail the way the open scan truncates it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     const fat = fixtureFatContent();
     try writeFatSessionLog(alloc, &dir, fat);
@@ -1191,7 +1209,8 @@ test "compaction validation rejects a corrupted rewrite" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     var file = try dir.dir.createFile(std.testing.io, tmp_file, .{ .truncate = true });
     {
@@ -1207,7 +1226,8 @@ test "compaction skips a fresh log without parsing it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var dir = try openTestDir(&tmp);
+    defer dir.close();
 
     // A big but clean log (no spillable payloads) is the case the freshness
     // marker exists for: the first pass scans once, later passes skip.
