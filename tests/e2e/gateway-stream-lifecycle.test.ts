@@ -1314,21 +1314,13 @@ describe("gateway stream lifecycle", () => {
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("FLAG_OVERRIDES_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use", "reasoning"],
-            fast_options: [{ type: "toggle" }],
-            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
       },
     );
 
@@ -1372,26 +1364,18 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask --model without --fast drops the compiled-default fast mode", async () => {
-    const root = createFixtureRoot("ask-model-override-drops-fast");
+  test("ask --model without --fast keeps fast mode off", async () => {
+    const root = createFixtureRoot("ask-model-override-no-fast");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("MODEL_ONLY_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          fast_options: [{ type: "toggle" }],
+        }],
       },
     );
 
@@ -1436,8 +1420,8 @@ describe("gateway stream lifecycle", () => {
           {
             id: DEFAULT_MODEL,
             type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
+            tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
           },
           {
             id: MODEL,
@@ -1495,8 +1479,9 @@ describe("gateway stream lifecycle", () => {
       );
       const restoredRequest = JSON.parse(gateway.requests[2]!.body);
       expect(restoredRequest).not.toHaveProperty("reasoning");
+      expect(restoredRequest).not.toHaveProperty("providerOptions.gateway.speed");
       expect(restoredRequest).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
+        providerOptions: { gateway: { caching: "auto" } },
       });
     } finally {
       gateway.stop();

@@ -620,7 +620,6 @@ fn loadStartupStateFromOwnedWorkspace(
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
-        state.provider,
         state.model_source,
         settings.fast_mode,
         detailed.sources.fast_mode,
@@ -673,7 +672,6 @@ const StartupFastMode = struct {
 };
 
 fn resolveStartupFastMode(
-    provider: model_provider.ProviderId,
     model_source: config_runtime.ModelSource,
     configured_fast_mode: ?bool,
     fast_mode_source: config_runtime.ConfigSource,
@@ -689,8 +687,7 @@ fn resolveStartupFastMode(
                 fast_mode_source == binding_source,
         };
     }
-    const enabled = provider == .gateway and model_source == .compiled_default;
-    return .{ .enabled = enabled, .model_bound = enabled };
+    return .{ .enabled = false, .model_bound = false };
 }
 
 pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
@@ -2282,7 +2279,7 @@ test "host-managed startup skips every local credential source" {
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, state.modelCatalogAccess());
 }
 
-test "loadStartupState defaults fast mode on only for the compiled Gateway default and requires bound explicit preferences" {
+test "loadStartupState defaults fast mode off and requires bound explicit preferences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2324,8 +2321,8 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     defer absent.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
-    try std.testing.expect(absent.fast_mode);
-    try std.testing.expect(absent.fast_mode_model_bound);
+    try std.testing.expect(!absent.fast_mode);
+    try std.testing.expect(!absent.fast_mode_model_bound);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
