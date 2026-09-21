@@ -797,16 +797,15 @@ fn spillResultFilePresentation(
     const presentation = result.committed_file_presentation orelse return result;
     if (!try presentationNeedsSpill(presentation)) return result;
     if (result_dir.* == null) {
-        const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                debug_trace.logf(
-                    "session",
-                    "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
-                    .{@errorName(err)},
-                );
-                return result;
-            },
+        const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| {
+            const path_err: anyerror = err;
+            if (path_err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf(
+                "session",
+                "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
+                .{@errorName(path_err)},
+            );
+            return result;
         };
         defer alloc.free(base);
         result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
@@ -999,16 +998,15 @@ fn projectRecoveryResult(
         projected.output.len <= result_store.stored_text_max_bytes)
     {
         if (result_dir.* == null) {
-            const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf(
-                        "session",
-                        "event=recovery_checkpoint_spill_unavailable err={s}; keeping result inline",
-                        .{@errorName(err)},
-                    );
-                    return projected;
-                },
+            const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| {
+                const path_err: anyerror = err;
+                if (path_err == error.OutOfMemory) return error.OutOfMemory;
+                debug_trace.logf(
+                    "session",
+                    "event=recovery_checkpoint_spill_unavailable err={s}; keeping result inline",
+                    .{@errorName(path_err)},
+                );
+                return projected;
             };
             defer alloc.free(base);
             result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
@@ -5290,7 +5288,12 @@ test "legacy import spills committed file snapshots before publishing events" {
         .writable,
     );
     defer capability.deinit();
-    var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+    var pack = try result_store.loadDiffContentManaged(
+        alloc,
+        &capability,
+        "legacy-edit",
+        handle,
+    );
     defer pack.deinit(alloc);
     try std.testing.expectEqualStrings(previous, pack.previous_content.?);
     try std.testing.expectEqualStrings(after, pack.after_content.?);
@@ -6486,7 +6489,12 @@ test "committed edit diff snapshots spill out of the conversation log" {
         .read_only,
     );
     defer capability.deinit();
-    var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+    var pack = try result_store.loadDiffContentManaged(
+        alloc,
+        &capability,
+        "call-edit",
+        handle,
+    );
     defer pack.deinit(alloc);
     try std.testing.expectEqualStrings(previous, pack.previous_content.?);
     try std.testing.expectEqualStrings(after, pack.after_content.?);
@@ -6760,7 +6768,12 @@ test "recovery checkpoint spills diff snapshots into the result store" {
             .read_only,
         );
         defer capability.deinit();
-        var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+        var pack = try result_store.loadDiffContentManaged(
+            alloc,
+            &capability,
+            "call-edit",
+            handle,
+        );
         defer pack.deinit(alloc);
         try std.testing.expectEqualStrings(previous, pack.previous_content.?);
         try std.testing.expectEqualStrings(after, pack.after_content.?);

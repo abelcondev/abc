@@ -4563,7 +4563,12 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return null;
             };
-            const pack = result_store.loadDiffContentManaged(app.alloc, capability, handle) catch |err| {
+            const pack = result_store.loadDiffContentManaged(
+                app.alloc,
+                capability,
+                call_id,
+                handle,
+            ) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume diff content load failed call_id={s} err={s}; rendering preview only",

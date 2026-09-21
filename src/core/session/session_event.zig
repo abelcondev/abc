@@ -24,7 +24,7 @@ pub const conversation_schema_version: u8 = 3;
 
 /// Every historical frame version a reader must still accept. Writers always
 /// emit conversation_schema_version.
-pub fn supportedConversationSchema(version: u8) bool {
+fn supportedConversationSchema(version: u8) bool {
     return version >= 1 and version <= conversation_schema_version;
 }
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;

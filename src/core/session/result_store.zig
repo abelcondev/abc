@@ -331,9 +331,50 @@ pub const DiffContentPack = struct {
     }
 };
 
+const diff_content_handle_prefix = "diff-";
+const diff_content_handle_suffix = ".json";
+const diff_content_digest_hex_bytes = 16;
+const diff_content_handle_bytes = diff_content_handle_prefix.len +
+    diff_content_digest_hex_bytes + 1 + diff_content_digest_hex_bytes +
+    diff_content_handle_suffix.len;
+
+fn isLowerHex(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+    }
+    return true;
+}
+
 pub fn isDiffContentHandle(handle: []const u8) bool {
-    return std.mem.startsWith(u8, handle, "diff-") and
-        std.mem.endsWith(u8, handle, ".json");
+    if (handle.len != diff_content_handle_bytes or
+        !std.mem.startsWith(u8, handle, diff_content_handle_prefix) or
+        !std.mem.endsWith(u8, handle, diff_content_handle_suffix))
+    {
+        return false;
+    }
+    const call_start = diff_content_handle_prefix.len;
+    const call_end = call_start + diff_content_digest_hex_bytes;
+    const content_start = call_end + 1;
+    const content_end = content_start + diff_content_digest_hex_bytes;
+    return handle[call_end] == '-' and
+        isLowerHex(handle[call_start..call_end]) and
+        isLowerHex(handle[content_start..content_end]);
+}
+
+pub fn diffContentHandleMatchesCall(
+    handle: []const u8,
+    tool_call_id: []const u8,
+) bool {
+    if (!isDiffContentHandle(handle)) return false;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tool_call_id, &digest, .{});
+    const expected = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    const start = diff_content_handle_prefix.len;
+    return std.mem.eql(
+        u8,
+        handle[start .. start + diff_content_digest_hex_bytes],
+        &expected,
+    );
 }
 
 pub fn diffContentHandleMatchesContentDigest(
@@ -341,7 +382,11 @@ pub fn diffContentHandleMatchesContentDigest(
     digest: [32]u8,
 ) bool {
     return isDiffContentHandle(handle) and
-        artifact_digest.handleMatchesContentDigest(handle, ".json", digest);
+        artifact_digest.handleMatchesContentDigest(
+            handle,
+            diff_content_handle_suffix,
+            digest,
+        );
 }
 
 /// Persists one edit's previous/after snapshots as a single content-addressed
@@ -367,9 +412,12 @@ pub fn storeDiffContent(
 pub fn loadDiffContentManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
+    tool_call_id: []const u8,
     handle: []const u8,
 ) !DiffContentPack {
-    if (!isDiffContentHandle(handle)) return error.InvalidResultHandle;
+    if (!diffContentHandleMatchesCall(handle, tool_call_id)) {
+        return error.InvalidResultHandle;
+    }
     var reader = try openReaderManaged(alloc, capability, handle);
     defer reader.deinit();
     if (reader.size > diff_content_max_bytes) return error.ResultTooLarge;
@@ -742,15 +790,29 @@ test "diff content packs round trip, bound, and reject tampering" {
         .writable,
     );
     defer capability.deinit();
-    var pack = try loadDiffContentManaged(alloc, &capability, handle);
+    var pack = try loadDiffContentManaged(
+        alloc,
+        &capability,
+        "call-edit-1",
+        handle,
+    );
     defer pack.deinit(alloc);
     try std.testing.expectEqualStrings("line one\nline two\n", pack.previous_content.?);
     try std.testing.expectEqualStrings("line one\nline 2\n", pack.after_content.?);
+    try std.testing.expectError(
+        error.InvalidResultHandle,
+        loadDiffContentManaged(alloc, &capability, "call-edit-2", handle),
+    );
 
     // Null snapshots survive the round trip.
     const partial = try storeDiffContent(alloc, dir, "call-edit-2", null, "created\n");
     defer alloc.free(partial);
-    var partial_pack = try loadDiffContentManaged(alloc, &capability, partial);
+    var partial_pack = try loadDiffContentManaged(
+        alloc,
+        &capability,
+        "call-edit-2",
+        partial,
+    );
     defer partial_pack.deinit(alloc);
     try std.testing.expect(partial_pack.previous_content == null);
     try std.testing.expectEqualStrings("created\n", partial_pack.after_content.?);
@@ -760,13 +822,18 @@ test "diff content packs round trip, bound, and reject tampering" {
     rewritten.deinit(alloc);
     try std.testing.expectError(
         error.DiffContentArtifactChanged,
-        loadDiffContentManaged(alloc, &capability, handle),
+        loadDiffContentManaged(alloc, &capability, "call-edit-1", handle),
     );
 
     // Handles from other artifact families are rejected before any read.
     try std.testing.expectError(
         error.InvalidResultHandle,
-        loadDiffContentManaged(alloc, &capability, "result-shell.txt"),
+        loadDiffContentManaged(
+            alloc,
+            &capability,
+            "call-edit-1",
+            "result-shell.txt",
+        ),
     );
 }
 
