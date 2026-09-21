@@ -900,6 +900,26 @@ fn spillHistoryTurnFilePresentations(
     return projected;
 }
 
+/// Appends one durable history turn after projecting oversized committed-file
+/// snapshots into the session result store. Every product path that seeds,
+/// imports, restores, or commits history uses this boundary.
+fn appendPersistedHistoryTurn(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    writer: *ConversationWriter,
+    timestamp_ms: i64,
+    turn: types.HistoryTurn,
+) !void {
+    var spill_arena = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(spill_arena);
+    const projected = try spillHistoryTurnFilePresentations(
+        spill_arena.allocator(),
+        dir,
+        turn,
+    );
+    try writer.appendHistoryTurn(alloc, timestamp_ms, projected);
+}
+
 /// Returns a copy of the checkpoint whose oversized tool-result outputs are
 /// spilled to the session result store and replaced by their handle. The
 /// source checkpoint is borrowed; the projection owns only its own
@@ -1666,14 +1686,13 @@ fn openConversationWritableSession(
             // prompt can replace the recovery slot. Sequence binding makes a
             // crash after this append safe even if sidecar cleanup did not run.
             const timestamp = io_mod.milliTimestamp();
-            var spill_arena = std.heap.ArenaAllocator.init(alloc);
-            defer mem_utils.deinit_arena(spill_arena);
-            const restored_turn = try spillHistoryTurnFilePresentations(
-                spill_arena.allocator(),
+            try appendPersistedHistoryTurn(
+                alloc,
                 &writable.dir,
+                &conversation_writer,
+                timestamp,
                 checkpoint.interruptedTurn(),
             );
-            try conversation_writer.appendHistoryTurn(alloc, timestamp, restored_turn);
             writeConversationRecoveryState(alloc, &writable.dir, null, conversation_writer.last_seq) catch |err| {
                 debug_trace.logf("session", "compaction source committed but recovery cleanup failed err={s}", .{@errorName(err)});
             };
@@ -3309,17 +3328,12 @@ pub const LoadedWritableSession = struct {
         else
             null;
         errdefer if (work_id) |value| mem_utils.free(alloc, value);
-        var spill_arena = std.heap.ArenaAllocator.init(alloc);
-        defer mem_utils.deinit_arena(spill_arena);
-        const turn = try spillHistoryTurnFilePresentations(
-            spill_arena.allocator(),
-            &self.log.dir,
-            payload.turn,
-        );
-        try self.conversation_writer.appendHistoryTurn(
+        try appendPersistedHistoryTurn(
             alloc,
+            &self.log.dir,
+            &self.conversation_writer,
             timestamp_ms,
-            turn,
+            payload.turn,
         );
         self.writeFirstConversationTitle(alloc, payload.turn);
         if (self.conversation_writer.failure) |err| return err;
@@ -3657,7 +3671,13 @@ fn importLegacySnapshotStateWithOps(
                 .summary = turn.compacted_summary.summary,
             } });
         } else {
-            try writer.appendHistoryTurn(alloc, converted.updated_at_ms, turn);
+            try appendPersistedHistoryTurn(
+                alloc,
+                &writable.dir,
+                &writer,
+                converted.updated_at_ms,
+                turn,
+            );
         }
     }
     const conversation_seq = writer.last_seq;
@@ -4370,8 +4390,10 @@ fn createNativeSession(
     errdefer conversation_writer.deinit();
     for (initial_state.history) |turn| {
         if (turn == .compacted_summary and conversation_writer.last_seq == 0) continue;
-        try conversation_writer.appendHistoryTurn(
+        try appendPersistedHistoryTurn(
             alloc,
+            &writable.dir,
+            &conversation_writer,
             initial_state.updated_at_ms,
             turn,
         );
@@ -5138,6 +5160,91 @@ test "legacy import migrates permissions before publishing controls" {
     defer reopened.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), reopened.state.permission_state.version);
     try std.testing.expectEqualStrings("existing question", reopened.state.history[0].assistant.user.text);
+}
+
+test "legacy import spills committed file snapshots before publishing events" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "legacy-diff-spill-import", 20);
+    defer initial.deinit(alloc);
+
+    const previous = "LEGACY_PREVIOUS_SNAPSHOT_0123456789abcdef\n" ** 180;
+    const after = "LEGACY_AFTER_SNAPSHOT_0123456789abcdef\n" ** 180;
+    var calls = [_]types.ToolCall{.{
+        .id = "legacy-edit",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("legacy-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited source.zig"),
+        .output_bytes = 17,
+        .stored_output_bytes = 17,
+        .committed_file_presentation = .{
+            .path = "source.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = previous,
+            .after_content = after,
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("edit source.zig") },
+        .assistant = @constCast("edit finished"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
+    {
+        var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
+        var writable_owned = true;
+        defer if (writable_owned) writable.deinit(alloc);
+        try io_mod.durableReplaceVerified(alloc, &writable.dir, manifest_file, "{\"schema_version\":3}\n");
+        var migrated = try importLegacySnapshotState(alloc, &writable, initial, 3, 0, null);
+        writable_owned = false;
+        defer migrated.deinit(alloc);
+        const events = try readManagedFileAlloc(
+            alloc,
+            &migrated.log.dir,
+            events_file,
+            session_event.event_frame_max_bytes,
+        );
+        defer alloc.free(events);
+        try std.testing.expect(std.mem.find(u8, events, "LEGACY_PREVIOUS_SNAPSHOT") == null);
+        try std.testing.expect(std.mem.find(u8, events, "LEGACY_AFTER_SNAPSHOT") == null);
+        try std.testing.expect(std.mem.find(u8, events, "\"content_handle\":\"diff-") != null);
+    }
+
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer reopened.deinit(alloc);
+    const result = reopened.state.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    const presentation = result.committed_file_presentation.?;
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    const handle = presentation.content_handle.?;
+    const display_path = try io_mod.dirRealpathAlloc(alloc, reopened.log.dir.dir, ".");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.init(
+        alloc,
+        reopened.log.dir.dir,
+        display_path,
+        .writable,
+    );
+    defer capability.deinit();
+    var pack = try result_store.loadDiffContentManaged(alloc, &capability, handle);
+    defer pack.deinit(alloc);
+    try std.testing.expectEqualStrings(previous, pack.previous_content.?);
+    try std.testing.expectEqualStrings(after, pack.after_content.?);
 }
 
 test "legacy import omits empty file paths without losing execution history" {
