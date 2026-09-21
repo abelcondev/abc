@@ -131,11 +131,19 @@ MCP user authorization. Employees connect their own account with
 `/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
 For `https://mcp.slack.com/mcp`, when the configured Client ID matches the fx app
 published by the web bridge, personal login also uses the HTTPS callback. It
+requests the shared `user_scopes` list from fx.sh for both first login and
+reauthorization. Local scope configuration, saved scopes, Slack's advertised
+capabilities, and scope challenges cannot expand this request. The shared list
+contains the 12 approved personal scopes; changing it requires a deliberate
+configuration update and any necessary Slack approval. This does not revoke
+permissions on previously issued tokens or change token refresh behavior. It
 opens an ephemeral loopback listener instead of the configured `callback_port`,
 keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
 saving to the existing MCP credential store. Other MCP providers and different
 Slack app Client IDs retain their direct callback behavior. Deploy the web
-personal-authorization routes before releasing this CLI. Keep the registered
+personal-authorization routes and scope metadata before releasing this CLI.
+Missing or invalid shared scopes stop authorization rather than falling back
+to Slack's broader capabilities. Keep the registered
 localhost callback for older clients until they have upgraded. Slack workspace
 approval requirements still apply to personal authorization.
 

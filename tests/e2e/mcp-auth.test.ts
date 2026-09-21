@@ -210,6 +210,8 @@ function startAuthFixture(
     rejectDiscoveryWithoutChallenge?: boolean;
     rejectDiscoveryWithRestAuthorizationDocument?: boolean;
     slackBridgeClientId?: string;
+    slackBridgeScopes?: unknown;
+    challengeScope?: string;
     rejectCodeExchange?: boolean;
   } = {},
 ) {
@@ -257,9 +259,11 @@ function startAuthFixture(
         (transport === "sse" && url.pathname === "/messages");
 
       if (url.pathname === "/api/slack/install/config" && options.slackBridgeClientId) {
+        expect(url.searchParams.get("flow")).toBe("auth");
         return Response.json({
           client_id: options.slackBridgeClientId,
           redirect_uri: "https://fx.sh/api/slack/oauth/callback",
+          user_scopes: "slackBridgeScopes" in options ? options.slackBridgeScopes : ["tools.read"],
         });
       }
 
@@ -272,7 +276,7 @@ function startAuthFixture(
             headers: {
               "www-authenticate": options.omitScopes
                 ? `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
-                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
+                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`,
             },
           });
         }
@@ -874,17 +878,24 @@ async function authorizePersonalFixture(activeAuth: AuthFixture, start: URL) {
 }
 
 describe("MCP remote authentication lifecycle", () => {
-  for (const scenario of ["success", "reauth", "denied", "issuer", "exchange", "save"] as const) {
+  for (const scenario of ["success", "reauth", "no-scopes", "extra-scopes", "denied", "issuer", "exchange", "save"] as const) {
     test(`personal Slack HTTPS bridge completes after persistence: ${scenario}`, async () => {
-      const succeeds = scenario === "success" || scenario === "reauth";
+      const succeeds = ["success", "reauth", "no-scopes", "extra-scopes"].includes(scenario);
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test", rejectCodeExchange: scenario === "exchange", rotateAuthorizationToken: scenario === "reauth" });
       const root = createRoot(auth, true, "http", auth.url, false);
-      if (scenario === "reauth") seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+      if (scenario === "reauth") {
+        const path = seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+        const saved = JSON.parse(readFileSync(path, "utf8"));
+        saved.credentials[0].scope = "tools.read offline_access im:history search:read.private";
+        writeFileSync(path, JSON.stringify(saved), { mode: 0o600 });
+      }
       const bridgeOrigin = new URL(auth.url).origin;
       const profilePath = join(root.home, ".fx", "mcp.json");
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       profile.mcp.fixture.oauth.callback_port = Number(new URL(auth.url).port);
+      if (scenario === "no-scopes") delete profile.mcp.fixture.oauth.scopes;
+      if (scenario === "extra-scopes") profile.mcp.fixture.oauth.scopes = ["im:history", "search:read.private"];
       writeFileSync(profilePath, JSON.stringify(profile));
       const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
       const authentication = runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
@@ -892,7 +903,7 @@ describe("MCP remote authentication lifecycle", () => {
       const start = new URL(readFileSync(root.openLog, "utf8").trim());
       expect(start.origin).toBe(bridgeOrigin);
       expect([...start.searchParams.keys()].sort()).toEqual(["challenge", "client_id", "port", "scope", "state"]);
-      expect(start.searchParams.get("scope")).toBe("tools.read offline_access");
+      expect(start.searchParams.get("scope")).toBe("tools.read");
       const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
       const body = await authorizePersonalFixture(auth, start);
       const postCallback = (fields: URLSearchParams, origin = bridgeOrigin) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
@@ -915,7 +926,7 @@ describe("MCP remote authentication lifecycle", () => {
       expect(existsSync(credentialPath)).toBe(succeeds);
       const result = await authentication;
       expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
-      expect(auth.tokenExchanges).toBe(["success", "reauth", "exchange", "save"].includes(scenario) ? 1 : 0);
+      expect(auth.tokenExchanges).toBe(["denied", "issuer"].includes(scenario) ? 0 : 1);
       for (const secret of ["fixture-code", ACCESS_INITIAL, REFRESH_INITIAL, ACCESS_REFRESHED, REFRESH_ROTATED]) {
         expect(result.stdout + result.stderr + JSON.stringify([...response.headers])).not.toContain(secret);
       }
@@ -929,11 +940,28 @@ describe("MCP remote authentication lifecycle", () => {
         expect(credentials).toHaveLength(1);
         expect(credentials[0].access_token).toBe(scenario === "reauth" ? ACCESS_REFRESHED : ACCESS_INITIAL);
         expect(credentials[0].refresh_token).toBe(scenario === "reauth" ? REFRESH_ROTATED : REFRESH_INITIAL);
+        expect(credentials[0].scope).toBe("tools.read");
         expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
       } else {
         expect(result.stdout).not.toContain("Authenticated MCP server");
       }
       expect(await postCallback(body).catch(() => null)).toBe(null);
+    }, 20_000);
+  }
+
+  for (const scopes of [undefined, [], [""], ["tools.read im:history"], ["bad<scope"], ["x".repeat(257)]]) {
+    test(`personal Slack rejects invalid shared scopes: ${JSON.stringify(scopes)}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test", slackBridgeScopes: scopes });
+      const root = createRoot(auth, true, "http", auth.url, false);
+      const result = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("InvalidSlackBridgeConfiguration");
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.tokenExchanges).toBe(0);
+      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
     }, 20_000);
   }
 
@@ -948,12 +976,13 @@ describe("MCP remote authentication lifecycle", () => {
     const opened = new URL(readFileSync(root.openLog, "utf8").trim());
     expect(opened.pathname).toBe("/authorize");
     expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
+    expect(opened.searchParams.get("scope")).toBe("tools.read offline_access");
     expect(auth.tokenExchanges).toBe(1);
   }, 20_000);
 
   test.skipIf(!tmuxAvailable())("in-session personal Slack HTTPS auth reconnects after saving", async () => {
     upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test" });
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: "fx-mcp-auth-test", challengeScope: "im:history", slackBridgeScopes: ["tools.read", "tools.approved"] });
     const root = createRoot(auth, true, "http", auth.url, false);
     const bridgeOrigin = new URL(auth.url).origin;
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
@@ -965,6 +994,7 @@ describe("MCP remote authentication lifecycle", () => {
     await tui.sendText("/mcp auth fixture --open");
     expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
     const start = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(start.searchParams.get("scope")).toBe("tools.read tools.approved");
     const body = await authorizePersonalFixture(auth, start);
     const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
       method: "POST", headers: { origin: bridgeOrigin }, body, redirect: "manual",

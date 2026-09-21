@@ -1042,10 +1042,13 @@ pub fn authorizeAutomated(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
 ) !AuthorizationResult {
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config.client_id);
+    defer if (bridge) |value| alloc.free(value.scope);
     return authorizeWithRedirect(
         alloc,
         options,
         "http://localhost:3000/callback",
+        if (bridge) |value| value.scope else null,
         null,
         requestAutomatedAuthorization,
     );
@@ -1196,7 +1199,9 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    const bridge_origin = try slack_bridge_origin(alloc, options.endpoint, options.config.client_id);
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config.client_id);
+    defer if (bridge) |value| alloc.free(value.scope);
+    const bridge_origin = if (bridge) |value| value.origin else null;
     if (bridge_origin != null and options.completion == null) return error.MissingAuthorizationCompletion;
     errdefer if (options.completion) |completion| completion.finish(false);
     const configured_port = if (bridge_origin == null) options.config.callback_port else null;
@@ -1244,6 +1249,7 @@ pub fn authorizeInteractive(
             .lifecycle_cancel_flag = options.lifecycle_cancel_flag,
         },
         redirect_uri,
+        if (bridge) |value| value.scope else null,
         &context,
         requestInteractiveAuthorization,
     );
@@ -1251,7 +1257,9 @@ pub fn authorizeInteractive(
 
 const slack_callback_url = "https://fx.sh/api/slack/oauth/callback";
 
-fn slack_bridge_origin(alloc: Allocator, endpoint: []const u8, client_id: ?[]const u8) !?[]const u8 {
+const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
+
+fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_id: ?[]const u8) !?SlackBridgeConfig {
     const configured_client = client_id orelse return null;
     const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
@@ -1263,16 +1271,32 @@ fn slack_bridge_origin(alloc: Allocator, endpoint: []const u8, client_id: ?[]con
     const resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
     defer if (fixture) alloc.free(resource);
     if (!std.mem.eql(u8, endpoint, resource)) return null;
-    const url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config", .{origin});
+    const url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config?flow=auth", .{origin});
     defer alloc.free(url);
     var response = try request(alloc, .GET, url, null, null, &.{});
     defer response.deinit(alloc);
     if (response.status != .ok) return error.SlackBridgeUnavailable;
     try validateJsonContentType(response.content_type);
-    const config = try std.json.parseFromSlice(struct { client_id: []const u8, redirect_uri: []const u8 }, alloc, response.body, .{ .ignore_unknown_fields = true });
+    const config = try std.json.parseFromSlice(struct {
+        client_id: []const u8,
+        redirect_uri: []const u8,
+        user_scopes: ?[]const []const u8 = null,
+    }, alloc, response.body, .{ .ignore_unknown_fields = true });
     defer config.deinit();
     if (!std.mem.eql(u8, config.value.redirect_uri, slack_callback_url)) return error.InvalidSlackBridgeConfiguration;
-    return if (std.mem.eql(u8, configured_client, config.value.client_id)) origin else null;
+    if (!std.mem.eql(u8, configured_client, config.value.client_id)) return null;
+    const scopes = config.value.user_scopes orelse return error.InvalidSlackBridgeConfiguration;
+    if (scopes.len == 0 or scopes.len > max_scope_tokens) return error.InvalidSlackBridgeConfiguration;
+    for (scopes) |scope| {
+        if (scope.len == 0 or scope.len > max_scope_token_bytes) return error.InvalidSlackBridgeConfiguration;
+        for (scope) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '_' and byte != '-') return error.InvalidSlackBridgeConfiguration;
+        }
+    }
+    const scope = (try requestedScope(alloc, scopes, null, &.{}, null, false)).?;
+    errdefer alloc.free(scope);
+    if (scope.len > 1024) return error.InvalidSlackBridgeConfiguration;
+    return .{ .origin = origin, .scope = scope };
 }
 
 const AuthorizationRequestFn = *const fn (
@@ -1286,6 +1310,7 @@ fn authorizeWithRedirect(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
     redirect_uri: []const u8,
+    fixed_scope: ?[]const u8,
     authorization_ctx: ?*anyopaque,
     request_authorization: AuthorizationRequestFn,
 ) !AuthorizationResult {
@@ -1330,7 +1355,7 @@ fn authorizeWithRedirect(
     defer registration.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
 
-    const scope = try requestedScope(
+    const scope = if (fixed_scope) |value| try alloc.dupe(u8, value) else try requestedScope(
         alloc,
         options.config.scopes,
         options.challenge.scope,
