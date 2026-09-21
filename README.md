@@ -121,6 +121,8 @@ After the CLI saves the installation, the browser returns to an fx.sh confirmati
 page. You can close that tab or refresh it after the command exits.
 
 `fx slack status --json` reports local installation metadata without tokens.
+Plain-text output omits Slack IDs and shows expiration as a readable UTC date
+and time. JSON output retains the IDs and Unix timestamps for scripts.
 `fx slack refresh` rotates the local bot credentials when needed. Credentials
 live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
 or background refresh service is created. An expired refresh token requires
