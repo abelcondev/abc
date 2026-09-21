@@ -868,15 +868,21 @@ fn contentAddressedHandle(
     };
 }
 
+pub fn isReplayHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "fx-command-replay-") and
+        std.mem.endsWith(u8, handle, ".bin");
+}
+
 pub fn handleMatchesContentDigest(
     handle: []const u8,
     digest: [Sha256.digest_length]u8,
 ) bool {
-    return artifact_digest.handleMatchesContentDigest(
-        handle,
-        ".bin",
-        digest,
-    );
+    return isReplayHandle(handle) and
+        artifact_digest.handleMatchesContentDigest(
+            handle,
+            ".bin",
+            digest,
+        );
 }
 
 pub fn hasContentDigest(handle: []const u8) bool {

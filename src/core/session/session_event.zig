@@ -342,6 +342,9 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 try validateOptionalConversationText(feedback);
             }
             if (result.committed_file_presentation) |presentation| {
+                if (!types.committedFilePresentationContentSourceValid(presentation)) {
+                    return rejectInvalidConversationEvent("tool-result-file-presentation-source");
+                }
                 try validateConversationPath(presentation.path);
                 for (presentation.lines) |line| {
                     try validateOptionalConversationText(line.text);
@@ -3574,6 +3577,57 @@ test "conversation frame carries a spilled diff content handle" {
     const presentation = decoded.value.event.tool_result.committed_file_presentation.?;
     try std.testing.expectEqualStrings("diff-0123456789abcdef-0123456789abcdef.json", presentation.content_handle.?);
     try std.testing.expect(presentation.previous_content == null);
+}
+
+test "conversation frame rejects competing inline and artifact diff sources" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result.txt",
+            .stored_bytes = 0,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{},
+                .additions = 1,
+                .deletions = 1,
+                .truncated = false,
+                .after_content = "inline",
+                .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+            },
+        } },
+    }));
+}
+
+test "conversation frame rejects a wrongly typed diff content handle" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result.txt",
+            .stored_bytes = 0,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{},
+                .additions = 1,
+                .deletions = 1,
+                .truncated = false,
+                .content_handle = "result-shell-0123456789abcdef.txt",
+            },
+        } },
+    }));
 }
 
 test "conversation frame rejects an oversized diff content handle" {

@@ -227,6 +227,9 @@ fn writeCommittedFilePresentationJson(
     writer: *std.Io.Writer,
     presentation: types.CommittedFilePresentation,
 ) !void {
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"path\":");
     try std.json.Stringify.value(presentation.path, .{}, writer);
     try writer.writeAll(",\"kind\":");
@@ -1009,7 +1012,7 @@ fn parseCommittedFilePresentation(
     errdefer if (lifecycle_id) |id| mem_utils.free(alloc, @constCast(id.call_id));
     const content_handle = try optionalStringDup(alloc, object.get("content_handle"));
     errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
-    return .{
+    const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = try parseCommittedFilePresentationKind(try requireString(object, "kind")),
         .lines = lines,
@@ -1021,6 +1024,10 @@ fn parseCommittedFilePresentation(
         .lifecycle_id = lifecycle_id,
         .content_handle = content_handle,
     };
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
+    return presentation;
 }
 
 fn parseCommittedFilePresentationLines(

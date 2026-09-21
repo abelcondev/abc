@@ -410,11 +410,11 @@ fn encodeDiffContentPack(
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.writeAll("{\"previous_content\":");
-    try writeOptionalPackString(&out.writer, previous_content);
-    try out.writer.writeAll(",\"after_content\":");
-    try writeOptionalPackString(&out.writer, after_content);
-    try out.writer.writeByte('}');
+    out.writer.writeAll("{\"previous_content\":") catch return error.OutOfMemory;
+    writeOptionalPackString(&out.writer, previous_content) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"after_content\":") catch return error.OutOfMemory;
+    writeOptionalPackString(&out.writer, after_content) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
     if (out.written().len > diff_content_max_bytes) return error.DiffContentTooLarge;
     return try out.toOwnedSlice();
 }
@@ -642,6 +642,11 @@ fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const u8,
     );
 }
 
+pub fn isStoredTextHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "result-") and
+        std.mem.endsWith(u8, handle, ".txt");
+}
+
 pub fn handleMatchesContentDigest(
     handle: []const u8,
     digest: [32]u8,
@@ -763,6 +768,34 @@ test "diff content packs round trip, bound, and reject tampering" {
         error.InvalidResultHandle,
         loadDiffContentManaged(alloc, &capability, "result-shell.txt"),
     );
+}
+
+test "diff content encoding propagates every allocation failure" {
+    const backing = std.testing.allocator;
+    const previous = "before\n" ** 800;
+    const after = "after\n" ** 800;
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    const encoded = try encodeDiffContentPack(
+        probe.allocator(),
+        previous,
+        after,
+    );
+    probe.allocator().free(encoded);
+    const allocation_count = probe.alloc_index;
+    try std.testing.expect(allocation_count > 1);
+
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            backing,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            encodeDiffContentPack(failing.allocator(), previous, after),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "saved preparation externalizes small results" {
@@ -1285,6 +1318,9 @@ test "managed result handles authenticate stored content" {
     defer alloc.free(handle);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    try std.testing.expect(isStoredTextHandle(handle));
+    try std.testing.expect(!isStoredTextHandle("image-result-shell-0123456789abcdef.txt"));
+    try std.testing.expect(!isStoredTextHandle("other-0123456789abcdef.txt"));
     try std.testing.expect(handleMatchesContentDigest(handle, digest));
     std.crypto.hash.sha2.Sha256.hash("xuthenticated result", &digest, .{});
     try std.testing.expect(!handleMatchesContentDigest(handle, digest));

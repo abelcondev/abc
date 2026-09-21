@@ -1704,6 +1704,9 @@ fn writeCommittedFilePresentation(
     writer: *std.Io.Writer,
     presentation: types.CommittedFilePresentation,
 ) !void {
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"path\":");
     try writeDurableBytes(writer, presentation.path);
     try writer.writeAll(",\"kind\":");
@@ -2500,7 +2503,7 @@ fn parseCommittedFilePresentation(
     else
         null;
     errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
-    return .{
+    const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = std.meta.stringToEnum(
             types.CommittedFilePresentationKind,
@@ -2515,6 +2518,10 @@ fn parseCommittedFilePresentation(
         .lifecycle_id = lifecycle_id,
         .content_handle = content_handle,
     };
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
+    return presentation;
 }
 
 fn parseCommittedFilePresentationLines(
@@ -3777,6 +3784,15 @@ test "committed file presentation codec reads shipped and spilled shapes" {
     );
     try std.testing.expect(spilled_presentation.previous_content == null);
     try std.testing.expect(spilled_presentation.after_content == null);
+
+    const competing_sources =
+        "{\"path\":\"note.txt\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":\"inline\",\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"}";
+    var competing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, competing_sources, .{});
+    defer competing_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseCommittedFilePresentation(alloc, competing_parsed.value),
+    );
 
     // Unknown keys still fail closed.
     const unknown_key =

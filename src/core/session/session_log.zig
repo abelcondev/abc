@@ -774,7 +774,10 @@ const recovery_checkpoint_inline_output_max_bytes: usize = result_store.preview_
 /// result-store artifact and the record carries its content-addressed handle.
 const file_presentation_inline_max_bytes: usize = result_store.preview_bytes;
 
-fn presentationNeedsSpill(presentation: types.CommittedFilePresentation) bool {
+fn presentationNeedsSpill(presentation: types.CommittedFilePresentation) !bool {
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidCommittedFilePresentation;
+    }
     if (presentation.content_handle != null) return false;
     const previous_bytes = if (presentation.previous_content) |content| content.len else 0;
     const after_bytes = if (presentation.after_content) |content| content.len else 0;
@@ -792,24 +795,21 @@ fn spillResultFilePresentation(
     result: types.PersistedToolResult,
 ) !types.PersistedToolResult {
     const presentation = result.committed_file_presentation orelse return result;
-    if (!presentationNeedsSpill(presentation)) return result;
+    if (!try presentationNeedsSpill(presentation)) return result;
     if (result_dir.* == null) {
-        const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| {
-            debug_trace.logf(
-                "session",
-                "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
-                .{@errorName(err)},
-            );
-            return result;
+        const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
+                    .{@errorName(err)},
+                );
+                return result;
+            },
         };
-        result_dir.* = std.fs.path.join(alloc, &.{ base, "tool-results" }) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event=diff_content_spill_unavailable err={s}; keeping presentation inline",
-                .{@errorName(err)},
-            );
-            return result;
-        };
+        defer alloc.free(base);
+        result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
     }
     const handle = result_store.storeDiffContent(
         alloc,
@@ -817,13 +817,16 @@ fn spillResultFilePresentation(
         result.tool_call_id,
         presentation.previous_content,
         presentation.after_content,
-    ) catch |err| {
-        debug_trace.logf(
-            "session",
-            "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline",
-            .{ result.tool_call_id, @errorName(err) },
-        );
-        return result;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "session",
+                "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline",
+                .{ result.tool_call_id, @errorName(err) },
+            );
+            return result;
+        },
     };
     debug_trace.logf(
         "session",
@@ -862,7 +865,7 @@ fn spillHistoryTurnFilePresentations(
     scan: for (execution.tool_steps) |step| {
         for (step.tool_results) |result| {
             if (result.committed_file_presentation) |presentation| {
-                if (presentationNeedsSpill(presentation)) {
+                if (try presentationNeedsSpill(presentation)) {
                     needs_spill = true;
                     break :scan;
                 }
@@ -878,7 +881,7 @@ fn spillHistoryTurnFilePresentations(
         var step_needs_spill = false;
         for (step.tool_results) |result| {
             if (result.committed_file_presentation) |presentation| {
-                if (presentationNeedsSpill(presentation)) {
+                if (try presentationNeedsSpill(presentation)) {
                     step_needs_spill = true;
                     break;
                 }
@@ -941,7 +944,7 @@ fn spillRecoveryCheckpointOutputs(
                 break :scan;
             }
             if (result.committed_file_presentation) |presentation| {
-                if (presentationNeedsSpill(presentation)) {
+                if (try presentationNeedsSpill(presentation)) {
                     spills = true;
                     break :scan;
                 }
@@ -963,7 +966,7 @@ fn spillRecoveryCheckpointOutputs(
                 break;
             }
             if (result.committed_file_presentation) |presentation| {
-                if (presentationNeedsSpill(presentation)) {
+                if (try presentationNeedsSpill(presentation)) {
                     results_changed = true;
                     break;
                 }
@@ -996,7 +999,18 @@ fn projectRecoveryResult(
         projected.output.len <= result_store.stored_text_max_bytes)
     {
         if (result_dir.* == null) {
-            const base = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+            const base = io_mod.dirRealpathAlloc(alloc, dir.dir, ".") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf(
+                        "session",
+                        "event=recovery_checkpoint_spill_unavailable err={s}; keeping result inline",
+                        .{@errorName(err)},
+                    );
+                    return projected;
+                },
+            };
+            defer alloc.free(base);
             result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
         }
         const handle = result_store.storeLargeResult(
@@ -1005,13 +1019,16 @@ fn projectRecoveryResult(
             result.tool_call_id,
             result.tool_name,
             result.output,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event=recovery_checkpoint_spill_failed tool_call_id={s} err={s}; keeping result inline",
-                .{ result.tool_call_id, @errorName(err) },
-            );
-            return projected;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf(
+                    "session",
+                    "event=recovery_checkpoint_spill_failed tool_call_id={s} err={s}; keeping result inline",
+                    .{ result.tool_call_id, @errorName(err) },
+                );
+                return projected;
+            },
         };
         projected.output_handle = handle;
         projected.stored_output_bytes = result.output.len;
@@ -3752,6 +3769,9 @@ fn importLegacySnapshotStateWithOps(
     converted.history = hydrated.history;
     hydrated.history = &.{};
     converted.context_history_start = hydrated.context_history_start;
+    if (converted.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    converted.recovery_checkpoint = hydrated.recovery_checkpoint;
+    hydrated.recovery_checkpoint = null;
 
     var event_file = try openManagedFile(
         &writable.dir,
@@ -4406,6 +4426,13 @@ fn createNativeSession(
         synthesized_usage = null;
     }
     try writeConversationControlState(alloc, &writable.dir, state, conversation_writer.last_seq);
+    const persisted_state = (try loadConversationStateIfPresent(
+        alloc,
+        &writable.dir,
+        writable.session_id,
+    )) orelse return error.InvalidSessionMetadata;
+    state.deinit(alloc);
+    state = persisted_state;
     const active_id = try alloc.dupe(u8, writable.session_id);
     errdefer mem_utils.free(alloc, active_id);
     const generation = randomIdentifier();
@@ -5204,6 +5231,20 @@ test "legacy import spills committed file snapshots before publishing events" {
         .execution = .{ .tool_steps = &steps },
     } }};
     initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("edit source.zig") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    initial.recovery_checkpoint = try checkpoint.dupe(alloc);
     try temp.root.sessions.?.dir.createDir(std.testing.io, initial.id, private_dir_permissions);
     {
         var writable = try temp.root.openWritableSessionDir(alloc, initial.id, lock_deadline_ms);
@@ -5223,6 +5264,10 @@ test "legacy import spills committed file snapshots before publishing events" {
         try std.testing.expect(std.mem.find(u8, events, "LEGACY_PREVIOUS_SNAPSHOT") == null);
         try std.testing.expect(std.mem.find(u8, events, "LEGACY_AFTER_SNAPSHOT") == null);
         try std.testing.expect(std.mem.find(u8, events, "\"content_handle\":\"diff-") != null);
+        const migrated_checkpoint_presentation = migrated.state.recovery_checkpoint.?.execution.tool_steps[0].tool_results[0].committed_file_presentation.?;
+        try std.testing.expect(migrated_checkpoint_presentation.previous_content == null);
+        try std.testing.expect(migrated_checkpoint_presentation.after_content == null);
+        try std.testing.expect(migrated_checkpoint_presentation.content_handle != null);
     }
 
     var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{});
@@ -5232,6 +5277,10 @@ test "legacy import spills committed file snapshots before publishing events" {
     try std.testing.expect(presentation.previous_content == null);
     try std.testing.expect(presentation.after_content == null);
     const handle = presentation.content_handle.?;
+    const checkpoint_presentation = reopened.state.recovery_checkpoint.?.execution.tool_steps[0].tool_results[0].committed_file_presentation.?;
+    try std.testing.expect(checkpoint_presentation.previous_content == null);
+    try std.testing.expect(checkpoint_presentation.after_content == null);
+    try std.testing.expectEqualStrings(handle, checkpoint_presentation.content_handle.?);
     const display_path = try io_mod.dirRealpathAlloc(alloc, reopened.log.dir.dir, ".");
     defer alloc.free(display_path);
     var capability = try session_child_store.SessionChildCapability.init(
@@ -6441,6 +6490,122 @@ test "committed edit diff snapshots spill out of the conversation log" {
     defer pack.deinit(alloc);
     try std.testing.expectEqualStrings(previous, pack.previous_content.?);
     try std.testing.expectEqualStrings(after, pack.after_content.?);
+}
+
+test "committed edit spill projection propagates allocation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) };
+    defer dir.close();
+    const content = "snapshot-content-0123456789abcdef\n" ** 180;
+    const result = types.PersistedToolResult{
+        .tool_call_id = @constCast("call-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = content,
+            .after_content = content,
+        },
+    };
+    var result_dir: ?[]const u8 = "/unused-tool-results";
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        spillResultFilePresentation(failing.allocator(), &dir, &result_dir, result),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "recovery checkpoint output spill propagates allocation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) };
+    defer dir.close();
+    const output = "checkpoint-output-0123456789abcdef\n" ** 180;
+    const result = types.PersistedToolResult{
+        .tool_call_id = @constCast("call-shell"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+    };
+    var result_dir: ?[]const u8 = null;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        projectRecoveryResult(failing.allocator(), &dir, &result_dir, result),
+    );
+}
+
+test "native session seed returns the persisted diff snapshot representation" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "native-seed-diff-spill", 10);
+    defer initial.deinit(alloc);
+    const content = "native-seed-snapshot-0123456789abcdef\n" ** 180;
+    var calls = [_]types.ToolCall{.{
+        .id = "seed-edit",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("seed-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited"),
+        .output_handle = @constCast("result-edit_file-seed.txt"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .committed_file_presentation = .{
+            .path = "src/a.zig",
+            .kind = .edited,
+            .lines = &.{},
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+            .previous_content = content,
+            .after_content = content,
+        },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("seed history") },
+        .assistant = @constCast("seeded"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    initial.history = try session.snapshotOwnedContextHistory(alloc, &history, 0, 0);
+
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const presentation = loaded.state.history[0].assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation.?;
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expect(presentation.content_handle != null);
+    var persisted = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer persisted.deinit(alloc);
+    try std.testing.expect(try durableStatesEqual(loaded.state, persisted));
 }
 
 test "small committed edit snapshots stay inline in the conversation log" {

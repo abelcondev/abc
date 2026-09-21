@@ -1019,6 +1019,18 @@ pub const CommittedFilePresentation = struct {
     content_handle: ?[]const u8 = null,
 };
 
+/// Rejects competing or wrongly typed durable content authorities. A
+/// preview-only presentation may have neither inline snapshots nor a handle.
+pub fn committedFilePresentationContentSourceValid(
+    presentation: CommittedFilePresentation,
+) bool {
+    const handle = presentation.content_handle orelse return true;
+    return presentation.previous_content == null and
+        presentation.after_content == null and
+        std.mem.startsWith(u8, handle, "diff-") and
+        std.mem.endsWith(u8, handle, ".json");
+}
+
 pub const PersistedToolResult = struct {
     tool_images: []ToolImage = &.{},
     tool_image_handle: ?[]u8 = null,
