@@ -827,6 +827,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(menu).toContain("MCP 1");
       expect(menu).toContain("canary");
       expect(menu).toContain("Disabled");
+      expect(menu).toContain("fx mcp list");
       expect(menu).toContain("MISSING_WORKSPACE_COMMAND");
       expect(menu).toContain("field command");
       expect(menu).not.toContain("secret-prefix");

@@ -93,14 +93,12 @@ pub noinline fn composeMcpMenuRow(
     if (show_header and row_index == 1 and
         projection.state.screen == .browse and
         projection.state.section == .servers and
-        projection.configuration_issue_message != null)
+        projection.configuration_issues.len > 0)
     {
-        return composeTextRow(
+        return composeConfigurationIssueRow(
             alloc,
-            projection.configuration_issue_message.?,
+            projection.configuration_issues,
             width,
-            ui_render.warning_style,
-            2,
         );
     }
     if (show_header and row_index == 1) {
@@ -234,7 +232,7 @@ fn composeBrowseRow(
         const text = if (projection.state.query_len > 0)
             "No matching MCP items."
         else switch (projection.state.section) {
-            .servers => if (projection.configuration_issue_count == 0)
+            .servers => if (projection.configuration_issues.len == 0)
                 "No MCP servers configured."
             else
                 "No MCP servers available; configuration errors need attention.",
@@ -609,6 +607,42 @@ fn composeTextRow(
     return row;
 }
 
+fn composeConfigurationIssueRow(
+    alloc: Allocator,
+    issues: []const mcp_health.ConfigurationIssue,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.warning_style);
+    const indent: usize = @min(2, width);
+    try row.appendNTimes(alloc, ' ', indent);
+    const content_width = @as(usize, width) -| indent;
+    var summary_buf: [96]u8 = undefined;
+    const summary = if (issues.len == 1)
+        "1 project MCP configuration error. Run fx mcp list for details. "
+    else
+        std.fmt.bufPrint(
+            &summary_buf,
+            "{d} project MCP configuration errors. Run fx mcp list for details. ",
+            .{issues.len},
+        ) catch "Project MCP configuration errors. Run fx mcp list for details. ";
+    const summary_width = display_width.visibleWidth(summary);
+    if (summary_width >= content_width) {
+        try appendTerminalSafeSingleLine(alloc, &row, summary, content_width);
+    } else {
+        try row.appendSlice(alloc, summary);
+        try appendTerminalSafeSingleLine(
+            alloc,
+            &row,
+            issues[0].message,
+            content_width - summary_width,
+        );
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 fn cloneClipped(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
@@ -888,17 +922,19 @@ test "MCP menu every screen and section renders through the VT" {
         &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
     );
 
-    projection.configuration_issue_count = 1;
-    projection.configuration_issue_message = ".mcp.json server 'broken' is missing MISSING_COMMAND in field command";
+    const configuration_issues = [_]mcp_health.ConfigurationIssue{
+        .{ .message = @constCast(".mcp.json server 'broken' is missing MISSING_COMMAND in field command") },
+        .{ .message = @constCast(".mcp.json server 'other' is invalid") },
+    };
+    projection.configuration_issues = &configuration_issues;
     try expectMcpMenuVtContains(
         alloc,
         projection,
         width,
         max_inline_rows,
-        &.{ "MCP 1", "fixture", ".mcp.json server 'broken'", "MISSING_COMMAND" },
+        &.{ "MCP 1", "fixture", "2 project MCP configuration errors", "fx mcp list", ".mcp.json server 'broken'" },
     );
-    projection.configuration_issue_count = 0;
-    projection.configuration_issue_message = null;
+    projection.configuration_issues = &.{};
 
     var unauthenticated = server;
     unauthenticated.transport = .http;
