@@ -3681,7 +3681,7 @@ pub fn retintEntriesForTheme(
     if (from.light == to.light) return;
     try self.assertCanMutateTranscript();
 
-    var token_buf: [80]ThemeToken = undefined;
+    var token_buf: [theme_retint_field_count]ThemeToken = undefined;
     const tokens = retintTokens(from, to, &token_buf);
     if (tokens.len == 0) return;
 
@@ -3773,33 +3773,58 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
 fn retintTokens(
     from: shared_theme.Theme,
     to: shared_theme.Theme,
-    buf: *[80]ThemeToken,
+    buf: *[theme_retint_field_count]ThemeToken,
 ) []const ThemeToken {
     const from_builtin = std.mem.eql(u8, from.name, shared_theme.fx_dark.name) or std.mem.eql(u8, from.name, shared_theme.fx_light.name);
     const to_builtin = std.mem.eql(u8, to.name, shared_theme.fx_dark.name) or std.mem.eql(u8, to.name, shared_theme.fx_light.name);
     if (from_builtin and to_builtin) {
-        const tokens = if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
-        const n = @min(tokens.len, buf.len);
-        @memcpy(buf[0..n], tokens[0..n]);
-        return buf[0..n];
+        return if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
     }
 
     var n: usize = 0;
-    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
-        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
-            n = appendTokenPair(buf, n, @field(from, field.name), @field(to, field.name));
-        }
+    for (0..theme_retint_field_count) |index| {
+        n = appendTokenPair(
+            buf,
+            n,
+            themeRetintField(&from, index),
+            themeRetintField(&to, index),
+        );
     }
-    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
-        if (field.type == []const u8) {
-            n = appendTokenPair(buf, n, @field(from.syntax, field.name), @field(to.syntax, field.name));
-        }
-    }
-    std.mem.sort(ThemeToken, buf[0..n], {}, tokenLongerFromFirst);
+    sortThemeTokensLongestFirst(buf[0..n]);
     return buf[0..n];
 }
 
-fn appendTokenPair(buf: *[80]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
+const theme_retint_field_count: usize = blk: {
+    var count: usize = 0;
+    for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
+        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) count += 1;
+    }
+    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
+        if (field.type == []const u8) count += 1;
+    }
+    break :blk count;
+};
+
+/// Keep field dispatch outside the admission loop so each theme slot does not
+/// expand another copy of duplicate detection and token insertion.
+noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
+    comptime var field_index: usize = 0;
+    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
+        if (comptime field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
+            if (index == field_index) return @field(theme.*, field.name);
+            field_index += 1;
+        }
+    }
+    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
+        if (comptime field.type == []const u8) {
+            if (index == field_index) return @field(theme.syntax, field.name);
+            field_index += 1;
+        }
+    }
+    unreachable;
+}
+
+fn appendTokenPair(buf: *[theme_retint_field_count]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
     if (from.len == 0 or std.mem.eql(u8, from, to) or n >= buf.len) return n;
     for (buf[0..n]) |existing| {
         if (std.mem.eql(u8, existing.from, from)) return n;
@@ -3808,8 +3833,17 @@ fn appendTokenPair(buf: *[80]ThemeToken, n: usize, from: []const u8, to: []const
     return n + 1;
 }
 
-fn tokenLongerFromFirst(_: void, a: ThemeToken, b: ThemeToken) bool {
-    return a.from.len > b.from.len;
+fn sortThemeTokensLongestFirst(tokens: []ThemeToken) void {
+    if (tokens.len < 2) return;
+    // The list is bounded by the theme's fields; a local insertion sort avoids
+    // pulling a general block-sort implementation into this cold path.
+    for (tokens[1..], 1..) |token, index| {
+        var insert_at = index;
+        while (insert_at > 0 and token.from.len > tokens[insert_at - 1].from.len) : (insert_at -= 1) {
+            tokens[insert_at] = tokens[insert_at - 1];
+        }
+        tokens[insert_at] = token;
+    }
 }
 
 fn retintThemeBytes(
