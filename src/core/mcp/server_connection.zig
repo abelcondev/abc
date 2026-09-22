@@ -53,10 +53,11 @@ pub const DetachedTransport = struct {
         self.* = undefined;
     }
 
-    /// Cancelled teardown: kills the stdio child and skips the remote session
-    /// DELETE, so a cancelled connection never starts another round trip.
+    /// Cancelled teardown: kills the stdio child without a drain and skips the
+    /// remote session DELETE, so a cancelled connection never starts another
+    /// round trip.
     pub fn deinitImmediate(self: *DetachedTransport) void {
-        if (self.dispatcher) |dispatcher| dispatcher.deinitImmediate();
+        if (self.dispatcher) |dispatcher| dispatcher.deinitAbandoned();
         if (self.legacy_http) |client| client.deinitWithoutSessionTermination();
         if (self.legacy_sse) |client| client.deinit();
         self.* = undefined;
@@ -320,13 +321,13 @@ pub const DetachedConnection = struct {
         self.deinitWithDispatcherMode(alloc, .graceful);
     }
 
-    /// Discard teardown: kill the stdio child immediately instead of waiting
-    /// out the stdin-close and SIGTERM grace windows.
+    /// Discard teardown: kill the stdio child after a short drain instead of
+    /// waiting out the stdin-close and SIGTERM grace windows.
     pub fn deinitImmediate(self: *DetachedConnection, alloc: Allocator) void {
         self.deinitWithDispatcherMode(alloc, .immediate);
     }
 
-    /// Process-exit teardown: kill the stdio child immediately and skip the
+    /// Process-exit teardown: kill the stdio child without a drain and skip the
     /// remote session DELETE. The server expires the abandoned session, and a
     /// network round trip per server must not hold the user's exit.
     pub fn deinitForProcessExit(self: *DetachedConnection, alloc: Allocator) void {
@@ -345,7 +346,8 @@ pub const DetachedConnection = struct {
             switch (dispatcher_shutdown) {
                 .forced => dispatcher.deinitForced(),
                 .graceful => dispatcher.deinit(),
-                .immediate, .process_exit => dispatcher.deinitImmediate(),
+                .immediate => dispatcher.deinitImmediate(),
+                .process_exit => dispatcher.deinitAbandoned(),
             }
         }
         if (self.legacy_http) |client| switch (dispatcher_shutdown) {

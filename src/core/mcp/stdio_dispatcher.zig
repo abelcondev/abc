@@ -11,6 +11,10 @@ const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const shutdown_grace_ms: i64 = 1_000;
 const termination_grace_ms: i64 = 1_000;
+/// Immediate-shutdown drain window: after stdin closes, give the child a short
+/// beat to read already-written frames (for example a cancellation
+/// notification) and exit before the kill lands.
+const immediate_drain_ms: i64 = 50;
 const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
 
@@ -800,14 +804,22 @@ pub const StdioDispatcher = struct {
         self.destroy();
     }
 
-    /// Process-exit path: kill the child immediately instead of waiting out
+    /// Discard path: kill the child after a short drain instead of waiting out
     /// the grace windows; the reader thread unblocks as soon as the child
     /// dies, so the join below stays bounded.
     fn shutdownImmediate(self: *StdioDispatcher) void {
         self.shutdownWithMode(.immediate);
     }
 
-    const ShutdownMode = enum { graceful, forced, immediate };
+    /// Kills the child without the drain window, for connections whose
+    /// written frames no longer matter: a cancelled startup, or a process
+    /// that is about to exit.
+    pub fn deinitAbandoned(self: *StdioDispatcher) void {
+        self.shutdownWithMode(.abandon);
+        self.destroy();
+    }
+
+    const ShutdownMode = enum { graceful, forced, immediate, abandon };
 
     fn shutdownWithMode(self: *StdioDispatcher, mode: ShutdownMode) void {
         var should_join = false;
@@ -840,7 +852,17 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if (mode != .immediate and !self.readerIsDone()) {
+        if (mode == .immediate and !self.readerIsDone()) {
+            const deadline_ms = std.math.add(
+                i64,
+                io_mod.milliTimestamp(),
+                immediate_drain_ms,
+            ) catch std.math.maxInt(i64);
+            while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
+                io_mod.sleep(request_poll_ns);
+            }
+        }
+        if ((mode == .graceful or mode == .forced) and !self.readerIsDone()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher requesting child termination generation={d}",
@@ -2395,6 +2417,29 @@ test "MCP immediate shutdown kills an uncooperative child without grace waits" {
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try expectProcessReaped(fixture.pid);
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
+}
+
+test "MCP immediate shutdown drains written frames while abandoned shutdown kills at once" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const script =
+        \\trap '' TERM
+        \\while :; do sleep 1; done
+    ;
+    const drained = try createShellDispatcher(script);
+    const drained_started_ms = io_mod.milliTimestamp();
+    drained.dispatcher.deinitImmediate();
+    const drained_elapsed_ms = io_mod.milliTimestamp() - drained_started_ms;
+    try expectProcessReaped(drained.pid);
+    try std.testing.expect(drained_elapsed_ms >= immediate_drain_ms);
+
+    const abandoned = try createShellDispatcher(script);
+    const abandoned_started_ms = io_mod.milliTimestamp();
+    abandoned.dispatcher.deinitAbandoned();
+    const abandoned_elapsed_ms = io_mod.milliTimestamp() - abandoned_started_ms;
+    try expectProcessReaped(abandoned.pid);
+    try std.testing.expect(abandoned_elapsed_ms < immediate_drain_ms);
 }
 
 test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {
