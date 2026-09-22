@@ -840,7 +840,7 @@ fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !Menu
 
 fn makeMenuPreviewOwned(alloc: Allocator, heading: []const u8, insert: []u8) !MenuPreview {
     errdefer alloc.free(insert);
-    var encoded = try text_utils.encodeTerminalSafe(alloc, insert, max_menu_preview_bytes);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, insert, max_menu_preview_bytes);
     defer encoded.deinit(alloc);
     return .{
         .display = try std.mem.concat(alloc, u8, &.{ heading, encoded.bytes }),
@@ -2583,6 +2583,19 @@ fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
     runtime.retireAndWait();
     runtime.deinit();
     alloc.destroy(runtime);
+}
+
+test "MCP menu preview display flattens untrusted multi-line content" {
+    const alloc = std.testing.allocator;
+    var preview = try makeMenuPreview(alloc, "heading\n\n", "line one\n\nline two\x1b]0;owned\x07");
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "heading\n\nline one line two\\x1b]0;owned\\x07",
+        preview.display,
+    );
+    try std.testing.expect(std.mem.find(u8, preview.display, "\\x0a") == null);
+    try std.testing.expectEqualStrings("line one\n\nline two\x1b]0;owned\x07", preview.insert);
 }
 
 test "MCP menu expands every resource template argument" {

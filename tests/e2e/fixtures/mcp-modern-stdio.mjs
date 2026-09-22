@@ -577,7 +577,7 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item",
+            text: "Invalid input: labels require at least one item\nretry rejected",
           }],
         },
       });
