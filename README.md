@@ -132,8 +132,11 @@ MCP user authorization. Employees connect their own account with
 For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
 Client ID and uses the HTTPS callback for personal login. Changing that Client
 ID requires a CLI update. First login and reauthorization request the full shared
-`user_scopes` list from fx.sh, replacing local `scopes` even when they are narrower.
-Per-user read-only subsets are not supported for the fx app. Saved scopes,
+`user_scopes` list from fx.sh. If local `scopes` are configured, they must include
+every shared scope; extra local scopes are not requested. A narrower or explicitly
+empty list stops authorization before opening the browser, leaving the configuration
+and stored credentials unchanged. Remove the override only if you want to authorize
+the full shared scope set. Per-user read-only subsets are not supported for the fx app. Saved scopes,
 Slack's advertised capabilities, and scope challenges cannot expand this
 request. The shared list contains nine personal scopes configured for fx and
 advertised by Slack MCP; changing it requires a deliberate configuration update

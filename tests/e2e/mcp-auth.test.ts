@@ -39,6 +39,10 @@ const REFRESH_ROTATED = "mcp-refresh-rotated-secret";
 const REPO_ROOT = realpathSync(join(import.meta.dirname, "..", ".."));
 const MCP_KEYCHAIN_SERVICE = "FX_MCP_OAUTH_CREDENTIALS_V1";
 const FX_SLACK_CLIENT_ID = "12364000946.12017137861236";
+const FX_SLACK_SCOPES = [
+  "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read",
+  "files:write", "search:read.public", "search:read.users", "users:read",
+];
 const inheritedKeychainDisable = process.env.FX_DISABLE_KEYCHAIN;
 const MCP_KEYCHAIN_PROBE_SCRIPT = `
 ObjC.import("Security");
@@ -900,7 +904,7 @@ describe("MCP remote authentication lifecycle", () => {
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       profile.mcp.fixture.oauth.callback_port = Number(new URL(auth.url).port);
       if (scenario === "no-scopes") delete profile.mcp.fixture.oauth.scopes;
-      if (scenario === "extra-scopes") profile.mcp.fixture.oauth.scopes = ["im:history", "search:read.private"];
+      if (scenario === "extra-scopes") profile.mcp.fixture.oauth.scopes = ["tools.read", "im:history", "search:read.private"];
       writeFileSync(profilePath, JSON.stringify(profile));
       const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
       const authentication = runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
@@ -951,6 +955,52 @@ describe("MCP remote authentication lifecycle", () => {
         expect(result.stdout).not.toContain("Authenticated MCP server");
       }
       expect(await postCallback(body).catch(() => null)).toBe(null);
+    }, 20_000);
+  }
+
+  for (const scenario of ["read-only", "empty", "unrelated-extra", "reauth"] as const) {
+    test(`personal Slack rejects scope expansion without changing credentials: ${scenario}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: FX_SLACK_SCOPES });
+      const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.scopes = scenario === "empty" ? [] :
+        scenario === "unrelated-extra" ? ["channels:read", "im:history"] : ["channels:read"];
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, AI_GATEWAY_API_KEY: undefined };
+      if (scenario === "empty") {
+        const added = await runFx(["mcp", "add", "auxiliary", "echo"], { cwd: root.workspace, env });
+        expect(added.code).toBe(0);
+        expect(JSON.parse(readFileSync(profilePath, "utf8")).mcp.fixture.oauth.scopes).toEqual([]);
+      }
+      const originalProfile = readFileSync(profilePath, "utf8");
+      const credentialPath = join(root.home, ".fx", "mcp-credentials", "credentials.json");
+      let originalCredentials: string | undefined;
+      if (scenario === "reauth") {
+        seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+        const saved = JSON.parse(readFileSync(credentialPath, "utf8"));
+        saved.credentials[0].client_id = FX_SLACK_CLIENT_ID;
+        saved.credentials[0].scope = FX_SLACK_SCOPES.join(" ");
+        originalCredentials = JSON.stringify(saved);
+        writeFileSync(credentialPath, originalCredentials, { mode: 0o600 });
+      }
+      const result = await runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("Your configured Slack scopes request fewer permissions than fx requires");
+      expect(result.stderr).toContain("Authorization was not started");
+      expect(result.stderr).toContain("Remove the local scopes override only if you want to authorize the full shared scope set");
+      expect(result.stdout).not.toContain("/api/slack/auth?");
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.requests.map((request) => request.path)).toEqual(["/api/slack/install/config"]);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(auth.tokenExchanges).toBe(0);
+      expect(readFileSync(profilePath, "utf8")).toBe(originalProfile);
+      if (originalCredentials !== undefined) expect(readFileSync(credentialPath, "utf8")).toBe(originalCredentials);
+      else expect(existsSync(credentialPath)).toBe(false);
+      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
+      expect(result.stdout + result.stderr).not.toContain(ACCESS_INITIAL);
+      expect(result.stdout + result.stderr).not.toContain(REFRESH_INITIAL);
     }, 20_000);
   }
 
@@ -1010,6 +1060,10 @@ describe("MCP remote authentication lifecycle", () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, challengeScope: "im:history", slackBridgeScopes: ["tools.read", "tools.approved"] });
     const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.oauth.scopes;
+    writeFileSync(profilePath, JSON.stringify(profile));
     const bridgeOrigin = new URL(auth.url).origin;
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -1035,6 +1089,27 @@ describe("MCP remote authentication lifecycle", () => {
     await tui.sendText("/mcp list");
     await tui.waitForText("auth=authenticated", 10_000);
     expect(auth.tokenExchanges).toBe(1);
+  }, 40_000);
+
+  test.skipIf(!tmuxAvailable())("in-session personal Slack rejects narrower scopes before opening a browser", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: ["tools.read", "tools.write"] });
+    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 34,
+      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp auth fixture --open");
+    const pane = await tui.waitForText("Authorization was not started", 15_000);
+    expect(pane).toContain("Your configured Slack scopes request fewer permissions");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+    expect(auth.tokenExchanges).toBe(0);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
+    expect(tui.paneStatus().dead).toBe(false);
+    await tui.waitForComposer(5_000);
   }, 40_000);
 
   test("top-level MCP auth accepts a manual callback when browser launch fails", async () => {

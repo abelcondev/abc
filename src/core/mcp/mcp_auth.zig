@@ -63,6 +63,7 @@ pub const ClientConfig = struct {
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
+    scopes_configured: bool = false,
     callback_port: ?u16 = null,
 };
 
@@ -1042,7 +1043,7 @@ pub fn authorizeAutomated(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
 ) !AuthorizationResult {
-    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config.client_id);
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
     defer if (bridge) |value| alloc.free(value.scope);
     return authorizeWithRedirect(
         alloc,
@@ -1199,7 +1200,7 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config.client_id);
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
     defer if (bridge) |value| alloc.free(value.scope);
     const bridge_origin = if (bridge) |value| value.origin else null;
     if (bridge_origin != null and options.completion == null) return error.MissingAuthorizationCompletion;
@@ -1260,8 +1261,8 @@ const fx_slack_client_id = "12364000946.12017137861236";
 
 const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
 
-fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_id: ?[]const u8) !?SlackBridgeConfig {
-    const configured_client = client_id orelse return null;
+fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: ClientConfig) !?SlackBridgeConfig {
+    const configured_client = client_config.client_id orelse return null;
     if (!std.mem.eql(u8, configured_client, fx_slack_client_id)) return null;
     const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
@@ -1295,10 +1296,25 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_id: ?[]con
             if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '_' and byte != '-') return error.InvalidSlackBridgeConfiguration;
         }
     }
+    if (client_config.scopes_configured or client_config.scopes.len > 0) {
+        var configured_scopes: std.ArrayList([]const u8) = .empty;
+        defer configured_scopes.deinit(alloc);
+        for (client_config.scopes) |scope| try appendScopeTokens(alloc, &configured_scopes, scope);
+        for (scopes) |scope| {
+            if (!contains(configured_scopes.items, scope)) return error.SlackScopeConfigurationMismatch;
+        }
+    }
     const scope = (try requestedScope(alloc, scopes, null, &.{}, null, false)).?;
     errdefer alloc.free(scope);
     if (scope.len > 1024) return error.InvalidSlackBridgeConfiguration;
     return .{ .origin = origin, .scope = scope };
+}
+
+pub fn authentication_error_message(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than fx requires. Authorization was not started. Custom scope subsets are not supported for the fx app. Remove the local scopes override only if you want to authorize the full shared scope set",
+        else => @errorName(err),
+    };
 }
 
 const AuthorizationRequestFn = *const fn (

@@ -427,6 +427,7 @@ pub fn authorizeForChallenge(
             .client_secret = client_secret,
             .client_metadata_url = auth_config.client_metadata_url,
             .scopes = auth_config.scopes,
+            .scopes_configured = auth_config.scopes_configured,
         },
         .previous_scope = source.previous_scope,
     })) {
@@ -719,6 +720,7 @@ pub fn authenticate(
             .client_secret = client_secret,
             .client_metadata_url = auth_config.client_metadata_url,
             .scopes = auth_config.scopes,
+            .scopes_configured = auth_config.scopes_configured,
             .callback_port = auth_config.callback_port,
         },
         .previous_scope = source.previous_scope,
