@@ -90,6 +90,26 @@ pub noinline fn composeMcpMenuRow(
         ) catch "Filter";
         return composeTextRow(alloc, filter, width, ui_render.dim_style, 2);
     }
+    if (show_header and row_index == 1 and
+        projection.state.screen == .browse and
+        projection.state.section == .servers and
+        projection.configuration_issue_message != null)
+    {
+        var warning_buf: [512]u8 = undefined;
+        const warning = if (projection.configuration_issue_count == 1)
+            std.fmt.bufPrint(
+                &warning_buf,
+                "Project MCP configuration error: {s}",
+                .{projection.configuration_issue_message.?},
+            ) catch "Project MCP configuration error needs attention."
+        else
+            std.fmt.bufPrint(
+                &warning_buf,
+                "Project MCP configuration errors ({d}): {s}",
+                .{ projection.configuration_issue_count, projection.configuration_issue_message.? },
+            ) catch "Project MCP configuration errors need attention.";
+        return composeTextRow(alloc, warning, width, ui_render.warning_style, 2);
+    }
     if (show_header and row_index == 1) {
         if (projection.state.section == .resources or projection.state.section == .prompts) {
             if (projection.selectedServer()) |server| return composeFactRow(alloc, "Server", server.configured_name, width);
@@ -874,6 +894,18 @@ test "MCP menu every screen and section renders through the VT" {
         max_inline_rows,
         &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
     );
+
+    projection.configuration_issue_count = 1;
+    projection.configuration_issue_message = ".mcp.json server 'broken' is missing MISSING_COMMAND in field command";
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "MCP 1", "fixture", "Project MCP configuration error", "MISSING_COMMAND" },
+    );
+    projection.configuration_issue_count = 0;
+    projection.configuration_issue_message = null;
 
     var unauthenticated = server;
     unauthenticated.transport = .http;

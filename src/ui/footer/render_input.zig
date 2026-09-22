@@ -107,6 +107,7 @@ pub const McpMenuProjection = struct {
     resource_templates: []const mcp_runtime.ResourceSummary = &.{},
     prompts: []const mcp_runtime.PromptSummary = &.{},
     configuration_issue_count: usize = 0,
+    configuration_issue_message: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     feedback: ?[]const u8 = null,
     add_name: []const u8 = "",

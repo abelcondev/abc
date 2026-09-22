@@ -783,6 +783,61 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     30_000,
   );
 
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP menu keeps a workspace configuration error visible beside a valid server",
+    async () => {
+      const root = createRoot("workspace-menu-configuration-error", MODERN_FIXTURE);
+      moveProfileFixtureToWorkspace(root);
+      const projectPath = join(root.workspace, ".mcp.json");
+      const project = JSON.parse(readFileSync(projectPath, "utf8"));
+      project.mcpServers.fixture.command = "secret-prefix-${MISSING_WORKSPACE_COMMAND}";
+      writeFileSync(projectPath, JSON.stringify(project));
+      writeFileSync(
+        join(root.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            canary: {
+              type: "local",
+              command: [process.execPath, MODERN_FIXTURE],
+              enabled: false,
+            },
+          },
+        }),
+      );
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = fixtureEnv(root, gateway);
+      const trusted = await runFx(
+        ["mcp", "trust", "approve", "fixture"],
+        { cwd: root.workspace, env },
+      );
+      expect(trusted.code).toBe(0);
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 180,
+        height: 36,
+        env,
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp list");
+      const menu = await tui.waitForText("Project MCP configuration error", 10_000);
+      expect(menu).toContain("MCP 1");
+      expect(menu).toContain("canary");
+      expect(menu).toContain("Disabled");
+      expect(menu).toContain("MISSING_WORKSPACE_COMMAND");
+      expect(menu).toContain("field command");
+      expect(menu).not.toContain("secret-prefix");
+      expect(menu).not.toContain(MODERN_FIXTURE);
+      expect(existsSync(root.wireLogPath)).toBe(false);
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+    },
+    30_000,
+  );
+
   test("top-level mcp add persists stdio and a later ask calls it", async () => {
     const root = createRoot("top-level-add", MODERN_FIXTURE);
     writeFileSync(
