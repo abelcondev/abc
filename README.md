@@ -135,8 +135,9 @@ ID requires a CLI update. First login and reauthorization request the full share
 `user_scopes` list from fx.sh, replacing local `scopes` even when they are narrower.
 Per-user read-only subsets are not supported for the fx app. Saved scopes,
 Slack's advertised capabilities, and scope challenges cannot expand this
-request. The shared list contains the 12 approved personal scopes; changing it requires a deliberate
-configuration update and any necessary Slack approval. This does not revoke
+request. The shared list contains nine personal scopes configured for fx and
+advertised by Slack MCP; changing it requires a deliberate configuration update
+and any necessary Slack approval. This does not revoke
 permissions on previously issued tokens or change token refresh behavior. It
 opens an ephemeral loopback listener instead of the configured `callback_port`,
 keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
