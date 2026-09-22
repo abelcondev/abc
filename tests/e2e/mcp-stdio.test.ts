@@ -823,7 +823,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
 
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp list");
-      const menu = await tui.waitForText("Project MCP configuration error", 10_000);
+      const menu = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
       expect(menu).toContain("MCP 1");
       expect(menu).toContain("canary");
       expect(menu).toContain("Disabled");
