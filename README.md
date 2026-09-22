@@ -129,18 +129,21 @@ or background refresh service is created. An expired refresh token requires
 installation again. This workspace operation is separate from each employee's
 MCP user authorization. Employees connect their own account with
 `/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
-For `https://mcp.slack.com/mcp`, when the configured Client ID matches the fx app
-published by the web bridge, personal login also uses the HTTPS callback. It
-requests the shared `user_scopes` list from fx.sh for both first login and
-reauthorization. Local scope configuration, saved scopes, Slack's advertised
-capabilities, and scope challenges cannot expand this request. The shared list
-contains the 12 approved personal scopes; changing it requires a deliberate
+For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
+Client ID and uses the HTTPS callback for personal login. Changing that Client
+ID requires a CLI update. First login and reauthorization request the full shared
+`user_scopes` list from fx.sh, replacing local `scopes` even when they are narrower.
+Per-user read-only subsets are not supported for the fx app. Saved scopes,
+Slack's advertised capabilities, and scope challenges cannot expand this
+request. The shared list contains the 12 approved personal scopes; changing it requires a deliberate
 configuration update and any necessary Slack approval. This does not revoke
 permissions on previously issued tokens or change token refresh behavior. It
 opens an ephemeral loopback listener instead of the configured `callback_port`,
 keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
 saving to the existing MCP credential store. Other MCP providers and different
-Slack app Client IDs retain their direct callback behavior. Deploy the web
+Slack app Client IDs retain their direct callback behavior without contacting
+fx.sh. Fx app authorization requires fx.sh to be available; an unavailable
+metadata endpoint returns `SlackBridgeUnavailable`. Deploy the web
 personal-authorization routes and scope metadata before releasing this CLI.
 Missing or invalid shared scopes stop authorization rather than falling back
 to Slack's broader capabilities. Keep the registered

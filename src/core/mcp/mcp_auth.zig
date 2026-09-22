@@ -1256,11 +1256,13 @@ pub fn authorizeInteractive(
 }
 
 const slack_callback_url = "https://fx.sh/api/slack/oauth/callback";
+const fx_slack_client_id = "12364000946.12017137861236";
 
 const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
 
 fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_id: ?[]const u8) !?SlackBridgeConfig {
     const configured_client = client_id orelse return null;
+    if (!std.mem.eql(u8, configured_client, fx_slack_client_id)) return null;
     const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
     if (fixture) {
@@ -1284,7 +1286,7 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_id: ?[]con
     }, alloc, response.body, .{ .ignore_unknown_fields = true });
     defer config.deinit();
     if (!std.mem.eql(u8, config.value.redirect_uri, slack_callback_url)) return error.InvalidSlackBridgeConfiguration;
-    if (!std.mem.eql(u8, configured_client, config.value.client_id)) return null;
+    if (!std.mem.eql(u8, configured_client, config.value.client_id)) return error.InvalidSlackBridgeConfiguration;
     const scopes = config.value.user_scopes orelse return error.InvalidSlackBridgeConfiguration;
     if (scopes.len == 0 or scopes.len > max_scope_tokens) return error.InvalidSlackBridgeConfiguration;
     for (scopes) |scope| {
