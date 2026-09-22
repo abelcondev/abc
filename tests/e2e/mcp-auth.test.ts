@@ -1310,9 +1310,9 @@ describe("MCP remote authentication lifecycle", () => {
         await tui.sendText("/mcp reload");
         await tui.waitForText("MCP configuration reloaded", 15_000);
         await tui.sendText("/mcp list");
-        let pane = await tui.waitForText("MCP health (2 servers):", 10_000);
-        expect(pane).toMatch(/fixture[\s\S]{0,240}state=ready/);
-        expect(pane).toMatch(/canary[\s\S]{0,240}state=ready/);
+        let pane = await tui.waitForText("[Servers]", 10_000);
+        expect(pane).toMatch(/fixture[\s\S]{0,120}Ready/);
+        expect(pane).toMatch(/canary[\s\S]{0,120}Ready/);
 
         const stored = JSON.parse(readFileSync(credentialPath, "utf8"));
         expect(stored.credentials).toHaveLength(1);
@@ -1329,9 +1329,9 @@ describe("MCP remote authentication lifecycle", () => {
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("/mcp list");
-        pane = await tui.waitForText("MCP health (2 servers):", 10_000);
-        expect(pane).toMatch(/fixture[\s\S]{0,240}state=ready/);
-        expect(pane).toMatch(/canary[\s\S]{0,240}state=ready/);
+        pane = await tui.waitForText("[Servers]", 10_000);
+        expect(pane).toMatch(/fixture[\s\S]{0,120}Ready/);
+        expect(pane).toMatch(/canary[\s\S]{0,120}Ready/);
       } finally {
         canary.stop();
       }
@@ -2316,7 +2316,10 @@ describe("MCP remote authentication lifecycle", () => {
         5_000,
       );
       await tui.sendText("/mcp list");
-      await tui.waitForText("auth=required", 5_000);
+      const menu = await tui.waitForText("Needs authentication", 5_000);
+      expect(menu).toContain("fixture");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
 
       await tui.sendText("/mcp reload");
       await tui.waitForText("MCP reconnection started.", 5_000);
@@ -2630,12 +2633,12 @@ describe("MCP remote authentication lifecycle", () => {
       expect(summary).toContain("Ready");
       await tui.sendKeys("Escape");
       await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+      const beforeListMenu = await tui.captureFullScrollback();
       await tui.sendText("/mcp list");
-      const status = await tui.waitForText("auth=authenticated", 5_000);
+      const status = await tui.waitForText("[Servers]", 5_000);
+      expect(status).toContain("fixture");
+      expect(status).toContain("Ready");
       expect(status).not.toContain(ACCESS_REFRESHED);
-      const beforeLogoutMenu = await tui.captureFullScrollback();
-      await tui.sendText("/mcp");
-      await tui.waitForText("[Servers]", 5_000);
       await tui.sendKeys("Enter");
       await tui.waitForText("Profile · ~/.fx/mcp.json", 5_000);
       await tui.sendKeys("L");
@@ -2646,7 +2649,7 @@ describe("MCP remote authentication lifecycle", () => {
       expect(auth.revocations).toBe(2);
       await tui.sendKeys("Escape");
       await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-      expect(await tui.captureFullScrollback()).toBe(beforeLogoutMenu);
+      expect(await tui.captureFullScrollback()).toBe(beforeListMenu);
       await tui.kill();
       tui = null;
 
