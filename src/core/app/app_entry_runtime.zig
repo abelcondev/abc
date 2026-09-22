@@ -299,7 +299,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (comptime cooperative) {
             app.deinit();
         } else {
-            var shutdown = app.deinitWithResumeHandoff();
+            var shutdown = app.shutdownForProcessExit();
             defer shutdown.deinit(alloc);
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
@@ -331,7 +331,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             if (comptime cooperative) {
                 app.deinit();
             } else {
-                var shutdown = app.deinitWithResumeHandoff();
+                var shutdown = app.shutdownForProcessExit();
                 defer shutdown.deinit(alloc);
                 if (shutdown.failure) |failure| {
                     reportShutdownFailure(deps, failure);
@@ -363,7 +363,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const shutdown: app_session_runtime.ShutdownOutcome = if (comptime cooperative) blk: {
         app.deinit();
         break :blk .{};
-    } else app.deinitWithResumeHandoff();
+    } else app.shutdownForProcessExit();
     const handoff_value = shutdown.handoff;
     if (shutdown.failure) |err| {
         if (handoff_value) |value| {
@@ -795,7 +795,7 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn deinitWithResumeHandoff(self: *TestApp) app_session_runtime.ShutdownOutcome {
+    fn shutdownForProcessExit(self: *TestApp) app_session_runtime.ShutdownOutcome {
         const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
             const session_id = std.testing.allocator.dupe(u8, id) catch {
                 self.deinit();

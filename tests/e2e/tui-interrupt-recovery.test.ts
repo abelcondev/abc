@@ -785,6 +785,77 @@ while :; do sleep 1; done
   );
 
   test(
+    "double Ctrl-C during a running command exits cleanly and kills the command",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-exit-running-command-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      const workspaceRoot = realpathSync(workspace);
+      const pidPath = join(workspaceRoot, "held-command.pid");
+      const scriptPath = join(workspaceRoot, "hold-exit.sh");
+      // Ignoring TERM keeps a cooperative stop inside its grace window, so
+      // exit has to force-kill the command rather than wait it out.
+      writeFileSync(
+        scriptPath,
+        `#!/bin/sh
+trap '' TERM
+echo $$ > held-command.pid
+while :; do sleep 1; done
+`,
+      );
+      chmodSync(scriptPath, 0o755);
+
+      gateway = startFakeGateway([
+        fakeShellRun("exit-hold", "./hold-exit.sh", { timeout_ms: 600_000 }),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspaceRoot,
+        stderrPath,
+        isolated: true,
+        remainOnExit: true,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-exit-running-command-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: `${TRACE_SCOPES},core,shutdown`,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Run the held exit command.");
+      await waitForCondition(
+        () => existsSync(pidPath) && readFileSync(pidPath, "utf8").trim().length > 0,
+        "held command start",
+      );
+      const commandPid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
+
+      // One burst, so exit lands while the first press is still cancelling
+      // the command and both paths join the same command thread.
+      session.sendKeysImmediate(["C-c", "C-c"]);
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+
+      expect(session.paneStatus().status).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readTrace(tracePath)).toContain("stage name=complete");
+      await waitForCondition(() => !processExists(commandPid), "held command termination");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "late successful tool settlement stays truthful after Escape",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-late-tool-success-")));
@@ -978,4 +1049,13 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

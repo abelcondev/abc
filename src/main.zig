@@ -838,13 +838,59 @@ const App = struct {
         return self.upgrader.takeRelaunchRequest();
     }
 
-    pub fn deinit(self: *App) void {
-        _ = self.deinitImpl(false);
-    }
+    /// Native interactive exit. Runs only the work whose effects outlive the
+    /// process: restoring the terminal, persisting the session, finishing
+    /// durable credential saves, and terminating child processes. Memory and
+    /// threads that hold no durable state are left for process exit, so a
+    /// thread blocked on the network or a disk scan cannot hold the prompt.
+    /// The caller must end the process without further teardown; the returned
+    /// handoff is owned by the caller.
+    pub fn shutdownForProcessExit(self: *App) app_session_runtime.ShutdownOutcome {
+        var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
+        // Failed startups (no TTY, too small) never earn a shutdown report.
+        const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
+        // Hand the terminal back first; nothing below renders.
+        self.releaseTerminal();
+        shutdown_trace.mark("terminal_released");
 
-    /// Returns an owned handoff only after all interactive state is torn down.
-    pub fn deinitWithResumeHandoff(self: *App) app_session_runtime.ShutdownOutcome {
-        return self.deinitImpl(true);
+        self.auth.stopProviderPreparation();
+        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
+        self.herdr.deinit();
+        self.stopStream();
+        self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
+        self.upgrader.requestStop();
+        self.file_index.requestStop();
+        WorkspaceAppRuntime.requestStop(self);
+        self.managed_executions.terminateForProcessExit();
+        shutdown_trace.mark("background_stops_requested");
+
+        // The worker mutates session state, so it stops before persistence.
+        if (self.worker_thread) |thread| thread.join();
+        shutdown_trace.mark("worker_thread_joined");
+        WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
+            SessionAppRuntime.recordShutdownFailure(self, err);
+        };
+        // The dashboard loader reads the profile usage ledger that
+        // persistence flushes; stop it first.
+        self.usage_dashboard.deinit();
+        InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
+        const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
+        const shutdown_failure = self.session_persistence.shutdown_failure;
+        // These delete image snapshots and log discarded drafts.
+        self.worker.deinit(std.heap.c_allocator);
+        self.clearPendingImages();
+        SessionAppRuntime.deinitPersistence(self);
+        self.question_prompt.deinit(self.alloc);
+        shutdown_trace.mark("persistence_finalized");
+
+        // Waits for an in-flight API key or credential save to land.
+        self.auth.deinit(self.alloc);
+        self.mcp.deinitForProcessExit(self.alloc);
+        shutdown_trace.mark("mcp_children_terminated");
+        shutdown_trace.mark("complete");
+        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
+        return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
     pub fn resumeHandoffColumns(self: *const App) u16 {
@@ -859,7 +905,10 @@ const App = struct {
         return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
-    fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
+    /// Full teardown for hosts that keep running after the shell ends, such as
+    /// the cooperative host. Native interactive exit uses
+    /// `shutdownForProcessExit`.
+    pub fn deinit(self: *App) void {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Only real interactive sessions earn a shutdown report; failed
         // startups (no TTY, too small) reach deinit through errdefer and must
@@ -890,14 +939,8 @@ const App = struct {
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
-        const resume_handoff = if (capture_resume_handoff)
-            SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
-        else blk: {
-            SessionAppRuntime.finalizePersistence(self);
-            break :blk null;
-        };
+        SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
-        const shutdown_failure = self.session_persistence.shutdown_failure;
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
@@ -937,7 +980,6 @@ const App = struct {
         if (self.review_model.len > 0) self.alloc.free(self.review_model);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
-        return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
     pub fn releaseTerminal(self: *App) void {
@@ -3452,18 +3494,19 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
                 .argv0 = .init(process_args),
                 .environ = .{ .block = env_block },
             });
-            defer threaded.deinit();
             io_mod.setIo(threaded.io());
 
             var owned_launch = launch;
-            defer owned_launch.deinit(alloc);
-            defer debug_trace.shutdown();
-
-            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode);
-            switch (outcome) {
-                .returned => return,
-                .exit => |code| std.process.exit(code),
-            }
+            // Interactive shutdown has already persisted the session and
+            // terminated child processes. What remains is freeing memory and
+            // joining the I/O pool, whose tasks can still be waiting on DNS or
+            // the network, so end the process here. Errors were reported by
+            // the interactive runner.
+            const outcome = app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode) catch exitFast(1);
+            exitFast(switch (outcome) {
+                .returned => 0,
+                .exit => |code| code,
+            });
         },
         .returned => exitFast(0),
         .exit => |code| exitFast(code),

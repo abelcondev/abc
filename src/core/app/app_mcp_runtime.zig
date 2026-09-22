@@ -2550,6 +2550,16 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .discard);
+    }
+
+    /// Teardown immediately followed by process exit: stdio servers are
+    /// killed without grace and remote sessions are left to expire.
+    pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .process_exit);
+    }
+
+    fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.cancelPendingMenuOperation("shutdown");
@@ -2557,7 +2567,7 @@ pub const State = struct {
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
+        if (previous) |runtime| destroyRuntimeWithMode(alloc, runtime, mode);
         self.clearMenuOwned(alloc);
         self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
         self.clearModelCatalogBaselineLocked(alloc);
@@ -2579,9 +2589,22 @@ fn cancelAndDeinitAuthentication(
     pending.deinit();
 }
 
+const RuntimeTeardown = enum { discard, process_exit };
+
 fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
+    destroyRuntimeWithMode(alloc, runtime, .discard);
+}
+
+fn destroyRuntimeWithMode(
+    alloc: Allocator,
+    runtime: *mcp_runtime.McpRuntime,
+    mode: RuntimeTeardown,
+) void {
     runtime.retireAndWait();
-    runtime.deinit();
+    switch (mode) {
+        .discard => runtime.deinit(),
+        .process_exit => runtime.deinitForProcessExit(),
+    }
     alloc.destroy(runtime);
 }
 

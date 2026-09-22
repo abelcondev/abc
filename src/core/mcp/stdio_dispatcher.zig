@@ -11,10 +11,6 @@ const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const shutdown_grace_ms: i64 = 1_000;
 const termination_grace_ms: i64 = 1_000;
-/// Process-exit drain window: after stdin closes, give the child a short
-/// beat to read already-written frames (for example a cancellation
-/// notification) and exit before the kill lands.
-const immediate_drain_ms: i64 = 50;
 const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
 
@@ -839,16 +835,6 @@ pub const StdioDispatcher = struct {
                 i64,
                 io_mod.milliTimestamp(),
                 shutdown_grace_ms,
-            ) catch std.math.maxInt(i64);
-            while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
-                io_mod.sleep(request_poll_ns);
-            }
-        }
-        if (mode == .immediate and !self.readerIsDone()) {
-            const deadline_ms = std.math.add(
-                i64,
-                io_mod.milliTimestamp(),
-                immediate_drain_ms,
             ) catch std.math.maxInt(i64);
             while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
                 io_mod.sleep(request_poll_ns);

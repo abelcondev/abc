@@ -300,14 +300,23 @@ pub const McpRuntime = struct {
     }
 
     pub fn deinit(self: *McpRuntime) void {
+        self.deinitWithMode(.immediate);
+    }
+
+    /// Kills stdio children without grace and skips remote session DELETEs;
+    /// only for teardown immediately followed by process exit.
+    pub fn deinitForProcessExit(self: *McpRuntime) void {
+        self.deinitWithMode(.process_exit);
+    }
+
+    fn deinitWithMode(self: *McpRuntime, shutdown_mode: ServerShutdownMode) void {
         self.discovery_cancel_requested.store(true, .seq_cst);
         if (self.discovery_thread) |thread| {
             self.discovery_thread = null;
             thread.join();
         }
-        // Process-exit path: kill stdio children immediately rather than
-        // waiting out per-server grace windows.
-        for (self.servers.items) |server| self.destroyServer(server, .immediate);
+        // A discarded runtime never waits out per-server grace windows.
+        for (self.servers.items) |server| self.destroyServer(server, shutdown_mode);
         self.servers.deinit(self.alloc);
         for (self.workspace_diagnostics.items) |*diagnostic| {
             diagnostic.deinit(self.alloc);
@@ -317,7 +326,7 @@ pub const McpRuntime = struct {
         self.tool_aliases.deinit();
     }
 
-    const ServerShutdownMode = enum { graceful, immediate };
+    const ServerShutdownMode = enum { graceful, immediate, process_exit };
 
     fn destroyServer(self: *McpRuntime, server: *McpServer, shutdown_mode: ServerShutdownMode) void {
         server.lifetime.retire();
@@ -337,6 +346,7 @@ pub const McpRuntime = struct {
         switch (shutdown_mode) {
             .graceful => detached.deinitGracefully(self.alloc),
             .immediate => detached.deinitImmediate(self.alloc),
+            .process_exit => detached.deinitForProcessExit(self.alloc),
         }
         server.deinit(self.alloc);
         server.connection_lock.unlock(io_mod.getIo());
@@ -6512,6 +6522,8 @@ test "caller cancellation interrupts blocked candidate connection" {
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expect(runtime.servers.items[0].last_error == null);
+    // Cancellation is not a startup failure and never spends a restart.
+    try std.testing.expectEqual(@as(u8, 0), runtime.servers.items[0].restart_attempts);
 }
 
 test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {

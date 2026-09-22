@@ -438,7 +438,16 @@ pub fn connectServerLegacyHttp(
         return err;
     };
     var client_owned = true;
-    defer if (client_owned) initialized.client.deinit();
+    // A cancelled connection starts no further round trips, so it leaves the
+    // session for the server to expire instead of sending a DELETE while the
+    // connection lock is still held.
+    errdefer if (client_owned) {
+        if (attempt_control.cancellation().cancelled()) {
+            initialized.client.deinitWithoutSessionTermination();
+        } else {
+            initialized.client.deinit();
+        }
+    };
     defer initialized.deinitResponse(alloc);
 
     server.negotiated_protocol_version = initialized.client.version.string();
@@ -1023,11 +1032,13 @@ fn connectServerBounded(
             server.tool_catalog.deinit(alloc);
             // A cancelled startup has no session state to flush; kill the
             // child immediately so shutdown cannot stall in grace windows.
+            // Cancellation is the owner stopping this connection, not a
+            // startup failure, so it never earns a restart.
             if (err == error.Cancelled) {
                 server.disconnectImmediate();
-            } else {
-                server.disconnect();
+                return err;
             }
+            server.disconnect();
             if (server.restart_attempts >= server.config.restart_limit) return err;
             server.restart_attempts += 1;
             debug_trace.logf(

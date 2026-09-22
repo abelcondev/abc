@@ -53,9 +53,11 @@ pub const DetachedTransport = struct {
         self.* = undefined;
     }
 
+    /// Cancelled teardown: kills the stdio child and skips the remote session
+    /// DELETE, so a cancelled connection never starts another round trip.
     pub fn deinitImmediate(self: *DetachedTransport) void {
         if (self.dispatcher) |dispatcher| dispatcher.deinitImmediate();
-        if (self.legacy_http) |client| client.deinit();
+        if (self.legacy_http) |client| client.deinitWithoutSessionTermination();
         if (self.legacy_sse) |client| client.deinit();
         self.* = undefined;
     }
@@ -212,9 +214,9 @@ pub const Server = struct {
         detached.deinit(true);
     }
 
-    /// Teardown after a cancelled startup: the handshake never completed, so
-    /// there is no session state to flush and no reason to wait out the
-    /// graceful termination windows.
+    /// Teardown after a cancelled startup: the connection never became usable,
+    /// so there is no session state to flush and no reason to wait out grace
+    /// windows or a session DELETE while the connection lock is held.
     pub fn disconnectImmediate(self: *Server) void {
         self.stopToolSubscription();
         var detached = self.detachTransport();
@@ -318,13 +320,20 @@ pub const DetachedConnection = struct {
         self.deinitWithDispatcherMode(alloc, .graceful);
     }
 
-    /// Process-exit teardown: kill the stdio child immediately instead of
-    /// waiting out the stdin-close and SIGTERM grace windows.
+    /// Discard teardown: kill the stdio child immediately instead of waiting
+    /// out the stdin-close and SIGTERM grace windows.
     pub fn deinitImmediate(self: *DetachedConnection, alloc: Allocator) void {
         self.deinitWithDispatcherMode(alloc, .immediate);
     }
 
-    const DispatcherShutdown = enum { graceful, forced, immediate };
+    /// Process-exit teardown: kill the stdio child immediately and skip the
+    /// remote session DELETE. The server expires the abandoned session, and a
+    /// network round trip per server must not hold the user's exit.
+    pub fn deinitForProcessExit(self: *DetachedConnection, alloc: Allocator) void {
+        self.deinitWithDispatcherMode(alloc, .process_exit);
+    }
+
+    const DispatcherShutdown = enum { graceful, forced, immediate, process_exit };
 
     fn deinitWithDispatcherMode(
         self: *DetachedConnection,
@@ -336,10 +345,13 @@ pub const DetachedConnection = struct {
             switch (dispatcher_shutdown) {
                 .forced => dispatcher.deinitForced(),
                 .graceful => dispatcher.deinit(),
-                .immediate => dispatcher.deinitImmediate(),
+                .immediate, .process_exit => dispatcher.deinitImmediate(),
             }
         }
-        if (self.legacy_http) |client| client.deinit();
+        if (self.legacy_http) |client| switch (dispatcher_shutdown) {
+            .process_exit => client.deinitWithoutSessionTermination(),
+            .graceful, .forced, .immediate => client.deinit(),
+        };
         if (self.legacy_sse) |client| client.deinit();
         if (self.resolved_headers.len > 0) alloc.free(self.resolved_headers);
         if (self.resolved_authorization) |value| {

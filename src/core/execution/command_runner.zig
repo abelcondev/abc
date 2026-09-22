@@ -50,6 +50,10 @@ const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
 const command_output_poll_ms: i64 = 100;
+/// Idle wait between stop checks while capturing output. Reads return as soon
+/// as output arrives, so this bounds only how long a silent command takes to
+/// observe a cancel or force-kill request.
+const capture_stop_poll_ms: i64 = 20;
 pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
@@ -2443,7 +2447,7 @@ fn collectOutput(
             continue;
         }
 
-        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = command_output_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
+        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = capture_stop_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
@@ -2729,10 +2733,19 @@ fn updateTerminationSignal(
     }
 
     if (signal_started_ms.*) |sent_ms| {
-        if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try observer.signal(process_group_id, termination_protocol, .force);
-            debug_trace.logf("core", "command force-killed after termination grace expired", .{});
-            force_kill_sent.* = true;
+        if (!force_kill_sent.*) {
+            // A force request (process exit) escalates a cooperative stop
+            // that is still inside its grace window.
+            const grace_expired = now_ms - sent_ms >= 800;
+            if (grace_expired or cancelRequested(cfg.force_cancel_flag)) {
+                try observer.signal(process_group_id, termination_protocol, .force);
+                debug_trace.logf(
+                    "core",
+                    "command force-killed reason={s}",
+                    .{if (grace_expired) "termination_grace_expired" else "force_cancel"},
+                );
+                force_kill_sent.* = true;
+            }
         }
     }
 }

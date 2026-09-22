@@ -85,11 +85,19 @@ pub const AutoUpgrade = struct {
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 
-    pub fn stop(self: *AutoUpgrade) void {
+    /// Signals the upgrade thread without waiting for it. Process exit uses
+    /// this directly: downloadAndInstall rechecks should_stop before touching
+    /// the executable and installs by atomic rename, so an unjoined thread can
+    /// neither install late nor leave a partial binary.
+    pub fn requestStop(self: *AutoUpgrade) void {
         self.should_stop.store(true, .release);
         // Wake a thread blocked in a transfer read so it can observe the
         // cancel flag instead of stalling on the socket.
         self.transfer_interrupt.interrupt();
+    }
+
+    pub fn stop(self: *AutoUpgrade) void {
+        self.requestStop();
         const t = self.thread orelse return;
         const deadline_ms = io_mod.milliTimestamp() + stop_join_budget_ms;
         while (!self.stopped.load(.acquire) and io_mod.milliTimestamp() < deadline_ms) {
