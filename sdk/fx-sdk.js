@@ -1290,6 +1290,15 @@ export async function createFxTerminal(options) {
   };
 }
 
+function isBlob(value) {
+  if (typeof Blob === "undefined" || value == null) return false;
+  try {
+    return Number.isSafeInteger(Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value));
+  } catch {
+    return false;
+  }
+}
+
 function normalizePromptInput(input) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
@@ -1298,7 +1307,7 @@ function normalizePromptInput(input) {
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
-      const blob = typeof Blob !== "undefined" && block.data instanceof Blob;
+      const blob = isBlob(block.data);
       if (!blob && (typeof block.data !== "string" || block.data.length === 0)) {
         throw new TypeError(`image prompt block ${index} requires base64 data or a Blob`);
       }
@@ -1920,8 +1929,10 @@ export async function createFxAgent(options = {}) {
         }
         pendingSteeringCount++;
         pendingSteeringBytes += bytes;
-        return promptStarted.then((started) => started ? apply() : Promise.reject(new Error("no prompt is running")))
-          .finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
+        return promptStarted.then((started) => {
+          if (coreExitError && !cancelled) throw coreExitError;
+          return started === true ? apply() : Promise.reject(started instanceof Error ? started : new Error("no prompt is running"));
+        }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
       },
       cancel() {
         if (finished || cancelled) return;
@@ -1934,7 +1945,7 @@ export async function createFxAgent(options = {}) {
         runtime.closeSteering?.();
         resumeOutput?.();
         resumeOutput = null;
-        send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        if (!closing) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
         for (const controller of toolControllers) controller.abort();
         runtime.abortHostEffects();
       },
@@ -1997,7 +2008,7 @@ export async function createFxAgent(options = {}) {
       .catch((error) => {
         cancelBlobRead = null;
         rejectBlobRead = null;
-        resolvePromptStart?.(false);
+        resolvePromptStart?.(error);
         resolvePromptStart = null;
         if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
         terminalError = error;

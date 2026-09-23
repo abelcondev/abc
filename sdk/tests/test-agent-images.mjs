@@ -473,11 +473,18 @@ for (const timing of ["during-read", "after-read"]) {
     abortHostEffects() {},
     closeStdin() { finishRuntime(0); },
   };
-  const agent = await createSharedAgent({ apiKey: "image-exit-test-key", runtimeFactory: async () => runtime });
+  const controller = new AbortController();
+  const agent = await createSharedAgent({
+    apiKey: "image-exit-test-key",
+    runtimeFactory: async () => runtime,
+    onEvent(event) {
+      if (event.type === "runtime.exit" && timing === "during-read") controller.abort();
+    },
+  });
   class SlowBlob extends Blob {
     arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
   }
-  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }], { signal: controller.signal });
   const settled = Promise.all([
     assert.rejects(turn.result, /fx-core exited with code 1/),
     assert.rejects(turn[Symbol.asyncIterator]().next(), /fx-core exited with code 1/),
@@ -495,6 +502,7 @@ for (const timing of ["during-read", "after-read"]) {
     clearTimeout(timer);
   }
   assert.equal(sentMethods.includes("session/prompt"), false);
+  assert.equal(sentMethods.includes("session/cancel"), false);
   await agent.close();
 }
 
@@ -536,8 +544,9 @@ for (const failure of ["write", "exit"]) {
   const steering = turn.steer("queued guidance");
   await Promise.resolve();
   finishRead(Buffer.from(pngData, "base64"));
-  await assert.rejects(turn.result, failure === "write" ? /prompt write failed/ : /fx-core exited with code 1/);
-  await assert.rejects(steering);
+  const expectedError = failure === "write" ? /prompt write failed/ : /fx-core exited with code 1/;
+  await assert.rejects(turn.result, expectedError);
+  await assert.rejects(steering, expectedError);
   assert.equal(sentMethods.includes("steer:queued guidance"), false);
   await agent.close();
 }
