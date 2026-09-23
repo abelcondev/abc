@@ -69,6 +69,28 @@ const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
 
+const RecoveryAutoContinue = enum {
+    auto_continue,
+    skip_compaction_owned,
+    ask_after_unclean_exit,
+};
+
+/// Whether a paused recovery continues on its own after a restart or resume.
+/// A leftover owner marker means the previous process died mid-recovery, and
+/// a leftover asked marker means a prior resume already suppressed this
+/// checkpoint without the user resolving it. Either way the turn is the
+/// user's to retry, not fx's to re-spend.
+fn recoveryAutoContinueDecision(
+    checkpoint: session_codec.RecoveryCheckpoint,
+    previous_owner_died: bool,
+    recovery_asked_before: bool,
+) RecoveryAutoContinue {
+    if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
+    if (recovery_asked_before) return .ask_after_unclean_exit;
+    if (previous_owner_died) return .ask_after_unclean_exit;
+    return .auto_continue;
+}
+
 const BackgroundSessionPolicy = enum {
     carry_forward,
     stop_forget,
@@ -2017,6 +2039,16 @@ pub fn Runtime(comptime App: type) type {
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
 
+            // Decide before rendering: the checkpoint replay below must not
+            // promise an automatic continuation the gate is about to suppress.
+            const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
+                if (state.recovery_checkpoint) |checkpoint|
+                    recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
+                else
+                    null
+            else
+                null;
+
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
@@ -2028,7 +2060,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -2048,52 +2080,86 @@ pub fn Runtime(comptime App: type) type {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
-            // A paused recovery resumes on its own after every restart or
-            // resume; the user never re-runs a manual continuation. Harnesses
-            // without a real worker queue opt out via the decl check. A
-            // compaction_prepared checkpoint records completed source, not a
-            // turn waiting to run; the compaction flow owns it.
+            // A paused recovery resumes on its own after a clean restart or
+            // resume. Harnesses without a real worker queue opt out via the
+            // decl check. A compaction_prepared checkpoint records completed
+            // source, not a turn waiting to run; the compaction flow owns it.
+            // A checkpoint left behind by an unclean exit is different: the
+            // interrupted turn may be what killed the process, so the user
+            // decides whether to retry it instead of fx re-spending the turn
+            // on its own, and that suppression stays sticky until the turn
+            // is resolved.
             if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
                 if (state.recovery_checkpoint) |checkpoint| {
-                    if (checkpoint.cause == .compaction_prepared) {
-                        debug_trace.logf(
+                    switch (recovery_decision.?) {
+                        .skip_compaction_owned => debug_trace.logf(
                             "session",
                             "event=auto_continue_skipped cause=compaction_prepared",
                             .{},
-                        );
-                    } else {
-                        const queued = continuePausedRecovery(app) catch |err| switch (err) {
-                            error.MissingApiKey => missing: {
-                                try app.writeDomainNotice(.{
-                                    .topic = "recovery",
-                                    .tone = .warning,
-                                    .body = "sign in to let the interrupted response continue automatically",
-                                }, true);
-                                break :missing false;
-                            },
-                            else => other: {
-                                debug_trace.logf(
-                                    "session",
-                                    "event=auto_continue_failed err={s}",
-                                    .{@errorName(err)},
-                                );
-                                try app.writeDomainNotice(.{
-                                    .topic = "recovery",
-                                    .tone = .warning,
-                                    .body = "the interrupted response could not continue automatically; it will try again on the next resume",
-                                }, true);
-                                break :other false;
-                            },
-                        };
-                        _ = queued;
+                        ),
+                        .ask_after_unclean_exit => {
+                            debug_trace.logf(
+                                "session",
+                                "event=auto_continue_suppressed reason=unclean_exit turn_id={d}",
+                                .{checkpoint.turn_id},
+                            );
+                            if (comptime @hasField(App, "session_persistence")) {
+                                if (app.session_persistence.writable) |*loaded| {
+                                    session_log.markRecoveryAsked(app.alloc, &loaded.log.dir);
+                                }
+                            }
+                            try app.writeDomainNotice(.{
+                                .topic = "recovery",
+                                .tone = .warning,
+                                .body = "fx quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+                            }, true);
+                        },
+                        .auto_continue => {
+                            const queued = continuePausedRecovery(app) catch |err| switch (err) {
+                                error.MissingApiKey => missing: {
+                                    try app.writeDomainNotice(.{
+                                        .topic = "recovery",
+                                        .tone = .warning,
+                                        .body = "sign in to let the interrupted response continue automatically",
+                                    }, true);
+                                    break :missing false;
+                                },
+                                else => other: {
+                                    debug_trace.logf(
+                                        "session",
+                                        "event=auto_continue_failed err={s}",
+                                        .{@errorName(err)},
+                                    );
+                                    try app.writeDomainNotice(.{
+                                        .topic = "recovery",
+                                        .tone = .warning,
+                                        .body = "the interrupted response could not continue automatically; it will try again on the next resume",
+                                    }, true);
+                                    break :other false;
+                                },
+                            };
+                            _ = queued;
+                        },
                     }
                 }
             }
+        }
+
+        fn previousOwnerDied(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return loaded.log.previous_owner_died;
+        }
+
+        fn recoveryAskedBefore(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return session_log.recoveryWasAsked(&loaded.log.dir);
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -2585,13 +2651,76 @@ pub fn Runtime(comptime App: type) type {
             return app.queueRecoveryCheckpoint(&checkpoint);
         }
 
+        /// Poll cadence and bound for snapshotFreshPromptBoundary's wait for an
+        /// in-flight turn close.
+        const fresh_prompt_turn_close_poll_ms: u64 = 50;
+        const fresh_prompt_turn_close_wait_ms: i64 = 30 * std.time.ms_per_s;
+
+        const FreshPromptBoundaryProbe = union(enum) {
+            wait,
+            ready: session_codec.RecoveryCheckpoint,
+        };
+
+        /// An open turn without a recovery checkpoint is the finalization
+        /// window of a cancelled or stall-stopped turn: those paths clear the
+        /// durable checkpoint first and close the turn through the queued
+        /// turn-finished event, which drains on another thread. Wait for the
+        /// close instead of failing the send. Only a turn that stays open
+        /// past the deadline is genuinely corrupt and still errors.
         pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            if (!loaded.conversation_writer.turn_open) return null;
-            const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
-            return try value.dupe(alloc);
+            return snapshotFreshPromptBoundaryWithin(app, alloc, fresh_prompt_turn_close_wait_ms);
+        }
+
+        fn snapshotFreshPromptBoundaryWithin(app: *App, alloc: Allocator, wait_ms: i64) !?session_codec.RecoveryCheckpoint {
+            const deadline_ms = io_mod.milliTimestamp() + wait_ms;
+            var waiting_logged = false;
+            while (true) {
+                const probe: FreshPromptBoundaryProbe = blk: {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                    const loaded = if (app.session_persistence.writable) |*value| value else return null;
+                    if (!loaded.conversation_writer.turn_open) {
+                        loaded.boundary_wedged = false;
+                        return null;
+                    }
+                    if (loaded.state.recovery_checkpoint) |checkpoint| {
+                        loaded.boundary_wedged = false;
+                        break :blk .{ .ready = try checkpoint.dupe(alloc) };
+                    }
+                    // A wedged boundary (a stop path that never commits the
+                    // close) already paid the wait once; fail fast after that.
+                    if (loaded.boundary_wedged) return error.InvalidRecoveryCheckpoint;
+                    break :blk .wait;
+                };
+                switch (probe) {
+                    .ready => |value| return value,
+                    .wait => {},
+                }
+                // A cancelled or shutting-down worker must not hold the send
+                // (or the worker-thread join at shutdown) for the full wait.
+                if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested")) {
+                    if (app.worker.isCancelRequested()) {
+                        debug_trace.logf("session", "event=fresh_prompt_boundary_aborted reason=cancel_requested", .{});
+                        return error.InvalidRecoveryCheckpoint;
+                    }
+                }
+                if (!waiting_logged) {
+                    debug_trace.logf("session", "event=fresh_prompt_boundary_waiting reason=open_turn_without_checkpoint", .{});
+                    waiting_logged = true;
+                }
+                if (io_mod.milliTimestamp() >= deadline_ms) {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    if (app.session_persistence.writable) |*loaded| {
+                        if (loaded.conversation_writer.turn_open and loaded.state.recovery_checkpoint == null) {
+                            loaded.boundary_wedged = true;
+                        }
+                    }
+                    app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                    debug_trace.logf("session", "event=fresh_prompt_boundary_timeout reason=open_turn_without_checkpoint wait_ms={d}", .{wait_ms});
+                    return error.InvalidRecoveryCheckpoint;
+                }
+                io_mod.sleep(fresh_prompt_turn_close_poll_ms * std.time.ns_per_ms);
+            }
         }
 
         pub fn normalizeFreshPromptPreparation(app: *App, request: worker_runtime.FreshPromptPreparation) worker_runtime.FreshPromptPreparation {
@@ -4035,6 +4164,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
             labels: *HistoricalSessionLabels,
+            recovery_decision: ?RecoveryAutoContinue,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -4056,8 +4186,14 @@ pub fn Runtime(comptime App: type) type {
             }
             // A compaction_prepared checkpoint records completed source owned by
             // the compaction flow, not a turn waiting to run; it gets no recovery
-            // notice and no automatic continuation.
-            if (checkpoint.cause != .compaction_prepared) {
+            // notice and no automatic continuation. Only a checkpoint the gate
+            // will actually auto-continue may promise one; a suppressed
+            // checkpoint gets the gate's own notice below.
+            const recovery_notice_suppressed = if (recovery_decision) |decision|
+                decision != .auto_continue
+            else
+                checkpoint.cause == .compaction_prepared;
+            if (!recovery_notice_suppressed) {
                 // No attempt counts: there is no budget to count against.
                 const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
                     "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
@@ -5661,10 +5797,15 @@ const FakeWorker = struct {
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
     active_prompt_is_root_authority: bool = false,
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn isCancelRequested(self: *const FakeWorker) bool {
+        return self.cancel_requested.load(.seq_cst);
     }
 
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
@@ -11992,4 +12133,162 @@ test "remembered selection write failure leaves pending user work durable and wa
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Session saved, but could not remember") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], loaded.active_id) != null);
+}
+
+fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_codec.RecoveryCheckpoint {
+    const json = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    return session_codec.parseRecoveryCheckpoint(alloc, parsed.value);
+}
+
+test "recovery auto-continue asks after an unclean exit instead of restarting" {
+    const alloc = std.testing.allocator;
+    var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
+    defer interrupted.deinit(alloc);
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
+    // Suppression stays sticky: a clean quit without a resolution still asks.
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
+
+    var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
+    defer compaction.deinit(alloc);
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true));
+}
+
+test "fresh prompt boundary waits out the cancel finalization window" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // The cancel-finalization window: turn still open, checkpoint cleared.
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 150);
+
+    // A checkpointed open turn still resolves immediately.
+    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("saved pending request") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    });
+    var ready = (try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200)).?;
+    ready.deinit(alloc);
+
+    // A close landing mid-wait resolves the boundary as no prior turn.
+    try Runtime(TestApp).clearRecoveryCheckpoint(&app);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(app_ptr: *TestApp) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            app_ptr.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app_ptr.session_persistence.write_mutex.unlock(io_mod.getIo());
+            app_ptr.session_persistence.writable.?.conversation_writer.turn_open = false;
+        }
+    }.run, .{&app});
+    defer closer.join();
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 10_000) == null);
+}
+
+test "fresh prompt boundary fails fast after the first wedged timeout" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    // The wedge is latched: later sends fail fast instead of re-waiting.
+    const latched_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - latched_ms < 150);
+
+    // The latch clears when the turn closes...
+    app.session_persistence.writable.?.conversation_writer.turn_open = false;
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200) == null);
+    // ...and a later open turn earns a full wait again.
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const reopened_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - reopened_ms >= 150);
+}
+
+test "fresh prompt boundary aborts the wait when cancellation lands" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const canceller = try std.Thread.spawn(.{}, struct {
+        fn run(app_ptr: *TestApp) void {
+            io_mod.sleep(150 * std.time.ns_per_ms);
+            app_ptr.worker.cancel_requested.store(true, .seq_cst);
+        }
+    }.run, .{&app});
+    defer canceller.join();
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms >= 150);
+    try std.testing.expect(elapsed_ms < 5_000);
 }
