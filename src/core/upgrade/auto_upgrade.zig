@@ -326,6 +326,18 @@ pub const AutoUpgrade = struct {
 
         var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch return error.SelfExeNotFound;
+        try self.installUnlessStopped(alloc, extracted_bin, self_exe);
+    }
+
+    /// Holds install_mutex across the stop check and the copy, so
+    /// stopForProcessExit waits out an install already under way and no
+    /// install starts after it.
+    fn installUnlessStopped(
+        self: *AutoUpgrade,
+        alloc: Allocator,
+        extracted_bin: []const u8,
+        self_exe: []const u8,
+    ) InstallError!void {
         self.install_mutex.lockUncancelable(io_mod.getIo());
         defer self.install_mutex.unlock(io_mod.getIo());
         if (self.should_stop.load(.acquire)) return error.Cancelled;
@@ -401,11 +413,21 @@ test "process-exit stop waits out an install already under way" {
             self.install_mutex.unlock(io_mod.getIo());
         }
     }.run, .{ &au, &install_started, &install_done });
+    defer installer.join();
     while (!install_started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
     au.stopForProcessExit();
     try std.testing.expect(install_done.load(.acquire));
-    try std.testing.expect(au.should_stop.load(.acquire));
-    installer.join();
+}
+
+test "no install starts after a process-exit stop" {
+    var au = AutoUpgrade{};
+    au.stopForProcessExit();
+    // Without the stop check, the copy of these missing paths would fail
+    // with InstallFailed instead.
+    try std.testing.expectError(
+        error.Cancelled,
+        au.installUnlessStopped(std.testing.allocator, "/nonexistent/fx-extracted", "/nonexistent/fx"),
+    );
 }
 
 test "statusLabel idle returns empty" {

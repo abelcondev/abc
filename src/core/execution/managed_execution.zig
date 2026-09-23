@@ -931,7 +931,9 @@ pub const Runtime = struct {
             const next = contract.transition(entry.state, entry.barrier, .stop_requested);
             entry.state = next.state;
             entry.barrier = next.barrier;
-            entry.force_cancel.store(force, .seq_cst);
+            // Force only escalates: a later cooperative stop must not undo a
+            // force-kill already requested, such as the one at process exit.
+            if (force) entry.force_cancel.store(true, .seq_cst);
             entry.cancel.store(true, .seq_cst);
             if (entry.active_waiter) |waiter_id| {
                 entry.preempted_waiter = waiter_id;
