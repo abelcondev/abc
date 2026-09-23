@@ -1290,12 +1290,12 @@ export async function createFxTerminal(options) {
   };
 }
 
-function isBlob(value) {
-  if (typeof Blob === "undefined" || value == null) return false;
+function blobByteLength(value) {
+  if (typeof Blob === "undefined" || value == null) return null;
   try {
-    return Number.isSafeInteger(Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value));
+    return Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1307,7 +1307,8 @@ function normalizePromptInput(input) {
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
-      const blob = isBlob(block.data);
+      const size = blobByteLength(block.data);
+      const blob = size !== null;
       if (!blob && (typeof block.data !== "string" || block.data.length === 0)) {
         throw new TypeError(`image prompt block ${index} requires base64 data or a Blob`);
       }
@@ -1318,7 +1319,6 @@ function normalizePromptInput(input) {
       if (typeof mimeType !== "string" || mimeType.length === 0 || mimeType.length > 128) {
         throw new TypeError(`image prompt block ${index} requires a mimeType`);
       }
-      const size = blob ? block.data.size : null;
       if (blob && (!Number.isSafeInteger(size) || size <= 0)) {
         throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
       }
@@ -1354,7 +1354,9 @@ function promptFrameSize(prompt) {
   let blobDataBytes = 0;
   const projected = prompt.map((block) => {
     if (block.type !== "image" || typeof block.data === "string") return block;
-    blobDataBytes += Math.ceil(block.data.size / 3) * 4;
+    const size = blobByteLength(block.data);
+    if (!Number.isSafeInteger(size)) throw new TypeError("image prompt requires a valid Blob size");
+    blobDataBytes += Math.ceil(size / 3) * 4;
     return { type: "image", data: "", mimeType: block.mimeType };
   });
   return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length + blobDataBytes + promptFrameEnvelopeBytes;

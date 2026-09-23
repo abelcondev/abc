@@ -202,25 +202,17 @@ function fileParts(body) {
   );
   let readOversized = false;
   class OversizedBlob extends Blob {
-    get size() { return 4 * 1024 * 1024; }
+    get size() { return 1; }
     async arrayBuffer() { readOversized = true; return super.arrayBuffer(); }
   }
   assert.throws(
-    () => agent.prompt([{ type: "image", data: new OversizedBlob(["bytes"], { type: "image/png" }) }]),
+    () => agent.prompt([{ type: "image", data: new OversizedBlob([Buffer.alloc(4 * 1024 * 1024)], { type: "image/png" }) }]),
     (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
   );
   assert.equal(readOversized, false);
-  class InvalidSizeBlob extends Blob {
-    get size() { return NaN; }
-    async arrayBuffer() { throw new Error("should not be read"); }
-  }
+  const budgetBlob = new Blob([Buffer.alloc(3.5 * 1024 * 1024)], { type: "image/png" });
   assert.throws(
-    () => agent.prompt([{ type: "image", data: new InvalidSizeBlob(["bytes"], { type: "image/png" }) }]),
-    (error) => error instanceof TypeError && /valid size/.test(error.message),
-  );
-  class BudgetBlob extends Blob { get size() { return 3.5 * 1024 * 1024; } }
-  assert.throws(
-    () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: new BudgetBlob(["bytes"], { type: "image/png" }) }))),
+    () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: budgetBlob }))),
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
 
