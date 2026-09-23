@@ -449,10 +449,11 @@ function fileParts(body) {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
-// A core exit during an unresolved Blob read rejects the turn and its event
-// iterator even though no ACP prompt request was submitted yet.
-{
+// A core exit before or just after Blob bytes arrive rejects the turn and
+// iterator without submitting a prompt or reporting user cancellation.
+for (const timing of ["during-read", "after-read"]) {
   let finishRuntime;
+  let finishRead;
   let onLine;
   const sentMethods = [];
   const runtime = {
@@ -474,7 +475,7 @@ function fileParts(body) {
   };
   const agent = await createSharedAgent({ apiKey: "image-exit-test-key", runtimeFactory: async () => runtime });
   class SlowBlob extends Blob {
-    arrayBuffer() { return new Promise(() => {}); }
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
   }
   const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
   const settled = Promise.all([
@@ -483,10 +484,12 @@ function fileParts(body) {
   ]);
   let timer;
   try {
+    await Promise.resolve();
+    if (timing === "after-read") finishRead(Buffer.from(pngData, "base64"));
     finishRuntime(1);
     await Promise.race([
       settled,
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("core exit did not settle Blob turn")), 1500); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`core exit ${timing} did not settle Blob turn`)), 1500); }),
     ]);
   } finally {
     clearTimeout(timer);
@@ -495,8 +498,9 @@ function fileParts(body) {
   await agent.close();
 }
 
-// A failed prompt write must reject steering queued during Blob loading.
-{
+// Queued steering must fail if the prompt write throws or the core exits as
+// it accepts the write; neither case may deliver guidance to a dead turn.
+for (const failure of ["write", "exit"]) {
   let finishRuntime;
   let onLine;
   let finishRead;
@@ -507,7 +511,11 @@ function fileParts(body) {
     write(line) {
       const request = JSON.parse(line);
       sentMethods.push(request.method);
-      if (request.method === "session/prompt") throw new Error("prompt write failed");
+      if (request.method === "session/prompt") {
+        if (failure === "write") throw new Error("prompt write failed");
+        finishRuntime(1);
+        return;
+      }
       if (request.method === "initialize" || request.method === "libfx/new") {
         queueMicrotask(() => onLine({
           jsonrpc: "2.0",
@@ -528,8 +536,8 @@ function fileParts(body) {
   const steering = turn.steer("queued guidance");
   await Promise.resolve();
   finishRead(Buffer.from(pngData, "base64"));
-  await assert.rejects(turn.result, /prompt write failed/);
-  await assert.rejects(steering, /no prompt is running/);
+  await assert.rejects(turn.result, failure === "write" ? /prompt write failed/ : /fx-core exited with code 1/);
+  await assert.rejects(steering);
   assert.equal(sentMethods.includes("steer:queued guidance"), false);
   await agent.close();
 }

@@ -1509,6 +1509,7 @@ export async function createFxAgent(options = {}) {
   let sessionId = null;
   let activeTurn = null;
   let closing = false;
+  let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
@@ -1650,6 +1651,7 @@ export async function createFxAgent(options = {}) {
   runtime.exited.then((code) => {
     closing = true;
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    coreExitError = error;
     activeTurn?.failPendingBlob(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
@@ -1891,10 +1893,12 @@ export async function createFxAgent(options = {}) {
         if (finished || cancelled || activeTurn !== turn) {
           return Promise.reject(new Error("no prompt is running"));
         }
+        if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
         const apply = () => {
           if (finished || cancelled || activeTurn !== turn) {
             return Promise.reject(new Error("no prompt is running"));
           }
+          if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
           try {
             if (typeof runtime.steer === "function") {
               runtime.steer(text);
@@ -1976,6 +1980,7 @@ export async function createFxAgent(options = {}) {
       ]).then((encodedPrompt) => {
         cancelBlobRead = null;
         rejectBlobRead = null;
+        if (coreExitError && !cancelled) throw coreExitError;
         if (encodedPrompt === null || cancelled || closing) {
           resolvePromptStart?.(false);
           resolvePromptStart = null;
