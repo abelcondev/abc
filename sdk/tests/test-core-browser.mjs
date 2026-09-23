@@ -183,6 +183,11 @@ try {
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
     expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
+  await runCase("Blob prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1", (result) => {
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.blobSent === true, "browser Blob image was not sent as a validated file part");
+    expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
+  });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");

@@ -101,6 +101,23 @@ function fileParts(body) {
   await agent.close();
 }
 
+// Blob and File use their own media types and share the base64 wire format
+// and the kernel's byte-sniffing path on both backends.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: { id: "sdk/vision-model" } });
+  const file = new File([Buffer.from(pngData, "base64")], "image.png", { type: "image/png" });
+  const result = await runPrompt(agent, [
+    { type: "text", text: "describe this file" },
+    { type: "image", data: file },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [
+    { type: "file", mediaType: "image/png", data: { type: "data", data: pngData } },
+  ]);
+  await agent.close();
+}
+
 // A pure-image prompt is valid; the placeholder keeps the turn non-empty.
 {
   const gateway = mockGateway();
@@ -140,7 +157,7 @@ function fileParts(body) {
   const first = await createAgent(gateway, { model: "sdk/vision-model" });
   const initial = await runPrompt(first, [
     { type: "text", text: "remember this image" },
-    { type: "image", data: pngData, mimeType: "image/png" },
+    { type: "image", data: new Blob([Buffer.from(pngData, "base64")], { type: "image/png" }) },
   ]);
   assert.equal(initial.stopReason, "end_turn");
   const checkpoint = await first.checkpoint();
@@ -172,6 +189,38 @@ function fileParts(body) {
   assert.throws(
     () => agent.prompt([{ type: "image", data: 42, mimeType: "image/png" }]),
     (error) => error instanceof TypeError && /requires base64 data/.test(error.message),
+  );
+
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Blob(["untyped"]) }]),
+    (error) => error instanceof TypeError && /requires a mimeType/.test(error.message),
+  );
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Blob(["bytes"], { type: "image/png" }), mimeType: "image/jpeg" }]),
+    (error) => error instanceof TypeError && /disagrees with Blob.type/.test(error.message),
+  );
+  let readOversized = false;
+  class OversizedBlob extends Blob {
+    get size() { return 4 * 1024 * 1024; }
+    async arrayBuffer() { readOversized = true; return super.arrayBuffer(); }
+  }
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new OversizedBlob(["bytes"], { type: "image/png" }) }]),
+    (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
+  );
+  assert.equal(readOversized, false);
+  class InvalidSizeBlob extends Blob {
+    get size() { return NaN; }
+    async arrayBuffer() { throw new Error("should not be read"); }
+  }
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new InvalidSizeBlob(["bytes"], { type: "image/png" }) }]),
+    (error) => error instanceof TypeError && /valid size/.test(error.message),
+  );
+  class BudgetBlob extends Blob { get size() { return 3.5 * 1024 * 1024; } }
+  assert.throws(
+    () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: new BudgetBlob(["bytes"], { type: "image/png" }) }))),
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
 
   const overSized = pngWithEncodedLength(5 * 1024 * 1024 + 4);
@@ -213,6 +262,14 @@ function fileParts(body) {
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
 
+  // The encoded data fits the image budgets but its ACP envelope does not.
+  const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
+  const frameOverflow = agent.prompt([
+    { type: "image", data: boundaryBlob },
+    { type: "image", data: boundaryBlob },
+  ]);
+  await assert.rejects(frameOverflow.result, (error) => error instanceof RangeError && /frame limit/.test(error.message));
+
   assert.equal(gateway.state.catalogFetches, 0);
   assert.equal(gateway.state.chatBodies.length, 0);
   await agent.close();
@@ -229,8 +286,58 @@ function fileParts(body) {
   const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]).toString("base64");
   const mismatch = agent.prompt([{ type: "image", data: jpegBytes, mimeType: "image/png" }]);
   await assert.rejects(mismatch.result, /Invalid image prompt block/);
+  const blobMismatch = agent.prompt([
+    { type: "image", data: new Blob([Buffer.from(jpegBytes, "base64")], { type: "image/png" }) },
+  ]);
+  await assert.rejects(blobMismatch.result, /Invalid image prompt block/);
   assert.equal(gateway.state.chatBodies.length, 0);
   await agent.close();
+}
+
+// A Blob read failure rejects only that turn and does not send a partial frame.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class BrokenBlob extends Blob {
+    async arrayBuffer() { throw new Error("read failed"); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new BrokenBlob(["bytes"], { type: "image/png" }) }]);
+  await assert.rejects(turn.result, /read failed/);
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "retry with text")).stopReason, "end_turn");
+  await agent.close();
+}
+
+// Cancel or close while Blob.arrayBuffer() is pending: settle promptly, do not
+// send a late prompt, and leave the agent available for the next turn.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  let finishRead;
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const blob = new SlowBlob([Buffer.from(pngData, "base64")], { type: "image/png" });
+  const turn = agent.prompt([{ type: "image", data: blob }]);
+  turn.cancel();
+  assert.equal((await turn.result).stopReason, "cancelled");
+  finishRead(Buffer.from(pngData, "base64"));
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "still usable")).stopReason, "end_turn");
+  await agent.close();
+}
+
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise(() => {}); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  await agent.close();
+  assert.equal((await turn.result).stopReason, "cancelled");
+  assert.equal(gateway.state.chatBodies.length, 0);
 }
 
 console.log(`${backend} agent image prompts passed`);

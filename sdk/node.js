@@ -530,7 +530,8 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
         return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
-        if (backend === "native") throw error;
+        if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT") throw error;
       }
     }
     if (backend === "native") {

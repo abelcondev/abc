@@ -76,6 +76,8 @@
     const forceUnsupported = params.has("force-unsupported");
     const hostToolEnabled = params.has("host-tool");
     const hostSkillEnabled = params.has("host-skill");
+    const blobPrompt = params.has("blob-prompt");
+    const blobPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
     const status = document.querySelector("#status");
     const timeline = document.querySelector("#timeline");
     const form = document.querySelector("form");
@@ -157,9 +159,16 @@
         return Response.json({ object: "list", data: [
           { id: "sdk/catalog-alpha", type: "language", released: 2, tags: ["tool-use"] },
           { id: "sdk/catalog-beta", type: "language", released: 1, tags: ["reasoning"] },
+          ...(blobPrompt ? [{ id: "sdk/chrome-model", type: "language", tags: ["vision", "file-input"] }] : []),
         ] });
       }
       test.fetchCalls++;
+      if (blobPrompt) {
+        const payload = JSON.parse(new TextDecoder().decode(init.body));
+        test.blobSent = payload.prompt.some((message) =>
+          message.role === "user" && message.content?.some((part) =>
+            part.type === "file" && part.mediaType === "image/png" && part.data?.data === blobPng));
+      }
       if (transport === "stall") {
         let controller;
         const body = new ReadableStream({ start(value) { controller = value; } });
@@ -272,7 +281,12 @@
       status.textContent = "running";
       let cancelTimer;
       try {
-        const turn = agent.prompt(prompt);
+        const turn = agent.prompt(blobPrompt ? [
+          { type: "text", text: prompt },
+          { type: "image", data: new Blob([
+            Uint8Array.from(atob(blobPng), (char) => char.charCodeAt(0)),
+          ], { type: "image/png" }) },
+        ] : prompt);
         currentTurn = turn;
         if (cancelAfter > 0) cancelTimer = setTimeout(() => turn.cancel(), cancelAfter);
         for await (const event of turn) {
