@@ -13,6 +13,7 @@ import {
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
+  normalizeAgentOptions,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
@@ -550,15 +551,12 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 }
 
 export async function createFxAgent(options = {}) {
-  if (options != null && Object.hasOwn(Object(options), "env")) {
-    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
-  }
   return createWithFallback(
     "agent",
     "createCore",
     createWasmAgent,
     defaultCoreWasm,
-    options,
+    normalizeAgentOptions(options),
   );
 }
 

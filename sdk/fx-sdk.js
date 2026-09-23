@@ -84,7 +84,7 @@ function normalizeFast(value) {
   return value;
 }
 
-function normalizeAgentOptions(value) {
+export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
   }

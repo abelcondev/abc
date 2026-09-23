@@ -142,6 +142,15 @@ async function runPrompt(agent) {
   }
   await assert.rejects(createAgent(gateway, { model: { effort: "low" } }), /model.id/);
   await assert.rejects(createAgent(gateway, { model: { id: "sdk/core-model", efffort: "high" } }), /unsupported model option: efffort/);
+  await assert.rejects(
+    createAgent(gateway, {
+      backend: "auto",
+      wasm: resolve(scriptDir, "missing-model-validation.wasm"),
+      model: { id: "sdk/core-model", effort: "high" },
+      effort: "low",
+    }),
+    (error) => error instanceof TypeError && /model options cannot be mixed/.test(error.message),
+  );
   assert.equal(gateway.state.catalogFetches, 0);
 }
 
