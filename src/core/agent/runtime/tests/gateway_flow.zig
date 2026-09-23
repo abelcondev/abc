@@ -797,10 +797,8 @@ test "processQueuedPrompt recovers when a model rejects assistant prefill after 
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.model = @constCast("anthropic/claude-fable-5");
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);

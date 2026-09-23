@@ -1134,8 +1134,8 @@ test "rejected subagent arguments keep their call and result during projection" 
         .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
         .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
     };
-    // A malformed call recast as an assistant summary would leave the next
-    // request ending in assistant prefill.
+    // Rewriting a malformed call into an assistant-role summary would leave
+    // the next request ending in assistant prefill.
     for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
         calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
