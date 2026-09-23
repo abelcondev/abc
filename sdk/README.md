@@ -66,6 +66,9 @@ Omitting effort or using `"default"` leaves the model default in place.
 fx CLI's `--fast` flag. A model without a fast path rejects at creation with
 `code: "LIBFX_MODEL_UNSUPPORTED_FAST"`, `model`, and `capability: "fast"`.
 Omitting fast or setting it to `false` leaves the model default in place.
+The new codes replace `LIBFX_UNSUPPORTED_EFFORT` and `LIBFX_UNSUPPORTED_FAST`
+for both nested and legacy top-level settings. Callers that check the old codes
+must update their error handling.
 
 The host selects the model. Agent creation does not fetch the Gateway model
 catalog unless effort requests a named level or fast is enabled. Prompting
@@ -132,10 +135,12 @@ const turn = agent.prompt([
 A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
 with at most 8 MiB of image data per prompt. The SDK checks Blob size before
 reading it, encodes it for the same ACP wire format, and rejects larger input
-with typed `RangeError`s. Blob reads are asynchronous: `prompt()` returns a
-turn, and read failures reject `turn.result`. Cancelling or closing while a
-Blob is being read settles the turn without sending its prompt. For base64
-input, size errors still throw synchronously from `prompt()`.
+with typed `RangeError`s. The total frame size is checked before reading a
+Blob, and the actual byte count is checked before encoding it. Blob reads are
+asynchronous: `prompt()` returns a turn, and read failures reject
+`turn.result`. Cancelling or closing while a Blob is being read settles the
+turn without sending its prompt. For base64 input, size errors still throw
+synchronously from `prompt()`.
 
 The kernel sniffs decoded bytes and compares them with the claimed MIME type
 for both input forms; a mismatch fails the turn with
@@ -152,8 +157,10 @@ without discarding the in-flight response or completed tool work. Steering also
 accepts an array of text blocks; image and resource steering blocks are rejected.
 Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
 queued steering text. Accepted steering appears as a `user_message` event before
-the model's continued output. Calling `steer()` after the turn settles rejects
-with `no prompt is running`.
+the model's continued output. For a Blob prompt, steering during the read
+waits for the prompt to be sent; cancelling before then rejects the pending
+steering. Calling `steer()` after the turn settles rejects with
+`no prompt is running`.
 
 ```js
 const turn = agent.prompt("Build the feature.");
