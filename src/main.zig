@@ -859,7 +859,7 @@ const App = struct {
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
-        self.upgrader.requestStop();
+        self.upgrader.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         self.managed_executions.terminateForProcessExit();
@@ -886,6 +886,7 @@ const App = struct {
 
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
+        shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit(self.alloc);
         shutdown_trace.mark("mcp_children_terminated");
         shutdown_trace.mark("complete");
@@ -3499,10 +3500,11 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             var owned_launch = launch;
             // Interactive shutdown has already persisted the session and
             // terminated child processes. What remains is freeing memory and
-            // joining the I/O pool, whose tasks can still be waiting on DNS or
-            // the network, so end the process here. Errors were reported by
-            // the interactive runner.
-            const outcome = app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode) catch exitFast(1);
+            // joining threads that can still be waiting on DNS, the network,
+            // or a disk scan, so end the process here. The app is declared in
+            // this scope because those threads still reference it.
+            var app: App = undefined;
+            const outcome = app_entry_runtime.runInteractive(App, &app, alloc, &owned_launch, auth_mode) catch exitFast(1);
             exitFast(switch (outcome) {
                 .returned => 0,
                 .exit => |code| code,

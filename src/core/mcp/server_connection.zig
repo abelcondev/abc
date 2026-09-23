@@ -56,7 +56,7 @@ pub const DetachedTransport = struct {
     /// Cancelled teardown: kills the stdio child without a drain and skips the
     /// remote session DELETE, so a cancelled connection never starts another
     /// round trip.
-    pub fn deinitImmediate(self: *DetachedTransport) void {
+    pub fn deinitAbandoned(self: *DetachedTransport) void {
         if (self.dispatcher) |dispatcher| dispatcher.deinitAbandoned();
         if (self.legacy_http) |client| client.deinitWithoutSessionTermination();
         if (self.legacy_sse) |client| client.deinit();
@@ -221,7 +221,7 @@ pub const Server = struct {
     pub fn disconnectImmediate(self: *Server) void {
         self.stopToolSubscription();
         var detached = self.detachTransport();
-        detached.deinitImmediate();
+        detached.deinitAbandoned();
     }
 
     pub fn detachTransport(self: *Server) DetachedTransport {

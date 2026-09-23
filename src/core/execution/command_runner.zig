@@ -49,7 +49,6 @@ const command_artifact_log_suffix = ".log";
 const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
-const command_output_poll_ms: i64 = 100;
 /// Idle wait between stop checks while capturing output. Reads return as soon
 /// as output arrives, so this bounds only how long a silent command takes to
 /// observe a cancel or force-kill request.
@@ -66,7 +65,7 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
-const foreground_supervisor_handoff_ms: i64 = command_output_poll_ms * 2;
+const foreground_supervisor_handoff_ms: i64 = 200;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;

@@ -2419,27 +2419,34 @@ test "MCP immediate shutdown kills an uncooperative child without grace waits" {
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
 }
 
-test "MCP immediate shutdown drains written frames while abandoned shutdown kills at once" {
+test "MCP immediate shutdown waits out the drain window before the kill" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
     }
-    const script =
+    const fixture = try createShellDispatcher(
         \\trap '' TERM
         \\while :; do sleep 1; done
-    ;
-    const drained = try createShellDispatcher(script);
-    const drained_started_ms = io_mod.milliTimestamp();
-    drained.dispatcher.deinitImmediate();
-    const drained_elapsed_ms = io_mod.milliTimestamp() - drained_started_ms;
-    try expectProcessReaped(drained.pid);
-    try std.testing.expect(drained_elapsed_ms >= immediate_drain_ms);
+    );
+    const started_ms = io_mod.milliTimestamp();
+    fixture.dispatcher.deinitImmediate();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms >= immediate_drain_ms);
+}
 
-    const abandoned = try createShellDispatcher(script);
-    const abandoned_started_ms = io_mod.milliTimestamp();
-    abandoned.dispatcher.deinitAbandoned();
-    const abandoned_elapsed_ms = io_mod.milliTimestamp() - abandoned_started_ms;
-    try expectProcessReaped(abandoned.pid);
-    try std.testing.expect(abandoned_elapsed_ms < immediate_drain_ms);
+test "MCP abandoned shutdown kills an uncooperative child without grace waits" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\trap '' TERM
+        \\while :; do sleep 1; done
+    );
+    const started_ms = io_mod.milliTimestamp();
+    fixture.dispatcher.deinitAbandoned();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms < shutdown_grace_ms);
 }
 
 test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {

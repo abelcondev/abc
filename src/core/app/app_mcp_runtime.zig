@@ -941,6 +941,9 @@ pub const State = struct {
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
+    /// Set by process-exit teardown before it joins a pending reload, so the
+    /// reload discards its candidate runtime without grace or session DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
     last_reload_completion_origin: PresentationOrigin = .command,
     last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
@@ -2510,7 +2513,11 @@ pub const State = struct {
         refresh_catalogs: bool,
     ) !ReloadOutcome {
         var candidate_owned = candidate != null;
-        defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        defer if (candidate_owned) destroyRuntime(
+            alloc,
+            candidate.?,
+            if (self.process_exiting.load(.acquire)) .process_exit else .discard,
+        );
         self.lock.lockSharedUncancelable(io_mod.getIo());
         const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
         self.lock.unlockShared(io_mod.getIo());
@@ -2560,6 +2567,13 @@ pub const State = struct {
     }
 
     fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
+        if (mode == .process_exit) {
+            // A reload still in flight must see this before it is joined.
+            self.process_exiting.store(true, .release);
+            self.lock.lockSharedUncancelable(io_mod.getIo());
+            if (self.runtime) |runtime| runtime.prepareForProcessExit();
+            self.lock.unlockShared(io_mod.getIo());
+        }
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.cancelPendingMenuOperation("shutdown");
@@ -2567,7 +2581,7 @@ pub const State = struct {
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
-        if (previous) |runtime| destroyRuntimeWithMode(alloc, runtime, mode);
+        if (previous) |runtime| destroyRuntime(alloc, runtime, mode);
         self.clearMenuOwned(alloc);
         self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
         self.clearModelCatalogBaselineLocked(alloc);
@@ -2591,11 +2605,7 @@ fn cancelAndDeinitAuthentication(
 
 const RuntimeTeardown = enum { discard, process_exit };
 
-fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
-    destroyRuntimeWithMode(alloc, runtime, .discard);
-}
-
-fn destroyRuntimeWithMode(
+fn destroyRuntime(
     alloc: Allocator,
     runtime: *mcp_runtime.McpRuntime,
     mode: RuntimeTeardown,

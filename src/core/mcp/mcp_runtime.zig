@@ -252,6 +252,10 @@ pub const McpRuntime = struct {
     discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     discovery_cancel_requested: std.atomic.Value(bool) = .init(false),
     discovery_thread: ?std.Thread = null,
+    /// Set when the process is about to exit, so a reload still reconciling
+    /// this runtime tears removed servers down without grace or session
+    /// DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
 
     fn legacyInputs(self: *McpRuntime) legacy_elicitation_runtime.Coordination {
         return .{ .catalog_mutex = &self.catalog_mutex, .completions = &self.completions };
@@ -327,6 +331,14 @@ pub const McpRuntime = struct {
     }
 
     const ServerShutdownMode = enum { graceful, immediate, process_exit };
+
+    pub fn prepareForProcessExit(self: *McpRuntime) void {
+        self.process_exiting.store(true, .release);
+    }
+
+    fn retiredServerShutdownMode(self: *const McpRuntime) ServerShutdownMode {
+        return if (self.process_exiting.load(.acquire)) .process_exit else .graceful;
+    }
 
     fn destroyServer(self: *McpRuntime, server: *McpServer, shutdown_mode: ServerShutdownMode) void {
         server.lifetime.retire();
@@ -818,7 +830,7 @@ pub const McpRuntime = struct {
         self.releaseServers(current);
         current_retained = false;
         for (previous.items) |server| {
-            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, .graceful);
+            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, self.retiredServerShutdownMode());
         }
         previous.deinit(self.alloc);
         return null;
@@ -864,7 +876,7 @@ pub const McpRuntime = struct {
         }
         self.server_mutex.unlock(io_mod.getIo());
         self.catalog_mutex.unlock(io_mod.getIo());
-        for (retired.items) |server| self.destroyServer(server, .graceful);
+        for (retired.items) |server| self.destroyServer(server, self.retiredServerShutdownMode());
     }
 
     pub fn workspaceAuthorityReducedAgainstConfigs(
