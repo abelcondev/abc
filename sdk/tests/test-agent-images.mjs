@@ -325,6 +325,11 @@ function fileParts(body) {
   }
   const turn = agent.prompt([{ type: "image", data: new BrokenBlob(["bytes"], { type: "image/png" }) }]);
   await assert.rejects(turn.result, /read failed/);
+  class CancelledBlob extends Blob {
+    async arrayBuffer() { throw new Error("Cancelled"); }
+  }
+  const failedRead = agent.prompt([{ type: "image", data: new CancelledBlob(["bytes"], { type: "image/png" }) }]);
+  await assert.rejects(failedRead.result, (error) => error.message === "Cancelled");
   assert.equal(gateway.state.chatBodies.length, 0);
   assert.equal((await runPrompt(agent, "retry with text")).stopReason, "end_turn");
   await agent.close();
@@ -341,6 +346,7 @@ function fileParts(body) {
   }
   const turn = agent.prompt([{ type: "image", data: new SlowBlob(["x"], { type: "image/png" }) }]);
   const steering = turn.steer("focus on the image");
+  await Promise.resolve();
   assert.equal(gateway.state.chatBodies.length, 0);
   finishRead(Buffer.from(pngData, "base64"));
   await steering;
@@ -361,6 +367,7 @@ function fileParts(body) {
   }
   const blob = new SlowBlob([Buffer.from(pngData, "base64")], { type: "image/png" });
   const turn = agent.prompt([{ type: "image", data: blob }]);
+  await Promise.resolve();
   const steering = turn.steer("pending guidance");
   turn.cancel();
   await assert.rejects(steering, /no prompt is running/);
@@ -414,6 +421,34 @@ function fileParts(body) {
   await agent.close();
 }
 
+// Closing from arrayBuffer() must find an initialized turn result and release
+// the runtime rather than rejecting before it can close stdin.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  let closing;
+  class ClosingBlob extends Blob {
+    arrayBuffer() {
+      closing = agent.close();
+      return new Promise(() => {});
+    }
+  }
+  const turn = agent.prompt([{ type: "image", data: new ClosingBlob(["bytes"], { type: "image/png" }) }]);
+  await Promise.resolve();
+  assert.ok(closing);
+  let timer;
+  try {
+    await Promise.race([
+      closing,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("reentrant close did not settle")), 1500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal((await turn.result).stopReason, "cancelled");
+  assert.equal(gateway.state.chatBodies.length, 0);
+}
+
 // A core exit during an unresolved Blob read rejects the turn and its event
 // iterator even though no ACP prompt request was submitted yet.
 {
@@ -457,6 +492,45 @@ function fileParts(body) {
     clearTimeout(timer);
   }
   assert.equal(sentMethods.includes("session/prompt"), false);
+  await agent.close();
+}
+
+// A failed prompt write must reject steering queued during Blob loading.
+{
+  let finishRuntime;
+  let onLine;
+  let finishRead;
+  const sentMethods = [];
+  const runtime = {
+    exited: new Promise((resolveExit) => { finishRuntime = resolveExit; }),
+    setLineHandler(handler) { onLine = handler; },
+    write(line) {
+      const request = JSON.parse(line);
+      sentMethods.push(request.method);
+      if (request.method === "session/prompt") throw new Error("prompt write failed");
+      if (request.method === "initialize" || request.method === "libfx/new") {
+        queueMicrotask(() => onLine({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: request.method === "libfx/new" ? { sessionId: "image-write-test" } : {},
+        }));
+      }
+    },
+    steer(text) { sentMethods.push(`steer:${text}`); },
+    abortHostEffects() {},
+    closeStdin() { finishRuntime(0); },
+  };
+  const agent = await createSharedAgent({ apiKey: "image-write-test-key", runtimeFactory: async () => runtime });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  const steering = turn.steer("queued guidance");
+  await Promise.resolve();
+  finishRead(Buffer.from(pngData, "base64"));
+  await assert.rejects(turn.result, /prompt write failed/);
+  await assert.rejects(steering, /no prompt is running/);
+  assert.equal(sentMethods.includes("steer:queued guidance"), false);
   await agent.close();
 }
 

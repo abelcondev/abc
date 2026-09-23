@@ -1640,6 +1640,7 @@ export async function createFxAgent(options = {}) {
     emit("acp.send", { message });
     if (message.method === "session/prompt" && activeTurn?.cancelled) throw new Error("Cancelled");
     runtime.write(`${JSON.stringify(message)}\n`);
+    if (message.method === "session/prompt") activeTurn?.promptWritten();
   };
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
@@ -1882,6 +1883,10 @@ export async function createFxAgent(options = {}) {
         rejectBlobRead = null;
         cancelBlobRead = null;
       },
+      promptWritten() {
+        resolvePromptStart?.(true);
+        resolvePromptStart = null;
+      },
       steer(text) {
         if (finished || cancelled || activeTurn !== turn) {
           return Promise.reject(new Error("no prompt is running"));
@@ -1966,7 +1971,7 @@ export async function createFxAgent(options = {}) {
     }) : null;
     const response = hasBlobs
       ? Promise.race([
-        materializePromptBlobs(prompt, () => cancelled || closing),
+        Promise.resolve().then(() => materializePromptBlobs(prompt, () => cancelled || closing)),
         blobReadCancelled,
       ]).then((encodedPrompt) => {
         cancelBlobRead = null;
@@ -1979,10 +1984,7 @@ export async function createFxAgent(options = {}) {
         if (promptFrameSize(encodedPrompt) > maxPromptFrameBytes) {
           throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
         }
-        const started = request("session/prompt", { sessionId, prompt: encodedPrompt });
-        resolvePromptStart?.(true);
-        resolvePromptStart = null;
-        return started;
+        return request("session/prompt", { sessionId, prompt: encodedPrompt });
       })
       : request("session/prompt", { sessionId, prompt });
     turn.result = response
@@ -1992,7 +1994,7 @@ export async function createFxAgent(options = {}) {
         rejectBlobRead = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
-        if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
         terminalError = error;
         throw error;
       })
