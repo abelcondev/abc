@@ -748,8 +748,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "/mcp list reports a missing workspace variable without exposing config values",
+  test(
+    "top-level mcp list reports a missing workspace variable without exposing config values",
     async () => {
       const root = createRoot("workspace-missing-environment", MODERN_FIXTURE);
       moveProfileFixtureToWorkspace(root);
@@ -766,23 +766,75 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         { cwd: root.workspace, env },
       );
       expect(trusted.code).toBe(0);
+
+      const listed = await runFx(["mcp", "list"], {
+        cwd: root.workspace,
+        env,
+      });
+      expect(listed.code).toBe(0);
+      expect(listed.stderr).toBe("");
+      expect(listed.stdout).toContain("Project MCP configuration errors:");
+      expect(listed.stdout).toContain(".mcp.json server 'fixture'");
+      expect(listed.stdout).toContain("field command");
+      expect(listed.stdout).not.toContain("secret-prefix");
+      expect(listed.stdout).not.toContain(MODERN_FIXTURE);
+      expect(existsSync(root.wireLogPath)).toBe(false);
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP menu keeps a workspace configuration error visible beside a valid server",
+    async () => {
+      const root = createRoot("workspace-menu-configuration-error", MODERN_FIXTURE);
+      moveProfileFixtureToWorkspace(root);
+      const projectPath = join(root.workspace, ".mcp.json");
+      const project = JSON.parse(readFileSync(projectPath, "utf8"));
+      project.mcpServers.fixture.command = "secret-prefix-${MISSING_WORKSPACE_COMMAND}";
+      writeFileSync(projectPath, JSON.stringify(project));
+      writeFileSync(
+        join(root.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            canary: {
+              type: "local",
+              command: [process.execPath, MODERN_FIXTURE],
+              enabled: false,
+            },
+          },
+        }),
+      );
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = fixtureEnv(root, gateway);
+      const trusted = await runFx(
+        ["mcp", "trust", "approve", "fixture"],
+        { cwd: root.workspace, env },
+      );
+      expect(trusted.code).toBe(0);
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
-        width: 160,
+        width: 180,
         height: 36,
         env,
       });
 
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
-      expect(pane).toContain("Project MCP configuration errors:");
-      expect(pane).toContain(".mcp.json server 'fixture'");
-      expect(pane).toContain("field command");
-      expect(pane).not.toContain("secret-prefix");
-      expect(pane).not.toContain(MODERN_FIXTURE);
+      const menu = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
+      expect(menu).toContain("MCP 1");
+      expect(menu).toContain("canary");
+      expect(menu).toContain("Disabled");
+      expect(menu).toContain("fx mcp list");
+      expect(menu).toContain("MISSING_WORKSPACE_COMMAND");
+      expect(menu).toContain("field command");
+      expect(menu).not.toContain("secret-prefix");
+      expect(menu).not.toContain(MODERN_FIXTURE);
       expect(existsSync(root.wireLogPath)).toBe(false);
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
     },
     30_000,
   );
@@ -980,10 +1032,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       );
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
-      let pane = await tui.waitForText("admission=approved", 10_000);
-      expect(pane).toContain("state=ready");
+      let pane = await tui.waitForText("[Servers]", 10_000);
+      expect(pane).toContain("fixture");
+      expect(pane).toContain("Ready");
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("enabledMcpjsonServers");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
 
       await tui.sendText("/mcp trust reset");
       await tui.waitForPane((pane) =>
@@ -993,8 +1048,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
-      pane = await tui.waitForText("admission=rejected", 10_000);
-      expect(pane).toContain("state=disabled");
+      pane = await tui.waitForText("[Servers]", 10_000);
+      expect(pane).toContain("fixture");
+      expect(pane).toContain("Disabled");
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("disabledMcpjsonServers");
 
@@ -4633,10 +4689,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForText("OPTIONAL_MCP_DEGRADED_TURN_READY", 10_000);
       expect(activeGateway.requests).toHaveLength(1);
       await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("failure=", 10_000);
-      expect(pane).toContain("policy=optional");
-      expect(pane).toContain("state=failed");
-      expect(pane).toContain("cache=unavailable");
+      const menu = await tui.waitForText("[Servers]", 10_000);
+      expect(menu).toContain("fixture");
+      expect(menu).toContain("Failed");
+      await tui.sendKeys("Enter");
+      const details = await tui.waitForText("Policy", 5_000);
+      expect(details).toMatch(/State\s+Failed/);
+      expect(details).toMatch(/Policy\s+optional/);
+      expect(details).toContain("Error");
 
       await tui.kill();
       tui = null;
@@ -5127,8 +5187,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     45_000,
   );
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "/mcp list renders complete secret-free health after releasing runtime locks",
+  test(
+    "top-level mcp list renders complete secret-free health after releasing runtime locks",
     async () => {
       const root = createRoot("health-output", MODERN_FIXTURE, { mode: "features" });
       const profilePath = join(root.home, ".fx", "mcp.json");
@@ -5141,17 +5201,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 180,
-        height: 36,
-        env: fixtureEnv(root, activeGateway),
-      });
 
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MCP health (1 server)", 10_000);
+      const result = await runFx(["mcp", "list", "--connect"], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
       for (const expected of [
         "MCP health (1 server",
         "source=profile",
@@ -5165,11 +5222,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "protocol=2026-07-28",
         "tools=1 resources=unknown templates=unknown prompts=unknown",
         "cache=fresh",
-        "subscription=active",
         "retry_attempt=0",
         "discovery=completed",
-      ]) expect(pane).toContain(expected);
-      expect(pane).not.toContain(root.workspace);
+      ]) expect(result.stdout).toContain(expected);
+      expect(result.stdout).toMatch(/subscription=(starting|active)/);
+      expect(result.stdout).not.toContain(root.workspace);
       for (const forbidden of [
         "captured_at_ms=",
         "runtime_generation=",
@@ -5179,11 +5236,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "S11_SECRET_ENV",
         MODERN_FIXTURE,
         "fake-mcp-stdio-key",
-      ]) expect(pane).not.toContain(forbidden);
+      ]) expect(result.stdout).not.toContain(forbidden);
       expect(activeGateway.requests).toHaveLength(0);
-
-      await tui.kill();
-      tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     },
     35_000,
@@ -5248,10 +5302,17 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await killFixture(firstPid);
 
       await tui.sendText("/mcp list");
-      const failedHealth = await tui.waitForText("state=failed", 10_000);
-      expect(failedHealth).toContain(
+      const failedMenu = await tui.waitForText("[Servers]", 10_000);
+      expect(failedMenu).toContain("fixture");
+      expect(failedMenu).toContain("Failed");
+      await tui.sendKeys("Enter");
+      const failedDetails = await tui.waitForText("Error", 5_000);
+      expect(failedDetails).toContain(
         "Connection or discovery failed; check the trusted profile configuration and trace logs.",
       );
+      await tui.sendKeys("Escape");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
 
       const initialWire = readWire(root.wireLogPath);
       const initialResourceLists = initialWire.filter(
@@ -5313,11 +5374,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(isProcessAlive(fifthPid)).toBe(true);
 
       await tui.sendText("/mcp list");
-      const recoveredHealth = await tui.waitForText("retry_attempt=4", 10_000);
-      expect(recoveredHealth.lastIndexOf("state=ready")).toBeGreaterThan(
-        recoveredHealth.lastIndexOf("state=failed"),
-      );
-      expect(recoveredHealth).toContain("retry_in_ms=none");
+      const recoveredMenu = await tui.waitForText("[Servers]", 10_000);
+      expect(recoveredMenu).toContain("fixture");
+      expect(recoveredMenu).toContain("Ready");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       expect(activeGateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 

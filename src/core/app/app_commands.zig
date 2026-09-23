@@ -1258,7 +1258,8 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0 and
+            const command = std.mem.trim(u8, rest, " \t");
+            if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
                 closeModelMenuIfPresent(app);
@@ -4215,8 +4216,10 @@ const McpCommandFakeApp = struct {
     };
 
     alloc: std.mem.Allocator,
+    shell: transcript_runtime.TranscriptRuntime = .{},
     notice_body: std.ArrayList(u8) = .empty,
     list_count: usize = 0,
+    menu_open_count: usize = 0,
     reload_count: usize = 0,
     notice_count: usize = 0,
     last_topic: ?[]const u8 = null,
@@ -4230,7 +4233,12 @@ const McpCommandFakeApp = struct {
     menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
+        self.shell.deinit(self.alloc);
         self.notice_body.deinit(self.alloc);
+    }
+
+    fn openMcpMenu(self: *McpCommandFakeApp) !void {
+        self.menu_open_count += 1;
     }
 
     fn mcpCommandProvider(_: *const McpCommandFakeApp) mcp_command_provider.Provider {
@@ -5242,6 +5250,18 @@ test "copy command reports missing replies and host failures" {
         try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
     }
     try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
+}
+
+test "MCP list opens the menu without writing a transcript notice" {
+    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), " list ");
+
+    try std.testing.expectEqual(@as(usize, 1), app.menu_open_count);
+    try std.testing.expectEqual(@as(usize, 0), app.list_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "app_commands renders transactional status for explicit MCP reload" {

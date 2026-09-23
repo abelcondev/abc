@@ -798,20 +798,21 @@ async function waitForMcpServerReady(
     throw new Error(`Timed out waiting for MCP fixture startup: ${serverName}`);
   }
 
-  const hasServerState = (pane: string, state: "ready" | "failed") =>
-    pane.includes(`${serverName} [${state}]`) ||
+  const hasServerState = (pane: string, state: "Ready" | "Failed") =>
     pane.split("\n").some((line) =>
-      line.includes(`${serverName} `) && line.includes(` state=${state}`)
+      line.includes(`${serverName} `) && line.includes(state)
     );
   await session.sendText("/mcp list");
   const status = await session.waitForPane(
-    (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
+    (pane) => hasServerState(pane, "Ready") || hasServerState(pane, "Failed"),
     timeoutMs,
   );
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
   if (!isProcessAlive(pid)) {
     throw new Error(`MCP fixture process ${pid} exited after startup.\n${status}`);
   }
-  if (hasServerState(status, "failed")) {
+  if (hasServerState(status, "Failed")) {
     throw new Error(`MCP server ${serverName} failed after startup.\n${status}`);
   }
 }

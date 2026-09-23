@@ -766,7 +766,7 @@ pub fn Runtime(comptime App: type) type {
                         .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
                         .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
                         .prompts = if (view.prompts) |catalog| catalog.items else &.{},
-                        .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                        .configuration_issues = if (view.health) |health| health.configuration_issues else &.{},
                         .preview = view.preview,
                         .feedback = view.feedback,
                         .add_name = view.add_form.name.items,

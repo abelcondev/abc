@@ -203,8 +203,8 @@ array. Workspace entries are always optional and never load stored credentials.
 Approved workspace `command`, `args`, `env`, and HTTP header values expand
 `${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
 rejected entries do not read environment values. Missing required variables
-leave an approved server unloaded and appear in `/mcp list` without exposing
-values.
+leave an approved server unloaded and appear in the `/mcp` and `/mcp list`
+menu without exposing values.
 
 Interactive sessions keep pending workspace servers disconnected and request
 project trust before any project-defined process or network effect. Pending
@@ -230,7 +230,9 @@ assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
-* `/mcp list`
+* `/mcp`
+
+* `/mcp list` (opens the same server menu)
 
 * `/mcp resource list <server>`
 
@@ -330,8 +332,9 @@ MCP capability to a child. Server-filtered searches, selected tools, and feature
 operations activate only their target; a broad search activates the broader
 catalog. Each server owns its startup and recovery progress. Connection deadlines
 cover discovery, fallback, and restarts together. Interactive authentication and
-logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
-snapshot. The interactive menu refreshes that view while it is open.
+logout change only the affected connection. `/mcp` and `/mcp list` open the same
+bounded, secret-free menu, which refreshes its live health snapshot while open.
+Noninteractive `fx mcp list` renders the health snapshot to stdout.
 
 Search and explicit selection share bounded schema publication. Definitions are
 checked against their runtime, connection, catalog, and credential generations
