@@ -1647,11 +1647,12 @@ export async function createFxAgent(options = {}) {
     try { send({ jsonrpc: "2.0", id, method, params }); } catch (error) { pending.delete(id); reject(error); }
   });
   runtime.exited.then((code) => {
-    emit("runtime.exit", { code });
     closing = true;
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    activeTurn?.failPendingBlob(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
+    emit("runtime.exit", { code });
   });
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
@@ -1847,6 +1848,7 @@ export async function createFxAgent(options = {}) {
     let reportedPressure = false;
     let discardedBytes = 0;
     let cancelBlobRead = null;
+    let rejectBlobRead = null;
     let resolvePromptStart = null;
     const promptStarted = hasBlobs ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
     let pendingSteeringCount = 0;
@@ -1875,6 +1877,11 @@ export async function createFxAgent(options = {}) {
       transportBytes: 0,
       lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
+      failPendingBlob(error) {
+        rejectBlobRead?.(error);
+        rejectBlobRead = null;
+        cancelBlobRead = null;
+      },
       steer(text) {
         if (finished || cancelled || activeTurn !== turn) {
           return Promise.reject(new Error("no prompt is running"));
@@ -1912,6 +1919,7 @@ export async function createFxAgent(options = {}) {
         cancelled = true;
         cancelBlobRead?.();
         cancelBlobRead = null;
+        rejectBlobRead = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
         runtime.closeSteering?.();
@@ -1952,13 +1960,17 @@ export async function createFxAgent(options = {}) {
     runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
-    const blobReadCancelled = hasBlobs ? new Promise((resolve) => { cancelBlobRead = () => resolve(null); }) : null;
+    const blobReadCancelled = hasBlobs ? new Promise((resolve, reject) => {
+      cancelBlobRead = () => resolve(null);
+      rejectBlobRead = reject;
+    }) : null;
     const response = hasBlobs
       ? Promise.race([
         materializePromptBlobs(prompt, () => cancelled || closing),
         blobReadCancelled,
       ]).then((encodedPrompt) => {
         cancelBlobRead = null;
+        rejectBlobRead = null;
         if (encodedPrompt === null || cancelled || closing) {
           resolvePromptStart?.(false);
           resolvePromptStart = null;
@@ -1976,6 +1988,8 @@ export async function createFxAgent(options = {}) {
     turn.result = response
       .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
       .catch((error) => {
+        cancelBlobRead = null;
+        rejectBlobRead = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
         if (error.message === "Cancelled") return { stopReason: "cancelled" };

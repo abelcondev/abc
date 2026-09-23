@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxAgent as createSharedAgent } from "../fx-sdk.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -410,6 +411,52 @@ function fileParts(body) {
   }
   assert.equal(gateway.state.chatBodies.length, 0);
   assert.equal((await runPrompt(agent, "usable after abort")).stopReason, "end_turn");
+  await agent.close();
+}
+
+// A core exit during an unresolved Blob read rejects the turn and its event
+// iterator even though no ACP prompt request was submitted yet.
+{
+  let finishRuntime;
+  let onLine;
+  const sentMethods = [];
+  const runtime = {
+    exited: new Promise((resolveExit) => { finishRuntime = resolveExit; }),
+    setLineHandler(handler) { onLine = handler; },
+    write(line) {
+      const request = JSON.parse(line);
+      sentMethods.push(request.method);
+      if (request.method === "initialize" || request.method === "libfx/new") {
+        queueMicrotask(() => onLine({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: request.method === "libfx/new" ? { sessionId: "image-exit-test" } : {},
+        }));
+      }
+    },
+    abortHostEffects() {},
+    closeStdin() { finishRuntime(0); },
+  };
+  const agent = await createSharedAgent({ apiKey: "image-exit-test-key", runtimeFactory: async () => runtime });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise(() => {}); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  const settled = Promise.all([
+    assert.rejects(turn.result, /fx-core exited with code 1/),
+    assert.rejects(turn[Symbol.asyncIterator]().next(), /fx-core exited with code 1/),
+  ]);
+  let timer;
+  try {
+    finishRuntime(1);
+    await Promise.race([
+      settled,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("core exit did not settle Blob turn")), 1500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(sentMethods.includes("session/prompt"), false);
   await agent.close();
 }
 
