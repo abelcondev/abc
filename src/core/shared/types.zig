@@ -1466,6 +1466,8 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    /// Checkpoint steering text has already had its envelope removed.
+    restored_steering: bool = false,
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
