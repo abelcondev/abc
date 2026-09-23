@@ -2861,16 +2861,26 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             if (persistence_failure) |err| {
-                // The turn already rendered. Keep the session alive and coherent
-                // in memory, record the failure for shutdown reporting, and warn
-                // instead of taking the process down.
+                // A finished turn kept in memory cannot be followed by another
+                // prompt while its unfinished copy is still in the journal.
                 recordShutdownFailure(app, err);
+                if (loaded.conversation_writer.turn_open and loaded.conversation_writer.failure == null) {
+                    loaded.conversation_writer.failure = error.SessionCommitFailed;
+                    debug_trace.logf("session", "open turn blocked after failed save err={s}", .{@errorName(err)});
+                }
                 if (comptime @hasDecl(App, "writeDomainNotice")) {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
-                        .{@errorName(err)},
-                    );
+                    const body = if (loaded.conversation_writer.turn_open)
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "Turn completed, but fx could not save it ({s}). New messages are blocked until you reopen the session. The turn may run again.",
+                            .{@errorName(err)},
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                            .{@errorName(err)},
+                        );
                     defer app.alloc.free(body);
                     app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
                 }

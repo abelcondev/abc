@@ -3200,9 +3200,7 @@ pub fn appendExecutionMemoryChatMessages(
                     try messages.append(alloc, .{ .role = .assistant, .content = prefix });
                 }
             }
-            if (steering.text.len > 0) {
-                try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
-            }
+            try messages.append(alloc, .{ .role = .user, .content = steering.text, .restored_steering = true });
             steering_index += 1;
         }
         if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
@@ -3245,8 +3243,7 @@ pub fn appendExecutionMemoryChatMessages(
                 try messages.append(alloc, .{ .role = .assistant, .content = prefix });
             }
         }
-        if (steering.text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
+        try messages.append(alloc, .{ .role = .user, .content = steering.text, .restored_steering = true });
     }
 }
 
