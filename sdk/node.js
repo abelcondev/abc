@@ -514,10 +514,11 @@ function createNativeAgent(addon, options) {
 }
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
-  const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
+  const { nativeAddon, backend = "auto", ...unvalidatedOptions } = options ?? {};
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
+  const runtimeOptions = surface === "agent" ? normalizeAgentOptions(unvalidatedOptions) : unvalidatedOptions;
 
   let nativeError;
   let nativeAttempted = false;
@@ -556,7 +557,7 @@ export async function createFxAgent(options = {}) {
     "createCore",
     createWasmAgent,
     defaultCoreWasm,
-    normalizeAgentOptions(options),
+    options,
   );
 }
 
