@@ -103,14 +103,6 @@ pub const Config = struct {
     acp_runner: acp_runner.Runner,
 };
 
-pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
-    const outcome = try runWithDeps(App, alloc, args, cfg, .{});
-    switch (outcome) {
-        .returned => return,
-        .exit => |code| std.process.exit(code),
-    }
-}
-
 pub const RunOutcome = union(enum) {
     returned,
     exit: u8,

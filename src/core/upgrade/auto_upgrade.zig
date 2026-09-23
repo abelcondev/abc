@@ -368,8 +368,9 @@ test "download sweep removes only stale upgrade directories" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const zio = std.testing.io;
-    try tmp.dir.createDir(zio, download_dir_prefix ++ "abandoned", .default_dir);
     try tmp.dir.createDir(zio, "unrelated", .default_dir);
+    try tmp.dir.writeFile(zio, .{ .sub_path = download_dir_prefix ++ "file", .data = "" });
+    try tmp.dir.createDir(zio, download_dir_prefix ++ "abandoned", .default_dir);
     const base = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(base);
     const created_ns = (try tmp.dir.statFile(zio, download_dir_prefix ++ "abandoned", .{})).mtime.nanoseconds;
@@ -377,12 +378,34 @@ test "download sweep removes only stale upgrade directories" {
     sweepStaleDownloadDirs(base, created_ns + stale_download_dir_ns - 1);
     _ = try tmp.dir.statFile(zio, download_dir_prefix ++ "abandoned", .{});
 
-    sweepStaleDownloadDirs(base, created_ns + stale_download_dir_ns);
+    // Far past every entry's age limit, only prefixed directories go.
+    sweepStaleDownloadDirs(base, created_ns + 10 * stale_download_dir_ns);
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.statFile(zio, download_dir_prefix ++ "abandoned", .{}),
     );
     _ = try tmp.dir.statFile(zio, "unrelated", .{});
+    _ = try tmp.dir.statFile(zio, download_dir_prefix ++ "file", .{});
+}
+
+test "process-exit stop waits out an install already under way" {
+    var au = AutoUpgrade{};
+    var install_started = std.atomic.Value(bool).init(false);
+    var install_done = std.atomic.Value(bool).init(false);
+    const installer = try std.Thread.spawn(.{}, struct {
+        fn run(self: *AutoUpgrade, started: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            self.install_mutex.lockUncancelable(io_mod.getIo());
+            started.store(true, .release);
+            io_mod.sleep(50 * std.time.ns_per_ms);
+            done.store(true, .release);
+            self.install_mutex.unlock(io_mod.getIo());
+        }
+    }.run, .{ &au, &install_started, &install_done });
+    while (!install_started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    au.stopForProcessExit();
+    try std.testing.expect(install_done.load(.acquire));
+    try std.testing.expect(au.should_stop.load(.acquire));
+    installer.join();
 }
 
 test "statusLabel idle returns empty" {
