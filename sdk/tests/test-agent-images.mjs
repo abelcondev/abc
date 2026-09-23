@@ -383,6 +383,70 @@ function fileParts(body) {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
+// A Blob can abort the signal synchronously from arrayBuffer(). The turn must
+// still settle even when the read promise never resolves.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  const controller = new AbortController();
+  class AbortingBlob extends Blob {
+    arrayBuffer() {
+      controller.abort();
+      return new Promise(() => {});
+    }
+  }
+  const turn = agent.prompt([
+    { type: "image", data: new AbortingBlob(["bytes"], { type: "image/png" }) },
+  ], { signal: controller.signal });
+  let timer;
+  try {
+    const result = await Promise.race([
+      turn.result,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Blob abort did not settle")), 1500); }),
+    ]);
+    assert.equal(result.stopReason, "cancelled");
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "usable after abort")).stopReason, "end_turn");
+  await agent.close();
+}
+
+// Pre-prompt steering has the same count and byte limits as the core queue.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise(() => {}); }
+  }
+  for (const [payload, count] of [["x", 64], ["x".repeat(64 * 1024), 16]]) {
+    const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+    const queued = Array.from({ length: count }, () => turn.steer(payload).catch((error) => error));
+    await assert.rejects(turn.steer(payload), /steering queue is full/);
+    turn.cancel();
+    const rejected = await Promise.all(queued);
+    assert.ok(rejected.every((error) => error instanceof Error && /no prompt is running/.test(error.message)));
+    assert.equal((await turn.result).stopReason, "cancelled");
+  }
+  assert.equal(gateway.state.chatBodies.length, 0);
+  await agent.close();
+}
+
+// A pre-aborted Blob prompt must reject steering immediately.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  const controller = new AbortController();
+  controller.abort();
+  const turn = agent.prompt([
+    { type: "image", data: new Blob([Buffer.from(pngData, "base64")], { type: "image/png" }) },
+  ], { signal: controller.signal });
+  await assert.rejects(turn.steer("late guidance"), /no prompt is running/);
+  assert.equal((await turn.result).stopReason, "cancelled");
+  await agent.close();
+}
+
 // Cancellation from the send event must not let a late prompt through after
 // its session/cancel notification.
 {

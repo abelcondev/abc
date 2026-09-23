@@ -1849,6 +1849,8 @@ export async function createFxAgent(options = {}) {
     let cancelBlobRead = null;
     let resolvePromptStart = null;
     const promptStarted = hasBlobs ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
+    let pendingSteeringCount = 0;
+    let pendingSteeringBytes = 0;
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
@@ -1874,6 +1876,9 @@ export async function createFxAgent(options = {}) {
       lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
       steer(text) {
+        if (finished || cancelled || activeTurn !== turn) {
+          return Promise.reject(new Error("no prompt is running"));
+        }
         const apply = () => {
           if (finished || cancelled || activeTurn !== turn) {
             return Promise.reject(new Error("no prompt is running"));
@@ -1892,9 +1897,15 @@ export async function createFxAgent(options = {}) {
             return Promise.reject(error);
           }
         };
-        return promptStarted
-          ? promptStarted.then((started) => started ? apply() : Promise.reject(new Error("no prompt is running")))
-          : apply();
+        if (!resolvePromptStart) return apply();
+        const bytes = encoder.encode(text).length;
+        if (pendingSteeringCount >= maxSteeringMessages || bytes > maxSteeringQueueBytes - pendingSteeringBytes) {
+          return Promise.reject(new Error("steering queue is full"));
+        }
+        pendingSteeringCount++;
+        pendingSteeringBytes += bytes;
+        return promptStarted.then((started) => started ? apply() : Promise.reject(new Error("no prompt is running")))
+          .finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
       },
       cancel() {
         if (finished || cancelled) return;
@@ -1931,6 +1942,8 @@ export async function createFxAgent(options = {}) {
       },
     };
     if (signal?.aborted) {
+      resolvePromptStart?.(false);
+      resolvePromptStart = null;
       finished = true;
       turn.result = Promise.resolve({ stopReason: "cancelled" });
       return turn;
@@ -1939,10 +1952,11 @@ export async function createFxAgent(options = {}) {
     runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
+    const blobReadCancelled = hasBlobs ? new Promise((resolve) => { cancelBlobRead = () => resolve(null); }) : null;
     const response = hasBlobs
       ? Promise.race([
         materializePromptBlobs(prompt, () => cancelled || closing),
-        new Promise((resolve) => { cancelBlobRead = () => resolve(null); }),
+        blobReadCancelled,
       ]).then((encodedPrompt) => {
         cancelBlobRead = null;
         if (encodedPrompt === null || cancelled || closing) {
