@@ -1104,7 +1104,7 @@ describe("version-scoped legacy MCP remote transports", () => {
 
   for (const version of VERSIONS) {
     test.skipIf(!tmuxAvailable())(
-      `TUI cancellation sends ${version} cancellation headers and cleans up`,
+      `TUI cancellation sends ${version} cancellation headers and quits without a session DELETE`,
       async () => {
         streamable = startLegacyStreamableHttpFixture(version, {
           mode: "stall_call",
@@ -1169,7 +1169,9 @@ describe("version-scoped legacy MCP remote transports", () => {
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(10_000);
         tui = null;
-        expect(streamable.deleteCalls).toBe(1);
+        // Exit leaves the session for the server to expire rather than
+        // holding the prompt for a DELETE round trip.
+        expect(streamable.deleteCalls).toBe(0);
       },
       40_000,
     );

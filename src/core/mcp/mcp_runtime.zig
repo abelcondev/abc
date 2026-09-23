@@ -252,6 +252,10 @@ pub const McpRuntime = struct {
     discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     discovery_cancel_requested: std.atomic.Value(bool) = .init(false),
     discovery_thread: ?std.Thread = null,
+    /// Set when the process is about to exit, so a reload still reconciling
+    /// this runtime tears removed servers down without grace or session
+    /// DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
 
     fn legacyInputs(self: *McpRuntime) legacy_elicitation_runtime.Coordination {
         return .{ .catalog_mutex = &self.catalog_mutex, .completions = &self.completions };
@@ -300,14 +304,23 @@ pub const McpRuntime = struct {
     }
 
     pub fn deinit(self: *McpRuntime) void {
+        self.deinitWithMode(.immediate);
+    }
+
+    /// Kills stdio children without grace and skips remote session DELETEs;
+    /// only for teardown immediately followed by process exit.
+    pub fn deinitForProcessExit(self: *McpRuntime) void {
+        self.deinitWithMode(.process_exit);
+    }
+
+    fn deinitWithMode(self: *McpRuntime, shutdown_mode: ServerShutdownMode) void {
         self.discovery_cancel_requested.store(true, .seq_cst);
         if (self.discovery_thread) |thread| {
             self.discovery_thread = null;
             thread.join();
         }
-        // Process-exit path: kill stdio children immediately rather than
-        // waiting out per-server grace windows.
-        for (self.servers.items) |server| self.destroyServer(server, .immediate);
+        // A discarded runtime never waits out per-server grace windows.
+        for (self.servers.items) |server| self.destroyServer(server, shutdown_mode);
         self.servers.deinit(self.alloc);
         for (self.workspace_diagnostics.items) |*diagnostic| {
             diagnostic.deinit(self.alloc);
@@ -317,7 +330,15 @@ pub const McpRuntime = struct {
         self.tool_aliases.deinit();
     }
 
-    const ServerShutdownMode = enum { graceful, immediate };
+    const ServerShutdownMode = enum { graceful, immediate, process_exit };
+
+    pub fn prepareForProcessExit(self: *McpRuntime) void {
+        self.process_exiting.store(true, .release);
+    }
+
+    fn retiredServerShutdownMode(self: *const McpRuntime) ServerShutdownMode {
+        return if (self.process_exiting.load(.acquire)) .process_exit else .graceful;
+    }
 
     fn destroyServer(self: *McpRuntime, server: *McpServer, shutdown_mode: ServerShutdownMode) void {
         server.lifetime.retire();
@@ -337,6 +358,7 @@ pub const McpRuntime = struct {
         switch (shutdown_mode) {
             .graceful => detached.deinitGracefully(self.alloc),
             .immediate => detached.deinitImmediate(self.alloc),
+            .process_exit => detached.deinitForProcessExit(self.alloc),
         }
         server.deinit(self.alloc);
         server.connection_lock.unlock(io_mod.getIo());
@@ -808,7 +830,7 @@ pub const McpRuntime = struct {
         self.releaseServers(current);
         current_retained = false;
         for (previous.items) |server| {
-            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, .graceful);
+            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, self.retiredServerShutdownMode());
         }
         previous.deinit(self.alloc);
         return null;
@@ -854,7 +876,7 @@ pub const McpRuntime = struct {
         }
         self.server_mutex.unlock(io_mod.getIo());
         self.catalog_mutex.unlock(io_mod.getIo());
-        for (retired.items) |server| self.destroyServer(server, .graceful);
+        for (retired.items) |server| self.destroyServer(server, self.retiredServerShutdownMode());
     }
 
     pub fn workspaceAuthorityReducedAgainstConfigs(
@@ -6512,6 +6534,8 @@ test "caller cancellation interrupts blocked candidate connection" {
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expect(runtime.servers.items[0].last_error == null);
+    // Cancellation is not a startup failure and never spends a restart.
+    try std.testing.expectEqual(@as(u8, 0), runtime.servers.items[0].restart_attempts);
 }
 
 test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {
