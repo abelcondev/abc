@@ -592,6 +592,107 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     } finally { await f.cleanup(passed); }
   }, 60_000);
 
+  test("auto: steering sent during a turn stays user text through compaction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compaction-steering-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    for (let n = 1; n <= 30; n++) {
+      writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
+    }
+    const task = "STEER_TASK_8d4: read the probe files and report progress.";
+    // Longer than the excerpt compaction used for generated notices.
+    const steering = "STEER_RULE_8d4: prefix every progress line with S1>. " +
+      "Keep all of this correction. ".repeat(80) + "STEER_END_8d4";
+    const ordinaryBodies: string[] = [];
+    const summaryBodies: string[] = [];
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        summaryBodies.push(raw);
+        return fakeGatewayFinalText("STEER_SUMMARY_8d4: the probe files are being read.");
+      }
+      ordinaryBodies.push(raw);
+      const n = ordinaryBodies.length;
+      if (summaryBodies.length > 0) return fakeGatewayFinalText("STEER_DONE_8d4");
+      if (n === 1) return fakeShellRun("steer-window-8d4", "printf STEER_WINDOW_8d4; sleep 3");
+      if (n <= 31) return fakeGatewayToolCall(`steer-probe-${n - 1}-8d4`, "read_file", { path: `probe-${n - 1}.txt` });
+      return fakeGatewayFinalText("STEER_NOT_COMPACTED_8d4");
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 60000, max_tokens: 4096 }] });
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const command = `/usr/bin/env -i ${Object.entries(env)
+      .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: command, cwd: workspace, env, isolated: true, remainOnExit: true,
+        stderrPath, width: 120, height: 40, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(15_000);
+      await terminal.sendText(task);
+      await terminal.waitForText("STEER_WINDOW_8d4", 15_000);
+      await terminal.sendText(steering);
+      await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
+      await terminal.waitForText("STEER_DONE_8d4", 20_000);
+
+      const steered = ordinaryBodies.filter((body) => body.includes("STEER_RULE_8d4"));
+      expect(steered.length).toBeGreaterThan(1);
+      expect(steered[0]).toContain("<user_steering>");
+
+      const source = JSON.parse(summaryBodies[0]!).prompt
+        .filter((message: { role: string }) => message.role === "user")
+        .map((message: { content: { text?: string }[] }) => message.content.map((part) => part.text ?? "").join(""))
+        .join("\n");
+      const at = source.indexOf("STEER_RULE_8d4");
+      expect(at).toBeGreaterThan(-1);
+      const header = source.slice(source.lastIndexOf("\n### ", at) + 1, at);
+      expect(header).toStartWith("### User\n> USER_RETAINED:");
+      expect(header).not.toContain("Generated notice");
+      expect(source).toContain("STEER_END_8d4");
+
+      const sessionId = readdirSync(join(home, ".fx/sessions"))
+        .find((id) => existsSync(join(home, ".fx/sessions", id, "events.jsonl")));
+      expect(sessionId).toBeDefined();
+      const sessionDir = join(home, ".fx/sessions", sessionId!);
+      await until(() => readFileSync(join(sessionDir, "events.jsonl"), "utf8").includes("\"turn_completed\""), "saved turn", 10_000);
+      const handoff = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).find((frame) => frame.event?.context_checkpoint)?.event.context_checkpoint.summary ?? "";
+      const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
+      expect(match).not.toBeNull();
+      const state = JSON.parse(readFileSync(join(sessionDir, "tool-results", match![1]!), "utf8"));
+      expect(state.users).toEqual([task, steering]);
+
+      const afterCompaction = ordinaryBodies.at(-1)!;
+      expect(afterCompaction).toContain("<context_handoff>");
+      expect(afterCompaction).toContain("STEER_END_8d4");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary: ordinaryBodies.length, summaries: summaryBodies.length }, null, 2));
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`compaction steering evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   for (const injectedStaleCheckpoint of [false, true]) {
     test(`overflow recovery ${injectedStaleCheckpoint ? "blocks a stale checkpoint" : "saves a retained image turn"} after a killed post-compaction tool`, async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-compaction-recovery-"));
