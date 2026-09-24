@@ -1670,7 +1670,10 @@ fn runRuntimeRecoveryControl(
         if (std.mem.find(u8, response, "server_restart_failed") == null or
             std.mem.find(u8, response, "did not complete startup within 500 ms (startup_timeout_ms)") == null)
         {
-            std.debug.print("unexpected recovery result: {s}\n", .{response});
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+            try stderr.interface.print("unexpected recovery result: {s}\n", .{response});
+            try stderr.interface.flush();
             return error.WrongRecoveryControlResult;
         }
     }
