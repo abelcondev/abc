@@ -1,4 +1,5 @@
 const std = @import("std");
+const browser_callback = @import("browser_callback.zig");
 const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -498,17 +499,29 @@ pub fn queryValueNonEmptyAlloc(
 }
 
 pub fn percentDecodeAlloc(alloc: Allocator, value: []const u8) QueryError![]u8 {
+    return percent_decode_alloc_detailed(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidPercentEncoding,
+    };
+}
+
+const PercentDecodeDetailedError = std.mem.Allocator.Error || error{
+    TruncatedPercentEncoding,
+    InvalidPercentDigit,
+};
+
+fn percent_decode_alloc_detailed(alloc: Allocator, value: []const u8) PercentDecodeDetailedError![]u8 {
     var out = try alloc.alloc(u8, value.len);
     errdefer alloc.free(out);
     var read_index: usize = 0;
     var write_index: usize = 0;
     while (read_index < value.len) {
         if (value[read_index] == '%') {
-            if (read_index + 2 >= value.len) return error.InvalidPercentEncoding;
+            if (read_index + 2 >= value.len) return error.TruncatedPercentEncoding;
             const high = std.fmt.charToDigit(value[read_index + 1], 16) catch
-                return error.InvalidPercentEncoding;
+                return error.InvalidPercentDigit;
             const low = std.fmt.charToDigit(value[read_index + 2], 16) catch
-                return error.InvalidPercentEncoding;
+                return error.InvalidPercentDigit;
             out[write_index] = @intCast(high * 16 + low);
             read_index += 3;
         } else {
@@ -518,6 +531,112 @@ pub fn percentDecodeAlloc(alloc: Allocator, value: []const u8) QueryError![]u8 {
         write_index += 1;
     }
     return alloc.realloc(out, write_index);
+}
+
+pub const FormCallback = struct {
+    state: []u8,
+    code: ?[]u8,
+    issuer: ?[]u8,
+    denied: bool,
+
+    pub fn deinit(self: *FormCallback, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.state);
+        if (self.code) |value| secret.zeroAndFree(alloc, value);
+        if (self.issuer) |value| secret.zeroAndFree(alloc, value);
+        self.* = undefined;
+    }
+};
+
+pub const FormCallbackContext = struct {
+    expected_state: []const u8,
+    invalid_error: anyerror,
+    allow_issuer: bool = false,
+    require_visible_ascii: bool = false,
+    max_value_bytes: usize,
+    code_max_bytes: usize = 2048,
+    consumed: bool = false,
+};
+
+pub fn parse_form_callback(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    body: []const u8,
+) browser_callback.ParseResult(FormCallback) {
+    const context: *FormCallbackContext = @ptrCast(@alignCast(raw.?));
+    if (context.consumed) return .unrelated;
+    const callback = parse_form_callback_body(alloc, body, context) catch |err| {
+        if (err == error.OAuthFormStateMismatch) return .unrelated;
+        return .{ .failed = err };
+    };
+    context.consumed = true;
+    return .{ .accepted = callback };
+}
+
+fn decode_form_callback_component(
+    alloc: Allocator,
+    value: []const u8,
+    context: *const FormCallbackContext,
+) ![]u8 {
+    const decoded = percent_decode_alloc_detailed(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TruncatedPercentEncoding => return if (context.require_visible_ascii)
+            context.invalid_error
+        else
+            error.InvalidPercentEncoding,
+        error.InvalidPercentDigit => return if (context.require_visible_ascii)
+            error.InvalidCharacter
+        else
+            error.InvalidPercentEncoding,
+    };
+    errdefer alloc.free(decoded);
+    if (context.require_visible_ascii) {
+        for (decoded) |byte| if (byte < 0x21 or byte > 0x7e) return context.invalid_error;
+    }
+    return decoded;
+}
+
+fn parse_form_callback_body(
+    alloc: Allocator,
+    body: []const u8,
+    context: *const FormCallbackContext,
+) !FormCallback {
+    var values: [4]?[]u8 = @splat(null);
+    defer for (values) |value| if (value) |bytes| secret.zeroAndFree(alloc, bytes);
+    var fields = std.mem.splitScalar(u8, body, '&');
+    while (fields.next()) |field| {
+        const equals = std.mem.findScalar(u8, field, '=') orelse return context.invalid_error;
+        const name = try decode_form_callback_component(alloc, field[0..equals], context);
+        defer alloc.free(name);
+        const index: usize = if (std.mem.eql(u8, name, "state"))
+            0
+        else if (std.mem.eql(u8, name, "code"))
+            1
+        else if (std.mem.eql(u8, name, "error"))
+            2
+        else if (context.allow_issuer and std.mem.eql(u8, name, "iss"))
+            3
+        else
+            return context.invalid_error;
+        if (values[index] != null) return context.invalid_error;
+        const value = try decode_form_callback_component(alloc, field[equals + 1 ..], context);
+        values[index] = value;
+        if (value.len == 0 or value.len > context.max_value_bytes) return context.invalid_error;
+        if (index == 1 and value.len > context.code_max_bytes) return context.invalid_error;
+    }
+    if (!std.mem.eql(u8, values[0] orelse return error.OAuthFormStateMismatch, context.expected_state)) {
+        return error.OAuthFormStateMismatch;
+    }
+    if ((values[1] == null) == (values[2] == null)) return context.invalid_error;
+    const result: FormCallback = .{
+        .state = values[0].?,
+        .code = values[1],
+        .issuer = values[3],
+        .denied = values[2] != null,
+    };
+    values[0] = null;
+    values[1] = null;
+    values[3] = null;
+    return result;
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
