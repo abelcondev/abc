@@ -2491,10 +2491,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       async () => {
         // Call again only after fx has seen the first server exit.
         const deadline = Date.now() + 5_000;
-        while (
-          !readFileSync(root.traceLogPath, "utf8").includes("stdio dispatcher failed") &&
-          Date.now() < deadline
-        ) {
+        while (!readFileSync(root.traceLogPath, "utf8").includes("stdio dispatcher failed")) {
+          if (Date.now() >= deadline) throw new Error("fx never saw the first server exit");
           await Bun.sleep(20);
         }
         return fakeGatewayToolCall("second_call", TOOL_NAME, { text: "second" });

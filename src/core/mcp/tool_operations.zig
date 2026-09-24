@@ -338,6 +338,7 @@ pub const Operations = struct {
                     return error.Cancelled;
                 }
                 if (!outcome.connection_running and !outcome.request_started and !retried_unsent_call) {
+                    const failures_before = server.failureSerial();
                     self.recoverServerForToolCall(
                         server,
                         snapshot,
@@ -345,8 +346,19 @@ pub const Operations = struct {
                         operation_deadline.?,
                         options,
                     ) catch |recovery_err| {
-                        if (recovery_err != error.Cancelled) {
-                            if (try restartFailedResult(arena, server, snapshot.prefixed_name)) |result| return result;
+                        debug_trace.logf(
+                            "mcp",
+                            "stdio server recovery failed server={s} generation={d} err={s}",
+                            .{ server.config.name, outcome.generation, @errorName(recovery_err) },
+                        );
+                        if (recovery_err == error.Cancelled or
+                            recovery_err == error.McpAccessDenied or
+                            recovery_err == error.McpAuthorityChanged)
+                        {
+                            return recovery_err;
+                        }
+                        if (try restartFailedResult(arena, server, snapshot.prefixed_name, failures_before)) |result| {
+                            return result;
                         }
                         return recovery_err;
                     };
@@ -661,11 +673,17 @@ pub const Operations = struct {
         };
     }
 
-    /// The recorded reason a stopped server failed to start again, or null
-    /// when it is not down with one.
-    fn restartFailedResult(arena: Allocator, server: *McpServer, tool_name: []const u8) !?tool_mcp_runtime.CallResult {
+    /// The reason a stopped server failed to start again, or null unless
+    /// the recovery that ran after `failures_before` recorded one.
+    fn restartFailedResult(
+        arena: Allocator,
+        server: *McpServer,
+        tool_name: []const u8,
+        failures_before: u64,
+    ) !?tool_mcp_runtime.CallResult {
         server.status_lock.lockUncancelable(io_mod.getIo());
         defer server.status_lock.unlock(io_mod.getIo());
+        if (server.failure_serial == failures_before) return null;
         if (server.state.load(.acquire) != .failed) return null;
         const failure = server.last_error orelse return null;
         return .{
@@ -1193,3 +1211,23 @@ pub const Operations = struct {
         });
     }
 };
+
+test "a failed recovery reports only the failure it recorded" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server = McpServer{ .config = .{ .name = @constCast("fixture") } };
+    defer if (server.last_error) |value| alloc.free(value);
+
+    server.setFailed(alloc, "MCP server exited with code 1 before completing startup");
+    // A recovery that stopped before relaunching, such as on an authority
+    // check, must not report the older failure.
+    const before = server.failureSerial();
+    try std.testing.expect((try Operations.restartFailedResult(arena, &server, "mcp_fixture_echo", before)) == null);
+
+    server.setFailed(alloc, "MCP server exited with code 5 before completing startup: relaunch blocked");
+    const result = (try Operations.restartFailedResult(arena, &server, "mcp_fixture_echo", before)).?;
+    try std.testing.expect(result.status == .protocol_failure);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "exited with code 5 before completing startup: relaunch blocked") != null);
+}
