@@ -3305,24 +3305,20 @@ fn connectServerCancellable(
     cancel_requested: *std.atomic.Value(bool),
     timeout_override: ?std.Io.Duration,
 ) !void {
-    const deadline = startupDeadline(
-        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-        server.config.startup_timeout_ms,
-        timeout_override,
-    );
-    const budget = connection_control.startupTimeout(server.config.startup_timeout_ms, timeout_override);
-    const budget_ms = std.math.cast(u32, budget.toMilliseconds()) orelse std.math.maxInt(u32);
+    // Fix the budget from the same instant as the deadline so later work,
+    // such as loading stored credentials, cannot shave it.
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const control = (connection_control.Control{
+        .deadline = startupDeadline(now, server.config.startup_timeout_ms, timeout_override),
+        .cancel_flag = cancel_requested,
+        .lifecycle_cancel_flag = server.cancellation(),
+    }).withStartupBudget(now, server.config.startup_timeout_ms);
     return server_transport.start(
         runtime.alloc,
         runtime.tool_registry,
         server,
         used_tool_names,
-        .{
-            .deadline = deadline,
-            .startup_budget_ms = @min(budget_ms, server.config.startup_timeout_ms),
-            .cancel_flag = cancel_requested,
-            .lifecycle_cancel_flag = server.cancellation(),
-        },
+        control,
     ) catch |err| switch (err) {
         error.McpRequestTimedOut => error.McpConnectionTimedOut,
         else => err,
@@ -5508,6 +5504,35 @@ test "server_transport.connectServer completes NDJSON handshake against a real s
 
     server.disconnect();
     try expectTestProcessExited(grandchild_pid);
+}
+
+test "server_transport.connectServer keeps the restart when discovery stalled before the legacy launch exited" {
+    const alloc = std.testing.allocator;
+    // Ignores the modern discovery probe, then exits on the legacy initialize.
+    const shell_server =
+        \\IFS= read -r line
+        \\case "$line" in
+        \\  *'"method":"server/discover"'*) exec sleep 30 ;;
+        \\esac
+        \\printf 'npm error code E401\n' >&2
+        \\exit 3
+    ;
+    var config = try shellMcpConfigForTest(alloc, "stalled", shell_server);
+    config.startup_timeout_ms = 400;
+    var server = McpServer{ .config = config };
+    defer server.deinit(alloc);
+    var used = tool_names.Registry.init(alloc);
+    defer used.deinit();
+
+    // Not every launch ended on its own, so this is not the no-restart error.
+    try std.testing.expectError(
+        error.McpInitFailed,
+        server_transport.connectServer(alloc, &server, .{}, &used, .{}),
+    );
+    try std.testing.expectEqualStrings(
+        "MCP server exited with code 3 before completing startup: npm error code E401",
+        server.last_error.?,
+    );
 }
 
 test "server_transport.connectServer discovers and calls a modern NDJSON tool" {

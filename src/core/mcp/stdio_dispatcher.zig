@@ -2673,6 +2673,40 @@ test "MCP stdio records how a child that exits before replying ended and what it
     try std.testing.expect(!diagnostics.stderr.omitted);
 }
 
+test "MCP stdio reports a write to a child that closed stdin as a closed connection" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\exec 0<&-
+        \\printf 'stdin closed\n' >&2
+        \\exec sleep 30
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+    for (0..400) |_| {
+        const early = dispatcher.childDiagnostics();
+        if (std.mem.startsWith(u8, early.stderr.headSlice(), "stdin closed")) break;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    } else return error.TestExpectedClosedStdin;
+
+    const request_id = try dispatcher.reserveRequestId();
+    try std.testing.expectError(
+        error.McpConnectionClosed,
+        dispatcher.request(
+            std.testing.allocator,
+            request_id,
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+            4096,
+            .{ .timeout_ms = 5_000 },
+        ),
+    );
+    // fx ends a child it can no longer write to; the details still arrive.
+    const diagnostics = dispatcher.childDiagnostics();
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, diagnostics.term.?);
+    try std.testing.expectEqualStrings("stdin closed\n", diagnostics.stderr.headSlice());
+}
+
 test "MCP stdio keeps draining stderr so a chatty child stays responsive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
