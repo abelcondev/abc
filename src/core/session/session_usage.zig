@@ -508,7 +508,9 @@ pub const Usage = struct {
         self.publication_mutex.lockUncancelable(io_mod.getIo());
         self.publication_sink = sink;
         self.publication_mutex.unlock(io_mod.getIo());
-        if (sink != null) self.flushProfilePublications();
+        // Restored sessions can carry a backlog; publishing it waits on the
+        // profile-wide ledger lock, so it must not run on the caller's thread.
+        if (sink != null) self.scheduleProfilePublicationDrain();
     }
 
     pub fn persistCheckpoint(self: *Usage) bool {
@@ -1395,58 +1397,65 @@ pub const Usage = struct {
         };
         defer batch.deinit(sink.allocator);
 
-        for (batch.pending) |marker| {
-            sink.publish(sink.context, .{ .pending = marker }) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "usage profile pending publication failed id={s} reason={s}",
-                    .{ marker.id, @errorName(err) },
-                );
-            };
-        }
         var published_any = false;
-        for (batch.incidents) |incident| {
-            sink.publish(sink.context, .{ .incident = incident }) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "usage profile incident publication failed reason={s}",
-                    .{@errorName(err)},
-                );
-                continue;
-            };
-            self.mutex.lockUncancelable(io_mod.getIo());
-            self.removeIncidentUnlocked(incident);
-            self.mutex.unlock(io_mod.getIo());
-            published_any = true;
-        }
+        // An unavailable ledger lock blocks every remaining item the same way.
+        // Unpublished items stay queued in session state for the next flush.
+        publish: {
+            for (batch.pending) |marker| {
+                sink.publish(sink.context, .{ .pending = marker }) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "usage profile pending publication failed id={s} reason={s}",
+                        .{ marker.id, @errorName(err) },
+                    );
+                    if (ledgerLockUnavailable(err)) break :publish;
+                };
+            }
+            for (batch.incidents) |incident| {
+                sink.publish(sink.context, .{ .incident = incident }) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "usage profile incident publication failed reason={s}",
+                        .{@errorName(err)},
+                    );
+                    if (ledgerLockUnavailable(err)) break :publish;
+                    continue;
+                };
+                self.mutex.lockUncancelable(io_mod.getIo());
+                self.removeIncidentUnlocked(incident);
+                self.mutex.unlock(io_mod.getIo());
+                published_any = true;
+            }
 
-        for (batch.facts) |fact| {
-            sink.publish(sink.context, .{ .generation = fact }) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "usage profile backlog retry failed id={s} reason={s}",
-                    .{ fact.id, @errorName(err) },
-                );
-                continue;
-            };
-            self.mutex.lockUncancelable(io_mod.getIo());
-            self.applyGenerationUnlocked(
-                sink.allocator,
-                generationRecordBorrowed(fact),
-                true,
-            ) catch |err| {
-                self.billing = .incomplete;
-                self.recordIncidentUnlocked(.incomplete, fact.created_at_ms);
-                self.removePublicationBacklogUnlocked(sink.allocator, fact.id);
-                self.dirty = true;
-                debug_trace.logf(
-                    "session",
-                    "usage profile backlog settlement failed id={s} reason={s}",
-                    .{ fact.id, @errorName(err) },
-                );
-            };
-            self.mutex.unlock(io_mod.getIo());
-            published_any = true;
+            for (batch.facts) |fact| {
+                sink.publish(sink.context, .{ .generation = fact }) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "usage profile backlog retry failed id={s} reason={s}",
+                        .{ fact.id, @errorName(err) },
+                    );
+                    if (ledgerLockUnavailable(err)) break :publish;
+                    continue;
+                };
+                self.mutex.lockUncancelable(io_mod.getIo());
+                self.applyGenerationUnlocked(
+                    sink.allocator,
+                    generationRecordBorrowed(fact),
+                    true,
+                ) catch |err| {
+                    self.billing = .incomplete;
+                    self.recordIncidentUnlocked(.incomplete, fact.created_at_ms);
+                    self.removePublicationBacklogUnlocked(sink.allocator, fact.id);
+                    self.dirty = true;
+                    debug_trace.logf(
+                        "session",
+                        "usage profile backlog settlement failed id={s} reason={s}",
+                        .{ fact.id, @errorName(err) },
+                    );
+                };
+                self.mutex.unlock(io_mod.getIo());
+                published_any = true;
+            }
         }
         self.publication_mutex.unlock(io_mod.getIo());
 
@@ -1455,6 +1464,12 @@ pub const Usage = struct {
             _ = self.persistCheckpointBestEffortLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
         }
+    }
+
+    /// Another process holds the profile ledger lock, or this process stopped
+    /// waiting for it because it is exiting.
+    fn ledgerLockUnavailable(err: anyerror) bool {
+        return err == error.UsageLockBusy or err == error.UsageLockAbandoned;
     }
 
     fn removePublicationBacklogUnlocked(
@@ -1801,7 +1816,7 @@ pub const Usage = struct {
         copied = undefined;
         self.dirty = false;
         self.mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.scheduleProfilePublicationDrain();
     }
 
     pub fn isDirty(self: *Usage) bool {
@@ -3919,6 +3934,59 @@ test "durable incident publication retires profile recovery" {
     try std.testing.expectEqual(@as(usize, 1), publication.incidents);
     try std.testing.expect(checkpoint.calls > 0);
     try std.testing.expect(!checkpoint.recovery_pending);
+}
+
+test "profile publication stops at an unavailable ledger lock and retries on the next flush" {
+    const alloc = std.testing.allocator;
+    const PublicationProbe = struct {
+        unavailable: ?anyerror,
+        calls: usize = 0,
+
+        fn publish(
+            raw: *anyopaque,
+            _: usage_report.ProfileEvent,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.unavailable) |err| return err;
+        }
+    };
+
+    for ([_]anyerror{ error.UsageLockBusy, error.UsageLockAbandoned }) |unavailable| {
+        var probe = PublicationProbe{ .unavailable = unavailable };
+        var usage = Usage.initFresh();
+        defer usage.deinit(alloc);
+        for ([_][]const u8{
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        }) |id| {
+            const sequence = try usage.reserveInvocation();
+            try usage.finishObservedInvocation(
+                alloc,
+                sequence,
+                1,
+                .observed_generation,
+                id,
+                "https://ai-gateway.vercel.sh",
+                null,
+            );
+        }
+        usage.markBillingIncomplete();
+        const sink: ProfilePublicationSink = .{
+            .context = &probe,
+            .allocator = alloc,
+            .publish = PublicationProbe.publish,
+        };
+
+        usage.configurePublicationSink(sink);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+        usage.configurePublicationSink(null);
+        probe.unavailable = null;
+        probe.calls = 0;
+        usage.configurePublicationSink(sink);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    }
 }
 
 test "profile publication failure preserves session totals and retries backlog" {
