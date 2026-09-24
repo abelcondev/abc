@@ -1087,7 +1087,11 @@ describe("MCP remote authentication lifecycle", () => {
     expect(tui.paneStatus().dead).toBe(false);
     await tui.waitForComposer(5_000);
     await tui.sendText("/mcp list");
-    await tui.waitForText("auth=authenticated", 10_000);
+    const menu = await tui.waitForText("[Servers]", 10_000);
+    expect(menu).toMatch(/fixture[\s\S]{0,120}Ready/);
+    expect(menu).not.toContain(ACCESS_INITIAL);
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
     expect(auth.tokenExchanges).toBe(1);
   }, 40_000);
 
