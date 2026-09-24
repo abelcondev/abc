@@ -2427,6 +2427,34 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectProcessesExited(launches);
   }, 30_000);
 
+  test("mcp list quotes the stdout line fx rejects from a modern stdio server", async () => {
+    const root = createRoot("modern-startup-garbage", MODERN_FIXTURE, {
+      mode: "startup_garbage",
+      recordLaunchAttempts: true,
+    });
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(
+      "failure=MCP server wrote output that is not an MCP message before completing startup: Server started on stdio",
+    );
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches.length).toBeGreaterThanOrEqual(1);
+    await expectProcessesExited(launches);
+  }, 30_000);
+
   test("fx ask search tells the model why a named stdio server failed to start", async () => {
     const root = createRoot("ask-startup-exit", LEGACY_FIXTURE, {
       mode: "startup_exit",

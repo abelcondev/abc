@@ -128,7 +128,10 @@ pub fn connectServer(
     }
 
     try spawnStdioServer(alloc, server, argv.items);
-    errdefer server.disconnectForced();
+    errdefer {
+        publishRejectedOutput(alloc, server);
+        server.disconnectForced();
+    }
 
     const dispatcher = server.dispatcher.?;
     const discover_id = try dispatcher.reserveRequestId();
@@ -752,6 +755,8 @@ fn connectServerLegacy(
     );
     // startAt always fixes the span.
     const span_ms = attempt_control.startup_span_ms.?;
+    // Runs before callers disconnect, while the latest launch is attached.
+    errdefer publishRejectedOutput(alloc, server);
     var offered_version = initial_version;
     var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
@@ -1100,12 +1105,6 @@ fn connectServerBounded(
                         .live = if (live) |*value| value else null,
                     },
                 });
-            } else if (server.dispatcher) |dispatcher| {
-                // Such as a banner printed to stdout, at any protocol version.
-                const diagnostics = dispatcher.childDiagnostics();
-                if (diagnostics.rejected_output != null) {
-                    publishStartupFailure(alloc, server, .{ .rejected_output = &diagnostics });
-                }
             }
             server.disconnect();
             const decision = decideStartupRestart(.{
@@ -1186,8 +1185,22 @@ const StartupFailure = union(enum) {
         live: ?*const stdio_dispatcher.ChildDiagnostics,
     },
     /// fx ended the connection on stdout output that is not an MCP message.
-    rejected_output: *const stdio_dispatcher.ChildDiagnostics,
+    rejected_output: struct {
+        line: *const stdio_dispatcher.RejectedOutput,
+        stderr: *const stdio_dispatcher.StderrCapture,
+    },
 };
+
+/// Publishes the stdout line fx rejected, if the current launch left one.
+/// Other failures return without waiting for the child's diagnostics.
+fn publishRejectedOutput(alloc: Allocator, server: *McpServer) void {
+    const dispatcher = server.dispatcher orelse return;
+    if (!dispatcher.hasRejectedOutput()) return;
+    const diagnostics = dispatcher.childDiagnostics();
+    if (diagnostics.rejected_output) |*line| {
+        publishStartupFailure(alloc, server, .{ .rejected_output = .{ .line = line, .stderr = &diagnostics.stderr } });
+    }
+}
 
 const TimeoutLimit = struct {
     ms: u32,
@@ -1243,16 +1256,14 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
                 if (text.len > 0) try writer.print("; last stderr: {s}", .{text});
             }
         },
-        .rejected_output => |diagnostics| {
+        .rejected_output => |rejected| {
             try writer.writeAll("MCP server wrote output that is not an MCP message before completing startup");
-            // Callers publish this variant only when a rejected line was kept.
-            const rejected = diagnostics.rejected_output.?;
-            var line = rejected.slice();
+            var line = try withoutAnsi(arena, rejected.line.slice());
             // A secret cut at the capture limit is too short to be masked.
-            if (rejected.truncated) line = withoutTrailingWord(line);
-            const text = try displayUntrusted(arena, line);
+            if (rejected.line.truncated) line = withoutTrailingWord(line);
+            const text = try displayPlain(arena, line);
             if (text.len > 0) try writer.print(": {s}", .{text});
-            const stderr_text = try displayStderr(arena, &diagnostics.stderr);
+            const stderr_text = try displayStderr(arena, rejected.stderr);
             if (stderr_text.len > 0) try writer.print("; stderr: {s}", .{stderr_text});
         },
     }
@@ -1291,27 +1302,26 @@ fn writeStderrSuffix(
 
 fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCapture) ![]const u8 {
     if (!capture.omitted) {
-        return displayUntrusted(arena, try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() }));
+        return displayPlain(arena, try withoutAnsi(arena, try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() })));
     }
-    // Drop the words cut by the omitted gap: a secret split there is too
-    // short to be masked. Cutting at ASCII whitespace also starts the tail
-    // on a UTF-8 boundary.
+    // Strip each side on its own so an escape sequence cut at the gap cannot
+    // swallow the start of the tail. Then drop the words cut by the gap: a
+    // secret split there is too short to be masked. Cutting at ASCII
+    // whitespace also starts the tail on a UTF-8 boundary.
     const joined = try std.mem.concat(arena, u8, &.{
-        withoutTrailingWord(capture.headSlice()),
+        withoutTrailingWord(try withoutAnsi(arena, capture.headSlice())),
         " ... ",
-        withoutLeadingWord(capture.tailSlice()),
+        withoutLeadingWord(try withoutAnsi(arena, capture.tailSlice())),
     });
-    return displayUntrusted(arena, joined);
+    return displayPlain(arena, joined);
 }
 
-/// Server output is untrusted. Produces one terminal-safe line: ANSI
-/// sequences dropped, secrets masked, whitespace collapsed and remaining
-/// control or non-printing characters escaped by the shared encoder, and the
-/// result bounded head-and-tail.
-fn displayUntrusted(arena: Allocator, raw: []const u8) ![]const u8 {
-    var plain: std.ArrayList(u8) = .empty;
-    try appendWithoutAnsi(arena, &plain, raw);
-    const masked = try text_utils.maskSecrets(arena, plain.items);
+/// Server output is untrusted. Turns text with ANSI sequences already
+/// removed into one terminal-safe line: secrets masked, whitespace collapsed
+/// and remaining control or non-printing characters escaped by the shared
+/// encoder, and the result bounded head-and-tail.
+fn displayPlain(arena: Allocator, plain: []const u8) ![]const u8 {
+    const masked = try text_utils.maskSecrets(arena, plain);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, std.math.maxInt(usize));
     var out: std.Io.Writer.Allocating = .init(arena);
     try text_utils.writeHeadTailBounded(&out.writer, encoded.bytes, stderr_display_bytes, " ... ", .down);
@@ -1330,14 +1340,16 @@ fn withoutLeadingWord(bytes: []const u8) []const u8 {
     return bytes[first_separator..];
 }
 
-fn appendWithoutAnsi(arena: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
+fn withoutAnsi(arena: Allocator, raw: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
     var index: usize = 0;
     while (index < raw.len) {
         const escape = std.mem.findScalarPos(u8, raw, index, 0x1b) orelse raw.len;
         try out.appendSlice(arena, raw[index..escape]);
-        if (escape == raw.len) return;
+        if (escape == raw.len) break;
         index = display_width.ansiSequenceEnd(raw, escape);
     }
+    return out.items;
 }
 
 test "startup restart runs only with budget left and a failure a relaunch could change" {
@@ -1402,25 +1414,24 @@ test "startup failure shows the stdout line fx rejected" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var banner = testDiagnostics(.{ .signal = .KILL }, "loading config\n");
-    banner.rejected_output = testRejectedOutput("\x1b[32mServer started\x1b[0m on stdio\x07");
+    const stderr = testDiagnostics(null, "loading config\n").stderr;
+    const banner = testRejectedOutput("\x1b[32mServer started\x1b[0m on stdio\x07");
     try std.testing.expectEqualStrings(
         "MCP server wrote output that is not an MCP message before completing startup: Server started on stdio\\x07; stderr: loading config",
-        try formatStartupFailure(arena, .{ .rejected_output = &banner }),
+        try formatStartupFailure(arena, .{ .rejected_output = .{ .line = &banner, .stderr = &stderr } }),
     );
-    var blank = testDiagnostics(null, "");
-    blank.rejected_output = testRejectedOutput("");
+    const silent: stdio_dispatcher.StderrCapture = .{};
+    const blank = testRejectedOutput("");
     try std.testing.expectEqualStrings(
         "MCP server wrote output that is not an MCP message before completing startup",
-        try formatStartupFailure(arena, .{ .rejected_output = &blank }),
+        try formatStartupFailure(arena, .{ .rejected_output = .{ .line = &blank, .stderr = &silent } }),
     );
     // A secret cut at the capture limit is dropped rather than shown in part.
-    var cut: stdio_dispatcher.ChildDiagnostics = .{};
-    cut.rejected_output = testRejectedOutput("token=abcdefghijklmnop");
-    cut.rejected_output.?.truncated = true;
+    var cut = testRejectedOutput("token=abcdefghijklmnop");
+    cut.truncated = true;
     try std.testing.expectEqualStrings(
         "MCP server wrote output that is not an MCP message before completing startup",
-        try formatStartupFailure(arena, .{ .rejected_output = &cut }),
+        try formatStartupFailure(arena, .{ .rejected_output = .{ .line = &cut, .stderr = &silent } }),
     );
 }
 
@@ -1518,6 +1529,13 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expect(std.mem.endsWith(u8, cut_display, "rejected"));
     try std.testing.expect(std.mem.find(u8, cut_display, "abcdefgh") == null);
     try std.testing.expect(std.mem.find(u8, cut_display, "ijklmnop") == null);
+
+    // An escape sequence cut at the gap cannot swallow the start of a token.
+    const token = "ghp_" ++ "a1b2c3d4e5" ** 4;
+    var cut_escape = testOmittedCapture("log line \x1b[ ", "xx " ++ token ++ " rejected\n");
+    const escape_display = try displayStderr(arena, &cut_escape);
+    try std.testing.expect(std.mem.find(u8, escape_display, token[1..]) == null);
+    try std.testing.expect(std.mem.endsWith(u8, escape_display, "rejected"));
 
     var invisible: stdio_dispatcher.StderrCapture = .{};
     invisible.append("rtl \u{202e}txt\u{200b} nel\u{85}");

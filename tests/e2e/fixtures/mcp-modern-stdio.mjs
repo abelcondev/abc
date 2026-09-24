@@ -166,6 +166,11 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("Server started on stdio\n");
+      return;
+    }
     if (
       mode === "crash_then_fail_recovery_once" &&
       recoveryGeneration &&

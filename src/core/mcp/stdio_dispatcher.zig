@@ -1118,6 +1118,14 @@ pub const StdioDispatcher = struct {
         self.awaitStderrEof();
     }
 
+    /// True once the reader rejected a stdout line. It records the line
+    /// before failing waiters, so callers need not wait for diagnostics.
+    pub fn hasRejectedOutput(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.diagnostics.rejected_output != null;
+    }
+
     fn recordRejectedOutput(self: *StdioDispatcher, line: []const u8) void {
         const rejected = RejectedOutput.init(line);
         self.state_mutex.lockUncancelable(io_mod.getIo());
