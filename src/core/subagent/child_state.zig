@@ -496,22 +496,6 @@ pub const Store = struct {
     }
 };
 
-/// Returns true for both the current immutable owner marker and legacy child
-/// control records. Any unreadable marker fails closed so a child cannot
-/// become externally resumable because its private metadata is damaged.
-pub fn isManagedChildSession(
-    sessions: session_store.Store,
-    alloc: Allocator,
-    session_id: []const u8,
-) !bool {
-    if (try hasManagedChildMarker(sessions, alloc, session_id)) return true;
-
-    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
-        error.SessionNotFound => false,
-        else => return err,
-    };
-}
-
 /// Listing check: reuses discovery's validated identity and every child
 /// marker. A legacy session without a metadata-level bit falls back to its
 /// first event, read only within a fixed 16 KiB bound; the session index

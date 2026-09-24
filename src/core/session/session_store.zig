@@ -1316,19 +1316,9 @@ pub const Store = struct {
         }
     }
 
-    /// Reads only the immutable initial-event child identity for a materialized
-    /// schema-v3 session. Index-only and legacy rows have no such payload.
-    pub fn loadSubagentChildIdentity(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !bool {
-        return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
-    }
-
-    /// Listing variant of `loadSubagentChildIdentity` for a session discovery
-    /// classified as legacy: reads its first event only within a small fixed
-    /// bound, so listing never scans a log.
+    /// Reads the child identity a legacy session records in its first event,
+    /// for a session discovery classified as legacy. The event is read only
+    /// within a small fixed bound, so listing never scans a log.
     pub fn loadListedLegacyChildIdentity(
         self: Store,
         alloc: Allocator,
@@ -1900,7 +1890,9 @@ pub const Store = struct {
         };
     }
 
-    /// The caller owns the candidate. No directory handle escapes this read.
+    /// Listing's read of one session: a stale schema-v3 projection is
+    /// summarized from its committed log. The caller owns the candidate. No
+    /// directory handle escapes this read.
     pub fn readOnlyCandidate(
         self: Store,
         alloc: Allocator,
@@ -1912,10 +1904,13 @@ pub const Store = struct {
         }
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
-        return if (cancelled) |stop|
+        var candidate = try if (cancelled) |stop|
             discovery.classifyReadOnlyCandidateCancellable(alloc, &dir, session_id, stop)
         else
             classifyReadOnlyCandidate(alloc, &dir, session_id);
+        errdefer candidate.deinit(alloc);
+        try discovery.summarizeStaleProjection(alloc, &dir, &candidate, cancelled);
+        return candidate;
     }
 
     /// Summarizes a legacy session behind an interrupted upgrade fence from
@@ -5122,10 +5117,9 @@ pub fn writeSchemaV3Fixture(
         .total_output_tokens = 0,
         .last_event_seq = if (fixture.stale_projection) 1 else 2,
         .event_log_bytes = projected_bytes,
-        .event_log_stat_fingerprint = if (fixture.stale_projection)
-            @splat(0)
-        else
-            try session_projection.eventFileStatFingerprint(try authority_module.eventFileStat(&dir, "events.jsonl"), log_bytes),
+        // Staleness is decided by log size, so nothing reads this field; the
+        // schema-v3 import path writes zeros as well.
+        .event_log_stat_fingerprint = @splat(0),
         .generation_base_seq = 1,
         .generation_base_bytes = first.len,
         .checkpoint_seq = null,
@@ -7810,8 +7804,11 @@ test "a legacy first event past the listing bound stays listed but uncached" {
     defer saved.deinit(alloc);
     try std.testing.expect(saved.contains("parent"));
     try std.testing.expect(!saved.contains("child"));
-    // The exact check reads the whole first event and still finds the child.
-    try std.testing.expect(try subagent_child_state.isManagedChildSession(ctx.store, alloc, "child"));
+    // Loading the session reads the whole first event, so exact resume
+    // admission still sees the child.
+    var loaded = try ctx.store.loadReadOnly(alloc, "child");
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded.subagent_child);
 }
 
 test "a stale schema-v3 projection lists and resumes from its committed log" {

@@ -252,7 +252,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             error.NoReadableSessions => {
-                writeStderr(deps, "fx: no readable saved sessions for this workspace; run `fx doctor` to check the unreadable ones.\n");
+                // The unreadable sessions can belong to any workspace; only
+                // the absence of a readable one is specific to this workspace.
+                writeStderr(deps, "fx: no saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n");
                 return .{ .exit = 1 };
             },
             error.SessionNotFound => {
@@ -1310,13 +1312,22 @@ test "app entry maps noninteractive terminal startup to exit one" {
 
 test "app entry maps missing saved sessions to exit one" {
     const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.NoSavedSessions;
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+    const Case = struct { err: anyerror, stderr: []const u8 };
+    for ([_]Case{
+        .{ .err = error.NoSavedSessions, .stderr = "fx: no saved sessions for this workspace.\n" },
+        .{
+            .err = error.NoReadableSessions,
+            .stderr = "fx: no saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n",
+        },
+    }) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.err;
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx: no saved sessions for this workspace.\n", capture.stderr.written());
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+    }
 }
 
 test "app entry maps unavailable session state to one expected startup failure" {

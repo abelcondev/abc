@@ -79,6 +79,24 @@ const Summary = struct {
         };
     }
 
+    /// The row contract `load` enforces. Discovery can report a summary
+    /// outside it, such as a legacy session whose clock stepped back, and one
+    /// such row would make `load` reject the whole file, so the catalog lists
+    /// that session without caching it.
+    fn persistable(self: Summary) bool {
+        if (self.created_at_ms < 0 or self.updated_at_ms < self.created_at_ms) return false;
+        _ = session.ConversationLanguage.fromSlice(self.language) catch return false;
+        if (std.math.cast(usize, self.history_len) == null) return false;
+        if (self.title) |title| {
+            if (title.len > session_codec.max_session_title_bytes or !std.unicode.utf8ValidateSlice(title)) return false;
+        }
+        for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root }) |root| {
+            const path = root orelse continue;
+            if (!std.fs.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return false;
+        }
+        return true;
+    }
+
     fn clone(self: Summary, alloc: Allocator, id: []const u8) !session_store.SessionSummary {
         return summary_codec.cloneSessionSummary(alloc, .{
             .id = @constCast(id),
@@ -175,20 +193,7 @@ pub const Loaded = struct {
             if (row.fingerprint.len != 64) return error.InvalidCatalogCache;
             var fingerprint_bytes: Fingerprint = undefined;
             _ = std.fmt.hexToBytes(&fingerprint_bytes, row.fingerprint) catch return error.InvalidCatalogCache;
-            if (row.value == .visible) {
-                const summary = row.value.visible;
-                if (summary.created_at_ms < 0 or summary.updated_at_ms < summary.created_at_ms) return error.InvalidCatalogCache;
-                _ = try session.ConversationLanguage.fromSlice(summary.language);
-                _ = std.math.cast(usize, summary.history_len) orelse return error.InvalidCatalogCache;
-                if (summary.title) |title| {
-                    if (title.len > session_codec.max_session_title_bytes or !std.unicode.utf8ValidateSlice(title)) return error.InvalidCatalogCache;
-                }
-                for ([_]?[]const u8{ summary.workspace_root, summary.origin_workspace_root }) |root| {
-                    if (root) |path| {
-                        if (!std.fs.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return error.InvalidCatalogCache;
-                    }
-                }
-            }
+            if (row.value == .visible and !row.value.visible.persistable()) return error.InvalidCatalogCache;
             const entry = index.getOrPutAssumeCapacity(row.id);
             if (entry.found_existing) return error.InvalidCatalogCache;
             entry.value_ptr.* = i;
@@ -484,6 +489,10 @@ const CatalogWorker = struct {
                     break :blk false;
                 },
             };
+            if (!managed and !Summary.from(&candidate.summary).persistable()) {
+                debug_trace.logf("core", "session catalog cache left id={s} uncached: summary outside the row contract", .{id});
+                cacheable = false;
+            }
             const after = if (cacheable) fingerprint(dir.dir, id) catch null else null;
             const stable = if (before) |a| if (after) |z| std.mem.eql(u8, &a, &z) else false else false;
             var entry = Entry{
@@ -635,7 +644,7 @@ test "actionable catalog preserves discovery and child visibility" {
     defer summary_codec.freeSummaries(alloc, &reference);
     var visible: usize = 0;
     for (reference.items) |summary| {
-        if (try child_state.isManagedChildSession(store, alloc, summary.id)) continue;
+        if (std.mem.eql(u8, summary.id, "private-bit") or std.mem.eql(u8, summary.id, "private-marker")) continue;
         try std.testing.expectEqualStrings(summary.id, catalog.summaries.items[visible].id);
         try std.testing.expectEqual(summary.history_len, catalog.summaries.items[visible].history_len);
         try std.testing.expectEqual(summary.updated_at_ms, catalog.summaries.items[visible].updated_at_ms);
@@ -749,6 +758,57 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer again.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), again.summaries.items.len);
+}
+
+test "a summary outside the row contract stays listed without disabling the index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    // A legacy snapshot whose clock stepped back records an update before its
+    // creation, which the index row contract rejects.
+    const Snapshot = struct { id: []const u8, created_at_ms: i64, updated_at_ms: i64 };
+    for ([_]Snapshot{
+        .{ .id = "legacy-ok", .created_at_ms = 1, .updated_at_ms = 2 },
+        .{ .id = "clock-skewed", .created_at_ms = 2000, .updated_at_ms = 1000 },
+    }) |snapshot| {
+        const dir_path = try std.fmt.allocPrint(alloc, "home/.fx/sessions/{s}", .{snapshot.id});
+        defer alloc.free(dir_path);
+        try tmp.dir.createDirPath(std.testing.io, dir_path);
+        const path = try std.fmt.allocPrint(alloc, "{s}/session.json", .{dir_path});
+        defer alloc.free(path);
+        const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{ snapshot.id, snapshot.created_at_ms, snapshot.updated_at_ms, workspace });
+        defer alloc.free(manifest);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = manifest });
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    {
+        var saved = try Loaded.load(alloc, writer.dir, null);
+        defer saved.deinit(alloc);
+        try std.testing.expect(saved.present());
+        try std.testing.expect(saved.contains("legacy-ok"));
+        try std.testing.expect(!saved.contains("clock-skewed"));
+    }
+    // The next listing reuses the saved row and leaves the index untouched.
+    const index_path = "home/.fx/sessions/.resume-catalog";
+    const before = try tmp.dir.statFile(std.testing.io, index_path, .{});
+    var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), again.summaries.items.len);
+    const after = try tmp.dir.statFile(std.testing.io, index_path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
 }
 
 test "actionable catalog lists an interrupted legacy upgrade without caching it" {

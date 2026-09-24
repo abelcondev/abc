@@ -20,7 +20,7 @@ const types = @import("session_store_types.zig");
 
 const classifyAuthority = authority.classifyAuthority;
 const entryExistsRelative = authority.entryExistsRelative;
-const eventFileStat = authority.eventFileStat;
+const eventLogSize = authority.eventLogSize;
 const loadAuthorityMarkerOptional = authority.loadAuthorityMarkerOptional;
 const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
@@ -379,10 +379,7 @@ fn classifyConversationCandidate(
 }
 
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
-/// authority marker, manifest identity, and projection freshness. A stale
-/// projection carries the wrong workspace and recency, so its summary comes
-/// from replaying the committed log; if that replay fails the manifest stays
-/// listed and opening the session reports the failure.
+/// authority marker, manifest identity, and projection freshness.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
 fn classifySchemaV3Candidate(
     alloc: Allocator,
@@ -422,39 +419,20 @@ fn classifySchemaV3Candidate(
     {
         return error.InvalidSessionFormat;
     }
-    const current_stat = try eventFileStat(session_dir, "events.jsonl");
-    // Listing needs the projection's summary, not its stat identity. Copying
-    // or restoring a session changes the log's inode and ctime without adding
-    // events, so only a log that grew past the projected bytes is stale here.
-    var projection_state: ProjectionState = if (current_stat.size != manifest.event_log_bytes) .stale else .current;
+    const event_log_size = try eventLogSize(session_dir, "events.jsonl");
+    const projection_state: ProjectionState = if (session_projection.isManifestStale(
+        manifest,
+        event_log_size,
+    )) .stale else .current;
     try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
-    var replay: ?migration.SchemaV3Import = null;
-    defer if (replay) |*value| value.deinit(alloc);
-    if (projection_state == .stale) {
-        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
-            replay = value;
-            projection_state = .replayed;
-        } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => debug_trace.logf(
-                "session",
-                "schema_v3 projection replay failed id={s} err={s}; listing the stale manifest",
-                .{ session_id, @errorName(err) },
-            ),
-        }
-    }
-    const state: ?*const session_codec.DurableSessionState = if (replay) |*value| &value.state else null;
-
-    const history_len = if (state) |value|
-        value.history.len
-    else
-        std.math.cast(usize, manifest.history_len) orelse return error.InvalidSessionFormat;
+    const history_len = std.math.cast(usize, manifest.history_len) orelse
+        return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, manifest.id);
     errdefer mem_utils.free(alloc, id);
-    const origin_workspace_root = try alloc.dupe(u8, if (state) |value| value.origin_workspace_root else manifest.origin_workspace_root);
+    const origin_workspace_root = try alloc.dupe(u8, manifest.origin_workspace_root);
     errdefer mem_utils.free(alloc, origin_workspace_root);
-    const workspace_root = try alloc.dupe(u8, if (state) |value| value.workspace_root else manifest.workspace_root);
+    const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
     errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
     if (display.origin_workspace_root) |root| {
@@ -470,15 +448,62 @@ fn classifySchemaV3Candidate(
             .title = display.title,
             .preview = display.preview,
             .display_metadata_present = display.present,
-            .created_at_ms = if (state) |value| value.created_at_ms else manifest.created_at_ms,
-            .updated_at_ms = if (state) |value| value.updated_at_ms else manifest.updated_at_ms,
-            .conversation_language = if (state) |value| value.conversation_language else manifest.conversation_language,
+            .created_at_ms = manifest.created_at_ms,
+            .updated_at_ms = manifest.updated_at_ms,
+            .conversation_language = manifest.conversation_language,
             .history_len = history_len,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
-        .subagent_child = if (state) |value| value.subagent_child else null,
     };
+}
+
+/// Listing's summary of a stale schema-v3 projection: a stale manifest carries
+/// the wrong workspace and recency, so the summary is replaced by one replayed
+/// from the committed log, and the child identity comes from its first event.
+/// If the replay fails the stale summary stays, and opening the session reports
+/// the failure. Exact opens replay the log themselves, so only listing calls this.
+pub fn summarizeStaleProjection(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    candidate: *ReadOnlyCandidate,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    if (candidate.storage != .schema_v3 or candidate.projection_state != .stale) return;
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    var replay = migration.loadSchemaV3ReadOnly(alloc, session_dir, candidate.summary.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "session",
+                "schema_v3 projection replay failed id={s} err={s}; listing the stale manifest",
+                .{ candidate.summary.id, @errorName(err) },
+            );
+            return;
+        },
+    };
+    defer replay.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const state = &replay.state;
+    const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
+    errdefer alloc.free(origin_workspace_root);
+    const workspace_root = try alloc.dupe(u8, state.workspace_root);
+
+    const summary = &candidate.summary;
+    if (summary.origin_workspace_root) |root| alloc.free(root);
+    if (summary.workspace_root) |root| alloc.free(root);
+    summary.origin_workspace_root = origin_workspace_root;
+    summary.workspace_root = workspace_root;
+    summary.created_at_ms = state.created_at_ms;
+    summary.updated_at_ms = state.updated_at_ms;
+    summary.conversation_language = state.conversation_language;
+    summary.history_len = state.history.len;
+    candidate.projection_state = .replayed;
+    candidate.subagent_child = state.subagent_child;
 }
 
 /// Builds a read-only candidate from a legacy `session.json` snapshot via a

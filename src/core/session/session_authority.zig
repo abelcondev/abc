@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
 const session_log = @import("session_log.zig");
@@ -287,65 +286,13 @@ pub fn entryExistsRelative(
     return true;
 }
 
-/// Resolves the containing device id for `name`, which the projection layer
-/// folds into its stat fingerprint. The OS-specific syscall path (Linux
-/// `statx`, Apple `fstatat`, 0 elsewhere) is isolated here so `eventFileStat`
-/// stays platform-agnostic. Syscall failures map to `error.InvalidSessionFormat`.
-fn statFileDevice(session_dir: *io_mod.VerifiedDir, name: []const u8) !u64 {
-    var path_buffer: [std.c.PATH_MAX]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buffer, "{s}", .{name}) catch
-        return error.InvalidSessionFormat;
-    return switch (builtin.os.tag) {
-        .linux => blk: {
-            const linux = std.os.linux;
-            while (true) {
-                var statx = std.mem.zeroes(linux.Statx);
-                switch (linux.errno(linux.statx(
-                    session_dir.dir.handle,
-                    path_z,
-                    linux.AT.SYMLINK_NOFOLLOW,
-                    linux.STATX.BASIC_STATS,
-                    &statx,
-                ))) {
-                    .SUCCESS => {
-                        const major: u64 = statx.dev_major;
-                        const minor: u64 = statx.dev_minor;
-                        break :blk (minor & 0xff) |
-                            ((major & 0xfff) << 8) |
-                            ((minor & ~@as(u64, 0xff)) << 12) |
-                            ((major & ~@as(u64, 0xfff)) << 32);
-                    },
-                    .INTR => continue,
-                    else => return error.InvalidSessionFormat,
-                }
-            }
-        },
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => blk: {
-            var native_stat = std.mem.zeroes(std.c.Stat);
-            while (true) {
-                switch (std.c.errno(std.c.fstatat(
-                    session_dir.dir.handle,
-                    path_z,
-                    &native_stat,
-                    std.c.AT.SYMLINK_NOFOLLOW,
-                ))) {
-                    .SUCCESS => break :blk @intCast(native_stat.dev),
-                    .INTR => continue,
-                    else => return error.InvalidSessionFormat,
-                }
-            }
-        },
-        else => 0,
-    };
-}
-
-/// Stats a session's event log into the `EventFileStat` fingerprint the
-/// projection layer compares against. Rejects non-regular or hard-linked files
-/// as `error.SessionPathUnsafe`; a missing log is `error.InvalidSessionFormat`.
-pub fn eventFileStat(
+/// Returns the size of a session's event log, the input to the projection
+/// staleness check. Rejects non-regular or hard-linked files as
+/// `error.SessionPathUnsafe`; a missing log is `error.InvalidSessionFormat`.
+pub fn eventLogSize(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
-) !session_projection.EventFileStat {
+) !u64 {
     const stat = session_dir.dir.statFile(io_mod.getIo(), name, .{
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -354,17 +301,7 @@ pub fn eventFileStat(
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
-    const device = try statFileDevice(session_dir, name);
-    return .{
-        .device = device,
-        .inode = @intCast(stat.inode),
-        .kind = .regular,
-        .mode = stat.permissions.toMode(),
-        .link_count = @intCast(stat.nlink),
-        .size = stat.size,
-        .mtime_ns = stat.mtime.nanoseconds,
-        .ctime_ns = stat.ctime.nanoseconds,
-    };
+    return stat.size;
 }
 
 /// Parses the top-level `schema_version` from manifest/snapshot bytes.

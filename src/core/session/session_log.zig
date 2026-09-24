@@ -4192,51 +4192,11 @@ pub const Root = struct {
         )) orelse error.SessionMigrationRequired;
     }
 
-    /// Reads the immutable child-privacy bit from current session metadata.
-    /// Legacy sessions retain their read-only first-event compatibility path.
-    pub fn loadSubagentChildIdentity(
-        self: *const Root,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !bool {
-        var sessions = self.sessions orelse return error.SessionNotFound;
-        try session_layout.validateSessionId(session_id);
-        var session_dir = openSessionDir(
-            &sessions,
-            session_id,
-            .read_only,
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            else => return err,
-        };
-        defer session_dir.close();
-        if (try hasConversationMetadata(alloc, &session_dir)) {
-            const metadata_bytes = try readManagedFileAlloc(
-                alloc,
-                &session_dir,
-                manifest_file,
-                session_codec.max_session_metadata_bytes,
-            );
-            defer alloc.free(metadata_bytes);
-            var metadata = try session_codec.decodeSessionMetadata(
-                alloc,
-                metadata_bytes,
-            );
-            defer metadata.deinit();
-            if (!std.mem.eql(u8, metadata.value.id, session_id)) {
-                return error.InvalidSessionMetadata;
-            }
-            return metadata.value.subagent_child;
-        }
-        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
-        defer log_file.close(io_mod.getIo());
-        return session_replay.readSubagentChildIdentity(alloc, log_file);
-    }
-
-    /// Listing variant for a session discovery classified as legacy, whose
-    /// metadata carries no child bit. It reads the first event only within
-    /// `listed_first_event_max_bytes`, so listing never scans a log; a longer
-    /// first line fails with `error.TruncatedEventFrame`.
+    /// Reads the child identity a legacy session records in its first event,
+    /// for a session discovery classified as legacy, whose metadata carries no
+    /// child bit. The event is read only within `listed_first_event_max_bytes`,
+    /// so listing never scans a log; a longer first line fails with
+    /// `error.TruncatedEventFrame`.
     pub fn loadListedLegacyChildIdentity(
         self: *const Root,
         alloc: Allocator,

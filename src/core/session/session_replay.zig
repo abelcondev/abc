@@ -271,12 +271,6 @@ test "cancelled event reads release work before reading another frame" {
     try std.testing.expectEqual(@as(u64, bytes.len), line.next_offset);
 }
 
-pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
-    var envelope = try readSessionStarted(alloc, file);
-    defer envelope.deinit(alloc);
-    return envelope.event.session_started.subagent_child;
-}
-
 /// Reads the child identity only when the first event ends within
 /// `max_bytes` of the log start. A real first event arrives in one positional
 /// read, so the cost never grows with the log; a longer or unterminated first
@@ -940,7 +934,7 @@ test "bounded child identity reads stop at their limit" {
     }
     var padded_file = try tmp.dir.openFile(io_mod.getIo(), "padded", .{});
     defer padded_file.close(io_mod.getIo());
-    try std.testing.expect(try readSubagentChildIdentity(alloc, padded_file));
+    // A limit of exactly the padded length decodes the whole event.
     try std.testing.expect(try readSubagentChildIdentityWithin(alloc, padded_file, padded.len));
     try std.testing.expectError(
         error.TruncatedEventFrame,
