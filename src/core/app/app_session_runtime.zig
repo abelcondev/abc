@@ -3449,6 +3449,15 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.title_generation.requestStop();
         }
 
+        /// Exit publishes nothing to the profile usage ledger, so it never
+        /// waits on another process holding its lock. The session keeps
+        /// unpublished usage for recovery and the next resume.
+        pub fn abandonProfileLedgerForProcessExit(app: *App) void {
+            if (comptime @hasField(@TypeOf(app.session), "profile_usage")) {
+                app.session.profile_usage.abandonLedgerForProcessExit();
+            }
+        }
+
         fn LiveHistorySink(comptime SinkApp: type) type {
             return struct {
                 app: *SinkApp,

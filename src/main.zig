@@ -859,6 +859,7 @@ const App = struct {
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
+        SessionAppRuntime.abandonProfileLedgerForProcessExit(self);
         self.upgrader.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
