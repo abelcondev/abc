@@ -1392,16 +1392,14 @@ test "server stderr display keeps the first line and the end, bounded and masked
     hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done\x07");
     try std.testing.expectEqualStrings("\\x98\\xa9ok \\xff caf\xc3\xa9 done\\x07", try displayStderr(arena, &hostile));
 
-    // One of these makes the retained tail start inside a two-byte character.
-    for ([_][]const u8{ "z", "zz" }) |suffix| {
-        var split: stdio_dispatcher.StderrCapture = .{};
-        for (0..3_000) |_| split.append("\xc3\xa9");
-        split.append(suffix);
-        try std.testing.expect(split.omitted);
-        const shown = try displayStderr(arena, &split);
-        try std.testing.expect(std.mem.find(u8, shown, "\\x") == null);
-        try std.testing.expect(std.mem.endsWith(u8, shown, suffix));
-    }
+    // The retained tail starts with the second byte of a cut character.
+    var split: stdio_dispatcher.StderrCapture = .{ .omitted = true };
+    @memcpy(split.head[0..4], "head");
+    split.head_len = 4;
+    const cut_tail = "\xa9 tail";
+    @memcpy(split.tail[0..cut_tail.len], cut_tail);
+    split.tail_len = cut_tail.len;
+    try std.testing.expectEqualStrings("head ... tail", try displayStderr(arena, &split));
 
     var invisible: stdio_dispatcher.StderrCapture = .{};
     invisible.append("rtl \u{202e}txt\u{200b} nel\u{85}");
