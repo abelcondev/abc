@@ -6,9 +6,14 @@ const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const operation_control = @import("operation_control.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
+const oauth = @import("../auth/oauth.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
+const Form = oauth.FormBody;
+const percentDecodeAlloc = oauth.percentDecodeAlloc;
+const percentEncode = oauth.percentEncode;
+const queryValueAlloc = oauth.queryValueAlloc;
 
 pub const max_document_bytes: usize = 256 * 1024;
 pub const expiry_skew_ms: i64 = 60 * 1000;
@@ -1317,11 +1322,21 @@ pub fn authentication_error_message(err: anyerror) []const u8 {
     };
 }
 
+const AuthorizationRequest = struct {
+    url: []const u8,
+    redirect_uri: []const u8,
+    endpoint: []const u8,
+    resource: []const u8,
+    state: []const u8,
+    code_challenge: []const u8,
+    client_id: []const u8,
+    scope: ?[]const u8,
+};
+
 const AuthorizationRequestFn = *const fn (
     ctx: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    redirect_uri: []const u8,
+    request: AuthorizationRequest,
 ) anyerror!AuthorizationResponse;
 
 fn authorizeWithRedirect(
@@ -1420,8 +1435,16 @@ fn authorizeWithRedirect(
     var callback = try request_authorization(
         authorization_ctx,
         alloc,
-        authorization_url,
-        redirect_uri,
+        .{
+            .url = authorization_url,
+            .redirect_uri = redirect_uri,
+            .endpoint = metadata.authorization_endpoint,
+            .resource = resource,
+            .state = state,
+            .code_challenge = code_challenge,
+            .client_id = registration.client_id,
+            .scope = scope,
+        },
     );
     defer callback.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
@@ -1487,13 +1510,12 @@ fn authorizeWithRedirect(
 fn requestAutomatedAuthorization(
     _: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    redirect_uri: []const u8,
+    authorization: AuthorizationRequest,
 ) !AuthorizationResponse {
     var response = try request(
         alloc,
         .GET,
-        authorization_url,
+        authorization.url,
         null,
         null,
         &.{},
@@ -1504,7 +1526,7 @@ fn requestAutomatedAuthorization(
     }
     const location = response.location orelse
         return error.AuthorizationRedirectMissing;
-    try validateRedirectTarget(location, redirect_uri);
+    try validateRedirectTarget(location, authorization.redirect_uri);
     return parseAuthorizationRedirect(alloc, location);
 }
 
@@ -1570,13 +1592,12 @@ fn waitForInteractiveCallback(
 fn requestInteractiveAuthorization(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    _: []const u8,
+    authorization: AuthorizationRequest,
 ) !AuthorizationResponse {
     const ctx: *InteractiveAuthorizationContext = @ptrCast(@alignCast(raw_ctx.?));
-    if (ctx.bridge_origin != null) return request_bridged_authorization(ctx, alloc, authorization_url);
+    if (ctx.bridge_origin != null) return request_bridged_authorization(ctx, alloc, authorization);
     try checkAuthorizationCancellation(ctx.cancellation);
-    if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
+    if (!try ctx.open_url(ctx.open_ctx, alloc, authorization.url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
     const max_accepts = if (ctx.ipv6_listener == null)
@@ -1605,38 +1626,34 @@ fn requestInteractiveAuthorization(
     return error.InvalidAuthorizationCallback;
 }
 
-fn request_bridged_authorization(ctx: *InteractiveAuthorizationContext, alloc: Allocator, authorization_url: []const u8) !AuthorizationResponse {
+fn request_bridged_authorization(
+    ctx: *InteractiveAuthorizationContext,
+    alloc: Allocator,
+    authorization: AuthorizationRequest,
+) !AuthorizationResponse {
     const origin = ctx.bridge_origin.?;
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
     const endpoint = if (fixture) try std.fmt.allocPrint(alloc, "{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
     defer if (fixture) alloc.free(endpoint);
-    const question = std.mem.findScalar(u8, authorization_url, '?') orelse return error.InvalidSlackAuthorizationEndpoint;
-    if (!std.mem.eql(u8, authorization_url[0..question], endpoint)) return error.InvalidSlackAuthorizationEndpoint;
-    const query = authorization_url[question + 1 ..];
-    const resource = try queryValueAlloc(alloc, query, "resource");
-    defer alloc.free(resource);
+    if (!std.mem.eql(u8, authorization.endpoint, endpoint)) return error.InvalidSlackAuthorizationEndpoint;
     const expected_resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
     defer if (fixture) alloc.free(expected_resource);
-    if (!std.mem.eql(u8, resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
-    const state = try queryValueAlloc(alloc, query, "state");
-    defer secret.zeroAndFree(alloc, state);
+    if (!std.mem.eql(u8, authorization.resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
+    const scope = authorization.scope orelse return error.InvalidSlackBridgeConfiguration;
     var start: std.Io.Writer.Allocating = .init(alloc);
     defer start.deinit();
     try start.writer.print("{s}/api/slack/auth?", .{origin});
     var form: Form = .{};
-    try form.append(&start.writer, "state", state);
-    const names = .{ .{ "code_challenge", "challenge" }, .{ "client_id", "client_id" }, .{ "scope", "scope" } };
-    inline for (names) |names_pair| {
-        const value = try queryValueAlloc(alloc, query, names_pair[0]);
-        defer alloc.free(value);
-        try form.append(&start.writer, names_pair[1], value);
-    }
+    try form.append(&start.writer, "state", authorization.state);
+    try form.append(&start.writer, "challenge", authorization.code_challenge);
+    try form.append(&start.writer, "client_id", authorization.client_id);
+    try form.append(&start.writer, "scope", scope);
     var port_buffer: [5]u8 = undefined;
     try form.append(&start.writer, "port", try std.fmt.bufPrint(&port_buffer, "{d}", .{ctx.listener.socket.address.getPort()}));
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .raw = .fromSeconds(300), .clock = .boot });
     try checkAuthorizationCancellation(ctx.cancellation);
     if (!try ctx.open_url(ctx.open_ctx, alloc, start.written())) return error.McpAuthorizationBrowserOpenFailed;
-    var parser = BridgedCallbackContext{ .state = state };
+    var parser = BridgedCallbackContext{ .state = authorization.state };
     while (true) {
         try checkAuthorizationCancellation(ctx.cancellation);
         if (deadline.durationFromNow(io_mod.getIo()).raw.nanoseconds <= 0) return error.McpAuthorizationCallbackTimedOut;
@@ -2172,38 +2189,6 @@ fn revokeToken(
     if (response.status != .ok) return error.TokenRevocationFailed;
 }
 
-const Form = struct {
-    first: bool = true,
-
-    fn append(
-        self: *Form,
-        writer: *std.Io.Writer,
-        key: []const u8,
-        value: []const u8,
-    ) !void {
-        if (!self.first) try writer.writeByte('&');
-        self.first = false;
-        try percentEncode(writer, key);
-        try writer.writeByte('=');
-        try percentEncode(writer, value);
-    }
-};
-
-fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (value) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or
-            byte == '.' or byte == '~')
-        {
-            try writer.writeByte(byte);
-        } else {
-            try writer.writeByte('%');
-            try writer.writeByte(hex[byte >> 4]);
-            try writer.writeByte(hex[byte & 0x0f]);
-        }
-    }
-}
-
 fn request(
     alloc: Allocator,
     method: std.http.Method,
@@ -2548,35 +2533,6 @@ fn appendUnique(
     for (tokens.items) |existing| if (std.mem.eql(u8, existing, value)) return;
     if (tokens.items.len >= max_scope_tokens) return error.TooManyOAuthScopes;
     try tokens.append(alloc, value);
-}
-
-fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
-    var pairs = std.mem.splitScalar(u8, query, '&');
-    while (pairs.next()) |pair| {
-        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..equals], key)) continue;
-        return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
-    }
-    return error.MissingQueryParameter;
-}
-
-fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    var index: usize = 0;
-    while (index < value.len) {
-        if (value[index] == '%') {
-            if (index + 2 >= value.len) return error.InvalidPercentEncoding;
-            const high = std.fmt.charToDigit(value[index + 1], 16) catch return error.InvalidPercentEncoding;
-            const low = std.fmt.charToDigit(value[index + 2], 16) catch return error.InvalidPercentEncoding;
-            try out.writer.writeByte((high << 4) | low);
-            index += 3;
-        } else {
-            try out.writer.writeByte(if (value[index] == '+') ' ' else value[index]);
-            index += 1;
-        }
-    }
-    return out.toOwnedSlice();
 }
 
 fn freeStrings(alloc: Allocator, values: []const []u8) void {
