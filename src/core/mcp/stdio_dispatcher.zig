@@ -66,10 +66,34 @@ pub const StderrCapture = struct {
     }
 };
 
+const rejected_output_capacity: usize = 256;
+
+/// The start of a stdout line fx rejected because it is not an MCP message.
+pub const RejectedOutput = struct {
+    bytes: [rejected_output_capacity]u8 = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+
+    fn init(line: []const u8) RejectedOutput {
+        var rejected: RejectedOutput = .{
+            .len = @min(line.len, rejected_output_capacity),
+            .truncated = line.len > rejected_output_capacity,
+        };
+        @memcpy(rejected.bytes[0..rejected.len], line[0..rejected.len]);
+        return rejected;
+    }
+
+    pub fn slice(self: *const RejectedOutput) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 /// How a stdio child ended, once reaped, and what it wrote to stderr.
 pub const ChildDiagnostics = struct {
     term: ?std.process.Child.Term = null,
     stderr: StderrCapture = .{},
+    /// Set when the connection ended on stdout output that is not an MCP message.
+    rejected_output: ?RejectedOutput = null,
 };
 
 pub const Progress = mcp_contract.Progress;
@@ -1074,6 +1098,8 @@ pub const StdioDispatcher = struct {
                 break;
             };
             self.dispatchFrame(frame) catch |err| {
+                // Record it before failing waiters so startup can report it.
+                if (err == error.McpInvalidJson) self.recordRejectedOutput(frame);
                 self.shared_allocator.free(frame);
                 terminal_error = err;
                 break;
@@ -1090,6 +1116,13 @@ pub const StdioDispatcher = struct {
         terminateChild(self.child_id);
         self.reapChild();
         self.awaitStderrEof();
+    }
+
+    fn recordRejectedOutput(self: *StdioDispatcher, line: []const u8) void {
+        const rejected = RejectedOutput.init(line);
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        self.diagnostics.rejected_output = rejected;
     }
 
     fn reapChild(self: *StdioDispatcher) void {
@@ -2671,6 +2704,44 @@ test "MCP stdio records how a child that exits before replying ended and what it
         diagnostics.stderr.headSlice(),
     );
     try std.testing.expect(!diagnostics.stderr.omitted);
+}
+
+test "MCP stdio keeps the stdout line it rejected as not an MCP message" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\read line
+        \\printf 'Server started on stdio\n'
+        \\exec sleep 30
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+
+    const request_id = try dispatcher.reserveRequestId();
+    try std.testing.expectError(
+        error.McpInvalidJson,
+        dispatcher.request(
+            std.testing.allocator,
+            request_id,
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+            4096,
+            .{ .timeout_ms = 5_000 },
+        ),
+    );
+    const diagnostics = dispatcher.childDiagnostics();
+    const rejected = diagnostics.rejected_output orelse return error.TestExpectedRejectedOutput;
+    try std.testing.expectEqualStrings("Server started on stdio", rejected.slice());
+    try std.testing.expect(!rejected.truncated);
+}
+
+test "rejected stdout keeps a bounded prefix of the line" {
+    const long_line = "x" ** (rejected_output_capacity + 10);
+    const rejected = RejectedOutput.init(long_line);
+    try std.testing.expectEqual(rejected_output_capacity, rejected.slice().len);
+    try std.testing.expect(rejected.truncated);
+    const exact = RejectedOutput.init(long_line[0..rejected_output_capacity]);
+    try std.testing.expect(!exact.truncated);
 }
 
 test "MCP stdio reports a write to a child that closed stdin as a closed connection" {

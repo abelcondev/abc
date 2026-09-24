@@ -10,8 +10,9 @@ pub fn check(io: std.Io, control: Control) error{ Cancelled, McpRequestTimedOut 
 
 pub const Control = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
-    /// Startup budget named by timeout messages, fixed when the operation starts.
-    startup_budget_ms: ?u32 = null,
+    /// Milliseconds from the start of the startup operation to its deadline,
+    /// fixed when the operation starts so timeout messages can name it.
+    startup_span_ms: ?u32 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool) = null,
 
@@ -32,22 +33,19 @@ pub const Control = struct {
 
     /// Existing deadlines belong to the whole connection operation, including fallback.
     pub fn startAt(self: Control, now: std.Io.Clock.Timestamp, timeout_ms: u32) Control {
-        var started = self.withStartupBudget(now, timeout_ms);
+        var started = self.withStartupSpan(now, timeout_ms);
         if (started.deadline == null) started.deadline = startupDeadline(now, timeout_ms, null);
         return started;
     }
 
-    /// Fixes the budget a startup timeout reports: the configured timeout,
-    /// which also caps each startup request, or the time left before an
-    /// earlier deadline. Fallbacks and restarts inherit the first value.
-    pub fn withStartupBudget(self: Control, now: std.Io.Clock.Timestamp, timeout_ms: u32) Control {
-        if (self.startup_budget_ms != null) return self;
-        var budgeted = self;
-        budgeted.startup_budget_ms = if (self.deadline) |deadline|
-            @min(millisUntil(now, deadline), timeout_ms)
-        else
-            timeout_ms;
-        return budgeted;
+    /// Fixes the span of the whole startup operation: the time left before an
+    /// earlier deadline, or the configured timeout that will set one.
+    /// Fallbacks and restarts inherit the first value.
+    pub fn withStartupSpan(self: Control, now: std.Io.Clock.Timestamp, timeout_ms: u32) Control {
+        if (self.startup_span_ms != null) return self;
+        var spanned = self;
+        spanned.startup_span_ms = if (self.deadline) |deadline| millisUntil(now, deadline) else timeout_ms;
+        return spanned;
     }
 };
 
@@ -92,27 +90,27 @@ test "fallback and restart cannot extend a started operation" {
     try std.testing.expectEqual(control.deadline.?, restart.deadline.?);
 }
 
-test "startup budget is fixed when the operation starts" {
+test "startup span is fixed when the operation starts" {
     const now = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = 5 * std.time.ns_per_s } };
     const later = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = now.raw.nanoseconds + 700 * std.time.ns_per_ms } };
 
     const configured = (Control{}).startAt(now, 1_500);
-    try std.testing.expectEqual(@as(?u32, 1_500), configured.startup_budget_ms);
-    try std.testing.expectEqual(@as(?u32, 1_500), configured.startAt(later, 30_000).startup_budget_ms);
-    try std.testing.expectEqual(@as(?u32, 1_500), configured.discoveryProbeAt(later).startup_budget_ms);
+    try std.testing.expectEqual(@as(?u32, 1_500), configured.startup_span_ms);
+    try std.testing.expectEqual(@as(?u32, 1_500), configured.startAt(later, 30_000).startup_span_ms);
+    try std.testing.expectEqual(@as(?u32, 1_500), configured.discoveryProbeAt(later).startup_span_ms);
 
     const caller_deadline = Control{ .deadline = startupDeadline(now, 0, .fromSeconds(2)) };
-    try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupBudget(now, 30_000).startup_budget_ms);
+    try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupSpan(now, 30_000).startup_span_ms);
     const almost = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = now.raw.nanoseconds + 1 } };
-    try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupBudget(almost, 30_000).startup_budget_ms);
+    try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupSpan(almost, 30_000).startup_span_ms);
     const spent = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = now.raw.nanoseconds + 3 * std.time.ns_per_s } };
-    try std.testing.expectEqual(@as(?u32, 0), caller_deadline.withStartupBudget(spent, 30_000).startup_budget_ms);
-    // Each startup request is also capped by the configured timeout.
+    try std.testing.expectEqual(@as(?u32, 0), caller_deadline.withStartupSpan(spent, 30_000).startup_span_ms);
+    // A tool call's deadline can outlast the configured startup timeout.
     const long_deadline = Control{ .deadline = startupDeadline(now, 0, .fromSeconds(60)) };
-    try std.testing.expectEqual(@as(?u32, 30_000), long_deadline.withStartupBudget(now, 30_000).startup_budget_ms);
+    try std.testing.expectEqual(@as(?u32, 60_000), long_deadline.withStartupSpan(now, 30_000).startup_span_ms);
 
-    const explicit = Control{ .deadline = caller_deadline.deadline, .startup_budget_ms = 60_000 };
-    try std.testing.expectEqual(@as(?u32, 60_000), explicit.startAt(later, 30_000).startup_budget_ms);
+    const explicit = Control{ .deadline = caller_deadline.deadline, .startup_span_ms = 45_000 };
+    try std.testing.expectEqual(@as(?u32, 45_000), explicit.startAt(later, 30_000).startup_span_ms);
 }
 
 test "deadline arithmetic saturates without changing the clock" {

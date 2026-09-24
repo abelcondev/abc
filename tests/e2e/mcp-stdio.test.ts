@@ -2415,6 +2415,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(result.code).toBe(0);
     expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
     // fx ended the child itself, so a fresh launch could behave differently.
+    expect(result.stdout).toContain(
+      "failure=MCP server wrote output that is not an MCP message before completing startup: not json",
+    );
     const launches = readAttemptedPids(root.launchLogPath);
     expect(launches).toHaveLength(2);
     const trace = readFileSync(root.traceLogPath, "utf8");

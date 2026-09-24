@@ -87,8 +87,8 @@ pub fn connectServer(
         .http => return connectServerHttp(alloc, server, tool_registry, used_tool_names, control),
         .stdio => {},
     }
-    // Fallbacks keep the caller's deadline and report this operation's budget.
-    const operation = control.withStartupBudget(
+    // Fallbacks keep the caller's deadline and report this operation's span.
+    const operation = control.withStartupSpan(
         std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
         server.config.startup_timeout_ms,
     );
@@ -750,8 +750,8 @@ fn connectServerLegacy(
         control,
         server.config.startup_timeout_ms,
     );
-    // startAt always fixes the budget.
-    const budget_ms = attempt_control.startup_budget_ms.?;
+    // startAt always fixes the span.
+    const span_ms = attempt_control.startup_span_ms.?;
     var offered_version = initial_version;
     var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
@@ -760,8 +760,7 @@ fn connectServerLegacy(
         connection_control.check(io_mod.getIo(), attempt_control) catch |err| {
             // The deadline passed between launches; keep the exit that used it up.
             if (err == error.McpRequestTimedOut) publishStartupFailure(alloc, server, .{ .timed_out = .{
-                .budget_ms = budget_ms,
-                .configured_ms = server.config.startup_timeout_ms,
+                .limit = startupTimeoutLimit(span_ms, server.config.startup_timeout_ms, true),
                 .earlier_exit = if (last_exit) |*exit| exit else null,
                 .live = null,
             } });
@@ -816,8 +815,11 @@ fn connectServerLegacy(
                 server.state.store(.failed, .release);
                 const live = dispatcher.childDiagnostics();
                 publishStartupFailure(alloc, server, .{ .timed_out = .{
-                    .budget_ms = budget_ms,
-                    .configured_ms = server.config.startup_timeout_ms,
+                    .limit = startupTimeoutLimit(
+                        span_ms,
+                        server.config.startup_timeout_ms,
+                        startupDeadlineSpent(attempt_control),
+                    ),
                     .earlier_exit = if (last_exit) |*exit| exit else null,
                     .live = &live,
                 } });
@@ -1062,7 +1064,7 @@ fn connectServerBounded(
     used_tool_names: *tool_names.Registry,
     control: ConnectionControl,
 ) !void {
-    const operation = control.withStartupBudget(
+    const operation = control.withStartupSpan(
         std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
         server.config.startup_timeout_ms,
     );
@@ -1088,13 +1090,22 @@ fn connectServerBounded(
                     if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
                 publishStartupFailure(alloc, server, .{
                     .timed_out = .{
-                        // withStartupBudget always fixes the budget.
-                        .budget_ms = operation.startup_budget_ms.?,
-                        .configured_ms = server.config.startup_timeout_ms,
+                        .limit = startupTimeoutLimit(
+                            // withStartupSpan always fixes the span.
+                            operation.startup_span_ms.?,
+                            server.config.startup_timeout_ms,
+                            startupDeadlineSpent(operation),
+                        ),
                         .earlier_exit = null,
                         .live = if (live) |*value| value else null,
                     },
                 });
+            } else if (server.dispatcher) |dispatcher| {
+                // Such as a banner printed to stdout, at any protocol version.
+                const diagnostics = dispatcher.childDiagnostics();
+                if (diagnostics.rejected_output != null) {
+                    publishStartupFailure(alloc, server, .{ .rejected_output = &diagnostics });
+                }
             }
             server.disconnect();
             const decision = decideStartupRestart(.{
@@ -1168,15 +1179,29 @@ const StartupFailure = union(enum) {
     /// The server closed its connection at every offered protocol version.
     closed: ?*const stdio_dispatcher.ChildDiagnostics,
     timed_out: struct {
-        budget_ms: u32,
-        /// Named as `startup_timeout_ms` only when it set the budget.
-        configured_ms: u32,
+        limit: TimeoutLimit,
         /// An earlier launch in this startup that exited.
         earlier_exit: ?*const stdio_dispatcher.ChildDiagnostics,
         /// The launch that was still running at the deadline.
         live: ?*const stdio_dispatcher.ChildDiagnostics,
     },
+    /// fx ended the connection on stdout output that is not an MCP message.
+    rejected_output: *const stdio_dispatcher.ChildDiagnostics,
 };
+
+const TimeoutLimit = struct {
+    ms: u32,
+    /// True when `startup_timeout_ms` set this limit.
+    names_setting: bool,
+};
+
+/// Names the limit a startup timeout ran into. Each startup request is capped
+/// by `startup_timeout_ms`, and the whole operation ends at its deadline,
+/// which a caller such as a tool call may set to a different span.
+fn startupTimeoutLimit(span_ms: u32, configured_ms: u32, deadline_spent: bool) TimeoutLimit {
+    if (!deadline_spent) return .{ .ms = configured_ms, .names_setting = true };
+    return .{ .ms = span_ms, .names_setting = span_ms == configured_ms };
+}
 
 /// Publishes a startup failure description unless a more specific one is set.
 fn publishStartupFailure(alloc: Allocator, server: *McpServer, failure: StartupFailure) void {
@@ -1207,8 +1232,8 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
             if (diagnostics) |value| try writeStderrSuffix(arena, writer, &value.stderr);
         },
         .timed_out => |timeout| {
-            try writer.print("MCP server did not complete startup within {d} ms", .{timeout.budget_ms});
-            if (timeout.budget_ms == timeout.configured_ms) try writer.writeAll(" (startup_timeout_ms)");
+            try writer.print("MCP server did not complete startup within {d} ms", .{timeout.limit.ms});
+            if (timeout.limit.names_setting) try writer.writeAll(" (startup_timeout_ms)");
             if (timeout.earlier_exit) |value| {
                 try writer.writeAll("; an earlier launch ");
                 try writeTermPhrase(writer, value.term);
@@ -1217,6 +1242,18 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
                 const text = try displayStderr(arena, &value.stderr);
                 if (text.len > 0) try writer.print("; last stderr: {s}", .{text});
             }
+        },
+        .rejected_output => |diagnostics| {
+            try writer.writeAll("MCP server wrote output that is not an MCP message before completing startup");
+            // Callers publish this variant only when a rejected line was kept.
+            const rejected = diagnostics.rejected_output.?;
+            var line = rejected.slice();
+            // A secret cut at the capture limit is too short to be masked.
+            if (rejected.truncated) line = withoutTrailingWord(line);
+            const text = try displayUntrusted(arena, line);
+            if (text.len > 0) try writer.print(": {s}", .{text});
+            const stderr_text = try displayStderr(arena, &diagnostics.stderr);
+            if (stderr_text.len > 0) try writer.print("; stderr: {s}", .{stderr_text});
         },
     }
     return try out.toOwnedSlice();
@@ -1252,27 +1289,45 @@ fn writeStderrSuffix(
     try writer.writeAll(text);
 }
 
-/// Server stderr is untrusted. Produces one terminal-safe line: ANSI
+fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCapture) ![]const u8 {
+    if (!capture.omitted) {
+        return displayUntrusted(arena, try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() }));
+    }
+    // Drop the words cut by the omitted gap: a secret split there is too
+    // short to be masked. Cutting at ASCII whitespace also starts the tail
+    // on a UTF-8 boundary.
+    const joined = try std.mem.concat(arena, u8, &.{
+        withoutTrailingWord(capture.headSlice()),
+        " ... ",
+        withoutLeadingWord(capture.tailSlice()),
+    });
+    return displayUntrusted(arena, joined);
+}
+
+/// Server output is untrusted. Produces one terminal-safe line: ANSI
 /// sequences dropped, secrets masked, whitespace collapsed and remaining
 /// control or non-printing characters escaped by the shared encoder, and the
 /// result bounded head-and-tail.
-fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCapture) ![]const u8 {
+fn displayUntrusted(arena: Allocator, raw: []const u8) ![]const u8 {
     var plain: std.ArrayList(u8) = .empty;
-    if (capture.omitted) {
-        try appendWithoutAnsi(arena, &plain, capture.headSlice());
-        try plain.appendSlice(arena, " ... ");
-        // The retained tail can begin inside a UTF-8 sequence.
-        const tail = capture.tailSlice();
-        try appendWithoutAnsi(arena, &plain, tail[text_utils.utf8ForwardBoundary(tail, 0)..]);
-    } else {
-        const contiguous = try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() });
-        try appendWithoutAnsi(arena, &plain, contiguous);
-    }
+    try appendWithoutAnsi(arena, &plain, raw);
     const masked = try text_utils.maskSecrets(arena, plain.items);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, std.math.maxInt(usize));
     var out: std.Io.Writer.Allocating = .init(arena);
     try text_utils.writeHeadTailBounded(&out.writer, encoded.bytes, stderr_display_bytes, " ... ", .down);
     return try out.toOwnedSlice();
+}
+
+const word_separators = " \t\r\n";
+
+fn withoutTrailingWord(bytes: []const u8) []const u8 {
+    const end = std.mem.findLastAny(u8, bytes, word_separators) orelse return "";
+    return bytes[0 .. end + 1];
+}
+
+fn withoutLeadingWord(bytes: []const u8) []const u8 {
+    const first_separator = std.mem.findAny(u8, bytes, word_separators) orelse return "";
+    return bytes[first_separator..];
 }
 
 fn appendWithoutAnsi(arena: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
@@ -1304,6 +1359,16 @@ test "startup restart runs only with budget left and a failure a relaunch could 
     }
 }
 
+/// A capture whose middle was dropped, with the given head and tail.
+fn testOmittedCapture(head: []const u8, tail: []const u8) stdio_dispatcher.StderrCapture {
+    var capture: stdio_dispatcher.StderrCapture = .{ .omitted = true };
+    @memcpy(capture.head[0..head.len], head);
+    capture.head_len = head.len;
+    @memcpy(capture.tail[0..tail.len], tail);
+    capture.tail_len = tail.len;
+    return capture;
+}
+
 fn testDiagnostics(term: ?std.process.Child.Term, stderr: []const u8) stdio_dispatcher.ChildDiagnostics {
     var diagnostics: stdio_dispatcher.ChildDiagnostics = .{ .term = term };
     diagnostics.stderr.append(stderr);
@@ -1333,35 +1398,85 @@ test "startup failure names how the server ended and its cleaned stderr" {
     );
 }
 
-test "startup timeout names its budget and the most useful stderr" {
+test "startup failure shows the stdout line fx rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var banner = testDiagnostics(.{ .signal = .KILL }, "loading config\n");
+    banner.rejected_output = testRejectedOutput("\x1b[32mServer started\x1b[0m on stdio\x07");
+    try std.testing.expectEqualStrings(
+        "MCP server wrote output that is not an MCP message before completing startup: Server started on stdio\\x07; stderr: loading config",
+        try formatStartupFailure(arena, .{ .rejected_output = &banner }),
+    );
+    var blank = testDiagnostics(null, "");
+    blank.rejected_output = testRejectedOutput("");
+    try std.testing.expectEqualStrings(
+        "MCP server wrote output that is not an MCP message before completing startup",
+        try formatStartupFailure(arena, .{ .rejected_output = &blank }),
+    );
+    // A secret cut at the capture limit is dropped rather than shown in part.
+    var cut: stdio_dispatcher.ChildDiagnostics = .{};
+    cut.rejected_output = testRejectedOutput("token=abcdefghijklmnop");
+    cut.rejected_output.?.truncated = true;
+    try std.testing.expectEqualStrings(
+        "MCP server wrote output that is not an MCP message before completing startup",
+        try formatStartupFailure(arena, .{ .rejected_output = &cut }),
+    );
+}
+
+fn testRejectedOutput(line: []const u8) stdio_dispatcher.RejectedOutput {
+    var rejected: stdio_dispatcher.RejectedOutput = .{ .len = line.len };
+    @memcpy(rejected.bytes[0..line.len], line);
+    return rejected;
+}
+
+test "startup timeout names its limit and the most useful stderr" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const live = testDiagnostics(null, "downloading chrome-devtools-mcp\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 10000 ms (startup_timeout_ms); last stderr: downloading chrome-devtools-mcp",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 10_000, .configured_ms = 10_000, .earlier_exit = null, .live = &live } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 10_000, .names_setting = true }, .earlier_exit = null, .live = &live } }),
     );
     const earlier = testDiagnostics(.{ .exited = 2 }, "boom\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 30000 ms (startup_timeout_ms); an earlier launch exited with code 2: boom",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 30_000, .configured_ms = 30_000, .earlier_exit = &earlier, .live = &live } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 30_000, .names_setting = true }, .earlier_exit = &earlier, .live = &live } }),
     );
     const silent = testDiagnostics(null, "");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .configured_ms = 50, .earlier_exit = null, .live = &silent } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 50, .names_setting = true }, .earlier_exit = null, .live = &silent } }),
     );
     const blank = testDiagnostics(null, "\n\r\x1b[2K\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .configured_ms = 50, .earlier_exit = null, .live = &blank } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 50, .names_setting = true }, .earlier_exit = null, .live = &blank } }),
     );
-    // A shorter caller deadline set the budget, so the setting is not named.
+    // A shorter caller deadline set the limit, so the setting is not named.
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 12345 ms",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 12_345, .configured_ms = 30_000, .earlier_exit = null, .live = &silent } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 12_345, .names_setting = false }, .earlier_exit = null, .live = &silent } }),
     );
+}
+
+test "startup timeout names the limit that ran out" {
+    // An ordinary startup: the deadline and the request cap are the same limit.
+    try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(30_000, 30_000, true));
+    try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(30_000, 30_000, false));
+    // A crash-recovery relaunch keeps the tool call's longer deadline, so a
+    // hung request is stopped by the configured cap first.
+    try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(60_000, 30_000, false));
+    // Slow exits used up the tool call's deadline instead.
+    try expectTimeoutLimit(.{ .ms = 60_000, .names_setting = false }, startupTimeoutLimit(60_000, 30_000, true));
+    // A shorter caller deadline ran out before the configured cap.
+    try expectTimeoutLimit(.{ .ms = 2_000, .names_setting = false }, startupTimeoutLimit(2_000, 30_000, true));
+}
+
+fn expectTimeoutLimit(expected: TimeoutLimit, actual: TimeoutLimit) !void {
+    try std.testing.expectEqual(expected.ms, actual.ms);
+    try std.testing.expectEqual(expected.names_setting, actual.names_setting);
 }
 
 test "server stderr display keeps the first line and the end, bounded and masked" {
@@ -1393,13 +1508,16 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expectEqualStrings("\\x98\\xa9ok \\xff caf\xc3\xa9 done\\x07", try displayStderr(arena, &hostile));
 
     // The retained tail starts with the second byte of a cut character.
-    var split: stdio_dispatcher.StderrCapture = .{ .omitted = true };
-    @memcpy(split.head[0..4], "head");
-    split.head_len = 4;
-    const cut_tail = "\xa9 tail";
-    @memcpy(split.tail[0..cut_tail.len], cut_tail);
-    split.tail_len = cut_tail.len;
+    var split = testOmittedCapture("head\n", "\xa9 tail");
     try std.testing.expectEqualStrings("head ... tail", try displayStderr(arena, &split));
+
+    // Neither half of a secret cut by the omitted gap is shown.
+    var cut_secret = testOmittedCapture("auth failed: Bearer abcdefgh", "ijklmnopqrstuvwxyz rejected\n");
+    const cut_display = try displayStderr(arena, &cut_secret);
+    try std.testing.expect(std.mem.startsWith(u8, cut_display, "auth failed: Bearer"));
+    try std.testing.expect(std.mem.endsWith(u8, cut_display, "rejected"));
+    try std.testing.expect(std.mem.find(u8, cut_display, "abcdefgh") == null);
+    try std.testing.expect(std.mem.find(u8, cut_display, "ijklmnop") == null);
 
     var invisible: stdio_dispatcher.StderrCapture = .{};
     invisible.append("rtl \u{202e}txt\u{200b} nel\u{85}");
