@@ -251,6 +251,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 writeStderr(deps, "fx: no saved sessions for this workspace.\n");
                 return .{ .exit = 1 };
             },
+            error.NoReadableSessions => {
+                writeStderr(deps, "fx: no readable saved sessions for this workspace; run `fx doctor` to check the unreadable ones.\n");
+                return .{ .exit = 1 };
+            },
             error.SessionNotFound => {
                 writeStderr(deps, "fx: saved session not found.\n");
                 return .{ .exit = 1 };

@@ -1,8 +1,8 @@
 //! The session index: the single derived owner of "which saved sessions exist
 //! and how they summarize". Every listing surface (the resume picker,
 //! `fx sessions`, `fx session last`, ACP listing, and latest-session resume)
-//! reads it through `listActionableCatalog`, so no caller scans session
-//! directories on its own.
+//! reads it through `listActionableCatalog`, so no listing surface scans
+//! session directories on its own.
 //!
 //! Rows are bound to stat fingerprints of each session's classification
 //! inputs. A matching fingerprint reuses the row without opening the session;
@@ -467,17 +467,18 @@ const CatalogWorker = struct {
             const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
-            // The fingerprint binds every classification input, so each storage
-            // class, stale schema_v3 projections included, is one cacheable row.
-            // A row read around an interrupted upgrade describes a transition,
-            // not settled state, so it is never reused. Empty sessions stay
-            // listed; the picker alone hides rows without resumable content.
-            var cacheable = !fenced;
+            // The fingerprint binds every classification input, so each settled
+            // row is cacheable, a replayed schema_v3 projection included. A
+            // row read around an interrupted upgrade, or from a stale
+            // projection whose replay failed, describes a transition, not
+            // settled state, so it is never reused. Empty sessions stay listed;
+            // the picker alone hides rows without resumable content.
+            var cacheable = !fenced and candidate.projection_state != .stale;
             const managed = child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                // An unverifiable marker stays listed, as `fx sessions` always
-                // did; exact resume still refuses a real child. The row is not
-                // cached, so the check runs again next time.
+                // An unverifiable marker or first event stays listed, as
+                // `fx sessions` always did; exact resume still refuses a real
+                // child. The row is not cached, so the check runs again.
                 else => blk: {
                     cacheable = false;
                     break :blk false;

@@ -8,6 +8,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
+const migration = @import("session_migration.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_replay = @import("session_replay.zig");
@@ -378,9 +379,12 @@ fn classifyConversationCandidate(
 }
 
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
-/// authority marker, manifest identity, and projection freshness.
+/// authority marker, manifest identity, and projection freshness. A stale
+/// projection carries the wrong workspace and recency, so its summary comes
+/// from replaying the committed log; if that replay fails the manifest stays
+/// listed and opening the session reports the failure.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
-pub fn classifySchemaV3Candidate(
+fn classifySchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
@@ -419,19 +423,38 @@ pub fn classifySchemaV3Candidate(
         return error.InvalidSessionFormat;
     }
     const current_stat = try eventFileStat(session_dir, "events.jsonl");
-    const projection_state: ProjectionState = if (session_projection.isManifestStale(
-        manifest,
-        current_stat,
-    )) .stale else .current;
+    // Listing needs the projection's summary, not its stat identity. Copying
+    // or restoring a session changes the log's inode and ctime without adding
+    // events, so only a log that grew past the projected bytes is stale here.
+    var projection_state: ProjectionState = if (current_stat.size != manifest.event_log_bytes) .stale else .current;
     try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
-    const history_len = std.math.cast(usize, manifest.history_len) orelse
-        return error.InvalidSessionFormat;
+    var replay: ?migration.SchemaV3Import = null;
+    defer if (replay) |*value| value.deinit(alloc);
+    if (projection_state == .stale) {
+        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
+            replay = value;
+            projection_state = .replayed;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => debug_trace.logf(
+                "session",
+                "schema_v3 projection replay failed id={s} err={s}; listing the stale manifest",
+                .{ session_id, @errorName(err) },
+            ),
+        }
+    }
+    const state: ?*const session_codec.DurableSessionState = if (replay) |*value| &value.state else null;
+
+    const history_len = if (state) |value|
+        value.history.len
+    else
+        std.math.cast(usize, manifest.history_len) orelse return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, manifest.id);
     errdefer mem_utils.free(alloc, id);
-    const origin_workspace_root = try alloc.dupe(u8, manifest.origin_workspace_root);
+    const origin_workspace_root = try alloc.dupe(u8, if (state) |value| value.origin_workspace_root else manifest.origin_workspace_root);
     errdefer mem_utils.free(alloc, origin_workspace_root);
-    const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
+    const workspace_root = try alloc.dupe(u8, if (state) |value| value.workspace_root else manifest.workspace_root);
     errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
     if (display.origin_workspace_root) |root| {
@@ -447,26 +470,19 @@ pub fn classifySchemaV3Candidate(
             .title = display.title,
             .preview = display.preview,
             .display_metadata_present = display.present,
-            .created_at_ms = manifest.created_at_ms,
-            .updated_at_ms = manifest.updated_at_ms,
-            .conversation_language = manifest.conversation_language,
+            .created_at_ms = if (state) |value| value.created_at_ms else manifest.created_at_ms,
+            .updated_at_ms = if (state) |value| value.updated_at_ms else manifest.updated_at_ms,
+            .conversation_language = if (state) |value| value.conversation_language else manifest.conversation_language,
             .history_len = history_len,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
+        .subagent_child = if (state) |value| value.subagent_child else null,
     };
 }
 
 /// Builds a read-only candidate from a legacy `session.json` snapshot via a
 /// streaming summary parse. Rejects directories carrying an authority fence.
-pub fn classifyLegacyCandidate(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !ReadOnlyCandidate {
-    return classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, null);
-}
-
 fn classifyLegacyCandidateWithCancellation(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
@@ -507,10 +523,12 @@ fn classifyLegacySnapshot(
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
-    // Check the entry before opening it: opening a FIFO for reading blocks.
-    const path_stat = try session_dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false });
-    if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
-    var file = try openSessionFile(session_dir, name, .read_only);
+    // Opening a FIFO or device for reading can block, so the helper checks
+    // the entry and opens it without blocking.
+    var file = io_mod.openExistingRegularFile(session_dir.dir, name, .read_only) catch |err| switch (err) {
+        error.DurablePathUnsafe => return error.SessionPathUnsafe,
+        else => return err,
+    };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;

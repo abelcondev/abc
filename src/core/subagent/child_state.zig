@@ -513,9 +513,9 @@ pub fn isManagedChildSession(
 }
 
 /// Listing check: reuses discovery's validated identity and every child
-/// marker, and never reads an event log, so listing cost does not grow with
-/// log size. A session whose identity only its first event records stays
-/// listed; latest selection skips it, and exact resume still refuses it.
+/// marker. A legacy session without a metadata-level bit falls back to its
+/// first event, one bounded line read; the session index caches the answer
+/// under the session's fingerprint, so it is paid once per change.
 pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
@@ -531,7 +531,12 @@ pub fn isDiscoveredManagedChildSession(
     if (capability) |*value| {
         if (try capabilityHasManagedChildMarker(alloc, value)) return true;
     }
-    return false;
+    if (subagent_child) |identity| return identity;
+    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
+        // A session without an event log has no first event to record it.
+        error.SessionNotFound, error.FileNotFound => false,
+        else => return err,
+    };
 }
 
 /// Checks only immutable current and legacy child markers. Callers that

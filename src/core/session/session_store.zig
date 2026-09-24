@@ -46,7 +46,6 @@ const DiscoveryCandidateMetadata = discovery.DiscoveryCandidateMetadata;
 const DiscoveryMode = discovery.DiscoveryMode;
 const ReadOnlyCandidate = discovery.ReadOnlyCandidate;
 const appendDoctorDiagnostic = discovery.appendDoctorDiagnostic;
-const classifyLegacyCandidate = discovery.classifyLegacyCandidate;
 const classifyReadOnlyCandidate = discovery.classifyReadOnlyCandidate;
 const freeDoctorDiagnostics = discovery.freeDoctorDiagnostics;
 const inspectDoctorSession = discovery.inspectDoctorSession;
@@ -322,11 +321,6 @@ pub const session_list_max_limit: usize = 100;
 /// Latest selection skips a candidate that vanished or moved between the index
 /// read and the exact open; this bounds how many such races one resume absorbs.
 const max_latest_selection_retries: usize = 3;
-pub const ListWorkspacePageError = error{
-    OutOfMemory,
-    InvalidSessionListLimit,
-    SessionStoreUnavailable,
-};
 const ResumableSessionScope = enum {
     all_workspaces,
     current_workspace,
@@ -1204,11 +1198,11 @@ pub const Store = struct {
         return loaded;
     }
 
-    /// Resumes the newest resumable session in `workspace_root`, in the order
-    /// the session index reports. A subagent child is skipped before it is
-    /// opened. A candidate that disappears or moves to another workspace
-    /// between selection and open yields to the next newest; every other
-    /// failure, including a busy session, is returned.
+    /// Resumes the newest resumable session in `workspace_root`, taking
+    /// candidates from the same index page `fx session last` reads. A
+    /// candidate that disappears or moves to another workspace between
+    /// selection and open yields to the next newest; every other failure,
+    /// including a busy session, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -1228,14 +1222,18 @@ pub const Store = struct {
             if (writer) |*value| value else null,
         );
         defer catalog.deinit(alloc);
+        // Each skip consumes one candidate, so the retry bound is also the
+        // most rows selection can ever need.
+        var page = try sessionListPageFromSummaries(
+            alloc,
+            catalog.summaries.items,
+            workspace_root,
+            null,
+            max_latest_selection_retries,
+        );
+        defer page.deinit(alloc);
         var skipped: usize = 0;
-        for (catalog.summaries.items) |summary| {
-            const candidate_root = summary.workspace_root orelse continue;
-            if (!std.mem.eql(u8, candidate_root, workspace_root)) continue;
-            if (try self.isLatestChildCandidate(alloc, summary.id)) {
-                debug_trace.logf("session", "latest selection skipped subagent child id={s}", .{summary.id});
-                continue;
-            }
+        for (page.summaries.items) |summary| {
             if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, options)) |loaded| {
                 return loaded;
             } else |err| switch (err) {
@@ -1250,6 +1248,7 @@ pub const Store = struct {
                 },
             }
         }
+        if (catalog.skipped_invalid > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
         return session_log.failLoadedWritableSession(error.NoSavedSessions);
     }
 
@@ -1325,21 +1324,6 @@ pub const Store = struct {
         session_id: []const u8,
     ) !bool {
         return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
-    }
-
-    /// Reports whether a latest-selection candidate is a subagent child.
-    /// Listing leaves a legacy child that only its first event identifies to
-    /// exact resume, so latest selection checks just its chosen candidate. An
-    /// unreadable identity is left to the open, which validates the session.
-    pub fn isLatestChildCandidate(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) error{OutOfMemory}!bool {
-        return self.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => false,
-        };
     }
 
     /// Reads one bounded chronological history page without acquiring the
@@ -2194,53 +2178,6 @@ pub const Store = struct {
     /// payloads remain the authority for child ownership.
     pub fn listManagedChildCandidatesForWorkspace(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
         return self.listForWorkspace(alloc);
-    }
-
-    /// Lists one bounded workspace page newest-first. The canonical summary
-    /// index is preferred; discovery remains a read-only fallback for legacy
-    /// or damaged indexes.
-    pub fn listWorkspacePage(
-        self: Store,
-        alloc: Allocator,
-        continuation: ?ResumableSessionContinuation,
-        limit: usize,
-    ) ListWorkspacePageError!SessionListPage {
-        return self.listSessionPage(
-            alloc,
-            .current_workspace,
-            continuation,
-            limit,
-        );
-    }
-
-    pub fn listSessionPage(
-        self: Store,
-        alloc: Allocator,
-        scope: SessionListScope,
-        continuation: ?ResumableSessionContinuation,
-        limit: usize,
-    ) ListWorkspacePageError!SessionListPage {
-        if (limit == 0 or limit > session_list_max_limit) {
-            return error.InvalidSessionListLimit;
-        }
-        const workspace_root: ?[]const u8 = switch (scope) {
-            .current_workspace => self.workspace_root,
-            .all_workspaces => null,
-        };
-        var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionStoreUnavailable,
-        };
-        defer scan.deinit(alloc);
-        var page = sessionListPageFromSummaries(
-            alloc,
-            scan.summaries.items,
-            workspace_root,
-            continuation,
-            limit,
-        ) catch return error.OutOfMemory;
-        page.skipped_invalid = scan.skipped_invalid;
-        return page;
     }
 
     /// Lists up to ten resumable sessions after filtering the current and empty sessions.
@@ -5057,76 +4994,122 @@ fn writeLegacyFixture(
     alloc.free(path);
 }
 
-/// Test fixture: a schema-v3 subagent child whose identity only its first
-/// event records, as a crash before the owner marker leaves one.
-pub fn writeSchemaV3ChildFixture(
+const schema_v3_test_generation: session_event.Identifier = @splat(1);
+const schema_v3_test_watermark = "commit.01010101010101010101010101010101.json";
+
+/// Shape of a test schema-v3 session. Its committed log holds two events:
+/// `session_started` in `projected_workspace`, then a move to `workspace` at
+/// `updated_at_ms`.
+pub const SchemaV3Fixture = struct {
+    projected_workspace: []const u8,
+    workspace: []const u8,
+    updated_at_ms: i64,
+    /// A stale manifest records only the first event, as when a crash lands
+    /// between a log append and the projection write.
+    stale_projection: bool = true,
+    /// Records the child identity only in the first event, as a crash before
+    /// the owner marker is written leaves it.
+    subagent_child: bool = false,
+};
+
+/// Test-only: writes the schema-v3 session `fixture` describes.
+pub fn writeSchemaV3Fixture(
     alloc: Allocator,
     store: Store,
     id: []const u8,
-    workspace_root: []const u8,
-    updated_at_ms: i64,
+    fixture: SchemaV3Fixture,
 ) !void {
     if (!builtin.is_test) @compileError("schema-v3 fixtures are test-only");
-    const sessions = store.canonical_root.sessions orelse return error.SessionNotFound;
-    try sessions.dir.createDir(io_mod.getIo(), id, .fromMode(0o700));
-    var dir = try sessions.dir.openDir(io_mod.getIo(), id, .{});
-    defer dir.close(io_mod.getIo());
-    const generation = [_]u8{1} ** 16;
-    const authority_id = [_]u8{3} ** 16;
-    const language = session.ConversationLanguage.literal("en");
-    const preferences: session_codec.DurableSessionPreferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
-    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
-        .log_generation = generation,
+    try makeSessionDir(alloc, store, id);
+    var dir = try store.openSessionDir(id);
+    defer dir.close();
+    try dir.dir.setPermissions(io_mod.getIo(), .fromMode(0o700));
+    const preferences = session_codec.DurableSessionPreferences{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+    const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = schema_v3_test_generation,
         .seq = 1,
-        .event_id = [_]u8{2} ** 16,
+        .event_id = @splat(2),
         .timestamp_ms = 10,
         .event = .{ .session_started = .{
             .id = @constCast(id),
             .created_at_ms = 10,
-            .origin_workspace_root = @constCast(workspace_root),
-            .workspace_root = @constCast(workspace_root),
-            .conversation_language = language,
+            .origin_workspace_root = @constCast(fixture.projected_workspace),
+            .workspace_root = @constCast(fixture.projected_workspace),
+            .conversation_language = .literal("en"),
             .preferences = preferences,
-            .subagent_child = true,
+            .subagent_child = fixture.subagent_child,
         } },
     });
-    defer alloc.free(started);
+    defer alloc.free(first);
+    const moves = !std.mem.eql(u8, fixture.projected_workspace, fixture.workspace);
+    const second = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = schema_v3_test_generation,
+        .seq = 2,
+        .event_id = @splat(3),
+        .timestamp_ms = fixture.updated_at_ms,
+        .event = if (moves) .{ .workspace_rebound = .{
+            .previous_workspace_root = @constCast(fixture.projected_workspace),
+            .workspace_root = @constCast(fixture.workspace),
+        } } else .{ .preferences_changed = .{ .fast_mode = true } },
+    });
+    defer alloc.free(second);
+    const log_bytes = first.len + second.len;
+    {
+        var events = try dir.dir.createFile(io_mod.getIo(), "events.jsonl", .{ .permissions = .fromMode(0o600) });
+        defer events.close(io_mod.getIo());
+        try events.writeStreamingAll(io_mod.getIo(), first);
+        try events.writeStreamingAll(io_mod.getIo(), second);
+    }
+    const generation_hex = std.fmt.bytesToHex(schema_v3_test_generation, .lower);
+    const event_hex = std.fmt.bytesToHex(@as(session_event.Identifier, @splat(3)), .lower);
+    const watermark = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(u32, 1),
+        .session_id = id,
+        .log_generation = @as([]const u8, &generation_hex),
+        .through_seq = @as(u64, 2),
+        .through_event_id = @as([]const u8, &event_hex),
+        .through_event_log_bytes = @as(u64, log_bytes),
+    }, .{});
+    defer alloc.free(watermark);
+    try io_mod.durableReplaceVerified(alloc, &dir, schema_v3_test_watermark, watermark);
+    const authority_id: session_event.Identifier = @splat(4);
+    const authority_hex = std.fmt.bytesToHex(authority_id, .lower);
+    const marker = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(u32, 1),
+        .storage_format = "event_log_v1",
+        .session_id = id,
+        .authority_id = @as([]const u8, &authority_hex),
+        .source = "native_create",
+    }, .{});
+    defer alloc.free(marker);
+    try io_mod.durableReplaceVerified(alloc, &dir, "authority.json", marker);
+    const projected_bytes: u64 = if (fixture.stale_projection) first.len else log_bytes;
     const manifest = try session_projection.encodeManifest(alloc, .{
         .id = @constCast(id),
         .authority_id = authority_id,
-        .log_generation = generation,
+        .log_generation = schema_v3_test_generation,
         .created_at_ms = 10,
-        .updated_at_ms = updated_at_ms,
-        .origin_workspace_root = @constCast(workspace_root),
-        .workspace_root = @constCast(workspace_root),
-        .conversation_language = language,
+        .updated_at_ms = if (fixture.stale_projection) 10 else fixture.updated_at_ms,
+        .origin_workspace_root = @constCast(fixture.projected_workspace),
+        .workspace_root = @constCast(if (fixture.stale_projection) fixture.projected_workspace else fixture.workspace),
+        .conversation_language = .literal("en"),
         .history_len = 0,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
-        .last_event_seq = 1,
-        .event_log_bytes = started.len,
-        .event_log_stat_fingerprint = [_]u8{0} ** 32,
+        .last_event_seq = if (fixture.stale_projection) 1 else 2,
+        .event_log_bytes = projected_bytes,
+        .event_log_stat_fingerprint = if (fixture.stale_projection)
+            @splat(0)
+        else
+            try session_projection.eventFileStatFingerprint(try authority_module.eventFileStat(&dir, "events.jsonl"), log_bytes),
         .generation_base_seq = 1,
-        .generation_base_bytes = started.len,
+        .generation_base_bytes = first.len,
         .checkpoint_seq = null,
         .checkpoint_sha256 = null,
         .preferences = preferences,
     });
     defer alloc.free(manifest);
-    const authority = try std.fmt.allocPrint(
-        alloc,
-        "{{\"schema_version\":1,\"storage_format\":\"event_log_v1\",\"session_id\":\"{s}\",\"authority_id\":\"{s}\",\"source\":\"native_create\"}}",
-        .{ id, std.fmt.bytesToHex(authority_id, .lower) },
-    );
-    defer alloc.free(authority);
-    const files = [_]struct { name: []const u8, data: []const u8 }{
-        .{ .name = "events.jsonl", .data = started },
-        .{ .name = "session.json", .data = manifest },
-        .{ .name = "authority.json", .data = authority },
-    };
-    for (files) |file| {
-        try dir.writeFile(io_mod.getIo(), .{ .sub_path = file.name, .data = file.data, .flags = .{ .permissions = .fromMode(0o600) } });
-    }
+    try io_mod.durableReplaceVerified(alloc, &dir, "session.json", manifest);
 }
 
 fn writeLegacyIncompleteAuthorityFixture(
@@ -7444,10 +7427,10 @@ test "invalid/corrupt record skipping" {
         const path = try writeSessionFixture(alloc, ctx.store, fixture[0], fixture[1]);
         alloc.free(path);
     }
-    var page = try ctx.store.listSessionPage(alloc, .all_workspaces, null, 10);
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), page.skipped_invalid);
+    var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), catalog.skipped_invalid);
     var listed = try ctx.store.list(alloc);
     defer freeSummaries(alloc, &listed);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
@@ -7733,29 +7716,155 @@ test "writable last excludes newer child metadata and legacy owner markers" {
     }
 }
 
-test "writable last skips a legacy child identified only by its first event" {
+test "a legacy child identified only by its first event stays out of listing and latest resume" {
+    const alloc = std.testing.allocator;
+    // A current projection reaches the first-event check; a stale one learns
+    // the identity from its replay.
+    for ([_]bool{ false, true }) |stale_projection| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
+        try writeSchemaV3Fixture(alloc, ctx.store, "child", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 1000,
+            .stale_projection = stale_projection,
+            .subagent_child = true,
+        });
+        const before = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
+        defer alloc.free(before);
+
+        var writer = (try catalog_cache.Writer.init(ctx.store)).?;
+        defer writer.deinit();
+        {
+            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
+            defer catalog.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+            try std.testing.expectEqualStrings("parent", catalog.summaries.items[0].id);
+            // The exclusion is cached under the child's fingerprint.
+            var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+            defer saved.deinit(alloc);
+            try std.testing.expect(saved.contains("child"));
+        }
+
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("parent", resumed.active_id);
+        // Nothing opened the child for write, so nothing migrated it.
+        const after = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
+        defer alloc.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+test "a stale schema-v3 projection lists and resumes from its committed log" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
-    try writeSchemaV3ChildFixture(alloc, ctx.store, "child", ctx.workspace, std.math.maxInt(i64) - 1);
-    const before = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
-    defer alloc.free(before);
-    // Listing leaves this child to exact resume, so it is the newest row.
-    var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqualStrings("child", catalog.summaries.items[0].id);
-    try std.testing.expect(try ctx.store.isLatestChildCandidate(alloc, "child"));
+    for ([_][]const u8{ "rank-a", "rank-b" }) |id| {
+        try writeSchemaV3Fixture(alloc, ctx.store, id, .{
+            .projected_workspace = "/old-workspace",
+            .workspace = ctx.workspace,
+            .updated_at_ms = 20,
+        });
+    }
+    var writer = (try catalog_cache.Writer.init(ctx.store)).?;
+    defer writer.deinit();
+    {
+        var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
+        defer catalog.deinit(alloc);
+        // Both manifests still say /old-workspace at 10; the committed logs
+        // moved the sessions here at 20.
+        try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+        for (catalog.summaries.items) |summary| {
+            try std.testing.expectEqualStrings(ctx.workspace, summary.workspace_root.?);
+            try std.testing.expectEqual(@as(i64, 20), summary.updated_at_ms);
+        }
+        // A replayed row is settled, so the index reuses it until the session changes.
+        var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+        defer saved.deinit(alloc);
+        try std.testing.expect(saved.contains("rank-a"));
+        try std.testing.expect(saved.contains("rank-b"));
+    }
+    try std.testing.expectError(
+        error.NoSavedSessions,
+        ctx.store.resumeTargetForWrite(alloc, .last, "/old-workspace", .{}),
+    );
 
+    {
+        var dir = try ctx.store.openSessionDir("rank-a");
+        defer dir.close();
+        try io_mod.durableReplaceVerified(alloc, &dir, schema_v3_test_watermark, "{}");
+    }
+    {
+        var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
+        defer catalog.deinit(alloc);
+        // A failed replay keeps the stale manifest listed, and never caches it.
+        try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+        for (catalog.summaries.items) |summary| {
+            const expected: []const u8 = if (std.mem.eql(u8, summary.id, "rank-a")) "/old-workspace" else ctx.workspace;
+            try std.testing.expectEqualStrings(expected, summary.workspace_root.?);
+        }
+        var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+        defer saved.deinit(alloc);
+        try std.testing.expect(!saved.contains("rank-a"));
+        try std.testing.expect(saved.contains("rank-b"));
+    }
     var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
     defer resumed.deinit(alloc);
-    try std.testing.expectEqualStrings("parent", resumed.active_id);
-    // The child is skipped before any writable open, so nothing migrates it.
-    const after = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
-    defer alloc.free(after);
-    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectEqualStrings("rank-b", resumed.active_id);
+    try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
+}
+
+test "a copied schema-v3 session lists from its manifest without a replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeSchemaV3Fixture(alloc, ctx.store, "copied", .{
+        .projected_workspace = ctx.workspace,
+        .workspace = ctx.workspace,
+        .updated_at_ms = 20,
+        .stale_projection = false,
+    });
+    {
+        var dir = try ctx.store.openSessionDir("copied");
+        defer dir.close();
+        // A copy or restore gives the log a new inode and ctime, same bytes.
+        const log = try readFixtureFile(alloc, ctx.store, "copied", "events.jsonl", 64 * 1024);
+        defer alloc.free(log);
+        try io_mod.durableReplaceVerified(alloc, &dir, "events.jsonl", log);
+        // Any replay would now fail, so a cached row proves none ran.
+        try io_mod.durableReplaceVerified(alloc, &dir, schema_v3_test_watermark, "{}");
+    }
+    var writer = (try catalog_cache.Writer.init(ctx.store)).?;
+    defer writer.deinit();
+    var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings(ctx.workspace, catalog.summaries.items[0].workspace_root.?);
+    try std.testing.expectEqual(@as(i64, 20), catalog.summaries.items[0].updated_at_ms);
+    var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.contains("copied"));
+}
+
+test "writable last reports unreadable sessions when nothing is resumable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try std.testing.expectError(error.NoSavedSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
+    const path = try writeSessionFixture(alloc, ctx.store, "broken", "{\"schema_version\":1,");
+    alloc.free(path);
+    // `fx session last` reports the same error for the same store.
+    try std.testing.expectError(error.NoReadableSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
 }
 
 test "writable last ignores unrelated conversation history" {

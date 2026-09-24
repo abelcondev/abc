@@ -4217,6 +4217,10 @@ test "deferred resumed diff builds once and degrades to its preview" {
     };
     try app.registerAndEmitDiffBlock(payload);
     const id = app.diff_entries.items[0].id;
+    // Registering and drawing a resumed edit builds nothing; the full diff
+    // waits for the full transcript to ask for it.
+    try std.testing.expect(app.diff_entries.items[0].deferred != null);
+    try std.testing.expect(app.diff_entries.items[0].full == null);
 
     // No saved session owns the snapshots: the entry falls back to its
     // preview, and the failed build is not retried on every lookup.

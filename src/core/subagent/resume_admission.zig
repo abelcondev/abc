@@ -53,25 +53,28 @@ pub fn listVisiblePage(
     return page;
 }
 
-/// Returns the session `--resume last` would open in this workspace: the
-/// newest listed row that is not a subagent child. Caller owns the summary.
+/// Returns the newest listed session in this workspace, the first candidate
+/// `--resume last` tries from the same index page. Caller owns the summary.
 pub fn latestVisibleWorkspaceSummary(
     store: session_store.Store,
     alloc: Allocator,
 ) !session_store.SessionSummary {
-    var catalog = catalog_cache.listActionableCatalog(store, alloc, null, null, null) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.SessionStoreUnavailable,
-    };
-    defer catalog.deinit(alloc);
-    for (catalog.summaries.items) |summary| {
-        const summary_workspace = summary.workspace_root orelse continue;
-        if (!std.mem.eql(u8, summary_workspace, store.workspace_root)) continue;
-        if (try store.isLatestChildCandidate(alloc, summary.id)) continue;
-        return session_summary_codec.cloneSessionSummary(alloc, summary);
+    var page = try listVisiblePage(
+        store,
+        alloc,
+        .current_workspace,
+        null,
+        1,
+    );
+    defer page.deinit(alloc);
+    if (page.summaries.items.len == 0) {
+        if (page.skipped_invalid > 0) return error.NoReadableSessions;
+        return error.NoSavedSessions;
     }
-    if (catalog.skipped_invalid > 0) return error.NoReadableSessions;
-    return error.NoSavedSessions;
+    return session_summary_codec.cloneSessionSummary(
+        alloc,
+        page.summaries.items[0],
+    );
 }
 
 pub fn loadVisibleReadOnlyDetail(
@@ -276,7 +279,13 @@ test "session last skips a legacy child identified only by its first event" {
     defer parent.deinit(alloc);
     var writable = try store.startWritableSession(alloc, parent);
     writable.deinit(alloc);
-    try session_store.writeSchemaV3ChildFixture(alloc, store, "child", workspace, std.math.maxInt(i64) - 1);
+    try session_store.writeSchemaV3Fixture(alloc, store, "child", .{
+        .projected_workspace = workspace,
+        .workspace = workspace,
+        .updated_at_ms = 1000,
+        .stale_projection = false,
+        .subagent_child = true,
+    });
 
     // `fx session last` names the session `--resume last` opens, not the child.
     var latest = try latestVisibleWorkspaceSummary(store, alloc);
