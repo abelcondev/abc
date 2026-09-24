@@ -357,7 +357,13 @@ pub const Operations = struct {
                         {
                             return recovery_err;
                         }
-                        if (try restartFailedResult(arena, server, snapshot.prefixed_name, failures_before)) |result| {
+                        if (try restartFailedResult(
+                            arena,
+                            self.lifecycle.catalog_mutex,
+                            server,
+                            snapshot.prefixed_name,
+                            failures_before,
+                        )) |result| {
                             return result;
                         }
                         return recovery_err;
@@ -673,14 +679,19 @@ pub const Operations = struct {
         };
     }
 
-    /// The reason a stopped server failed to start again, or null unless
-    /// the recovery that ran after `failures_before` recorded one.
+    /// The reason a stopped server failed to start again, or null unless a
+    /// failure was recorded after the caller read `failures_before`.
     fn restartFailedResult(
         arena: Allocator,
+        catalog_mutex: *std.Io.RwLock,
         server: *McpServer,
         tool_name: []const u8,
         failures_before: u64,
     ) !?tool_mcp_runtime.CallResult {
+        // A successful recovery replaces last_error under the exclusive
+        // catalog lock without taking status_lock.
+        catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer catalog_mutex.unlockShared(io_mod.getIo());
         server.status_lock.lockUncancelable(io_mod.getIo());
         defer server.status_lock.unlock(io_mod.getIo());
         if (server.failure_serial == failures_before) return null;
@@ -1217,17 +1228,18 @@ test "a failed recovery reports only the failure it recorded" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var catalog_mutex: std.Io.RwLock = .init;
     var server = McpServer{ .config = .{ .name = @constCast("fixture") } };
     defer if (server.last_error) |value| alloc.free(value);
 
     server.setFailed(alloc, "MCP server exited with code 1 before completing startup");
-    // A recovery that stopped before relaunching, such as on an authority
-    // check, must not report the older failure.
+    // A recovery that stopped before relaunching, such as on a lock
+    // timeout, must not report the older failure.
     const before = server.failureSerial();
-    try std.testing.expect((try Operations.restartFailedResult(arena, &server, "mcp_fixture_echo", before)) == null);
+    try std.testing.expect((try Operations.restartFailedResult(arena, &catalog_mutex, &server, "mcp_fixture_echo", before)) == null);
 
     server.setFailed(alloc, "MCP server exited with code 5 before completing startup: relaunch blocked");
-    const result = (try Operations.restartFailedResult(arena, &server, "mcp_fixture_echo", before)).?;
+    const result = (try Operations.restartFailedResult(arena, &catalog_mutex, &server, "mcp_fixture_echo", before)).?;
     try std.testing.expect(result.status == .protocol_failure);
     try std.testing.expect(std.mem.find(u8, result.model_output, "exited with code 5 before completing startup: relaunch blocked") != null);
 }

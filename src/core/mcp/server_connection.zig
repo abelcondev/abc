@@ -113,8 +113,8 @@ pub const Server = struct {
     reload_pending: std.atomic.Value(bool) = .init(false),
     state: atomic_value.Value(ServerState) = .init(.disconnected),
     last_error: ?[]u8 = null,
-    /// Counts setFailed calls so a caller can tell whether its own attempt
-    /// recorded the current failure. Guarded by status_lock.
+    /// Counts setFailed calls so a caller can tell whether a failure was
+    /// recorded after it read the count. Guarded by status_lock.
     failure_serial: u64 = 0,
     instructions: ?[]u8 = null,
     negotiated_server_name: ?[]u8 = null,

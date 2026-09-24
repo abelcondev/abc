@@ -2513,6 +2513,7 @@ if [ "$(wc -l < "$FX_MCP_LAUNCH_LOG")" -gt 1 ]; then echo 'relaunch blocked by t
 exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     ];
     writeFileSync(profilePath, JSON.stringify(profile));
+    let sawFirstExit = true;
     const activeGateway = startFakeGateway([
       fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
       fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
@@ -2520,7 +2521,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // Call again only after fx has seen the first server exit.
         const deadline = Date.now() + 5_000;
         while (!readFileSync(root.traceLogPath, "utf8").includes("stdio dispatcher failed")) {
-          if (Date.now() >= deadline) throw new Error("fx never saw the first server exit");
+          if (Date.now() >= deadline) {
+            sawFirstExit = false;
+            break;
+          }
           await Bun.sleep(20);
         }
         return fakeGatewayToolCall("second_call", TOOL_NAME, { text: "second" });
@@ -2540,6 +2544,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       },
     );
 
+    expect(sawFirstExit, "fx never saw the first server exit").toBe(true);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toContain("RESTART_FAILURE_REPORTED");
     expect(activeGateway.requests[2]?.body).toContain("MODERN_MCP_TOOL_RESULT:first");
