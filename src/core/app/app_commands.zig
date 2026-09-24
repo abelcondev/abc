@@ -559,7 +559,7 @@ pub fn Handlers(comptime App: type) type {
                     try std.fmt.allocPrint(
                         app.alloc,
                         "MCP authentication for '{s}' failed: {s}.",
-                        .{ completion.server_name, @errorName(err) },
+                        .{ completion.server_name, mcp_auth.authentication_error_message(err) },
                     );
                 defer app.alloc.free(body);
                 try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);

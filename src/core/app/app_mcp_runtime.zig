@@ -1642,7 +1642,7 @@ pub const State = struct {
                     "MCP authentication for '",
                     completion.server_name,
                     "' failed: ",
-                    @errorName(err),
+                    mcp_auth.authentication_error_message(err),
                 },
             );
         }

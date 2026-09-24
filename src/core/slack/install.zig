@@ -66,7 +66,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     var accepted: ?browser.Accepted(Callback) = null;
     var saved = false;
     defer if (accepted) |*value| {
-        value.respond(if (saved) .ok else .failed) catch {};
+        respond_completion(value.stream, origin, saved) catch {};
         value.deinit();
     };
     if (action == .install) {
@@ -96,7 +96,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         var cancelled: std.atomic.Value(bool) = .init(false);
         while (accepted == null) {
             if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
-            accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, origin);
+            accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, null, origin);
         }
         if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
         if (accepted.?.callback.denied) return error.SlackAuthorizationDenied;
@@ -122,6 +122,19 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     try io.durableReplaceVerified(alloc, &dir, "installation.json", serialized.written());
     saved = true;
     return snapshot(action, record);
+}
+
+fn respond_completion(stream: std.Io.net.Stream, origin: []const u8, saved: bool) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io.getIo(), &buffer);
+    try writer.interface.print(
+        "HTTP/1.1 303 See Other\r\n" ++
+            "Location: {s}/api/slack/install/complete?result={s}\r\n" ++
+            "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n" ++
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+        .{ origin, if (saved) "success" else "failed" },
+    );
+    try writer.interface.flush();
 }
 
 fn test_origin(value: []const u8) bool {

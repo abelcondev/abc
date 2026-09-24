@@ -63,6 +63,7 @@ pub const ClientConfig = struct {
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
+    scopes_configured: bool = false,
     callback_port: ?u16 = null,
 };
 
@@ -242,6 +243,27 @@ pub const InteractiveAuthorizationOptions = struct {
     open_url: OpenUrlFn,
     cancel_flag: ?*const std.atomic.Value(bool) = null,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool) = null,
+    completion: ?*InteractiveCompletion = null,
+};
+
+pub const InteractiveCompletion = struct {
+    stream: ?std.Io.net.Stream = null,
+    origin: []const u8 = "https://fx.sh",
+
+    pub fn finish(self: *InteractiveCompletion, saved: bool) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        defer stream.close(io_mod.getIo());
+        var buffer: [1024]u8 = undefined;
+        var writer = stream.writer(io_mod.getIo(), &buffer);
+        writer.interface.print(
+            "HTTP/1.1 303 See Other\r\nLocation: {s}/api/slack/auth/complete?result={s}\r\n" ++
+                "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n" ++
+                "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ self.origin, if (saved) "success" else "failed" },
+        ) catch return;
+        writer.interface.flush() catch {};
+    }
 };
 
 pub const ResourceMetadata = struct {
@@ -1021,10 +1043,13 @@ pub fn authorizeAutomated(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
 ) !AuthorizationResult {
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
+    defer if (bridge) |value| alloc.free(value.scope);
     return authorizeWithRedirect(
         alloc,
         options,
         "http://localhost:3000/callback",
+        if (bridge) |value| value.scope else null,
         null,
         requestAutomatedAuthorization,
     );
@@ -1175,7 +1200,12 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    const configured_port = options.config.callback_port;
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
+    defer if (bridge) |value| alloc.free(value.scope);
+    const bridge_origin = if (bridge) |value| value.origin else null;
+    if (bridge_origin != null and options.completion == null) return error.MissingAuthorizationCompletion;
+    errdefer if (options.completion) |completion| completion.finish(false);
+    const configured_port = if (bridge_origin == null) options.config.callback_port else null;
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
     var listener = if (configured_port != null)
         listenPinnedCallback(address) catch return error.McpCallbackPortUnavailable
@@ -1191,7 +1221,7 @@ pub fn authorizeInteractive(
         };
     }
     defer if (ipv6_listener) |*value| value.deinit(io_mod.getIo());
-    const redirect_uri = try callbackRedirectUri(
+    const redirect_uri = if (bridge_origin != null) try alloc.dupe(u8, slack_callback_url) else try callbackRedirectUri(
         alloc,
         configured_port,
         listener.socket.address.getPort(),
@@ -1206,6 +1236,8 @@ pub fn authorizeInteractive(
             .caller = options.cancel_flag,
             .runtime = options.lifecycle_cancel_flag,
         },
+        .bridge_origin = bridge_origin,
+        .completion = options.completion,
     };
     return authorizeWithRedirect(
         alloc,
@@ -1218,9 +1250,71 @@ pub fn authorizeInteractive(
             .lifecycle_cancel_flag = options.lifecycle_cancel_flag,
         },
         redirect_uri,
+        if (bridge) |value| value.scope else null,
         &context,
         requestInteractiveAuthorization,
     );
+}
+
+const slack_callback_url = "https://fx.sh/api/slack/oauth/callback";
+const fx_slack_client_id = "12364000946.12017137861236";
+
+const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
+
+fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: ClientConfig) !?SlackBridgeConfig {
+    const configured_client = client_config.client_id orelse return null;
+    if (!std.mem.eql(u8, configured_client, fx_slack_client_id)) return null;
+    const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
+    const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
+    if (fixture) {
+        if (!std.mem.startsWith(u8, origin, "http://127.0.0.1:")) return error.InvalidSlackTestOrigin;
+        const port = std.fmt.parseInt(u16, origin[17..], 10) catch return error.InvalidSlackTestOrigin;
+        if (port < 1024) return error.InvalidSlackTestOrigin;
+    }
+    const resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
+    defer if (fixture) alloc.free(resource);
+    if (!std.mem.eql(u8, endpoint, resource)) return null;
+    const url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config?flow=auth", .{origin});
+    defer alloc.free(url);
+    var response = try request(alloc, .GET, url, null, null, &.{});
+    defer response.deinit(alloc);
+    if (response.status != .ok) return error.SlackBridgeUnavailable;
+    try validateJsonContentType(response.content_type);
+    const config = try std.json.parseFromSlice(struct {
+        client_id: []const u8,
+        redirect_uri: []const u8,
+        user_scopes: ?[]const []const u8 = null,
+    }, alloc, response.body, .{ .ignore_unknown_fields = true });
+    defer config.deinit();
+    if (!std.mem.eql(u8, config.value.redirect_uri, slack_callback_url)) return error.InvalidSlackBridgeConfiguration;
+    if (!std.mem.eql(u8, configured_client, config.value.client_id)) return error.InvalidSlackBridgeConfiguration;
+    const scopes = config.value.user_scopes orelse return error.InvalidSlackBridgeConfiguration;
+    if (scopes.len == 0 or scopes.len > max_scope_tokens) return error.InvalidSlackBridgeConfiguration;
+    for (scopes) |scope| {
+        if (scope.len == 0 or scope.len > max_scope_token_bytes) return error.InvalidSlackBridgeConfiguration;
+        for (scope) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '_' and byte != '-') return error.InvalidSlackBridgeConfiguration;
+        }
+    }
+    if (client_config.scopes_configured or client_config.scopes.len > 0) {
+        var configured_scopes: std.ArrayList([]const u8) = .empty;
+        defer configured_scopes.deinit(alloc);
+        for (client_config.scopes) |scope| try appendScopeTokens(alloc, &configured_scopes, scope);
+        for (scopes) |scope| {
+            if (!contains(configured_scopes.items, scope)) return error.SlackScopeConfigurationMismatch;
+        }
+    }
+    const scope = (try requestedScope(alloc, scopes, null, &.{}, null, false)).?;
+    errdefer alloc.free(scope);
+    if (scope.len > 1024) return error.InvalidSlackBridgeConfiguration;
+    return .{ .origin = origin, .scope = scope };
+}
+
+pub fn authentication_error_message(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than fx requires. Authorization was not started. Custom scope subsets are not supported for the fx app. Remove the local scopes override only if you want to authorize the full shared scope set",
+        else => @errorName(err),
+    };
 }
 
 const AuthorizationRequestFn = *const fn (
@@ -1234,6 +1328,7 @@ fn authorizeWithRedirect(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
     redirect_uri: []const u8,
+    fixed_scope: ?[]const u8,
     authorization_ctx: ?*anyopaque,
     request_authorization: AuthorizationRequestFn,
 ) !AuthorizationResult {
@@ -1278,7 +1373,7 @@ fn authorizeWithRedirect(
     defer registration.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
 
-    const scope = try requestedScope(
+    const scope = if (fixed_scope) |value| try alloc.dupe(u8, value) else try requestedScope(
         alloc,
         options.config.scopes,
         options.challenge.scope,
@@ -1419,6 +1514,8 @@ const InteractiveAuthorizationContext = struct {
     open_ctx: ?*anyopaque,
     open_url: OpenUrlFn,
     cancellation: operation_control.CancellationSources,
+    bridge_origin: ?[]const u8 = null,
+    completion: ?*InteractiveCompletion = null,
 };
 
 const interactive_callback_timeout_ms: i32 = 5 * 60 * 1000;
@@ -1477,6 +1574,7 @@ fn requestInteractiveAuthorization(
     _: []const u8,
 ) !AuthorizationResponse {
     const ctx: *InteractiveAuthorizationContext = @ptrCast(@alignCast(raw_ctx.?));
+    if (ctx.bridge_origin != null) return request_bridged_authorization(ctx, alloc, authorization_url);
     try checkAuthorizationCancellation(ctx.cancellation);
     if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
         return error.McpAuthorizationBrowserOpenFailed;
@@ -1505,6 +1603,113 @@ fn requestInteractiveAuthorization(
         return response;
     }
     return error.InvalidAuthorizationCallback;
+}
+
+fn request_bridged_authorization(ctx: *InteractiveAuthorizationContext, alloc: Allocator, authorization_url: []const u8) !AuthorizationResponse {
+    const origin = ctx.bridge_origin.?;
+    const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
+    const endpoint = if (fixture) try std.fmt.allocPrint(alloc, "{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
+    defer if (fixture) alloc.free(endpoint);
+    const question = std.mem.findScalar(u8, authorization_url, '?') orelse return error.InvalidSlackAuthorizationEndpoint;
+    if (!std.mem.eql(u8, authorization_url[0..question], endpoint)) return error.InvalidSlackAuthorizationEndpoint;
+    const query = authorization_url[question + 1 ..];
+    const resource = try queryValueAlloc(alloc, query, "resource");
+    defer alloc.free(resource);
+    const expected_resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
+    defer if (fixture) alloc.free(expected_resource);
+    if (!std.mem.eql(u8, resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
+    const state = try queryValueAlloc(alloc, query, "state");
+    defer secret.zeroAndFree(alloc, state);
+    var start: std.Io.Writer.Allocating = .init(alloc);
+    defer start.deinit();
+    try start.writer.print("{s}/api/slack/auth?", .{origin});
+    var form: Form = .{};
+    try form.append(&start.writer, "state", state);
+    const names = .{ .{ "code_challenge", "challenge" }, .{ "client_id", "client_id" }, .{ "scope", "scope" } };
+    inline for (names) |names_pair| {
+        const value = try queryValueAlloc(alloc, query, names_pair[0]);
+        defer alloc.free(value);
+        try form.append(&start.writer, names_pair[1], value);
+    }
+    var port_buffer: [5]u8 = undefined;
+    try form.append(&start.writer, "port", try std.fmt.bufPrint(&port_buffer, "{d}", .{ctx.listener.socket.address.getPort()}));
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .raw = .fromSeconds(300), .clock = .boot });
+    try checkAuthorizationCancellation(ctx.cancellation);
+    if (!try ctx.open_url(ctx.open_ctx, alloc, start.written())) return error.McpAuthorizationBrowserOpenFailed;
+    var parser = BridgedCallbackContext{ .state = state };
+    while (true) {
+        try checkAuthorizationCancellation(ctx.cancellation);
+        if (deadline.durationFromNow(io_mod.getIo()).raw.nanoseconds <= 0) return error.McpAuthorizationCallbackTimedOut;
+        var accepted = (try browser_callback.await_form(BridgedCallback, parse_bridged_callback, alloc, ctx.listener, &parser, ctx.cancellation.caller, ctx.cancellation.runtime, origin)) orelse continue;
+        ctx.completion.?.stream = accepted.stream;
+        ctx.completion.?.origin = origin;
+        errdefer accepted.callback.response.deinit(alloc);
+        try checkAuthorizationCancellation(ctx.cancellation);
+        if (deadline.durationFromNow(io_mod.getIo()).raw.nanoseconds <= 0) return error.McpAuthorizationCallbackTimedOut;
+        if (accepted.callback.denied) return error.McpAuthorizationDenied;
+        return accepted.callback.response;
+    }
+}
+
+const BridgedCallback = struct { response: AuthorizationResponse, denied: bool };
+const BridgedCallbackContext = struct { state: []const u8, consumed: bool = false };
+
+fn parse_bridged_callback(raw_ctx: ?*anyopaque, alloc: Allocator, body: []const u8) browser_callback.ParseResult(BridgedCallback) {
+    const ctx: *BridgedCallbackContext = @ptrCast(@alignCast(raw_ctx.?));
+    if (ctx.consumed) return .unrelated;
+    const callback = bridged_callback(alloc, body, ctx.state) catch |err| return if (err == error.AuthorizationStateMismatch) .unrelated else .{ .failed = err };
+    ctx.consumed = true;
+    return .{ .accepted = callback };
+}
+
+fn bridged_callback(alloc: Allocator, body: []const u8, expected_state: []const u8) !BridgedCallback {
+    var values: [4]?[]u8 = @splat(null);
+    defer for (values) |value| if (value) |bytes| secret.zeroAndFree(alloc, bytes);
+    var fields = std.mem.splitScalar(u8, body, '&');
+    while (fields.next()) |field| {
+        const equals = std.mem.findScalar(u8, field, '=') orelse return error.InvalidAuthorizationCallback;
+        const name = try percentDecodeAlloc(alloc, field[0..equals]);
+        defer alloc.free(name);
+        const index: usize = if (std.mem.eql(u8, name, "state")) 0 else if (std.mem.eql(u8, name, "code")) 1 else if (std.mem.eql(u8, name, "error")) 2 else if (std.mem.eql(u8, name, "iss")) 3 else return error.InvalidAuthorizationCallback;
+        if (values[index] != null) return error.InvalidAuthorizationCallback;
+        values[index] = try percentDecodeAlloc(alloc, field[equals + 1 ..]);
+        if (values[index].?.len == 0 or values[index].?.len > 2048) return error.InvalidAuthorizationCallback;
+    }
+    if (!std.mem.eql(u8, values[0] orelse return error.AuthorizationStateMismatch, expected_state)) return error.AuthorizationStateMismatch;
+    if ((values[1] == null) == (values[2] == null)) return error.InvalidAuthorizationCallback;
+    const denied = values[2] != null;
+    const response = AuthorizationResponse{ .state = values[0].?, .code = values[1] orelse try alloc.dupe(u8, ""), .issuer = values[3] };
+    values[0] = null;
+    values[1] = null;
+    values[3] = null;
+    return .{ .response = response, .denied = denied };
+}
+
+test "personal Slack relay consumes state once and preserves issuer and form encoding" {
+    const alloc = std.testing.allocator;
+    var context = BridgedCallbackContext{ .state = "expected" };
+    try std.testing.expect(parse_bridged_callback(&context, alloc, "state=wrong&code=code") == .unrelated);
+    var parsed = parse_bridged_callback(&context, alloc, "state=expected&code=code%2Bvalue&iss=https%3A%2F%2Fmcp.slack.com");
+    try std.testing.expect(parsed == .accepted);
+    defer parsed.accepted.response.deinit(alloc);
+    try std.testing.expectEqualStrings("code+value", parsed.accepted.response.code);
+    try std.testing.expectEqualStrings("https://mcp.slack.com", parsed.accepted.response.issuer.?);
+    try std.testing.expect(parse_bridged_callback(&context, alloc, "state=expected&code=code") == .unrelated);
+    for ([_][]const u8{
+        "state=expected&state=expected&code=x",
+        "state=expected&code=x&code=y",
+        "state=expected&code=x&error=denied",
+        "state=expected&code=x&iss=a&iss=b",
+        "state=expected&code=x&redirect_uri=https://evil.example",
+        "state=expected&code=%zz",
+    }) |body| {
+        var other = BridgedCallbackContext{ .state = "expected" };
+        try std.testing.expect(parse_bridged_callback(&other, alloc, body) == .failed);
+        try std.testing.expect(!other.consumed);
+    }
+    var denied = try bridged_callback(alloc, "state=expected&error=access_denied", "expected");
+    defer denied.response.deinit(alloc);
+    try std.testing.expect(denied.denied);
 }
 
 fn readInteractiveAuthorizationCallback(
