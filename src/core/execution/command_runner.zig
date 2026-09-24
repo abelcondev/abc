@@ -430,15 +430,15 @@ fn waitForForegroundTarget(
                 );
                 return term;
             }
-            const count = try cleanupCompletedForegroundTarget(
+            const cleanup = try cleanupCompletedForegroundTarget(
                 &descendants,
                 target_pid,
             );
-            if (count > 0) {
+            if (cleanup.terminated > 0 or cleanup.kept_detached > 0) {
                 debug_trace.logf(
                     "core",
-                    "captured command target completed; tracked descendants terminated count={d}",
-                    .{count},
+                    "captured command target completed; tracked descendants terminated count={d} detached daemons kept count={d}",
+                    .{ cleanup.terminated, cleanup.kept_detached },
                 );
             }
             return term;
@@ -447,29 +447,54 @@ fn waitForForegroundTarget(
     }
 }
 
+const CompletedTargetCleanup = struct {
+    terminated: usize = 0,
+    kept_detached: usize = 0,
+
+    fn record(self: *CompletedTargetCleanup, delivery: process_tree.CompletionDelivery) void {
+        self.terminated += delivery.delivery.delivered;
+        self.kept_detached = delivery.kept_detached;
+    }
+};
+
+/// Stops what a naturally completed command left in its session or on its
+/// output pipes. Daemons that moved to their own session and released the
+/// output keep running, so background servers that tools start survive
+/// between calls. Cancellation, timeout, and owner loss still stop them.
 fn cleanupCompletedForegroundTarget(
     descendants: *process_tree.Tracker,
     target_pid: std.posix.pid_t,
-) !usize {
+) !CompletedTargetCleanup {
+    const boundary: ?process_tree.CommandBoundary =
+        process_tree.CommandBoundary.ofSupervisor() catch |err| blk: {
+            debug_trace.logf(
+                "core",
+                "captured command boundary unavailable err={s}; stopping every tracked descendant",
+                .{@errorName(err)},
+            );
+            break :blk null;
+        };
+    const boundary_ref: ?*const process_tree.CommandBoundary =
+        if (boundary) |*value| value else null;
     const started_ms = io_mod.milliTimestamp();
-    var signaled: usize = 0;
+    var cleanup: CompletedTargetCleanup = .{};
     var empty_scans: u8 = 0;
     while (io_mod.milliTimestamp() - started_ms <
         foreground_target_cleanup_wait_ms)
     {
         try refreshForegroundTargetTree(descendants, target_pid);
-        signaled += descendants.signalAll(std.posix.SIG.KILL);
-        if (descendants.anyAlive()) {
+        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, boundary_ref));
+        if (descendants.anyAttachedAlive(boundary_ref)) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
-            if (empty_scans >= 2) return signaled;
+            if (empty_scans >= 2) return cleanup;
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
     try refreshForegroundTargetTree(descendants, target_pid);
-    signaled += descendants.signalAll(std.posix.SIG.KILL);
-    return signaled;
+    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, boundary_ref));
+    return cleanup;
 }
 
 fn refreshForegroundTargetTree(
@@ -4701,7 +4726,7 @@ test "natural command completion terminates background child with redirected str
     try expectProcessGone(pid);
 }
 
-test "natural command completion terminates redirected descendant after setsid" {
+test "natural command completion keeps a daemon that detached after setsid" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -4711,8 +4736,8 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
-    // Natural cleanup may kill the child before it publishes its PID unless
-    // the parent waits for readiness after setsid and stream redirection.
+    // Natural cleanup stops the child while it is still in the command
+    // session, so the parent waits for readiness after setsid and redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
@@ -4741,14 +4766,131 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
-    defer alloc.free(pid_text);
-    const pid = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trim(u8, pid_text, " \t\r\n"),
-        10,
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural command completion keeps a double-forked daemon and its children" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "daemon.pids" });
+    defer alloc.free(pid_path);
+    // The daemon keeps every inherited descriptor except the output streams,
+    // like CLIs that spawn a detached background server and a browser child.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if os.fork() > 0: os._exit(0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " worker=os.fork()\n" ++
+            " if worker == 0:\n" ++
+            "  time.sleep(30)\n" ++
+            "  os._exit(0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid())+\" \"+str(worker))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"DAEMON-STARTED\")'",
+        .{pid_path},
     );
-    try expectProcessGone(pid);
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "DAEMON-STARTED") != null);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 2), pids.len);
+    for (pids) |pid| {
+        try std.testing.expect(try process_tree.processIsAlive(alloc, pid));
+    }
+}
+
+test "natural command completion stops a detached process that keeps command output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "output-holder.pid" });
+    defer alloc.free(pid_path);
+    // The child leaves the session and redirects its standard streams but
+    // keeps a duplicate of the output pipe on a high descriptor. Keeping it
+    // alive would leave the capture waiting for end of file.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 5_000);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try expectProcessGone(pids[0]);
+}
+
+/// Reads whitespace-separated PIDs. The caller owns the returned slice.
+fn readPidsForTest(alloc: Allocator, path: []const u8) ![]std.posix.pid_t {
+    const text = try readAbsoluteFile(alloc, path, 256);
+    defer alloc.free(text);
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    errdefer pids.deinit(alloc);
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (tokens.next()) |token| {
+        try pids.append(alloc, try std.fmt.parseInt(std.posix.pid_t, token, 10));
+    }
+    return pids.toOwnedSlice(alloc);
+}
+
+fn stopProcessesForTest(pids: []const std.posix.pid_t) void {
+    for (pids) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
 }
 
 test "cancellation preserves grace and removes an escaped descendant" {

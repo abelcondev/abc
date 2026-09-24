@@ -5284,6 +5284,119 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("shell keeps a detached daemon across calls and stops same-session jobs", async () => {
+    const root = createFixtureRoot("shell-detached-daemon");
+    const tracePath = join(root.root, "trace.log");
+    const daemonPidPath = join(root.workspace, "daemon.pid");
+    const jobPidPath = join(root.workspace, "job.pid");
+    const startCallId = "shell_detached_daemon_start";
+    const probeCallId = "shell_detached_daemon_probe";
+    const startCommand = [
+      `sleep 30 >/dev/null 2>&1 & printf '%s' "$!" > ${JSON.stringify(jobPidPath)}`,
+      "python3 -c 'import os,sys,time",
+      "ready_r,ready_w=os.pipe()",
+      "if os.fork() == 0:",
+      " os.close(ready_r)",
+      " os.setsid()",
+      " if os.fork() > 0: os._exit(0)",
+      " null=os.open(\"/dev/null\",os.O_RDWR)",
+      " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      ` with open(${JSON.stringify(daemonPidPath)},\"w\") as f: f.write(str(os.getpid()))`,
+      " os.write(ready_w,b\"R\"); os.close(ready_w)",
+      " time.sleep(30)",
+      " os._exit(0)",
+      "os.close(ready_w)",
+      "if os.read(ready_r,1) != b\"R\": sys.exit(1)",
+      "print(\"DAEMON-STARTED\")'",
+    ].join("\n");
+    let step = 0;
+    let daemonPid: number | null = null;
+    let jobPid: number | null = null;
+    let started: ShellResult | null = null;
+    let probed: ShellResult | null = null;
+    let daemonAliveAfterStart = false;
+    let jobAliveAfterStart = true;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(startCallId, startCommand, {
+            profile: "clean",
+            timeout_ms: 10_000,
+          });
+        case 1: {
+          try {
+            started = shellResult(body, startCallId);
+            daemonPid = Number.parseInt(readFileSync(daemonPidPath, "utf8"), 10);
+            jobPid = Number.parseInt(readFileSync(jobPidPath, "utf8"), 10);
+            daemonAliveAfterStart = isProcessAlive(daemonPid);
+            jobAliveAfterStart = isProcessAlive(jobPid);
+          } catch (error) {
+            gatewayObservationError = error;
+            return fakeGatewayFinalText("Detached daemon fixture failed.");
+          }
+          return fakeShellRun(
+            probeCallId,
+            `kill -0 ${daemonPid} && printf DAEMON-ALIVE`,
+            { profile: "clean" },
+          );
+        }
+        case 2:
+          try {
+            probed = shellResult(body, probeCallId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Detached daemon survived.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the detached daemon fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Detached daemon survived.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: expect.stringContaining("DAEMON-STARTED"),
+      });
+      expect(Number.isSafeInteger(daemonPid) && daemonPid! > 0).toBe(true);
+      expect(Number.isSafeInteger(jobPid) && jobPid! > 0).toBe(true);
+      expect(daemonAliveAfterStart).toBe(true);
+      expect(jobAliveAfterStart).toBe(false);
+      expect(probed).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_delta: "DAEMON-ALIVE",
+      });
+      expect(isProcessAlive(daemonPid!)).toBe(true);
+    } finally {
+      for (const pid of [daemonPid, jobPid]) {
+        if (pid === null || !Number.isSafeInteger(pid) || pid <= 0) continue;
+        if (!isProcessAlive(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("saved shell replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");

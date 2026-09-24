@@ -94,11 +94,126 @@ pub const DeliverySummary = struct {
     incomplete: bool = false,
 };
 
+/// Signal delivery after a command completed naturally. `kept_detached`
+/// counts the daemons the latest pass left running.
+pub const CompletionDelivery = struct {
+    delivery: DeliverySummary = .{},
+    kept_detached: usize = 0,
+};
+
+/// Kernel identity of one pipe end, comparable across processes.
+const PipeIdentity = switch (builtin.os.tag) {
+    .macos => DarwinPipeIdentity,
+    else => LinuxPipeIdentity,
+};
+
+/// Every Linux descriptor for either end of a pipe names the same pipefs
+/// inode.
+const LinuxPipeIdentity = struct {
+    inode: u64,
+
+    fn eql(self: LinuxPipeIdentity, other: LinuxPipeIdentity) bool {
+        return self.inode == other.inode;
+    }
+};
+
+/// What a captured command still owns once its root exits: the session it
+/// runs in and the pipes that carry its output back to fx. The foreground
+/// supervisor leads that session, and its stdout and stderr are those pipes.
+pub const CommandBoundary = struct {
+    session: std.posix.pid_t,
+    output_pipes: [2]?PipeIdentity,
+
+    pub const InitError = error{
+        SessionUnavailable,
+        ProcessIdentityUnavailable,
+        ProcessTreeUnsupported,
+    };
+
+    /// Describes the calling process as the supervisor of its own session.
+    pub fn ofSupervisor() InitError!CommandBoundary {
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) {
+            return error.ProcessTreeUnsupported;
+        }
+        const session = getsid(0);
+        if (session < 0) return error.SessionUnavailable;
+        return .{
+            .session = session,
+            .output_pipes = .{
+                try ownPipeIdentity(std.posix.STDOUT_FILENO),
+                try ownPipeIdentity(std.posix.STDERR_FILENO),
+            },
+        };
+    }
+
+    fn carriesOutput(self: *const CommandBoundary, identity: PipeIdentity) bool {
+        for (self.output_pipes) |candidate| {
+            const output = candidate orelse continue;
+            if (output.eql(identity)) return true;
+        }
+        return false;
+    }
+};
+
 const ProcessGroupState = union(enum) {
     found: std.posix.pid_t,
     vanished,
     unavailable,
 };
+
+const SessionState = union(enum) {
+    found: std.posix.pid_t,
+    vanished,
+    unavailable,
+};
+
+/// Whether a process still holds a descriptor for the command's output.
+const OutputHold = enum {
+    released,
+    held,
+    unknown,
+};
+
+/// How natural completion treats one live tracked process.
+const CompletionStanding = enum {
+    /// Still part of the command, so natural completion stops it.
+    attached,
+    /// A daemon by POSIX convention: it left the command's session and holds
+    /// none of its output. Natural completion leaves it running.
+    detached,
+    /// Exited or replaced, so nothing remains to stop.
+    gone,
+};
+
+/// Only a process that left the command's session and released its output
+/// counts as detached. A process whose session or descriptors cannot be
+/// inspected stays attached, preserving containment when evidence is missing.
+fn completionStanding(
+    command_session: std.posix.pid_t,
+    session: SessionState,
+    output: OutputHold,
+) CompletionStanding {
+    const process_session = switch (session) {
+        .found => |value| value,
+        .vanished => return .gone,
+        .unavailable => return .attached,
+    };
+    if (process_session == command_session) return .attached;
+    return switch (output) {
+        .released => .detached,
+        .held, .unknown => .attached,
+    };
+}
+
+fn leftCommandSession(
+    command_session: std.posix.pid_t,
+    session: SessionState,
+) bool {
+    return switch (session) {
+        .found => |value| value != command_session,
+        .vanished, .unavailable => false,
+    };
+}
 
 const SystemSignalEffects = struct {
     fn capture(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -107,6 +222,18 @@ const SystemSignalEffects = struct {
 
     fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
         return inspectProcessGroup(pid);
+    }
+
+    fn session(pid: std.posix.pid_t) SessionState {
+        return inspectSession(pid);
+    }
+
+    fn outputHold(
+        alloc: Allocator,
+        pid: std.posix.pid_t,
+        boundary: *const CommandBoundary,
+    ) OutputHold {
+        return inspectOutputHold(alloc, pid, boundary);
     }
 
     fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
@@ -357,6 +484,105 @@ pub const Tracker = struct {
             if (process.identity.eql(actual.identity) and snapshotIsAlive(actual)) return true;
         }
         return false;
+    }
+
+    /// Signals the tracked processes a naturally completed command still
+    /// owns and leaves detached daemons running. A null boundary treats
+    /// every process as attached.
+    pub fn signalAttached(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        boundary: ?*const CommandBoundary,
+    ) CompletionDelivery {
+        return self.signalAttachedWith(signal, boundary, SystemSignalEffects);
+    }
+
+    /// Reports whether any process the completed command still owns is alive.
+    pub fn anyAttachedAlive(
+        self: *Tracker,
+        boundary: ?*const CommandBoundary,
+    ) bool {
+        return self.anyAttachedAliveWith(boundary, SystemSignalEffects);
+    }
+
+    fn signalAttachedWith(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        boundary: ?*const CommandBoundary,
+        comptime Effects: type,
+    ) CompletionDelivery {
+        var result: CompletionDelivery = .{};
+        var index = self.processes.items.len;
+        while (index > 0) {
+            index -= 1;
+            self.signalIfAttachedWith(
+                self.processes.items[index],
+                signal,
+                boundary,
+                &result,
+                Effects,
+            );
+        }
+        if (self.root) |root| {
+            self.signalIfAttachedWith(root, signal, boundary, &result, Effects);
+        }
+        return result;
+    }
+
+    fn signalIfAttachedWith(
+        self: *Tracker,
+        process: TrackedProcess,
+        signal: std.posix.SIG,
+        boundary: ?*const CommandBoundary,
+        result: *CompletionDelivery,
+        comptime Effects: type,
+    ) void {
+        switch (self.completionStandingWith(process, boundary, Effects)) {
+            .attached => self.signalTrackedProcessWith(
+                process,
+                signal,
+                null,
+                &result.delivery,
+                Effects,
+            ),
+            .detached => result.kept_detached += 1,
+            .gone => {},
+        }
+    }
+
+    fn anyAttachedAliveWith(
+        self: *Tracker,
+        boundary: ?*const CommandBoundary,
+        comptime Effects: type,
+    ) bool {
+        if (self.root) |root| {
+            if (self.completionStandingWith(root, boundary, Effects) == .attached) return true;
+        }
+        for (self.processes.items) |process| {
+            if (self.completionStandingWith(process, boundary, Effects) == .attached) return true;
+        }
+        return false;
+    }
+
+    fn completionStandingWith(
+        self: *Tracker,
+        process: TrackedProcess,
+        boundary: ?*const CommandBoundary,
+        comptime Effects: type,
+    ) CompletionStanding {
+        const actual = Effects.capture(self.alloc, process.pid) catch return .gone;
+        if (!process.identity.eql(actual.identity) or !snapshotIsAlive(actual)) {
+            return .gone;
+        }
+        const command = boundary orelse return .attached;
+        const session = Effects.session(process.pid);
+        // Descriptor scans are reserved for processes that already left the
+        // command's session; everything still inside it is attached.
+        const output: OutputHold = if (leftCommandSession(command.session, session))
+            Effects.outputHold(self.alloc, process.pid, command)
+        else
+            .unknown;
+        return completionStanding(command.session, session, output);
     }
 
     fn appendDirectChildren(
@@ -619,6 +845,146 @@ fn inspectProcessGroup(pid: std.posix.pid_t) ProcessGroupState {
 
 extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
 
+fn inspectSession(pid: std.posix.pid_t) SessionState {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .unavailable;
+    }
+    const session = getsid(pid);
+    if (session >= 0) return .{ .found = session };
+    return switch (std.c.errno(session)) {
+        .SRCH => .vanished,
+        else => .unavailable,
+    };
+}
+
+extern "c" fn getsid(pid: std.posix.pid_t) std.posix.pid_t;
+
+/// Returns the identity of this process's descriptor `fd`, or null when the
+/// descriptor is not a pipe. A pipe whose identity cannot be read is an
+/// error so callers never mistake it for output that nothing holds.
+fn ownPipeIdentity(fd: std.posix.fd_t) CommandBoundary.InitError!?PipeIdentity {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io_mod.getIo()) catch return error.ProcessIdentityUnavailable;
+    if (stat.kind != .named_pipe) return null;
+    switch (builtin.os.tag) {
+        .macos => return captureDarwinPipeIdentity(std.c.getpid(), fd) catch
+            error.ProcessIdentityUnavailable,
+        .linux => {
+            var path_buffer: [32]u8 = undefined;
+            const path = std.fmt.bufPrintZ(
+                &path_buffer,
+                "/proc/self/fd/{d}",
+                .{fd},
+            ) catch return error.ProcessIdentityUnavailable;
+            const identity = readLinuxPipeLink(std.posix.AT.FDCWD, path) catch
+                return error.ProcessIdentityUnavailable;
+            return identity orelse error.ProcessIdentityUnavailable;
+        },
+        else => return error.ProcessTreeUnsupported,
+    }
+}
+
+fn inspectOutputHold(
+    alloc: Allocator,
+    pid: std.posix.pid_t,
+    boundary: *const CommandBoundary,
+) OutputHold {
+    const held = switch (builtin.os.tag) {
+        .macos => darwinProcessHoldsOutput(alloc, pid, boundary),
+        .linux => linuxProcessHoldsOutput(alloc, pid, boundary),
+        else => return .unknown,
+    } catch return .unknown;
+    return if (held) .held else .released;
+}
+
+fn darwinProcessHoldsOutput(
+    alloc: Allocator,
+    pid: std.posix.pid_t,
+    boundary: *const CommandBoundary,
+) !bool {
+    if (comptime builtin.os.tag != .macos) return error.ProcessTreeUnsupported;
+    const entry_size = @sizeOf(Darwin.ProcFdInfo);
+    const reported = Darwin.proc_pidinfo(pid, Darwin.proc_pid_list_fds, 0, null, 0);
+    if (reported <= 0) return error.ProcessNotFound;
+    // Leave room for descriptors opened between the size query and the list.
+    const capacity = @as(usize, @intCast(reported)) / entry_size + 64;
+    const entries = try alloc.alloc(Darwin.ProcFdInfo, capacity);
+    defer alloc.free(entries);
+    const buffer_size = std.math.cast(c_int, capacity * entry_size) orelse
+        return error.ProcessIdentityUnavailable;
+    const written = Darwin.proc_pidinfo(
+        pid,
+        Darwin.proc_pid_list_fds,
+        0,
+        entries.ptr,
+        buffer_size,
+    );
+    if (written <= 0) return error.ProcessNotFound;
+    const count = @as(usize, @intCast(written)) / entry_size;
+    // A full buffer may be truncated, so it cannot prove the output was released.
+    if (count >= capacity) return error.ProcessIdentityUnavailable;
+    for (entries[0..count]) |entry| {
+        if (entry.proc_fdtype != Darwin.prox_fdtype_pipe) continue;
+        const identity = captureDarwinPipeIdentity(pid, entry.proc_fd) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => |other| return other,
+        };
+        if (boundary.carriesOutput(identity)) return true;
+    }
+    return false;
+}
+
+fn linuxProcessHoldsOutput(
+    alloc: Allocator,
+    pid: std.posix.pid_t,
+    boundary: *const CommandBoundary,
+) !bool {
+    if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
+    const path = try std.fmt.allocPrint(alloc, "/proc/{d}/fd", .{pid});
+    defer alloc.free(path);
+    var fd_dir = (try openLinuxProcDir(path)) orelse return error.ProcessNotFound;
+    defer fd_dir.close(io_mod.getIo());
+    var entries = fd_dir.iterate();
+    while (try entries.next(io_mod.getIo())) |entry| {
+        _ = std.fmt.parseUnsigned(u32, entry.name, 10) catch continue;
+        var name_buffer: [16]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buffer, "{s}", .{entry.name}) catch continue;
+        const identity = (readLinuxPipeLink(fd_dir.handle, name) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => |other| return other,
+        }) orelse continue;
+        if (boundary.carriesOutput(identity)) return true;
+    }
+    return false;
+}
+
+/// Reads one `/proc` descriptor link. Returns null for descriptors that are
+/// not pipes and `error.ProcessNotFound` when the descriptor is gone.
+fn readLinuxPipeLink(
+    dir_fd: std.posix.fd_t,
+    path: [*:0]const u8,
+) error{ ProcessNotFound, ProcessIdentityUnavailable }!?LinuxPipeIdentity {
+    var buffer: [64]u8 = undefined;
+    while (true) {
+        const read_len = std.c.readlinkat(dir_fd, path, &buffer, buffer.len);
+        switch (std.posix.errno(read_len)) {
+            .SUCCESS => return parseLinuxPipeLink(buffer[0..@intCast(read_len)]),
+            .INTR => continue,
+            .NOENT, .SRCH => return error.ProcessNotFound,
+            else => return error.ProcessIdentityUnavailable,
+        }
+    }
+}
+
+fn parseLinuxPipeLink(link: []const u8) ?LinuxPipeIdentity {
+    const prefix = "pipe:[";
+    if (!std.mem.startsWith(u8, link, prefix)) return null;
+    if (link.len <= prefix.len + 1 or link[link.len - 1] != ']') return null;
+    const inode = std.fmt.parseUnsigned(u64, link[prefix.len .. link.len - 1], 10) catch
+        return null;
+    return .{ .inode = inode };
+}
+
 fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
     if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
     while (true) {
@@ -814,6 +1180,225 @@ test "checked signal delivery keeps vanished stale and excluded targets complete
     try std.testing.expect(!summary.incomplete);
 }
 
+test "natural completion detaches only processes that left the session and its output" {
+    const command_session: std.posix.pid_t = 500;
+    const outside: SessionState = .{ .found = 700 };
+    const inside: SessionState = .{ .found = command_session };
+    for ([_]OutputHold{ .released, .held, .unknown }) |output| {
+        try std.testing.expectEqual(
+            CompletionStanding.attached,
+            completionStanding(command_session, inside, output),
+        );
+        try std.testing.expectEqual(
+            CompletionStanding.attached,
+            completionStanding(command_session, .unavailable, output),
+        );
+        try std.testing.expectEqual(
+            CompletionStanding.gone,
+            completionStanding(command_session, .vanished, output),
+        );
+    }
+    try std.testing.expectEqual(
+        CompletionStanding.detached,
+        completionStanding(command_session, outside, .released),
+    );
+    try std.testing.expectEqual(
+        CompletionStanding.attached,
+        completionStanding(command_session, outside, .held),
+    );
+    try std.testing.expectEqual(
+        CompletionStanding.attached,
+        completionStanding(command_session, outside, .unknown),
+    );
+    try std.testing.expect(leftCommandSession(command_session, outside));
+    try std.testing.expect(!leftCommandSession(command_session, inside));
+    try std.testing.expect(!leftCommandSession(command_session, .unavailable));
+    try std.testing.expect(!leftCommandSession(command_session, .vanished));
+}
+
+test "Linux pipe links parse only pipefs identities" {
+    try std.testing.expectEqual(
+        @as(?u64, 12345),
+        if (parseLinuxPipeLink("pipe:[12345]")) |identity| identity.inode else null,
+    );
+    for ([_][]const u8{
+        "pipe:[]",
+        "pipe:[12a]",
+        "pipe:[12",
+        "socket:[12]",
+        "/dev/null",
+        "anon_inode:[eventpoll]",
+        "",
+    }) |link| {
+        try std.testing.expect(parseLinuxPipeLink(link) == null);
+    }
+}
+
+test "natural completion stops attached processes and keeps detached daemons" {
+    const FakeEffects = struct {
+        var sent: [16]std.posix.pid_t = undefined;
+        var sent_count: usize = 0;
+        var scanned: [16]std.posix.pid_t = undefined;
+        var scanned_count: usize = 0;
+
+        fn reset() void {
+            sent_count = 0;
+            scanned_count = 0;
+        }
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return switch (pid) {
+                35 => .{ .identity = .{ .linux_start_ticks = 999 }, .parent_pid = 1 },
+                36 => .{
+                    .identity = .{ .linux_start_ticks = 36 },
+                    .parent_pid = 1,
+                    .zombie = true,
+                },
+                else => .{
+                    .identity = .{ .linux_start_ticks = @intCast(pid) },
+                    .parent_pid = 1,
+                },
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = pid };
+        }
+
+        fn session(pid: std.posix.pid_t) SessionState {
+            return switch (pid) {
+                30 => .{ .found = 500 },
+                34 => .vanished,
+                37 => .unavailable,
+                else => .{ .found = pid },
+            };
+        }
+
+        fn outputHold(
+            _: Allocator,
+            pid: std.posix.pid_t,
+            _: *const CommandBoundary,
+        ) OutputHold {
+            scanned[scanned_count] = pid;
+            scanned_count += 1;
+            return switch (pid) {
+                31 => .released,
+                32 => .held,
+                else => .unknown,
+            };
+        }
+
+        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            sent[sent_count] = pid;
+            sent_count += 1;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (30..38) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+    const boundary = CommandBoundary{
+        .session = 500,
+        .output_pipes = .{ null, null },
+    };
+
+    FakeEffects.reset();
+    const completed = tracker.signalAttachedWith(
+        std.posix.SIG.KILL,
+        &boundary,
+        FakeEffects,
+    );
+    try std.testing.expectEqualSlices(
+        std.posix.pid_t,
+        &.{ 37, 33, 32, 30 },
+        FakeEffects.sent[0..FakeEffects.sent_count],
+    );
+    try std.testing.expectEqual(@as(usize, 4), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 1), completed.kept_detached);
+    try std.testing.expectEqualSlices(
+        std.posix.pid_t,
+        &.{ 33, 32, 31 },
+        FakeEffects.scanned[0..FakeEffects.scanned_count],
+    );
+    try std.testing.expect(tracker.anyAttachedAliveWith(&boundary, FakeEffects));
+
+    FakeEffects.reset();
+    const unbounded = tracker.signalAttachedWith(
+        std.posix.SIG.KILL,
+        null,
+        FakeEffects,
+    );
+    try std.testing.expectEqualSlices(
+        std.posix.pid_t,
+        &.{ 37, 34, 33, 32, 31, 30 },
+        FakeEffects.sent[0..FakeEffects.sent_count],
+    );
+    try std.testing.expectEqual(@as(usize, 0), unbounded.kept_detached);
+    try std.testing.expectEqual(@as(usize, 0), FakeEffects.scanned_count);
+
+    var daemon_only = Tracker{ .alloc = std.testing.allocator };
+    defer daemon_only.deinit();
+    try daemon_only.processes.append(std.testing.allocator, .{
+        .pid = 31,
+        .identity = .{ .linux_start_ticks = 31 },
+    });
+    try std.testing.expect(!daemon_only.anyAttachedAliveWith(&boundary, FakeEffects));
+    try std.testing.expect(daemon_only.anyAttachedAliveWith(null, FakeEffects));
+}
+
+test "output hold detects a child that inherited the command output pipe" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var fds: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.pipe(&fds))) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    try setCloseOnExec(fds[0]);
+    try setCloseOnExec(fds[1]);
+
+    const output = (try ownPipeIdentity(fds[1])) orelse return error.TestUnexpectedResult;
+    const boundary = CommandBoundary{
+        .session = getsid(0),
+        .output_pipes = .{ null, output },
+    };
+    var null_file = try std.Io.Dir.cwd().openFile(io, "/dev/null", .{});
+    defer null_file.close(io);
+    try std.testing.expect((try ownPipeIdentity(null_file.handle)) == null);
+
+    var holder = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "5" },
+        .stdin = .ignore,
+        .stdout = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } },
+        .stderr = .ignore,
+    });
+    defer holder.kill(io);
+    var releaser = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "5" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer releaser.kill(io);
+
+    try std.testing.expectEqual(
+        OutputHold.held,
+        inspectOutputHold(std.testing.allocator, holder.id.?, &boundary),
+    );
+    try std.testing.expectEqual(
+        OutputHold.released,
+        inspectOutputHold(std.testing.allocator, releaser.id.?, &boundary),
+    );
+}
+
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => try captureLinuxSnapshot(alloc, pid),
@@ -928,8 +1513,15 @@ const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
+    const proc_pid_list_fds: c_int = 1;
     const proc_pid_fd_pipe_info: c_int = 6;
+    const prox_fdtype_pipe: u32 = 6;
     const process_status_zombie: u32 = 5;
+
+    const ProcFdInfo = extern struct {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    };
 
     const ProcFileInfo = extern struct {
         fi_openflags: u32,
@@ -1026,7 +1618,7 @@ const Darwin = struct {
         pid: c_int,
         flavor: c_int,
         arg: u64,
-        buffer: *anyopaque,
+        buffer: ?*anyopaque,
         buffersize: c_int,
     ) c_int;
 
