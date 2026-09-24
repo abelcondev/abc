@@ -98,8 +98,8 @@ test "restored steering survives execution memory round trips" {
     try std.testing.expectEqual(@as(usize, 0), rebuilt.steering[0].after_tool_step_count);
     try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", rebuilt.steering[1].text);
     try std.testing.expectEqual(@as(usize, 1), rebuilt.steering[1].after_tool_step_count);
-    try std.testing.expect(messages.items[0].context_origin == .ordinary);
-    try std.testing.expect(messages.items[3].context_origin == .ordinary);
+    try std.testing.expect(messages.items[0].context_origin == .user_turn);
+    try std.testing.expect(messages.items[3].context_origin == .user_turn);
 
     const offset = try retainedMessageOffset(messages.items, .{ .tool_steps = 1, .steering = 1 });
     const retained = try buildExecutionMemory(alloc, messages.items[offset..]);

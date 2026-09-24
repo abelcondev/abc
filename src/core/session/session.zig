@@ -3200,7 +3200,7 @@ pub fn appendExecutionMemoryChatMessages(
                     try messages.append(alloc, .{ .role = .assistant, .content = prefix });
                 }
             }
-            try messages.append(alloc, .{ .role = .user, .content = steering.text, .restored_steering = true });
+            try messages.append(alloc, restoredSteeringChatMessage(steering.text));
             steering_index += 1;
         }
         if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
@@ -3243,8 +3243,20 @@ pub fn appendExecutionMemoryChatMessages(
                 try messages.append(alloc, .{ .role = .assistant, .content = prefix });
             }
         }
-        try messages.append(alloc, .{ .role = .user, .content = steering.text, .restored_steering = true });
+        try messages.append(alloc, restoredSteeringChatMessage(steering.text));
     }
+}
+
+/// Steering comes from whoever drives this session, so compaction keeps it as
+/// user text rather than a generated notice. Empty entries only mark a
+/// checkpoint boundary. Borrows `text`.
+fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    return .{
+        .role = .user,
+        .content = text,
+        .restored_steering = true,
+        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+    };
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
