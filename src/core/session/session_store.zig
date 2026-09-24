@@ -1326,6 +1326,17 @@ pub const Store = struct {
         return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
     }
 
+    /// Listing variant of `loadSubagentChildIdentity` for a session discovery
+    /// classified as legacy: reads its first event only within a small fixed
+    /// bound, so listing never scans a log.
+    pub fn loadListedLegacyChildIdentity(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        return self.canonical_root.loadListedLegacyChildIdentity(alloc, session_id);
+    }
+
     /// Reads one bounded chronological history page without acquiring the
     /// session writer lock. The cursor is opaque and anchored to the history
     /// length that produced it, so later appends cannot duplicate older pages.
@@ -5010,6 +5021,9 @@ pub const SchemaV3Fixture = struct {
     /// Records the child identity only in the first event, as a crash before
     /// the owner marker is written leaves it.
     subagent_child: bool = false,
+    /// JSON whitespace added inside the first event, lengthening its line
+    /// without changing what it decodes to.
+    first_event_padding: usize = 0,
 };
 
 /// Test-only: writes the schema-v3 session `fixture` describes.
@@ -5025,7 +5039,7 @@ pub fn writeSchemaV3Fixture(
     defer dir.close();
     try dir.dir.setPermissions(io_mod.getIo(), .fromMode(0o700));
     const preferences = session_codec.DurableSessionPreferences{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
-    const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = schema_v3_test_generation,
         .seq = 1,
         .event_id = @splat(2),
@@ -5039,6 +5053,16 @@ pub fn writeSchemaV3Fixture(
             .preferences = preferences,
             .subagent_child = fixture.subagent_child,
         } },
+    });
+    defer alloc.free(started);
+    const padding = try alloc.alloc(u8, fixture.first_event_padding);
+    defer alloc.free(padding);
+    @memset(padding, ' ');
+    // The frame ends in "}\n"; the padding goes before the closing brace.
+    const first = try std.mem.concat(alloc, u8, &.{
+        started[0 .. started.len - 2],
+        padding,
+        started[started.len - 2 ..],
     });
     defer alloc.free(first);
     const moves = !std.mem.eql(u8, fixture.projected_workspace, fixture.workspace);
@@ -7757,6 +7781,37 @@ test "a legacy child identified only by its first event stays out of listing and
         defer alloc.free(after);
         try std.testing.expectEqualStrings(before, after);
     }
+}
+
+test "a legacy first event past the listing bound stays listed but uncached" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
+    // Listing reads a first event only within a fixed bound, so it never
+    // scans a large log for a newline.
+    try writeSchemaV3Fixture(alloc, ctx.store, "child", .{
+        .projected_workspace = ctx.workspace,
+        .workspace = ctx.workspace,
+        .updated_at_ms = 1000,
+        .stale_projection = false,
+        .subagent_child = true,
+        .first_event_padding = 32 * 1024,
+    });
+
+    var writer = (try catalog_cache.Writer.init(ctx.store)).?;
+    defer writer.deinit();
+    var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.contains("parent"));
+    try std.testing.expect(!saved.contains("child"));
+    // The exact check reads the whole first event and still finds the child.
+    try std.testing.expect(try subagent_child_state.isManagedChildSession(ctx.store, alloc, "child"));
 }
 
 test "a stale schema-v3 projection lists and resumes from its committed log" {

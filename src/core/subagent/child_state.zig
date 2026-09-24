@@ -514,8 +514,9 @@ pub fn isManagedChildSession(
 
 /// Listing check: reuses discovery's validated identity and every child
 /// marker. A legacy session without a metadata-level bit falls back to its
-/// first event, one bounded line read; the session index caches the answer
-/// under the session's fingerprint, so it is paid once per change.
+/// first event, read only within a fixed 16 KiB bound; the session index
+/// caches the answer under the session's fingerprint, so it is paid once per
+/// change. A first event past the bound is unverifiable: listed, not cached.
 pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
@@ -532,7 +533,7 @@ pub fn isDiscoveredManagedChildSession(
         if (try capabilityHasManagedChildMarker(alloc, value)) return true;
     }
     if (subagent_child) |identity| return identity;
-    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
+    return sessions.loadListedLegacyChildIdentity(alloc, session_id) catch |err| switch (err) {
         // A session without an event log has no first event to record it.
         error.SessionNotFound, error.FileNotFound => false,
         else => return err,

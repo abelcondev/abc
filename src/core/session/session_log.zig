@@ -25,6 +25,9 @@ const Identifier = session_event.Identifier;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const lock_deadline_ms: u64 = 2000;
+/// Real first events stay under 2 KiB; this leaves room for two maximum-length
+/// workspace paths while keeping listing reads independent of log size.
+const listed_first_event_max_bytes: usize = 16 * 1024;
 const events_file = "events.jsonl";
 const authority_file = "authority.json";
 const authority_intent_file = "authority.pending.json";
@@ -4228,6 +4231,31 @@ pub const Root = struct {
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         defer log_file.close(io_mod.getIo());
         return session_replay.readSubagentChildIdentity(alloc, log_file);
+    }
+
+    /// Listing variant for a session discovery classified as legacy, whose
+    /// metadata carries no child bit. It reads the first event only within
+    /// `listed_first_event_max_bytes`, so listing never scans a log; a longer
+    /// first line fails with `error.TruncatedEventFrame`.
+    pub fn loadListedLegacyChildIdentity(
+        self: *const Root,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        var sessions = self.sessions orelse return error.SessionNotFound;
+        try session_layout.validateSessionId(session_id);
+        var session_dir = openSessionDir(
+            &sessions,
+            session_id,
+            .read_only,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer session_dir.close();
+        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
+        defer log_file.close(io_mod.getIo());
+        return session_replay.readSubagentChildIdentityWithin(alloc, log_file, listed_first_event_max_bytes);
     }
 
     fn openWritableSessionDir(
