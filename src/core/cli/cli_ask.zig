@@ -3594,8 +3594,16 @@ fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runti
     if (request.server) |server_name| {
         mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
             error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
-            error.Cancelled, error.OutOfMemory => return err,
-            else => if (!mcp.hasStartupFailure(server_name)) return err, // Search reports the recorded reason.
+            error.Cancelled, error.OutOfMemory, error.McpAccessDenied, error.McpAuthorityChanged => return err,
+            else => {
+                if (!mcp.hasRecordedFailure(server_name)) return err;
+                // Search reports the recorded reason instead of the error name.
+                debug_trace.logf(
+                    "mcp",
+                    "deferred ask connection failed server={s} err={s}; search reports the recorded failure",
+                    .{ server_name, @errorName(err) },
+                );
+            },
         };
     } else {
         try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());

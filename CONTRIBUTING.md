@@ -318,8 +318,8 @@ line. A startup restart runs only when it could change the outcome: a server
 that closed its connection at every offered protocol version is not
 restarted, and neither is one whose startup deadline has already passed. A
 server that fx stopped because of invalid output still gets its restart. The
-model sees the same reason when it searches for a server that failed to start
-or calls a tool whose stopped server could not be restarted.
+model sees the same reason when it searches a named server that is down, or
+when a tool call finds its server stopped and the relaunch fails.
 
 MongoDB Atlas Managed MCP configuration service accounts use the OAuth
 client-credentials grant. fx does not implement that grant directly. Use

@@ -2491,7 +2491,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     const searchResult = activeGateway.requests[1]?.body ?? "";
     expect(searchResult).toContain("server_failed");
     expect(searchResult).toContain(
-      "MCP server 'fixture' failed to start: MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
+      "MCP server 'fixture' is unavailable: MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
     );
     await expectProcessesExited(readAttemptedPids(root.launchLogPath));
   }, 30_000);

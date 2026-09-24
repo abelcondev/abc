@@ -48,13 +48,10 @@ pub fn search(
     )) |output| {
         return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
     }
-    if (try renderStartupFailure(
-        alloc,
-        server_handles,
-        operation_access,
-        request.server orelse request.query.raw,
-    )) |output| {
-        return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+    if (request.server) |name| {
+        if (try renderServerFailure(alloc, server_handles, operation_access, name)) |output| {
+            return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+        }
     }
     var candidate_capacity: usize = 0;
     var server_configured = request.server == null;
@@ -467,25 +464,25 @@ pub fn renderAuthenticationRequired(
     return null;
 }
 
-/// Tells the model why a server named by the search failed to start, so it
-/// can report the cause instead of an empty result.
-fn renderStartupFailure(
+/// Tells the model why the server a search names is down, so it can report
+/// the cause instead of an empty result.
+pub fn renderServerFailure(
     alloc: Allocator,
     servers: []const *McpServer,
     access: *const OperationAccessGuard,
-    query: []const u8,
+    name: []const u8,
 ) !?[]u8 {
     for (servers) |server| {
+        if (!std.mem.eql(u8, server.config.name, name)) continue;
         if (!server.isPublished()) continue;
         if (!access.allows(.{ .tool_server = server.config.name })) continue;
-        if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
         server.status_lock.lockUncancelable(io_mod.getIo());
         defer server.status_lock.unlock(io_mod.getIo());
         if (server.state.load(.acquire) != .failed) continue;
         const failure = server.last_error orelse continue;
         const message = try std.fmt.allocPrint(
             alloc,
-            "MCP server '{s}' failed to start: {s}",
+            "MCP server '{s}' is unavailable: {s}",
             .{ server.config.name, failure },
         );
         defer alloc.free(message);
@@ -501,7 +498,7 @@ fn renderStartupFailure(
     return null;
 }
 
-test "MCP search names why a matching server failed to start" {
+test "MCP search names why the server it names is down" {
     const alloc = std.testing.allocator;
     var servers = [_]McpServer{.{
         .config = .{ .name = "devtools" },
@@ -513,20 +510,18 @@ test "MCP search names why a matching server failed to start" {
     const handles = [_]*McpServer{&servers[0]};
 
     // Without a recorded reason the ordinary search runs.
-    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtools"));
+    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
 
     servers[0].setFailed(alloc, "MCP server exited with code 1 before completing startup: npm error code E401");
-    const output = (try renderStartupFailure(alloc, &handles, &access, "devtools")).?;
+    const output = (try renderServerFailure(alloc, &handles, &access, "devtools")).?;
     defer alloc.free(output);
     try std.testing.expectEqualStrings(
         "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\"," ++
-            "\"error\":\"MCP server 'devtools' failed to start: MCP server exited with code 1 before completing startup: npm error code E401\"}",
+            "\"error\":\"MCP server 'devtools' is unavailable: MCP server exited with code 1 before completing startup: npm error code E401\"}",
         output,
     );
-    const in_query = (try renderStartupFailure(alloc, &handles, &access, "take a screenshot with devtools")).?;
-    alloc.free(in_query);
-    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtoolsx"));
+    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtoolsx"));
 
     servers[0].state.store(.ready, .release);
-    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtools"));
+    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
 }

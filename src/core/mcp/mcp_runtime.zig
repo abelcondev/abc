@@ -1145,9 +1145,9 @@ pub const McpRuntime = struct {
         return .{ .servers = servers };
     }
 
-    /// True when the named server is down with a recorded startup failure,
-    /// which a tool search reports to the model.
-    pub fn hasStartupFailure(self: *McpRuntime, name: []const u8) bool {
+    /// True when the named server is down with a recorded failure, which a
+    /// tool search naming it reports to the model.
+    pub fn hasRecordedFailure(self: *McpRuntime, name: []const u8) bool {
         const server = self.acquireServer(name) orelse return false;
         defer server.lifetime.release(io_mod.getIo());
         server.status_lock.lockUncancelable(io_mod.getIo());
@@ -8074,6 +8074,13 @@ test "scoped MCP authentication rendering excludes denied servers" {
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "DENIED_SECRET_ENV") != null);
+
+    // A scoped caller cannot learn why a denied server is down either.
+    runtime.servers.items[1].setFailed(alloc, "MCP server exited with code 1 before completing startup");
+    try std.testing.expect(try renderServerFailure(alloc, runtime.servers.items, &scoped, "denied") == null);
+    const failure = (try renderServerFailure(alloc, runtime.servers.items, &root, "denied")).?;
+    defer alloc.free(failure);
+    try std.testing.expect(std.mem.find(u8, failure, "exited with code 1 before completing startup") != null);
 }
 
 test "MCP server instructions are captured from initialize and exposed only when present" {
@@ -8530,6 +8537,7 @@ test "configuration reload cleans up every allocation failure without opening a 
 
 const boundedEncodedScalar = tool_search.boundedEncodedScalar;
 const renderAuthenticationRequired = tool_search.renderAuthenticationRequired;
+const renderServerFailure = tool_search.renderServerFailure;
 
 const digestResources = feature_catalog_runtime.digestResources;
 
