@@ -307,6 +307,14 @@ server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
 without `--cidfile` receive a private cidfile so fx can remove the container
 after shutdown or startup failure. An explicit cidfile remains user-owned.
 
+When a stdio server exits before completing startup, its reported failure names
+the exit code or signal and includes a bounded, terminal-safe excerpt of the
+server's stderr with secrets masked. A startup timeout names the budget and the
+`startup_timeout_ms` key, plus an earlier launch's exit when there was one. A
+startup restart runs only when it could change the outcome: a server that
+exited at every offered protocol version is not restarted, and neither is one
+whose startup deadline has already passed.
+
 MongoDB Atlas Managed MCP configuration service accounts use the OAuth
 client-credentials grant. fx does not implement that grant directly. Use
 MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited

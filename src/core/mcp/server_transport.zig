@@ -738,9 +738,19 @@ fn connectServerLegacy(
         server.config.startup_timeout_ms,
     );
     var offered_version = initial_version;
+    var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
+        rememberChildExit(server, &last_exit);
         server.disconnectForced();
-        try connection_control.check(io_mod.getIo(), attempt_control);
+        connection_control.check(io_mod.getIo(), attempt_control) catch |err| {
+            // The deadline passed between launches; keep the exit that used it up.
+            if (err == error.McpRequestTimedOut) publishStartupFailure(alloc, server, .{ .timed_out = .{
+                .budget_ms = server.config.startup_timeout_ms,
+                .earlier_exit = if (last_exit) |*exit| exit else null,
+                .live = null,
+            } });
+            return err;
+        };
         try spawnStdioServer(alloc, server, argv);
         server.stdio_protocol = .legacy;
 
@@ -778,11 +788,25 @@ fn connectServerLegacy(
                 },
                 .accept => unreachable,
                 .fail => {
+                    rememberChildExit(server, &last_exit);
                     server.state.store(.failed, .release);
+                    publishStartupFailure(alloc, server, .{
+                        .closed = if (last_exit) |*exit| exit else null,
+                    });
                     return error.McpInitFailed;
                 },
             },
-            error.Cancelled, error.McpRequestTimedOut => {
+            error.McpRequestTimedOut => {
+                server.state.store(.failed, .release);
+                const live = dispatcher.childDiagnostics();
+                publishStartupFailure(alloc, server, .{ .timed_out = .{
+                    .budget_ms = server.config.startup_timeout_ms,
+                    .earlier_exit = if (last_exit) |*exit| exit else null,
+                    .live = &live,
+                } });
+                return err;
+            },
+            error.Cancelled => {
                 server.state.store(.failed, .release);
                 return err;
             },
@@ -873,7 +897,7 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = if (builtin.os.tag == .windows) .ignore else .pipe,
         .environ_map = if (server.env_map != null) &server.env_map.? else null,
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
@@ -1038,8 +1062,35 @@ fn connectServerBounded(
                 server.disconnectImmediate();
                 return err;
             }
+            const diagnostics: ?stdio_dispatcher.ChildDiagnostics =
+                if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
+            if (err == error.McpRequestTimedOut) {
+                publishStartupFailure(alloc, server, .{ .timed_out = .{
+                    .budget_ms = server.config.startup_timeout_ms,
+                    .earlier_exit = null,
+                    .live = if (diagnostics) |*live| live else null,
+                } });
+            }
             server.disconnect();
-            if (server.restart_attempts >= server.config.restart_limit) return err;
+            const decision = decideStartupRestart(.{
+                .attempts = server.restart_attempts,
+                .limit = server.config.restart_limit,
+                .deadline_spent = startupDeadlineSpent(control),
+                .child_exited = err == error.McpInitFailed and
+                    diagnostics != null and diagnostics.?.term != null,
+            });
+            switch (decision) {
+                .restart => {},
+                .stop_limit => return err,
+                .stop_deadline_spent, .stop_child_exited => {
+                    debug_trace.logf(
+                        "mcp",
+                        "skipping stdio startup restart server={s} reason={s} err={s}",
+                        .{ server.config.name, @tagName(decision), @errorName(err) },
+                    );
+                    return err;
+                },
+            }
             server.restart_attempts += 1;
             debug_trace.logf(
                 "mcp",
@@ -1050,6 +1101,299 @@ fn connectServerBounded(
         };
         return;
     }
+}
+
+fn rememberChildExit(server: *McpServer, last_exit: *?stdio_dispatcher.ChildDiagnostics) void {
+    const dispatcher = server.dispatcher orelse return;
+    const diagnostics = dispatcher.childDiagnostics();
+    if (diagnostics.term != null) last_exit.* = diagnostics;
+}
+
+fn startupDeadlineSpent(control: ConnectionControl) bool {
+    connection_control.check(io_mod.getIo(), control) catch |err| return err == error.McpRequestTimedOut;
+    return false;
+}
+
+const StartupRestartInput = struct {
+    attempts: u8,
+    limit: u8,
+    deadline_spent: bool,
+    /// Startup failed because the child process exited, after the version
+    /// ladder had already relaunched it at every offered version.
+    child_exited: bool,
+};
+
+const StartupRestartDecision = enum {
+    restart,
+    stop_limit,
+    stop_deadline_spent,
+    stop_child_exited,
+};
+
+/// Restart only when a new launch has budget and could behave differently:
+/// the shared deadline cannot be extended, and a child that exited at every
+/// offered protocol version has already been relaunched by the ladder.
+fn decideStartupRestart(input: StartupRestartInput) StartupRestartDecision {
+    if (input.attempts >= input.limit) return .stop_limit;
+    if (input.deadline_spent) return .stop_deadline_spent;
+    if (input.child_exited) return .stop_child_exited;
+    return .restart;
+}
+
+const StartupFailure = union(enum) {
+    /// The server closed its connection at every offered protocol version.
+    closed: ?*const stdio_dispatcher.ChildDiagnostics,
+    timed_out: struct {
+        budget_ms: u32,
+        /// An earlier launch in this startup that exited.
+        earlier_exit: ?*const stdio_dispatcher.ChildDiagnostics,
+        /// The launch that was still running at the deadline.
+        live: ?*const stdio_dispatcher.ChildDiagnostics,
+    },
+};
+
+/// Publishes a startup failure description unless a more specific one is set.
+fn publishStartupFailure(alloc: Allocator, server: *McpServer, failure: StartupFailure) void {
+    if (server.last_error != null) return;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const message = formatStartupFailure(arena_state.allocator(), failure) catch |err| {
+        debug_trace.logf(
+            "mcp",
+            "startup failure message unavailable server={s} err={s}",
+            .{ server.config.name, @errorName(err) },
+        );
+        return;
+    };
+    server.setFailed(alloc, message);
+}
+
+const stderr_display_bytes: usize = 400;
+
+fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    switch (failure) {
+        .closed => |diagnostics| {
+            try writer.writeAll("MCP server ");
+            try writeTermPhrase(writer, if (diagnostics) |value| value.term else null);
+            try writer.writeAll(" before completing startup");
+            if (diagnostics) |value| try writeStderrSuffix(arena, writer, &value.stderr);
+        },
+        .timed_out => |timeout| {
+            try writer.print(
+                "MCP server did not complete startup within {d} ms (startup_timeout_ms)",
+                .{timeout.budget_ms},
+            );
+            if (timeout.earlier_exit) |value| {
+                try writer.writeAll("; an earlier launch ");
+                try writeTermPhrase(writer, value.term);
+                try writeStderrSuffix(arena, writer, &value.stderr);
+            } else if (timeout.live) |value| {
+                if (value.stderr.head_len > 0) {
+                    try writer.writeAll("; last stderr");
+                    try writeStderrSuffix(arena, writer, &value.stderr);
+                }
+            }
+        },
+    }
+    return try out.toOwnedSlice();
+}
+
+fn writeTermPhrase(writer: *std.Io.Writer, term: ?std.process.Child.Term) !void {
+    const value = term orelse return writer.writeAll("closed its connection");
+    switch (value) {
+        .exited => |code| try writer.print("exited with code {d}", .{code}),
+        .signal => |signal| try writer.print("was killed by signal {d}", .{@intFromEnum(signal)}),
+        .stopped => |signal| try writer.print("was stopped by signal {d}", .{@intFromEnum(signal)}),
+        .unknown => |status| try writer.print("ended with status {d}", .{status}),
+    }
+}
+
+fn writeStderrSuffix(
+    arena: Allocator,
+    writer: *std.Io.Writer,
+    capture: *const stdio_dispatcher.StderrCapture,
+) !void {
+    const text = try displayStderr(arena, capture);
+    if (text.len == 0) return;
+    try writer.writeAll(": ");
+    try writer.writeAll(text);
+}
+
+/// Server stderr is untrusted. Produces one terminal-safe line: escape
+/// sequences removed, control bytes collapsed to single spaces, invalid UTF-8
+/// replaced, secrets masked, and the result bounded head-and-tail.
+fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCapture) ![]const u8 {
+    var cleaned: std.ArrayList(u8) = .empty;
+    if (capture.omitted) {
+        try appendTerminalSafe(arena, &cleaned, capture.headSlice());
+        try cleaned.appendSlice(arena, " ... ");
+        try appendTerminalSafe(arena, &cleaned, capture.tailSlice());
+    } else {
+        const contiguous = try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() });
+        try appendTerminalSafe(arena, &cleaned, contiguous);
+    }
+    const masked = try text_utils.maskSecrets(arena, std.mem.trim(u8, cleaned.items, " "));
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try text_utils.writeHeadTailBounded(&out.writer, masked, stderr_display_bytes, " ... ", .down);
+    return try out.toOwnedSlice();
+}
+
+fn appendTerminalSafe(arena: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
+    var index: usize = 0;
+    // A segment cut from a longer stream can begin inside a UTF-8 sequence.
+    while (index < raw.len and (raw[index] & 0xc0) == 0x80) index += 1;
+    var pending_space = false;
+    while (index < raw.len) {
+        const byte = raw[index];
+        if (byte == 0x1b) {
+            index = skipEscapeSequence(raw, index);
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f) {
+            pending_space = true;
+            index += 1;
+            continue;
+        }
+        if (pending_space and byte != ' ' and out.items.len > 0 and out.items[out.items.len - 1] != ' ') {
+            try out.append(arena, ' ');
+        }
+        pending_space = false;
+        const sequence_len: usize = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        if (sequence_len > 0 and index + sequence_len <= raw.len and
+            std.unicode.utf8ValidateSlice(raw[index..][0..sequence_len]))
+        {
+            try out.appendSlice(arena, raw[index..][0..sequence_len]);
+            index += sequence_len;
+        } else {
+            try out.append(arena, '?');
+            index += 1;
+        }
+    }
+}
+
+/// Returns the index just past the ANSI escape sequence at `escape_index`.
+fn skipEscapeSequence(raw: []const u8, escape_index: usize) usize {
+    var index = escape_index + 1;
+    if (index >= raw.len) return index;
+    switch (raw[index]) {
+        '[' => {
+            index += 1;
+            while (index < raw.len and !(raw[index] >= 0x40 and raw[index] <= 0x7e)) index += 1;
+            return @min(index + 1, raw.len);
+        },
+        ']' => {
+            index += 1;
+            while (index < raw.len and raw[index] != 0x07 and raw[index] != 0x1b) index += 1;
+            if (index < raw.len and raw[index] == 0x07) return index + 1;
+            if (index + 1 < raw.len and raw[index] == 0x1b and raw[index + 1] == '\\') return index + 2;
+            return index;
+        },
+        else => return index + 1,
+    }
+}
+
+test "startup restart runs only with budget left and a failure a relaunch could change" {
+    for ([_]bool{ false, true }) |deadline_spent| {
+        for ([_]bool{ false, true }) |child_exited| {
+            for ([_]u8{ 0, 1, 2 }) |attempts| {
+                for ([_]u8{ 0, 1, 2 }) |limit| {
+                    const decision = decideStartupRestart(.{
+                        .attempts = attempts,
+                        .limit = limit,
+                        .deadline_spent = deadline_spent,
+                        .child_exited = child_exited,
+                    });
+                    const expect_restart = attempts < limit and !deadline_spent and !child_exited;
+                    try std.testing.expectEqual(expect_restart, decision == .restart);
+                }
+            }
+        }
+    }
+}
+
+fn testDiagnostics(term: ?std.process.Child.Term, stderr: []const u8) stdio_dispatcher.ChildDiagnostics {
+    var diagnostics: stdio_dispatcher.ChildDiagnostics = .{ .term = term };
+    diagnostics.stderr.append(stderr);
+    return diagnostics;
+}
+
+test "startup failure names how the server ended and its cleaned stderr" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const exited = testDiagnostics(
+        .{ .exited = 1 },
+        "npm error code E401\n\x1b[31mnpm error\x1b[0m Incorrect or missing password.\n",
+    );
+    try std.testing.expectEqualStrings(
+        "MCP server exited with code 1 before completing startup: npm error code E401 npm error Incorrect or missing password.",
+        try formatStartupFailure(arena, .{ .closed = &exited }),
+    );
+    const killed = testDiagnostics(.{ .signal = .KILL }, "");
+    try std.testing.expectEqualStrings(
+        "MCP server was killed by signal 9 before completing startup",
+        try formatStartupFailure(arena, .{ .closed = &killed }),
+    );
+    try std.testing.expectEqualStrings(
+        "MCP server closed its connection before completing startup",
+        try formatStartupFailure(arena, .{ .closed = null }),
+    );
+}
+
+test "startup timeout names its budget and the most useful stderr" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = testDiagnostics(null, "downloading chrome-devtools-mcp\n");
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 10000 ms (startup_timeout_ms); last stderr: downloading chrome-devtools-mcp",
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 10_000, .earlier_exit = null, .live = &live } }),
+    );
+    const earlier = testDiagnostics(.{ .exited = 2 }, "boom\n");
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 30000 ms (startup_timeout_ms); an earlier launch exited with code 2: boom",
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 30_000, .earlier_exit = &earlier, .live = &live } }),
+    );
+    const silent = testDiagnostics(null, "");
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .earlier_exit = null, .live = &silent } }),
+    );
+}
+
+test "server stderr display keeps the first line and the end, bounded and masked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(arena, "FIRST-LINE TypeError: boom\n");
+    for (0..400) |index| try big.print(arena, "    at frame {d} (loader.js:{d})\n", .{ index, index });
+    try big.appendSlice(arena, "LAST-LINE exit\n");
+    var capture: stdio_dispatcher.StderrCapture = .{};
+    capture.append(big.items);
+    try std.testing.expect(capture.omitted);
+    const bounded = try displayStderr(arena, &capture);
+    try std.testing.expect(bounded.len <= stderr_display_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bounded, "FIRST-LINE TypeError: boom"));
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "LAST-LINE exit"));
+    for (bounded) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+
+    var secret: stdio_dispatcher.StderrCapture = .{};
+    secret.append("auth failed: Bearer abcdefghijklmnopqrstuvwxyz\n");
+    const masked = try displayStderr(arena, &secret);
+    try std.testing.expect(std.mem.find(u8, masked, "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, masked, "[redacted]") != null);
+
+    var hostile: stdio_dispatcher.StderrCapture = .{};
+    hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done");
+    try std.testing.expectEqualStrings("ok ? caf\xc3\xa9 done", try displayStderr(arena, &hostile));
+
+    var blank: stdio_dispatcher.StderrCapture = .{};
+    blank.append("\n\r\t\x1b[2K");
+    try std.testing.expectEqualStrings("", try displayStderr(arena, &blank));
 }
 
 pub fn start(

@@ -111,7 +111,9 @@ type RootOptions = {
     | "draft7_schema"
     | "list_changed"
     | "crash_once"
-    | "crash_always";
+    | "crash_always"
+    | "startup_exit"
+    | "startup_exit_after_delay";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   operationTimeoutMs?: number;
@@ -2307,6 +2309,82 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(wire.filter((entry) => entry.message.method === "tools/call"))
       .toHaveLength(1);
     await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("mcp list reports how a stdio server that exits during startup ended", async () => {
+    const root = createRoot("startup-exit", LEGACY_FIXTURE, {
+      mode: "startup_exit",
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
+    expect(result.stdout).toContain(
+      "failure=MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
+    );
+    // One launch per offered protocol version, then no restart of a server that keeps exiting.
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches).toHaveLength(4);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("skipping stdio startup restart server=fixture reason=stop_child_exited");
+    expect(trace).not.toContain("restarting stdio server after startup failure");
+    await expectProcessesExited(launches);
+  }, 30_000);
+
+  test("mcp list keeps the earlier exit when a crashing stdio server runs out of startup time", async () => {
+    const root = createRoot("startup-exit-timeout", LEGACY_FIXTURE, {
+      mode: "startup_exit_after_delay",
+      startupTimeoutMs: 1_500,
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(
+      "failure=MCP server did not complete startup within 1500 ms (startup_timeout_ms); an earlier launch exited with code 7: npm error code E401",
+    );
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches.length).toBeGreaterThanOrEqual(2);
+    expect(launches.length).toBeLessThanOrEqual(4);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("skipping stdio startup restart server=fixture reason=stop_deadline_spent");
+    expect(trace).not.toContain("restarting stdio server after startup failure");
+    await expectProcessesExited(launches);
   }, 30_000);
 
   for (

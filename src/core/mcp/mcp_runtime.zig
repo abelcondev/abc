@@ -6918,7 +6918,9 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
-    try std.testing.expectEqualStrings("McpConnectionTimedOut", runtime.servers.items[0].last_error.?);
+    const timed_out = runtime.servers.items[0].last_error.?;
+    try std.testing.expect(std.mem.startsWith(u8, timed_out, "MCP server did not complete startup within "));
+    try std.testing.expect(std.mem.endsWith(u8, timed_out, " ms (startup_timeout_ms)"));
     try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state.load(.acquire));
     try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
 }
