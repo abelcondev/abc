@@ -584,6 +584,19 @@ function handle(message) {
       return;
     }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "exit_after_result") {
+      // Answer, then exit so the next call finds the connection already closed.
+      const result = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }],
+        },
+      };
+      process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
+      return;
+    }
     if (
       [
         "crash_once",

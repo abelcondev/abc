@@ -1145,6 +1145,16 @@ pub const McpRuntime = struct {
         return .{ .servers = servers };
     }
 
+    /// True when the named server is down with a recorded startup failure,
+    /// which a tool search reports to the model.
+    pub fn hasStartupFailure(self: *McpRuntime, name: []const u8) bool {
+        const server = self.acquireServer(name) orelse return false;
+        defer server.lifetime.release(io_mod.getIo());
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        return server.state.load(.acquire) == .failed and server.last_error != null;
+    }
+
     pub fn requiredStartupFailure(
         self: *McpRuntime,
         alloc: Allocator,

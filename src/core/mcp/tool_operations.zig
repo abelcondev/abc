@@ -338,13 +338,18 @@ pub const Operations = struct {
                     return error.Cancelled;
                 }
                 if (!outcome.connection_running and !outcome.request_started and !retried_unsent_call) {
-                    try self.recoverServerForToolCall(
+                    self.recoverServerForToolCall(
                         server,
                         snapshot,
                         outcome.generation,
                         operation_deadline.?,
                         options,
-                    );
+                    ) catch |recovery_err| {
+                        if (recovery_err != error.Cancelled) {
+                            if (try restartFailedResult(arena, server, snapshot.prefixed_name)) |result| return result;
+                        }
+                        return recovery_err;
+                    };
                     try lockRwSharedUntil(
                         &server.connection_lock,
                         operation_deadline.?,
@@ -653,6 +658,19 @@ pub const Operations = struct {
         return switch (status) {
             .success, .tool_failure => .completed,
             .protocol_failure, .input_required => .abandoned,
+        };
+    }
+
+    /// The recorded reason a stopped server failed to start again, or null
+    /// when it is not down with one.
+    fn restartFailedResult(arena: Allocator, server: *McpServer, tool_name: []const u8) !?tool_mcp_runtime.CallResult {
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        if (server.state.load(.acquire) != .failed) return null;
+        const failure = server.last_error orelse return null;
+        return .{
+            .model_output = try tool_result.restart_failed_result(arena, server.config.name, tool_name, failure),
+            .status = .protocol_failure,
         };
     }
 

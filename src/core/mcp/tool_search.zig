@@ -48,6 +48,14 @@ pub fn search(
     )) |output| {
         return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
     }
+    if (try renderStartupFailure(
+        alloc,
+        server_handles,
+        operation_access,
+        request.server orelse request.query.raw,
+    )) |output| {
+        return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+    }
     var candidate_capacity: usize = 0;
     var server_configured = request.server == null;
     for (server_handles) |server| {
@@ -457,4 +465,68 @@ pub fn renderAuthenticationRequired(
         return try out.toOwnedSlice();
     }
     return null;
+}
+
+/// Tells the model why a server named by the search failed to start, so it
+/// can report the cause instead of an empty result.
+fn renderStartupFailure(
+    alloc: Allocator,
+    servers: []const *McpServer,
+    access: *const OperationAccessGuard,
+    query: []const u8,
+) !?[]u8 {
+    for (servers) |server| {
+        if (!server.isPublished()) continue;
+        if (!access.allows(.{ .tool_server = server.config.name })) continue;
+        if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        if (server.state.load(.acquire) != .failed) continue;
+        const failure = server.last_error orelse continue;
+        const message = try std.fmt.allocPrint(
+            alloc,
+            "MCP server '{s}' failed to start: {s}",
+            .{ server.config.name, failure },
+        );
+        defer alloc.free(message);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll(
+            "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\",\"error\":",
+        );
+        try writeEncodedJsonScalar(alloc, &out.writer, message);
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+    return null;
+}
+
+test "MCP search names why a matching server failed to start" {
+    const alloc = std.testing.allocator;
+    var servers = [_]McpServer{.{
+        .config = .{ .name = "devtools" },
+        .state = .init(.failed),
+    }};
+    defer if (servers[0].last_error) |value| alloc.free(value);
+    var access = try OperationAccessGuard.init(alloc, .unrestricted, 1);
+    defer access.deinit();
+    const handles = [_]*McpServer{&servers[0]};
+
+    // Without a recorded reason the ordinary search runs.
+    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtools"));
+
+    servers[0].setFailed(alloc, "MCP server exited with code 1 before completing startup: npm error code E401");
+    const output = (try renderStartupFailure(alloc, &handles, &access, "devtools")).?;
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\"," ++
+            "\"error\":\"MCP server 'devtools' failed to start: MCP server exited with code 1 before completing startup: npm error code E401\"}",
+        output,
+    );
+    const in_query = (try renderStartupFailure(alloc, &handles, &access, "take a screenshot with devtools")).?;
+    alloc.free(in_query);
+    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtoolsx"));
+
+    servers[0].state.store(.ready, .release);
+    try std.testing.expectEqual(@as(?[]u8, null), try renderStartupFailure(alloc, &handles, &access, "devtools"));
 }
