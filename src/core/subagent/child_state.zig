@@ -512,7 +512,10 @@ pub fn isManagedChildSession(
     };
 }
 
-/// Reuses discovery's validated identity while retaining all child-marker checks.
+/// Listing check: reuses discovery's validated identity and every child
+/// marker, and never reads an event log, so listing cost does not grow with
+/// log size. A session whose identity only its first event records stays
+/// listed; exact resume still refuses it once the session is loaded.
 pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
@@ -528,11 +531,7 @@ pub fn isDiscoveredManagedChildSession(
     if (capability) |*value| {
         if (try capabilityHasManagedChildMarker(alloc, value)) return true;
     }
-    if (subagent_child) |identity| return identity;
-    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
-        error.SessionNotFound => false,
-        else => return err,
-    };
+    return false;
 }
 
 /// Checks only immutable current and legacy child markers. Callers that

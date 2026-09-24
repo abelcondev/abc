@@ -557,7 +557,7 @@ const SessionPickerCatalogCache = struct {
     ready: bool = false,
     loaded_at_ns: i128 = 0,
     active_id: ?[]u8 = null,
-    catalog: subagent_resume_admission.ActionableSessionCatalog = .{},
+    catalog: session_catalog_cache.ActionableSessionCatalog = .{},
 
     fn deinit(self: *SessionPickerCatalogCache) void {
         const alloc = std.heap.c_allocator;
@@ -581,7 +581,7 @@ const SessionPickerCatalogCache = struct {
 
     fn install(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
     ) !void {
         return self.installAt(source, active_id, io_mod.nanoTimestamp());
@@ -591,7 +591,7 @@ const SessionPickerCatalogCache = struct {
     /// immediately while still scheduling a background revalidation scan.
     fn installStale(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
     ) !void {
         return self.installAt(source, active_id, 0);
@@ -599,7 +599,7 @@ const SessionPickerCatalogCache = struct {
 
     fn installAt(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
         loaded_at_ns: i128,
     ) !void {
@@ -638,7 +638,7 @@ fn installStaleDiskCatalog(
         for (summaries.items) |*summary| summary.deinit(std.heap.c_allocator);
         summaries.deinit(std.heap.c_allocator);
     }
-    var catalog: subagent_resume_admission.ActionableSessionCatalog = .{ .summaries = summaries };
+    var catalog: session_catalog_cache.ActionableSessionCatalog = .{ .summaries = summaries };
     session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
     try cache.installStale(&catalog, active_id);
 }
@@ -790,7 +790,7 @@ const SessionPickerLoad = struct {
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
-        catalog: ?subagent_resume_admission.ActionableSessionCatalog = null,
+        catalog: ?session_catalog_cache.ActionableSessionCatalog = null,
         cache_writer: ?session_catalog_cache.Writer = null,
         failure: ?anyerror = null,
 
@@ -993,7 +993,7 @@ const SessionPickerLoad = struct {
         };
         defer read_only.deinit(std.heap.c_allocator);
 
-        task.catalog = subagent_resume_admission.listActionableCatalog(
+        task.catalog = session_catalog_cache.listActionableCatalog(
             read_only,
             std.heap.c_allocator,
             task.request.active_id,
@@ -4688,50 +4688,64 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Loads spilled previous/after snapshots for a replayed presentation.
-        /// A missing or corrupt artifact degrades to the inline preview, never
-        /// to a resume failure; the full-diff expansion is simply absent.
-        fn loadResumeDiffContent(
+        /// Builds the full review of a resumed edit the first time it is
+        /// opened, from the spilled snapshots. Runs at most once per entry. A
+        /// missing or corrupt artifact leaves only the preview and never
+        /// fails; the full-diff expansion is simply absent. The built diff is
+        /// owned by `entry` and allocated with `std.heap.c_allocator`.
+        pub fn materializeDeferredDiff(
             app: *App,
-            call_id: []const u8,
-            handle: []const u8,
-        ) ?result_store.DiffContentPack {
-            if (comptime !@hasField(App, "session_persistence")) return null;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            const capability = loaded.childCapability() catch |err| {
+            entry: *diff.DiffEntry,
+            styles: diff.FormatStyles,
+        ) void {
+            const deferred = entry.deferred orelse return;
+            entry.deferred = null;
+            defer deferred.deinit(std.heap.c_allocator);
+            const capability = childCapability(app) orelse {
                 debug_trace.logf(
                     "session",
-                    "resume diff content capability unavailable call_id={s} err={s}",
-                    .{ call_id, @errorName(err) },
+                    "event=diff_content_unavailable call_id={s} reason=no_session",
+                    .{deferred.call_id},
                 );
-                return null;
+                return;
             };
-            const pack = result_store.loadDiffContentManaged(
+            var pack = result_store.loadDiffContentManaged(
                 app.alloc,
                 capability,
-                call_id,
-                handle,
+                deferred.call_id,
+                deferred.content_handle,
             ) catch |err| {
                 debug_trace.logf(
                     "session",
-                    "resume diff content load failed call_id={s} err={s}; rendering preview only",
-                    .{ call_id, @errorName(err) },
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
                 );
-                return null;
+                return;
+            };
+            defer pack.deinit(app.alloc);
+            const after = pack.after_content orelse return;
+            entry.full = diff.formatFileChangeFullDiff(
+                std.heap.c_allocator,
+                pack.previous_content,
+                .{ .after_content = after, .lifecycle_id = deferred.lifecycle_id },
+                styles,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
+                );
+                return;
             };
             debug_trace.logf(
                 "session",
                 "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d}",
                 .{
-                    call_id,
+                    deferred.call_id,
                     if (pack.previous_content) |content| content.len else 0,
-                    if (pack.after_content) |content| content.len else 0,
+                    after.len,
                 },
             );
-            return pack;
         }
 
         fn writeCommittedFilePresentation(
@@ -4747,20 +4761,24 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
-            var resolved = presentation;
-            var content_pack: result_store.DiffContentPack = .{};
-            defer content_pack.deinit(app.alloc);
+            // Spilled snapshots stay on disk: the transcript renders the inline
+            // preview, and the full review is built only when it is opened.
+            var deferred: ?diff.DeferredFullDiff = null;
             if (presentation.content_handle) |handle| {
-                if (presentation.previous_content == null or presentation.after_content == null) {
-                    if (loadResumeDiffContent(app, result.tool_call_id, handle)) |pack| {
-                        content_pack = pack;
-                        resolved.previous_content = content_pack.previous_content;
-                        resolved.after_content = content_pack.after_content;
+                if (presentation.lifecycle_id) |lifecycle_id| {
+                    if (presentation.previous_content == null or presentation.after_content == null) {
+                        deferred = try diff.DeferredFullDiff.clone(
+                            std.heap.c_allocator,
+                            result.tool_call_id,
+                            handle,
+                            lifecycle_id,
+                        );
                     }
                 }
             }
 
-            const payload = app.preparePersistedFileDiff(resolved) catch |err| {
+            var payload = app.preparePersistedFileDiff(presentation) catch |err| {
+                if (deferred) |value| value.deinit(std.heap.c_allocator);
                 debug_trace.logf(
                     "session",
                     "resume committed file presentation unavailable call_id={s} err={s}",
@@ -4768,6 +4786,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return false;
             };
+            payload.deferred = deferred;
             var owns_payload = true;
             errdefer if (owns_payload) diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
 
@@ -5088,6 +5107,12 @@ pub fn Runtime(comptime App: type) type {
                 };
                 break :blk .{ .session_id = session_id };
             } else null;
+            // WASM hosts keep sessions in the JavaScript host store, never in a
+            // native session directory, so only native builds discard here.
+            const discard_empty = if (comptime host_target.is_wasm)
+                false
+            else
+                handoff == null and discardableOnClose(app, loaded);
             if (comptime @hasDecl(
                 @TypeOf(app.session),
                 "clearWebFetchArtifacts",
@@ -5095,9 +5120,43 @@ pub fn Runtime(comptime App: type) type {
                 app.session.clearWebFetchArtifacts();
             }
             disableSubagentHost(app);
+            if (comptime !host_target.is_wasm) {
+                if (discard_empty) {
+                    if (app.session_persistence.store) |store| {
+                        // Consumes `loaded` on every return; the store logs the disposition.
+                        _ = store.discardPristineStartedSession(app.alloc, loaded);
+                        app.session_persistence.writable = null;
+                        return handoff;
+                    }
+                }
+            }
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
             return handoff;
+        }
+
+        /// A fresh interactive session that never received durable work has
+        /// nothing to resume. Discarding it on close keeps each launch from
+        /// leaving an empty session directory behind, matching `fx ask` and
+        /// ACP. A user-chosen title is durable intent, so a renamed session stays.
+        fn discardableOnClose(
+            app: *App,
+            loaded: *session_store.LoadedWritableSession,
+        ) bool {
+            if (!session_store.isPristineStartedSession(loaded)) return false;
+            const title = loaded.conversationTitle(app.alloc) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=pristine_session_discard disposition=retained reason=title_unreadable err={s}",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            if (title) |value| {
+                app.alloc.free(value);
+                return false;
+            }
+            return true;
         }
 
         fn configureWebFetchArtifacts(
@@ -6840,10 +6899,44 @@ test "resume handoff suppresses missing and pristine writable sessions" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const pristine_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+    defer alloc.free(pristine_id);
     Runtime(TestApp).requestResumeHandoff(&app);
 
     try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
     try std.testing.expect(app.session_persistence.writable == null);
+    // Nothing durable happened, so closing leaves no empty session behind.
+    try std.testing.expectError(
+        error.SessionNotFound,
+        app.session_persistence.store.?.loadReadOnly(alloc, pristine_id),
+    );
+}
+
+test "closing a renamed pristine session keeps it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const renamed_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+    defer alloc.free(renamed_id);
+    try std.testing.expect(try app.session_persistence.writable.?.renameConversation(alloc, "kept by name"));
+
+    try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
+    var kept = try app.session_persistence.store.?.loadReadOnly(alloc, renamed_id);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings(renamed_id, kept.id);
 }
 
 test "upgrade resume handoff owns a validated pristine session" {
@@ -10614,7 +10707,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var all_catalog: subagent_resume_admission.ActionableSessionCatalog = .{};
+    var all_catalog: session_catalog_cache.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
     try all_catalog.summaries.append(catalog_alloc, .{
         .id = try catalog_alloc.dupe(u8, "foreign-session"),
@@ -10708,7 +10801,7 @@ test "session picker cold open paints the persisted catalog before revalidation"
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var built = try subagent_resume_admission.listActionableCatalog(store, alloc, active_id, &stopped, &writer);
+    var built = try session_catalog_cache.listActionableCatalog(store, alloc, active_id, &stopped, &writer);
     defer built.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), built.summaries.items.len);
     app.session_persistence.session_picker_cache.deinit();
@@ -10754,7 +10847,7 @@ test "session catalog preload feeds the picker open without a second scan" {
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var seeded = try subagent_resume_admission.listActionableCatalog(
+    var seeded = try session_catalog_cache.listActionableCatalog(
         store,
         alloc,
         app.session_persistence.writable.?.active_id,
@@ -10826,7 +10919,7 @@ test "session catalog preload is best-effort and never duplicates an in-flight s
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var seeded = try subagent_resume_admission.listActionableCatalog(
+    var seeded = try session_catalog_cache.listActionableCatalog(
         store,
         alloc,
         app.session_persistence.writable.?.active_id,

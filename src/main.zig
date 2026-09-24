@@ -2624,15 +2624,20 @@ const App = struct {
         return diff_mod.formatPersistedFileChangePayload(
             std.heap.c_allocator,
             presentation,
-            .{
-                .added_fg = ui_render.diff_added_style,
-                .removed_fg = ui_render.diff_removed_style,
-                .context_fg = ui_render.dim_style,
-                .added_marker_fg = ui_render.diff_added_marker_style,
-                .removed_marker_fg = ui_render.diff_removed_marker_style,
-                .reset = ui_render.reset_style,
-            },
+            persistedDiffStyles(),
         );
+    }
+
+    /// Reads the active theme, so it is evaluated at each use.
+    fn persistedDiffStyles() @import("core/output/diff.zig").FormatStyles {
+        return .{
+            .added_fg = ui_render.diff_added_style,
+            .removed_fg = ui_render.diff_removed_style,
+            .context_fg = ui_render.dim_style,
+            .added_marker_fg = ui_render.diff_added_marker_style,
+            .removed_marker_fg = ui_render.diff_removed_marker_style,
+            .reset = ui_render.reset_style,
+        };
     }
 
     pub fn registerAndEmitDiffBlock(self: *App, payload: agent_runtime.DiffEntryPayload) !void {
@@ -2646,6 +2651,7 @@ const App = struct {
         try self.diff_entries.append(c_alloc, .{
             .id = id,
             .full = payload.full,
+            .deferred = payload.deferred,
         });
         appended = true;
         self.next_diff_id += 1;
@@ -2666,20 +2672,27 @@ const App = struct {
 
     fn fullDiffForMarker(ctx: *anyopaque, id: u32) ?[]const u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        for (self.diff_entries.items) |entry| {
+        for (self.diff_entries.items) |*entry| {
             if (entry.id != id) continue;
+            SessionAppRuntime.materializeDeferredDiff(self, entry, persistedDiffStyles());
             const full = entry.full orelse return null;
             return full.content;
         }
         return null;
     }
 
+    /// Builds a matching deferred resumed edit first, so the answer stays
+    /// exact when its saved snapshots are missing.
     fn hasFullDiffForLifecycle(
         ctx: *anyopaque,
         lifecycle_id: types.ToolLifecycleId,
     ) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
-        for (self.diff_entries.items) |entry| {
+        for (self.diff_entries.items) |*entry| {
+            if (entry.deferred) |deferred| {
+                if (!deferred.matches(lifecycle_id)) continue;
+                SessionAppRuntime.materializeDeferredDiff(self, entry, persistedDiffStyles());
+            }
             const full = entry.full orelse continue;
             if (full.lifecycle_id.turn_id != lifecycle_id.turn_id) continue;
             if (std.mem.eql(u8, full.lifecycle_id.call_id, lifecycle_id.call_id)) return true;
@@ -4157,6 +4170,60 @@ test "diff block writes are classified" {
         transcript_runtime.RawEntryClass.diff_block,
         app.shell.entries.items[app.shell.entries.items.len - 1].raw_bytes.class,
     );
+}
+
+test "deferred resumed diff builds once and degrades to its preview" {
+    const alloc = std.testing.allocator;
+    const c_alloc = std.heap.c_allocator;
+    const diff_mod = @import("core/output/diff.zig");
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+
+    var app = App{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = sink,
+            .layout = .{
+                .rows = 24,
+                .cols = 80,
+                .content_bottom = 21,
+                .divider_top_row = 22,
+                .input_row = 23,
+                .divider_bottom_row = 24,
+                .hint_row = 22,
+            },
+        },
+    };
+    defer {
+        for (app.diff_entries.items) |*entry| entry.deinit(c_alloc);
+        app.diff_entries.deinit(c_alloc);
+        app.shell.deinit(alloc);
+        app.session.deinit(alloc);
+    }
+
+    const lifecycle: types.ToolLifecycleId = .{ .turn_id = 3, .call_id = "call_deferred" };
+    var payload = agent_runtime.DiffEntryPayload{
+        .preview = try c_alloc.dupe(u8, "diff preview"),
+    };
+    payload.deferred = diff_mod.DeferredFullDiff.clone(
+        c_alloc,
+        "call_deferred",
+        "diff-0000000000000000-0000000000000000.json",
+        lifecycle,
+    ) catch |err| {
+        diff_mod.freeDiffEntryPayload(c_alloc, payload);
+        return err;
+    };
+    try app.registerAndEmitDiffBlock(payload);
+    const id = app.diff_entries.items[0].id;
+
+    // No saved session owns the snapshots: the entry falls back to its
+    // preview, and the failed build is not retried on every lookup.
+    try std.testing.expect(!App.hasFullDiffForLifecycle(&app, lifecycle));
+    try std.testing.expect(app.diff_entries.items[0].deferred == null);
+    try std.testing.expect(App.fullDiffForMarker(&app, id) == null);
+    try std.testing.expect(app.diff_entries.items[0].full == null);
 }
 
 test "prompt card wraps image badges in OSC 8 hyperlinks" {

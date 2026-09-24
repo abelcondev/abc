@@ -36,9 +36,8 @@ const recovery_checkpoint_file = "recovery.json";
 /// unclean exit. Cleared with the checkpoint so suppression stays sticky
 /// until the user resolves the turn instead of re-arming after a clean quit.
 const recovery_asked_file = "recovery.asked";
-/// Liveness marker naming the live writable owner; also consulted by
-/// session_store.only_unpublished_creation, which ignores it.
-pub const owner_live_file = "owner.live";
+/// Liveness marker naming the live writable owner.
+const owner_live_file = "owner.live";
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
