@@ -142,7 +142,9 @@ pub const Loaded = struct {
     }
 
     fn loadChecked(alloc: Allocator, dir: std.Io.Dir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
-        var file = try dir.openFile(io_mod.getIo(), file_name, .{ .follow_symlinks = false, .allow_directory = false, .resolve_beneath = true });
+        // Opening a FIFO or device for reading can block, so the helper checks
+        // the entry and opens it without blocking before any read.
+        var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
         if (stat.kind != .file or stat.nlink > 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidCatalogCache;
@@ -746,6 +748,102 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer again.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), again.summaries.items.len);
+}
+
+test "actionable catalog lists an interrupted legacy upgrade without caching it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/fenced");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const snapshot = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"fenced\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    defer alloc.free(snapshot);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.legacy.json", .data = snapshot });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/authority.pending.json", .data = "pending" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.json", .data = "interrupted replacement" });
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // The stable snapshot keeps the session listed so resuming it can finish
+    // the upgrade, but the row describes a transition and is never reused.
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings("fenced", catalog.summaries.items[0].id);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(!saved.contains("fenced"));
+}
+
+test "actionable catalog lists an unverifiable child marker without caching it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, .{
+        .id = @constCast("unverified"),
+        .origin_workspace_root = workspace,
+        .workspace_root = workspace,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+    });
+    writable.deinit(alloc);
+    try tmp.dir.createDir(std.testing.io, "home/.fx/sessions/unverified/subagent", .fromMode(0o700));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = .fromMode(0o600) } });
+
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // A damaged marker cannot prove the session is a child, so it stays
+    // listed; the row is not cached so the next listing checks it again.
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings("unverified", catalog.summaries.items[0].id);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(!saved.contains("unverified"));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "catalog cache ignores a FIFO without blocking" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, file_name });
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    // Reading a FIFO waits for a writer that never comes; the index is ignored.
+    var loaded = try Loaded.load(alloc, dir, null);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(!loaded.present());
 }
 
 test "catalog cache round trips owned rows and ignores incomplete observations" {

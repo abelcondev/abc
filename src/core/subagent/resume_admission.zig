@@ -53,26 +53,25 @@ pub fn listVisiblePage(
     return page;
 }
 
+/// Returns the session `--resume last` would open in this workspace: the
+/// newest listed row that is not a subagent child. Caller owns the summary.
 pub fn latestVisibleWorkspaceSummary(
     store: session_store.Store,
     alloc: Allocator,
 ) !session_store.SessionSummary {
-    var page = try listVisiblePage(
-        store,
-        alloc,
-        .current_workspace,
-        null,
-        1,
-    );
-    defer page.deinit(alloc);
-    if (page.summaries.items.len == 0) {
-        if (page.skipped_invalid > 0) return error.NoReadableSessions;
-        return error.NoSavedSessions;
+    var catalog = catalog_cache.listActionableCatalog(store, alloc, null, null, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SessionStoreUnavailable,
+    };
+    defer catalog.deinit(alloc);
+    for (catalog.summaries.items) |summary| {
+        const summary_workspace = summary.workspace_root orelse continue;
+        if (!std.mem.eql(u8, summary_workspace, store.workspace_root)) continue;
+        if (try store.isLatestChildCandidate(alloc, summary.id)) continue;
+        return session_summary_codec.cloneSessionSummary(alloc, summary);
     }
-    return session_summary_codec.cloneSessionSummary(
-        alloc,
-        page.summaries.items[0],
-    );
+    if (catalog.skipped_invalid > 0) return error.NoReadableSessions;
+    return error.NoSavedSessions;
 }
 
 pub fn loadVisibleReadOnlyDetail(
@@ -243,4 +242,44 @@ test "subagent work identity hides a partial child without owner sidecar" {
             .{},
         ),
     );
+}
+
+test "session last skips a legacy child identified only by its first event" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var parent = session_codec.DurableSessionState{
+        .id = try alloc.dupe(u8, "parent"),
+        .origin_workspace_root = try alloc.dupe(u8, workspace),
+        .workspace_root = try alloc.dupe(u8, workspace),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = try alloc.alloc(session.HistoryTurn, 0),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{
+            .model = try alloc.dupe(u8, "test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+    };
+    defer parent.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, parent);
+    writable.deinit(alloc);
+    try session_store.writeSchemaV3ChildFixture(alloc, store, "child", workspace, std.math.maxInt(i64) - 1);
+
+    // `fx session last` names the session `--resume last` opens, not the child.
+    var latest = try latestVisibleWorkspaceSummary(store, alloc);
+    defer latest.deinit(alloc);
+    try std.testing.expectEqualStrings("parent", latest.id);
 }

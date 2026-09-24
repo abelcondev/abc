@@ -6967,6 +6967,10 @@ test "upgrade resume handoff owns a validated pristine session" {
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+    // The relaunch resumes this id, so closing must not discard it.
+    var kept = try app.session_persistence.store.?.loadReadOnly(alloc, expected_id);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings(expected_id, kept.id);
 }
 
 test "resume handoff owns the exact non-pristine session id" {

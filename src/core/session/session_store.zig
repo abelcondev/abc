@@ -1205,9 +1205,10 @@ pub const Store = struct {
     }
 
     /// Resumes the newest resumable session in `workspace_root`, in the order
-    /// the session index reports. A candidate that disappears or moves to
-    /// another workspace between selection and open yields to the next newest;
-    /// every other failure, including a busy session, is returned.
+    /// the session index reports. A subagent child is skipped before it is
+    /// opened. A candidate that disappears or moves to another workspace
+    /// between selection and open yields to the next newest; every other
+    /// failure, including a busy session, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -1231,6 +1232,10 @@ pub const Store = struct {
         for (catalog.summaries.items) |summary| {
             const candidate_root = summary.workspace_root orelse continue;
             if (!std.mem.eql(u8, candidate_root, workspace_root)) continue;
+            if (try self.isLatestChildCandidate(alloc, summary.id)) {
+                debug_trace.logf("session", "latest selection skipped subagent child id={s}", .{summary.id});
+                continue;
+            }
             if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, options)) |loaded| {
                 return loaded;
             } else |err| switch (err) {
@@ -1320,6 +1325,21 @@ pub const Store = struct {
         session_id: []const u8,
     ) !bool {
         return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
+    }
+
+    /// Reports whether a latest-selection candidate is a subagent child.
+    /// Listing leaves a legacy child that only its first event identifies to
+    /// exact resume, so latest selection checks just its chosen candidate. An
+    /// unreadable identity is left to the open, which validates the session.
+    pub fn isLatestChildCandidate(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) error{OutOfMemory}!bool {
+        return self.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
     }
 
     /// Reads one bounded chronological history page without acquiring the
@@ -5037,6 +5057,78 @@ fn writeLegacyFixture(
     alloc.free(path);
 }
 
+/// Test fixture: a schema-v3 subagent child whose identity only its first
+/// event records, as a crash before the owner marker leaves one.
+pub fn writeSchemaV3ChildFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+) !void {
+    if (!builtin.is_test) @compileError("schema-v3 fixtures are test-only");
+    const sessions = store.canonical_root.sessions orelse return error.SessionNotFound;
+    try sessions.dir.createDir(io_mod.getIo(), id, .fromMode(0o700));
+    var dir = try sessions.dir.openDir(io_mod.getIo(), id, .{});
+    defer dir.close(io_mod.getIo());
+    const generation = [_]u8{1} ** 16;
+    const authority_id = [_]u8{3} ** 16;
+    const language = session.ConversationLanguage.literal("en");
+    const preferences: session_codec.DurableSessionPreferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false };
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = [_]u8{2} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast(id),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast(workspace_root),
+            .workspace_root = @constCast(workspace_root),
+            .conversation_language = language,
+            .preferences = preferences,
+            .subagent_child = true,
+        } },
+    });
+    defer alloc.free(started);
+    const manifest = try session_projection.encodeManifest(alloc, .{
+        .id = @constCast(id),
+        .authority_id = authority_id,
+        .log_generation = generation,
+        .created_at_ms = 10,
+        .updated_at_ms = updated_at_ms,
+        .origin_workspace_root = @constCast(workspace_root),
+        .workspace_root = @constCast(workspace_root),
+        .conversation_language = language,
+        .history_len = 0,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .last_event_seq = 1,
+        .event_log_bytes = started.len,
+        .event_log_stat_fingerprint = [_]u8{0} ** 32,
+        .generation_base_seq = 1,
+        .generation_base_bytes = started.len,
+        .checkpoint_seq = null,
+        .checkpoint_sha256 = null,
+        .preferences = preferences,
+    });
+    defer alloc.free(manifest);
+    const authority = try std.fmt.allocPrint(
+        alloc,
+        "{{\"schema_version\":1,\"storage_format\":\"event_log_v1\",\"session_id\":\"{s}\",\"authority_id\":\"{s}\",\"source\":\"native_create\"}}",
+        .{ id, std.fmt.bytesToHex(authority_id, .lower) },
+    );
+    defer alloc.free(authority);
+    const files = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "events.jsonl", .data = started },
+        .{ .name = "session.json", .data = manifest },
+        .{ .name = "authority.json", .data = authority },
+    };
+    for (files) |file| {
+        try dir.writeFile(io_mod.getIo(), .{ .sub_path = file.name, .data = file.data, .flags = .{ .permissions = .fromMode(0o600) } });
+    }
+}
+
 fn writeLegacyIncompleteAuthorityFixture(
     alloc: Allocator,
     store: Store,
@@ -7639,6 +7731,31 @@ test "writable last excludes newer child metadata and legacy owner markers" {
         defer resumed.deinit(alloc);
         try std.testing.expectEqualStrings("parent", resumed.active_id);
     }
+}
+
+test "writable last skips a legacy child identified only by its first event" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
+    try writeSchemaV3ChildFixture(alloc, ctx.store, "child", ctx.workspace, std.math.maxInt(i64) - 1);
+    const before = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
+    defer alloc.free(before);
+    // Listing leaves this child to exact resume, so it is the newest row.
+    var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqualStrings("child", catalog.summaries.items[0].id);
+    try std.testing.expect(try ctx.store.isLatestChildCandidate(alloc, "child"));
+
+    var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("parent", resumed.active_id);
+    // The child is skipped before any writable open, so nothing migrates it.
+    const after = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "writable last ignores unrelated conversation history" {

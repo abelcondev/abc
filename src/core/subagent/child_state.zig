@@ -515,7 +515,7 @@ pub fn isManagedChildSession(
 /// Listing check: reuses discovery's validated identity and every child
 /// marker, and never reads an event log, so listing cost does not grow with
 /// log size. A session whose identity only its first event records stays
-/// listed; exact resume still refuses it once the session is loaded.
+/// listed; latest selection skips it, and exact resume still refuses it.
 pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
