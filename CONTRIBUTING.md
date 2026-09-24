@@ -307,11 +307,11 @@ server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
 without `--cidfile` receive a private cidfile so fx can remove the container
 after shutdown or startup failure. An explicit cidfile remains user-owned.
 
-When a stdio server exits before completing startup, its reported failure names
-the exit code or signal and includes a bounded, terminal-safe excerpt of the
-server's stderr with secrets masked. A startup timeout names the budget the
-connection had and the `startup_timeout_ms` key, plus an earlier launch's exit
-when there was one. A startup restart runs only when it could change the
+When a stdio server exits before answering `initialize`, its reported failure
+names the exit code or signal and includes a bounded, terminal-safe excerpt of
+the server's stderr with secrets masked. A startup timeout names the budget the
+connection had, plus an earlier launch's exit when there was one, and names the
+`startup_timeout_ms` key when that setting set the budget. A startup restart runs only when it could change the
 outcome: a server that closed its connection at every offered protocol version
 is not restarted, and neither is one whose startup deadline has already passed.
 A server that fx stopped because of invalid output still gets its restart.

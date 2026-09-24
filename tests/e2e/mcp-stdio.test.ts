@@ -113,7 +113,8 @@ type RootOptions = {
     | "crash_once"
     | "crash_always"
     | "startup_exit"
-    | "startup_exit_after_delay";
+    | "startup_exit_after_delay"
+    | "startup_garbage";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
   operationTimeoutMs?: number;

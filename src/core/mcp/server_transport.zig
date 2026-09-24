@@ -160,7 +160,14 @@ pub fn connectServer(
                 used_tool_names,
                 operation,
                 .v2024_11_05,
-            );
+            ) catch |legacy_err| {
+                // The discovery launch stayed up, so not every launch ended
+                // on its own and a restart could still help.
+                if (err == error.McpRequestTimedOut and legacy_err == error.McpServerExitedDuringStartup) {
+                    return error.McpInitFailed;
+                }
+                return legacy_err;
+            };
         },
         else => return err,
     };
@@ -743,7 +750,8 @@ fn connectServerLegacy(
         control,
         server.config.startup_timeout_ms,
     );
-    const budget_ms = attempt_control.startup_budget_ms orelse server.config.startup_timeout_ms;
+    // startAt always fixes the budget.
+    const budget_ms = attempt_control.startup_budget_ms.?;
     var offered_version = initial_version;
     var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
@@ -753,6 +761,7 @@ fn connectServerLegacy(
             // The deadline passed between launches; keep the exit that used it up.
             if (err == error.McpRequestTimedOut) publishStartupFailure(alloc, server, .{ .timed_out = .{
                 .budget_ms = budget_ms,
+                .configured_ms = server.config.startup_timeout_ms,
                 .earlier_exit = if (last_exit) |*exit| exit else null,
                 .live = null,
             } });
@@ -808,6 +817,7 @@ fn connectServerLegacy(
                 const live = dispatcher.childDiagnostics();
                 publishStartupFailure(alloc, server, .{ .timed_out = .{
                     .budget_ms = budget_ms,
+                    .configured_ms = server.config.startup_timeout_ms,
                     .earlier_exit = if (last_exit) |*exit| exit else null,
                     .live = &live,
                 } });
@@ -1076,11 +1086,15 @@ fn connectServerBounded(
             if (err == error.McpRequestTimedOut) {
                 const live: ?stdio_dispatcher.ChildDiagnostics =
                     if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
-                publishStartupFailure(alloc, server, .{ .timed_out = .{
-                    .budget_ms = operation.startup_budget_ms orelse server.config.startup_timeout_ms,
-                    .earlier_exit = null,
-                    .live = if (live) |*value| value else null,
-                } });
+                publishStartupFailure(alloc, server, .{
+                    .timed_out = .{
+                        // withStartupBudget always fixes the budget.
+                        .budget_ms = operation.startup_budget_ms.?,
+                        .configured_ms = server.config.startup_timeout_ms,
+                        .earlier_exit = null,
+                        .live = if (live) |*value| value else null,
+                    },
+                });
             }
             server.disconnect();
             const decision = decideStartupRestart(.{
@@ -1155,6 +1169,8 @@ const StartupFailure = union(enum) {
     closed: ?*const stdio_dispatcher.ChildDiagnostics,
     timed_out: struct {
         budget_ms: u32,
+        /// Named as `startup_timeout_ms` only when it set the budget.
+        configured_ms: u32,
         /// An earlier launch in this startup that exited.
         earlier_exit: ?*const stdio_dispatcher.ChildDiagnostics,
         /// The launch that was still running at the deadline.
@@ -1191,10 +1207,8 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
             if (diagnostics) |value| try writeStderrSuffix(arena, writer, &value.stderr);
         },
         .timed_out => |timeout| {
-            try writer.print(
-                "MCP server did not complete startup within {d} ms (startup_timeout_ms)",
-                .{timeout.budget_ms},
-            );
+            try writer.print("MCP server did not complete startup within {d} ms", .{timeout.budget_ms});
+            if (timeout.budget_ms == timeout.configured_ms) try writer.writeAll(" (startup_timeout_ms)");
             if (timeout.earlier_exit) |value| {
                 try writer.writeAll("; an earlier launch ");
                 try writeTermPhrase(writer, value.term);
@@ -1328,22 +1342,27 @@ test "startup timeout names its budget and the most useful stderr" {
     const live = testDiagnostics(null, "downloading chrome-devtools-mcp\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 10000 ms (startup_timeout_ms); last stderr: downloading chrome-devtools-mcp",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 10_000, .earlier_exit = null, .live = &live } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 10_000, .configured_ms = 10_000, .earlier_exit = null, .live = &live } }),
     );
     const earlier = testDiagnostics(.{ .exited = 2 }, "boom\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 30000 ms (startup_timeout_ms); an earlier launch exited with code 2: boom",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 30_000, .earlier_exit = &earlier, .live = &live } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 30_000, .configured_ms = 30_000, .earlier_exit = &earlier, .live = &live } }),
     );
     const silent = testDiagnostics(null, "");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .earlier_exit = null, .live = &silent } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .configured_ms = 50, .earlier_exit = null, .live = &silent } }),
     );
     const blank = testDiagnostics(null, "\n\r\x1b[2K\n");
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
-        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .earlier_exit = null, .live = &blank } }),
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .configured_ms = 50, .earlier_exit = null, .live = &blank } }),
+    );
+    // A shorter caller deadline set the budget, so the setting is not named.
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 12345 ms",
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 12_345, .configured_ms = 30_000, .earlier_exit = null, .live = &silent } }),
     );
 }
 

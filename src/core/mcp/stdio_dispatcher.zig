@@ -19,9 +19,9 @@ const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
 /// Leading bytes of child stderr kept for diagnostics; the first line usually
 /// names the failure.
-pub const stderr_head_capacity: usize = 1024;
+const stderr_head_capacity: usize = 1024;
 /// Newest bytes of child stderr kept after the head.
-pub const stderr_tail_capacity: usize = 3072;
+const stderr_tail_capacity: usize = 3072;
 /// After the child is reaped, how long its stderr may take to reach EOF.
 const stderr_eof_grace_ms: i64 = 100;
 const diagnostics_settle_ms: i64 = 2 * stderr_eof_grace_ms;
@@ -559,8 +559,10 @@ pub const StdioDispatcher = struct {
             error.McpRequestTimedOut => write_control = .timed_out,
             else => {
                 if (write_outcome.phase == .waiting) return err;
-                self.failConnection(err);
-                terminateChild(self.child_id);
+                // A closed stdin means the child already ended; fail like the
+                // reader's end of stream so waiters see one consistent reason.
+                self.failConnection(if (err == error.BrokenPipe) error.McpConnectionClosed else err);
+                if (self.childMayBeRunning()) terminateChild(self.child_id);
             },
         };
         if (write_outcome.phase == .committed) {
@@ -2151,7 +2153,7 @@ fn createShellDispatcher(script: []const u8) !struct {
         .argv = &.{ "sh", "-c", script },
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
         .pgid = 0,
     });
     const pid = child.id.?;
@@ -2615,33 +2617,6 @@ test "operation timeout returns and shutdown joins an uncooperative child" {
     try expectProcessReaped(fixture.pid);
 }
 
-fn createShellDispatcherWithStderr(script: []const u8) !struct {
-    dispatcher: *StdioDispatcher,
-    pid: std.posix.pid_t,
-} {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.SkipZigTest;
-    }
-    const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &.{ "sh", "-c", script },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = 0,
-    });
-    const pid = child.id.?;
-    return .{
-        .dispatcher = try StdioDispatcher.create(
-            std.testing.allocator,
-            std.heap.c_allocator,
-            child,
-            1,
-            4096,
-        ),
-        .pid = pid,
-    };
-}
-
 test "stderr capture keeps the leading bytes and the newest trailing bytes" {
     const window = stderr_head_capacity + stderr_tail_capacity;
     const sizes = [_]usize{
@@ -2671,7 +2646,7 @@ test "MCP stdio records how a child that exits before replying ended and what it
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
     }
-    const fixture = try createShellDispatcherWithStderr(
+    const fixture = try createShellDispatcher(
         \\printf 'npm error code E401\nnpm error Incorrect or missing password.\n' >&2
         \\exit 3
     );
@@ -2702,7 +2677,7 @@ test "MCP stdio keeps draining stderr so a chatty child stays responsive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
     }
-    const fixture = try createShellDispatcherWithStderr(
+    const fixture = try createShellDispatcher(
         \\head -c 1048576 /dev/zero | tr '\0' 'x' >&2
         \\read line
         \\printf '{"jsonrpc":"2.0","id":0,"result":{}}\n'
@@ -2747,7 +2722,9 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     );
     defer alloc.free(script);
 
-    const fixture = try createShellDispatcherWithStderr(script);
+    const fixture = try createShellDispatcher(script);
+    var dispatcher_live = true;
+    defer if (dispatcher_live) fixture.dispatcher.deinitAbandoned();
     var descendant: ?std.posix.pid_t = null;
     defer if (descendant) |pid| std.posix.kill(pid, .KILL) catch {};
     for (0..200) |_| {
@@ -2762,6 +2739,7 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     } else return error.TestExpectedDescendant;
 
     const started_ms = io_mod.milliTimestamp();
+    dispatcher_live = false;
     fixture.dispatcher.deinitAbandoned();
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try expectProcessReaped(fixture.pid);

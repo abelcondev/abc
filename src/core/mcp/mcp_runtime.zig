@@ -3311,6 +3311,7 @@ fn connectServerCancellable(
         timeout_override,
     );
     const budget = connection_control.startupTimeout(server.config.startup_timeout_ms, timeout_override);
+    const budget_ms = std.math.cast(u32, budget.toMilliseconds()) orelse std.math.maxInt(u32);
     return server_transport.start(
         runtime.alloc,
         runtime.tool_registry,
@@ -3318,7 +3319,7 @@ fn connectServerCancellable(
         used_tool_names,
         .{
             .deadline = deadline,
-            .startup_budget_ms = std.math.cast(u32, budget.toMilliseconds()) orelse std.math.maxInt(u32),
+            .startup_budget_ms = @min(budget_ms, server.config.startup_timeout_ms),
             .cancel_flag = cancel_requested,
             .lifecycle_cancel_flag = server.cancellation(),
         },
@@ -6924,8 +6925,9 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
+    // The private override, not startup_timeout_ms, set this budget.
     try std.testing.expectEqualStrings(
-        "MCP server did not complete startup within 2000 ms (startup_timeout_ms)",
+        "MCP server did not complete startup within 2000 ms",
         runtime.servers.items[0].last_error.?,
     );
     try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state.load(.acquire));

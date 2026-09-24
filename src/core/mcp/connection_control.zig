@@ -37,13 +37,16 @@ pub const Control = struct {
         return started;
     }
 
-    /// Fixes the budget a startup timeout reports: the time left before an
-    /// existing deadline, or the configured timeout when there is none yet.
-    /// Fallbacks and restarts inherit the first value.
+    /// Fixes the budget a startup timeout reports: the configured timeout,
+    /// which also caps each startup request, or the time left before an
+    /// earlier deadline. Fallbacks and restarts inherit the first value.
     pub fn withStartupBudget(self: Control, now: std.Io.Clock.Timestamp, timeout_ms: u32) Control {
         if (self.startup_budget_ms != null) return self;
         var budgeted = self;
-        budgeted.startup_budget_ms = if (self.deadline) |deadline| millisUntil(now, deadline) else timeout_ms;
+        budgeted.startup_budget_ms = if (self.deadline) |deadline|
+            @min(millisUntil(now, deadline), timeout_ms)
+        else
+            timeout_ms;
         return budgeted;
     }
 };
@@ -104,6 +107,9 @@ test "startup budget is fixed when the operation starts" {
     try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupBudget(almost, 30_000).startup_budget_ms);
     const spent = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = now.raw.nanoseconds + 3 * std.time.ns_per_s } };
     try std.testing.expectEqual(@as(?u32, 0), caller_deadline.withStartupBudget(spent, 30_000).startup_budget_ms);
+    // Each startup request is also capped by the configured timeout.
+    const long_deadline = Control{ .deadline = startupDeadline(now, 0, .fromSeconds(60)) };
+    try std.testing.expectEqual(@as(?u32, 30_000), long_deadline.withStartupBudget(now, 30_000).startup_budget_ms);
 
     const explicit = Control{ .deadline = caller_deadline.deadline, .startup_budget_ms = 60_000 };
     try std.testing.expectEqual(@as(?u32, 60_000), explicit.startAt(later, 30_000).startup_budget_ms);
