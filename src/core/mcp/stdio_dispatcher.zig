@@ -2665,7 +2665,7 @@ test "MCP stdio records how a child that exits before replying ended and what it
         ),
     );
     const diagnostics = dispatcher.childDiagnostics();
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, diagnostics.term.?);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, diagnostics.term orelse return error.TestExpectedExit);
     try std.testing.expectEqualStrings(
         "npm error code E401\nnpm error Incorrect or missing password.\n",
         diagnostics.stderr.headSlice(),
@@ -2703,7 +2703,7 @@ test "MCP stdio reports a write to a child that closed stdin as a closed connect
     );
     // fx ends a child it can no longer write to; the details still arrive.
     const diagnostics = dispatcher.childDiagnostics();
-    try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, diagnostics.term.?);
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, diagnostics.term orelse return error.TestExpectedExit);
     try std.testing.expectEqualStrings("stdin closed\n", diagnostics.stderr.headSlice());
 }
 

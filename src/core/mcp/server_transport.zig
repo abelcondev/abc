@@ -1263,9 +1263,7 @@ fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCaptur
         try plain.appendSlice(arena, " ... ");
         // The retained tail can begin inside a UTF-8 sequence.
         const tail = capture.tailSlice();
-        var tail_start: usize = 0;
-        while (tail_start < tail.len and (tail[tail_start] & 0xc0) == 0x80) tail_start += 1;
-        try appendWithoutAnsi(arena, &plain, tail[tail_start..]);
+        try appendWithoutAnsi(arena, &plain, tail[text_utils.utf8ForwardBoundary(tail, 0)..]);
     } else {
         const contiguous = try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() });
         try appendWithoutAnsi(arena, &plain, contiguous);
@@ -1393,6 +1391,17 @@ test "server stderr display keeps the first line and the end, bounded and masked
     var hostile: stdio_dispatcher.StderrCapture = .{};
     hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done\x07");
     try std.testing.expectEqualStrings("\\x98\\xa9ok \\xff caf\xc3\xa9 done\\x07", try displayStderr(arena, &hostile));
+
+    // One of these makes the retained tail start inside a two-byte character.
+    for ([_][]const u8{ "z", "zz" }) |suffix| {
+        var split: stdio_dispatcher.StderrCapture = .{};
+        for (0..3_000) |_| split.append("\xc3\xa9");
+        split.append(suffix);
+        try std.testing.expect(split.omitted);
+        const shown = try displayStderr(arena, &split);
+        try std.testing.expect(std.mem.find(u8, shown, "\\x") == null);
+        try std.testing.expect(std.mem.endsWith(u8, shown, suffix));
+    }
 
     var invisible: stdio_dispatcher.StderrCapture = .{};
     invisible.append("rtl \u{202e}txt\u{200b} nel\u{85}");
