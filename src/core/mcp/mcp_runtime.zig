@@ -1320,7 +1320,11 @@ pub const McpRuntime = struct {
         defer server.connection_lock.unlock(io_mod.getIo());
         const names = &self.tool_aliases;
         connectServerCancellable(self, server, names, cancel, null) catch |err| {
-            server.setFailed(self.alloc, @errorName(err));
+            if (server.last_error == null) {
+                server.setFailed(self.alloc, @errorName(err));
+            } else {
+                server.state.store(.failed, .release);
+            }
             return err;
         };
     }
@@ -3306,6 +3310,7 @@ fn connectServerCancellable(
         server.config.startup_timeout_ms,
         timeout_override,
     );
+    const budget = connection_control.startupTimeout(server.config.startup_timeout_ms, timeout_override);
     return server_transport.start(
         runtime.alloc,
         runtime.tool_registry,
@@ -3313,6 +3318,7 @@ fn connectServerCancellable(
         used_tool_names,
         .{
             .deadline = deadline,
+            .startup_budget_ms = std.math.cast(u32, budget.toMilliseconds()) orelse std.math.maxInt(u32),
             .cancel_flag = cancel_requested,
             .lifecycle_cancel_flag = server.cancellation(),
         },
@@ -6918,9 +6924,10 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
-    const timed_out = runtime.servers.items[0].last_error.?;
-    try std.testing.expect(std.mem.startsWith(u8, timed_out, "MCP server did not complete startup within "));
-    try std.testing.expect(std.mem.endsWith(u8, timed_out, " ms (startup_timeout_ms)"));
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 2000 ms (startup_timeout_ms)",
+        runtime.servers.items[0].last_error.?,
+    );
     try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state.load(.acquire));
     try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
 }

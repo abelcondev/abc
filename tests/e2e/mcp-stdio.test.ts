@@ -2387,6 +2387,41 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectProcessesExited(launches);
   }, 30_000);
 
+  test("mcp list still restarts a stdio server whose startup output fx rejects", async () => {
+    const root = createRoot("startup-garbage", LEGACY_FIXTURE, {
+      mode: "startup_garbage",
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
+    // fx ended the child itself, so a fresh launch could behave differently.
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches).toHaveLength(2);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("restarting stdio server after startup failure server=fixture attempt=1");
+    expect(trace).not.toContain("skipping stdio startup restart");
+    await expectProcessesExited(launches);
+  }, 30_000);
+
   for (
     const malformed of [
       { mode: "response_missing_jsonrpc", label: "missing jsonrpc" },

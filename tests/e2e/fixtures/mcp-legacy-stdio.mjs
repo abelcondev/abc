@@ -234,6 +234,11 @@ function handle(message) {
   }
   if (message.method === "initialize") {
     if (startupFailure) return;
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("not json\n");
+      return;
+    }
     if (messageCount !== 1) process.exit(2);
     const requestedVersion = message.params?.protocolVersion;
     if (requestedVersion !== legacyVersion && rejectNewerInitialize) process.exit(5);

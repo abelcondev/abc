@@ -6,6 +6,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const server_auth = @import("server_auth.zig");
 const server_subscriptions = @import("server_subscriptions.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const display_width = @import("../shared/display_width.zig");
 const tool_names = @import("tool_names.zig");
 const tool_catalog = @import("tool_catalog.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -86,8 +87,13 @@ pub fn connectServer(
         .http => return connectServerHttp(alloc, server, tool_registry, used_tool_names, control),
         .stdio => {},
     }
+    // Fallbacks keep the caller's deadline and report this operation's budget.
+    const operation = control.withStartupBudget(
+        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+        server.config.startup_timeout_ms,
+    );
     const attempt_control = connectionAttemptControl(
-        control,
+        operation,
         server.config.startup_timeout_ms,
     );
     try connection_control.check(io_mod.getIo(), attempt_control);
@@ -145,14 +151,14 @@ pub fn connectServer(
         error.McpRequestTimedOut,
         error.McpConnectionClosed,
         => {
-            try connection_control.check(io_mod.getIo(), control);
+            try connection_control.check(io_mod.getIo(), operation);
             return connectServerLegacy(
                 alloc,
                 server,
                 argv.items,
                 tool_registry,
                 used_tool_names,
-                control,
+                operation,
                 .v2024_11_05,
             );
         },
@@ -171,7 +177,7 @@ pub fn connectServer(
             argv.items,
             tool_registry,
             used_tool_names,
-            control,
+            operation,
             version,
         ),
         .unsupported => {
@@ -737,6 +743,7 @@ fn connectServerLegacy(
         control,
         server.config.startup_timeout_ms,
     );
+    const budget_ms = attempt_control.startup_budget_ms orelse server.config.startup_timeout_ms;
     var offered_version = initial_version;
     var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
@@ -745,7 +752,7 @@ fn connectServerLegacy(
         connection_control.check(io_mod.getIo(), attempt_control) catch |err| {
             // The deadline passed between launches; keep the exit that used it up.
             if (err == error.McpRequestTimedOut) publishStartupFailure(alloc, server, .{ .timed_out = .{
-                .budget_ms = server.config.startup_timeout_ms,
+                .budget_ms = budget_ms,
                 .earlier_exit = if (last_exit) |*exit| exit else null,
                 .live = null,
             } });
@@ -793,14 +800,14 @@ fn connectServerLegacy(
                     publishStartupFailure(alloc, server, .{
                         .closed = if (last_exit) |*exit| exit else null,
                     });
-                    return error.McpInitFailed;
+                    return error.McpServerExitedDuringStartup;
                 },
             },
             error.McpRequestTimedOut => {
                 server.state.store(.failed, .release);
                 const live = dispatcher.childDiagnostics();
                 publishStartupFailure(alloc, server, .{ .timed_out = .{
-                    .budget_ms = server.config.startup_timeout_ms,
+                    .budget_ms = budget_ms,
                     .earlier_exit = if (last_exit) |*exit| exit else null,
                     .live = &live,
                 } });
@@ -1045,13 +1052,17 @@ fn connectServerBounded(
     used_tool_names: *tool_names.Registry,
     control: ConnectionControl,
 ) !void {
+    const operation = control.withStartupBudget(
+        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+        server.config.startup_timeout_ms,
+    );
     while (true) {
         connectServer(
             alloc,
             server,
             tool_registry,
             used_tool_names,
-            control,
+            operation,
         ) catch |err| {
             server.tool_catalog.deinit(alloc);
             // A cancelled startup has no session state to flush; kill the
@@ -1062,22 +1073,21 @@ fn connectServerBounded(
                 server.disconnectImmediate();
                 return err;
             }
-            const diagnostics: ?stdio_dispatcher.ChildDiagnostics =
-                if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
             if (err == error.McpRequestTimedOut) {
+                const live: ?stdio_dispatcher.ChildDiagnostics =
+                    if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
                 publishStartupFailure(alloc, server, .{ .timed_out = .{
-                    .budget_ms = server.config.startup_timeout_ms,
+                    .budget_ms = operation.startup_budget_ms orelse server.config.startup_timeout_ms,
                     .earlier_exit = null,
-                    .live = if (diagnostics) |*live| live else null,
+                    .live = if (live) |*value| value else null,
                 } });
             }
             server.disconnect();
             const decision = decideStartupRestart(.{
                 .attempts = server.restart_attempts,
                 .limit = server.config.restart_limit,
-                .deadline_spent = startupDeadlineSpent(control),
-                .child_exited = err == error.McpInitFailed and
-                    diagnostics != null and diagnostics.?.term != null,
+                .deadline_spent = startupDeadlineSpent(operation),
+                .child_exited = err == error.McpServerExitedDuringStartup,
             });
             switch (decision) {
                 .restart => {},
@@ -1118,8 +1128,8 @@ const StartupRestartInput = struct {
     attempts: u8,
     limit: u8,
     deadline_spent: bool,
-    /// Startup failed because the child process exited, after the version
-    /// ladder had already relaunched it at every offered version.
+    /// The server closed its connection at every protocol version the
+    /// ladder offered, so each of those launches already ended.
     child_exited: bool,
 };
 
@@ -1190,10 +1200,8 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
                 try writeTermPhrase(writer, value.term);
                 try writeStderrSuffix(arena, writer, &value.stderr);
             } else if (timeout.live) |value| {
-                if (value.stderr.head_len > 0) {
-                    try writer.writeAll("; last stderr");
-                    try writeStderrSuffix(arena, writer, &value.stderr);
-                }
+                const text = try displayStderr(arena, &value.stderr);
+                if (text.len > 0) try writer.print("; last stderr: {s}", .{text});
             }
         },
     }
@@ -1204,9 +1212,18 @@ fn writeTermPhrase(writer: *std.Io.Writer, term: ?std.process.Child.Term) !void 
     const value = term orelse return writer.writeAll("closed its connection");
     switch (value) {
         .exited => |code| try writer.print("exited with code {d}", .{code}),
-        .signal => |signal| try writer.print("was killed by signal {d}", .{@intFromEnum(signal)}),
-        .stopped => |signal| try writer.print("was stopped by signal {d}", .{@intFromEnum(signal)}),
+        .signal => |signal| try writeSignalPhrase(writer, "was killed by", signal),
+        .stopped => |signal| try writeSignalPhrase(writer, "was stopped by", signal),
         .unknown => |status| try writer.print("ended with status {d}", .{status}),
+    }
+}
+
+/// Targets without POSIX signals, such as WASI, carry no signal number.
+fn writeSignalPhrase(writer: *std.Io.Writer, verb: []const u8, signal: anytype) !void {
+    if (@TypeOf(signal) == void) {
+        try writer.print("{s} a signal", .{verb});
+    } else {
+        try writer.print("{s} signal {d}", .{ verb, @intFromEnum(signal) });
     }
 }
 
@@ -1221,76 +1238,38 @@ fn writeStderrSuffix(
     try writer.writeAll(text);
 }
 
-/// Server stderr is untrusted. Produces one terminal-safe line: escape
-/// sequences removed, control bytes collapsed to single spaces, invalid UTF-8
-/// replaced, secrets masked, and the result bounded head-and-tail.
+/// Server stderr is untrusted. Produces one terminal-safe line: ANSI
+/// sequences dropped, secrets masked, whitespace collapsed and remaining
+/// control or non-printing characters escaped by the shared encoder, and the
+/// result bounded head-and-tail.
 fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCapture) ![]const u8 {
-    var cleaned: std.ArrayList(u8) = .empty;
+    var plain: std.ArrayList(u8) = .empty;
     if (capture.omitted) {
-        try appendTerminalSafe(arena, &cleaned, capture.headSlice());
-        try cleaned.appendSlice(arena, " ... ");
-        try appendTerminalSafe(arena, &cleaned, capture.tailSlice());
+        try appendWithoutAnsi(arena, &plain, capture.headSlice());
+        try plain.appendSlice(arena, " ... ");
+        // The retained tail can begin inside a UTF-8 sequence.
+        const tail = capture.tailSlice();
+        var tail_start: usize = 0;
+        while (tail_start < tail.len and (tail[tail_start] & 0xc0) == 0x80) tail_start += 1;
+        try appendWithoutAnsi(arena, &plain, tail[tail_start..]);
     } else {
         const contiguous = try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() });
-        try appendTerminalSafe(arena, &cleaned, contiguous);
+        try appendWithoutAnsi(arena, &plain, contiguous);
     }
-    const masked = try text_utils.maskSecrets(arena, std.mem.trim(u8, cleaned.items, " "));
+    const masked = try text_utils.maskSecrets(arena, plain.items);
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, std.math.maxInt(usize));
     var out: std.Io.Writer.Allocating = .init(arena);
-    try text_utils.writeHeadTailBounded(&out.writer, masked, stderr_display_bytes, " ... ", .down);
+    try text_utils.writeHeadTailBounded(&out.writer, encoded.bytes, stderr_display_bytes, " ... ", .down);
     return try out.toOwnedSlice();
 }
 
-fn appendTerminalSafe(arena: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
+fn appendWithoutAnsi(arena: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
     var index: usize = 0;
-    // A segment cut from a longer stream can begin inside a UTF-8 sequence.
-    while (index < raw.len and (raw[index] & 0xc0) == 0x80) index += 1;
-    var pending_space = false;
     while (index < raw.len) {
-        const byte = raw[index];
-        if (byte == 0x1b) {
-            index = skipEscapeSequence(raw, index);
-            continue;
-        }
-        if (byte < 0x20 or byte == 0x7f) {
-            pending_space = true;
-            index += 1;
-            continue;
-        }
-        if (pending_space and byte != ' ' and out.items.len > 0 and out.items[out.items.len - 1] != ' ') {
-            try out.append(arena, ' ');
-        }
-        pending_space = false;
-        const sequence_len: usize = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-        if (sequence_len > 0 and index + sequence_len <= raw.len and
-            std.unicode.utf8ValidateSlice(raw[index..][0..sequence_len]))
-        {
-            try out.appendSlice(arena, raw[index..][0..sequence_len]);
-            index += sequence_len;
-        } else {
-            try out.append(arena, '?');
-            index += 1;
-        }
-    }
-}
-
-/// Returns the index just past the ANSI escape sequence at `escape_index`.
-fn skipEscapeSequence(raw: []const u8, escape_index: usize) usize {
-    var index = escape_index + 1;
-    if (index >= raw.len) return index;
-    switch (raw[index]) {
-        '[' => {
-            index += 1;
-            while (index < raw.len and !(raw[index] >= 0x40 and raw[index] <= 0x7e)) index += 1;
-            return @min(index + 1, raw.len);
-        },
-        ']' => {
-            index += 1;
-            while (index < raw.len and raw[index] != 0x07 and raw[index] != 0x1b) index += 1;
-            if (index < raw.len and raw[index] == 0x07) return index + 1;
-            if (index + 1 < raw.len and raw[index] == 0x1b and raw[index + 1] == '\\') return index + 2;
-            return index;
-        },
-        else => return index + 1,
+        const escape = std.mem.findScalarPos(u8, raw, index, 0x1b) orelse raw.len;
+        try out.appendSlice(arena, raw[index..escape]);
+        if (escape == raw.len) return;
+        index = display_width.ansiSequenceEnd(raw, escape);
     }
 }
 
@@ -1361,6 +1340,11 @@ test "startup timeout names its budget and the most useful stderr" {
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
         try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .earlier_exit = null, .live = &silent } }),
     );
+    const blank = testDiagnostics(null, "\n\r\x1b[2K\n");
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
+        try formatStartupFailure(arena, .{ .timed_out = .{ .budget_ms = 50, .earlier_exit = null, .live = &blank } }),
+    );
 }
 
 test "server stderr display keeps the first line and the end, bounded and masked" {
@@ -1388,8 +1372,12 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expect(std.mem.find(u8, masked, "[redacted]") != null);
 
     var hostile: stdio_dispatcher.StderrCapture = .{};
-    hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done");
-    try std.testing.expectEqualStrings("ok ? caf\xc3\xa9 done", try displayStderr(arena, &hostile));
+    hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done\x07");
+    try std.testing.expectEqualStrings("\\x98\\xa9ok \\xff caf\xc3\xa9 done\\x07", try displayStderr(arena, &hostile));
+
+    var invisible: stdio_dispatcher.StderrCapture = .{};
+    invisible.append("rtl \u{202e}txt\u{200b} nel\u{85}");
+    try std.testing.expectEqualStrings("rtl \\u{202e}txt\\u{200b} nel\\u{0085}", try displayStderr(arena, &invisible));
 
     var blank: stdio_dispatcher.StderrCapture = .{};
     blank.append("\n\r\t\x1b[2K");

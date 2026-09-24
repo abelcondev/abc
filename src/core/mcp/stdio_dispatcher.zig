@@ -24,6 +24,7 @@ pub const stderr_head_capacity: usize = 1024;
 pub const stderr_tail_capacity: usize = 3072;
 /// After the child is reaped, how long its stderr may take to reach EOF.
 const stderr_eof_grace_ms: i64 = 100;
+const diagnostics_settle_ms: i64 = 2 * stderr_eof_grace_ms;
 
 /// A bounded record of a child's stderr: the first `stderr_head_capacity`
 /// bytes, then the newest `stderr_tail_capacity` bytes after them. `omitted`
@@ -936,7 +937,7 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if ((mode == .graceful or mode == .forced) and !self.readerIsDone()) {
+        if ((mode == .graceful or mode == .forced) and self.childMayBeRunning()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher requesting child termination generation={d}",
@@ -952,7 +953,7 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if (!self.readerIsDone()) {
+        if (self.childMayBeRunning()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher forcing child termination generation={d}",
@@ -1081,12 +1082,12 @@ pub const StdioDispatcher = struct {
             self.reapChild();
             return;
         }
-        // Reap before failing requests so every waiter that observes the
-        // failure can also read how the child ended and what it printed.
+        // Fail waiters first so no new request writes into the ended child.
+        // childDiagnostics waits for the reap and stderr below.
+        self.failConnection(terminal_error orelse error.McpConnectionClosed);
         terminateChild(self.child_id);
         self.reapChild();
         self.awaitStderrEof();
-        self.failConnection(terminal_error orelse error.McpConnectionClosed);
     }
 
     fn reapChild(self: *StdioDispatcher) void {
@@ -1104,10 +1105,33 @@ pub const StdioDispatcher = struct {
     }
 
     /// Copy of how the child ended (once reaped) and what it wrote to stderr.
+    /// After the connection fails, briefly waits for the reader to record both.
     pub fn childDiagnostics(self: *StdioDispatcher) ChildDiagnostics {
+        const deadline_ms = std.math.add(
+            i64,
+            io_mod.milliTimestamp(),
+            diagnostics_settle_ms,
+        ) catch std.math.maxInt(i64);
+        while (self.diagnosticsPending() and io_mod.milliTimestamp() < deadline_ms) {
+            io_mod.sleep(request_poll_ns);
+        }
         self.state_mutex.lockUncancelable(io_mod.getIo());
         defer self.state_mutex.unlock(io_mod.getIo());
         return self.diagnostics;
+    }
+
+    fn diagnosticsPending(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.state == .failed and !self.reader_done;
+    }
+
+    /// False once the reader has reaped the child, so no signal can reach a
+    /// process group that reused its id.
+    fn childMayBeRunning(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return !self.reader_done and self.diagnostics.term == null;
     }
 
     fn awaitStderrEof(self: *StdioDispatcher) void {
@@ -1639,7 +1663,7 @@ pub const StdioDispatcher = struct {
                 "stdio dispatcher interrupting active writer generation={d}",
                 .{self.generation},
             );
-            terminateChild(self.child_id);
+            if (self.childMayBeRunning()) terminateChild(self.child_id);
             self.write_mutex.lockUncancelable(io_mod.getIo());
         }
         defer self.write_mutex.unlock(io_mod.getIo());
@@ -2714,9 +2738,11 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     defer alloc.free(root);
     const pid_path = try std.fmt.allocPrint(alloc, "{s}/descendant.pid", .{root});
     defer alloc.free(pid_path);
+    // The descendant publishes its pid only after leaving the process group,
+    // and it keeps the inherited stderr pipe open.
     const script = try std.fmt.allocPrint(
         alloc,
-        "perl -MPOSIX -e 'setsid(); sleep 30' </dev/null >/dev/null &\necho $! > \"{s}\"\nexec sleep 30",
+        "perl -MPOSIX -e 'setsid(); open(my $f, \">\", \"$ARGV[0].tmp\") or die; print $f \"$$\\n\"; close $f; rename(\"$ARGV[0].tmp\", $ARGV[0]) or die; sleep 30' \"{s}\" </dev/null >/dev/null &\nexec sleep 30",
         .{pid_path},
     );
     defer alloc.free(script);
@@ -2740,6 +2766,8 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try expectProcessReaped(fixture.pid);
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
+    // Still alive: it escaped the group kill and held stderr the whole time.
+    try std.posix.kill(descendant.?, @enumFromInt(0));
 }
 
 test "MCP immediate shutdown kills an uncooperative child without grace waits" {
