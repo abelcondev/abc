@@ -33,8 +33,9 @@ const Fingerprint = [Sha256.digest_length]u8;
 const Entry = struct {
     fingerprint: ?Fingerprint,
     value: union(enum) { visible: session_store.SessionSummary, excluded: []u8 },
-    /// A stale schema-v3 projection whose committed log could not be
-    /// replayed: listed from its manifest, but opening it fails.
+    /// A stale schema-v3 projection whose committed log failed to replay in
+    /// this listing: listed from its manifest. The failure may be transient,
+    /// so the row is never cached and every listing checks it again.
     unreplayable: bool = false,
 
     fn id(self: Entry) []const u8 {
@@ -399,9 +400,9 @@ fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
 pub const ActionableSessionCatalog = struct {
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
     skipped_invalid: usize = 0,
-    /// Owned ids of listed sessions that cannot be opened because their stale
-    /// schema-v3 log could not be replayed. Such rows are never cached, so
-    /// every listing observes them afresh.
+    /// Owned ids of listed sessions whose stale schema-v3 log failed to replay
+    /// in this listing. Such rows are never cached, so every listing observes
+    /// them afresh.
     unreplayable_ids: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {

@@ -1200,8 +1200,8 @@ pub const Store = struct {
     /// Resumes the newest resumable session in `workspace_root`, taking
     /// candidates in the order and with the workspace filter of the index
     /// page `fx session last` reads. A listed session whose stale schema-v3
-    /// log could not be replayed cannot be opened, so it is skipped without
-    /// opening and counted as unreadable. A candidate that disappears or
+    /// log failed to replay in this listing is skipped without a second replay
+    /// and counted as unreadable. A candidate that disappears or
     /// moves to another workspace between selection and open yields to the
     /// next newest, up to `max_latest_selection_retries`. Every other
     /// failure, including a busy session, is returned.
@@ -1890,9 +1890,9 @@ pub const Store = struct {
         };
     }
 
-    /// Listing's read of one session: a stale schema-v3 projection is
-    /// summarized from its committed log. The caller owns the candidate. No
-    /// directory handle escapes this read.
+    /// Listing's read of one session: a schema-v3 session whose projection is
+    /// stale, missing, or unreadable is summarized from its committed log. The
+    /// caller owns the candidate. No directory handle escapes this read.
     pub fn readOnlyCandidate(
         self: Store,
         alloc: Allocator,
@@ -1904,10 +1904,18 @@ pub const Store = struct {
         }
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
-        var candidate = try if (cancelled) |stop|
+        const classified = if (cancelled) |stop|
             discovery.classifyReadOnlyCandidateCancellable(alloc, &dir, session_id, stop)
         else
             classifyReadOnlyCandidate(alloc, &dir, session_id);
+        var candidate = classified catch |err| switch (err) {
+            error.OutOfMemory,
+            error.Cancelled,
+            error.UnsupportedSessionSchema,
+            error.SessionAuthorityBoundaryUnavailable,
+            => return err,
+            else => (try discovery.recoverSchemaV3Candidate(alloc, &dir, session_id, cancelled)) orelse return err,
+        };
         errdefer candidate.deinit(alloc);
         try discovery.summarizeStaleProjection(alloc, &dir, &candidate, cancelled);
         return candidate;
@@ -7874,6 +7882,55 @@ test "a stale schema-v3 projection lists and resumes from its committed log" {
     try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
 }
 
+test "a schema-v3 session with a lost manifest lists and resumes from its committed log" {
+    const alloc = std.testing.allocator;
+    const Mutation = enum { missing, bad, unsupported };
+    for (std.enums.values(Mutation)) |mutation| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try writeSchemaV3Fixture(alloc, ctx.store, "older", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 30,
+            .stale_projection = false,
+        });
+        try writeSchemaV3Fixture(alloc, ctx.store, "recover", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 50,
+            .stale_projection = false,
+        });
+        {
+            var dir = try ctx.store.openSessionDir("recover");
+            defer dir.close();
+            switch (mutation) {
+                .missing => try dir.dir.deleteFile(std.testing.io, "session.json"),
+                .bad => try io_mod.durableReplaceVerified(alloc, &dir, "session.json", "{\"schema_version\":3}"),
+                .unsupported => try io_mod.durableReplaceVerified(alloc, &dir, "session.json", "{\"schema_version\":99}"),
+            }
+        }
+        // The committed log is the authority, so a lost or unreadable manifest
+        // is recovered from it; an unsupported manifest is not.
+        const recoverable = mutation != .unsupported;
+        {
+            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+            defer catalog.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, if (recoverable) 2 else 1), catalog.summaries.items.len);
+            try std.testing.expectEqual(@as(usize, if (recoverable) 0 else 1), catalog.skipped_invalid);
+            if (recoverable) {
+                try std.testing.expectEqualStrings("recover", catalog.summaries.items[0].id);
+                try std.testing.expectEqual(@as(i64, 50), catalog.summaries.items[0].updated_at_ms);
+                try std.testing.expectEqualStrings(ctx.workspace, catalog.summaries.items[0].workspace_root.?);
+            }
+        }
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings(if (recoverable) "recover" else "older", resumed.active_id);
+    }
+}
+
 test "latest resume skips a stale session whose log cannot be replayed" {
     const alloc = std.testing.allocator;
     for ([_]bool{ true, false }) |with_readable| {
@@ -7905,8 +7962,8 @@ test "latest resume skips a stale session whose log cannot be replayed" {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
             defer catalog.deinit(alloc);
             try std.testing.expectEqualStrings("broken", catalog.summaries.items[0].id);
-            // Listing knows the session cannot be opened, so latest resume
-            // skips it without replaying the log again.
+            // Listing saw the replay fail, so latest resume skips the session
+            // without replaying the log again.
             try std.testing.expect(catalog.isUnreplayable("broken"));
             try std.testing.expect(!catalog.isUnreplayable("readable"));
         }

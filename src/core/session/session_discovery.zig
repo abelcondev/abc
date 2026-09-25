@@ -478,6 +478,66 @@ fn classifySchemaV3Candidate(
     };
 }
 
+/// Listing's recovery of a schema-v3 session whose manifest is missing or
+/// cannot be read: its committed log is the authority, so the summary is
+/// replayed from it, as latest selection always did. Returns null when the
+/// session is not schema-v3 or its log cannot be replayed either, leaving the
+/// caller to report the classification error.
+pub fn recoverSchemaV3Candidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?ReadOnlyCandidate {
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) return null;
+    const route = classifyAuthority(alloc, session_dir, session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (route != .schema_v3) return null;
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    var replay = migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer replay.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const state = &replay.state;
+    const id = try alloc.dupe(u8, session_id);
+    errdefer mem_utils.free(alloc, id);
+    const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
+    const workspace_root = try alloc.dupe(u8, state.workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
+    var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
+    if (display.origin_workspace_root) |root| {
+        alloc.free(root);
+        display.origin_workspace_root = null;
+    }
+    debug_trace.logf("session", "schema_v3 manifest unreadable id={s}; listing from the committed log", .{session_id});
+    return .{
+        .summary = .{
+            .id = id,
+            .workspace_root = workspace_root,
+            .origin_workspace_root = origin_workspace_root,
+            .title = display.title,
+            .preview = display.preview,
+            .display_metadata_present = display.present,
+            .created_at_ms = state.created_at_ms,
+            .updated_at_ms = state.updated_at_ms,
+            .conversation_language = state.conversation_language,
+            .history_len = state.history.len,
+        },
+        .storage = .schema_v3,
+        .projection_state = .replayed,
+        .subagent_child = state.subagent_child,
+    };
+}
+
 /// Listing's summary of a stale schema-v3 projection: a stale manifest carries
 /// the wrong workspace and recency, so the summary is replaced by one replayed
 /// from the committed log, and the child identity comes from its first event.

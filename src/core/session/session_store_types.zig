@@ -30,8 +30,8 @@ pub const CandidateStorage = enum {
 pub const ProjectionState = enum {
     current,
     stale,
-    /// The projection lagged its log, and the summary came from replaying
-    /// the committed log instead.
+    /// The projection lagged its log or could not be read, and the summary
+    /// came from replaying the committed log instead.
     replayed,
     missing,
     invalid,
