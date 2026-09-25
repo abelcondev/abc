@@ -1145,6 +1145,16 @@ pub const McpRuntime = struct {
         return .{ .servers = servers };
     }
 
+    /// True when the named server is down with a recorded failure, which a
+    /// tool search naming it reports to the model.
+    pub fn hasRecordedFailure(self: *McpRuntime, name: []const u8) bool {
+        const server = self.acquireServer(name) orelse return false;
+        defer server.lifetime.release(io_mod.getIo());
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        return server.state.load(.acquire) == .failed and server.last_error != null;
+    }
+
     pub fn requiredStartupFailure(
         self: *McpRuntime,
         alloc: Allocator,
@@ -1320,7 +1330,11 @@ pub const McpRuntime = struct {
         defer server.connection_lock.unlock(io_mod.getIo());
         const names = &self.tool_aliases;
         connectServerCancellable(self, server, names, cancel, null) catch |err| {
-            server.setFailed(self.alloc, @errorName(err));
+            if (server.last_error == null) {
+                server.setFailed(self.alloc, @errorName(err));
+            } else {
+                server.state.store(.failed, .release);
+            }
             return err;
         };
     }
@@ -3301,21 +3315,20 @@ fn connectServerCancellable(
     cancel_requested: *std.atomic.Value(bool),
     timeout_override: ?std.Io.Duration,
 ) !void {
-    const deadline = startupDeadline(
-        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-        server.config.startup_timeout_ms,
-        timeout_override,
-    );
+    // Fix the span from the same instant as the deadline so later work,
+    // such as loading stored credentials, cannot shave it.
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const control = (connection_control.Control{
+        .deadline = startupDeadline(now, server.config.startup_timeout_ms, timeout_override),
+        .cancel_flag = cancel_requested,
+        .lifecycle_cancel_flag = server.cancellation(),
+    }).withStartupSpan(now, server.config.startup_timeout_ms);
     return server_transport.start(
         runtime.alloc,
         runtime.tool_registry,
         server,
         used_tool_names,
-        .{
-            .deadline = deadline,
-            .cancel_flag = cancel_requested,
-            .lifecycle_cancel_flag = server.cancellation(),
-        },
+        control,
     ) catch |err| switch (err) {
         error.McpRequestTimedOut => error.McpConnectionTimedOut,
         else => err,
@@ -5503,6 +5516,35 @@ test "server_transport.connectServer completes NDJSON handshake against a real s
     try expectTestProcessExited(grandchild_pid);
 }
 
+test "server_transport.connectServer keeps the restart when discovery stalled before the legacy launch exited" {
+    const alloc = std.testing.allocator;
+    // Ignores the modern discovery probe, then exits on the legacy initialize.
+    const shell_server =
+        \\IFS= read -r line
+        \\case "$line" in
+        \\  *'"method":"server/discover"'*) exec sleep 30 ;;
+        \\esac
+        \\printf 'npm error code E401\n' >&2
+        \\exit 3
+    ;
+    var config = try shellMcpConfigForTest(alloc, "stalled", shell_server);
+    config.startup_timeout_ms = 400;
+    var server = McpServer{ .config = config };
+    defer server.deinit(alloc);
+    var used = tool_names.Registry.init(alloc);
+    defer used.deinit();
+
+    // Not every launch ended on its own, so this is not the no-restart error.
+    try std.testing.expectError(
+        error.McpInitFailed,
+        server_transport.connectServer(alloc, &server, .{}, &used, .{}),
+    );
+    try std.testing.expectEqualStrings(
+        "MCP server exited with code 3 before completing startup: npm error code E401",
+        server.last_error.?,
+    );
+}
+
 test "server_transport.connectServer discovers and calls a modern NDJSON tool" {
     const alloc = std.testing.allocator;
     const shell_server =
@@ -6918,7 +6960,11 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
-    try std.testing.expectEqualStrings("McpConnectionTimedOut", runtime.servers.items[0].last_error.?);
+    // The private override, not startup_timeout_ms, set this limit.
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 2000 ms",
+        runtime.servers.items[0].last_error.?,
+    );
     try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state.load(.acquire));
     try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
 }
@@ -8028,6 +8074,13 @@ test "scoped MCP authentication rendering excludes denied servers" {
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "DENIED_SECRET_ENV") != null);
+
+    // A scoped caller cannot learn why a denied server is down either.
+    runtime.servers.items[1].setFailed(alloc, "MCP server exited with code 1 before completing startup");
+    try std.testing.expect(try renderServerFailure(alloc, runtime.servers.items, &scoped, "denied") == null);
+    const failure = (try renderServerFailure(alloc, runtime.servers.items, &root, "denied")).?;
+    defer alloc.free(failure);
+    try std.testing.expect(std.mem.find(u8, failure, "exited with code 1 before completing startup") != null);
 }
 
 test "MCP server instructions are captured from initialize and exposed only when present" {
@@ -8484,6 +8537,7 @@ test "configuration reload cleans up every allocation failure without opening a 
 
 const boundedEncodedScalar = tool_search.boundedEncodedScalar;
 const renderAuthenticationRequired = tool_search.renderAuthenticationRequired;
+const renderServerFailure = tool_search.renderServerFailure;
 
 const digestResources = feature_catalog_runtime.digestResources;
 

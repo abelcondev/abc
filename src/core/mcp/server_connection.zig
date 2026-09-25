@@ -113,6 +113,9 @@ pub const Server = struct {
     reload_pending: std.atomic.Value(bool) = .init(false),
     state: atomic_value.Value(ServerState) = .init(.disconnected),
     last_error: ?[]u8 = null,
+    /// Counts setFailed calls so a caller can tell whether a failure was
+    /// recorded after it read the count. Guarded by status_lock.
+    failure_serial: u64 = 0,
     instructions: ?[]u8 = null,
     negotiated_server_name: ?[]u8 = null,
     negotiated_server_version: ?[]u8 = null,
@@ -251,7 +254,14 @@ pub const Server = struct {
         defer self.status_lock.unlock(io_mod.getIo());
         if (self.last_error) |old| alloc.free(old);
         self.last_error = alloc.dupe(u8, msg) catch null;
+        self.failure_serial +%= 1;
         self.state.store(.failed, .release);
+    }
+
+    pub fn failureSerial(self: *Server) u64 {
+        self.status_lock.lockUncancelable(io_mod.getIo());
+        defer self.status_lock.unlock(io_mod.getIo());
+        return self.failure_serial;
     }
 
     pub fn setReady(self: *Server, alloc: Allocator, observed_at_ms: u64) void {
