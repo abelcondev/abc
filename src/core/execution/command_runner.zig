@@ -53,6 +53,10 @@ const pending_output_flush_bytes: usize = 4096;
 /// as output arrives, so this bounds only how long a silent command takes to
 /// observe a cancel or force-kill request.
 const capture_stop_poll_ms: i64 = 20;
+/// How long capture keeps reading after a command finishes naturally. Its
+/// session has been stopped by then, so only a detached daemon that kept the
+/// output pipe open can delay end of file.
+const natural_completion_output_drain_ms: i64 = 1_000;
 pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
@@ -457,25 +461,23 @@ const CompletedTargetCleanup = struct {
     }
 };
 
-/// Stops what a naturally completed command left in its session or on its
-/// output pipes. Daemons that moved to their own session and released the
-/// output keep running, so background servers that tools start survive
-/// between calls. Cancellation, timeout, and owner loss still stop them.
+/// Stops what a naturally completed command left in its session. Daemons
+/// that moved to their own session keep running, so background servers that
+/// tools start survive between calls. Cancellation, timeout, and owner loss
+/// still stop them.
 fn cleanupCompletedForegroundTarget(
     descendants: *process_tree.Tracker,
     target_pid: std.posix.pid_t,
 ) !CompletedTargetCleanup {
-    const boundary: ?process_tree.CommandBoundary =
-        process_tree.CommandBoundary.ofSupervisor() catch |err| blk: {
-            debug_trace.logf(
-                "core",
-                "captured command boundary unavailable err={s}; stopping every tracked descendant",
-                .{@errorName(err)},
-            );
-            break :blk null;
-        };
-    const boundary_ref: ?*const process_tree.CommandBoundary =
-        if (boundary) |*value| value else null;
+    // The supervisor leads the command's session after its bootstrap setsid.
+    const command_session: ?std.posix.pid_t = process_tree.currentSession() catch |err| blk: {
+        debug_trace.logf(
+            "core",
+            "captured command session unavailable err={s}; stopping every tracked descendant",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
     const started_ms = io_mod.milliTimestamp();
     var cleanup: CompletedTargetCleanup = .{};
     var empty_scans: u8 = 0;
@@ -483,8 +485,8 @@ fn cleanupCompletedForegroundTarget(
         foreground_target_cleanup_wait_ms)
     {
         try refreshForegroundTargetTree(descendants, target_pid);
-        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, boundary_ref));
-        if (descendants.anyAttachedAlive(boundary_ref)) {
+        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+        if (descendants.anyAttachedAlive(command_session)) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
@@ -493,7 +495,7 @@ fn cleanupCompletedForegroundTarget(
         io_mod.sleep(std.time.ns_per_ms);
     }
     try refreshForegroundTargetTree(descendants, target_pid);
-    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, boundary_ref));
+    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
     return cleanup;
 }
 
@@ -2403,6 +2405,7 @@ fn collectOutput(
     var force_kill_sent = false;
     var streams_finished = false;
     var output_incomplete = false;
+    var natural_completion_ms: ?i64 = null;
 
     while (true) {
         try updateTerminationSignal(
@@ -2418,6 +2421,7 @@ fn collectOutput(
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
+                if (source.* == .natural) natural_completion_ms = io_mod.milliTimestamp();
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2455,6 +2459,16 @@ fn collectOutput(
                 &output_incomplete,
                 "termination_settle_deadline",
                 error.Timeout,
+            );
+            break;
+        }
+        if (!streams_finished and source.* == .natural and
+            naturalOutputDrainExpired(natural_completion_ms, now_ms))
+        {
+            debug_trace.logf(
+                "core",
+                "captured command output drain stopped after natural completion; a detached process still holds the output",
+                .{},
             );
             break;
         }
@@ -2532,6 +2546,12 @@ fn collectOutput(
         .source = source.*,
         .output_incomplete = output_incomplete,
     };
+}
+
+fn naturalOutputDrainExpired(natural_completion_ms: ?i64, now_ms: i64) bool {
+    const completed_ms = natural_completion_ms orelse return false;
+    return now_ms >= completed_ms and
+        now_ms - completed_ms >= natural_completion_output_drain_ms;
 }
 
 fn recordMultiReaderFailure(
@@ -4827,7 +4847,7 @@ test "natural command completion keeps a double-forked daemon and its children" 
     }
 }
 
-test "natural command completion stops a detached process that keeps command output" {
+test "natural command completion returns while a detached daemon keeps command output" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -4837,9 +4857,8 @@ test "natural command completion stops a detached process that keeps command out
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "output-holder.pid" });
     defer alloc.free(pid_path);
-    // The child leaves the session and redirects its standard streams but
-    // keeps a duplicate of the output pipe on a high descriptor. Keeping it
-    // alive would leave the capture waiting for end of file.
+    // The daemon keeps a duplicate of the output pipe on a high descriptor,
+    // so end of file never arrives while it runs.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
@@ -4855,7 +4874,8 @@ test "natural command completion stops a detached process that keeps command out
             " time.sleep(30)\n" ++
             " os._exit(0)\n" ++
             "os.close(ready_w)\n" ++
-            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"BEFORE-EXIT\", flush=True)'",
         .{pid_path},
     );
     defer alloc.free(command);
@@ -4866,14 +4886,77 @@ test "natural command completion stops a detached process that keeps command out
         .timeout_ms = 10_000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 5_000);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "BEFORE-EXIT") != null);
+    try std.testing.expect(elapsed_ms >= natural_completion_output_drain_ms);
+    try std.testing.expect(elapsed_ms < 5_000);
 
     const pids = try readPidsForTest(alloc, pid_path);
     defer alloc.free(pids);
     defer stopProcessesForTest(pids);
     try std.testing.expectEqual(@as(usize, 1), pids.len);
-    try expectProcessGone(pids[0]);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural command completion keeps a detached daemon that hides its descriptors" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
+    defer alloc.free(pid_path);
+    // Like ssh-agent, the daemon turns off Linux process inspection, then it
+    // closes every descriptor. Neither may decide whether it survives.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import ctypes,os,sys,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if sys.platform.startswith(\"linux\"): ctypes.CDLL(None).prctl(4,0,0,0,0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\")\n" ++
+            " os.closerange(0,65536)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(0.1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural completion output drain ends one bounded window after the command" {
+    try std.testing.expect(!naturalOutputDrainExpired(null, 5_000));
+    try std.testing.expect(!naturalOutputDrainExpired(1_000, 1_000));
+    try std.testing.expect(!naturalOutputDrainExpired(
+        1_000,
+        1_000 + natural_completion_output_drain_ms - 1,
+    ));
+    try std.testing.expect(naturalOutputDrainExpired(
+        1_000,
+        1_000 + natural_completion_output_drain_ms,
+    ));
+    try std.testing.expect(!naturalOutputDrainExpired(2_000, 1_000));
 }
 
 /// Reads whitespace-separated PIDs. The caller owns the returned slice.
