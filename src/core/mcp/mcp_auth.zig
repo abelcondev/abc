@@ -1636,7 +1636,7 @@ fn request_bridged_authorization(
     const endpoint = if (fixture) try std.fmt.allocPrint(alloc, "{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
     defer if (fixture) alloc.free(endpoint);
     if (!std.mem.eql(u8, authorization.endpoint, endpoint)) return error.InvalidSlackAuthorizationEndpoint;
-    const expected_resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
+    const expected_resource = if (fixture) try std.fmt.allocPrint(alloc, "{s}/", .{origin}) else "https://mcp.slack.com/";
     defer if (fixture) alloc.free(expected_resource);
     if (!std.mem.eql(u8, authorization.resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
     const scope = authorization.scope orelse return error.InvalidSlackBridgeConfiguration;
