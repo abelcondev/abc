@@ -53,10 +53,16 @@ const pending_output_flush_bytes: usize = 4096;
 /// as output arrives, so this bounds only how long a silent command takes to
 /// observe a cancel or force-kill request.
 const capture_stop_poll_ms: i64 = 20;
-/// How long capture keeps reading after a command finishes naturally. Its
-/// session has been stopped by then, so only a detached daemon that kept the
-/// output pipe open can delay end of file.
-const natural_completion_output_drain_ms: i64 = 1_000;
+/// After a command finishes on its own, capture keeps reading its leftover
+/// output until the pipes have been quiet for this long in total. Time spent
+/// delivering output to callbacks does not count, so a slow consumer still
+/// receives everything. Only a detached daemon that kept a pipe open can keep
+/// the pipes from reaching end of file.
+const natural_completion_quiet_ms: i64 = 1_000;
+/// Output capture may read after a natural completion before treating the
+/// stream as a detached writer. A finished command can leave at most one pipe
+/// buffer per stream behind, and Linux lets a pipe grow to 1 MiB by default.
+const natural_completion_drain_max_bytes: usize = 4 * 1024 * 1024;
 pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
@@ -316,6 +322,8 @@ const ChildWaiter = struct {
     io: std.Io,
     ready: std.atomic.Value(bool) = .init(false),
     result: std.process.Child.WaitError!std.process.Child.Term = undefined,
+    /// When the wait returned. Valid once `ready` is observed.
+    completed_ms: i64 = 0,
     future: ?std.Io.Future(void) = null,
 
     fn init(child: *std.process.Child) ChildWaiter {
@@ -335,6 +343,7 @@ const ChildWaiter = struct {
 
     fn waitMain(self: *ChildWaiter) void {
         self.result = self.child.wait(self.io);
+        self.completed_ms = io_mod.milliTimestamp();
         self.ready.store(true, .release);
     }
 
@@ -2406,27 +2415,18 @@ fn collectOutput(
     var force_kill_sent = false;
     var streams_finished = false;
     var output_incomplete = false;
-    var natural_completion_ms: ?i64 = null;
+    var natural_drain: ?NaturalDrain = null;
+    var last_read_had_output = false;
 
     while (true) {
-        // A command that already finished on its own is never reclassified
-        // or signaled; a later cancel or deadline only ends the drain.
-        if (natural_completion_ms == null) {
-            try updateTerminationSignal(
-                observer,
-                process_group_id,
-                termination_protocol,
-                cfg,
-                started_ms,
-                source,
-                &signal_started_ms,
-                &force_kill_sent,
-            );
-        }
+        // Observe the leader before any deadline or cancel so a command that
+        // already exited on its own is never signaled or reclassified.
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
-                if (source.* == .natural) natural_completion_ms = io_mod.milliTimestamp();
+                if (source.* == .natural) {
+                    natural_drain = .{ .completed_ms = observer.waiter.completed_ms };
+                }
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2444,6 +2444,18 @@ fn collectOutput(
                     }
                 }
             }
+        }
+        if (natural_drain == null) {
+            try updateTerminationSignal(
+                observer,
+                process_group_id,
+                termination_protocol,
+                cfg,
+                started_ms,
+                source,
+                &signal_started_ms,
+                &force_kill_sent,
+            );
         }
 
         const now_ms = io_mod.milliTimestamp();
@@ -2467,18 +2479,26 @@ fn collectOutput(
             );
             break;
         }
-        if (!streams_finished and naturalOutputDrainFinished(
-            natural_completion_ms,
-            now_ms,
-            cancelRequested(cfg.cancel_flag),
-            deadline_ms,
-        )) {
-            debug_trace.logf(
-                "core",
-                "captured command output drain stopped after natural completion; another process still holds the output",
-                .{},
-            );
-            break;
+        if (natural_drain) |drain| {
+            const stop = if (streams_finished)
+                .none
+            else
+                drain.stop(now_ms, cancelRequested(cfg.cancel_flag), deadline_ms);
+            if (stop != .none) {
+                debug_trace.logf(
+                    "core",
+                    "captured command output drain stopped after natural completion reason={s} bytes={d} quiet_ms={d}",
+                    .{ @tagName(stop), drain.bytes, drain.quiet_ms },
+                );
+                if (stop != .quiet and last_read_had_output) {
+                    recordOutputDrainFailure(
+                        &output_incomplete,
+                        @tagName(stop),
+                        error.OutputDrainInterrupted,
+                    );
+                }
+                break;
+            }
         }
 
         if (streams_finished) {
@@ -2493,13 +2513,18 @@ fn collectOutput(
             continue;
         }
 
+        const fill_started_ms = io_mod.milliTimestamp();
         const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = capture_stop_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
             error.Timeout => true,
             else => |e| blk: {
-                if (source.* != .natural or cancelRequested(cfg.cancel_flag)) return e;
+                if (source.* != .natural or
+                    (natural_drain == null and cancelRequested(cfg.cancel_flag)))
+                {
+                    return e;
+                }
                 recordOutputDrainFailure(
                     &output_incomplete,
                     "reader_coordination",
@@ -2511,6 +2536,11 @@ fn collectOutput(
 
         const stdout_buf = stdout_r.buffered();
         const stderr_buf = stderr_r.buffered();
+        const read_len = stdout_buf.len + stderr_buf.len;
+        last_read_had_output = read_len > 0;
+        if (natural_drain) |*drain| {
+            drain.record(read_len, io_mod.milliTimestamp() - fill_started_ms);
+        }
         if (stdout_buf.len > 0) {
             try emitter.append(arena, output, .stdout, stdout_buf, cfg);
             stdout_r.tossBuffered();
@@ -2523,7 +2553,9 @@ fn collectOutput(
             }
             stderr_r.tossBuffered();
         }
-        if (emitter.presentation_suppressed and cancelRequested(cfg.cancel_flag)) {
+        if (natural_drain == null and emitter.presentation_suppressed and
+            cancelRequested(cfg.cancel_flag))
+        {
             return error.Cancelled;
         }
         if (source.* == .natural) {
@@ -2553,27 +2585,47 @@ fn collectOutput(
     return .{
         .source = source.*,
         .output_incomplete = output_incomplete,
-        .natural_completion_ms = natural_completion_ms,
+        .natural_completion_ms = if (natural_drain) |drain| drain.completed_ms else null,
     };
 }
 
-/// After a natural completion, capture reads leftover output until end of
-/// file, the drain window closes, the caller cancels, or the command's
-/// deadline passes, whichever comes first.
-fn naturalOutputDrainFinished(
-    natural_completion_ms: ?i64,
-    now_ms: i64,
-    cancel_requested: bool,
-    deadline_ms: ?i64,
-) bool {
-    const completed_ms = natural_completion_ms orelse return false;
-    if (cancel_requested) return true;
-    if (deadline_ms) |deadline| {
-        if (now_ms >= deadline) return true;
+/// Leftover-output drain after a command finishes on its own.
+const NaturalDrain = struct {
+    completed_ms: i64,
+    quiet_ms: i64 = 0,
+    bytes: usize = 0,
+
+    const Stop = enum {
+        none,
+        quiet,
+        cancelled,
+        deadline,
+        byte_limit,
+    };
+
+    /// Records one read. Only waits that produced no output count as quiet.
+    fn record(self: *NaturalDrain, read_len: usize, waited_ms: i64) void {
+        self.bytes +|= read_len;
+        if (read_len == 0) self.quiet_ms +|= @max(waited_ms, 0);
     }
-    return now_ms >= completed_ms and
-        now_ms - completed_ms >= natural_completion_output_drain_ms;
-}
+
+    /// Reading ends at end of file, after enough quiet, on a cancel, at the
+    /// deadline, or once the byte budget shows a detached writer.
+    fn stop(
+        self: NaturalDrain,
+        now_ms: i64,
+        cancel_requested: bool,
+        deadline_ms: ?i64,
+    ) Stop {
+        if (cancel_requested) return .cancelled;
+        if (deadline_ms) |deadline| {
+            if (now_ms >= deadline) return .deadline;
+        }
+        if (self.bytes >= natural_completion_drain_max_bytes) return .byte_limit;
+        if (self.quiet_ms >= natural_completion_quiet_ms) return .quiet;
+        return .none;
+    }
+};
 
 fn recordMultiReaderFailure(
     multi_reader: *const std.Io.File.MultiReader,
@@ -4912,7 +4964,7 @@ test "natural command completion returns while a detached daemon keeps command o
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "BEFORE-EXIT") != null);
-    try std.testing.expect(elapsed_ms >= natural_completion_output_drain_ms);
+    try std.testing.expect(elapsed_ms >= natural_completion_quiet_ms);
     try std.testing.expect(elapsed_ms < 5_000);
 
     const pids = try readPidsForTest(alloc, pid_path);
@@ -4968,16 +5020,104 @@ test "natural command completion keeps a detached daemon that hides its descript
     try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
 }
 
-test "natural completion output drain ends at its window, a cancel, or the deadline" {
-    const window_end = 1_000 + natural_completion_output_drain_ms;
-    try std.testing.expect(!naturalOutputDrainFinished(null, 5_000, true, 0));
-    try std.testing.expect(!naturalOutputDrainFinished(1_000, 1_000, false, null));
-    try std.testing.expect(!naturalOutputDrainFinished(1_000, window_end - 1, false, null));
-    try std.testing.expect(naturalOutputDrainFinished(1_000, window_end, false, null));
-    try std.testing.expect(!naturalOutputDrainFinished(2_000, 1_000, false, null));
-    try std.testing.expect(naturalOutputDrainFinished(1_000, 1_001, true, null));
-    try std.testing.expect(naturalOutputDrainFinished(1_000, 1_500, false, 1_500));
-    try std.testing.expect(!naturalOutputDrainFinished(1_000, 1_499, false, 1_500));
+test "natural completion drain counts only quiet waits and stops on cancel, deadline, or budget" {
+    var drain: NaturalDrain = .{ .completed_ms = 1_000 };
+    // Slow delivery with output does not count toward the quiet limit.
+    drain.record(4096, 5_000);
+    try std.testing.expectEqual(@as(i64, 0), drain.quiet_ms);
+    try std.testing.expectEqual(NaturalDrain.Stop.none, drain.stop(9_000, false, null));
+
+    drain.record(0, natural_completion_quiet_ms - 1);
+    try std.testing.expectEqual(NaturalDrain.Stop.none, drain.stop(9_000, false, null));
+    drain.record(0, 1);
+    try std.testing.expectEqual(NaturalDrain.Stop.quiet, drain.stop(9_000, false, null));
+
+    var busy: NaturalDrain = .{ .completed_ms = 1_000 };
+    busy.record(0, -5);
+    try std.testing.expectEqual(@as(i64, 0), busy.quiet_ms);
+    try std.testing.expectEqual(NaturalDrain.Stop.cancelled, busy.stop(1_001, true, null));
+    try std.testing.expectEqual(NaturalDrain.Stop.deadline, busy.stop(1_500, false, 1_500));
+    try std.testing.expectEqual(NaturalDrain.Stop.none, busy.stop(1_499, false, 1_500));
+    busy.record(natural_completion_drain_max_bytes, 0);
+    try std.testing.expectEqual(NaturalDrain.Stop.byte_limit, busy.stop(1_499, false, null));
+}
+
+const SlowOutputConsumer = struct {
+    delay_ms: u64,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, _: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+    }
+};
+
+test "natural completion delivers all leftover output to a slow consumer" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The command exits with its last lines still in the pipe, and delivery
+    // takes 10 ms per line, so draining them takes well over one second.
+    var consumer = SlowOutputConsumer{ .delay_ms = 10 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 30_000,
+        .output_chunk_ctx = @ptrCast(&consumer),
+        .on_output_chunk = SlowOutputConsumer.onChunk,
+    }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(usize, 20_000), command_result.stdout_bytes);
+    try std.testing.expect(!command_result.output_incomplete);
+}
+
+test "natural command completion stops a same-session process that left the process group" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "own-group.pid" });
+    defer alloc.free(pid_path);
+    // A process group kill cannot reach this child, so only the session
+    // rule stops it.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setpgid(0,0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try expectProcessGone(pids[0]);
 }
 
 test "natural completion keeps its exit when the deadline passes during the output drain" {
