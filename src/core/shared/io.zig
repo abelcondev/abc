@@ -207,9 +207,9 @@ fn openExistingRegularFileWithPolicy(
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
-    // The metadata check applies the opened-file policy: an atomic
-    // replacement can unlink the file between this stat and the open, and a
-    // read-only open accepts that snapshot.
+    // A lookup that races an atomic replacement can return the replaced file
+    // after its last link is gone. Apply the opened-file policy, so a
+    // read-only open accepts that snapshot as the check after the open does.
     try verifyOpenedRegularFileWithPolicy(initial, policy);
 
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
@@ -328,6 +328,37 @@ test "read-only regular files remain valid when atomic replacement unlinks the d
     const bytes = try readFileToEnd(alloc, &file, 16);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("old", bytes);
+}
+
+test "read-only opens accept a file that a concurrent atomic replacement unlinks" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "target", .data = "v" });
+    const Replacer = struct {
+        dir: std.Io.Dir,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.dir.writeFile(getIo(), .{ .sub_path = "next", .data = "v" }) catch return;
+                self.dir.rename("next", self.dir, "target", getIo()) catch return;
+            }
+        }
+    };
+    var replacer: Replacer = .{ .dir = tmp.dir };
+    const thread = try std.Thread.spawn(.{}, Replacer.run, .{&replacer});
+    defer {
+        replacer.stop.store(true, .release);
+        thread.join();
+    }
+    // Some lookups see the replaced file after its last link is gone.
+    for (0..5000) |_| {
+        var file = try openExistingRegularFile(tmp.dir, "target", .read_only);
+        file.close(getIo());
+    }
 }
 
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {
