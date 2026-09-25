@@ -2638,6 +2638,9 @@ const NaturalDrain = struct {
         self.bytes +|= read_len;
         self.waited_ns +|= @max(waited_ns, 0);
         if (timed_out) self.leftover_read = true;
+        // A read that returns nothing without timing out ended one stream,
+        // which settles nothing about the other, so confirmation starts over.
+        if (read_len == 0) self.confirming = false;
     }
 
     /// Reading ends at end of file, at the wait limit, on a cancel, at the
@@ -5077,7 +5080,15 @@ test "natural completion drain counts every wait and cuts output only before the
     drain.record(16, false, 1);
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .wait_limit), drain.stop(9_000, false, null));
 
-    // A read that finds nothing shows the command's own output is done.
+    // A stream reaching end of file restarts a confirmation but proves
+    // nothing about the other stream.
+    drain.confirming = true;
+    drain.record(0, false, 0);
+    try std.testing.expect(!drain.confirming);
+    try std.testing.expect(drain.cutsCommandOutput(.cancelled));
+
+    // A read that finds nothing for a whole poll shows the command's own
+    // output is done.
     drain.record(0, true, 0);
     try std.testing.expect(!drain.cutsCommandOutput(.cancelled));
     try std.testing.expect(!drain.cutsCommandOutput(.deadline));
@@ -5279,12 +5290,43 @@ test "natural completion stops waiting on a detached daemon that keeps writing" 
 const CancelOnOutput = struct {
     cancel: *std.atomic.Value(bool),
     needle: []const u8,
+    delay_ms: u64 = 0,
 
     fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (std.mem.indexOf(u8, bytes, self.needle) != null) self.cancel.store(true, .release);
+        if (std.mem.indexOf(u8, bytes, self.needle) == null) return;
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+        self.cancel.store(true, .release);
     }
 };
+
+test "natural completion keeps complete output when a cancel follows the command's last line" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // Delivering the last line takes long enough for the command to exit
+    // and both pipes to reach end of file before the cancel lands.
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "FINAL-LINE", .delay_ms = 300 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, "printf 'FINAL-LINE\\n'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expect(cancel.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command_result.signal);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "FINAL-LINE") != null);
+}
 
 test "natural completion keeps complete output when a cancel follows only daemon output" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;

@@ -1054,6 +1054,48 @@ test "natural completion stops attached processes and keeps detached daemons" {
     try std.testing.expect(!daemons_only.anyAttachedAliveWith(500, FakeEffects));
 }
 
+test "natural completion keeps an unreadable process attached and reports it" {
+    const FakeEffects = struct {
+        var sent_count: usize = 0;
+
+        fn capture(
+            _: Allocator,
+            _: std.posix.pid_t,
+        ) error{ ProcessNotFound, ProcessIdentityUnavailable }!ProcessSnapshot {
+            return error.ProcessIdentityUnavailable;
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = pid };
+        }
+
+        fn session(pid: std.posix.pid_t) SessionState {
+            return .{ .found = pid };
+        }
+
+        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            sent_count += 1;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    try tracker.processes.append(std.testing.allocator, .{
+        .pid = 40,
+        .identity = .{ .linux_start_ticks = 40 },
+    });
+
+    FakeEffects.sent_count = 0;
+    const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    // Without a snapshot the process cannot be signaled safely, but it is
+    // neither kept as a daemon nor treated as gone.
+    try std.testing.expectEqual(@as(usize, 0), FakeEffects.sent_count);
+    try std.testing.expectEqual(@as(usize, 0), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 0), completed.kept_detached);
+    try std.testing.expect(completed.delivery.incomplete);
+    try std.testing.expect(tracker.anyAttachedAliveWith(500, FakeEffects));
+}
+
 test "session inspection separates the caller's session from a new one" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
