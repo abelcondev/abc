@@ -758,17 +758,20 @@ fn connectServerLegacy(
     // Runs before callers disconnect, while the latest launch is attached.
     errdefer publishRejectedOutput(alloc, server);
     var offered_version = initial_version;
-    var last_exit: ?stdio_dispatcher.ChildDiagnostics = null;
+    var last_exit: stdio_dispatcher.ChildDiagnostics = undefined;
+    var last_exit_ptr: ?*const stdio_dispatcher.ChildDiagnostics = null;
     const initialized: LegacyInitializeSuccess = while (true) {
-        rememberChildExit(server, &last_exit);
+        last_exit_ptr = rememberChildExit(server, &last_exit) orelse last_exit_ptr;
         server.disconnectForced();
         connection_control.check(io_mod.getIo(), attempt_control) catch |err| {
             // The deadline passed between launches; keep the exit that used it up.
-            if (err == error.McpRequestTimedOut) publishStartupFailure(alloc, server, .{ .timed_out = .{
-                .limit = startupTimeoutLimit(span_ms, server.config.startup_timeout_ms, true),
-                .earlier_exit = if (last_exit) |*exit| exit else null,
-                .live = null,
-            } });
+            if (err == error.McpRequestTimedOut) publishStartupTimeout(
+                alloc,
+                server,
+                startupTimeoutLimit(span_ms, server.config.startup_timeout_ms, true),
+                last_exit_ptr,
+                null,
+            );
             return err;
         };
         try spawnStdioServer(alloc, server, argv);
@@ -808,26 +811,27 @@ fn connectServerLegacy(
                 },
                 .accept => unreachable,
                 .fail => {
-                    rememberChildExit(server, &last_exit);
+                    last_exit_ptr = rememberChildExit(server, &last_exit) orelse last_exit_ptr;
                     server.state.store(.failed, .release);
                     publishStartupFailure(alloc, server, .{
-                        .closed = if (last_exit) |*exit| exit else null,
+                        .closed = last_exit_ptr,
                     });
                     return error.McpServerExitedDuringStartup;
                 },
             },
             error.McpRequestTimedOut => {
                 server.state.store(.failed, .release);
-                const live = dispatcher.childDiagnostics();
-                publishStartupFailure(alloc, server, .{ .timed_out = .{
-                    .limit = startupTimeoutLimit(
+                publishStartupTimeout(
+                    alloc,
+                    server,
+                    startupTimeoutLimit(
                         span_ms,
                         server.config.startup_timeout_ms,
                         startupDeadlineSpent(attempt_control),
                     ),
-                    .earlier_exit = if (last_exit) |*exit| exit else null,
-                    .live = &live,
-                } });
+                    last_exit_ptr,
+                    dispatcher,
+                );
                 return err;
             },
             error.Cancelled => {
@@ -1091,20 +1095,18 @@ fn connectServerBounded(
                 return err;
             }
             if (err == error.McpRequestTimedOut) {
-                const live: ?stdio_dispatcher.ChildDiagnostics =
-                    if (server.dispatcher) |dispatcher| dispatcher.childDiagnostics() else null;
-                publishStartupFailure(alloc, server, .{
-                    .timed_out = .{
-                        .limit = startupTimeoutLimit(
-                            // withStartupSpan always fixes the span.
-                            operation.startup_span_ms.?,
-                            server.config.startup_timeout_ms,
-                            startupDeadlineSpent(operation),
-                        ),
-                        .earlier_exit = null,
-                        .live = if (live) |*value| value else null,
-                    },
-                });
+                publishStartupTimeout(
+                    alloc,
+                    server,
+                    startupTimeoutLimit(
+                        // withStartupSpan always fixes the span.
+                        operation.startup_span_ms.?,
+                        server.config.startup_timeout_ms,
+                        startupDeadlineSpent(operation),
+                    ),
+                    null,
+                    server.dispatcher,
+                );
             }
             server.disconnect();
             const decision = decideStartupRestart(.{
@@ -1137,10 +1139,15 @@ fn connectServerBounded(
     }
 }
 
-fn rememberChildExit(server: *McpServer, last_exit: *?stdio_dispatcher.ChildDiagnostics) void {
-    const dispatcher = server.dispatcher orelse return;
+fn rememberChildExit(
+    server: *McpServer,
+    last_exit: *stdio_dispatcher.ChildDiagnostics,
+) ?*const stdio_dispatcher.ChildDiagnostics {
+    const dispatcher = server.dispatcher orelse return null;
     const diagnostics = dispatcher.childDiagnostics();
-    if (diagnostics.term != null) last_exit.* = diagnostics;
+    if (diagnostics.term == null) return null;
+    last_exit.* = diagnostics;
+    return last_exit;
 }
 
 fn startupDeadlineSpent(control: ConnectionControl) bool {
@@ -1214,6 +1221,29 @@ const TimeoutLimit = struct {
 fn startupTimeoutLimit(span_ms: u32, configured_ms: u32, deadline_spent: bool) TimeoutLimit {
     if (!deadline_spent) return .{ .ms = configured_ms, .names_setting = true };
     return .{ .ms = span_ms, .names_setting = span_ms == configured_ms };
+}
+
+fn publishStartupTimeout(
+    alloc: Allocator,
+    server: *McpServer,
+    limit: TimeoutLimit,
+    earlier_exit: ?*const stdio_dispatcher.ChildDiagnostics,
+    live_dispatcher: ?*stdio_dispatcher.StdioDispatcher,
+) void {
+    if (server.last_error != null) return;
+    var live_diagnostics: stdio_dispatcher.ChildDiagnostics = undefined;
+    var live: ?*const stdio_dispatcher.ChildDiagnostics = null;
+    if (earlier_exit == null) {
+        if (live_dispatcher) |dispatcher| {
+            live_diagnostics = dispatcher.childDiagnostics();
+            live = &live_diagnostics;
+        }
+    }
+    publishStartupFailure(alloc, server, .{ .timed_out = .{
+        .limit = limit,
+        .earlier_exit = earlier_exit,
+        .live = live,
+    } });
 }
 
 /// Publishes a startup failure description unless a more specific one is set.

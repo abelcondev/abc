@@ -31,6 +31,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
@@ -3719,36 +3720,7 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     while (i < input.len) {
         const c = input[i];
         if (c == 0x1b and i + 1 < input.len) {
-            const next = input[i + 1];
-            if (next == '[') {
-                // CSI: ESC '[' params... final-byte (0x40-0x7E)
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    i += 1;
-                    if (b >= 0x40 and b <= 0x7E) break;
-                }
-                continue;
-            }
-            if (next == ']') {
-                // OSC: ESC ']' ... BEL (0x07) or ESC '\'
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    if (b == 0x07) {
-                        i += 1;
-                        break;
-                    }
-                    if (b == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            // Other ESC sequences: skip ESC + one byte
-            i += 2;
+            i = display_width.ansiSequenceEnd(input, i);
             continue;
         }
         if (c == '\r') {

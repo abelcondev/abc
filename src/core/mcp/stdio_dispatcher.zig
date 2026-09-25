@@ -1220,11 +1220,7 @@ pub const StdioDispatcher = struct {
         var buffer: [1024]u8 = undefined;
         while (true) {
             _ = std.posix.poll(&fds, -1) catch |err| {
-                debug_trace.logf(
-                    "mcp",
-                    "stdio dispatcher stderr poll failed generation={d} err={s}",
-                    .{ self.generation, @errorName(err) },
-                );
+                logStderrFailure(self.generation, "poll", "err", @errorName(err));
                 return;
             };
             if (fds[1].revents != 0) return;
@@ -1232,11 +1228,7 @@ pub const StdioDispatcher = struct {
             const count = std.posix.read(file.handle, &buffer) catch |err| switch (err) {
                 error.WouldBlock => continue,
                 else => {
-                    debug_trace.logf(
-                        "mcp",
-                        "stdio dispatcher stderr read failed generation={d} err={s}",
-                        .{ self.generation, @errorName(err) },
-                    );
+                    logStderrFailure(self.generation, "read", "err", @errorName(err));
                     return;
                 },
             };
@@ -1255,11 +1247,7 @@ pub const StdioDispatcher = struct {
                     const byte = [_]u8{0};
                     switch (std.posix.errno(std.posix.system.write(wake[1], &byte, byte.len))) {
                         .SUCCESS => {},
-                        else => |err| debug_trace.logf(
-                            "mcp",
-                            "stdio dispatcher stderr wake failed generation={d} errno={s}",
-                            .{ self.generation, @tagName(err) },
-                        ),
+                        else => |err| logStderrFailure(self.generation, "wake", "errno", @tagName(err)),
                     }
                     thread.join();
                     self.stderr_thread = null;
@@ -1270,6 +1258,14 @@ pub const StdioDispatcher = struct {
         }
         if (self.stderr) |file| file.close(io_mod.getIo());
         self.stderr = null;
+    }
+
+    fn logStderrFailure(generation: u64, operation: []const u8, reason_name: []const u8, reason: []const u8) void {
+        debug_trace.logf(
+            "mcp",
+            "stdio dispatcher stderr {s} failed generation={d} {s}={s}",
+            .{ operation, generation, reason_name, reason },
+        );
     }
 
     fn dispatchFrame(self: *StdioDispatcher, frame: []u8) !void {
