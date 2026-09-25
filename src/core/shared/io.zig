@@ -207,9 +207,10 @@ fn openExistingRegularFileWithPolicy(
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
-    if (initial.kind != .file or (policy.hardlinks == .reject and initial.nlink != 1)) {
-        return error.DurablePathUnsafe;
-    }
+    // The metadata check applies the opened-file policy: an atomic
+    // replacement can unlink the file between this stat and the open, and a
+    // read-only open accepts that snapshot.
+    try verifyOpenedRegularFileWithPolicy(initial, policy);
 
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         var file = try dir.openFile(getIo(), sub_path, .{
