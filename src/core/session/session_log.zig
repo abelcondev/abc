@@ -25,6 +25,9 @@ const Identifier = session_event.Identifier;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const lock_deadline_ms: u64 = 2000;
+/// Real first events stay under 2 KiB; this leaves room for two maximum-length
+/// workspace paths while keeping listing reads independent of log size.
+const listed_first_event_max_bytes: usize = 16 * 1024;
 const events_file = "events.jsonl";
 const authority_file = "authority.json";
 const authority_intent_file = "authority.pending.json";
@@ -36,9 +39,8 @@ const recovery_checkpoint_file = "recovery.json";
 /// unclean exit. Cleared with the checkpoint so suppression stays sticky
 /// until the user resolves the turn instead of re-arming after a clean quit.
 const recovery_asked_file = "recovery.asked";
-/// Liveness marker naming the live writable owner; also consulted by
-/// session_store.only_unpublished_creation, which ignores it.
-pub const owner_live_file = "owner.live";
+/// Liveness marker naming the live writable owner.
+const owner_live_file = "owner.live";
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
@@ -4190,9 +4192,12 @@ pub const Root = struct {
         )) orelse error.SessionMigrationRequired;
     }
 
-    /// Reads the immutable child-privacy bit from current session metadata.
-    /// Legacy sessions retain their read-only first-event compatibility path.
-    pub fn loadSubagentChildIdentity(
+    /// Reads the child identity a legacy session records in its first event,
+    /// for a session discovery classified as legacy, whose metadata carries no
+    /// child bit. The event is read only within `listed_first_event_max_bytes`,
+    /// so listing never scans a log; a longer first line fails with
+    /// `error.TruncatedEventFrame`.
+    pub fn loadListedLegacyChildIdentity(
         self: *const Root,
         alloc: Allocator,
         session_id: []const u8,
@@ -4208,27 +4213,9 @@ pub const Root = struct {
             else => return err,
         };
         defer session_dir.close();
-        if (try hasConversationMetadata(alloc, &session_dir)) {
-            const metadata_bytes = try readManagedFileAlloc(
-                alloc,
-                &session_dir,
-                manifest_file,
-                session_codec.max_session_metadata_bytes,
-            );
-            defer alloc.free(metadata_bytes);
-            var metadata = try session_codec.decodeSessionMetadata(
-                alloc,
-                metadata_bytes,
-            );
-            defer metadata.deinit();
-            if (!std.mem.eql(u8, metadata.value.id, session_id)) {
-                return error.InvalidSessionMetadata;
-            }
-            return metadata.value.subagent_child;
-        }
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         defer log_file.close(io_mod.getIo());
-        return session_replay.readSubagentChildIdentity(alloc, log_file);
+        return session_replay.readSubagentChildIdentityWithin(alloc, log_file, listed_first_event_max_bytes);
     }
 
     fn openWritableSessionDir(
@@ -4358,19 +4345,16 @@ fn openSessionDir(
     return .{ .dir = dir };
 }
 
+/// Opens an existing session file without waiting on a special file such as
+/// a FIFO; non-regular, hard-linked, or linked targets are unsafe.
 fn openManagedFile(
     dir: *io_mod.VerifiedDir,
     name: []const u8,
     mode: std.Io.Dir.OpenFileOptions.Mode,
 ) !std.Io.File {
     try validateLeaf(name);
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{
-        .mode = mode,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+    var file = io_mod.openExistingRegularFile(dir.dir, name, mode) catch |err| switch (err) {
+        error.DurablePathUnsafe, error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
