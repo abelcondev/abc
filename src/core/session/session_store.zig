@@ -330,7 +330,6 @@ const automatic_legacy_max_bytes = store_types.automatic_legacy_max_bytes;
 const StoreContext = store_types.StoreContext;
 const freeSummaries = summary_codec.freeSummaries;
 const resumablePageFromSummaries = summary_codec.resumablePageFromSummaries;
-const sessionListPageFromSummaries = summary_codec.sessionListPageFromSummaries;
 const sortSummariesNewestFirst = summary_codec.sortSummariesNewestFirst;
 
 const SessionSummaryScan = struct {
@@ -1200,11 +1199,12 @@ pub const Store = struct {
 
     /// Resumes the newest resumable session in `workspace_root`, taking
     /// candidates in the order and with the workspace filter of the index
-    /// page `fx session last` reads. A candidate that disappears or moves to
-    /// another workspace between selection and open yields to the next
-    /// newest, up to `max_latest_selection_retries`. A candidate listing
-    /// cannot read either is skipped the way every listing skips it. Every
-    /// other failure, including a busy session, is returned.
+    /// page `fx session last` reads. A listed session whose stale schema-v3
+    /// log could not be replayed cannot be opened, so it is skipped without
+    /// opening and counted as unreadable. A candidate that disappears or
+    /// moves to another workspace between selection and open yields to the
+    /// next newest, up to `max_latest_selection_retries`. Every other
+    /// failure, including a busy session, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -1229,6 +1229,11 @@ pub const Store = struct {
         for (catalog.summaries.items) |summary| {
             const summary_workspace = summary.workspace_root orelse continue;
             if (!std.mem.eql(u8, summary_workspace, workspace_root)) continue;
+            if (catalog.isUnreplayable(summary.id)) {
+                debug_trace.logf("session", "latest selection skipped unreplayable id={s}", .{summary.id});
+                unreadable += 1;
+                continue;
+            }
             if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, options)) |loaded| {
                 return loaded;
             } else |err| switch (err) {
@@ -1237,43 +1242,14 @@ pub const Store = struct {
                     vanished += 1;
                     if (vanished == max_latest_selection_retries) return err;
                 },
-                error.OutOfMemory => return err,
                 else => {
                     logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
-                    if (!try self.latestCandidateUnreadable(alloc, summary.id)) return err;
-                    unreadable += 1;
+                    return err;
                 },
             }
         }
         if (unreadable > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
         return session_log.failLoadedWritableSession(error.NoSavedSessions);
-    }
-
-    /// Whether a latest candidate that failed to open is one listing cannot
-    /// read either, by the same reads the catalog makes: neither its summary
-    /// nor an interrupted upgrade's stable snapshot reads, or it is a stale
-    /// schema-v3 projection whose committed log cannot be replayed. Checked
-    /// only after a failed open, so resuming a readable session pays nothing.
-    fn latestCandidateUnreadable(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) error{OutOfMemory}!bool {
-        var candidate = self.readOnlyCandidate(alloc, session_id, null) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // A session behind an interrupted upgrade stays listed from its
-            // stable snapshot, and its open failure is the one to report.
-            else => {
-                var fenced = self.readOnlyFencedLegacyCandidate(alloc, session_id, null) catch |fenced_err| switch (fenced_err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return true,
-                };
-                fenced.deinit(alloc);
-                return false;
-            },
-        };
-        defer candidate.deinit(alloc);
-        return candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     }
 
     /// Opens one latest-selection candidate, retrying a namespace loss once:
@@ -7929,6 +7905,10 @@ test "latest resume skips a stale session whose log cannot be replayed" {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
             defer catalog.deinit(alloc);
             try std.testing.expectEqualStrings("broken", catalog.summaries.items[0].id);
+            // Listing knows the session cannot be opened, so latest resume
+            // skips it without replaying the log again.
+            try std.testing.expect(catalog.isUnreplayable("broken"));
+            try std.testing.expect(!catalog.isUnreplayable("readable"));
         }
         // Doctor names the session latest resume skips.
         {

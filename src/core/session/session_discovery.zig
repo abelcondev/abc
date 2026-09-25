@@ -481,8 +481,9 @@ fn classifySchemaV3Candidate(
 /// Listing's summary of a stale schema-v3 projection: a stale manifest carries
 /// the wrong workspace and recency, so the summary is replaced by one replayed
 /// from the committed log, and the child identity comes from its first event.
-/// If the replay fails the stale summary stays, and opening the session reports
-/// the failure. Exact opens replay the log themselves, so only listing calls this.
+/// If the replay fails the stale summary stays listed: exact opens report the
+/// failure, and latest resume skips the session. Exact opens replay the log
+/// themselves, so only listing calls this.
 pub fn summarizeStaleProjection(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,

@@ -33,6 +33,9 @@ const Fingerprint = [Sha256.digest_length]u8;
 const Entry = struct {
     fingerprint: ?Fingerprint,
     value: union(enum) { visible: session_store.SessionSummary, excluded: []u8 },
+    /// A stale schema-v3 projection whose committed log could not be
+    /// replayed: listed from its manifest, but opening it fails.
+    unreplayable: bool = false,
 
     fn id(self: Entry) []const u8 {
         return switch (self.value) {
@@ -396,11 +399,24 @@ fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
 pub const ActionableSessionCatalog = struct {
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
     skipped_invalid: usize = 0,
+    /// Owned ids of listed sessions that cannot be opened because their stale
+    /// schema-v3 log could not be replayed. Such rows are never cached, so
+    /// every listing observes them afresh.
+    unreplayable_ids: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
+        for (self.unreplayable_ids.items) |id| alloc.free(id);
+        self.unreplayable_ids.deinit(alloc);
         self.* = undefined;
+    }
+
+    pub fn isUnreplayable(self: *const ActionableSessionCatalog, id: []const u8) bool {
+        for (self.unreplayable_ids.items) |value| {
+            if (std.mem.eql(u8, value, id)) return true;
+        }
+        return false;
     }
 };
 
@@ -500,6 +516,7 @@ const CatalogWorker = struct {
             var entry = Entry{
                 .fingerprint = if (stable) after else null,
                 .value = if (managed) .{ .excluded = try self.alloc.dupe(u8, id) } else .{ .visible = candidate.summary },
+                .unreplayable = !fenced and candidate.storage == .schema_v3 and candidate.projection_state == .stale,
             };
             if (!managed) owned = false;
             errdefer entry.deinit(self.alloc);
@@ -578,6 +595,11 @@ pub fn listActionableCatalog(
         switch (entry.value) {
             .visible => |summary| {
                 if (active_id) |active| if (std.mem.eql(u8, active, summary.id)) continue;
+                if (entry.unreplayable) {
+                    const unreplayable_id = try alloc.dupe(u8, summary.id);
+                    errdefer alloc.free(unreplayable_id);
+                    try catalog.unreplayable_ids.append(alloc, unreplayable_id);
+                }
                 var copy = try summary_codec.cloneSessionSummary(alloc, summary);
                 errdefer copy.deinit(alloc);
                 try catalog.summaries.append(alloc, copy);
