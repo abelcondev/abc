@@ -137,17 +137,6 @@ fn completionStanding(
     };
 }
 
-/// Returns the session of the calling process.
-pub fn currentSession() error{ SessionUnavailable, ProcessTreeUnsupported }!std.posix.pid_t {
-    return switch (inspectSession(0)) {
-        .found => |session| session,
-        .vanished, .unavailable => if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos)
-            error.SessionUnavailable
-        else
-            error.ProcessTreeUnsupported,
-    };
-}
-
 const SystemSignalEffects = struct {
     fn capture(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
         return captureSnapshot(alloc, pid);
@@ -412,12 +401,11 @@ pub const Tracker = struct {
     }
 
     /// Signals the tracked processes still in `command_session` and leaves
-    /// processes that moved to their own session running. A null session
-    /// treats every process as attached.
+    /// processes that moved to their own session running.
     pub fn signalAttached(
         self: *Tracker,
         signal: std.posix.SIG,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
     ) CompletionDelivery {
         return self.signalAttachedWith(signal, command_session, SystemSignalEffects);
     }
@@ -425,7 +413,7 @@ pub const Tracker = struct {
     /// Reports whether any tracked process still in `command_session` is alive.
     pub fn anyAttachedAlive(
         self: *Tracker,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
     ) bool {
         return self.anyAttachedAliveWith(command_session, SystemSignalEffects);
     }
@@ -433,7 +421,7 @@ pub const Tracker = struct {
     fn signalAttachedWith(
         self: *Tracker,
         signal: std.posix.SIG,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionDelivery {
         var result: CompletionDelivery = .{};
@@ -458,7 +446,7 @@ pub const Tracker = struct {
         self: *Tracker,
         process: TrackedProcess,
         signal: std.posix.SIG,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
         result: *CompletionDelivery,
         comptime Effects: type,
     ) void {
@@ -477,7 +465,7 @@ pub const Tracker = struct {
 
     fn anyAttachedAliveWith(
         self: *Tracker,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
         comptime Effects: type,
     ) bool {
         if (self.root) |root| {
@@ -492,15 +480,14 @@ pub const Tracker = struct {
     fn completionStandingWith(
         self: *Tracker,
         process: TrackedProcess,
-        command_session: ?std.posix.pid_t,
+        command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionStanding {
         const actual = Effects.capture(self.alloc, process.pid) catch return .gone;
         if (!process.identity.eql(actual.identity) or !snapshotIsAlive(actual)) {
             return .gone;
         }
-        const session = command_session orelse return .attached;
-        return completionStanding(session, Effects.session(process.pid));
+        return completionStanding(command_session, Effects.session(process.pid));
     }
 
     fn appendDirectChildren(
@@ -1051,15 +1038,6 @@ test "natural completion stops attached processes and keeps detached daemons" {
     try std.testing.expectEqual(@as(usize, 2), completed.kept_detached);
     try std.testing.expect(tracker.anyAttachedAliveWith(500, FakeEffects));
 
-    FakeEffects.sent_count = 0;
-    const unbounded = tracker.signalAttachedWith(std.posix.SIG.KILL, null, FakeEffects);
-    try std.testing.expectEqualSlices(
-        std.posix.pid_t,
-        &.{ 37, 34, 33, 32, 31, 30 },
-        FakeEffects.sent[0..FakeEffects.sent_count],
-    );
-    try std.testing.expectEqual(@as(usize, 0), unbounded.kept_detached);
-
     var daemons_only = Tracker{ .alloc = std.testing.allocator };
     defer daemons_only.deinit();
     for ([_]std.posix.pid_t{ 31, 33 }) |pid| {
@@ -1069,14 +1047,16 @@ test "natural completion stops attached processes and keeps detached daemons" {
         });
     }
     try std.testing.expect(!daemons_only.anyAttachedAliveWith(500, FakeEffects));
-    try std.testing.expect(daemons_only.anyAttachedAliveWith(null, FakeEffects));
 }
 
 test "session inspection separates the caller's session from a new one" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
     const io = std.testing.io;
-    const own_session = try currentSession();
+    const own_session = switch (inspectSession(0)) {
+        .found => |session| session,
+        .vanished, .unavailable => return error.TestUnexpectedResult,
+    };
     try std.testing.expectEqual(
         SessionState{ .found = own_session },
         inspectSession(std.c.getpid()),

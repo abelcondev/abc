@@ -135,7 +135,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     else
         std.fmt.parseInt(i64, args[1], 10) catch
             return error.InvalidForegroundSessionInvocation;
-    if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
+    const command_session = std.c.setsid();
+    if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
     try std.Io.File.stderr().writeStreamingAll(
@@ -227,6 +228,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         &target,
         if (process_witness) |*witness| witness else null,
         deadline_ms,
+        command_session,
     ) catch |err| {
         target.kill(zio);
         writeForegroundSessionReplaceFailure(failure_nonce, err);
@@ -366,6 +368,7 @@ fn waitForForegroundTarget(
     target: *std.process.Child,
     process_witness: ?*const process_tree.DarwinProcessWitness,
     deadline_ms: ?i64,
+    command_session: std.posix.pid_t,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
@@ -437,6 +440,7 @@ fn waitForForegroundTarget(
             const cleanup = try cleanupCompletedForegroundTarget(
                 &descendants,
                 target_pid,
+                command_session,
             );
             if (cleanup.terminated > 0 or cleanup.kept_detached > 0) {
                 debug_trace.logf(
@@ -468,16 +472,8 @@ const CompletedTargetCleanup = struct {
 fn cleanupCompletedForegroundTarget(
     descendants: *process_tree.Tracker,
     target_pid: std.posix.pid_t,
+    command_session: std.posix.pid_t,
 ) !CompletedTargetCleanup {
-    // The supervisor leads the command's session after its bootstrap setsid.
-    const command_session: ?std.posix.pid_t = process_tree.currentSession() catch |err| blk: {
-        debug_trace.logf(
-            "core",
-            "captured command session unavailable err={s}; stopping every tracked descendant",
-            .{@errorName(err)},
-        );
-        break :blk null;
-    };
     const started_ms = io_mod.milliTimestamp();
     var cleanup: CompletedTargetCleanup = .{};
     var empty_scans: u8 = 0;
@@ -1249,10 +1245,11 @@ fn executeProcessWithDetachedSession(
         process_group_id,
         .foreground_supervisor,
     );
+    // Judge the deadline at the supervisor's exit, not after the output drain.
     collected.source = reconcileForegroundTerminationSource(
         collected.source,
         deadline_ms,
-        io_mod.milliTimestamp(),
+        collected.natural_completion_ms orelse io_mod.milliTimestamp(),
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -1935,6 +1932,8 @@ const TerminationSource = enum {
 const CollectedOutput = struct {
     source: TerminationSource,
     output_incomplete: bool = false,
+    /// When the leader was seen exiting on its own, before any output drain.
+    natural_completion_ms: ?i64 = null,
 };
 
 fn reconcileForegroundTerminationSource(
@@ -2400,7 +2399,9 @@ fn collectOutput(
     var emitter: OutputChunkEmitter = .{};
     defer emitter.deinit(arena);
 
-    const started_ms = ExecutionControl.init(cfg).started_ms;
+    const control = ExecutionControl.init(cfg);
+    const started_ms = control.started_ms;
+    const deadline_ms = control.deadlineMs();
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
@@ -2408,16 +2409,20 @@ fn collectOutput(
     var natural_completion_ms: ?i64 = null;
 
     while (true) {
-        try updateTerminationSignal(
-            observer,
-            process_group_id,
-            termination_protocol,
-            cfg,
-            started_ms,
-            source,
-            &signal_started_ms,
-            &force_kill_sent,
-        );
+        // A command that already finished on its own is never reclassified
+        // or signaled; a later cancel or deadline only ends the drain.
+        if (natural_completion_ms == null) {
+            try updateTerminationSignal(
+                observer,
+                process_group_id,
+                termination_protocol,
+                cfg,
+                started_ms,
+                source,
+                &signal_started_ms,
+                &force_kill_sent,
+            );
+        }
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
@@ -2462,12 +2467,15 @@ fn collectOutput(
             );
             break;
         }
-        if (!streams_finished and source.* == .natural and
-            naturalOutputDrainExpired(natural_completion_ms, now_ms))
-        {
+        if (!streams_finished and naturalOutputDrainFinished(
+            natural_completion_ms,
+            now_ms,
+            cancelRequested(cfg.cancel_flag),
+            deadline_ms,
+        )) {
             debug_trace.logf(
                 "core",
-                "captured command output drain stopped after natural completion; a detached process still holds the output",
+                "captured command output drain stopped after natural completion; another process still holds the output",
                 .{},
             );
             break;
@@ -2545,11 +2553,24 @@ fn collectOutput(
     return .{
         .source = source.*,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = natural_completion_ms,
     };
 }
 
-fn naturalOutputDrainExpired(natural_completion_ms: ?i64, now_ms: i64) bool {
+/// After a natural completion, capture reads leftover output until end of
+/// file, the drain window closes, the caller cancels, or the command's
+/// deadline passes, whichever comes first.
+fn naturalOutputDrainFinished(
+    natural_completion_ms: ?i64,
+    now_ms: i64,
+    cancel_requested: bool,
+    deadline_ms: ?i64,
+) bool {
     const completed_ms = natural_completion_ms orelse return false;
+    if (cancel_requested) return true;
+    if (deadline_ms) |deadline| {
+        if (now_ms >= deadline) return true;
+    }
     return now_ms >= completed_ms and
         now_ms - completed_ms >= natural_completion_output_drain_ms;
 }
@@ -2625,6 +2646,7 @@ const CollectedTermination = struct {
     source: TerminationSource,
     status: command_contract.CommandStatus,
     output_incomplete: bool = false,
+    natural_completion_ms: ?i64 = null,
 };
 
 fn collectSpawnedProcess(
@@ -2701,6 +2723,7 @@ fn collectSpawnedProcess(
         .source = collected_output.source,
         .status = status,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = collected_output.natural_completion_ms,
     };
 }
 
@@ -4945,18 +4968,71 @@ test "natural command completion keeps a detached daemon that hides its descript
     try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
 }
 
-test "natural completion output drain ends one bounded window after the command" {
-    try std.testing.expect(!naturalOutputDrainExpired(null, 5_000));
-    try std.testing.expect(!naturalOutputDrainExpired(1_000, 1_000));
-    try std.testing.expect(!naturalOutputDrainExpired(
-        1_000,
-        1_000 + natural_completion_output_drain_ms - 1,
-    ));
-    try std.testing.expect(naturalOutputDrainExpired(
-        1_000,
-        1_000 + natural_completion_output_drain_ms,
-    ));
-    try std.testing.expect(!naturalOutputDrainExpired(2_000, 1_000));
+test "natural completion output drain ends at its window, a cancel, or the deadline" {
+    const window_end = 1_000 + natural_completion_output_drain_ms;
+    try std.testing.expect(!naturalOutputDrainFinished(null, 5_000, true, 0));
+    try std.testing.expect(!naturalOutputDrainFinished(1_000, 1_000, false, null));
+    try std.testing.expect(!naturalOutputDrainFinished(1_000, window_end - 1, false, null));
+    try std.testing.expect(naturalOutputDrainFinished(1_000, window_end, false, null));
+    try std.testing.expect(!naturalOutputDrainFinished(2_000, 1_000, false, null));
+    try std.testing.expect(naturalOutputDrainFinished(1_000, 1_001, true, null));
+    try std.testing.expect(naturalOutputDrainFinished(1_000, 1_500, false, 1_500));
+    try std.testing.expect(!naturalOutputDrainFinished(1_000, 1_499, false, 1_500));
+}
+
+test "natural completion keeps its exit when the deadline passes during the output drain" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
+    defer alloc.free(pid_path);
+    const timeout_ms: usize = 3_000;
+    // The command exits about 800 ms before its deadline while a detached
+    // daemon keeps the output open, so the deadline lands inside the drain.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(2.2)\n" ++
+            "print(\"FINISHED-BEFORE-DEADLINE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = timeout_ms,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.output, "FINISHED-BEFORE-DEADLINE") != null,
+    );
+    try std.testing.expect(elapsed_ms < @as(i64, timeout_ms) + 1_000);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
 }
 
 /// Reads whitespace-separated PIDs. The caller owns the returned slice.
