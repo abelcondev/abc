@@ -55,14 +55,14 @@ const pending_output_flush_bytes: usize = 4096;
 const capture_stop_poll_ms: i64 = 20;
 /// After a command finishes on its own, capture keeps reading its leftover
 /// output until it has waited this long in total for more. Leftover output is
-/// already in the pipes and reads without waiting, so a slow consumer still
-/// receives all of it. Only a detached daemon that kept a pipe open can keep
+/// already in the pipes and reads without waiting, so time spent delivering it
+/// never ends the drain. Only a detached daemon that kept a pipe open can keep
 /// the pipes from reaching end of file, and this bounds waiting on it.
 const natural_completion_wait_ms: i64 = 1_000;
-/// Longest capture keeps draining after a natural completion. Leftover output
-/// normally takes far less, so this bounds only a reader too slow to keep up
-/// with a detached writer. Output still unread at this point is incomplete.
-const natural_completion_drain_max_ms: i64 = 10_000;
+/// Live delivery of drained output ends this long after a natural completion,
+/// so a reader too slow to keep up with a detached writer cannot hold the
+/// call. Capture keeps reading and collecting the output after that.
+const natural_completion_live_ms: i64 = 10_000;
 /// Most output capture reads after a natural completion. A finished command
 /// leaves at most one pipe buffer per stream behind, and Linux lets a pipe
 /// buffer grow to 1 MiB by default, so reading this much means the command's
@@ -2093,7 +2093,9 @@ const OutputChunkEmitter = struct {
             std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
         }
-        if (pending.items.len > 0 and self.liveDeliveryEnded(cfg)) {
+        // The final flush always delivers the last partial line. It is one
+        // callback, so it cannot stretch the drain.
+        if (!flush_remainder and pending.items.len > 0 and self.liveDeliveryEnded(cfg)) {
             self.suppressPresentation(error.OutputDrainInterrupted);
             return;
         }
@@ -2652,7 +2654,6 @@ const NaturalDrain = struct {
 
     const Stop = enum {
         wait_limit,
-        time_limit,
         cancelled,
         deadline,
         byte_limit,
@@ -2670,8 +2671,7 @@ const NaturalDrain = struct {
     }
 
     /// Reading ends at end of file, at the wait limit, on a cancel, at the
-    /// deadline, once the byte budget shows a detached writer, or at the
-    /// drain's time limit.
+    /// deadline, or once the byte budget shows a detached writer.
     fn stop(
         self: NaturalDrain,
         now_ms: i64,
@@ -2684,7 +2684,6 @@ const NaturalDrain = struct {
         }
         if (self.bytes >= natural_completion_drain_max_bytes) return .byte_limit;
         if (self.waited_ns >= natural_completion_wait_ms * std.time.ns_per_ms) return .wait_limit;
-        if (now_ms >= self.completed_ms + natural_completion_drain_max_ms) return .time_limit;
         return null;
     }
 
@@ -2692,15 +2691,15 @@ const NaturalDrain = struct {
     /// and the byte budget are reached only after that output was read.
     fn cutsCommandOutput(self: NaturalDrain, reason: Stop) bool {
         return switch (reason) {
-            .cancelled, .deadline, .time_limit => !self.leftover_read,
+            .cancelled, .deadline => !self.leftover_read,
             .wait_limit, .byte_limit => false,
         };
     }
 
     /// When live delivery of drained output ends, so a slow reader cannot
-    /// hold the drain past its deadline or time limit.
+    /// hold the drain past its deadline or live limit.
     fn liveUntilMs(self: NaturalDrain, deadline_ms: ?i64) i64 {
-        const limit_ms = self.completed_ms + natural_completion_drain_max_ms;
+        const limit_ms = self.completed_ms + natural_completion_live_ms;
         const deadline = deadline_ms orelse return limit_ms;
         return @min(deadline, limit_ms);
     }
@@ -5135,10 +5134,9 @@ test "natural completion drain counts every wait and cuts output only before the
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .cancelled), busy.stop(1_001, true, null));
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .deadline), busy.stop(1_500, false, 1_500));
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(1_499, false, 1_500));
-    const limit_ms = busy.completed_ms + natural_completion_drain_max_ms;
-    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(limit_ms - 1, false, null));
-    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .time_limit), busy.stop(limit_ms, false, null));
-    try std.testing.expect(busy.cutsCommandOutput(.time_limit));
+    // The live limit ends only delivery. Reading continues past it.
+    const limit_ms = busy.completed_ms + natural_completion_live_ms;
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(limit_ms + 1, false, null));
     try std.testing.expectEqual(limit_ms, busy.liveUntilMs(null));
     try std.testing.expectEqual(@as(i64, 1_500), busy.liveUntilMs(1_500));
     try std.testing.expectEqual(limit_ms, busy.liveUntilMs(limit_ms + 1));
@@ -5494,6 +5492,65 @@ test "natural completion keeps complete output when a cancel follows only daemon
     try std.testing.expect(!command_result.output_incomplete);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "COMMAND-DONE") != null);
     try std.testing.expect(elapsed_ms < 3_000);
+}
+
+const LiveOutputRecorder = struct {
+    delivered: std.ArrayList(u8) = .empty,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        try self.delivered.appendSlice(std.testing.allocator, bytes);
+    }
+};
+
+test "natural completion delivers a final partial line live after the deadline passes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "tail-daemon.pid" });
+    defer alloc.free(pid_path);
+    // A quiet daemon keeps the output open, so the drain runs until the
+    // deadline, and the command's last line has no newline, so only the
+    // final flush delivers it.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,sys\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " import time; time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "sys.stdout.write(\"PARTIAL-TAIL\"); sys.stdout.flush()'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(std.testing.allocator);
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 800,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.endsWith(u8, recorder.delivered.items, "PARTIAL-TAIL"));
 }
 
 test "natural completion marks output incomplete when the deadline cuts leftover output" {
