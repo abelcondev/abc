@@ -198,7 +198,27 @@ pub fn inspectDoctorSession(
         );
         return;
     };
+    const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     candidate.deinit(alloc);
+    // A stale schema-v3 session resumes from its committed log, so a log that
+    // cannot be replayed leaves the session unreadable even though its
+    // manifest is valid; latest resume skips it for the same reason.
+    if (stale_schema_v3) {
+        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
+            var replay = value;
+            replay.deinit(alloc);
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try appendDoctorDiagnostic(
+                diagnostics,
+                alloc,
+                session_id,
+                if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
+                null,
+            );
+            return;
+        }
+    }
     try inspectDoctorManagedChildren(
         ctx,
         alloc,

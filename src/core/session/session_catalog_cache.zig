@@ -26,11 +26,11 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // projections, is one fingerprint-bound listing observation.
 const magic = "fx-resume-catalog-v5\n";
 const file_name = ".resume-catalog";
-pub const max_bytes = 64 * 1024 * 1024;
-pub const max_records = 100_000;
+const max_bytes = 64 * 1024 * 1024;
+const max_records = 100_000;
 const Fingerprint = [Sha256.digest_length]u8;
 
-pub const Entry = struct {
+const Entry = struct {
     fingerprint: ?Fingerprint,
     value: union(enum) { visible: session_store.SessionSummary, excluded: []u8 },
 
@@ -137,10 +137,10 @@ pub const Loaded = struct {
         self.* = .{};
     }
 
-    pub fn count(self: *const Loaded) usize {
+    fn count(self: *const Loaded) usize {
         return self.index.count();
     }
-    pub fn present(self: *const Loaded) bool {
+    fn present(self: *const Loaded) bool {
         return self.parsed != null;
     }
     pub fn contains(self: *const Loaded, id: []const u8) bool {
@@ -201,7 +201,7 @@ pub const Loaded = struct {
         return .{ .bytes = bytes, .parsed = parsed, .index = index };
     }
 
-    pub fn reuse(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
+    fn reuse(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
         const position = self.index.get(id) orelse return null;
         const row = self.parsed.?.value[position];
         if (!matches(row, fingerprint_value)) return null;
@@ -260,7 +260,7 @@ pub const Writer = struct {
 
     /// Publishes every fingerprinted entry, then keeps any earlier row this
     /// scan did not observe only while its session still matches that row.
-    pub fn save(self: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) !void {
+    fn save(self: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) !void {
         if (cancelled.load(.acquire)) return error.Cancelled;
         if (entries.len > max_records) return error.CatalogCacheTooLarge;
         var previous = try Loaded.load(alloc, self.dir, cancelled);
@@ -318,7 +318,7 @@ pub fn catalogFileExists(sessions: ?io_mod.VerifiedDir) bool {
 }
 
 /// Stats are freshness evidence only. Cache misses still use canonical discovery and admission.
-pub fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
+fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     try session_layout.validateSessionId(id);
     const before = (try statOptional(dir, id)) orelse return null;
     if (before.kind != .directory) return null;
@@ -473,11 +473,13 @@ const CatalogWorker = struct {
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
             // The fingerprint binds every classification input, so each settled
-            // row is cacheable, a replayed schema_v3 projection included. A
-            // row read around an interrupted upgrade, or from a stale
-            // projection whose replay failed, describes a transition, not
-            // settled state, so it is never reused. Empty sessions stay listed;
-            // the picker alone hides rows without resumable content.
+            // row is cacheable, a replayed schema_v3 projection included: the
+            // commit watermark and checkpoint the replay also reads are
+            // replaced by rename, which changes the session directory stat the
+            // fingerprint binds. A row read around an interrupted upgrade
+            // describes a transition, and a failed replay can be transient,
+            // so neither is ever reused. Empty sessions stay listed; the
+            // picker alone hides rows without resumable content.
             var cacheable = !fenced and candidate.projection_state != .stale;
             const managed = child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,

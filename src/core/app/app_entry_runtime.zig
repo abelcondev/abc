@@ -252,9 +252,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             error.NoReadableSessions => {
-                // The unreadable sessions can belong to any workspace; only
-                // the absence of a readable one is specific to this workspace.
-                writeStderr(deps, "fx: no saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n");
+                // The unreadable sessions can belong to any workspace, so only
+                // the absence of a readable one is tied to this workspace.
+                writeStderr(deps, "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n");
                 return .{ .exit = 1 };
             },
             error.SessionNotFound => {
@@ -1317,7 +1317,7 @@ test "app entry maps missing saved sessions to exit one" {
         .{ .err = error.NoSavedSessions, .stderr = "fx: no saved sessions for this workspace.\n" },
         .{
             .err = error.NoReadableSessions,
-            .stderr = "fx: no saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n",
+            .stderr = "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n",
         },
     }) |case| {
         var capture = TestCapture.init(.{ .interactive = .{} });

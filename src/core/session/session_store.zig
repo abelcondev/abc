@@ -1199,10 +1199,12 @@ pub const Store = struct {
     }
 
     /// Resumes the newest resumable session in `workspace_root`, taking
-    /// candidates from the same index page `fx session last` reads. A
-    /// candidate that disappears or moves to another workspace between
-    /// selection and open yields to the next newest; every other failure,
-    /// including a busy session, is returned.
+    /// candidates in the order and with the workspace filter of the index
+    /// page `fx session last` reads. A candidate that disappears or moves to
+    /// another workspace between selection and open yields to the next
+    /// newest, up to `max_latest_selection_retries`. A candidate listing
+    /// cannot read either is skipped the way every listing skips it. Every
+    /// other failure, including a busy session, is returned.
     fn resumeLatestByDiscovery(
         self: Store,
         alloc: Allocator,
@@ -1222,34 +1224,56 @@ pub const Store = struct {
             if (writer) |*value| value else null,
         );
         defer catalog.deinit(alloc);
-        // Each skip consumes one candidate, so the retry bound is also the
-        // most rows selection can ever need.
-        var page = try sessionListPageFromSummaries(
-            alloc,
-            catalog.summaries.items,
-            workspace_root,
-            null,
-            max_latest_selection_retries,
-        );
-        defer page.deinit(alloc);
-        var skipped: usize = 0;
-        for (page.summaries.items) |summary| {
+        var vanished: usize = 0;
+        var unreadable = catalog.skipped_invalid;
+        for (catalog.summaries.items) |summary| {
+            const summary_workspace = summary.workspace_root orelse continue;
+            if (!std.mem.eql(u8, summary_workspace, workspace_root)) continue;
             if (self.resumeLatestCandidate(alloc, summary.id, workspace_root, options)) |loaded| {
                 return loaded;
             } else |err| switch (err) {
                 error.SessionNotFound, error.FileNotFound, error.SessionTargetChanged => {
                     logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
-                    skipped += 1;
-                    if (skipped == max_latest_selection_retries) return err;
+                    vanished += 1;
+                    if (vanished == max_latest_selection_retries) return err;
                 },
+                error.OutOfMemory => return err,
                 else => {
                     logDiscoveryError(.workspace_writable_last, summary.id, null, null, err);
-                    return err;
+                    if (!try self.latestCandidateUnreadable(alloc, summary.id)) return err;
+                    unreadable += 1;
                 },
             }
         }
-        if (catalog.skipped_invalid > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
+        if (unreadable > 0) return session_log.failLoadedWritableSession(error.NoReadableSessions);
         return session_log.failLoadedWritableSession(error.NoSavedSessions);
+    }
+
+    /// Whether a latest candidate that failed to open is one listing cannot
+    /// read either, by the same reads the catalog makes: neither its summary
+    /// nor an interrupted upgrade's stable snapshot reads, or it is a stale
+    /// schema-v3 projection whose committed log cannot be replayed. Checked
+    /// only after a failed open, so resuming a readable session pays nothing.
+    fn latestCandidateUnreadable(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) error{OutOfMemory}!bool {
+        var candidate = self.readOnlyCandidate(alloc, session_id, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A session behind an interrupted upgrade stays listed from its
+            // stable snapshot, and its open failure is the one to report.
+            else => {
+                var fenced = self.readOnlyFencedLegacyCandidate(alloc, session_id, null) catch |fenced_err| switch (fenced_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return true,
+                };
+                fenced.deinit(alloc);
+                return false;
+            },
+        };
+        defer candidate.deinit(alloc);
+        return candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     }
 
     /// Opens one latest-selection candidate, retrying a namespace loss once:
@@ -5013,6 +5037,8 @@ pub const SchemaV3Fixture = struct {
     /// A stale manifest records only the first event, as when a crash lands
     /// between a log append and the projection write.
     stale_projection: bool = true,
+    /// The update time a stale manifest records.
+    projected_updated_at_ms: i64 = 10,
     /// Records the child identity only in the first event, as a crash before
     /// the owner marker is written leaves it.
     subagent_child: bool = false,
@@ -5108,7 +5134,7 @@ pub fn writeSchemaV3Fixture(
         .authority_id = authority_id,
         .log_generation = schema_v3_test_generation,
         .created_at_ms = 10,
-        .updated_at_ms = if (fixture.stale_projection) 10 else fixture.updated_at_ms,
+        .updated_at_ms = if (fixture.stale_projection) fixture.projected_updated_at_ms else fixture.updated_at_ms,
         .origin_workspace_root = @constCast(fixture.projected_workspace),
         .workspace_root = @constCast(if (fixture.stale_projection) fixture.projected_workspace else fixture.workspace),
         .conversation_language = .literal("en"),
@@ -7870,6 +7896,59 @@ test "a stale schema-v3 projection lists and resumes from its committed log" {
     defer resumed.deinit(alloc);
     try std.testing.expectEqualStrings("rank-b", resumed.active_id);
     try std.testing.expectEqualStrings(ctx.workspace, resumed.state.workspace_root);
+}
+
+test "latest resume skips a stale session whose log cannot be replayed" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |with_readable| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        if (with_readable) {
+            try writeSchemaV3Fixture(alloc, ctx.store, "readable", .{
+                .projected_workspace = ctx.workspace,
+                .workspace = ctx.workspace,
+                .updated_at_ms = 30,
+                .stale_projection = false,
+            });
+        }
+        // The stale manifest ranks the broken session newest in this workspace.
+        try writeSchemaV3Fixture(alloc, ctx.store, "broken", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .projected_updated_at_ms = 50,
+            .updated_at_ms = 60,
+        });
+        {
+            var dir = try ctx.store.openSessionDir("broken");
+            defer dir.close();
+            try io_mod.durableReplaceVerified(alloc, &dir, schema_v3_test_watermark, "{}");
+        }
+        {
+            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+            defer catalog.deinit(alloc);
+            try std.testing.expectEqualStrings("broken", catalog.summaries.items[0].id);
+        }
+        // Doctor names the session latest resume skips.
+        {
+            var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
+            defer inspection.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), inspection.diagnostics.items.len);
+            try std.testing.expectEqualStrings("broken", inspection.diagnostics.items[0].session_id);
+            try std.testing.expectEqual(DoctorIssueKind.canonical_state_invalid, inspection.diagnostics.items[0].kind);
+        }
+        if (with_readable) {
+            var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqualStrings("readable", resumed.active_id);
+        } else {
+            try std.testing.expectError(
+                error.NoReadableSessions,
+                ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}),
+            );
+        }
+    }
 }
 
 test "a copied schema-v3 session lists from its manifest without a replay" {
