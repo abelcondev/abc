@@ -329,22 +329,12 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     var digest = Sha256.init(.{});
     addStat(&digest, before);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const session_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "session.json" });
-    const session_stat = (try statOptional(dir, session_path)) orelse return null;
-    if (session_stat.kind != .file or session_stat.nlink != 1) return null;
-    addStat(&digest, session_stat);
-    // Legacy sessions carry no event log, so absence is part of the proof:
-    // a later appearance of events.jsonl must invalidate a cached row.
-    const events_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "events.jsonl" });
-    if (try statOptional(dir, events_path)) |stat| {
-        if (stat.kind != .file or stat.nlink != 1) return null;
-        digest.update(&.{1});
-        addStat(&digest, stat);
-    } else digest.update(&.{0});
-    // schema_v3 and legacy classification also observe the authority marker,
-    // the authority fence, and the display sidecar. Their presence, absence, or
-    // replacement must invalidate a cached row, so bind them into the digest.
-    for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
+    // Classification observes each of these files, and its result depends on
+    // whether each is present: a legacy session carries no event log, and a
+    // schema_v3 session whose manifest is lost is listed from its log. Their
+    // presence, absence, or replacement must invalidate a cached row, so bind
+    // them into the digest.
+    for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
         const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
             if (stat.kind != .file or stat.nlink != 1) return null;

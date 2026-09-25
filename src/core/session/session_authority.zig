@@ -219,56 +219,56 @@ pub fn readOptionalSessionFile(
 }
 
 /// Opens an in-session file with symlink/escape protections, rejecting
-/// non-regular or hard-linked targets as `error.SessionPathUnsafe`.
+/// non-regular or hard-linked targets as `error.SessionPathUnsafe` without
+/// waiting on a special file such as a FIFO. A read-only open accepts a file
+/// that atomic replacement unlinks after the open: the descriptor remains a
+/// safe, immutable snapshot. `name` is a single path component.
 pub fn openSessionFile(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
     mode: session_log.OpenMode,
 ) !std.Io.File {
-    const file = session_dir.dir.openFile(io_mod.getIo(), name, .{
-        .mode = if (mode == .writable) .read_write else .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
+    std.debug.assert(std.mem.findScalar(u8, name, '/') == null);
+    return io_mod.openExistingRegularFile(
+        session_dir.dir,
+        name,
+        if (mode == .writable) .read_write else .read_only,
+    ) catch |err| switch (err) {
+        error.DurablePathUnsafe, error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
         else => return err,
     };
-    errdefer file.close(io_mod.getIo());
-    try verifyOpenedSessionFile(try file.stat(io_mod.getIo()), mode);
-    return file;
 }
 
-fn verifyOpenedSessionFile(
-    stat: std.Io.File.Stat,
-    mode: session_log.OpenMode,
-) !void {
-    if (stat.kind != .file or stat.nlink > 1) {
-        return error.SessionPathUnsafe;
+test "session files open without waiting on a FIFO" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/events.jsonl", .{root});
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
+    defer dir.close();
+    // A blocking open of a FIFO waits for a writer that never comes.
+    for ([_]session_log.OpenMode{ .read_only, .writable }) |mode| {
+        try std.testing.expectError(error.SessionPathUnsafe, openSessionFile(&dir, "events.jsonl", mode));
     }
-    // Atomic replacement can unlink the old inode after a read-only open but
-    // before fstat. The descriptor remains a safe, immutable snapshot.
-    if (mode == .writable and stat.nlink != 1) {
-        return error.SessionPathUnsafe;
-    }
+    try std.testing.expectEqual(@as(?[]u8, null), try readOptionalSessionFile(alloc, &dir, "missing.json", 16));
 }
 
 test "read-only session files accept an atomically unlinked descriptor" {
     var stat = std.mem.zeroes(std.Io.File.Stat);
     stat.kind = .file;
     stat.nlink = 0;
-    try verifyOpenedSessionFile(stat, .read_only);
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        verifyOpenedSessionFile(stat, .writable),
-    );
+    try io_mod.verifyOpenedRegularFile(stat, .read_only);
+    try std.testing.expectError(error.DurablePathUnsafe, io_mod.verifyOpenedRegularFile(stat, .read_write));
 
     stat.nlink = 2;
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        verifyOpenedSessionFile(stat, .read_only),
-    );
+    try std.testing.expectError(error.DurablePathUnsafe, io_mod.verifyOpenedRegularFile(stat, .read_only));
 }
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.

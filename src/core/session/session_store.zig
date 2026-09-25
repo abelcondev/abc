@@ -1909,12 +1909,10 @@ pub const Store = struct {
         else
             classifyReadOnlyCandidate(alloc, &dir, session_id);
         var candidate = classified catch |err| switch (err) {
-            error.OutOfMemory,
-            error.Cancelled,
-            error.UnsupportedSessionSchema,
-            error.SessionAuthorityBoundaryUnavailable,
-            => return err,
-            else => (try discovery.recoverSchemaV3Candidate(alloc, &dir, session_id, cancelled)) orelse return err,
+            // A missing or undecodable manifest; every other failure is
+            // reported, not recovered.
+            error.SessionNotFound, error.InvalidSessionFormat => (try discovery.recoverSchemaV3Candidate(alloc, &dir, session_id, cancelled)) orelse return err,
+            else => return err,
         };
         errdefer candidate.deinit(alloc);
         try discovery.summarizeStaleProjection(alloc, &dir, &candidate, cancelled);
@@ -7884,7 +7882,7 @@ test "a stale schema-v3 projection lists and resumes from its committed log" {
 
 test "a schema-v3 session with a lost manifest lists and resumes from its committed log" {
     const alloc = std.testing.allocator;
-    const Mutation = enum { missing, bad, unsupported };
+    const Mutation = enum { missing, bad, unsupported, missing_behind_fence };
     for (std.enums.values(Mutation)) |mutation| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -7909,13 +7907,21 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
                 .missing => try dir.dir.deleteFile(std.testing.io, "session.json"),
                 .bad => try io_mod.durableReplaceVerified(alloc, &dir, "session.json", "{\"schema_version\":3}"),
                 .unsupported => try io_mod.durableReplaceVerified(alloc, &dir, "session.json", "{\"schema_version\":99}"),
+                .missing_behind_fence => {
+                    try dir.dir.deleteFile(std.testing.io, "session.json");
+                    try io_mod.durableReplaceVerified(alloc, &dir, "authority.pending.json", "{}");
+                },
             }
         }
         // The committed log is the authority, so a lost or unreadable manifest
-        // is recovered from it; an unsupported manifest is not.
-        const recoverable = mutation != .unsupported;
-        {
-            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+        // is recovered from it; an unsupported manifest, or one lost behind an
+        // interrupted upgrade, is not.
+        const recoverable = mutation == .missing or mutation == .bad;
+        var writer = (try catalog_cache.Writer.init(ctx.store)).?;
+        defer writer.deinit();
+        // The second pass reads the recovered row back from the index.
+        for (0..2) |_| {
+            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
             defer catalog.deinit(alloc);
             try std.testing.expectEqual(@as(usize, if (recoverable) 2 else 1), catalog.summaries.items.len);
             try std.testing.expectEqual(@as(usize, if (recoverable) 0 else 1), catalog.skipped_invalid);
@@ -7924,12 +7930,76 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
                 try std.testing.expectEqual(@as(i64, 50), catalog.summaries.items[0].updated_at_ms);
                 try std.testing.expectEqualStrings(ctx.workspace, catalog.summaries.items[0].workspace_root.?);
             }
+            var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+            defer saved.deinit(alloc);
+            try std.testing.expectEqual(recoverable, saved.contains("recover"));
         }
         var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
         defer resumed.deinit(alloc);
         try std.testing.expectEqualStrings(if (recoverable) "recover" else "older", resumed.active_id);
     }
 }
+
+test "a FIFO in a schema-v3 session never blocks listing or latest resume" {
+    const alloc = std.testing.allocator;
+    const Case = enum { event_log, stale_watermark, lost_manifest_watermark };
+    for (std.enums.values(Case)) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var ctx = try initTempStore(alloc, &tmp);
+        defer ctx.deinit(alloc);
+        try writeSchemaV3Fixture(alloc, ctx.store, "older", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 30,
+            .stale_projection = false,
+        });
+        try writeSchemaV3Fixture(alloc, ctx.store, "fifo", .{
+            .projected_workspace = ctx.workspace,
+            .workspace = ctx.workspace,
+            .updated_at_ms = 50,
+            .stale_projection = case == .stale_watermark,
+        });
+        {
+            var dir = try ctx.store.openSessionDir("fifo");
+            defer dir.close();
+            var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+            const name = if (case == .event_log) "events.jsonl" else watermark: {
+                var it = dir.dir.iterate();
+                while (try it.next(std.testing.io)) |entry| {
+                    if (std.mem.startsWith(u8, entry.name, "commit.") and std.mem.endsWith(u8, entry.name, ".json") and
+                        !std.mem.eql(u8, entry.name, "commit.pending.json"))
+                    {
+                        @memcpy(name_buf[0..entry.name.len], entry.name);
+                        break :watermark name_buf[0..entry.name.len];
+                    }
+                }
+                return error.TestUnexpectedResult;
+            };
+            if (case == .lost_manifest_watermark) try dir.dir.deleteFile(std.testing.io, "session.json");
+            try dir.dir.deleteFile(std.testing.io, name);
+            const root = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+            defer alloc.free(root);
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, name });
+            if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+        }
+        // A blocking open of the FIFO would wait for a writer that never comes.
+        {
+            var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
+            defer catalog.deinit(alloc);
+            const listed_stale = case == .stale_watermark;
+            try std.testing.expectEqual(@as(usize, if (listed_stale) 2 else 1), catalog.summaries.items.len);
+            try std.testing.expectEqual(@as(usize, if (listed_stale) 0 else 1), catalog.skipped_invalid);
+            try std.testing.expectEqual(listed_stale, catalog.isUnreplayable("fifo"));
+        }
+        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings("older", resumed.active_id);
+    }
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "latest resume skips a stale session whose log cannot be replayed" {
     const alloc = std.testing.allocator;
