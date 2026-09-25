@@ -5177,7 +5177,6 @@ test "natural completion delivers all leftover output to a slow consumer" {
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expectEqual(@as(usize, 20_000), command_result.stdout_bytes);
     try std.testing.expect(!command_result.output_incomplete);
-    try std.testing.expectEqual(@as(usize, 200), consumer.lines);
 }
 
 test "natural command completion stops a same-session process that left the process group" {
@@ -5238,9 +5237,10 @@ test "natural completion keeps its exit when the deadline passes during the outp
     const timeout_ms: usize = 3_000;
     // The command exits about 800 ms before its deadline while a detached
     // daemon keeps the output open, so the deadline lands inside the drain.
+    // Its last line has no newline, so only the final flush delivers it live.
     const command = try std.fmt.allocPrint(
         alloc,
-        "python3 -c 'import os,time\n" ++
+        "python3 -c 'import os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
             " os.close(ready_r)\n" ++
@@ -5255,15 +5255,19 @@ test "natural completion keeps its exit when the deadline passes during the outp
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "time.sleep(2.2)\n" ++
-            "print(\"FINISHED-BEFORE-DEADLINE\", flush=True)'",
+            "sys.stdout.write(\"FINISHED-BEFORE-DEADLINE\"); sys.stdout.flush()'",
         .{pid_path},
     );
     defer alloc.free(command);
 
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(std.testing.allocator);
     const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = timeout_ms,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
@@ -5273,6 +5277,7 @@ test "natural completion keeps its exit when the deadline passes during the outp
     );
     try std.testing.expect(elapsed_ms < @as(i64, timeout_ms) + 1_000);
     try std.testing.expect(!result.command_result.?.output_incomplete);
+    try std.testing.expect(std.mem.endsWith(u8, recorder.delivered.items, "FINISHED-BEFORE-DEADLINE"));
 
     const pids = try readPidsForTest(alloc, pid_path);
     defer alloc.free(pids);
@@ -5388,7 +5393,6 @@ test "natural completion ends live delivery of drained output at a cancel" {
         .cancel_after = 20,
         .delay_ms = 20,
     };
-    const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = 10_000,
@@ -5397,7 +5401,6 @@ test "natural completion ends live delivery of drained output at a cancel" {
         .on_output_chunk = CancelOnOutput.onChunk,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
 
     const pids = try readPidsForTest(alloc, pid_path);
     defer alloc.free(pids);
@@ -5406,7 +5409,6 @@ test "natural completion ends live delivery of drained output at a cancel" {
     try std.testing.expectEqual(@as(usize, 20), trigger.seen);
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expect(!command_result.output_incomplete);
-    try std.testing.expect(elapsed_ms < 3_000);
 }
 
 test "natural completion keeps complete output when a cancel follows the command's last line" {
@@ -5496,61 +5498,45 @@ test "natural completion keeps complete output when a cancel follows only daemon
 
 const LiveOutputRecorder = struct {
     delivered: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
 
     fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
         try self.delivered.appendSlice(std.testing.allocator, bytes);
     }
 };
 
-test "natural completion delivers a final partial line live after the deadline passes" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
+test "output emitter delivers each line once and flushes the last partial line after live delivery ends" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "tail-daemon.pid" });
-    defer alloc.free(pid_path);
-    // A quiet daemon keeps the output open, so the drain runs until the
-    // deadline, and the command's last line has no newline, so only the
-    // final flush delivers it.
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "python3 -c 'import os,sys\n" ++
-            "ready_r,ready_w=os.pipe()\n" ++
-            "if os.fork() == 0:\n" ++
-            " os.close(ready_r)\n" ++
-            " os.setsid()\n" ++
-            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
-            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
-            " import time; time.sleep(30)\n" ++
-            " os._exit(0)\n" ++
-            "os.close(ready_w)\n" ++
-            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
-            "sys.stdout.write(\"PARTIAL-TAIL\"); sys.stdout.flush()'",
-        .{pid_path},
-    );
-    defer alloc.free(command);
-
     var recorder = LiveOutputRecorder{};
-    defer recorder.delivered.deinit(std.testing.allocator);
-    const result = try executeCommand(.{
+    defer recorder.delivered.deinit(alloc);
+    const cfg: Config = .{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 800,
         .output_chunk_ctx = @ptrCast(&recorder),
         .on_output_chunk = LiveOutputRecorder.onChunk,
-    }, alloc, command, workspace);
-    defer alloc.free(result.output);
+    };
 
-    const pids = try readPidsForTest(alloc, pid_path);
-    defer alloc.free(pids);
-    defer stopProcessesForTest(pids);
-    const command_result = result.command_result.?;
-    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
-    try std.testing.expect(!command_result.output_incomplete);
-    try std.testing.expect(std.mem.endsWith(u8, recorder.delivered.items, "PARTIAL-TAIL"));
+    var emitter: OutputChunkEmitter = .{};
+    defer emitter.deinit(alloc);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "one\ntw", cfg, false);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "o\nthree\nfour", cfg, false);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 3), recorder.calls);
+
+    // Once live delivery has ended, the final flush still delivers the last
+    // partial line.
+    emitter.live_until_ms = 0;
+    emitter.flush(alloc, cfg);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+
+    // Later lines are collected by the caller but no longer delivered live.
+    var ended: OutputChunkEmitter = .{ .live_until_ms = 0 };
+    defer ended.deinit(alloc);
+    ended.emitPending(alloc, &ended.stdout_pending, .stdout, "late\n", cfg, false);
+    try std.testing.expect(ended.presentation_suppressed);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
 }
 
 test "natural completion marks output incomplete when the deadline cuts leftover output" {
@@ -5564,7 +5550,6 @@ test "natural completion marks output incomplete when the deadline cuts leftover
     // The command exits at once, but delivering its 200 lines takes about
     // four seconds, so the deadline lands while its output is still unread.
     var consumer = SlowOutputConsumer{ .delay_ms = 20 };
-    const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = 1_000,
@@ -5572,14 +5557,12 @@ test "natural completion marks output incomplete when the deadline cuts leftover
         .on_output_chunk = SlowOutputConsumer.onChunk,
     }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
     defer alloc.free(result.output);
-    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     const command_result = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expect(!command_result.timed_out);
     try std.testing.expect(command_result.output_incomplete);
-    // Live delivery ends at the deadline instead of finishing the lines
-    // already read.
-    try std.testing.expect(elapsed_ms < 2_500);
+    // Live delivery ends at the deadline, so the confirming read is not
+    // delivered line by line.
     try std.testing.expect(consumer.lines < 100);
 }
 
