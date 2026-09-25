@@ -483,7 +483,12 @@ pub const Tracker = struct {
         command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionStanding {
-        const actual = Effects.capture(self.alloc, process.pid) catch return .gone;
+        const actual = Effects.capture(self.alloc, process.pid) catch |err| switch (err) {
+            error.ProcessNotFound => return .gone,
+            // An unreadable process stays attached, so cleanup still tries
+            // to stop it and reports the failed attempt.
+            else => return .attached,
+        };
         if (!process.identity.eql(actual.identity) or !snapshotIsAlive(actual)) {
             return .gone;
         }
