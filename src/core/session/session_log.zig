@@ -4345,19 +4345,16 @@ fn openSessionDir(
     return .{ .dir = dir };
 }
 
+/// Opens an existing session file without waiting on a special file such as
+/// a FIFO; non-regular, hard-linked, or linked targets are unsafe.
 fn openManagedFile(
     dir: *io_mod.VerifiedDir,
     name: []const u8,
     mode: std.Io.Dir.OpenFileOptions.Mode,
 ) !std.Io.File {
     try validateLeaf(name);
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{
-        .mode = mode,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+    var file = io_mod.openExistingRegularFile(dir.dir, name, mode) catch |err| switch (err) {
+        error.DurablePathUnsafe, error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
         else => return err,
     };
     errdefer file.close(io_mod.getIo());

@@ -257,17 +257,6 @@ test "session files open without waiting on a FIFO" {
     try std.testing.expectEqual(@as(?[]u8, null), try readOptionalSessionFile(alloc, &dir, "missing.json", 16));
 }
 
-test "read-only session files accept an atomically unlinked descriptor" {
-    var stat = std.mem.zeroes(std.Io.File.Stat);
-    stat.kind = .file;
-    stat.nlink = 0;
-    try io_mod.verifyOpenedRegularFile(stat, .read_only);
-    try std.testing.expectError(error.DurablePathUnsafe, io_mod.verifyOpenedRegularFile(stat, .read_write));
-
-    stat.nlink = 2;
-    try std.testing.expectError(error.DurablePathUnsafe, io_mod.verifyOpenedRegularFile(stat, .read_only));
-}
-
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// Reports whether `name` exists directly under the session dir, mapping

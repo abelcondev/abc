@@ -7940,10 +7940,27 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
     }
 }
 
-test "a FIFO in a schema-v3 session never blocks listing or latest resume" {
+test "a FIFO in a session never blocks listing or latest resume" {
     const alloc = std.testing.allocator;
-    const Case = enum { event_log, stale_watermark, lost_manifest_watermark };
-    for (std.enums.values(Case)) |case| {
+    const Case = struct {
+        legacy: bool = false,
+        file: []const u8,
+        stale: bool = false,
+        lost_manifest: bool = false,
+        listed: usize,
+        unreplayable: bool = false,
+        /// Null when latest resume reports the unsafe session, as base did.
+        resumed: ?[]const u8,
+    };
+    const cases = [_]Case{
+        .{ .file = "events.jsonl", .listed = 1, .resumed = "older" },
+        .{ .file = schema_v3_test_watermark, .stale = true, .listed = 2, .unreplayable = true, .resumed = "older" },
+        .{ .file = schema_v3_test_watermark, .lost_manifest = true, .listed = 1, .resumed = "older" },
+        .{ .file = "session.json", .listed = 1, .resumed = "older" },
+        .{ .file = "display.json", .listed = 2, .resumed = "fifo" },
+        .{ .legacy = true, .file = "events.jsonl", .listed = 2, .resumed = null },
+    };
+    for (cases) |case| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var ctx = try initTempStore(alloc, &tmp);
@@ -7954,48 +7971,44 @@ test "a FIFO in a schema-v3 session never blocks listing or latest resume" {
             .updated_at_ms = 30,
             .stale_projection = false,
         });
-        try writeSchemaV3Fixture(alloc, ctx.store, "fifo", .{
+        if (case.legacy) {
+            try writeLegacyV2Fixture(alloc, ctx.store, "fifo", ctx.workspace, 50);
+        } else try writeSchemaV3Fixture(alloc, ctx.store, "fifo", .{
             .projected_workspace = ctx.workspace,
             .workspace = ctx.workspace,
             .updated_at_ms = 50,
-            .stale_projection = case == .stale_watermark,
+            .stale_projection = case.stale,
         });
         {
             var dir = try ctx.store.openSessionDir("fifo");
             defer dir.close();
-            var name_buf: [std.fs.max_name_bytes]u8 = undefined;
-            const name = if (case == .event_log) "events.jsonl" else watermark: {
-                var it = dir.dir.iterate();
-                while (try it.next(std.testing.io)) |entry| {
-                    if (std.mem.startsWith(u8, entry.name, "commit.") and std.mem.endsWith(u8, entry.name, ".json") and
-                        !std.mem.eql(u8, entry.name, "commit.pending.json"))
-                    {
-                        @memcpy(name_buf[0..entry.name.len], entry.name);
-                        break :watermark name_buf[0..entry.name.len];
-                    }
-                }
-                return error.TestUnexpectedResult;
+            if (case.lost_manifest) try dir.dir.deleteFile(std.testing.io, "session.json");
+            dir.dir.deleteFile(std.testing.io, case.file) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
             };
-            if (case == .lost_manifest_watermark) try dir.dir.deleteFile(std.testing.io, "session.json");
-            try dir.dir.deleteFile(std.testing.io, name);
             const root = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
             defer alloc.free(root);
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, name });
+            const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, case.file });
             if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
         }
         // A blocking open of the FIFO would wait for a writer that never comes.
         {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
             defer catalog.deinit(alloc);
-            const listed_stale = case == .stale_watermark;
-            try std.testing.expectEqual(@as(usize, if (listed_stale) 2 else 1), catalog.summaries.items.len);
-            try std.testing.expectEqual(@as(usize, if (listed_stale) 0 else 1), catalog.skipped_invalid);
-            try std.testing.expectEqual(listed_stale, catalog.isUnreplayable("fifo"));
+            try std.testing.expectEqual(case.listed, catalog.summaries.items.len);
+            try std.testing.expectEqual(2 - case.listed, catalog.skipped_invalid);
+            try std.testing.expectEqual(case.unreplayable, catalog.isUnreplayable("fifo"));
         }
-        var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
-        defer resumed.deinit(alloc);
-        try std.testing.expectEqualStrings("older", resumed.active_id);
+        if (case.resumed) |id| {
+            var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqualStrings(id, resumed.active_id);
+        } else try std.testing.expectError(
+            error.SessionPathUnsafe,
+            ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}),
+        );
     }
 }
 
