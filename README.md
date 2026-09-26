@@ -52,6 +52,19 @@ Inside a session, `/provider` lists the presets and switches between them, and
 Preset endpoints and model ids follow each provider's public documentation and
 may drift; override a preset by defining a provider with the same name.
 
+## Web search
+
+The `web_search` tool works with any provider once a search API is configured:
+
+| Backend | Variable |
+| --- | --- |
+| Tavily | `TAVILY_API_KEY` (supports allowed/blocked domains) |
+| Brave Search API | `BRAVE_API_KEY` |
+| SearXNG (self-hosted, JSON format enabled) | `ABC_SEARXNG_URL=http://host:8080` |
+
+With several set, they are preferred in that order; `ABC_WEB_SEARCH_BACKEND`
+pins one. `web_fetch` works without any configuration.
+
 ## Configure a connection
 
 Settings live in `~/.abc/settings.json` (per project: `.abc.json`). Environment

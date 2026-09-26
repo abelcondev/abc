@@ -4429,6 +4429,7 @@ test {
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/web_search_api.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");

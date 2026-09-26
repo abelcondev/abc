@@ -1,4 +1,5 @@
 const std = @import("std");
+const web_search_api = @import("../builtins/web_search_api.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -107,7 +108,14 @@ fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choi
     for (tools.advertised_names) |name| {
         const function = tools.advertisedFunction(name) orelse {
             const registered = tools.registry.lookup(name) orelse return error.InvalidToolSelection;
-            if (registered.provider_executed) continue;
+            if (registered.provider_executed) {
+                // With a search API configured, web_search runs locally and is
+                // offered as an ordinary function.
+                if (registered.executor_kind == .web_search and web_search_api.available()) {
+                    try append_function(alloc, &functions, .{ .name = name, .description = registered.model_schema.description, .schema = .{ .builtin = registered.model_schema.input_schema } });
+                }
+                continue;
+            }
             return error.InvalidToolSelection;
         };
         // A repeated definition must not be selected by accidental first match.

@@ -127,6 +127,12 @@ pub const Runtime = struct {
         self.usage_allocator = inputs.usage_allocator;
     }
 
+    /// True when the installed provider reports that it can serve searches.
+    pub fn ready(self: *const Runtime) bool {
+        const provider = self.provider orelse return false;
+        return provider.ready();
+    }
+
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
         return .{ .ctx = @ptrCast(self), .execute_fn = executeForDispatch };
     }
