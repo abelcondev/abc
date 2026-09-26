@@ -4646,7 +4646,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "abc v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -5031,7 +5031,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "abc v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -5328,7 +5328,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\nabc v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5339,7 +5339,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\nabc v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {

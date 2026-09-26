@@ -251,7 +251,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .upgrade,
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade 𝒇x on the selected release channel",
+        .summary = "Upgrade abc on the selected release channel",
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,

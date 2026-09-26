@@ -5606,7 +5606,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with abc --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {

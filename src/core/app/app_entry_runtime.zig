@@ -240,11 +240,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             error.NoRememberedSession => {
-                writeStderr(deps, "fx: no remembered session for this workspace; choose one with fx -r or fx --resume <id>\n");
+                writeStderr(deps, "fx: no remembered session for this workspace; choose one with abc -r or abc --resume <id>\n");
                 return .{ .exit = 1 };
             },
             error.RememberedSessionUnavailable => {
-                writeStderr(deps, "fx: the remembered session ID could not be read; choose one with fx -r or fx --resume <id>\n");
+                writeStderr(deps, "fx: the remembered session ID could not be read; choose one with abc -r or abc --resume <id>\n");
                 return .{ .exit = 1 };
             },
             error.NoSavedSessions => {
@@ -442,7 +442,7 @@ fn writeUpgradeRelaunchFailure(
     var buffer: [768]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: abc --resume {s}\n",
         .{ @errorName(err), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
@@ -517,7 +517,7 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "Continue session with: fx --resume {s}\n",
+        "Continue session with: abc --resume {s}\n",
         .{session_id},
     );
 }
@@ -981,7 +981,7 @@ test "app entry writes exact resume handoff after interactive teardown" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Continue session with: abc --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
@@ -1022,7 +1022,7 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Continue session with: abc --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
@@ -1062,7 +1062,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "abc --resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
