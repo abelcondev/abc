@@ -4601,7 +4601,7 @@ test "root init rejects symlinked durable and sessions roots" {
         tmp.dir.symLink(
             io_mod.getIo(),
             "../outside",
-            "home/.fx",
+            "home/.abc",
             .{ .is_directory = true },
         ) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
@@ -4619,12 +4619,12 @@ test "root init rejects symlinked durable and sessions roots" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
         try tmp.dir.createDirPath(io_mod.getIo(), "outside");
         tmp.dir.symLink(
             io_mod.getIo(),
             "../../outside",
-            "home/.fx/sessions",
+            "home/.abc/sessions",
             .{ .is_directory = true },
         ) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
@@ -7062,7 +7062,7 @@ test "recovery checkpoint spill failure keeps the result inline" {
     defer loaded.deinit(alloc);
 
     // Block the result store: tool-results exists as a regular file.
-    const session_path = try std.fs.path.join(alloc, &.{ temp.home, ".fx", "sessions", initial.id });
+    const session_path = try std.fs.path.join(alloc, &.{ temp.home, ".abc", "sessions", initial.id });
     defer alloc.free(session_path);
     var session_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), session_path, .{});
     defer session_dir.close(io_mod.getIo());

@@ -2700,7 +2700,7 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
+        "fx: ~/.abc/mcp.json warning: {s}",
         .{@tagName(warning.cause)},
     );
     if (warning.key()) |key| {
@@ -4589,7 +4589,7 @@ test "top-level MCP add mutates through the focused provider without startup" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
     try std.testing.expectEqualStrings(
-        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
+        "Saved MCP server 'fixture' to /tmp/test-home/.abc/mcp.json.\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -4641,7 +4641,7 @@ test "top-level MCP list loads configuration without discovery and remove uses i
         try std.testing.expectEqual(RunResult.handled_success, result);
         try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
         try std.testing.expectEqualStrings(
-            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
+            "Removed MCP server 'fixture' from /tmp/test-home/.abc/mcp.json.\n",
             capture.stdout.written(),
         );
         try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -5473,7 +5473,7 @@ test "status and doctor inspect MCP configuration once per command" {
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+        "\"detail\":\"failed to load ~/.abc/mcp.json: McpConfigInvalidJson\"",
     ) != null);
 }
 
@@ -5678,7 +5678,7 @@ fn captureMcpProfileAddForTest(
         .http => return error.TestUnexpectedResult,
     }
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.abc/mcp.json"),
     };
 }
 
@@ -5689,7 +5689,7 @@ fn captureMcpProfileRemoveForTest(
     mcp_profile_remove_calls_for_test += 1;
     try std.testing.expectEqualStrings("fixture", name);
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.abc/mcp.json"),
         .removed = true,
     };
 }

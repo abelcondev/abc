@@ -2146,7 +2146,7 @@ pub const slack_install_spec: TopLevelSpec = .{
         "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
         "status shows local installation metadata; refresh renews tokens without browser authorization.",
         "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
-        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Credentials are saved in ~/.abc/slack/installation.json with owner-only permissions.",
         "Refresh runs only when requested; no background service is installed.",
     },
 };

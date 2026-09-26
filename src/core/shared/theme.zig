@@ -3,7 +3,7 @@
 //! `fx_dark` and `fx_light` retain their historical palette bytes. The ui
 //! keeps diff marker accents off until a theme is explicitly selected. Both
 //! core presentation and ui rendering resolve their themed values from here.
-//! User themes load from `~/.fx/themes/<name>.json` (selected with
+//! User themes load from `~/.abc/themes/<name>.json` (selected with
 //! FX_THEME=<name>) in either the
 //! native fx slot schema or the VS Code theme schema (`colors` +
 //! `tokenColors`), so editor themes like GitHub Dark apply
@@ -182,7 +182,7 @@ pub const ThemeChoice = union(enum) {
 
 /// Classifies a configured theme value (FX_THEME or the settings "theme"
 /// key): light/dark pin the builtin variant, anything else names a theme file
-/// under ~/.fx/themes.
+/// under ~/.abc/themes.
 pub fn classifyValue(value: []const u8) ?ThemeChoice {
     if (value.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(value, "light")) return .pin_light;
@@ -756,7 +756,7 @@ fn parseVsCode(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
     return theme;
 }
 
-// --- Loading from ~/.fx/themes ---
+// --- Loading from ~/.abc/themes ---
 
 pub const LoadError = error{ InvalidName, ThemeNotFound, InvalidTheme, OutOfMemory };
 
@@ -810,7 +810,7 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
     return null;
 }
 
-/// Loads `~/.fx/themes/<name>.json` and resolves it for the terminal's color
+/// Loads `~/.abc/themes/<name>.json` and resolves it for the terminal's color
 /// capability. The returned Theme is process-lifetime state allocated from
 /// `alloc`; the caller keeps the allocation alive.
 pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptions) LoadError!Theme {
@@ -822,7 +822,7 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
 
     const home = io_mod.getenv("HOME") orelse return error.ThemeNotFound;
-    const dir_path = try std.fmt.allocPrint(alloc, "{s}/.fx/themes", .{home});
+    const dir_path = try std.fmt.allocPrint(alloc, "{s}/.abc/themes", .{home});
     defer alloc.free(dir_path);
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;
     defer dir.close(io_mod.getIo());

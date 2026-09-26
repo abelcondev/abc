@@ -14,7 +14,7 @@ const RootSpec = skill_contract.RootSpec;
 /// home, in precedence order. `.fx/skills` and `skills/` belong to the product;
 /// the rest are compatibility roots for other agent installs.
 const workspace_roots = [_]RootSpec{
-    .{ .source = .workspace_fx, .path = ".fx/skills" },
+    .{ .source = .workspace_fx, .path = ".abc/skills" },
     .{ .source = .workspace_shared, .path = "skills" },
     .{ .source = .workspace_opencode, .path = ".opencode/skills" },
     .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -54,7 +54,7 @@ pub fn loadVisibleSkillsForTool(
 }
 
 fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
-    const suffix = "/.fx/skills";
+    const suffix = "/.abc/skills";
     if (!std.mem.endsWith(u8, skills_dir, suffix)) return null;
     return skills_dir[0 .. skills_dir.len - suffix.len];
 }
@@ -1172,7 +1172,7 @@ test "copySkillDir preserves the installed skill across allocation failures" {
 
 test "workspace skill roots scan the product root before compatibility roots" {
     const expected = [_]RootSpec{
-        .{ .source = .workspace_fx, .path = ".fx/skills" },
+        .{ .source = .workspace_fx, .path = ".abc/skills" },
         .{ .source = .workspace_shared, .path = "skills" },
         .{ .source = .workspace_opencode, .path = ".opencode/skills" },
         .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -2116,7 +2116,7 @@ test "built-in skills command creates and removes managed skills" {
         .name = "exact-skill",
         .info = .{
             .path = skill_dir,
-            .source_label = "global ~/.fx/skills",
+            .source_label = "global ~/.abc/skills",
             .managed_install = true,
         },
     }};
@@ -2166,7 +2166,7 @@ test "built-in skills command creates a missing managed parent root" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const skills_dir = try std.fs.path.join(alloc, &.{ root, "home", ".fx", "skills" });
+    const skills_dir = try std.fs.path.join(alloc, &.{ root, "home", ".abc", "skills" });
     defer alloc.free(skills_dir);
 
     var empty_ctx = StaticSkillCtx{ .skills = &.{} };

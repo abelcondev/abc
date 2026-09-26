@@ -743,7 +743,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // Theme selection: FX_THEME wins over the settings "theme" key; an empty
     // FX_THEME counts as unset per the codebase convention. light/dark pin the
     // builtin variant and skip the OSC 11 probe; any other value names a theme
-    // file under ~/.fx/themes.
+    // file under ~/.abc/themes.
     var configured_theme: ?[]const u8 = state.theme;
     if (io_mod.getenv("FX_THEME")) |value| {
         if (value.len > 0) configured_theme = value;
@@ -2242,7 +2242,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
@@ -2259,7 +2259,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
         .{disabled_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.abc/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2277,7 +2277,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2292,7 +2292,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     defer initial.deinit(std.testing.allocator);
     try std.testing.expect(initial.slash_menu_categories);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    try writeFixtureFile(tmp.dir, "home/.abc/settings.json", "{\"slash_menu_categories\":false}\n");
     var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
     defer hidden.deinit(std.testing.allocator);
     try std.testing.expect(!hidden.slash_menu_categories);
@@ -2308,8 +2308,8 @@ test "loadStartupState resolves max_agent_steps default zero and positive values
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "zero");
     try tmp.dir.createDirPath(io_mod.getIo(), "positive");
-    try writeFixtureFile(tmp.dir, "zero/.fx.json", "{\"max_agent_steps\":0}");
-    try writeFixtureFile(tmp.dir, "positive/.fx.json", "{\"max_agent_steps\":50}");
+    try writeFixtureFile(tmp.dir, "zero/.abc.json", "{\"max_agent_steps\":0}");
+    try writeFixtureFile(tmp.dir, "positive/.abc.json", "{\"max_agent_steps\":50}");
 
     const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
     defer std.testing.allocator.free(absent_root);
@@ -2340,7 +2340,7 @@ test "loadStartupState resolves max_tool_result_bytes default and explicit value
 
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "explicit");
-    try writeFixtureFile(tmp.dir, "explicit/.fx.json", "{\"max_tool_result_bytes\":131072}");
+    try writeFixtureFile(tmp.dir, "explicit/.abc.json", "{\"max_tool_result_bytes\":131072}");
 
     const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
     defer std.testing.allocator.free(absent_root);
@@ -2364,7 +2364,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"first_call_tool_choice\":\"required\"}");
+    try writeFixtureFile(tmp.dir, "workspace/.abc.json", "{\"first_call_tool_choice\":\"required\"}");
 
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
@@ -2378,7 +2378,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2386,7 +2386,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+    try writeFixtureFile(tmp.dir, "home/.abc/settings.json", "{\"skill_match_fuzzy\":true}");
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();

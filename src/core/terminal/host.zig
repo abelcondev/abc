@@ -1758,7 +1758,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host-v7",
+        "/.abc/terminal-host-v7",
     ));
     try std.testing.expect(!std.mem.eql(
         u8,
