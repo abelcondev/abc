@@ -5785,7 +5785,7 @@ const TestStoreFixture = struct {
             .{ .iterate = true, .follow_symlinks = false },
         ) };
         defer root.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".fx");
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".abc");
         defer fx.close();
         var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx, "sessions");
         defer sessions.close();
@@ -6836,7 +6836,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     defer alloc.free(name);
     const path = try std.fs.path.join(alloc, &.{
         fixture.home,
-        ".fx",
+        ".abc",
         "sessions",
         "terminal-store-owner",
         "terminal",

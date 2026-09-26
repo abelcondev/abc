@@ -2690,7 +2690,7 @@ test "tmux backend identity and shell quoting remain deterministic" {
 
 test "tmux paths keep artifacts durable and place only the server socket in transport" {
     const alloc = std.testing.allocator;
-    const durable_root = "/profiles/example/.fx/terminal-host";
+    const durable_root = "/profiles/example/.abc/terminal-host";
     const transport_root = "/tmp/fx-terminal-501-profile";
     const identity = "0123456789abcdef0123456789abcdef";
     var paths = try Paths.init(

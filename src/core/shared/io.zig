@@ -412,7 +412,19 @@ pub fn setRawEnviron(raw: RawEnviron) void {
     global_raw_environ = raw;
 }
 
+/// abc reads `ABC_*` variables first and falls back to the upstream `FX_*`
+/// names, so every `FX_X` lookup also honors `ABC_X`.
 pub fn getenv(key: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, key, "FX_")) {
+        var buffer: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buffer, "ABC_{s}", .{key["FX_".len..]})) |alias| {
+            if (getenvExact(alias)) |value| return value;
+        } else |_| {}
+    }
+    return getenvExact(key);
+}
+
+fn getenvExact(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
     if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
@@ -1565,4 +1577,25 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+test "getenv prefers ABC_ names over their FX_ equivalents" {
+    const previous_environ = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    defer {
+        global_environ = previous_environ;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("FX_MODEL", "fx-model");
+    try map.put("FX_PROVIDER", "fx-provider");
+    try map.put("ABC_PROVIDER", "abc-provider");
+    setEnvironMap(&map);
+    try std.testing.expectEqualStrings("fx-model", getenv("FX_MODEL").?);
+    try std.testing.expectEqualStrings("abc-provider", getenv("FX_PROVIDER").?);
+    try std.testing.expectEqualStrings("abc-provider", getenv("ABC_PROVIDER").?);
+    try std.testing.expect(getenv("FX_MISSING") == null);
 }

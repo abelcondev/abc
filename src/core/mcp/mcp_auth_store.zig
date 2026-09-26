@@ -1444,7 +1444,7 @@ test "credential store is private atomic and supports restart deletion" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("access-secret", loaded.access_token);
 
-    var root = try tmp.dir.openDir(std.testing.io, "home/.fx", .{ .iterate = true });
+    var root = try tmp.dir.openDir(std.testing.io, "home/.abc", .{ .iterate = true });
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(
