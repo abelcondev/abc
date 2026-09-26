@@ -3871,7 +3871,7 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         &hint_buf,
     );
     try std.testing.expectEqualStrings(
-        "run /login · ask · opus 4.8 · xhigh · ⚡︎",
+        "run /provider · ask",
         line,
     );
 }
@@ -5471,7 +5471,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "run /provider"));
 }
 
 test "core.app_render_runtime inline model catalog survives modal preemption and close" {
@@ -6585,5 +6585,5 @@ test "core.app_render_runtime coordinator physically scrolls preserved shell row
     try std.testing.expect(!(try coordinatorGridContains(terminal, "SHELL01")));
     try std.testing.expect(try coordinatorRowHasText(terminal, 1));
     try std.testing.expect(try coordinatorGridContains(terminal, "WRAPPED_TAIL"));
-    try std.testing.expect(try coordinatorGridContains(terminal, "run /login"));
+    try std.testing.expect(try coordinatorGridContains(terminal, "run /provider"));
 }

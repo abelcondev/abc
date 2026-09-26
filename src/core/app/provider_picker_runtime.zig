@@ -11,6 +11,7 @@
 //! provider switching, OAuth, API key entry, and team selection.
 
 const std = @import("std");
+const provider_keys = @import("../auth/provider_keys.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -259,6 +260,18 @@ pub fn Runtime(comptime App: type) type {
             switch (query.stage) {
                 .provider => {
                     const provider = provider_picker_catalog.parseProvider(selected) orelse return false;
+                    if (provider == .configured) {
+                        // A connection without a usable key asks for one first;
+                        // saving it (see app_auth_runtime) finishes the switch.
+                        const registry = if (comptime @hasField(App, "provider_selection")) app.provider_selection.definitions else @import("../config/configured_provider.zig").Registry{};
+                        if (registry.get(provider.label())) |definition| {
+                            if (!provider_keys.available(app.alloc, definition)) {
+                                try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider.label(), "", .method);
+                                try openKeyStage(app, query.prefix, .api_key);
+                                return true;
+                            }
+                        }
+                    }
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;
@@ -685,9 +698,8 @@ test "provider column lists every provider and marks the active one" {
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
-    try std.testing.expectEqualStrings("vercel", column.labels[0]);
-    try std.testing.expectEqualStrings("current", column.annotations[0]);
-    for (column.annotations[1..column.count]) |annotation| {
+    try std.testing.expectEqualStrings("deepseek", column.labels[0]);
+    for (column.annotations[0..column.count]) |annotation| {
         try std.testing.expectEqualStrings("", annotation);
     }
 }

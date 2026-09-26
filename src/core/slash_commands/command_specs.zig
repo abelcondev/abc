@@ -1547,7 +1547,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.startsWith(u8, text, "abc v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "abc"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "abc v"));
     try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);

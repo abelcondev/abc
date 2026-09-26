@@ -63,6 +63,11 @@ xattr -d com.apple.quarantine "$install_dir/abc" 2>/dev/null || true
 
 printf 'Installed %s to %s\n' "$("$install_dir/abc" --version 2>/dev/null || echo abc)" "$install_dir/abc"
 
+# `abc update` reuses this script and only needs the install line above.
+if [ "${ABC_UPDATING:-0}" = "1" ]; then
+	exit 0
+fi
+
 case ":$PATH:" in
 *":$install_dir:"*)
 	resolved="$(command -v abc 2>/dev/null || true)"

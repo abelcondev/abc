@@ -1,4 +1,6 @@
 const std = @import("std");
+const provider_keys = @import("../auth/provider_keys.zig");
+const secret = @import("../auth/secret.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -199,24 +201,18 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "The provider's API key is unavailable. Export the environment variable named in its auth settings.",
+                    .body = "This provider has no API key yet. Run /provider and choose it again to enter the key, or export its key variable.",
                 }, true);
                 app.shell.render_requests.request(.footer);
                 return false;
             }
 
-            const auth_view = app.auth.view();
-            if (auth_view.onboarding_skipped) {
-                if (compactionOwnsCredentialFeedback(app)) return false;
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = credentials.missing_interactive_credential_message,
-                }, true);
-            } else if (!app.auth.pickerView().active) {
-                try app.auth.refreshSourceInventory(app.alloc);
-                app.auth.openOnboardingPicker(app.alloc);
-            }
+            if (compactionOwnsCredentialFeedback(app)) return false;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .warning,
+                .body = credentials.missing_interactive_credential_message,
+            }, true);
             app.shell.render_requests.request(.footer);
             return false;
         }
@@ -646,6 +642,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitApiKeyEntry(app: *App) !void {
             if (app.auth.pickerView().api_key_mask_count == 0) return;
+            if (try submitConnectionKey(app)) return;
             switch (app.auth.beginApiKeySave(app.alloc)) {
                 .started => app.shell.render_requests.request(.footer),
                 .empty => {},
@@ -655,6 +652,42 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Still saving the previous API key. Nothing was stored for this one; try again in a moment.",
                 }, true),
             }
+        }
+
+        /// `/provider <connection> api-key`: store the key for that connection
+        /// (Keychain or profile file) and switch to it. Returns false when the
+        /// key field belongs to the Gateway instead.
+        fn submitConnectionKey(app: *App) !bool {
+            if (comptime !provider_runtime.supported(App) or !provider_picker_runtime.supported(App) or
+                !@hasDecl(@TypeOf(app.auth), "takeInlineApiKey"))
+            {
+                return false;
+            }
+            if (app.input_runtime.picker.provider_picker_stage != .api_key) return false;
+            const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
+            const target = model_provider.parse(pending) orelse return false;
+            if (target != .configured) return false;
+            const registry = if (comptime @hasField(App, "provider_selection")) app.provider_selection.definitions else @import("../config/configured_provider.zig").Registry{};
+            const definition = registry.get(target.label()) orelse return false;
+            const id = try app.alloc.dupe(u8, definition.id);
+            defer app.alloc.free(id);
+            const key = (try app.auth.takeInlineApiKey(app.alloc)) orelse return true;
+            defer secret.zeroAndFree(app.alloc, key);
+            app.input_runtime.picker.clearProviderPickerFlow();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            const trimmed = std.mem.trim(u8, key, " \t\r\n");
+            provider_keys.store(app.alloc, id, trimmed) catch |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "Could not save the {s} API key ({s}). Nothing changed.", .{ id, @errorName(err) });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "provider", .tone = .@"error", .body = body }, true);
+                return true;
+            };
+            const body = try std.fmt.allocPrint(app.alloc, "Saved the {s} API key in the {s}.", .{ id, provider_keys.backendLabel() });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
+            try switchProvider(app, target, false, .manual);
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         /// Polled from the event loop so a save that blocks on a locked key store
@@ -831,11 +864,24 @@ pub fn Runtime(comptime App: type) type {
 
         fn startProviderSwitch(
             app: *App,
-            target: model_provider.ProviderId,
+            requested_target: model_provider.ProviderId,
             allow_login: bool,
             intent: ProviderSwitchIntent,
             fallback: ?model_provider.ProviderId,
         ) !void {
+            // Picker slugs name connections without their endpoint binding;
+            // sessions and settings persist only bound connections.
+            const target = if (comptime @hasField(App, "provider_selection"))
+                requested_target.bind(app.provider_selection.definitions) catch {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = "That provider is not defined. The current provider is unchanged.",
+                    }, true);
+                    return;
+                }
+            else
+                requested_target;
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "providerCatalog") or
                 !@hasDecl(@TypeOf(app.auth), "beginProviderPreparation") or host_target.is_wasm)
@@ -911,6 +957,11 @@ pub fn Runtime(comptime App: type) type {
             return definition.default_model;
         }
 
+        /// Connection names read better than the generic "Configured provider".
+        fn providerName(provider: *const model_provider.ProviderId) []const u8 {
+            return if (provider.* == .configured) provider.label() else provider_catalog.label(provider.*);
+        }
+
         fn pendingPromptBlocksPreparation(app: *const App) bool {
             if (comptime !@hasField(App, "submission")) return false;
             const pending = app.submission.pending orelse return false;
@@ -944,7 +995,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            const target_provider = input.target();
+            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{providerName(&target_provider)});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1089,7 +1141,7 @@ pub fn Runtime(comptime App: type) type {
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Switched to {s} with {s}.",
-                .{ provider_catalog.label(target), provider_runtime.model(app) },
+                .{ providerName(&target), provider_runtime.model(app) },
             );
             defer app.alloc.free(body);
             if (comptime @hasDecl(App, "persistRuntimePreferences")) {
@@ -3021,16 +3073,21 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.auth.picker_opened);
 }
 
-test "manual compaction missing credentials preserves onboarding when it is enabled" {
+test "missing provider credentials point to /provider without opening onboarding" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.active_source = null;
-    app.submission.compaction_pending = true;
 
     try std.testing.expect(!try Runtime(TestApp).missingPromptCredential(&app, .gateway));
-    try std.testing.expect(app.auth.picker_opened);
-    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
-    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+
+    var compacting: TestApp = .{};
+    defer compacting.deinit();
+    compacting.auth.active_source = null;
+    compacting.submission.compaction_pending = true;
+    try std.testing.expect(!try Runtime(TestApp).missingPromptCredential(&compacting, .gateway));
+    try std.testing.expectEqual(@as(usize, 0), compacting.notice_write_count);
 }
 
 test "manual compaction credential failure leaves feedback to its lifecycle owner" {

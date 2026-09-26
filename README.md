@@ -17,7 +17,11 @@ curl -fsSL https://raw.githubusercontent.com/abelcondev/abc/main/install.sh | sh
 
 Installs the latest release for Apple Silicon or Intel into `~/.local/bin`
 (`ABC_INSTALL_DIR` changes it, `ABC_VERSION=v0.1.0` pins a release). Other
-platforms can build from source.
+platforms can build from source. Later, `abc update` installs the newest
+release over the running binary.
+
+Open `abc` in a project and run `/provider`: pick a preset, paste its API key
+when asked (saved in the macOS Keychain), then choose a model with `/model`.
 
 ## Build
 
