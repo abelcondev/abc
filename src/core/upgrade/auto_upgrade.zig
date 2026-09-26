@@ -43,9 +43,8 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
-    return !isDevelopmentBuildPath(exe_buf[0..n]);
+    // abc has no release CDN yet; never auto-upgrade to the upstream fx binary.
+    return false;
 }
 
 pub fn isDevelopmentBuildPath(path: []const u8) bool {

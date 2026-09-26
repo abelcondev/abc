@@ -22,6 +22,7 @@ pub const RunResult = struct {
 };
 
 const RunError = error{
+    UpgradesDisabled,
     FetchFailed,
     DownloadFailed,
     ChecksumFetchFailed,
@@ -39,7 +40,10 @@ pub fn run(
     channel: update_target.Channel,
     format: output_contracts.OutputFormat,
 ) RunResult {
-    return runInner(alloc, current, channel, format) catch |err| failureResult(current, channel, err);
+    // abc has no release CDN yet; the upstream CDN would replace this binary with fx.
+    _ = alloc;
+    _ = format;
+    return failureResult(current, channel, error.UpgradesDisabled);
 }
 
 fn runInner(
@@ -131,6 +135,7 @@ fn failureResult(
 
 fn failureMessage(err: RunError) []const u8 {
     return switch (err) {
+        error.UpgradesDisabled => "upgrades are disabled in abc; rebuild from source",
         error.FetchFailed => "failed to fetch latest version from CDN",
         error.DownloadFailed => "failed to download release archive",
         error.ChecksumFetchFailed => "failed to fetch checksum from CDN",
