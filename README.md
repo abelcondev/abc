@@ -9,6 +9,16 @@ Gateway.
 > Status: experimental, under active restructuring. See [PROPOSAL.md](PROPOSAL.md)
 > for the plan.
 
+## Install (macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abelcondev/abc/main/install.sh | sh
+```
+
+Installs the latest release for Apple Silicon or Intel into `~/.local/bin`
+(`ABC_INSTALL_DIR` changes it, `ABC_VERSION=v0.1.0` pins a release). Other
+platforms can build from source.
+
 ## Build
 
 Requires Zig 0.16.0.
