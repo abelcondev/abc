@@ -67,6 +67,7 @@ Inside a session, `/provider` lists the presets and switches between them, and
 | --- | --- | --- |
 | `deepseek` | `DEEPSEEK_API_KEY` | api.deepseek.com (`deepseek-flash`, `deepseek-v4-pro`; verified end to end) |
 | `qwen`, `qwen-cn` | `DASHSCOPE_API_KEY` | DashScope compatible mode (intl / China) |
+| `qwen-plan` | `QWEN_TOKEN_PLAN_API_KEY` | Model Studio Token Plan, Singapore (`sk-sp-…` plan key; qwen3.8, GLM and DeepSeek models; verified end to end) |
 | `moonshot`, `moonshot-cn` | `MOONSHOT_API_KEY` | Kimi (intl / China) |
 | `zai`, `zhipu` | `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | GLM (Z.ai / BigModel) |
 | `minimax` | `MINIMAX_API_KEY` | api.minimax.io |
