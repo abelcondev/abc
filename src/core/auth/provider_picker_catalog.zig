@@ -110,13 +110,17 @@ pub fn parseMethod(value: []const u8) ?Method {
     return null;
 }
 
-/// Writes the visible provider slugs into `out` and returns how many landed:
-/// built-in providers first, then the connection presets.
+/// Writes the visible provider slugs into `out` and returns how many landed.
+/// abc lists only the connection presets; the Vercel AI Gateway stays
+/// reachable by name (`/provider vercel`) but is not offered. WASM hosts,
+/// which cannot use presets, still list the built-in providers.
 pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
     var count: usize = 0;
-    for (&provider_catalog.entries) |*entry| {
-        out[count] = entry.slug;
-        count += 1;
+    if (comptime host_target.is_wasm) {
+        for (&provider_catalog.entries) |*entry| {
+            out[count] = entry.slug;
+            count += 1;
+        }
     }
     if (comptime !host_target.is_wasm) {
         for (&provider_presets.definitions) |*definition| {
@@ -159,7 +163,7 @@ test "provider options expose the catalog slugs the composer accepts" {
     const count = providerOptions(&buf);
 
     try std.testing.expect(count >= 1);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
+    try std.testing.expectEqualStrings("deepseek", buf[0]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(parseProvider(slug) != null);
         try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);

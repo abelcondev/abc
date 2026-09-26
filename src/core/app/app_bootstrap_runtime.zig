@@ -381,10 +381,7 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
-            const startup_auth_view = app.auth.view();
-            if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
-                app.auth.openOnboardingPicker(app.alloc);
-            }
+            // abc opens straight into the chat; providers are chosen with /provider.
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FX_THEME; probing stays gated.
                 app.terminal_input_runtime.terminal_theme_monitor.start();
@@ -1202,7 +1199,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expect(app.begin_fresh_called);
 }
 
-test "app_bootstrap_runtime opens onboarding before first frame without a credential" {
+test "app_bootstrap_runtime opens straight into the chat without a credential" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.startup_with_credential = false;
@@ -1212,10 +1209,7 @@ test "app_bootstrap_runtime opens onboarding before first frame without a creden
 
     try runBootstrapForTest(&app, &capture);
 
-    const picker = app.auth.pickerView();
-    try std.testing.expect(picker.active);
-    try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(auth_runtime.PickerStage.root, picker.stage);
+    try std.testing.expect(!app.auth.pickerView().active);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
 }
 

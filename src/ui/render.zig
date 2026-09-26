@@ -449,14 +449,18 @@ pub fn buildHintLine(
     const permission_label = permissionModeStatusLabel(permission_mode, &permission_buf);
 
     var end: usize = 0;
-    if (!awaiting_permission and !has_api_key) {
-        appendStatusSegment(out, &end, "run /login");
-    }
     const status_limit = @min(@as(usize, width), out.len);
-    if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
+    // Without a usable credential the model label is only a placeholder, so
+    // the footer points at /provider instead of naming it.
+    if (!awaiting_permission and !has_api_key) {
+        appendStatusSegment(out, &end, "run /provider");
         appendStatusSegment(out, &end, permission_label);
+    } else {
+        if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
+            appendStatusSegment(out, &end, permission_label);
+        }
+        appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, fast_indicator_active, statusline);
     }
-    appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, fast_indicator_active, statusline);
 
     const width_usize: usize = width;
     if (width_usize == 0) return "";
@@ -1133,7 +1137,7 @@ test "buildHintLine keeps system labels and dot separators" {
     }, 256, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "run /login · {s}auto{s} · opus 4.8 · low · ⚡︎ · 43k/1000k 4%",
+        "run /provider · {s}auto{s}",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

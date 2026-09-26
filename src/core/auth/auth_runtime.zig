@@ -2153,6 +2153,18 @@ pub const Runtime = struct {
         return @min(self.api_key_input.items.len, max_api_key_mask_glyphs);
     }
 
+    /// Ends the inline key field and hands the typed key to the caller, who
+    /// must zero and free it. Used for connection keys, which skip the
+    /// Gateway validator and its key store.
+    pub fn takeInlineApiKey(self: *Self, alloc: Allocator) Allocator.Error!?[]u8 {
+        if (!self.apiKeyInlineActive() or self.api_key_input.items.len == 0) return null;
+        const key = try alloc.dupe(u8, self.api_key_input.items);
+        self.exitApiKeyStage(alloc, .saved);
+        self.picker_active = false;
+        self.picker_stage = .root;
+        return key;
+    }
+
     /// Leaves the key field without saving, zeroing whatever was typed.
     pub fn cancelInlineApiKeyEntry(self: *Self, alloc: Allocator) void {
         if (!self.apiKeyInlineActive()) return;

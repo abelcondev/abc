@@ -236,14 +236,14 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "No model provider is set up. Run `abc login deepseek` (or another preset) to save its API key, or export the key variable.";
+pub const missing_interactive_credential_message = "No model provider is set up. Choose one with /provider (for example /provider deepseek); abc asks for its API key.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
 
-test "public credential guidance spells fx lowercase" {
-    try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
-    try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
+test "public credential guidance points at provider setup" {
+    try std.testing.expect(std.mem.find(u8, missing_credential_message, "abc login") != null);
+    try std.testing.expect(std.mem.find(u8, missing_interactive_credential_message, "/provider") != null);
     try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
 }
 
@@ -830,22 +830,6 @@ test "stored key label discloses the backend that answered" {
     for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
         try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
     }
-}
-
-test "missing credential messages use surface commands in preferred order" {
-    const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
-    const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
-
-    try std.testing.expect(cli_login < cli_setup);
-    try std.testing.expect(cli_setup < cli_env);
-
-    const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
-    const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/provider").?;
-    const tui_env = std.mem.find(u8, missing_interactive_credential_message, "AI_GATEWAY_API_KEY").?;
-
-    try std.testing.expect(tui_login < tui_setup);
-    try std.testing.expect(tui_setup < tui_env);
 }
 
 test "credential gateway team prefers team id" {

@@ -45,6 +45,24 @@ pub fn validate(value: []const u8) Error!void {
     for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidProviderKey;
 }
 
+/// Whether a connection can authenticate now: no auth needed, its key
+/// variable is exported, or a key was saved for it.
+pub fn available(alloc: Allocator, definition: *const configured_provider.Definition) bool {
+    const env = switch (definition.auth) {
+        .none => return true,
+        .bearer => |name| name,
+    };
+    if (io_mod.getenv(env)) |value| {
+        if (std.mem.trim(u8, value, " \t\r\n").len != 0) return true;
+    }
+    const saved = load(alloc, definition.id) catch return false;
+    if (saved) |key| {
+        secret.zeroAndFree(alloc, key);
+        return true;
+    }
+    return false;
+}
+
 /// Returns an owned key or null. Callers zero and free it with `alloc`.
 pub fn load(alloc: Allocator, id: []const u8) Error!?[]u8 {
     // Unit tests never touch the user's Keychain or profile.
