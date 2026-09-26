@@ -15,6 +15,8 @@ const Allocator = std.mem.Allocator;
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    reasoning_format: configured_provider.ReasoningFormat = .none,
+    merge_system_messages: bool = false,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -164,9 +166,8 @@ fn validate_dynamic_schema(value: std.json.Value, depth: usize, budget: *SchemaB
 fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
-    const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
-    if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
+    // Fast mode, gateway prompt caching and gateway provider routing have no
+    // Chat Completions equivalent; they are ignored rather than failing the turn.
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.
@@ -526,12 +527,23 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     defer pending_names.deinit(alloc);
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
+    // Adjacent system messages (across both lanes) join into one when merging.
+    var pending_system: std.ArrayList(u8) = .empty;
+    defer pending_system.deinit(alloc);
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
     for (lanes) |lane| {
         for (lane) |message| {
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
+            if (options.merge_system_messages and message.role == .system and message.images.len == 0 and message.provider_replay == null) {
+                if (message.content) |content| {
+                    if (pending_system.items.len != 0) try pending_system.appendSlice(alloc, "\n\n");
+                    try pending_system.appendSlice(alloc, content);
+                    continue;
+                }
+            }
+            try flush_system_message(writer, &count, &pending_system);
             if (count != 0) try writer.writeByte(',');
             count += 1;
             try writer.writeAll("{\"role\":");
@@ -573,6 +585,7 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         // Lane boundary: flush before the next lane starts.
         try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
     }
+    try flush_system_message(writer, &count, &pending_system);
     try writer.writeByte(']');
     if (functions.len != 0) {
         try writer.writeAll(",\"tools\":[");
@@ -602,7 +615,40 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.provider_options.reasoning) |*effort| try write_reasoning(writer, options.reasoning_format, effort);
     try writer.writeByte('}');
+}
+
+fn flush_system_message(writer: *std.Io.Writer, count: *usize, pending: *std.ArrayList(u8)) !void {
+    if (pending.items.len == 0) return;
+    if (count.* != 0) try writer.writeByte(',');
+    count.* += 1;
+    try writer.writeAll("{\"role\":\"system\",\"content\":");
+    try std.json.Stringify.value(pending.items, .{}, writer);
+    try writer.writeByte('}');
+    pending.clearRetainingCapacity();
+}
+
+/// "auto" leaves the provider default in place; "none", "off" and "disabled"
+/// turn thinking off for the boolean-style formats.
+fn write_reasoning(writer: *std.Io.Writer, format: configured_provider.ReasoningFormat, effort: *const types.ReasoningEffort) !void {
+    if (effort.* == .auto) return;
+    const label = effort.label();
+    const disabled = std.ascii.eqlIgnoreCase(label, "none") or std.ascii.eqlIgnoreCase(label, "off") or std.ascii.eqlIgnoreCase(label, "disabled");
+    switch (format) {
+        .none => {},
+        .reasoning_effort => {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(label, .{}, writer);
+        },
+        .thinking => try writer.print(",\"thinking\":{{\"type\":\"{s}\"}}", .{if (disabled) "disabled" else "enabled"}),
+        .enable_thinking => try writer.print(",\"enable_thinking\":{}", .{!disabled}),
+        .openrouter => {
+            try writer.writeAll(",\"reasoning\":{\"effort\":");
+            try std.json.Stringify.value(label, .{}, writer);
+            try writer.writeByte('}');
+        },
+    }
 }
 
 pub const Limits = struct {
@@ -2228,12 +2274,11 @@ test "chat completions serializes user message images as content parts" {
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.provider_options.reasoning = .auto;
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
-    request.provider_options = .{ .fast = true };
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
-    request.provider_options = .{ .prompt_caching = true };
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
+    for ([_]@TypeOf(request.provider_options){ .{ .reasoning = .auto }, .{ .fast = true }, .{ .prompt_caching = true } }) |options| {
+        request.provider_options = options;
+        const body = try build_request(alloc, request, .{});
+        alloc.free(body);
+    }
     request = test_request();
     request.vision_mode = .optional;
     try std.testing.expectError(error.UnsupportedVision, build_request(alloc, request, .{}));
@@ -2912,4 +2957,51 @@ test "lenient chat completions stream ends without DONE only after finish_reason
         defer result.deinit(alloc);
         try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason);
     }
+}
+
+test "chat completions serializes reasoning effort per provider format" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { format: configured_provider.ReasoningFormat, effort: []const u8, expected: ?[]const u8 }{
+        .{ .format = .reasoning_effort, .effort = "high", .expected = "\"reasoning_effort\":\"high\"" },
+        .{ .format = .thinking, .effort = "high", .expected = "\"thinking\":{\"type\":\"enabled\"}" },
+        .{ .format = .thinking, .effort = "none", .expected = "\"thinking\":{\"type\":\"disabled\"}" },
+        .{ .format = .enable_thinking, .effort = "medium", .expected = "\"enable_thinking\":true" },
+        .{ .format = .enable_thinking, .effort = "off", .expected = "\"enable_thinking\":false" },
+        .{ .format = .openrouter, .effort = "low", .expected = "\"reasoning\":{\"effort\":\"low\"}" },
+        .{ .format = .none, .effort = "high", .expected = null },
+    };
+    for (cases) |case| {
+        var request = test_request();
+        request.provider_options.reasoning = types.ReasoningEffort.parse(case.effort).?;
+        const body = try build_request(alloc, request, .{ .reasoning_format = case.format });
+        defer alloc.free(body);
+        if (case.expected) |expected| {
+            try std.testing.expect(std.mem.find(u8, body, expected) != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, body, "reasoning") == null and std.mem.find(u8, body, "thinking") == null);
+        }
+    }
+    var request = test_request();
+    request.provider_options.reasoning = .auto;
+    const body = try build_request(alloc, request, .{ .reasoning_format = .reasoning_effort });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "reasoning_effort") == null);
+}
+
+test "chat completions merges adjacent system messages when asked" {
+    const alloc = std.testing.allocator;
+    const merged = try build_request(alloc, test_request(), .{ .merge_system_messages = true });
+    defer alloc.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, merged, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system", messages[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("first\n\nsecond", messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+    const separate = try build_request(alloc, test_request(), .{});
+    defer alloc.free(separate);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, alloc, separate, .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), reparsed.value.object.get("messages").?.array.items.len);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -26,10 +27,25 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidReasoningFormat,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
+
+/// How a selected reasoning effort is serialized for this endpoint.
+pub const ReasoningFormat = enum {
+    /// Never send reasoning controls.
+    none,
+    /// `"reasoning_effort": "<effort>"` (OpenAI style).
+    reasoning_effort,
+    /// `"thinking": {"type": "enabled" | "disabled"}` (DeepSeek, GLM, Kimi style).
+    thinking,
+    /// `"enable_thinking": true | false` (Qwen / DashScope style).
+    enable_thinking,
+    /// `"reasoning": {"effort": "<effort>"}` (OpenRouter style).
+    openrouter,
+};
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -44,6 +60,8 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Effort names the model accepts; empty means no reasoning controls.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -58,6 +76,9 @@ pub const Definition = struct {
     model_metadata: []const ModelMetadata = &.{},
     /// Opt out of the lenient stream reader and require strict OpenAI framing.
     strict_stream: bool = false,
+    reasoning_format: ReasoningFormat = .reasoning_effort,
+    /// Join consecutive system messages; some servers accept only one.
+    merge_system_messages: bool = true,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -98,7 +119,10 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(self.model_metadata);
     }
 };
@@ -165,7 +189,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "strict_stream" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "strict_stream", "reasoning_format", "merge_system_messages" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -178,6 +202,12 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
     }
     const strict_stream = (optional_bool(value.object.get("strict_stream")) catch return error.InvalidObject) orelse false;
+    const merge_system_messages = (optional_bool(value.object.get("merge_system_messages")) catch return error.InvalidObject) orelse true;
+    var reasoning_format: ReasoningFormat = .reasoning_effort;
+    if (value.object.get("reasoning_format")) |format| {
+        if (format != .string) return error.InvalidReasoningFormat;
+        reasoning_format = std.meta.stringToEnum(ReasoningFormat, format.string) orelse return error.InvalidReasoningFormat;
+    }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
         if (model_value != .string) return error.InvalidModelId;
@@ -208,6 +238,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
         .strict_stream = strict_stream,
+        .reasoning_format = reasoning_format,
+        .merge_system_messages = merge_system_messages,
     };
 }
 
@@ -236,20 +268,26 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const efforts = try parse_efforts(alloc, metadata.object.get("reasoning_efforts"));
+        errdefer alloc.free(efforts);
         models[initialized] = .{
+            .reasoning_efforts = efforts,
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
@@ -259,6 +297,18 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
         initialized += 1;
     }
     return models;
+}
+
+fn parse_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
+    const present = value orelse return &.{};
+    if (present != .array or present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+    const efforts = try alloc.alloc(types.ReasoningEffort, present.array.items.len);
+    errdefer alloc.free(efforts);
+    for (present.array.items, efforts) |item, *effort| {
+        if (item != .string) return error.InvalidModelMetadata;
+        effort.* = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -346,7 +396,7 @@ fn validate_url(url: []const u8) ParseError![]const u8 {
     }
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InsecureBaseUrl;
-        if (!std.mem.eql(u8, host, "127.0.0.1") and !std.mem.eql(u8, host, "[::1]") and !std.ascii.eqlIgnoreCase(host, "localhost")) return error.InsecureBaseUrl;
+        if (!std.mem.eql(u8, host, "127.0.0.1") and !std.mem.eql(u8, host, "[::1]") and !std.ascii.eqlIgnoreCase(host, "localhost") and !is_private_network_host(host)) return error.InsecureBaseUrl;
     }
     // Preserve encoded path bytes but reject malformed escapes and encoded
     // controls so later HTTP construction cannot reinterpret unsafe bytes.
@@ -362,6 +412,25 @@ fn validate_url(url: []const u8) ParseError![]const u8 {
         } else if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "/-._~!$&'()*+,;=:@", byte) == null) return error.InvalidBaseUrl;
     }
     return if (std.mem.endsWith(u8, url, "/")) url[0 .. url.len - 1] else url;
+}
+
+/// Plain HTTP is also allowed for self-hosted servers on a private network:
+/// RFC 1918 and CGNAT (Tailscale) IPv4 literals and mDNS `.local` names.
+fn is_private_network_host(host: []const u8) bool {
+    if (host.len > ".local".len and std.ascii.endsWithIgnoreCase(host, ".local")) return true;
+    var octets: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    for (&octets) |*octet| {
+        const part = parts.next() orelse return false;
+        if (part.len == 0 or part.len > 3 or (part.len > 1 and part[0] == '0')) return false;
+        for (part) |byte| if (!std.ascii.isDigit(byte)) return false;
+        octet.* = std.fmt.parseInt(u8, part, 10) catch return false;
+    }
+    if (parts.next() != null) return false;
+    return octets[0] == 10 or
+        (octets[0] == 172 and octets[1] >= 16 and octets[1] <= 31) or
+        (octets[0] == 192 and octets[1] == 168) or
+        (octets[0] == 100 and octets[1] >= 64 and octets[1] <= 127);
 }
 
 fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
@@ -429,6 +498,12 @@ test "configured provider URL policy and prefix normalization" {
     for (invalid) |url| try std.testing.expectError(error.InvalidBaseUrl, validate_url(url));
     const insecure = [_][]const u8{ "http://example.com", "ftp://example.com", "http://127.0.0.2", "http://127.1", "http://2130706433", "http://localhost.evil", "http://[::ffff:127.0.0.1]", "http://[0:0:0:0:0:0:0:1]" };
     for (insecure) |url| try std.testing.expectError(error.InsecureBaseUrl, validate_url(url));
+    for ([_][]const u8{ "http://192.168.1.20:11434/v1", "http://10.0.0.5/v1", "http://172.20.1.1:8000/v1", "http://100.100.1.2:8080/v1", "http://gpu-box.local:11434/v1" }) |url| {
+        _ = try validate_url(url);
+    }
+    for ([_][]const u8{ "http://192.169.1.1", "http://172.32.0.1", "http://8.8.8.8", "http://010.0.0.1", "http://10.0.0.1.evil.com", "http://.local" }) |url| {
+        try std.testing.expect(std.meta.isError(validate_url(url)));
+    }
 }
 
 test "configured provider binding identity separates name endpoint and auth slot" {
@@ -639,4 +714,25 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, test_invalid_allocations, .{});
+}
+
+test "configured provider parses reasoning controls and system merging" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"qwen":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"},"reasoning_format":"enable_thinking","merge_system_messages":false,"model_metadata":{"qwen3":{"reasoning_efforts":["off","high"]}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("qwen").?;
+    try std.testing.expectEqual(ReasoningFormat.enable_thinking, definition.reasoning_format);
+    try std.testing.expect(!definition.merge_system_messages);
+    try std.testing.expect(!definition.strict_stream);
+    const efforts = definition.model("qwen3").?.reasoning_efforts;
+    try std.testing.expectEqual(@as(usize, 2), efforts.len);
+    try std.testing.expectEqualStrings("high", efforts[1].label());
+    try std.testing.expectError(error.InvalidReasoningFormat, Registry.parse_json(alloc,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"},"reasoning_format":"magic"}}
+    ));
+    try std.testing.expectError(error.InvalidModelMetadata, Registry.parse_json(alloc,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"},"model_metadata":{"m":{"reasoning_efforts":["bad effort"]}}}}
+    ));
 }
