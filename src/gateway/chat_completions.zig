@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const codec = @import("chat_completions_protocol.zig");
 const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
@@ -251,7 +252,73 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
+    var remote = try fetch_remote_model_ids(alloc, definition, input.cancel_flag);
+    defer {
+        for (remote.items) |id| alloc.free(id);
+        remote.deinit(alloc);
+    }
+    for (remote.items) |id| {
+        if (definition.model(id) != null) continue;
+        const owned_id = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned_id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = owned_id, .model_type = model_type });
+    }
     return .{ .catalog = entries };
+}
+
+const max_remote_models = 512;
+
+/// Lists `GET {base_url}/models`. Any failure (unreachable server, missing
+/// key, unexpected shape) yields an empty list so declared models still load.
+fn fetch_remote_model_ids(alloc: Allocator, definition: *const definitions.Definition, cancel_flag: ?*std.atomic.Value(bool)) Allocator.Error!std.ArrayList([]u8) {
+    var ids: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    // Unit tests stay hermetic; catalog requests are exercised end to end.
+    if (builtin.is_test) return ids;
+    const key: ?[]const u8 = switch (definition.auth) {
+        .none => null,
+        .bearer => |env| io.getenv(env) orelse return ids,
+    };
+    const url = try std.mem.concat(alloc, u8, &.{ definition.base_url, "/models" });
+    defer alloc.free(url);
+    var local_cancel = std.atomic.Value(bool).init(false);
+    const result = client_mod.fetchGatewayJsonCancellable(alloc, key, null, url, cancel_flag orelse &local_cancel) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("catalog", "configured_models_fetch_failed provider={s} err={s}", .{ definition.id, @errorName(err) });
+        return ids;
+    };
+    const body = switch (result) {
+        .success => |bytes| bytes,
+        .http_status => |status| {
+            debug_trace.logf("catalog", "configured_models_fetch_status provider={s} status={d}", .{ definition.id, @intFromEnum(status) });
+            return ids;
+        },
+    };
+    defer alloc.free(body);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return ids;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return ids;
+    const data = parsed.value.object.get("data") orelse return ids;
+    if (data != .array) return ids;
+    for (data.array.items) |item| {
+        if (ids.items.len == max_remote_models) break;
+        if (item != .object) continue;
+        const id = item.object.get("id") orelse continue;
+        if (id != .string) continue;
+        definitions.validate_model_id(id.string) catch continue;
+        const owned = try alloc.dupe(u8, id.string);
+        errdefer alloc.free(owned);
+        try ids.append(alloc, owned);
+    }
+    return ids;
 }
 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
