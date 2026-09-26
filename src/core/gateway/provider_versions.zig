@@ -78,10 +78,7 @@ fn resolveWithCache(alloc: Allocator, provider: Provider, lookup: Lookup, cache:
 }
 
 fn cacheFile(provider: Provider) []const u8 {
-    return switch (provider) {
-        .codex => "codex.json",
-        .grok => "grok.json",
-    };
+    return switch (provider) {};
 }
 
 fn loadCache(_: ?*anyopaque, alloc: Allocator, provider: Provider) !?Cached {

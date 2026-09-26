@@ -14,8 +14,6 @@ const Allocator = std.mem.Allocator;
 pub const Bundle = struct {
     pub const AuthStrategy = enum {
         vercel,
-        chatgpt,
-        grok,
     };
     pub const Capabilities = struct {
         gateway_prompt_caching: bool = false,
@@ -53,16 +51,12 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 
 pub const Set = struct {
     gateway: Bundle,
-    codex: Bundle,
-    grok: Bundle,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
     configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
-            .codex => self.codex,
-            .grok => self.grok,
             .configured => blk: {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
@@ -75,8 +69,6 @@ pub const Set = struct {
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
             .gateway = self.gateway.deferred_usage,
-            .codex = self.codex.deferred_usage,
-            .grok = self.grok.deferred_usage,
         };
     }
 };
@@ -84,15 +76,11 @@ pub const Set = struct {
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
         .gateway = gateway,
-        .codex = .{},
-        .grok = .{},
     };
 }
 
 test "provider set selects each provider's complete route" {
     var gateway_tag: u8 = 0;
-    var codex_tag: u8 = 0;
-    var grok_tag: u8 = 0;
 
     const Fake = struct {
         fn cli_catalog(
@@ -138,25 +126,7 @@ test "provider set selects each provider's complete route" {
         .permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review },
         .deferred_usage = generation_usage_provider.unavailable_provider,
     };
-    const codex = Bundle{
-        .agent_stream = stream_provider.Provider{
-            .context = &codex_tag,
-            .stream_fn = stream_provider.unavailable_provider.stream_fn,
-        },
-        .cli_model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.cli_catalog },
-        .model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.model_catalog_fetch },
-        .permission_reviewer = .{ .context = &codex_tag, .review_fn = Fake.review },
-    };
-    const grok = Bundle{
-        .agent_stream = stream_provider.Provider{
-            .context = &grok_tag,
-            .stream_fn = stream_provider.unavailable_provider.stream_fn,
-        },
-        .cli_model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.cli_catalog },
-        .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
-        .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
-    };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    var providers = Set{ .gateway = gateway };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
@@ -164,14 +134,10 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.gateway).deferred_usage != null);
     try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
     try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
-    try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
-    try std.testing.expect(providers.select(.codex).deferred_usage == null);
     try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
-    try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
-    try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
-    try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
 
-    providers.codex.model_catalog = null;
-    try std.testing.expect(providers.select(.codex).model_catalog == null);
-    try std.testing.expect(providers.select(.gateway).model_catalog != null);
+    providers.gateway.model_catalog = null;
+    try std.testing.expect(providers.select(.gateway).model_catalog == null);
+    // An unknown configured provider selects an empty bundle.
+    try std.testing.expect(providers.select(model_provider.parse("missing-provider").?).agent_stream == null);
 }

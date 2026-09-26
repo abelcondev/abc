@@ -398,11 +398,6 @@ pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Crede
         active.credential_source = state.credential_source;
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
-        if (comptime !host_target.is_wasm) {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
-                active.session_rt.usage.clearReconciliationCredential();
-            }
-        }
     }
 }
 
@@ -550,19 +545,19 @@ fn publishRefreshedCredential(
     if (expected_account_id) |expected| {
         const refreshed_account = refreshed.accountId() orelse {
             debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_missing", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         };
         const state_account = state.account_id orelse {
             debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_missing", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         };
         if (!std.mem.eql(u8, expected, refreshed_account)) {
             debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_changed", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         }
         if (!std.mem.eql(u8, expected, state_account)) {
             debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_changed", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         }
     }
     if (expected_team) |expected| {
@@ -579,11 +574,11 @@ fn publishRefreshedCredential(
         if (expected_account_id) |expected| {
             const active_account = active.account_id orelse {
                 debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_missing", .{});
-                return error.ChatGptAccountChanged;
+                return error.CredentialAccountChanged;
             };
             if (!std.mem.eql(u8, expected, active_account)) {
                 debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_changed", .{});
-                return error.ChatGptAccountChanged;
+                return error.CredentialAccountChanged;
             }
         }
     }
@@ -1963,12 +1958,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = if (state.provider == .codex)
-                        credentials.missing_chatgpt_credential_message
-                    else if (state.provider == .grok)
-                        credentials.missing_grok_credential_message
-                    else
-                        credentials.missing_credential_message,
+                    .message = credentials.missing_credential_message,
                 });
             }
             break :routed &routed_credential.?;
@@ -1976,12 +1966,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (credential.token.len == 0 and credential.source != .configured) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = credentials.missing_credential_message,
             });
         }
         adoptServerCredential(state, credential);
@@ -2404,12 +2389,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (session.provider == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (session.provider == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            "Configured provider authentication is unavailable",
+                        .message = "Configured provider authentication is unavailable",
                     });
                 }
             }
@@ -2483,12 +2463,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 )) orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = credentials.missing_credential_message,
                     });
             };
             defer if (staged_credential) |*credential| credential.deinit(alloc);
@@ -3282,84 +3257,6 @@ test "ACP model commits honor the active session write boundary" {
         error.SessionPersistenceUnavailable,
         worker.failure.?,
     );
-}
-
-test "ACP publishes an account-bound refreshed Codex token for later prompts" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.api_key = try alloc.dupe(u8, "stale-token");
-    state.account_id = try alloc.dupe(u8, "acct-1");
-    state.credential_source = .chatgpt_subscription;
-    state.credential_refresh_after_ms = 1;
-    state.gateway_team = null;
-    var active: ActiveSessionState = undefined;
-    active.api_key = state.api_key;
-    active.account_id = state.account_id;
-    active.credential_source = .chatgpt_subscription;
-    active.credential_refresh_after_ms = 1;
-    active.session_rt = .{ .max_history_turns = 8 };
-    state.active_session = active;
-    defer {
-        state.active_session.?.session_rt.deinit(alloc);
-        secret.zeroAndFree(alloc, state.api_key);
-        alloc.free(state.account_id.?);
-    }
-
-    var refreshed = credentials.Credential{
-        .token = try alloc.dupe(u8, "fresh-token"),
-        .source = .chatgpt_subscription,
-        .account_id = try alloc.dupe(u8, "acct-1"),
-        .refresh_after_ms = 100,
-    };
-    defer refreshed.deinit(alloc);
-    try publishRefreshedCredential(&state, &refreshed, "acct-1", null);
-
-    try std.testing.expectEqualStrings("fresh-token", state.api_key);
-    try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
-    try std.testing.expectEqualStrings("acct-1", state.account_id.?);
-    try std.testing.expectEqualStrings("acct-1", state.active_session.?.account_id.?);
-    try std.testing.expectEqual(@as(?i64, 100), state.credential_refresh_after_ms);
-    try std.testing.expectEqual(@as(?i64, 100), state.active_session.?.credential_refresh_after_ms);
-}
-
-test "ACP credential readiness rejects refresh-due access tokens" {
-    try std.testing.expect(credentialReadyAt(.chatgpt_subscription, "token", 11, 10));
-    try std.testing.expect(!credentialReadyAt(.chatgpt_subscription, "token", 10, 10));
-    try std.testing.expect(!credentialReadyAt(.grok_subscription, "token", 1, 10));
-    try std.testing.expect(credentialReadyAt(.ai_gateway_api_key, "token", null, 10));
-    try std.testing.expect(!credentialReadyAt(.ai_gateway_api_key, "", null, 10));
-}
-
-test "ACP rejects refreshed Codex tokens for another account" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.api_key = try alloc.dupe(u8, "stale-token");
-    state.account_id = try alloc.dupe(u8, "acct-1");
-    state.credential_source = .chatgpt_subscription;
-    state.credential_refresh_after_ms = 1;
-    state.gateway_team = null;
-    state.active_session = null;
-    defer {
-        secret.zeroAndFree(alloc, state.api_key);
-        alloc.free(state.account_id.?);
-    }
-
-    var refreshed = credentials.Credential{
-        .token = try alloc.dupe(u8, "wrong-token"),
-        .source = .chatgpt_subscription,
-        .account_id = try alloc.dupe(u8, "acct-2"),
-        .refresh_after_ms = 100,
-    };
-    defer refreshed.deinit(alloc);
-    try std.testing.expectError(error.ChatGptAccountChanged, publishRefreshedCredential(
-        &state,
-        &refreshed,
-        "acct-2",
-        null,
-    ));
-    try std.testing.expectEqualStrings("stale-token", state.api_key);
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {

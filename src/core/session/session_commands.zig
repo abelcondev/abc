@@ -2195,29 +2195,6 @@ test "session_commands handleModel reports current model for empty query" {
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
 }
 
-test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
-    const alloc = std.testing.allocator;
-    const ids = [_][]const u8{
-        "openai/gpt-4o-mini",
-        "anthropic/claude-sonnet-4-20250514",
-    };
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
-    defer app.deinit();
-    app.cached_ids = &ids;
-    app.selected_provider = .codex;
-
-    try Commands(FakeApp).handleModel(&app, "claude sonnet");
-
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
-    try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
-        app.terminalTitleLabelText(),
-    );
-    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
-}
-
 test "session_commands handleModel falls back to raw query when model fetch fails" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
@@ -2855,38 +2832,6 @@ test "session_commands model picker follows mock catalog controls independent of
     try std.testing.expectEqualStrings("future-tier", app.effort.label());
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     try std.testing.expectEqualStrings("future-tier", app.worker.synced_effort.?.label());
-}
-
-test "session_commands model picker emits one combined preference transaction" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(
-        alloc,
-        "/tmp/workspace",
-        "anthropic/claude-opus-4.7",
-    );
-    defer app.deinit();
-    app.selected_provider = .codex;
-    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
-    app.setGatewayControls("anthropic/claude-opus-4.7", &efforts, true);
-
-    try Commands(FakeApp).selectModelFromPicker(
-        &app,
-        "anthropic/claude-opus-4.7",
-        types.ReasoningEffort.literal("high"),
-        true,
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
-    try std.testing.expectEqualStrings(
-        "anthropic/claude-opus-4.7",
-        app.last_preference_model.items,
-    );
-    try std.testing.expectEqual(
-        types.ReasoningEffort.literal("high"),
-        app.last_preference_effort.?,
-    );
-    try std.testing.expectEqual(true, app.last_preference_fast_mode.?);
 }
 
 test "session_commands user save notice uses one post-commit load after legacy cleanup" {

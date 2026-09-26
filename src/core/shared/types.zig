@@ -108,8 +108,6 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
-    chatgpt_subscription,
-    grok_subscription,
     host_managed,
     configured,
 };
@@ -1541,34 +1539,6 @@ pub fn projectProviderReplay(
         projected.?[index].provider_replay = null;
     }
     return projected;
-}
-
-test "provider replay projection preserves matching origin and excludes other routes" {
-    const alloc = std.testing.allocator;
-    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
-    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
-    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
-    for ([_]@import("../config/model_provider.zig").ProviderSelection{
-        .{ .provider = .codex, .model = "model" },
-        .{ .provider = .grok, .model = "model" },
-        .{ .provider = .gateway, .model = "different" },
-    }) |other| {
-        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
-        defer alloc.free(projected);
-        try std.testing.expect(projected[0].provider_replay == null);
-        try std.testing.expectEqualStrings("answer", projected[0].content.?);
-        try std.testing.expect(messages[0].provider_replay != null);
-        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
-    }
-    try std.testing.checkAllAllocationFailures(alloc, struct {
-        fn check(a: std.mem.Allocator) !void {
-            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
-            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
-            defer a.free(projected);
-            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
-            defer freeProviderReplay(a, copy);
-        }
-    }.check, .{});
 }
 
 pub const Usage = struct {

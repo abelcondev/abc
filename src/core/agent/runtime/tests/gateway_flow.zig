@@ -174,46 +174,6 @@ test "processQueuedPrompt projects lifecycle session identity to the provider" {
     );
 }
 
-test "processQueuedPrompt accounts exact direct-provider usage without deferred capability" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
-        .content = "ok",
-        .generation_id = "response-codex-1",
-        .billing = .{
-            .created_at_ms = 1,
-            .model = "codex/gpt-test",
-            .total_cost = 0,
-            .input_tokens = 17,
-            .output_tokens = 7,
-            .cache_read_tokens = 0,
-            .cache_write_tokens = 0,
-            .reasoning_tokens = null,
-            .billable_web_search_calls = 0,
-        },
-        .exact_usage_provider = .codex,
-    }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.usage = &usage;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.provider_capabilities = .{};
-    var job = fixture.job();
-    job.provider = .codex;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 17), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), snapshot.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
-}
-
 test "terminal assistant completion continues with steering admitted during the response" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -2502,42 +2462,6 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     try std.testing.expectEqualStrings("Native image answer", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt never uses the vision fallback for Codex" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const image_path = try writeTestImagePath(alloc, &tmp);
-    defer alloc.free(image_path);
-    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
-    defer types.freeImageAttachment(alloc, image);
-    var images = [_]types.ImageAttachment{image};
-    const capability_overrides = [_]ModelCapabilityOverride{.{
-        .model = "gpt-5.6-sol",
-        .capabilities = .{ .image_input_support = .non_native },
-    }};
-    var gateway = FakeGateway.init(alloc, &.{});
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.capability_overrides = &capability_overrides;
-    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.provider = .codex;
-    job.model = @constCast("gpt-5.6-sol");
-    job.prompt = @constCast("Describe the attached image.");
-    job.images = &images;
-    job.authorized_image_catalog = &images;
-
-    var config = fixture.config();
-    config.provider_capabilities = .{};
-    try std.testing.expectError(
-        error.SubscriptionNativeImageUnavailable,
-        runFakePrompt(&gateway, &hooks, config, job),
-    );
-    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
-}
-
 test "processQueuedPrompt routes images natively only when vision and file input are both supported" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -2898,107 +2822,6 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try expectBodyContains(&gateway, 2, "NEW_HISTORY_USER");
     try expectBodyContains(&gateway, 2, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 2, "\"maxOutputTokens\":16000");
-}
-
-test "processQueuedPrompt compacts with the selected working model" {
-    const alloc = std.testing.allocator;
-    const old_user = try alloc.alloc(u8, 48_000);
-    defer alloc.free(old_user);
-    @memset(old_user, 'u');
-    const old_assistant = try alloc.alloc(u8, 48_000);
-    defer alloc.free(old_assistant);
-    @memset(old_assistant, 'a');
-    var history = [_]HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = old_user },
-            .assistant = old_assistant,
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("recent user") },
-            .assistant = @constCast("recent assistant"),
-        } },
-    };
-    const cases = [_]struct {
-        provider: model_provider.ProviderId,
-        credential_source: types.CredentialSource,
-        working_model: []const u8,
-    }{
-        .{
-            .provider = .codex,
-            .credential_source = .chatgpt_subscription,
-            .working_model = "gpt-5.6-sol",
-        },
-        .{
-            .provider = .grok,
-            .credential_source = .grok_subscription,
-            .working_model = "grok-4.6",
-        },
-        .{
-            .provider = .gateway,
-            .credential_source = .ai_gateway_api_key,
-            .working_model = "zai/glm-5.2",
-        },
-        .{
-            .provider = .gateway,
-            .credential_source = .ai_gateway_api_key,
-            .working_model = "moonshotai/kimi-k3",
-        },
-    };
-    for (cases) |case| {
-        const available_overrides = [_]ModelCapabilityOverride{.{
-            .model = case.working_model,
-            .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
-        }};
-        const completions = [_]FakeCompletion{
-            .{ .content = "The earlier user request is preserved." },
-            .{ .content = "The earlier assistant work is summarized." },
-            .{ .content = "Done" },
-        };
-        var gateway = FakeGateway.init(alloc, &completions);
-        defer gateway.deinit();
-        var hooks = FakeAgentRuntimeDeps.init(alloc);
-        hooks.available_capability_overrides = &available_overrides;
-        defer hooks.deinit();
-        var fixture = PromptFixture{};
-        var job = fixture.job();
-        job.provider = case.provider;
-        job.credential_source = case.credential_source;
-        job.model = @constCast(case.working_model);
-        job.history = &history;
-
-        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-        try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-        for (gateway.request_models.items) |model| try std.testing.expectEqualStrings(case.working_model, model);
-        try std.testing.expectEqualStrings("Done", hooks.finish_assistant_text.?);
-    }
-
-    const unavailable_capabilities = [_]ModelCapabilityOverride{.{
-        .model = "anthropic/claude-opus-4.6",
-        .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
-    }};
-    const unused = [_]FakeCompletion{.{ .content = "must not run" }};
-    var unavailable_gateway = FakeGateway.init(alloc, &unused);
-    defer unavailable_gateway.deinit();
-    var unavailable_hooks = FakeAgentRuntimeDeps.init(alloc);
-    unavailable_hooks.available_capability_overrides = &unavailable_capabilities;
-    defer unavailable_hooks.deinit();
-    var unavailable_fixture = PromptFixture{};
-    var unavailable_job = unavailable_fixture.job();
-    unavailable_job.provider = .codex;
-    unavailable_job.credential_source = .ai_gateway_api_key;
-    unavailable_job.history = &history;
-
-    try std.testing.expectError(
-        error.ContextCompactionUnavailable,
-        runFakePrompt(
-            &unavailable_gateway,
-            &unavailable_hooks,
-            unavailable_fixture.config(),
-            unavailable_job,
-        ),
-    );
-    try std.testing.expectEqual(@as(usize, 0), unavailable_gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt projects bounded output limits into gateway requests" {
@@ -5721,7 +5544,6 @@ test "processQueuedPrompt empty history recovery preserves validation and source
         .{ .content = " ", .state = "[{\"type\":\"text\",\"offset\":0,\"length\":42}]" },
         .{ .content = "kept", .state = "[{\"type\":\"text\",\"offset\":0,\"length\":4}]", .failure = false },
         .{ .state = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]", .failure = false },
-        .{ .state = "not-json", .provider = .codex, .failure = false },
         .{ .state = "not-json", .model = "other-model", .failure = false },
     };
     const alloc = std.testing.allocator;
@@ -8455,86 +8277,6 @@ test "processQueuedPrompt does not retry a second fx login 401" {
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
-}
-
-test "Codex 401 replay keeps payload and semantic recovery unchanged for the captured account" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .status = .unauthorized, .err_body = "expired" },
-        .{
-            .content = "Done.",
-            .generation_id = "response-replay-success",
-            .billing = .{
-                .created_at_ms = 1,
-                .model = "codex/gpt-test",
-                .total_cost = 0,
-                .input_tokens = 17,
-                .output_tokens = 7,
-                .cache_read_tokens = 0,
-                .cache_write_tokens = 0,
-                .reasoning_tokens = null,
-                .billable_web_search_calls = 0,
-            },
-            .exact_usage_provider = .codex,
-        },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.usage = &usage;
-    hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-token" };
-    hooks.enable_recovery_checkpoint = true;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.provider = .codex;
-    job.credential_source = .chatgpt_subscription;
-    job.account_id = @constCast("acct-a");
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
-    try std.testing.expectEqualStrings("stale-loaded", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqualStrings("fresh-token", gateway.request_api_keys.items[1]);
-    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
-    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 17), usage_snapshot.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), usage_snapshot.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), usage_snapshot.request_count);
-    try std.testing.expectEqual(@as(u64, 3), usage_snapshot.next_sequence);
-    try std.testing.expectEqual(@as(u64, 2), usage_snapshot.settled_through_sequence);
-}
-
-test "Codex 401 account change makes no second provider request" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .status = .unauthorized, .err_body = "expired" },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.credential_refresh_error = error.ChatGptAccountChanged;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.provider = .codex;
-    job.credential_source = .chatgpt_subscription;
-    job.account_id = @constCast("acct-a");
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
-    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
-    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }

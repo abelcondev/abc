@@ -476,8 +476,6 @@ pub fn loadStartupStatusWithAuthMode(
         auth_runtime.StatusSnapshot{
             .active_source = .host_managed,
             .gateway_connected = true,
-            .chatgpt_connected = true,
-            .grok_connected = true,
         }
     else
         try auth_runtime.loadStatusSnapshotForProvider(
@@ -1416,8 +1414,6 @@ fn configuredProviderSelection(
     const provider = provider_override orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
         .configured => io_mod.getenv("FX_MODEL") orelse configuredDefaultModel(settings, provider) orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
@@ -1433,49 +1429,6 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
     const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
-}
-
-test "startup provider chooses only its provider-scoped model" {
-    var gateway_settings = config_runtime.Settings{ .provider = .gateway };
-    defer gateway_settings.deinit(std.testing.allocator);
-    try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
-    try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const gateway = try configuredProviderSelection("default/model", &gateway_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
-    try std.testing.expectEqualStrings("gateway/model", gateway.model);
-
-    var codex_settings = config_runtime.Settings{ .provider = .codex };
-    defer codex_settings.deinit(std.testing.allocator);
-    try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
-    try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const codex = try configuredProviderSelection("default/model", &codex_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
-    try std.testing.expectEqualStrings("gpt-model", codex.model);
-
-    const missing_codex = config_runtime.Settings{ .provider = .codex };
-    try std.testing.expectError(
-        error.CodexModelNotSelected,
-        configuredProviderSelection("default/model", &missing_codex, null),
-    );
-
-    var grok_settings = config_runtime.Settings{ .provider = .grok };
-    defer grok_settings.deinit(std.testing.allocator);
-    try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
-    const grok = try configuredProviderSelection("default/model", &grok_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
-    try std.testing.expectEqualStrings("grok-model", grok.model);
-
-    // A launch --provider override selects that provider and its saved model.
-    try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
-    const overridden = try configuredProviderSelection("default/model", &gateway_settings, .grok);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
-    try std.testing.expectEqualStrings("grok-model", overridden.model);
-    try std.testing.expectError(
-        error.CodexModelNotSelected,
-        configuredProviderSelection("default/model", &grok_settings, .codex),
-    );
-    const overridden_gateway = try configuredProviderSelection("default/model", &codex_settings, .gateway);
-    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -2283,82 +2236,6 @@ test "host-managed startup skips every local credential source" {
     try std.testing.expect(state.credential == null);
     try std.testing.expect(state.apiKey() == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, state.modelCatalogAccess());
-}
-
-test "loadStartupState defaults fast mode off and requires bound explicit preferences" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
-    try tmp.dir.createDirPath(io_mod.getIo(), "configured");
-    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
-    try tmp.dir.createDirPath(io_mod.getIo(), "legacy-fast");
-    try tmp.dir.createDirPath(io_mod.getIo(), "bound-fast");
-    try tmp.dir.createDirPath(io_mod.getIo(), "codex");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
-    defer std.testing.allocator.free(absent_root);
-    const configured_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "configured");
-    defer std.testing.allocator.free(configured_root);
-    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
-    defer std.testing.allocator.free(disabled_root);
-    const legacy_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "legacy-fast");
-    defer std.testing.allocator.free(legacy_fast_root);
-    const bound_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bound-fast");
-    defer std.testing.allocator.free(bound_fast_root);
-    const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
-    defer std.testing.allocator.free(codex_root);
-
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
-        .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
-    defer env.deinit();
-
-    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "zai/glm-5.2", 25);
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
-    try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
-    try std.testing.expect(!absent.fast_mode);
-    try std.testing.expect(!absent.fast_mode_model_bound);
-
-    var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
-    defer configured.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
-    try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
-    try std.testing.expect(!configured.fast_mode);
-    try std.testing.expect(!configured.fast_mode_model_bound);
-
-    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
-    defer disabled.deinit(std.testing.allocator);
-    try std.testing.expect(!disabled.fast_mode);
-    try std.testing.expect(!disabled.fast_mode_model_bound);
-
-    var legacy_fast = try loadStartupStateForWorkspace(std.testing.allocator, legacy_fast_root, "zai/glm-5.2", 25);
-    defer legacy_fast.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("zai/glm-5.3", legacy_fast.selected_model);
-    try std.testing.expect(legacy_fast.fast_mode);
-    try std.testing.expect(!legacy_fast.fast_mode_model_bound);
-
-    var bound_fast = try loadStartupStateForWorkspace(std.testing.allocator, bound_fast_root, "zai/glm-5.2", 25);
-    defer bound_fast.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("provider/fast-toggle", bound_fast.selected_model);
-    try std.testing.expect(bound_fast.fast_mode);
-    try std.testing.expect(bound_fast.fast_mode_model_bound);
-
-    var codex = try loadStartupStateForWorkspace(std.testing.allocator, codex_root, "zai/glm-5.2", 25);
-    defer codex.deinit(std.testing.allocator);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", codex.selected_model);
-    try std.testing.expect(!codex.fast_mode);
 }
 
 test "loadStartupState resolves startup scrollback default and explicit false" {

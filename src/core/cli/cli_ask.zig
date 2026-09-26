@@ -5367,30 +5367,6 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
     );
 }
 
-test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
-    const alloc = std.testing.allocator;
-    var stdout_capture = TestCapture{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture = TestCapture{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        "/tmp/workspace",
-    );
-    defer ctx.deinit();
-    ctx.api_key = "chatgpt-secret";
-    ctx.credential_source = .chatgpt_subscription;
-    ctx.provider = .codex;
-    ctx.model = "gpt-5.4";
-
-    const tool_ctx = ctx.toolContext();
-    try std.testing.expect(tool_ctx.web_search_backend == null);
-    try std.testing.expect(!tool_ctx.auto_classifier.enabled());
-    try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
-}
-
 test "fx ask finalization fails every failed turn" {
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,

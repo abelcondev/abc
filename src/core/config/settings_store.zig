@@ -954,29 +954,6 @@ test "collapse tool calls user patch writes the profile preference" {
     try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
 }
 
-test "provider patch writes one bounded provider model collection" {
-    const alloc = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    var root = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        "{\"model\":\"gateway/model\"}",
-        .{},
-    );
-    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
-        .provider = .codex,
-        .model_preference = .{ .provider = .codex, .model = "gpt-5.4-mini" },
-    });
-    try std.testing.expect(application.changed);
-    try std.testing.expectEqualStrings("gateway/model", root.object.get("model").?.string);
-    try std.testing.expectEqualStrings("codex", root.object.get("provider").?.string);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("models").?.object.get("codex").?.string);
-    try std.testing.expect(!root.object.contains("codex_model"));
-    try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
-}
-
 test "model and fast patch binds the fast preference atomically" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1617,8 +1594,6 @@ fn putModelPreference(
     changed = try putString(arena, models, provider_key, preference.model) or changed;
     const legacy_key = switch (preference.provider) {
         .gateway => "model",
-        .codex => "codex_model",
-        .grok => "grok_model",
         .configured => return changed,
     };
     if (root.contains(legacy_key)) {

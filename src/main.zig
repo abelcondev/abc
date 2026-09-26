@@ -2052,7 +2052,7 @@ const App = struct {
     }
 
     pub fn providerSet(self: *const App) provider_set.Set {
-        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
+        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
@@ -2083,8 +2083,6 @@ const App = struct {
         }
         if (comptime !host_profile.tools) {
             providers.gateway.permission_reviewer = null;
-            providers.codex.permission_reviewer = null;
-            providers.grok.permission_reviewer = null;
         }
         return providers;
     }
@@ -4436,17 +4434,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
-    _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");
-    _ = @import("gateway/openai_codex_models.zig");
-    _ = @import("gateway/openai_codex.zig");
-    _ = @import("gateway/responses_protocol.zig");
-    _ = @import("gateway/openai_codex_permission_reviewer.zig");
-    _ = @import("core/auth/grok_session.zig");
-    _ = @import("core/auth/grok_oauth.zig");
-    _ = @import("gateway/xai_grok_models.zig");
-    _ = @import("gateway/xai_grok.zig");
-    _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");

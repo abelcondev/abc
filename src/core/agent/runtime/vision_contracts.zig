@@ -1705,7 +1705,7 @@ fn check_native_replay_projection_allocations(alloc: Allocator) !void {
             try std.testing.expect(text and reasoning);
             try std.testing.expectEqual(@as(usize, 1), calls.len);
             try std.testing.expectEqualStrings("read", calls[0].id);
-            if (source.source.provider == .codex) return source;
+            if (source.source.provider == .configured) return source;
             return .{ .source = source.source, .parts_json = try arena.dupe(u8, selected) };
         }
     };
@@ -1718,7 +1718,9 @@ fn check_native_replay_projection_allocations(alloc: Allocator) !void {
         .{ .id = "vision", .name = "vision", .arguments_json = "{}" },
         .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
     };
-    for ([_]model_provider.ProviderId{ .gateway, .codex }) |provider_id| {
+    var bound_local = model_provider.parse("local").?;
+    bound_local.configured.binding = @splat(1);
+    for ([_]model_provider.ProviderId{ .gateway, bound_local }) |provider_id| {
         const selection = model_provider.ProviderSelection{ .provider = provider_id, .model = "fixture-model" };
         const source_parts = if (provider_id == .gateway) original else "[{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}]";
         const messages = [_]types.ChatMessage{
@@ -1762,7 +1764,6 @@ test "native message projection leaves mismatched replay to the provider adapter
     const source = model_provider.ProviderSelection{ .provider = .gateway, .model = "original-model" };
     for ([_]model_provider.ProviderSelection{
         .{ .provider = .gateway, .model = "different-model" },
-        .{ .provider = .codex, .model = "original-model" },
     }) |selection| {
         const messages = [_]types.ChatMessage{
             .{ .role = .assistant, .content = "retained prose", .tool_calls = &.{.{ .id = "vision", .name = "vision", .arguments_json = "{}" }}, .provider_replay = .{ .source = source, .parts_json = "provider-owned" } },

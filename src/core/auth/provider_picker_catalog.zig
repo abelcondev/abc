@@ -9,6 +9,7 @@ const std = @import("std");
 const host_target = @import("../hosts/target.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_presets = @import("../config/provider_presets.zig");
 const types = @import("../shared/types.zig");
 
 /// How a provider is authenticated. Subscription providers expose no methods;
@@ -20,7 +21,7 @@ pub const Method = enum {
     api_key,
 };
 
-pub const max_provider_options = provider_catalog.entries.len;
+pub const max_provider_options = provider_catalog.entries.len + provider_presets.definitions.len;
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -109,26 +110,38 @@ pub fn parseMethod(value: []const u8) ?Method {
     return null;
 }
 
-fn providerVisible(id: model_provider.ProviderId) bool {
-    if (comptime host_target.is_wasm) return id != .grok;
-    return true;
-}
-
-/// Writes the visible provider slugs into `out` and returns how many landed.
+/// Writes the visible provider slugs into `out` and returns how many landed:
+/// built-in providers first, then the connection presets.
 pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
     var count: usize = 0;
     for (&provider_catalog.entries) |*entry| {
-        if (!providerVisible(entry.id)) continue;
         out[count] = entry.slug;
         count += 1;
     }
+    if (comptime !host_target.is_wasm) {
+        for (&provider_presets.definitions) |*definition| {
+            out[count] = definition.id;
+            count += 1;
+        }
+    }
     return count;
+}
+
+/// Resolves a picker slug: a built-in provider slug or alias, otherwise a
+/// connection name (a preset or a settings.json provider), left unbound.
+pub fn parseProvider(slug: []const u8) ?model_provider.ProviderId {
+    return provider_catalog.parse(slug) orelse model_provider.parse(slug);
+}
+
+/// The slug the picker writes for a provider.
+pub fn providerSlug(id: *const model_provider.ProviderId) []const u8 {
+    return if (id.* == .configured) id.label() else provider_catalog.find(id.*).slug;
 }
 
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
-        .codex, .grok, .configured => &.{},
+        .configured => &.{},
     };
 }
 
@@ -145,18 +158,12 @@ test "provider options expose the catalog slugs the composer accepts" {
     var buf: [max_provider_options][]const u8 = undefined;
     const count = providerOptions(&buf);
 
-    try std.testing.expect(count >= 2);
+    try std.testing.expect(count >= 1);
     try std.testing.expectEqualStrings("vercel", buf[0]);
     for (buf[0..count]) |slug| {
-        try std.testing.expect(provider_catalog.parse(slug) != null);
+        try std.testing.expect(parseProvider(slug) != null);
         try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
     }
-}
-
-test "only the gateway offers a method column" {
-    try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
-    try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
-    try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }
 
 test "method slugs round trip and stay single tokens" {

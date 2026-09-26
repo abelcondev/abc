@@ -11600,31 +11600,8 @@ const ReconciliationOriginApp = struct {
     selected_model: std.ArrayList(u8) = .empty,
 };
 
-test "resumed sessions install provider-scoped usage reconciliation authority" {
-    var chatgpt = ReconciliationOriginApp{
-        .auth = .{ .source = .chatgpt_subscription },
-        .selected_provider = .codex,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
-
-    var gateway = ReconciliationOriginApp{
-        .auth = .{ .source = .ai_gateway_api_key },
-        .selected_provider = .gateway,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
-}
-
 test "resumed usage reconciliation rejects the previous provider credential" {
-    const cases = .{
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
-        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
-        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
-    };
+    const cases = .{};
     inline for (cases) |case| {
         var app = ReconciliationOriginApp{
             .auth = .{ .source = case[1] },
