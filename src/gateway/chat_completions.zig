@@ -48,7 +48,12 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .reasoning_format = definition.reasoning_format,
+        .merge_system_messages = definition.merge_system_messages,
+        .provider = &identity,
+    });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -218,8 +223,14 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 }
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
-    const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    const definition = definition_at(raw);
+    const metadata = definition.model(model) orelse return .{};
+    var gateway_metadata = model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*));
+    if (definition.reasoning_format != .none) {
+        gateway_metadata.reasoning_efforts = .fromSlice(metadata.reasoning_efforts);
+        gateway_metadata.supports_reasoning = metadata.reasoning_efforts.len != 0;
+    }
+    return model_capabilities.mergeCapabilities(.{}, gateway_metadata);
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -233,6 +244,11 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        if (definition.reasoning_format != .none and metadata.reasoning_efforts.len != 0) {
+            entry.has_reasoning = true;
+            try entry.reasoning_efforts.appendSlice(alloc, metadata.reasoning_efforts);
+        }
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
