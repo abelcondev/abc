@@ -10,6 +10,19 @@
 > - Se eliminan Vercel AI Gateway, Codex y Grok. Solo quedan proveedores por API key o endpoints locales.
 > Estado: borrador para arrancar. Las causas marcadas como **hipótesis** hay que confirmarlas con el error real (ver Fase 1).
 
+## Estado (2026-09-26)
+
+| Fase | Estado | Notas |
+|---|---|---|
+| 0. Fork | ✅ | Repo local con historial, binario `abc`, fingerprint nuevo, upgrades desactivados, CI mínima. Repo `abelcondev/abc` creado en GitHub (privado, Actions apagadas); **falta el push** (el token de `gh` no tiene scope `workflow`). |
+| 1. Reproducir | 🟡 | Servidor falso con rarezas de stream + pruebas reales con DeepSeek. Con la API actual de DeepSeek incluso el lector estricto funciona; el error original no se pudo reproducir con DeepSeek hoy. Qwen/Kimi/GLM sin probar (sin keys). |
+| 2. Lector tolerante | ✅ | `strict_stream` para volver al modo estricto. |
+| 3. Opciones/capacidades | ✅ | `reasoning_format` (incluye `thinking_effort`), `reasoning_efforts`, fusión de `system`, HTTP en LAN, sin `UnsupportedProviderOption`. |
+| 4. Presets | ✅ | 22 presets, autodetección por API key, `/provider` los lista, `abc login <preset>` guarda la key, catálogo desde `GET /models` con metadata. |
+| 5. Búsqueda web | ✅ | Tavily / Brave / SearXNG para cualquier proveedor. Visión fallback y contabilidad local de uso: pendientes. |
+| 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
+| 7. Anthropic Messages | ⬜ | No empezado. |
+
 ## 1. Objetivo
 
 Que fx trate a DeepSeek, Qwen, Kimi, GLM, MiniMax, Ollama/vLLM/llama.cpp, OpenRouter, etc. como proveedores de primera clase, con el mismo nivel de soporte que hoy tiene Vercel AI Gateway: tools, subagentes, compactación, razonamiento, caching, visión y búsqueda web. Sin depender de Vercel para nada.
