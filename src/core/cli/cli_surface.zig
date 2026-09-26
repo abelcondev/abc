@@ -3,8 +3,6 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
-const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -801,8 +799,6 @@ fn activateProviderSelection(
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
 }
@@ -882,8 +878,6 @@ fn activateProviderSelectionFallible(
     {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
-            .codex => "Codex is already selected.\n",
-            .grok => "Grok is already selected.\n",
             .configured => "Configured provider is already selected.\n",
         });
         return true;
@@ -915,8 +909,6 @@ fn activateProviderSelectionFallible(
             deps,
             caller,
             switch (target) {
-                .codex => "Codex credential is unavailable",
-                .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
                 .configured => "configure the provider auth environment variable first",
             },
@@ -925,8 +917,6 @@ fn activateProviderSelectionFallible(
     };
     const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
-            .codex => "Codex model catalog is unavailable",
-            .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
             .configured => "Configured model catalog is unavailable",
         });
@@ -993,15 +983,11 @@ fn activateProviderSelectionFallible(
         .outcome => {},
     }
     if (performed_login) |provider| switch (provider) {
-        .codex => try writeStdout(deps, "Signed in with Codex.\n"),
-        .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .gateway, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
-            .codex => "Provider set to Codex.\n",
-            .grok => "Provider set to Grok.\n",
             .configured => "Provider set to configured connection.\n",
         });
     }
@@ -1127,7 +1113,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1150,15 +1136,13 @@ fn runNonInteractiveWithDeps(
             )) return .handled_failure;
             try writeStdout(deps, switch (login_provider) {
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
-                .codex => "Signed in with Codex.\n",
-                .grok => "Signed in with Grok.\n",
                 .configured => "Configured providers use settings.json authentication.\n",
             });
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1166,50 +1150,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_success;
             }
             // Preserve the original `fx logout` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
-            if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
-                    return .handled_failure;
-                };
-                return switch (outcome) {
-                    .deleted => result: {
-                        try writeStdout(deps, "Signed out of Codex.\n");
-                        break :result .handled_success;
-                    },
-                    .missing => result: {
-                        try writeStdout(deps, "No Codex login session found.\n");
-                        break :result .handled_success;
-                    },
-                    .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
-                        break :result .handled_failure;
-                    },
-                };
-            }
-            if (login_provider == .grok) {
-                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
-                    return .handled_failure;
-                };
-                if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
-                }
-                return switch (outcome.deletion) {
-                    .deleted => result: {
-                        try writeStdout(deps, "Signed out of Grok.\n");
-                        break :result .handled_success;
-                    },
-                    .missing => result: {
-                        try writeStdout(deps, "No Grok login session found.\n");
-                        break :result .handled_success;
-                    },
-                    .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
-                        break :result .handled_failure;
-                    },
-                };
-            }
+            _ = maybe_login_provider;
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
@@ -1438,8 +1379,6 @@ fn runNonInteractiveWithDeps(
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
                     .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
@@ -3985,56 +3924,6 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
-}
-
-test "global launch modifiers own provider model effort and fast overrides before the command" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--provider"),
-        @constCast("grok"),
-        @constCast("--model"),
-        @constCast("provider/launch-model"),
-        @constCast("--effort=high"),
-        @constCast("--fast"),
-        @constCast("--add-dir"),
-        @constCast("/tmp/shared"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(?model_provider.ProviderId, .grok), parsed.modifiers.provider_override);
-    try std.testing.expectEqualStrings("provider/launch-model", parsed.modifiers.model_override.?);
-    try std.testing.expect(parsed.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
-    try std.testing.expect(parsed.modifiers.hasModelOverrides());
-    try std.testing.expectEqual(@as(usize, 1), parsed.modifiers.additional_directories.len);
-    try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
-
-    var routed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--provider-order"),
-        @constCast("azure, anthropic"),
-        @constCast("--provider-strict"),
-    });
-    defer routed.deinit(std.testing.allocator);
-    const order = routed.modifiers.provider_order_override.?;
-    try std.testing.expectEqual(@as(usize, 2), order.len);
-    try std.testing.expectEqualStrings("azure", order[0]);
-    try std.testing.expectEqualStrings("anthropic", order[1]);
-    try std.testing.expectEqual(@as(?bool, true), routed.modifiers.provider_strict_override);
-
-    var spaced = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--model= provider/spaced "),
-        @constCast("--effort"),
-        @constCast("low"),
-        @constCast("--no-fast"),
-    });
-    defer spaced.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("provider/spaced", spaced.modifiers.model_override.?);
-    try std.testing.expect(spaced.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("low")));
-    try std.testing.expectEqual(@as(?bool, false), spaced.modifiers.fast_override);
-
-    var untouched = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("ask"), @constCast("--fast") });
-    defer untouched.deinit(std.testing.allocator);
-    try std.testing.expect(!untouched.modifiers.hasModelOverrides());
-    try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
 }
 
 test "global launch modifiers accept configured provider names" {

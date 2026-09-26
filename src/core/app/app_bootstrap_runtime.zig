@@ -380,10 +380,6 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
-            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
-                };
             }
             const startup_auth_view = app.auth.view();
             if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
@@ -1111,22 +1107,6 @@ test "app_bootstrap_runtime applies provider routing launch overrides" {
     try std.testing.expectEqualStrings("azure", settings.provider_order[0]);
     try std.testing.expectEqualStrings("anthropic", settings.provider_order[1]);
     try std.testing.expect(settings.provider_strict);
-}
-
-test "app_bootstrap_runtime launch provider override marks the provider for resume" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapWithOverridesForTest(&app, &capture, .{
-        .provider = .grok,
-    });
-
-    try std.testing.expectEqual(
-        @as(?model_provider.ProviderId, .grok),
-        capture.provider_process_override,
-    );
 }
 
 test "app_bootstrap_runtime model override drops compiled-default fast mode" {

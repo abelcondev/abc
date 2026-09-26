@@ -1246,16 +1246,6 @@ pub fn Runtime(comptime App: type) type {
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
-                    .codex = .{
-                        .capabilities = tool_context.provider_capabilities,
-                        .agent_stream = tool_context.agent_stream_provider,
-                        .permission_reviewer = tool_context.permission_reviewer_provider,
-                    },
-                    .grok = .{
-                        .capabilities = tool_context.provider_capabilities,
-                        .agent_stream = tool_context.agent_stream_provider,
-                        .permission_reviewer = tool_context.permission_reviewer_provider,
-                    },
                 };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
@@ -2188,33 +2178,6 @@ test "app prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
-}
-
-test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "chatgpt-secret"),
-        .source = .chatgpt_subscription,
-    };
-    defer credential.deinit(alloc);
-    _ = app.auth.adoptCredential(alloc, &credential);
-    app.selected_provider = .codex;
-
-    const ctx = Runtime(FakeApp).toolContext(
-        &app,
-        &test_ignored_list_entries,
-        100,
-        1024,
-        40,
-        120,
-        2048,
-        2,
-        test_gateway_chat_url,
-    );
-    try std.testing.expect(ctx.web_search_backend == null);
-    try std.testing.expect(ctx.permission_reviewer_provider == null);
 }
 
 test "app agent runtime tool context combines active settings with live permission mode" {

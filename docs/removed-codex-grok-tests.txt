@@ -1,0 +1,70 @@
+src/acp/prompt.zig: test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
+src/acp/server.zig: test "ACP rejects refreshed Codex tokens for another account" {
+src/acp/server.zig: test "ACP credential readiness rejects refresh-due access tokens" {
+src/acp/server.zig: test "ACP publishes an account-bound refreshed Codex token for later prompts" {
+src/builtins/gateway.zig: test "Gateway catalog ID wrappers reject subscription credentials before HTTP" {
+src/builtins/gateway.zig: test "Gateway catalog provider rejects subscription credentials before HTTP" {
+src/builtins/gateway.zig: test "built-in credits provider rejects ChatGPT credentials before Gateway I/O" {
+src/core/agent/runtime/gateway_step.zig: test "provider-local exact usage reaches session accounting" {
+src/core/agent/runtime/orchestrator.zig: test "potentially sent recovery rejects missing or changed credential authority" {
+src/core/agent/runtime/tests/gateway_flow.zig: test "Codex 401 account change makes no second provider request" {
+src/core/agent/runtime/tests/gateway_flow.zig: test "Codex 401 replay keeps payload and semantic recovery unchanged for the captured account" {
+src/core/agent/runtime/tests/gateway_flow.zig: test "processQueuedPrompt compacts with the selected working model" {
+src/core/agent/runtime/tests/gateway_flow.zig: test "processQueuedPrompt never uses the vision fallback for Codex" {
+src/core/agent/runtime/tests/gateway_flow.zig: test "processQueuedPrompt accounts exact direct-provider usage without deferred capability" {
+src/core/app/app_agent_runtime.zig: test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
+src/core/app/app_auth_runtime.zig: test "manual compaction missing credentials leave transcript feedback to its owner" {
+src/core/app/app_auth_runtime.zig: test "login prepares the inline picker before its asynchronous inventory refresh completes" {
+src/core/app/app_auth_runtime.zig: test "setup hub projects the selected provider into the auth picker" {
+src/core/app/app_auth_runtime.zig: test "interactive subscription sign-in rejects active and queued work before OAuth" {
+src/core/app/app_auth_runtime.zig: test "provider switch state machine no-ops rejects busy work and prepares only idle changes" {
+src/core/app/app_bootstrap_runtime.zig: test "app_bootstrap_runtime launch provider override marks the provider for resume" {
+src/core/app/app_lifecycle.zig: test "loadStartupState defaults fast mode off and requires bound explicit preferences" {
+src/core/app/app_lifecycle.zig: test "startup provider chooses only its provider-scoped model" {
+src/core/app/app_session_runtime.zig: test "resumed sessions install provider-scoped usage reconciliation authority" {
+src/core/app/model_cache_runtime.zig: test "model cache access owns Grok account identity with its credential" {
+src/core/app/provider_picker_runtime.zig: test "provider column requires matching authentication for a current annotation" {
+src/core/app/provider_runtime.zig: test "provider runtime adopts an owned selection without a fallible publication" {
+src/core/auth/auth_runtime.zig: test "request-path credential verification stamp gates only within the window" {
+src/core/auth/auth_runtime.zig: test "provider stage pops to its setup root action" {
+src/core/auth/auth_runtime.zig: test "auth onboarding picker exposes the setup paths" {
+src/core/auth/auth_runtime.zig: test "credential switcher excludes provider-routed subscription sessions" {
+src/core/auth/auth_runtime.zig: test "host-managed provider selection never reads local credentials" {
+src/core/auth/auth_runtime.zig: test "provider selection preserves failure provenance and prior authority until recovery" {
+src/core/auth/auth_runtime.zig: test "auth inventory worker publishes one current action and preserves state on failure" {
+src/core/auth/auth_runtime.zig: test "startup status and inventory preserve selected and host-managed failure semantics" {
+src/core/auth/auth_runtime.zig: test "startup credential failures clear after source removal or credential adoption" {
+src/core/auth/auth_runtime.zig: test "startup credential failures reach only the matching provider status" {
+src/core/auth/auth_runtime.zig: test "provider status snapshot preserves loaded and host-managed authority" {
+src/core/auth/auth_runtime.zig: test "provider status snapshot retains required sources without selecting a credential" {
+src/core/auth/auth_runtime.zig: test "credential failure classification keeps storage failures out of sign-in recovery" {
+src/core/auth/auth_runtime.zig: test "host-managed runtime exposes authority without local credential state" {
+src/core/auth/auth_runtime.zig: test "credential preparation rejects refresh-due and provider-mismatched credentials" {
+src/core/auth/credential_authority.zig: test "credential authority uses account identity for provider subscriptions" {
+src/core/auth/provider_picker_catalog.zig: test "only the gateway offers a method column" {
+src/core/cli/cli_ask.zig: test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
+src/core/cli/cli_surface.zig: test "global launch modifiers own provider model effort and fast overrides before the command" {
+src/core/config/config_runtime.zig: test "provider settings keep independent provider models" {
+src/core/config/model_preferences.zig: test "model preferences are bounded and provider keyed" {
+src/core/config/settings_store.zig: test "provider patch writes one bounded provider model collection" {
+src/core/gateway/gateway_provider.zig: test "capability refresh keys host-managed catalogs by provider" {
+src/core/output/output_contracts.zig: test "model list explains public-only and rejected-credential catalogs" {
+src/core/output/output_contracts.zig: test "status distinguishes the selected model route from connected providers" {
+src/core/session/generation_usage_provider.zig: test "generation usage providers are selected by provider identity" {
+src/core/session/session_codec.zig: test "recovery checkpoint round trips while legacy state stays absent" {
+src/core/session/session_commands.zig: test "session_commands model picker emits one combined preference transaction" {
+src/core/session/session_commands.zig: test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
+src/core/session/session_usage.zig: test "resumed provider reconciliation uses Gateway credential slot identity" {
+src/core/session/session_usage.zig: test "direct exact generation IDs are deterministic and provider scoped" {
+src/core/session/session_usage_sidecar.zig: test "torn exact settlement republishes stale backlog without reapplying totals" {
+src/core/shared/types.zig: test "provider replay projection preserves matching origin and excludes other routes" {
+src/core/subagent/agent_adapter.zig: test "child runtime capability callbacks preserve fallback and child cancellation" {
+src/core/subagent/tool_host.zig: test "model override passes through for non-gateway providers" {
+src/core/tooling/tool_runtime.zig: test "Codex vision calls fail before provider access" {
+src/ui/footer/input_presentation.zig: test "compose hint row replaces model status with subscription sign-in controls" {
+src/ui/footer/picker_presentation.zig: test "compact Grok sign-in keeps masked code entry without duplicate controls" {
+src/ui/footer/picker_presentation.zig: test "Grok manual fallback projects the approved expanded layout through the VT emulator" {
+src/ui/footer/picker_presentation.zig: test "Grok sign-in starts with the collapsed browser flow in the VT emulator" {
+src/ui/footer/picker_presentation.zig: test "Codex sign-in projects the compact aligned footer through the VT emulator" {
+src/ui/footer/picker_presentation.zig: test "Codex sign-in stage renders a bounded clickable authorization action" {
+src/ui/footer/picker_presentation.zig: test "setup root fits the inline picker with status and controls" {

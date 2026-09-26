@@ -406,8 +406,6 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
-            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
-            .grok_subscription => "Grok models require an authenticated Grok catalog.",
         };
     }
     if (state.access_level == .authenticated) {
@@ -417,8 +415,6 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
-            .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
-            .grok_subscription => "Grok catalog: authenticated with a subscription.",
             .host_managed => "Provider catalog: authentication is managed by the host.",
             .configured => "Provider catalog: models from profile settings.",
         };

@@ -3568,8 +3568,6 @@ fn canonicalExactGenerationId(
 fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
         .gateway => "exact/gateway",
-        .codex => "exact/codex",
-        .grok => "exact/grok",
         .configured => "exact/configured",
     };
 }
@@ -3595,47 +3593,6 @@ test "newer missing context usage clears the prior observation" {
 
     usage.observeContextUsage(1, .{ .input_tokens = 90, .output_tokens = 10 });
     try std.testing.expect(usage.liveContextSnapshot() == null);
-}
-
-test "direct exact generation IDs are deterministic and provider scoped" {
-    var first_buffer: [30]u8 = undefined;
-    var replay_buffer: [30]u8 = undefined;
-    var other_provider_buffer: [30]u8 = undefined;
-    const first = try canonicalExactGenerationId(
-        .codex,
-        "response-shared-id",
-        &first_buffer,
-    );
-    const replay = try canonicalExactGenerationId(
-        .codex,
-        "response-shared-id",
-        &replay_buffer,
-    );
-    const other_provider = try canonicalExactGenerationId(
-        .grok,
-        "response-shared-id",
-        &other_provider_buffer,
-    );
-
-    try std.testing.expectEqualStrings(first, replay);
-    try std.testing.expect(!std.mem.eql(u8, first, other_provider));
-    try std.testing.expect(types.validGatewayGenerationId(first));
-    try std.testing.expect(types.validGatewayGenerationId(other_provider));
-
-    var gateway_buffer: [30]u8 = undefined;
-    const gateway_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    try std.testing.expectEqualStrings(
-        gateway_id,
-        try canonicalExactGenerationId(.gateway, gateway_id, &gateway_buffer),
-    );
-    try std.testing.expectError(
-        error.InvalidGenerationId,
-        canonicalExactGenerationId(.codex, "", &gateway_buffer),
-    );
-    try std.testing.expectError(
-        error.InvalidGenerationId,
-        canonicalExactGenerationId(.grok, "response\ninvalid", &gateway_buffer),
-    );
 }
 
 fn validateGenerationId(id: []const u8) !void {
@@ -6220,50 +6177,6 @@ test "stale reconciliation credential cannot replace a refreshed credential" {
         &(usage.reconciliation_key_digest orelse return error.TestUnexpectedResult),
     );
     try std.testing.expect(!usage.reconciliation_credential_blocked);
-}
-
-test "resumed provider reconciliation uses Gateway credential slot identity" {
-    const alloc = std.testing.allocator;
-    var usage = Usage.initFresh();
-    defer usage.deinit(alloc);
-
-    usage.replaceProviderReconciliationCredential(
-        alloc,
-        .gateway,
-        .ai_gateway_api_key,
-        null,
-        "fresh-secret-key",
-    );
-    try std.testing.expect(usage.reconciliation_key_digest != null);
-    try std.testing.expect(!usage.reconciliation_credential_blocked);
-
-    const observation = try InvocationObservation.begin(&usage);
-    try observation.complete(alloc, .{}, .{ .deferred = testGatewayUsageReference(
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-    ) });
-
-    usage.replaceProviderReconciliationCredential(
-        alloc,
-        .gateway,
-        .ai_gateway_api_key,
-        null,
-        "secret-key",
-    );
-    try std.testing.expect(usage.reconciliation_key_digest != null);
-    try std.testing.expect(usage.reconciliation_authority.?.credential_identity != null);
-    try std.testing.expect(!usage.reconciliation_credential_blocked);
-
-    usage.replaceProviderReconciliationCredential(
-        alloc,
-        .codex,
-        .chatgpt_subscription,
-        null,
-        "subscription-token",
-    );
-    try std.testing.expect(usage.reconciliation_key_digest == null);
-    try std.testing.expect(usage.reconciliation_authority == null);
-    try std.testing.expect(usage.reconciliation_credential_blocked);
 }
 
 test "host-managed reconciliation records authority without credential bytes" {

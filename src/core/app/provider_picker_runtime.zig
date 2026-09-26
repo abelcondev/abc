@@ -76,14 +76,14 @@ pub fn Runtime(comptime App: type) type {
                     count = provider_picker_catalog.providerOptions(&slugs);
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
-                        const id = provider_catalog.parse(slug) orelse .gateway;
+                        const id = provider_picker_catalog.parseProvider(slug) orelse .gateway;
                         column.annotations[i] = if (id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
                 .method => {
                     const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
-                    const provider = provider_catalog.parse(pending) orelse return 0;
+                    const provider = provider_picker_catalog.parseProvider(pending) orelse return 0;
                     const active_source = app.auth.credentialSource();
                     const methods = provider_picker_catalog.providerMethods(provider);
                     for (methods, 0..) |method, i| {
@@ -232,7 +232,7 @@ pub fn Runtime(comptime App: type) type {
             const selected = exactLabel(query.query, &column) orelse return false;
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
+                    const provider = provider_picker_catalog.parseProvider(selected) orelse return false;
                     if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
                 },
                 .method => {
@@ -258,14 +258,14 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
+                    const provider = provider_picker_catalog.parseProvider(selected) orelse return false;
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;
                     }
                     // Nothing is applied yet: the provider is only a heading
                     // until the method, and then the team, are chosen too.
-                    const slug = provider_catalog.find(provider).slug;
+                    const slug = provider_picker_catalog.providerSlug(&provider);
                     try setComposerText(app, "{s}{s} ", .{ query.prefix, slug });
                     try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
                     app.shell.render_requests.request(.footer);
@@ -277,7 +277,7 @@ pub fn Runtime(comptime App: type) type {
                     // has a credential to switch to; it goes stale the moment
                     // a key lands in the environment or the keychain.
                     try app.auth.refreshSourceInventory(app.alloc);
-                    const provider = provider_catalog.parse(
+                    const provider = provider_picker_catalog.parseProvider(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (method == .api_key) {
@@ -337,7 +337,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .key_source => {
                     const key_source = provider_picker_catalog.parseKeySource(selected) orelse return false;
-                    const pending_provider = provider_catalog.parse(
+                    const pending_provider = provider_picker_catalog.parseProvider(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (provider_picker_catalog.keySourceCredential(key_source)) |credential| {
@@ -352,7 +352,7 @@ pub fn Runtime(comptime App: type) type {
                 .api_key => return false,
                 .team => {
                     const index = teamIndex(app, selected) orelse return false;
-                    const provider = provider_catalog.parse(
+                    const provider = provider_picker_catalog.parseProvider(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     try commitTeam(app, index, provider);
@@ -541,7 +541,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncMethodSelection(app: *App, provider_slug: []const u8, method_slug: []const u8) void {
-            const provider = provider_catalog.parse(provider_slug) orelse return;
+            const provider = provider_picker_catalog.parseProvider(provider_slug) orelse return;
             for (provider_picker_catalog.providerMethods(provider), 0..) |method, index| {
                 if (!std.mem.eql(u8, provider_picker_catalog.methodSlug(method), method_slug)) continue;
                 app.input_runtime.picker.method_column_index = index;
@@ -597,8 +597,8 @@ test "model provider identity stays aligned with the catalog slugs" {
     var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
     const count = provider_picker_catalog.providerOptions(&slugs);
     for (slugs[0..count]) |slug| {
-        const id: model_provider.ProviderId = provider_catalog.parse(slug).?;
-        try std.testing.expectEqualStrings(slug, provider_catalog.find(id).slug);
+        const id: model_provider.ProviderId = provider_picker_catalog.parseProvider(slug).?;
+        try std.testing.expectEqualStrings(slug, provider_picker_catalog.providerSlug(&id));
     }
 }
 
@@ -692,28 +692,14 @@ test "provider column lists every provider and marks the active one" {
     }
 }
 
-test "provider column requires matching authentication for a current annotation" {
-    var app = ColumnTestApp.init(std.testing.allocator);
-    defer app.deinit();
-    for ([_]?credentials.Source{ null, .chatgpt_subscription }) |source| {
-        app.auth.source = source;
-        const column = columnFor(&app, .provider, "");
-        for (column.annotations[0..column.count]) |annotation| {
-            try std.testing.expectEqualStrings("", annotation);
-        }
-    }
-    app.auth.source = .host_managed;
-    try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
-}
-
 test "provider column narrows to what was typed" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
 
-    const column = columnFor(&app, .provider, "gro");
+    const column = columnFor(&app, .provider, "deeps");
     try std.testing.expectEqual(@as(usize, 1), column.count);
-    try std.testing.expectEqualStrings("grok", column.labels[0]);
+    try std.testing.expectEqualStrings("deepseek", column.labels[0]);
 }
 
 test "provider picker loading preserves query and selection instead of exposing cached options" {
@@ -721,23 +707,23 @@ test "provider picker loading preserves query and selection instead of exposing 
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
     app.auth.inventory_refresh_active = true;
-    try app.input_runtime.textReplacementState().replace(alloc, "/provider co");
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider deeps");
     app.input_runtime.picker.provider_column_index = 2;
 
-    const pending = columnFor(&app, .provider, "co");
+    const pending = columnFor(&app, .provider, "deeps");
     try std.testing.expectEqual(@as(usize, 1), pending.count);
     try std.testing.expectEqualStrings("checking credentials...", pending.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);
     Runtime(ColumnTestApp).navigate(&app, 1);
-    try std.testing.expectEqualStrings("/provider co", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/provider deeps", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.provider_column_index);
 
     app.auth.inventory_refresh_active = false;
-    const ready = columnFor(&app, .provider, "co");
+    const ready = columnFor(&app, .provider, "deeps");
     try std.testing.expectEqual(@as(usize, 1), ready.count);
-    try std.testing.expectEqualStrings("codex", ready.labels[0]);
+    try std.testing.expectEqualStrings("deepseek", ready.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);
-    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/provider deepseek", app.input_runtime.edit_state.input.items);
 }
 
 test "method column marks the credential the active provider is using" {

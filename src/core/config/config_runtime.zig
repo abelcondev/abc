@@ -1555,18 +1555,6 @@ fn parseProfileOnlyFields(
             return error.InvalidProviderValue;
     }
 
-    if (root.object.get("codex_model")) |model_value| {
-        if (model_value != .string) return error.InvalidCodexModelType;
-        settings_store.validateModel(model_value.string) catch return error.InvalidCodexModelValue;
-        try settings.models.putCopy(alloc, .codex, model_value.string);
-    }
-
-    if (root.object.get("grok_model")) |model_value| {
-        if (model_value != .string) return error.InvalidGrokModelType;
-        settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
-        try settings.models.putCopy(alloc, .grok, model_value.string);
-    }
-
     if (root.object.get("models")) |models_value| {
         if (models_value != .object) return error.InvalidModelType;
         var iterator = models_value.object.iterator();
@@ -2502,27 +2490,6 @@ test "max_agent_steps absence and explicit values resolve distinctly" {
     defer positive.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 50), positive.max_agent_steps.?);
     try std.testing.expectEqual(@as(usize, 50), agent_steps.resolveMaxAgentSteps(positive.max_agent_steps, 25));
-}
-
-test "provider settings keep independent provider models" {
-    var settings = try parseSettingsJson(
-        std.testing.allocator,
-        "{\"provider\":\"grok\",\"model\":\"gateway/model\",\"codex_model\":\"gpt-5.4-mini\",\"grok_model\":\"grok-4.20-0309-non-reasoning\"}",
-    );
-    defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, settings.provider.?);
-    try std.testing.expectEqualStrings("gateway/model", settings.models.get(.gateway).?);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", settings.models.get(.codex).?);
-    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.models.get(.grok).?);
-
-    var current = try parseSettingsJson(
-        std.testing.allocator,
-        "{\"model\":\"legacy/gateway\",\"codex_model\":\"legacy-codex\",\"models\":{\"gateway\":\"current/gateway\",\"codex\":\"current-codex\",\"grok\":\"current-grok\"}}",
-    );
-    defer current.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("current/gateway", current.models.get(.gateway).?);
-    try std.testing.expectEqualStrings("current-codex", current.models.get(.codex).?);
-    try std.testing.expectEqualStrings("current-grok", current.models.get(.grok).?);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {

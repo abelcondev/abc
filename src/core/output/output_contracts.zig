@@ -370,31 +370,13 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
-}
-
-fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    return auth.chatgpt_connected or auth.active_source == .chatgpt_subscription;
-}
-
-fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    return auth.grok_connected or auth.active_source == .grok_subscription;
+    return auth.gateway_connected or source != .configured;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
     var wrote_provider = false;
     if (gatewayProviderConnected(auth)) {
         try writer.writeAll("Vercel AI Gateway");
-        wrote_provider = true;
-    }
-    if (chatGptProviderConnected(auth)) {
-        if (wrote_provider) try writer.writeAll(", Codex");
-        if (!wrote_provider) try writer.writeAll("Codex");
-        wrote_provider = true;
-    }
-    if (grokProviderConnected(auth)) {
-        if (wrote_provider) try writer.writeAll(", Grok");
-        if (!wrote_provider) try writer.writeAll("Grok");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -586,7 +568,7 @@ pub const StatusSnapshot = struct {
     fn writeConnections(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         if (self.provider == .configured and self.auth.active_source == .configured) {
             try writer.writeAll(self.provider.label());
-            if (!gatewayProviderConnected(self.auth) and !chatGptProviderConnected(self.auth) and !grokProviderConnected(self.auth)) return;
+            if (!gatewayProviderConnected(self.auth)) return;
             try writer.writeAll(", ");
         }
         try writeConnectedProvidersText(writer, self.auth);
@@ -640,15 +622,6 @@ pub const StatusSnapshot = struct {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("vercel-ai-gateway", .{}, writer);
                 wrote_provider = true;
-            }
-            if (chatGptProviderConnected(self.auth)) {
-                if (wrote_provider) try writer.writeByte(',');
-                try std.json.Stringify.value("codex", .{}, writer);
-                wrote_provider = true;
-            }
-            if (grokProviderConnected(self.auth)) {
-                if (wrote_provider) try writer.writeByte(',');
-                try std.json.Stringify.value("grok", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -876,8 +849,6 @@ pub const ModelListSnapshot = struct {
     fn emptyCatalogProviderName(self: ModelListSnapshot) []const u8 {
         return switch (self.provider) {
             .gateway => "gateway",
-            .codex => provider_catalog.label(.codex),
-            .grok => provider_catalog.label(.grok),
             .configured => "configured provider",
         };
     }
@@ -893,8 +864,6 @@ pub const ModelListSnapshot = struct {
             .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
-            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
-            .grok_subscription => "Grok models require an authenticated Grok catalog.",
         };
     }
 };
@@ -1974,32 +1943,6 @@ test "core status snapshot includes selected team when present" {
     );
 }
 
-test "status distinguishes the selected model route from connected providers" {
-    const snapshot = StatusSnapshot{
-        .model = "gpt-5.4",
-        .provider = .codex,
-        .auth = .{
-            .active_source = .chatgpt_subscription,
-            .gateway_connected = true,
-            .chatgpt_connected = true,
-        },
-        .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
-        .history_turns = 0,
-        .session_permission_grants = 0,
-        .agent_step_limit = 24,
-    };
-    const text = try snapshot.renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "model_source=Codex subscription") != null);
-    try std.testing.expect(std.mem.find(u8, text, "connected_providers=Vercel AI Gateway, Codex") != null);
-
-    const json = try snapshot.renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"Codex subscription\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"vercel-ai-gateway\",\"codex\"]") != null);
-}
-
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
@@ -2148,69 +2091,6 @@ test "core permissions snapshot text and json stay stable" {
         "{\"kind\":\"permissions\",\"mode\":\"auto\",\"grant_count\":2,\"grant_scope\":\"session\",\"runtime_grants_available\":true,\"rules_scope\":\"persistent_config\",\"rules\":[{\"permission\":\"edit\",\"pattern\":\"src/*\",\"action\":\"allow\"},{\"permission\":\"open_url\",\"pattern\":\"*\",\"action\":\"ask\"}],\"grants\":[{\"tool_name\":\"write_file\",\"target_path\":\"/tmp/workspace/src/app.zig\",\"display_target\":\"src/app.zig\"},{\"tool_name\":\"run_command\",\"target_path\":\"/tmp/workspace::npm test\",\"display_target\":\"/tmp/workspace::npm test\"}]}",
         json,
     );
-}
-
-test "model list explains public-only and rejected-credential catalogs" {
-    const alloc = std.testing.allocator;
-    const ids = [_][]const u8{"alpha"};
-    const rejected = ModelListSnapshot{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected };
-    const shown = ModelListSnapshot{ .ids = &ids };
-    const cases = [_]struct {
-        snapshot: ModelListSnapshot,
-        text: []const u8,
-        body: []const u8,
-    }{
-        .{
-            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
-        },
-        .{
-            .snapshot = rejected,
-            .text = "[models] 1 available\n - alpha\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "1 available\n - alpha\nYour Gateway credential was rejected; using the public model catalog.",
-        },
-        .{
-            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
-        },
-        .{
-            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected },
-            .text = "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "no models returned by gateway\nYour Gateway credential was rejected; using the public model catalog.",
-        },
-        .{
-            .snapshot = .{ .ids = &.{}, .provider = .codex },
-            .text = "[models] no models returned by Codex subscription\n",
-            .body = "no models returned by Codex subscription",
-        },
-    };
-
-    for (cases) |case| {
-        const text = try case.snapshot.renderText(alloc);
-        defer alloc.free(text);
-        try std.testing.expectEqualStrings(case.text, text);
-
-        const body = try case.snapshot.renderInteractiveBody(alloc);
-        defer alloc.free(body);
-        try std.testing.expectEqualStrings(case.body, body);
-    }
-
-    const json = try rejected.renderJson(alloc);
-    defer alloc.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":true,\"ids\":[\"alpha\"]}",
-        json,
-    );
-
-    // An API key hides nothing, so the note must stay absent.
-    const quiet_text = try shown.renderText(alloc);
-    defer alloc.free(quiet_text);
-    try std.testing.expect(std.mem.find(u8, quiet_text, "team-private") == null);
-    const quiet_body = try shown.renderInteractiveBody(alloc);
-    defer alloc.free(quiet_body);
-    try std.testing.expect(std.mem.find(u8, quiet_body, "team-private") == null);
 }
 
 test "core model list snapshot handles limits and empty lists" {

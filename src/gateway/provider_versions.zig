@@ -15,10 +15,7 @@ pub fn resolve(
     outer_deadline: ?std.Io.Clock.Timestamp,
 ) versions.Error!versions.Version {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_CLIENT_VERSION",
-        .grok => "FX_E2E_GROK_CLIENT_VERSION",
-    };
+    const override_name = switch (provider) {};
     if (io_mod.getenv(override_name)) |value| {
         return versions.Version.parse(value) orelse error.ProviderVersionUnavailable;
     }
@@ -33,17 +30,11 @@ const LookupContext = struct {
 
 fn fetch(raw: ?*anyopaque, alloc: Allocator, provider: versions.Provider) versions.Error!versions.Version {
     const context: *LookupContext = @ptrCast(@alignCast(raw.?));
-    const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_VERSION_URL",
-        .grok => "FX_E2E_GROK_VERSION_URL",
-    };
+    const override_name = switch (provider) {};
     const url = if (io_mod.getenv(override_name)) |value| blk: {
         if (!gateway_client.isLoopbackHttpUrl(value)) return error.ProviderVersionUnavailable;
         break :blk value;
-    } else switch (provider) {
-        .codex => "https://registry.npmjs.org/@openai/codex/latest",
-        .grok => "https://x.ai/cli/stable",
-    };
+    } else switch (provider) {};
     var deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(lookup_timeout_ms),

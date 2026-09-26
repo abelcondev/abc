@@ -93,8 +93,6 @@ pub const Set = struct {
     pub fn select(self: Set, provider: model_provider.ProviderId) ?Provider {
         return switch (provider) {
             .gateway => self.gateway,
-            .codex => self.codex,
-            .grok => self.grok,
             .configured => null,
         };
     }
@@ -168,11 +166,4 @@ test "generation usage lookup can defer authentication to the host" {
         .cancel_flag = &cancel,
     });
     try std.testing.expectEqual(LookupOutcome.preserve_pending, outcome);
-}
-
-test "generation usage providers are selected by provider identity" {
-    const routes = Set.gatewayOnly(unavailable_provider);
-    try std.testing.expect(routes.select(.gateway) != null);
-    try std.testing.expect(routes.select(.codex) == null);
-    try std.testing.expect(routes.select(.grok) == null);
 }

@@ -638,11 +638,7 @@ fn handleRestoreSession(
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (effective_provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (effective_provider == .grok)
-                credentials.missing_grok_credential_message
-            else if (effective_provider == .configured)
+            .message = if (effective_provider == .configured)
                 "Configured provider authentication is unavailable"
             else
                 credentials.missing_credential_message,

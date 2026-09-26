@@ -3720,75 +3720,6 @@ fn shouldRejectRecoveryAuthority(
     );
 }
 
-test "potentially sent recovery rejects missing or changed credential authority" {
-    const identity = credential_authority.derive(
-        .chatgpt_subscription,
-        "acct_1",
-    ).?;
-    const checkpoint = session_codec.RecoveryCheckpoint{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("continue") },
-        .assistant_source = @constCast("partial"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{
-            .provider = .codex,
-            .model = @constCast("gpt-5.4"),
-            .credential_source = .chatgpt_subscription,
-            .credential_identity = identity,
-        },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    };
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_2",
-    ));
-
-    var legacy = checkpoint;
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.authority.credential_source = .ai_gateway_api_key;
-    legacy.authority.credential_identity = credential_authority.derive(
-        .ai_gateway_api_key,
-        null,
-    );
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .ai_gateway_api_key,
-        null,
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .stored_key,
-        null,
-    ));
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    legacy.consumed_provider_attempts = 0;
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
-}
-
 fn checkpointCause(
     cause: model_response_recovery.FailureCause,
 ) types.ModelRecoveryCause {
@@ -4752,15 +4683,11 @@ fn refreshGatewayCredentialForJob(
     const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
+            usage.refreshReconciliationCredential(
+                deps.usage_allocator,
+                previous_api_key,
+                refreshed,
+            );
         }
     }
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);

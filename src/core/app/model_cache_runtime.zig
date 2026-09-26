@@ -1307,31 +1307,6 @@ test "model cache access copies clean up every induced allocation failure" {
     }
 }
 
-test "model cache access owns Grok account identity with its credential" {
-    const access = credentials.catalogAccessForCredentialAndAccount(
-        .grok_subscription,
-        "copied-secret",
-        null,
-        "acct_grok",
-    );
-    for (0..2) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            OwnedCatalogAccess.init(failing.allocator(), access),
-        );
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-    }
-
-    var owned = try OwnedCatalogAccess.init(std.testing.allocator, access);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("acct_grok", owned.access.accountId().?);
-}
-
 fn runRepeatedAuthChangeCycle(iteration: usize) !void {
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
