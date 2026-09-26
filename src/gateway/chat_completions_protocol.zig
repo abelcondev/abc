@@ -650,6 +650,12 @@ fn write_reasoning(writer: *std.Io.Writer, format: configured_provider.Reasoning
             try std.json.Stringify.value(label, .{}, writer);
         },
         .thinking => try writer.print(",\"thinking\":{{\"type\":\"{s}\"}}", .{if (disabled) "disabled" else "enabled"}),
+        .thinking_effort => if (disabled) {
+            try writer.writeAll(",\"thinking\":{\"type\":\"disabled\"}");
+        } else {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(label, .{}, writer);
+        },
         .enable_thinking => try writer.print(",\"enable_thinking\":{}", .{!disabled}),
         .openrouter => {
             try writer.writeAll(",\"reasoning\":{\"effort\":");
@@ -2976,6 +2982,8 @@ test "chat completions serializes reasoning effort per provider format" {
         .{ .format = .enable_thinking, .effort = "medium", .expected = "\"enable_thinking\":true" },
         .{ .format = .enable_thinking, .effort = "off", .expected = "\"enable_thinking\":false" },
         .{ .format = .openrouter, .effort = "low", .expected = "\"reasoning\":{\"effort\":\"low\"}" },
+        .{ .format = .thinking_effort, .effort = "max", .expected = "\"reasoning_effort\":\"max\"" },
+        .{ .format = .thinking_effort, .effort = "none", .expected = "\"thinking\":{\"type\":\"disabled\"}" },
         .{ .format = .none, .effort = "high", .expected = null },
     };
     for (cases) |case| {

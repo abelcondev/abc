@@ -51,7 +51,7 @@ Inside a session, `/provider` lists the presets and switches between them, and
 
 | Preset | API key variable | Endpoint |
 | --- | --- | --- |
-| `deepseek` | `DEEPSEEK_API_KEY` | api.deepseek.com |
+| `deepseek` | `DEEPSEEK_API_KEY` | api.deepseek.com (`deepseek-flash`, `deepseek-v4-pro`; verified end to end) |
 | `qwen`, `qwen-cn` | `DASHSCOPE_API_KEY` | DashScope compatible mode (intl / China) |
 | `moonshot`, `moonshot-cn` | `MOONSHOT_API_KEY` | Kimi (intl / China) |
 | `zai`, `zhipu` | `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | GLM (Z.ai / BigModel) |
@@ -61,6 +61,8 @@ Inside a session, `/provider` lists the presets and switches between them, and
 | `groq`, `together`, `fireworks`, `siliconflow` | `<NAME>_API_KEY` | vendor OpenAI-compatible endpoints |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | none | localhost default ports |
 
+Models that `GET /models` reports with `context_window`, `max_output_tokens`,
+`effort.supported_levels` or `input_modalities` pick those up automatically.
 Preset endpoints and model ids follow each provider's public documentation and
 may drift; override a preset by defining a provider with the same name.
 
@@ -88,13 +90,13 @@ fallback.
   "providers": {
     "deepseek": {
       "protocol": "openai-chat-completions",
-      "base_url": "https://api.deepseek.com/v1",
+      "base_url": "https://api.deepseek.com",
       "auth": { "type": "bearer", "env": "DEEPSEEK_API_KEY" },
       "tool_choice_mode": "send",
-      "default_model": "deepseek-chat",
-      "reasoning_format": "thinking",
+      "default_model": "deepseek-flash",
+      "reasoning_format": "thinking_effort",
       "model_metadata": {
-        "deepseek-chat": { "context_window": 128000, "supports_tool_use": true, "reasoning_efforts": ["none", "high"] }
+        "deepseek-flash": { "context_window": 1048576, "max_output_tokens": 393216, "supports_tool_use": true, "reasoning_efforts": ["none", "low", "high", "max"] }
       }
     }
   }
@@ -103,7 +105,7 @@ fallback.
 
 | Field | Meaning |
 | --- | --- |
-| `reasoning_format` | How `--effort` is sent: `reasoning_effort` (default), `thinking`, `enable_thinking`, `openrouter`, or `none` |
+| `reasoning_format` | How `--effort` is sent: `reasoning_effort` (default), `thinking`, `thinking_effort` (DeepSeek V4), `enable_thinking`, `openrouter`, or `none` |
 | `model_metadata.<id>.reasoning_efforts` | Efforts the model accepts; enables the effort picker for it |
 | `default_model` | Model used when `ABC_MODEL` and saved preferences do not pick one |
 | `merge_system_messages` | Join adjacent system messages (default `true`) |
