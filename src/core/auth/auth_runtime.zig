@@ -1487,7 +1487,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
-            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
+            .configured => "The provider's API key is unavailable. Export the environment variable named in its auth settings (built-in presets use names like DEEPSEEK_API_KEY, DASHSCOPE_API_KEY or OPENROUTER_API_KEY); no other provider was selected.",
         };
     }
 

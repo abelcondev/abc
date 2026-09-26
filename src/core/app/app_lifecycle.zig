@@ -1418,9 +1418,15 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
-        .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,
+        .configured => io_mod.getenv("FX_MODEL") orelse configuredDefaultModel(settings, provider) orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
+}
+
+fn configuredDefaultModel(settings: *const config_runtime.Settings, provider: model_provider.ProviderId) ?[]const u8 {
+    const registry = settings.providers orelse @import("../config/configured_provider.zig").Registry{};
+    const definition = registry.get(provider.label()) orelse return null;
+    return definition.default_model;
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
