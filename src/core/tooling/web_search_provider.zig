@@ -34,6 +34,14 @@ pub const Provider = struct {
     input_overhead_bytes: usize = 0,
     preferred_backends_fn: PreferredBackendsFn,
     execute_fn: ExecuteFn,
+    /// Whether the provider can serve requests right now. Providers without
+    /// it are treated as unavailable, which keeps web_search off.
+    ready_fn: ?*const fn () bool = null,
+
+    pub fn ready(self: Provider) bool {
+        const check = self.ready_fn orelse return false;
+        return check();
+    }
 
     pub fn preferredBackends(self: Provider) !?[]const web_search_contract.SearchBackendId {
         return self.preferred_backends_fn(self.context);

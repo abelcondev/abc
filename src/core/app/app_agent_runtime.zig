@@ -324,7 +324,7 @@ pub fn Runtime(comptime App: type) type {
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
-                ctx.web_search_runtime_ready = false;
+                ctx.web_search_runtime_ready = provider_capabilities.fx_search and app.web_search_runtime.ready();
                 ctx.web_search_progress_ctx = @ptrCast(app);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
