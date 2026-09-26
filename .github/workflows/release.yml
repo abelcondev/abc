@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tag matches src/main.zig
+        run: |
+          version="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/main.zig)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in src/main.zig" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            runner: macos-15
+            target: aarch64-macos
+          - name: macos-x86_64
+            runner: macos-15
+            target: x86_64-macos
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Smoke test
+        if: matrix.name == 'macos-aarch64'
+        run: ./zig-out/bin/abc --version
+
+      - name: Package
+        run: |
+          package_dir="$RUNNER_TEMP/abc-${{ matrix.name }}"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/abc LICENSE NOTICE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "abc-${{ matrix.name }}.tar.gz" -C "$package_dir" abc LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          shasum -a 256 "abc-${{ matrix.name }}.tar.gz" > "abc-${{ matrix.name }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abc-${{ matrix.name }}
+          path: |
+            abc-${{ matrix.name }}.tar.gz
+            abc-${{ matrix.name }}.tar.gz.sha256
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "abc $GITHUB_REF_NAME" \
+            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh\`" \
+            --verify-tag
