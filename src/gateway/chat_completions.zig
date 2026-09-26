@@ -305,6 +305,24 @@ fn remote_entry(alloc: Allocator, definition: *const definitions.Definition, ite
     return entry;
 }
 
+/// Plans often list image, audio and embedding models next to chat models;
+/// none of them can drive the agent loop.
+fn looks_like_chat_model(id: []const u8) bool {
+    const markers = [_][]const u8{ "image", "tts", "audio", "realtime", "embedding", "embed-", "rerank", "whisper", "wan2", "dall-e", "moderation" };
+    var buffer: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(buffer[0..@min(id.len, buffer.len)], id[0..@min(id.len, buffer.len)]);
+    for (markers) |marker| if (std.mem.find(u8, lower, marker) != null) return false;
+    return true;
+}
+
+test "remote catalog keeps chat models only" {
+    try std.testing.expect(looks_like_chat_model("qwen3.8-max"));
+    try std.testing.expect(looks_like_chat_model("deepseek-v4.1-flash"));
+    try std.testing.expect(!looks_like_chat_model("wan2.7-image-pro"));
+    try std.testing.expect(!looks_like_chat_model("qwen-audio-3.0-tts-plus"));
+    try std.testing.expect(!looks_like_chat_model("text-embedding-3-small"));
+}
+
 fn positive_field(item: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = item.get(key) orelse return null;
     if (value != .integer or value.integer <= 0) return null;
@@ -354,6 +372,7 @@ fn fetch_remote_model_ids(alloc: Allocator, definition: *const definitions.Defin
         const id = item.object.get("id") orelse continue;
         if (id != .string) continue;
         definitions.validate_model_id(id.string) catch continue;
+        if (!looks_like_chat_model(id.string)) continue;
         const entry = try remote_entry(alloc, definition, item.object, id.string);
         errdefer catalog.freeModelCatalogEntry(alloc, entry);
         try ids.append(alloc, entry);

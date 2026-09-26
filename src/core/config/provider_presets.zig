@@ -51,12 +51,26 @@ pub const definitions = [_]Definition{
     }),
     preset("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", .{
         .reasoning_format = .enable_thinking,
+        .tool_choice_mode = .omit,
         .default_model = "qwen3-coder-plus",
         .models = &.{
             .{ .id = "qwen3-coder-plus", .context_window = 1_000_000, .max_output_tokens = 65_536, .supports_tool_use = true },
             .{ .id = "qwen3-coder-flash", .context_window = 1_000_000, .max_output_tokens = 65_536, .supports_tool_use = true },
             .{ .id = "qwen-max", .context_window = 262_144, .max_output_tokens = 32_768, .supports_tool_use = true },
             .{ .id = "qwen-plus", .context_window = 1_000_000, .max_output_tokens = 32_768, .supports_tool_use = true, .reasoning_efforts = &on_off },
+        },
+    }),
+    preset("qwen-plan", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "QWEN_TOKEN_PLAN_API_KEY", .{
+        .reasoning_format = .enable_thinking,
+        // The plan's `auto` model rejects tool_choice.
+        .tool_choice_mode = .omit,
+        .default_model = "qwen3.8-max",
+        .models = &.{
+            .{ .id = "qwen3.8-max", .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &on_off },
+            .{ .id = "qwen3.8-flash", .supports_tool_use = true, .reasoning_efforts = &on_off },
+            .{ .id = "qwen3.7-max", .supports_tool_use = true, .reasoning_efforts = &on_off },
+            .{ .id = "qwen3.7-plus", .supports_tool_use = true, .reasoning_efforts = &on_off },
+            .{ .id = "auto", .supports_tool_use = true, .reasoning_efforts = &on_off },
         },
     }),
     preset("qwen-cn", "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", .{

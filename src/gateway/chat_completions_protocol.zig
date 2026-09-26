@@ -691,6 +691,12 @@ const Deltas = struct {
     reasoning: [2]?[]const u8 = @splat(null),
 };
 
+const ContainerField = struct {
+    function: usize,
+    name: []u8,
+    is_object: bool,
+};
+
 const Tool = struct {
     id: ?[]u8 = null,
     name: std.ArrayList(u8) = .empty,
@@ -715,6 +721,9 @@ pub const Reducer = struct {
     tools: std.ArrayList(Tool) = .empty,
     /// Lenient mode: provider tool_calls index -> slot in `tools`.
     index_map: std.ArrayList(usize) = .empty,
+    /// Top-level object/array parameters per selected function, used to
+    /// undo models that send nested objects as JSON-encoded strings.
+    container_fields: std.ArrayList(ContainerField) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
@@ -740,12 +749,75 @@ pub const Reducer = struct {
         defer functions.deinit(alloc);
         var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
         errdefer self.deinit();
-        for (functions.items) |function| {
+        for (functions.items, 0..) |function, function_index| {
             const name = try alloc.dupe(u8, function.name);
             errdefer alloc.free(name);
             try self.names.append(alloc, name);
+            if (limits.lenient) try self.collect_container_fields(function_index, function);
         }
         return self;
+    }
+
+    fn collect_container_fields(self: *Reducer, function_index: usize, function: Function) Error!void {
+        switch (function.schema) {
+            .builtin => |schema| for (schema.properties) |property| {
+                if (property.json_type != .object and property.json_type != .array) continue;
+                try self.add_container_field(function_index, property.name, property.json_type == .object);
+            },
+            .dynamic => |schema| {
+                if (schema != .object) return;
+                const properties = schema.object.get("properties") orelse return;
+                if (properties != .object) return;
+                var iterator = properties.object.iterator();
+                while (iterator.next()) |entry| {
+                    const property = entry.value_ptr.*;
+                    if (property != .object) continue;
+                    const kind = property.object.get("type") orelse continue;
+                    if (kind != .string) continue;
+                    const is_object = std.mem.eql(u8, kind.string, "object");
+                    if (!is_object and !std.mem.eql(u8, kind.string, "array")) continue;
+                    try self.add_container_field(function_index, entry.key_ptr.*, is_object);
+                }
+            },
+        }
+    }
+
+    fn add_container_field(self: *Reducer, function_index: usize, name: []const u8, is_object: bool) Error!void {
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.container_fields.append(self.alloc, .{ .function = function_index, .name = owned, .is_object = is_object });
+    }
+
+    /// Lenient repair: when a parameter declared as an object or array
+    /// arrives as a string holding exactly that JSON shape, decode it.
+    /// Ordinary string parameters are never touched.
+    fn repair_container_arguments(self: *Reducer, tool: *Tool) Error!void {
+        const function_index = for (self.names.items, 0..) |name, index| {
+            if (std.mem.eql(u8, name, tool.name.items)) break index;
+        } else return;
+        var relevant = false;
+        for (self.container_fields.items) |field| relevant = relevant or field.function == function_index;
+        if (!relevant) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var root = std.json.parseFromSliceLeaky(std.json.Value, arena, tool.arguments.items, .{}) catch return;
+        if (root != .object) return;
+        var changed = false;
+        for (self.container_fields.items) |field| {
+            if (field.function != function_index) continue;
+            const slot = root.object.getPtr(field.name) orelse continue;
+            if (slot.* != .string) continue;
+            const decoded = std.json.parseFromSliceLeaky(std.json.Value, arena, slot.string, .{}) catch continue;
+            if ((field.is_object and decoded != .object) or (!field.is_object and decoded != .array)) continue;
+            slot.* = decoded;
+            changed = true;
+        }
+        if (!changed) return;
+        const encoded = std.json.Stringify.valueAlloc(arena, root, .{}) catch return error.OutOfMemory;
+        if (encoded.len > self.limits.arguments_bytes) return;
+        tool.arguments.clearRetainingCapacity();
+        try tool.arguments.appendSlice(self.alloc, encoded);
     }
 
     pub fn deinit(self: *Reducer) void {
@@ -754,6 +826,8 @@ pub const Reducer = struct {
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.index_map.deinit(self.alloc);
+        for (self.container_fields.items) |field| self.alloc.free(field.name);
+        self.container_fields.deinit(self.alloc);
         self.content.deinit(self.alloc);
         for (&self.reasoning) |*part| part.bytes.deinit(self.alloc);
         self.reasoning_details.bytes.deinit(self.alloc);
@@ -1181,6 +1255,7 @@ pub const Reducer = struct {
         var reason = self.finish_reason.?;
         if (self.limits.lenient) {
             try self.repair_tools();
+            for (self.tools.items) |*tool| try self.repair_container_arguments(tool);
             // Many servers report "stop" on tool-call turns, and vice versa.
             if (reason == .stop and self.tools.items.len != 0) reason = .tool_calls;
             if (reason == .tool_calls and self.tools.items.len == 0) reason = .stop;
@@ -3020,4 +3095,18 @@ test "chat completions merges adjacent system messages when asked" {
     var reparsed = try std.json.parseFromSlice(std.json.Value, alloc, separate, .{});
     defer reparsed.deinit();
     try std.testing.expectEqual(@as(usize, 3), reparsed.value.object.get("messages").?.array.items.len);
+}
+
+test "lenient chat completions decodes nested objects sent as JSON strings" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"s1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"request\\\":\\\"{\\\\\\\"command\\\\\\\":\\\\\\\"ls\\\\\\\"}\\\"}\"}},{\"index\":1,\"id\":\"r1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"{\\\\\\\"a\\\\\\\":1}\\\"}\"}}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqualStrings("{\"request\":{\"command\":\"ls\"}}", calls[0].arguments_json);
+    // A string parameter that happens to hold JSON stays a string.
+    try std.testing.expectEqualStrings("{\"path\":\"{\\\"a\\\":1}\"}", calls[1].arguments_json);
 }
