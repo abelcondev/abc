@@ -614,6 +614,11 @@ pub const Limits = struct {
     arguments_bytes: usize = 1024 * 1024,
     content_bytes: usize = 8 * 1024 * 1024,
     reasoning_bytes: usize = types.ProviderReplay.max_bytes,
+    /// Tolerate common OpenAI-compatible stream deviations: missing [DONE] or
+    /// finish_reason, "stop" on tool-call turns, vendor finish reasons, chunks
+    /// without choices, unindexed or re-sent tool call deltas, and inexact
+    /// usage. Tool names and final argument JSON stay validated either way.
+    lenient: bool = false,
 };
 
 const ReasoningPart = struct {
@@ -648,6 +653,8 @@ pub const Reducer = struct {
     choice: types.ToolChoice,
     names: std.ArrayList([]u8) = .empty,
     tools: std.ArrayList(Tool) = .empty,
+    /// Lenient mode: provider tool_calls index -> slot in `tools`.
+    index_map: std.ArrayList(usize) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
@@ -686,6 +693,7 @@ pub const Reducer = struct {
         self.names.deinit(self.alloc);
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
+        self.index_map.deinit(self.alloc);
         self.content.deinit(self.alloc);
         for (&self.reasoning) |*part| part.bytes.deinit(self.alloc);
         self.reasoning_details.bytes.deinit(self.alloc);
@@ -706,8 +714,13 @@ pub const Reducer = struct {
         self.json_bytes += data.len;
         if (self.event_count == self.limits.events) return error.TooManyEvents;
         self.event_count += 1;
+        const lenient = self.limits.lenient;
         if (std.mem.eql(u8, data, "[DONE]")) {
-            if (self.phase != .finished) return error.IncompleteStream;
+            if (self.phase != .finished) {
+                // Some servers end with [DONE] without ever sending finish_reason.
+                if (!lenient) return error.IncompleteStream;
+                self.finish_reason = .stop;
+            }
             self.phase = .done;
             return .{};
         }
@@ -719,20 +732,41 @@ pub const Reducer = struct {
         defer parsed.deinit();
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
-        try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
-        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
-        const choices_value = root.get("choices") orelse return error.InvalidChunk;
+        if (lenient) {
+            try self.remember_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
+            try self.remember_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        } else {
+            try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
+            try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        }
+        const choices_value = root.get("choices") orelse if (lenient) std.json.Value{ .null = {} } else return error.InvalidChunk;
+        if (lenient and choices_value == .null) {
+            // Usage-only or keep-alive chunk.
+            if (non_null(root, "usage")) |usage| try self.accept_usage(usage, self.phase == .finished);
+            return .{};
+        }
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
         if (choices.len > 1) return error.InvalidChunk;
         if (choices.len == 0) {
+            if (lenient) {
+                if (non_null(root, "usage")) |usage| try self.accept_usage(usage, self.phase == .finished);
+                return .{};
+            }
             if (self.phase != .finished) return error.InvalidChunk;
             try self.accept_usage(non_null(root, "usage") orelse return error.InvalidChunk, true);
             return .{};
         }
         const choice = try object(choices[0]);
-        if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
-        const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
+        const choice_index = if (choice.get("index")) |value| try index_value(value) else if (lenient) 0 else return error.InvalidChunk;
+        if (choice_index != 0) return error.InvalidChunk;
+        if (lenient and self.phase == .finished) {
+            // Trailing chunks after finish_reason only contribute usage.
+            if (non_null(root, "usage")) |usage| try self.accept_usage(usage, true);
+            return .{};
+        }
+        const empty_delta: std.json.ObjectMap = .empty;
+        const delta = if (non_null(choice, "delta")) |value| try object(value) else if (lenient) empty_delta else return error.InvalidChunk;
         if (self.phase == .finished) {
             const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
             if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
@@ -747,21 +781,28 @@ pub const Reducer = struct {
             try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason, true);
             return .{};
         }
-        if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
-        // These fields carry semantics outside this codec's text/function subset.
-        for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        if (!lenient) {
+            if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
+            // These fields carry semantics outside this codec's text/function subset.
+            for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        }
         const reasoning_delta = try self.accept_reasoning(delta);
         const content_start = self.content.items.len;
-        if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
+        if (non_null(delta, "content")) |value| {
+            if (value == .string) {
+                try append_bounded(self.alloc, &self.content, value.string, self.limits.content_bytes, error.ContentTooLarge);
+            } else if (!lenient) return error.InvalidChunk;
+        }
         if (non_null(delta, "refusal")) |value| {
             const refusal = try string(value);
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
-        if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
+        if (non_null(delta, "tool_calls")) |value| {
+            if (lenient) try self.accept_tools_lenient(value) else try self.accept_tools(value);
+        }
         if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
         if (non_null(choice, "finish_reason")) |value| {
-            const reason = try string(value);
-            self.finish_reason = if (std.mem.eql(u8, reason, "stop")) .stop else if (std.mem.eql(u8, reason, "tool_calls")) .tool_calls else if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "content_filter")) .content_filter else return error.InvalidFinishReason;
+            self.finish_reason = try parse_finish_reason(try string(value), lenient);
             self.phase = .finished;
         }
         return .{
@@ -857,6 +898,131 @@ pub const Reducer = struct {
         } else destination.* = try self.alloc.dupe(u8, text);
     }
 
+    /// Lenient identity: keep the first usable value and ignore later changes.
+    fn remember_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize) Error!void {
+        if (destination.* != null) return;
+        const present = value orelse return;
+        if (present != .string or present.string.len == 0 or present.string.len > max_bytes) return;
+        destination.* = try self.alloc.dupe(u8, present.string);
+    }
+
+    /// Lenient tool deltas. Routes each fragment by call id first, then by
+    /// index, then to the latest call, which covers servers that omit index,
+    /// send every parallel call at index 0, re-send the full name, send empty
+    /// ids on continuations, or send arguments as a JSON value.
+    fn accept_tools_lenient(self: *Reducer, value: std.json.Value) Error!void {
+        if (value != .array) return;
+        if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
+        for (value.array.items) |item| {
+            if (item != .object) continue;
+            const delta = item.object;
+            if (non_null(delta, "type")) |kind| if (kind != .string or !std.mem.eql(u8, kind.string, "function")) continue;
+            const id: ?[]const u8 = if (non_null(delta, "id")) |text| (if (text == .string and text.string.len != 0) text.string else null) else null;
+            const index: ?usize = if (non_null(delta, "index")) |number| (index_value(number) catch null) else null;
+            const slot = try self.resolve_tool_slot(id, index);
+            const tool = &self.tools.items[slot];
+            if (id) |text| if (tool.id == null) {
+                if (text.len > self.limits.identity_bytes) return error.IdentityTooLarge;
+                tool.id = try self.alloc.dupe(u8, text);
+            };
+            const function_value = non_null(delta, "function") orelse continue;
+            if (function_value != .object) continue;
+            const function = function_value.object;
+            if (non_null(function, "name")) |name_value| if (name_value == .string and name_value.string.len != 0) {
+                const fragment = name_value.string;
+                if (self.known_name(tool.name.items) and self.known_name(fragment)) tool.name.clearRetainingCapacity();
+                try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
+            };
+            if (non_null(function, "arguments")) |arguments| switch (arguments) {
+                .string => |text| try append_bounded(self.alloc, &tool.arguments, text, self.limits.arguments_bytes, error.ArgumentsTooLarge),
+                .object, .array => {
+                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, arguments, .{});
+                    defer self.alloc.free(encoded);
+                    try append_bounded(self.alloc, &tool.arguments, encoded, self.limits.arguments_bytes, error.ArgumentsTooLarge);
+                },
+                else => {},
+            };
+        }
+    }
+
+    const unmapped_slot = std.math.maxInt(usize);
+
+    fn resolve_tool_slot(self: *Reducer, id: ?[]const u8, index: ?usize) Error!usize {
+        if (id) |text| for (self.tools.items, 0..) |tool, slot| {
+            const known = tool.id orelse continue;
+            if (!std.mem.eql(u8, known, text)) continue;
+            if (index) |position| try self.map_index(position, slot);
+            return slot;
+        };
+        if (index) |position| {
+            if (position >= self.limits.tool_calls) return error.TooManyTools;
+            if (position < self.index_map.items.len and self.index_map.items[position] != unmapped_slot) {
+                const slot = self.index_map.items[position];
+                const existing = self.tools.items[slot];
+                // A new id at a used index starts another call only once the
+                // previous call is complete; otherwise the id is noise.
+                if (id == null or existing.id == null or !try self.call_complete(existing)) return slot;
+            }
+            const slot = try self.new_tool();
+            try self.map_index(position, slot);
+            return slot;
+        }
+        if (id == null and self.tools.items.len != 0) return self.tools.items.len - 1;
+        return self.new_tool();
+    }
+
+    fn new_tool(self: *Reducer) Error!usize {
+        if (self.tools.items.len >= self.limits.tool_calls) return error.TooManyTools;
+        try self.tools.append(self.alloc, .{});
+        return self.tools.items.len - 1;
+    }
+
+    fn map_index(self: *Reducer, position: usize, slot: usize) Error!void {
+        while (self.index_map.items.len <= position) try self.index_map.append(self.alloc, unmapped_slot);
+        self.index_map.items[position] = slot;
+    }
+
+    fn call_complete(self: *Reducer, tool: Tool) Error!bool {
+        if (!self.known_name(tool.name.items)) return false;
+        return try types.ToolArgumentIntegrity.classifyFunctionInput(self.alloc, tool.arguments.items) == .valid;
+    }
+
+    fn has_tool_id(self: *const Reducer, id: []const u8) bool {
+        for (self.tools.items) |tool| if (tool.id) |known| if (std.mem.eql(u8, known, id)) return true;
+        return false;
+    }
+
+    /// Lenient repairs before validation: drop empty call slots, synthesize
+    /// missing ids, and treat empty arguments as an empty object.
+    fn repair_tools(self: *Reducer) Error!void {
+        var index = self.tools.items.len;
+        while (index > 0) {
+            index -= 1;
+            const tool = &self.tools.items[index];
+            if (tool.name.items.len == 0 and std.mem.trim(u8, tool.arguments.items, " \t\r\n").len == 0) {
+                tool.deinit(self.alloc);
+                _ = self.tools.orderedRemove(index);
+            }
+        }
+        for (self.tools.items, 0..) |*tool, position| {
+            if (tool.id == null) {
+                var suffix = position;
+                while (true) : (suffix += 1) {
+                    const candidate = try std.fmt.allocPrint(self.alloc, "call_{d}", .{suffix});
+                    if (!self.has_tool_id(candidate)) {
+                        tool.id = candidate;
+                        break;
+                    }
+                    self.alloc.free(candidate);
+                }
+            }
+            if (std.mem.trim(u8, tool.arguments.items, " \t\r\n").len == 0) {
+                tool.arguments.clearRetainingCapacity();
+                try tool.arguments.appendSlice(self.alloc, "{}");
+            }
+        }
+    }
+
     fn accept_tools(self: *Reducer, value: std.json.Value) Error!void {
         if (value != .array) return error.InvalidChunk;
         if (value.array.items.len > self.limits.tool_calls) return error.TooManyTools;
@@ -895,6 +1061,15 @@ pub const Reducer = struct {
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
+        if (self.limits.lenient) {
+            // Providers disagree on totals (cached or reasoning tokens) and on
+            // repeating usage; keep the latest counts without cross-checks.
+            if (value != .object) return;
+            if (token_count(value.object, "prompt_tokens") catch null) |tokens| self.usage.input_tokens = tokens;
+            if (token_count(value.object, "completion_tokens") catch null) |tokens| self.usage.output_tokens = tokens;
+            if (token_count(value.object, "total_tokens") catch null) |tokens| self.usage_total = tokens;
+            return;
+        }
         const fields = try object(value);
         const incoming = types.Usage{
             .input_tokens = try token_count(fields, "prompt_tokens"),
@@ -943,7 +1118,13 @@ pub const Reducer = struct {
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed) return error.StreamClosed;
         if (self.phase != .done) return error.IncompleteStream;
-        const reason = self.finish_reason.?;
+        var reason = self.finish_reason.?;
+        if (self.limits.lenient) {
+            try self.repair_tools();
+            // Many servers report "stop" on tool-call turns, and vice versa.
+            if (reason == .stop and self.tools.items.len != 0) reason = .tool_calls;
+            if (reason == .tool_calls and self.tools.items.len == 0) reason = .stop;
+        }
         switch (reason) {
             .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
@@ -998,6 +1179,21 @@ pub const Reducer = struct {
         } };
     }
 };
+
+fn parse_finish_reason(reason: []const u8, lenient: bool) Error!types.ProviderFinishReason {
+    if (std.mem.eql(u8, reason, "stop")) return .stop;
+    if (std.mem.eql(u8, reason, "tool_calls")) return .tool_calls;
+    if (std.mem.eql(u8, reason, "length")) return .length;
+    if (std.mem.eql(u8, reason, "content_filter")) return .content_filter;
+    if (!lenient) return error.InvalidFinishReason;
+    // DeepSeek ends a generation with this when its servers are overloaded.
+    if (std.mem.eql(u8, reason, "insufficient_system_resource")) return error.ProviderError;
+    for ([_][]const u8{ "tool_call", "function_call", "tool_use" }) |alias| if (std.mem.eql(u8, reason, alias)) return .tool_calls;
+    for ([_][]const u8{ "max_tokens", "max_output_tokens", "model_length" }) |alias| if (std.mem.eql(u8, reason, alias)) return .length;
+    for ([_][]const u8{ "content_filtered", "sensitive", "safety" }) |alias| if (std.mem.eql(u8, reason, alias)) return .content_filter;
+    // "eos", "end_turn", "stop_sequence" and other spellings of a normal end.
+    return .stop;
+}
 
 fn object(value: std.json.Value) Error!std.json.ObjectMap {
     return if (value == .object) value.object else error.InvalidChunk;
@@ -1055,7 +1251,14 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
             error.StreamTooLarge => return if (event_limited) error.EventTooLarge else error.StreamTooLarge,
             else => return err,
         };
-        const chunk = data orelse return error.IncompleteStream;
+        const chunk = data orelse {
+            // Some servers close the stream after finish_reason without [DONE].
+            if (limits.lenient and reducer.phase == .finished) {
+                reducer.phase = .done;
+                return reducer.finish(cancel_flag.load(.seq_cst));
+            }
+            return error.IncompleteStream;
+        };
         const deltas = try reducer.accept(chunk, cancel_flag.load(.seq_cst));
         if (events) |sink| {
             for (deltas.reasoning) |delta| if (delta) |text| {
@@ -2577,4 +2780,136 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, test_stop);
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
+}
+
+const lenient_limits: Limits = .{ .lenient = true };
+
+fn test_lenient_result(chunks: []const []const u8) Error!stream_provider.Result {
+    var reducer = try Reducer.init(std.testing.allocator, test_tool_request(), lenient_limits);
+    defer reducer.deinit();
+    for (chunks) |chunk| try test_accept(&reducer, chunk);
+    return reducer.finish(false);
+}
+
+test "lenient chat completions treats stop with tool calls as a tool-call turn" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{ test_call, test_stop, "[DONE]" });
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
+    // Strict mode keeps rejecting the same stream.
+    var strict = try Reducer.init(alloc, test_tool_request(), .{});
+    defer strict.deinit();
+    try test_accept(&strict, test_call);
+    try std.testing.expectError(error.InconsistentFinishReason, test_finish(&strict, test_stop));
+}
+
+test "lenient chat completions splits parallel calls sent at index zero" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"arguments\":\"\\\"x\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"b\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"y\\\"}\"}}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("a", calls[0].id);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", calls[0].arguments_json);
+    try std.testing.expectEqualStrings("b", calls[1].id);
+    try std.testing.expectEqualStrings("{\"path\":\"y\"}", calls[1].arguments_json);
+}
+
+test "lenient chat completions routes unindexed deltas and repeated names" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"shell\",\"arguments\":{\"request\":{\"command\":\"ls\"}}}}]}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_call\"}]}",
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("c1", calls[0].id);
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    try std.testing.expectEqualStrings("{\"request\":{\"command\":\"ls\"}}", calls[0].arguments_json);
+}
+
+test "lenient chat completions synthesizes missing ids and empty arguments" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\"}},{\"index\":1}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("call_0", calls[0].id);
+    try std.testing.expectEqualStrings("{}", calls[0].arguments_json);
+}
+
+test "lenient chat completions accepts vendor framing around the answer" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"id\":\"x\",\"choices\":[]}",
+        "{\"id\":\"y\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hel\",\"reasoning_content\":null}}]}",
+        "{\"id\":\"z\",\"model\":\"m2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"eos\"}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":12}}",
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings("hello", completion.content.?);
+    try std.testing.expectEqualStrings("x", completion.generation_id.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason);
+    try std.testing.expectEqual(@as(?u64, 7), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), completion.usage.output_tokens);
+}
+
+test "lenient chat completions maps vendor finish reasons" {
+    try std.testing.expectEqual(types.ProviderFinishReason.length, try parse_finish_reason("max_tokens", true));
+    try std.testing.expectEqual(types.ProviderFinishReason.content_filter, try parse_finish_reason("sensitive", true));
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, try parse_finish_reason("end_turn", true));
+    try std.testing.expectError(error.ProviderError, parse_finish_reason("insufficient_system_resource", true));
+    try std.testing.expectError(error.InvalidFinishReason, parse_finish_reason("eos", false));
+}
+
+test "lenient chat completions still rejects unknown tools and malformed arguments" {
+    try std.testing.expectError(error.InvalidToolName, test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{}\"}}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    }));
+    try std.testing.expectError(error.InvalidToolArguments, test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    }));
+}
+
+test "lenient chat completions stream ends without DONE only after finish_reason" {
+    const alloc = std.testing.allocator;
+    const cancelled = std.atomic.Value(bool).init(false);
+    {
+        var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\n");
+        var result = try consume_stream(alloc, &source, test_request(), lenient_limits, null, &cancelled);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+    }
+    {
+        var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\n");
+        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), lenient_limits, null, &cancelled));
+    }
+    {
+        var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: [DONE]\n\n");
+        var result = try consume_stream(alloc, &source, test_request(), lenient_limits, null, &cancelled);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason);
+    }
 }

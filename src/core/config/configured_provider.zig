@@ -56,6 +56,8 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Opt out of the lenient stream reader and require strict OpenAI framing.
+    strict_stream: bool = false,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -163,7 +165,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "strict_stream" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -175,6 +177,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
     }
+    const strict_stream = (optional_bool(value.object.get("strict_stream")) catch return error.InvalidObject) orelse false;
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
         if (model_value != .string) return error.InvalidModelId;
@@ -204,6 +207,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
+        .strict_stream = strict_stream,
     };
 }
 
