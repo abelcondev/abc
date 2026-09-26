@@ -253,31 +253,71 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         try entries.append(alloc, entry);
     }
     var remote = try fetch_remote_model_ids(alloc, definition, input.cancel_flag);
-    defer {
-        for (remote.items) |id| alloc.free(id);
-        remote.deinit(alloc);
-    }
-    for (remote.items) |id| {
-        if (definition.model(id) != null) continue;
-        const owned_id = try alloc.dupe(u8, id);
-        errdefer alloc.free(owned_id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        try entries.append(alloc, .{ .id = owned_id, .model_type = model_type });
+    defer remote.deinit(alloc);
+    // Declared metadata wins; remote entries move into `entries` one by one.
+    for (remote.items, 0..) |entry, index| {
+        if (definition.model(entry.id) != null) {
+            catalog.freeModelCatalogEntry(alloc, entry);
+            continue;
+        }
+        entries.append(alloc, entry) catch |err| {
+            for (remote.items[index..]) |rest| catalog.freeModelCatalogEntry(alloc, rest);
+            return err;
+        };
     }
     return .{ .catalog = entries };
+}
+
+/// Reads the optional metadata some servers add to `/models` entries
+/// (DeepSeek, OpenRouter-style): context_window / context_length,
+/// max_output_tokens, effort.supported_levels and input_modalities.
+fn remote_entry(alloc: Allocator, definition: *const definitions.Definition, item: std.json.ObjectMap, id: []const u8) Allocator.Error!catalog.ModelCatalogEntry {
+    var entry: catalog.ModelCatalogEntry = .{ .id = try alloc.dupe(u8, id), .model_type = undefined };
+    errdefer alloc.free(entry.id);
+    entry.model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(entry.model_type);
+    entry.context_window = positive_field(item, "context_window") orelse positive_field(item, "context_length") orelse 0;
+    entry.max_tokens = positive_field(item, "max_output_tokens") orelse 0;
+    if (entry.max_tokens >= entry.context_window and entry.context_window != 0) entry.max_tokens = 0;
+    if (item.get("input_modalities")) |modalities| if (modalities == .array) {
+        for (modalities.array.items) |modality| {
+            if (modality == .string and std.mem.eql(u8, modality.string, "image")) {
+                entry.has_vision = true;
+                entry.has_file_input = true;
+            }
+        }
+    };
+    if (definition.reasoning_format != .none) if (item.get("effort")) |effort| if (effort == .object) {
+        if (effort.object.get("supported_levels")) |levels| if (levels == .array) {
+            errdefer entry.reasoning_efforts.deinit(alloc);
+            if (definition.reasoning_format == .thinking_effort or definition.reasoning_format == .thinking or definition.reasoning_format == .enable_thinking) {
+                try entry.reasoning_efforts.append(alloc, types.ReasoningEffort.parse("none").?);
+            }
+            for (levels.array.items) |level| {
+                if (level != .string) continue;
+                const parsed = types.ReasoningEffort.parse(level.string) orelse continue;
+                if (entry.reasoning_efforts.items.len == types.ReasoningEffort.max_options) break;
+                try entry.reasoning_efforts.append(alloc, parsed);
+            }
+            entry.has_reasoning = entry.reasoning_efforts.items.len != 0;
+        };
+    };
+    return entry;
+}
+
+fn positive_field(item: std.json.ObjectMap, key: []const u8) ?u32 {
+    const value = item.get(key) orelse return null;
+    if (value != .integer or value.integer <= 0) return null;
+    return std.math.cast(u32, value.integer);
 }
 
 const max_remote_models = 512;
 
 /// Lists `GET {base_url}/models`. Any failure (unreachable server, missing
 /// key, unexpected shape) yields an empty list so declared models still load.
-fn fetch_remote_model_ids(alloc: Allocator, definition: *const definitions.Definition, cancel_flag: ?*std.atomic.Value(bool)) Allocator.Error!std.ArrayList([]u8) {
-    var ids: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (ids.items) |id| alloc.free(id);
-        ids.deinit(alloc);
-    }
+fn fetch_remote_model_ids(alloc: Allocator, definition: *const definitions.Definition, cancel_flag: ?*std.atomic.Value(bool)) Allocator.Error!std.ArrayList(catalog.ModelCatalogEntry) {
+    var ids: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
+    errdefer catalog.freeModelCatalog(alloc, &ids);
     // Unit tests stay hermetic; catalog requests are exercised end to end.
     if (builtin.is_test) return ids;
     const key: ?[]const u8 = switch (definition.auth) {
@@ -314,9 +354,9 @@ fn fetch_remote_model_ids(alloc: Allocator, definition: *const definitions.Defin
         const id = item.object.get("id") orelse continue;
         if (id != .string) continue;
         definitions.validate_model_id(id.string) catch continue;
-        const owned = try alloc.dupe(u8, id.string);
-        errdefer alloc.free(owned);
-        try ids.append(alloc, owned);
+        const entry = try remote_entry(alloc, definition, item.object, id.string);
+        errdefer catalog.freeModelCatalogEntry(alloc, entry);
+        try ids.append(alloc, entry);
     }
     return ids;
 }

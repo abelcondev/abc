@@ -14,6 +14,7 @@ const ModelMetadata = configured_provider.ModelMetadata;
 const ReasoningEffort = types.ReasoningEffort;
 
 const on_off = [_]ReasoningEffort{ ReasoningEffort.literal("none"), ReasoningEffort.literal("high") };
+const deepseek_efforts = [_]ReasoningEffort{ ReasoningEffort.literal("none"), ReasoningEffort.literal("low"), ReasoningEffort.literal("high"), ReasoningEffort.literal("max") };
 const low_medium_high = [_]ReasoningEffort{ ReasoningEffort.literal("low"), ReasoningEffort.literal("medium"), ReasoningEffort.literal("high") };
 
 fn preset(
@@ -40,12 +41,12 @@ fn preset(
 }
 
 pub const definitions = [_]Definition{
-    preset("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", .{
-        .reasoning_format = .thinking,
-        .default_model = "deepseek-chat",
+    preset("deepseek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", .{
+        .reasoning_format = .thinking_effort,
+        .default_model = "deepseek-flash",
         .models = &.{
-            .{ .id = "deepseek-chat", .context_window = 128_000, .max_output_tokens = 8_192, .supports_tool_use = true },
-            .{ .id = "deepseek-reasoner", .context_window = 128_000, .max_output_tokens = 64_000, .supports_tool_use = true },
+            .{ .id = "deepseek-flash", .context_window = 1_048_576, .max_output_tokens = 393_216, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &deepseek_efforts },
+            .{ .id = "deepseek-v4-pro", .context_window = 1_048_576, .max_output_tokens = 393_216, .supports_tool_use = true, .reasoning_efforts = &deepseek_efforts },
         },
     }),
     preset("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", .{

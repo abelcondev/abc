@@ -40,8 +40,11 @@ pub const ReasoningFormat = enum {
     none,
     /// `"reasoning_effort": "<effort>"` (OpenAI style).
     reasoning_effort,
-    /// `"thinking": {"type": "enabled" | "disabled"}` (DeepSeek, GLM, Kimi style).
+    /// `"thinking": {"type": "enabled" | "disabled"}` (GLM, Kimi style).
     thinking,
+    /// `"reasoning_effort": "<effort>"`, or `"thinking": {"type": "disabled"}`
+    /// for none/off (DeepSeek V4 style).
+    thinking_effort,
     /// `"enable_thinking": true | false` (Qwen / DashScope style).
     enable_thinking,
     /// `"reasoning": {"effort": "<effort>"}` (OpenRouter style).
