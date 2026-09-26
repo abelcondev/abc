@@ -196,7 +196,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             else => .provider_error,
         }, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var limits: codec.Limits = .{};
+    var limits: codec.Limits = .{ .lenient = !definition.strict_stream };
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
 }
