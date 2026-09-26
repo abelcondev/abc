@@ -523,6 +523,9 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    if (err == error.ConfiguredModelNotSelected) {
+        return std.fmt.bufPrint(buffer, "fx: no model is selected for this provider. Set FX_MODEL=<model id> or add default_model to its settings.\n", .{});
+    }
     return std.fmt.bufPrint(buffer, "fx: {s}\n", .{@errorName(err)});
 }
 
@@ -537,9 +540,8 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 }
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
-    writeStderr(deps, "fx: ");
-    writeStderr(deps, @errorName(err));
-    writeStderr(deps, "\n");
+    var buffer: [256]u8 = undefined;
+    writeStderr(deps, formatUnexpectedError(&buffer, err) catch "fx: unexpected error\n");
 }
 
 fn gatherNoopContextForTest(_: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {

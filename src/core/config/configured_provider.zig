@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const provider_presets = @import("provider_presets.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -79,6 +80,8 @@ pub const Definition = struct {
     reasoning_format: ReasoningFormat = .reasoning_effort,
     /// Join consecutive system messages; some servers accept only one.
     merge_system_messages: bool = true,
+    /// Model used when neither FX_MODEL nor a saved model selects one.
+    default_model: ?[]const u8 = null,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -119,6 +122,7 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
+        if (self.default_model) |id| alloc.free(id);
         for (self.model_metadata) |metadata| {
             alloc.free(metadata.id);
             alloc.free(metadata.reasoning_efforts);
@@ -178,18 +182,19 @@ pub const Registry = struct {
     }
 
     /// Returns a borrow valid until registry teardown. IDs are case-sensitive.
+    /// Settings definitions shadow the built-in presets of the same id.
     pub fn get(self: Registry, id: []const u8) ?*const Definition {
         if (id.len > max_id_bytes) return null;
         for (self.definitions) |*definition| {
             if (std.mem.eql(u8, definition.id, id)) return definition;
         }
-        return null;
+        return provider_presets.get(id);
     }
 };
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "strict_stream", "reasoning_format", "merge_system_messages" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "strict_stream", "reasoning_format", "merge_system_messages", "default_model" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -207,6 +212,12 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     if (value.object.get("reasoning_format")) |format| {
         if (format != .string) return error.InvalidReasoningFormat;
         reasoning_format = std.meta.stringToEnum(ReasoningFormat, format.string) orelse return error.InvalidReasoningFormat;
+    }
+    var default_model: ?[]const u8 = null;
+    if (value.object.get("default_model")) |model_value| {
+        if (model_value != .string) return error.InvalidModelId;
+        try validate_model_id(model_value.string);
+        default_model = model_value.string;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -229,6 +240,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const owned_default_model = if (default_model) |model_id| try alloc.dupe(u8, model_id) else null;
+    errdefer if (owned_default_model) |model_id| alloc.free(model_id);
     return .{
         .id = owned_id,
         .protocol = .@"openai-chat-completions",
@@ -240,6 +253,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .strict_stream = strict_stream,
         .reasoning_format = reasoning_format,
         .merge_system_messages = merge_system_messages,
+        .default_model = owned_default_model,
     };
 }
 

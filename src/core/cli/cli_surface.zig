@@ -843,7 +843,9 @@ fn activateProviderSelectionFallible(
 
     if (target == .configured) {
         const bound = try target.bind(settings.providers orelse .{});
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        const registry = settings.providers orelse @import("../config/configured_provider.zig").Registry{};
+        const preset_model = if (registry.get(bound.label())) |definition| definition.default_model else null;
+        const selected_model = settings.models.get(bound) orelse preset_model orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
             .model_preference = .{ .provider = bound, .model = selected_model },
