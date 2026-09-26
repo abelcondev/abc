@@ -103,6 +103,20 @@ pub const definitions = [_]Definition{
     preset("vllm", "http://localhost:8000/v1", null, .{ .reasoning_format = .none }),
 };
 
+/// The first preset, in list order, whose API key variable is set and
+/// non-empty. Local presets without a key are never detected.
+pub fn detect(getenv: *const fn ([]const u8) ?[]const u8) ?*const Definition {
+    for (&definitions) |*definition| {
+        const env = switch (definition.auth) {
+            .none => continue,
+            .bearer => |name| name,
+        };
+        const value = getenv(env) orelse continue;
+        if (std.mem.trim(u8, value, " \t\r\n").len != 0) return definition;
+    }
+    return null;
+}
+
 /// Returns a static preset; the pointer stays valid for the whole process.
 pub fn get(id: []const u8) ?*const Definition {
     for (&definitions) |*definition| {
@@ -127,4 +141,20 @@ test "provider presets are valid connection definitions" {
     try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", get("deepseek").?.auth.bearer);
     try std.testing.expect(get("ollama").?.auth == .none);
     try std.testing.expect(get("missing") == null);
+}
+
+test "provider preset detection follows list order and ignores blank keys" {
+    const Env = struct {
+        fn only_qwen(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "DEEPSEEK_API_KEY")) return "  ";
+            if (std.mem.eql(u8, name, "DASHSCOPE_API_KEY")) return "sk-qwen";
+            if (std.mem.eql(u8, name, "OPENROUTER_API_KEY")) return "sk-or";
+            return null;
+        }
+        fn none(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("qwen", detect(Env.only_qwen).?.id);
+    try std.testing.expect(detect(Env.none) == null);
 }
