@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_keys = @import("provider_keys.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -368,7 +369,7 @@ pub fn resolveForProvider(
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) orelse try loadSavedProviderKey(alloc, definition.id) },
         };
     }
     if (provider != .gateway) {
@@ -599,6 +600,19 @@ fn loadEnvCredential(
         .token = try alloc.dupe(u8, value),
         .source = source,
     };
+}
+
+/// A key saved with `abc login <provider>`; unreadable storage reads as absent
+/// so the missing-key message still names the environment variable.
+fn loadSavedProviderKey(alloc: std.mem.Allocator, id: []const u8) !?Credential {
+    const value = provider_keys.load(alloc, id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("auth", "saved provider key unavailable provider={s} err={s}", .{ id, @errorName(err) });
+            return null;
+        },
+    } orelse return null;
+    return .{ .token = value, .source = .configured };
 }
 
 fn loadStoredKeyCredential(

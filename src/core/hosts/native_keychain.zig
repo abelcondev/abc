@@ -215,6 +215,25 @@ pub fn loadMcpCredentialsCancellable(
     );
 }
 
+/// Generic-password helpers for callers that own their service name.
+pub fn loadService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
+    return loadFromService(alloc, service) catch |err| switch (err) {
+        error.KeychainItemNotFound => null,
+        else => err,
+    };
+}
+
+pub fn storeService(service: []const u8, value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0) return error.KeychainWriteFailed;
+    if (comptime builtin.os.tag == .macos) return storeValueMac(service, value);
+    return error.UnsupportedPlatform;
+}
+
+pub fn deleteService(alloc: std.mem.Allocator, service: []const u8) Error!bool {
+    return deleteServiceItem(alloc, service);
+}
+
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     if (!isAvailable()) return null;
 

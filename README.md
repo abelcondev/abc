@@ -34,6 +34,18 @@ export DASHSCOPE_API_KEY=...
 ABC_PROVIDER=qwen ABC_MODEL=qwen3-coder-plus ./zig-out/bin/abc
 ```
 
+Or save the key once instead of exporting it (macOS Keychain, or an
+owner-only file under `~/.abc/provider-keys` elsewhere):
+
+```bash
+./zig-out/bin/abc login deepseek      # prompts for the key, then selects deepseek
+echo "$KEY" | ./zig-out/bin/abc login qwen
+./zig-out/bin/abc logout deepseek
+```
+
+An exported variable takes precedence over a saved key. With no provider
+selected, abc picks the first preset whose key variable is exported.
+
 Inside a session, `/provider` lists the presets and switches between them, and
 `abc models` lists the models the provider reports at `GET /models`.
 
