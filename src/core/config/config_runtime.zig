@@ -281,6 +281,12 @@ fn resolve_provider_selection(settings: *Settings) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
+    // With nothing chosen, use the first preset whose API key is exported.
+    if (settings.provider == null) {
+        if (@import("provider_presets.zig").detect(io_mod.getenv)) |preset| {
+            settings.provider = model_provider.parse(preset.id);
+        }
+    }
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
 }
 

@@ -335,8 +335,8 @@ fn prioritizedRowIndex(
     return source_row_count -| 1;
 }
 
-const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto mode.";
-const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
+const onboarding_note = "   ⚠︎ Note: abc is experimental and defaults to auto mode.";
+const onboarding_note_link = onboarding_note;
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
     if (row_count >= 18) return row_index;
@@ -392,12 +392,12 @@ fn composeOnboardingPickerRow(
 
     try row.appendSlice(alloc, ui_render.hint_style);
     const label = switch (source_row_index) {
-        0 => "   Welcome to fx",
+        0 => "   Welcome to abc",
         1 => "",
-        2 => "   fx can access AI models with an account, subscription, or API key.",
-        3 => "   Choose a sign-in option below, or add your own API key.",
+        2 => "   abc works with DeepSeek, Qwen, Kimi, GLM, OpenRouter, Ollama and more.",
+        3 => "   Export a provider key (for example DEEPSEEK_API_KEY) and restart abc.",
         4 => "",
-        5 => "   You can change this anytime with /setup.",
+        5 => "   Switch providers anytime with /provider, or use Vercel AI Gateway below.",
         6 => "",
         7 => "   Get started",
         12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
@@ -2026,10 +2026,10 @@ test "auth onboarding composes the welcome copy and setup choices" {
         try screen.append(alloc, '\n');
     }
 
-    try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to fx") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "fx can access AI models with an account, subscription, or API key") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to abc") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "abc works with DeepSeek, Qwen, Kimi, GLM, OpenRouter, Ollama and more") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Switch providers anytime with /provider") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: abc is experimental and defaults to auto mode.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
@@ -2037,7 +2037,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     var body_row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 100);
     defer body_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, body_row.items, "fx can access AI models") != null);
+    try std.testing.expect(std.mem.find(u8, body_row.items, "abc works with DeepSeek") != null);
 
     var spacer_row = try composeAuthPickerRow(alloc, view, 6, authPickerRowCount(view), 100);
     defer spacer_row.deinit(alloc);
