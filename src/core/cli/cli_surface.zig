@@ -1,4 +1,6 @@
 const std = @import("std");
+const provider_keys = @import("../auth/provider_keys.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
@@ -233,6 +235,71 @@ pub const Config = struct {
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
+
+/// A `login`/`logout` argument naming a connection (preset or settings.json
+/// provider) that authenticates with a bearer key. Caller frees the name.
+fn connectionKeyTarget(alloc: Allocator, rest: []const [:0]const u8) !?[]u8 {
+    if (rest.len != 1 or provider_catalog.parse(rest[0]) != null) return null;
+    var registry = config_runtime.loadConfiguredProviders(alloc) catch configured_provider.Registry{};
+    defer registry.deinit(alloc);
+    const definition = registry.get(rest[0]) orelse return null;
+    if (definition.auth != .bearer) return null;
+    return try alloc.dupe(u8, definition.id);
+}
+
+fn runConnectionKeyLogin(alloc: Allocator, cfg: Config, deps: RunDeps, target: []const u8) !RunResult {
+    const key = readConnectionKey(alloc, deps, target) catch |err| {
+        const text = try std.fmt.allocPrint(alloc, "abc login: could not read the key: {s}\n", .{@errorName(err)});
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    defer secret.zeroAndFree(alloc, key);
+    provider_keys.store(alloc, target, key) catch |err| {
+        const text = try std.fmt.allocPrint(alloc, "abc login: could not save the {s} key: {s}\n", .{ target, @errorName(err) });
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    const saved = try std.fmt.allocPrint(alloc, "Saved the {s} key in the {s}.\n", .{ target, provider_keys.backendLabel() });
+    defer alloc.free(saved);
+    try writeStdout(deps, saved);
+    const provider = model_provider.parse(target) orelse return .handled_success;
+    if (!try activateProviderSelection(alloc, cfg, deps, provider, .provider_command, null)) return .handled_failure;
+    return .handled_success;
+}
+
+/// Reads one line from stdin; on a terminal the prompt goes to stderr and
+/// echo is turned off while the key is typed or pasted.
+fn readConnectionKey(alloc: Allocator, deps: RunDeps, target: []const u8) ![]u8 {
+    const stdin = std.Io.File.stdin();
+    const interactive = stdin.isTty(io_mod.getIo()) catch false;
+    var saved_termios: ?std.posix.termios = null;
+    if (interactive) {
+        const prompt = try std.fmt.allocPrint(alloc, "Paste the {s} API key: ", .{target});
+        defer alloc.free(prompt);
+        try writeStderr(deps, prompt);
+        if (std.posix.tcgetattr(stdin.handle)) |termios| {
+            var silent = termios;
+            silent.lflag.ECHO = false;
+            std.posix.tcsetattr(stdin.handle, .NOW, silent) catch {};
+            saved_termios = termios;
+        } else |_| {}
+    }
+    defer if (saved_termios) |termios| {
+        std.posix.tcsetattr(stdin.handle, .NOW, termios) catch {};
+        writeStderr(deps, "\n") catch {};
+    };
+    var buffer: [4096]u8 = undefined;
+    var reader = stdin.readerStreaming(io_mod.getIo(), &buffer);
+    const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => reader.interface.buffered(),
+        else => return err,
+    };
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    try provider_keys.validate(trimmed);
+    return alloc.dupe(u8, trimmed);
+}
 
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
@@ -1112,8 +1179,12 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
+            if (try connectionKeyTarget(alloc, rest)) |target| {
+                defer alloc.free(target);
+                return runConnectionKeyLogin(alloc, cfg, deps, target);
+            }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel]\n");
+                try writeStderr(deps, "usage: fx login [vercel|<provider>]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1141,8 +1212,24 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
+            if (try connectionKeyTarget(alloc, rest)) |target| {
+                defer alloc.free(target);
+                const existed = provider_keys.delete(alloc, target) catch |err| {
+                    const text = try std.fmt.allocPrint(alloc, "abc logout: could not remove the saved {s} key: {s}\n", .{ target, @errorName(err) });
+                    defer alloc.free(text);
+                    try writeStderr(deps, text);
+                    return .handled_failure;
+                };
+                const text = if (existed)
+                    try std.fmt.allocPrint(alloc, "Removed the saved {s} key.\n", .{target})
+                else
+                    try std.fmt.allocPrint(alloc, "No saved {s} key found.\n", .{target});
+                defer alloc.free(text);
+                try writeStdout(deps, text);
+                return .handled_success;
+            }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|<provider>]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
