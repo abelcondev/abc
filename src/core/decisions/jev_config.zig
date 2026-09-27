@@ -9,7 +9,7 @@
 //! "jev": {
 //!   "enabled": true,
 //!   "model": "jev-latest",
-//!   "gates": { "plan": true, "stop": true, "ask": true, "drift": true, "action": false },
+//!   "gates": { "plan": true, "stop": true, "ask": true, "drift": true, "sdd": true, "action": false },
 //!   "thresholds": { "plan": 0.5, "stop": 0.5, "ask": 0.8, "action": 0.6 },
 //!   "routing": {
 //!     "light": { "model": "deepseek-flash", "effort": "low" },
@@ -54,6 +54,9 @@ pub const Config = struct {
     /// changes contradict (only in workspaces with a decisions directory and
     /// SDD on).
     drift_gate: bool = true,
+    /// With SDD on, route the first file change of a turn to fix, spec or
+    /// change (`sdd_gate.zig`).
+    sdd_gate: bool = true,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,
     /// Probability of unrequested damage at which an action is held.
@@ -72,7 +75,7 @@ pub const Config = struct {
 
     /// Whether any gate needs the PreToolUse hook.
     pub fn usesPreToolUse(self: Config) bool {
-        return self.plan_gate or self.ask_gate or self.action_gate or self.routes.len != 0;
+        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.routes.len != 0;
     }
 
     fn setModel(self: *Config, alloc: Allocator, value: []const u8) !void {
@@ -119,6 +122,9 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (gates.object.get("drift")) |drift| {
                 if (drift == .bool) config.drift_gate = drift.bool;
+            }
+            if (gates.object.get("sdd")) |sdd| {
+                if (sdd == .bool) config.sdd_gate = sdd.bool;
             }
         }
     }
