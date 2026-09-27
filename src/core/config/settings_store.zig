@@ -91,10 +91,12 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
-/// Writes `workspaces["<root>"].sdd.enabled`.
+/// Writes `workspaces["<root>"].sdd.enabled` and `.tdd`.
 pub const WorkspaceSddMutation = struct {
     workspace_root: []const u8,
-    enabled: bool,
+    enabled: ?bool = null,
+    /// `off`, `on` or `strict`.
+    tdd: ?[]const u8 = null,
 };
 
 pub const UserSettingsPatch = struct {
@@ -905,7 +907,14 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
-        .workspace_sdd => |workspace_sdd| try validateWorkspaceRoot(workspace_sdd.workspace_root),
+        .workspace_sdd => |workspace_sdd| {
+            try validateWorkspaceRoot(workspace_sdd.workspace_root);
+            if (workspace_sdd.tdd) |tdd| {
+                if (!std.mem.eql(u8, tdd, "off") and !std.mem.eql(u8, tdd, "on") and !std.mem.eql(u8, tdd, "strict")) {
+                    return error.InvalidDurableField;
+                }
+            }
+        },
     }
 }
 
@@ -998,6 +1007,13 @@ test "workspace sdd mutation writes only that workspace's sdd switch" {
     const again = try applyWorkspaceSddMutationToRoot(arena.allocator(), &root, .{ .workspace_root = "/repo", .enabled = true });
     try std.testing.expect(!again.changed);
     try std.testing.expectError(error.InvalidDurableField, validateMutation(.{ .workspace_sdd = .{ .workspace_root = "relative", .enabled = true } }));
+
+    const tdd = try applyWorkspaceSddMutationToRoot(arena.allocator(), &root, .{ .workspace_root = "/repo", .tdd = "strict" });
+    try std.testing.expect(tdd.changed);
+    const sdd = root.object.get("workspaces").?.object.get("/repo").?.object.get("sdd").?.object;
+    try std.testing.expectEqualStrings("strict", sdd.get("tdd").?.string);
+    try std.testing.expect(sdd.get("enabled").?.bool);
+    try std.testing.expectError(error.InvalidDurableField, validateMutation(.{ .workspace_sdd = .{ .workspace_root = "/repo", .tdd = "always" } }));
 }
 
 test "model and fast patch binds the fast preference atomically" {
@@ -1537,7 +1553,10 @@ fn applyWorkspaceSddMutationToRoot(
         try workspace.put(arena, "sdd", .{ .object = .empty });
         break :blk workspace.getPtr("sdd").?;
     };
-    return .{ .changed = try putBool(arena, &sdd.object, "enabled", mutation.enabled) };
+    var changed = false;
+    if (mutation.enabled) |enabled| changed = try putBool(arena, &sdd.object, "enabled", enabled) or changed;
+    if (mutation.tdd) |tdd| changed = try putString(arena, &sdd.object, "tdd", tdd) or changed;
+    return .{ .changed = changed };
 }
 
 fn applyProjectMcpMutationToRoot(

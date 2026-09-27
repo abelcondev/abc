@@ -215,6 +215,7 @@ fx sdd off
 fx sdd new <slug>        # write sdd/changes/<yyyy-mm-dd>-<slug>.md (proposed)
 fx sdd approve [<name>]  # proposed -> approved
 fx sdd done [<name>]     # approved -> done
+fx sdd tdd off|on|strict # test-first behavior changes (writes sdd.tdd)
 ```
 
 Inside a session, `/sdd` accepts the same subcommands. The status line shows
@@ -261,6 +262,28 @@ you which route it is. Saying "no hagas propuesta" or "skip the spec" makes it
 a fix. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
 reply that approves it ("sí, dale"); once a change is approved, code changes go
 through. `fx jev eval sdd` runs the routing against labeled cases.
+
+**Test-first.** `fx sdd tdd on` (or `/sdd tdd on`) makes behavior changes
+test-first while SDD is on: spec and change routes, and fixes that repair a
+bug. Before the first source change, the turn must have changed a test and run
+it failing; before the answer, a test run must pass after the last source
+change. Both come from the turn's own tool results, including a runner's
+`1 fail` summary when the command is piped. Jev then checks that the changed
+tests would fail without the requested behavior. `fx sdd tdd strict` also
+requires every changed rule to be cited by a test, and `fx sdd` reports how
+many rules are:
+
+```ts
+// spec: reservas › Saldo is the outstanding balance
+test("subtracts payments", () => { ... });
+```
+
+A rule whose heading ends in `(manual)`, or a change with `tdd: manual` in its
+front matter, is checked in the running app instead. fx recognizes common
+runners (`bun test`, `npm test`, `pytest`, `go test`, `cargo test`,
+`zig build test` and others); set `"test": "<command>"` under `sdd` in the
+settings for anything else. A fix or spec update that grows past 8 source files
+is held once so the agent can propose a change instead.
 
 After turns that change files, the Jev spec drift check compares the
 uncommitted changes with each rule in `sdd/specs` (or with the files in

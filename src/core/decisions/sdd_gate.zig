@@ -37,6 +37,7 @@ pub const high_stakes_id = "high_stakes";
 pub const skip_id = "skip_process";
 pub const clear_id = "clear";
 pub const approves_id = "approves_proposal";
+pub const bug_id = "bug_fix";
 
 /// Probability at which a request counts as high stakes.
 pub const high_stakes_threshold = 0.6;
@@ -50,6 +51,9 @@ pub const skip_threshold = 0.7;
 pub const clear_threshold = 0.4;
 /// Probability at which the user's message approves the proposed change.
 pub const approval_threshold = 0.8;
+/// Probability at which the request reports a bug (it then needs a
+/// regression test under TDD).
+pub const bug_threshold = 0.6;
 
 const base_questions = [_]jev_contract.Question{
     .{
@@ -76,6 +80,11 @@ const base_questions = [_]jev_contract.Question{
         .instructions = "`user_request` is specific enough to tell how much work it asks for",
         .kind = .noul,
     },
+    .{
+        .id = bug_id,
+        .instructions = "`user_request` reports behavior that is wrong and asks to fix it (a bug), rather than a copy, style, typo, or refactoring change",
+        .kind = .noul,
+    },
 };
 
 const approves_question = jev_contract.Question{
@@ -93,7 +102,7 @@ const rule_ids = blk: {
 const rule_instructions = blk: {
     var list: [Limits.max_rules][]const u8 = undefined;
     for (0..Limits.max_rules) |index| list[index] = std.fmt.comptimePrint(
-        "`user_request` changes the behavior that `rules[{d}]` describes (not merely code near it)",
+        "`user_request` asks for behavior different from what `rules[{d}]` says, so the rule text must change; fixing code to do what the rule already says does not count",
         .{index},
     );
     break :blk list;
@@ -168,6 +177,8 @@ pub const Verdict = struct {
     substantial: bool = false,
     /// The user's message approves the proposed change.
     approves: bool = false,
+    /// The request reports a bug.
+    bug: bool = false,
 };
 
 pub const EvaluateError = error{ IncompleteJevAnswer, OutOfMemory };
@@ -177,6 +188,7 @@ pub fn evaluate(arena: Allocator, response: *const jev_contract.Response, rule_c
     const high_stakes = response.noul(high_stakes_id) orelse return error.IncompleteJevAnswer;
     const skip = response.noul(skip_id) orelse return error.IncompleteJevAnswer;
     const clear = response.noul(clear_id) orelse return error.IncompleteJevAnswer;
+    const bug = response.noul(bug_id) orelse return error.IncompleteJevAnswer;
     const approves = if (with_proposal)
         (response.noul(approves_id) orelse return error.IncompleteJevAnswer) >= approval_threshold
     else
@@ -193,6 +205,7 @@ pub fn evaluate(arena: Allocator, response: *const jev_contract.Response, rule_c
         .high_stakes = high_stakes,
         .substantial = substantial,
         .approves = approves,
+        .bug = bug >= bug_threshold,
     };
     if (skip >= skip_threshold) return verdict;
     // A vague request is sent back before scope counts: "improve the page"
@@ -240,6 +253,17 @@ pub fn pendingReason(alloc: Allocator, proposal_file: []const u8) ![]u8 {
     );
 }
 
+/// Sent once when the user's reply approved the proposal. Caller owns the
+/// text.
+pub fn approvedNotice(alloc: Allocator, proposal_file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "SDD: the user's reply approved {s}/{s}; fx set its status to approved. Retry this change and implement it. " ++
+            "When every task is done, tell the user they can close it with /sdd done.",
+        .{ sdd_layout.changes_dir, proposal_file },
+    );
+}
+
 /// Guidance for a spec-route change (held once). Caller owns the text.
 pub fn specReason(alloc: Allocator, rules: []const sdd_layout.Rule, touched: []const usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -269,25 +293,25 @@ test "questions include one per rule and the approval question on demand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const without = try questions(arena.allocator(), 2, false);
-    try std.testing.expectEqual(@as(usize, 6), without.len);
-    try std.testing.expectEqualStrings("rule_1", without[5].id);
+    try std.testing.expectEqual(@as(usize, 7), without.len);
+    try std.testing.expectEqualStrings("rule_1", without[6].id);
     const with = try questions(arena.allocator(), 40, true);
-    try std.testing.expectEqual(@as(usize, 5 + Limits.max_rules), with.len);
-    try std.testing.expectEqualStrings(approves_id, with[4].id);
+    try std.testing.expectEqual(@as(usize, 6 + Limits.max_rules), with.len);
+    try std.testing.expectEqualStrings(approves_id, with[5].id);
 }
 
 test "evaluate routes high stakes to change and touched rules to spec" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var stakes = try testResponse(
-        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.8},"high_stakes":{"type":"noul","noul":0.9},"skip_process":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9},"rule_0":{"type":"noul","noul":0.9}}}
+        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.8},"high_stakes":{"type":"noul","noul":0.9},"skip_process":{"type":"noul","noul":0.1},"bug_fix":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9},"rule_0":{"type":"noul","noul":0.9}}}
     );
     defer stakes.deinit();
     const change = try evaluate(arena.allocator(), &stakes, 1, false);
     try std.testing.expectEqual(Route.change, change.route);
 
     var spec = try testResponse(
-        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.9},"high_stakes":{"type":"noul","noul":0.1},"skip_process":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9},"rule_0":{"type":"noul","noul":0.2},"rule_1":{"type":"noul","noul":0.8}}}
+        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.9},"high_stakes":{"type":"noul","noul":0.1},"skip_process":{"type":"noul","noul":0.1},"bug_fix":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9},"rule_0":{"type":"noul","noul":0.2},"rule_1":{"type":"noul","noul":0.8}}}
     );
     defer spec.deinit();
     const spec_verdict = try evaluate(arena.allocator(), &spec, 2, false);
@@ -299,13 +323,13 @@ test "evaluate honors skip, flags vague requests and needs every answer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var skip = try testResponse(
-        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"substantial","confidence":0.9},"high_stakes":{"type":"noul","noul":0.9},"skip_process":{"type":"noul","noul":0.9},"clear":{"type":"noul","noul":0.9}}}
+        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"substantial","confidence":0.9},"high_stakes":{"type":"noul","noul":0.9},"skip_process":{"type":"noul","noul":0.9},"bug_fix":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9}}}
     );
     defer skip.deinit();
     try std.testing.expectEqual(Route.fix, (try evaluate(arena.allocator(), &skip, 0, false)).route);
 
     var vague = try testResponse(
-        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.5},"high_stakes":{"type":"noul","noul":0.2},"skip_process":{"type":"noul","noul":0.0},"clear":{"type":"noul","noul":0.2},"approves_proposal":{"type":"noul","noul":0.95}}}
+        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.5},"high_stakes":{"type":"noul","noul":0.2},"skip_process":{"type":"noul","noul":0.0},"bug_fix":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.2},"approves_proposal":{"type":"noul","noul":0.95}}}
     );
     defer vague.deinit();
     const unclear = try evaluate(arena.allocator(), &vague, 0, true);
@@ -313,7 +337,7 @@ test "evaluate honors skip, flags vague requests and needs every answer" {
     try std.testing.expect(unclear.approves);
 
     var missing = try testResponse(
-        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.9},"high_stakes":{"type":"noul","noul":0.1},"skip_process":{"type":"noul","noul":0.0},"clear":{"type":"noul","noul":0.9}}}
+        \\{"model":"m","answers":{"scope":{"type":"choice","choice":"small","confidence":0.9},"high_stakes":{"type":"noul","noul":0.1},"skip_process":{"type":"noul","noul":0.0},"bug_fix":{"type":"noul","noul":0.1},"clear":{"type":"noul","noul":0.9}}}
     );
     defer missing.deinit();
     try std.testing.expectError(error.IncompleteJevAnswer, evaluate(arena.allocator(), &missing, 1, false));

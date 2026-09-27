@@ -34,6 +34,8 @@ pub const Change = struct {
     tasks_total: usize,
     /// Text after the front matter.
     body: []const u8,
+    /// `tdd: manual`: the change is checked in the running app, not by tests.
+    tdd_manual: bool = false,
 };
 
 pub const Rule = struct {
@@ -78,6 +80,7 @@ pub fn parseChange(file: []const u8, text: []const u8) Change {
         .tasks_done = 0,
         .tasks_total = 0,
         .body = front.body,
+        .tdd_manual = if (frontField(front.fields, "tdd")) |value| std.mem.eql(u8, value, "manual") else false,
     };
     var title_found = false;
     var lines = std.mem.splitScalar(u8, front.body, '\n');
@@ -360,6 +363,9 @@ test "parseChange reads status, title and task progress" {
     try std.testing.expectEqualStrings("Boletos desde PDF", change.title);
     try std.testing.expectEqual(@as(usize, 2), change.tasks_done);
     try std.testing.expectEqual(@as(usize, 3), change.tasks_total);
+
+    try std.testing.expect(!change.tdd_manual);
+    try std.testing.expect(parseChange("m.md", "---\nstatus: approved\ntdd: manual\n---\n").tdd_manual);
 
     const bare = parseChange("x.md", "no front matter");
     try std.testing.expect(bare.status == null);

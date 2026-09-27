@@ -1084,13 +1084,25 @@ pub fn setWorkspaceSdd(
     workspace_root: []const u8,
     enabled: bool,
 ) !CommitOutcome {
+    return mutateWorkspaceSdd(alloc, .{ .workspace_root = workspace_root, .enabled = enabled });
+}
+
+/// Saves `workspaces["<workspace_root>"].sdd.tdd` in the profile settings.
+pub fn setWorkspaceTdd(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    tdd: []const u8,
+) !CommitOutcome {
+    return mutateWorkspaceSdd(alloc, .{ .workspace_root = workspace_root, .tdd = tdd });
+}
+
+fn mutateWorkspaceSdd(alloc: Allocator, mutation: settings_store.WorkspaceSddMutation) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
-    return store.applyWorkspaceSddPatch(alloc, .{
-        .workspace_root = normalizeWorkspaceRoot(workspace_root),
-        .enabled = enabled,
-    });
+    var normalized = mutation;
+    normalized.workspace_root = normalizeWorkspaceRoot(mutation.workspace_root);
+    return store.applyWorkspaceSddPatch(alloc, normalized);
 }
 
 pub fn setUserPreferences(

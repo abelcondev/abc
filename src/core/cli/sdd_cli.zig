@@ -3,7 +3,8 @@
 //! `fx sdd` prints the status; `on`/`off` persist
 //! `workspaces["<root>"].sdd.enabled` in the profile settings; `new <slug>`
 //! writes `sdd/changes/<date>-<slug>.md`; `approve` and `done` set a change's
-//! status. `/sdd` in a session accepts the same subcommands.
+//! status; `tdd off|on|strict` saves `workspaces["<root>"].sdd.tdd`. `/sdd`
+//! in a session accepts the same subcommands.
 
 const std = @import("std");
 const sdd_mode = @import("../sdd/sdd_mode.zig");
@@ -14,14 +15,14 @@ const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Action = enum { status, on, off, new, approve, done };
+pub const Action = enum { status, on, off, new, approve, done, tdd };
 
-pub const usage = "usage: fx sdd [on|off|new <slug>|approve [<change>]|done [<change>]]\n";
-pub const slash_usage = "usage: /sdd [on|off|new <slug>|approve [<change>]|done [<change>]]";
+pub const usage = "usage: fx sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|on|strict]\n";
+pub const slash_usage = "usage: /sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|on|strict]";
 
 pub const Parsed = struct {
     action: Action,
-    /// Slug for `new`, change name for `approve` and `done`.
+    /// Slug for `new`, change name for `approve` and `done`, mode for `tdd`.
     name: ?[]const u8 = null,
 };
 
@@ -32,6 +33,10 @@ pub fn parseWords(words: []const []const u8) ?Parsed {
         .status => return null,
         .on, .off => return if (words.len == 1) .{ .action = action } else null,
         .new => return if (words.len == 2) .{ .action = .new, .name = words[1] } else null,
+        .tdd => {
+            if (words.len != 2 or std.meta.stringToEnum(sdd_mode.Tdd, words[1]) == null) return null;
+            return .{ .action = .tdd, .name = words[1] };
+        },
         .approve, .done => return switch (words.len) {
             1 => .{ .action = action },
             2 => .{ .action = action, .name = words[1] },
@@ -71,6 +76,8 @@ pub const StatusContext = struct {
     spec_count: usize = 0,
     rule_count: usize = 0,
     changes: []const sdd_layout.Change = &.{},
+    /// Rules cited by a `spec: <spec> › <rule>` line somewhere in the repo.
+    cited_rules: usize = 0,
     /// How the reader turns SDD on (`fx sdd on` or `/sdd on`).
     enable_command: []const u8,
 };
@@ -100,6 +107,12 @@ pub fn renderStatus(alloc: Allocator, mode: sdd_mode.Mode, context: StatusContex
         });
     }
     if (active == 0) try w.writeAll("  changes    none open\n");
+    try w.print("  tdd        {s}", .{@tagName(mode.tdd)});
+    if (mode.tdd != .off) {
+        if (mode.testCommand()) |command| try w.print(" (tests: {s} or a common runner)", .{command}) else try w.writeAll(" (tests: common runners)");
+    }
+    try w.writeByte('\n');
+    if (context.rule_count != 0) try w.print("  coverage   {d}/{d} rule(s) cited by a test (`spec: <spec> › <rule>`)\n", .{ context.cited_rules, context.rule_count });
 
     try w.writeAll("  checks     ");
     if (!mode.enabled) {
@@ -115,6 +128,11 @@ pub fn renderStatus(alloc: Allocator, mode: sdd_mode.Mode, context: StatusContex
         if (context.drift_gate and context.records_dir != null) {
             if (any) try w.writeAll("             ");
             try w.writeAll("rules the turn's changes contradict\n");
+            any = true;
+        }
+        if (context.sdd_gate and mode.tdd != .off) {
+            if (any) try w.writeAll("             ");
+            try w.writeAll(if (mode.tdd == .strict) "test-first behavior changes; every changed rule cited by a test\n" else "test-first behavior changes and bug fixes\n");
             any = true;
         }
         if (!any) try w.writeAll("none; the Jev sdd and drift gates are off\n");
@@ -151,8 +169,21 @@ pub fn statusFor(alloc: Allocator, workspace_root: []const u8, enable_command: [
         context.spec_count = try sdd_layout.countSpecs(arena, root);
         context.rule_count = (try sdd_layout.listRules(arena, root)).len;
         context.changes = try sdd_layout.listChanges(arena, root);
+        const rules = try sdd_layout.listRules(arena, root);
+        const citations = citationLines(arena, workspace_root);
+        for (rules) |rule| {
+            if (std.mem.find(u8, citations, rule.title) != null) context.cited_rules += 1;
+        }
     } else |_| {}
     return renderStatus(alloc, sdd_mode.load(alloc, workspace_root), context);
+}
+
+fn citationLines(arena: Allocator, workspace_root: []const u8) []const u8 {
+    const result = std.process.run(arena, io_mod.getIo(), .{
+        .argv = &.{ "git", "grep", "-h", "-I", "-F", "-e", "spec:", "--", ".", ":(exclude)" ++ sdd_layout.root_dir },
+        .cwd = .{ .path = workspace_root },
+    }) catch return "";
+    return result.stdout;
 }
 
 /// Confirmation after saving the workspace setting. `effective` is the mode
@@ -202,7 +233,7 @@ pub fn applyChangeAction(alloc: Allocator, root: std.Io.Dir, parsed: Parsed) !Ou
                 .not_found => return .{ .ok = false, .text = try std.fmt.allocPrint(alloc, "No change named {s} in " ++ sdd_layout.changes_dir ++ ".\n", .{parsed.name.?}) },
             }
         },
-        .status, .on, .off => unreachable,
+        .status, .on, .off, .tdd => unreachable,
     }
 }
 
@@ -219,6 +250,9 @@ test "parseAction accepts the documented subcommands" {
     try std.testing.expect(parseAction(&.{ "on", "now" }) == null);
     try std.testing.expectEqual(Action.approve, parseSlash("  approve  ").?.action);
     try std.testing.expect(parseSlash("new a b") == null);
+    try std.testing.expectEqualStrings("strict", parseSlash("tdd strict").?.name.?);
+    try std.testing.expect(parseSlash("tdd sometimes") == null);
+    try std.testing.expect(parseSlash("tdd") == null);
 }
 
 test "renderStatus lists open changes and explains the checks" {
