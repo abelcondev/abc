@@ -111,6 +111,9 @@ fx jev           # show status
 fx jev off
 ```
 
+Inside a session, `/jev` shows the status and `/jev on` or `/jev off` switches
+it for the current session and saves the choice.
+
 **Plan before changes.** Before the first file change (`write_file` or
 `edit_file`) of a turn, Jev rates how substantial the request is. Trivial and
 small requests pass. For a substantial one, the change is held until the
