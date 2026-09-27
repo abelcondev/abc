@@ -15,9 +15,9 @@
 //! The completion gate runs on `Stop`. It sends the agent back once when Jev
 //! cannot confirm the final answer is backed by the turn's tool results.
 //! When the work passes and the turn changed files in a workspace with
-//! decision records, the drift check flags records the uncommitted changes
-//! contradict and asks the agent to update them (each record once per
-//! process).
+//! decision records and SDD on (`fx sdd on`), the drift check flags records
+//! the uncommitted changes contradict and asks the agent to update them
+//! (each record once per process).
 //!
 //! Gates run for root interactive and `fx ask` turns only. When Jev is
 //! unreachable, has no key, or answers incompletely, the call or turn goes
@@ -38,6 +38,7 @@ const ask_gate = @import("ask_gate.zig");
 const routing = @import("routing.zig");
 const drift = @import("drift.zig");
 const decision_log = @import("decision_log.zig");
+const sdd_mode = @import("../sdd/sdd_mode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -397,7 +398,9 @@ pub const Gate = struct {
             },
             .passed => {
                 decision_log.append(self.alloc, entry);
-                if (self.config.drift_gate and changedFiles(input.turn_messages)) {
+                if (self.config.drift_gate and changedFiles(input.turn_messages) and
+                    sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
+                {
                     return self.checkDrift(input) catch |err| {
                         debug_trace.logf("jev", "drift check failed err={s}", .{@errorName(err)});
                         return .allow;
