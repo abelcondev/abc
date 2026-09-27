@@ -1,8 +1,32 @@
 # fx
 
-## 0.0.11
+## 0.2.0
 
 <!-- release:start -->
+
+**This fork is `fx` again, and Jev now checks the agent's decisions: plans before large changes, verified answers, settled questions, subagent routing and decision records that stay in sync with the code.**
+
+### Breaking Changes
+
+- **Name:** The binary, profile and variables are `fx`, `~/.fx`, `.fx.json` and `FX_*` again. Move `~/.abc` to `~/.fx`; keys saved under the old name move automatically the first time they are used. `abc update` cannot install this release; reinstall with the install script.
+
+### New Features
+
+- **Jev decisions:** `fx jev key`, `fx jev on` and `fx jev check` connect Jev, TypeSafe AI's decision model. `/jev` shows or switches it inside a session.
+- **Completion check:** Before a turn ends, Jev checks that the final answer is backed by the turn's tool results; otherwise the agent verifies before answering again.
+- **Plan before changes:** The first file change of a substantial request waits until the agent states a plan that covers it.
+- **Settled questions:** Jev answers the agent's multiple-choice questions only when the request or the agent's findings already settle them.
+- **Living decision records:** `fx jev drift` flags decision records a diff contradicts, and after each turn that changes files the agent is asked to update the records it made out of date.
+- **Subagent routing:** `jev.routing` lets Jev pick a model for each temporary subagent.
+- **Action check:** Optional `gates.action` holds file changes and commands that look off-task or damaging in ways the user did not ask for.
+- **Calibration:** `fx jev eval` runs labeled cases through the same checks to confirm thresholds and models.
+
+### Bug Fixes
+
+- **Subagent results:** Subagents no longer return an empty result when a completion hook is active.
+<!-- release:end -->
+
+## 0.0.11
 
 **fx now supports custom model connections and themes. Resume, file lookup and request handling are up to 100× faster, long turns use 17× less memory, and libfx adds steering, images, web search and model controls.**
 
@@ -64,7 +88,6 @@
 - **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
 - **Safe tool errors:** Tool failure details now redact secrets and escape terminal control sequences before rendering.
 
-<!-- release:end -->
 
 ## 0.0.10
 
