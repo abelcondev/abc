@@ -7,8 +7,12 @@
 //!
 //! ```json
 //! "sdd": { "enabled": false },
-//! "workspaces": { "/path/to/repo": { "sdd": { "enabled": true } } }
+//! "workspaces": { "/path/to/repo": { "sdd": { "enabled": true, "tdd": "on", "test": "bun test" } } }
 //! ```
+//!
+//! `tdd` (`off`, `on` or `strict`) and `test` (the project's test command,
+//! used besides the common runners fx recognizes) resolve the same way,
+//! workspace first, without the environment override.
 //!
 //! While SDD is off, fx does not check decision records after a turn;
 //! `fx jev drift` still runs on demand.
@@ -39,28 +43,75 @@ pub const Source = enum {
     }
 };
 
+pub const Tdd = enum { off, on, strict };
+
+pub const max_test_command_bytes = 256;
+
 pub const Mode = struct {
     enabled: bool = false,
     source: Source = .default,
+    tdd: Tdd = .off,
+    test_command_buf: [max_test_command_bytes]u8 = undefined,
+    test_command_len: usize = 0,
+
+    /// The configured test command, if any.
+    pub fn testCommand(self: *const Mode) ?[]const u8 {
+        return if (self.test_command_len == 0) null else self.test_command_buf[0..self.test_command_len];
+    }
 };
 
 /// Resolves the mode from parsed profile settings (null when absent or
 /// unreadable) and the raw `FX_SDD` value.
 pub fn resolve(settings: ?std.json.Value, workspace_root: []const u8, env: ?[]const u8) Mode {
-    if (env) |raw| {
-        if (parseSwitch(std.mem.trim(u8, raw, " \t\r\n"))) |enabled| return .{ .enabled = enabled, .source = .environment };
+    var mode = Mode{};
+    const root: ?std.json.Value = if (settings) |value| (if (value == .object) value else null) else null;
+    const workspace: ?std.json.Value = blk: {
+        const value = root orelse break :blk null;
+        const workspaces = value.object.get("workspaces") orelse break :blk null;
+        if (workspaces != .object) break :blk null;
+        break :blk workspaces.object.get(trimTrailingSlashes(workspace_root));
+    };
+    if (workspace) |value| {
+        if (enabledField(value)) |enabled| {
+            mode.enabled = enabled;
+            mode.source = .workspace;
+        }
     }
-    const root = settings orelse return .{};
-    if (root != .object) return .{};
-    if (root.object.get("workspaces")) |workspaces| {
-        if (workspaces == .object) {
-            if (workspaces.object.get(trimTrailingSlashes(workspace_root))) |workspace| {
-                if (enabledField(workspace)) |enabled| return .{ .enabled = enabled, .source = .workspace };
+    if (mode.source == .default) {
+        if (root) |value| {
+            if (enabledField(value)) |enabled| {
+                mode.enabled = enabled;
+                mode.source = .profile;
             }
         }
     }
-    if (enabledField(root)) |enabled| return .{ .enabled = enabled, .source = .profile };
-    return .{};
+    if (env) |raw| {
+        if (parseSwitch(std.mem.trim(u8, raw, " \t\r\n"))) |enabled| {
+            mode.enabled = enabled;
+            mode.source = .environment;
+        }
+    }
+    const tdd = (if (workspace) |value| sddString(value, "tdd") else null) orelse
+        (if (root) |value| sddString(value, "tdd") else null);
+    if (tdd) |text| mode.tdd = std.meta.stringToEnum(Tdd, text) orelse .off;
+    const command = (if (workspace) |value| sddString(value, "test") else null) orelse
+        (if (root) |value| sddString(value, "test") else null);
+    if (command) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len != 0 and trimmed.len <= max_test_command_bytes) {
+            @memcpy(mode.test_command_buf[0..trimmed.len], trimmed);
+            mode.test_command_len = trimmed.len;
+        }
+    }
+    return mode;
+}
+
+fn sddString(container: std.json.Value, name: []const u8) ?[]const u8 {
+    if (container != .object) return null;
+    const sdd = container.object.get("sdd") orelse return null;
+    if (sdd != .object) return null;
+    const value = sdd.object.get(name) orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 /// Loads the mode for `workspace_root`. Missing or unreadable settings mean
@@ -136,6 +187,20 @@ test "FX_SDD overrides settings and ignores unknown values" {
     const unknown = resolve(parsed.value, "/repo", "maybe");
     try std.testing.expect(unknown.enabled);
     try std.testing.expectEqual(Source.workspace, unknown.source);
+}
+
+test "tdd mode and test command resolve workspace first" {
+    var parsed = try parseForTest(
+        \\{"sdd":{"tdd":"strict","test":"make test"},"workspaces":{"/repo":{"sdd":{"enabled":true,"tdd":"on"}},"/other":{"sdd":{"tdd":"sometimes"}}}}
+    );
+    defer parsed.deinit();
+    const repo = resolve(parsed.value, "/repo", "off");
+    try std.testing.expect(!repo.enabled);
+    try std.testing.expectEqual(Tdd.on, repo.tdd);
+    try std.testing.expectEqualStrings("make test", repo.testCommand().?);
+    const other = resolve(parsed.value, "/other", null);
+    try std.testing.expectEqual(Tdd.off, other.tdd);
+    try std.testing.expect(resolve(null, "/repo", null).testCommand() == null);
 }
 
 test "mistyped sdd settings fall back to the next layer" {

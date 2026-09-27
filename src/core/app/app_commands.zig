@@ -4007,6 +4007,18 @@ fn handleSddCommand(app: anytype, rest: []const u8) !void {
             const body = std.mem.trimEnd(u8, sdd_cli.savedMessage(enable, effective), "\n");
             try app.writeDomainNotice(.{ .topic = "sdd", .tone = .success, .body = body }, true);
         },
+        .tdd => {
+            var outcome = config_runtime.setWorkspaceTdd(app.alloc, workspace_root, parsed.name.?) catch |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "Could not save SDD settings: {s}", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            outcome.deinit(app.alloc);
+            const body = try std.fmt.allocPrint(app.alloc, "TDD is {s} for this workspace.", .{parsed.name.?});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "sdd", .tone = .success, .body = body }, true);
+        },
         .new, .approve, .done => {
             const io = io_mod.getIo();
             var root = std.Io.Dir.cwd().openDir(io, workspace_root, .{}) catch |err| {
