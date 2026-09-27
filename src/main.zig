@@ -4396,6 +4396,8 @@ test {
     _ = @import("core/cli/jev_cli.zig");
     _ = @import("core/cli/sdd_cli.zig");
     _ = @import("core/sdd/sdd_mode.zig");
+    _ = @import("core/sdd/sdd_layout.zig");
+    _ = @import("core/decisions/sdd_gate.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");

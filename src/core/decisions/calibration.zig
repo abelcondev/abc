@@ -15,11 +15,13 @@ const plan_gate = @import("plan_gate.zig");
 const action_gate = @import("action_gate.zig");
 const ask_gate = @import("ask_gate.zig");
 const routing = @import("routing.zig");
+const sdd_gate = @import("sdd_gate.zig");
+const sdd_layout = @import("../sdd/sdd_layout.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd };
 
 const Case = struct {
     gate: Gate,
@@ -32,6 +34,10 @@ const Case = struct {
     assistant_text: []const u8 = "",
     tool: []const u8 = "",
     arguments: []const u8 = "{}",
+    /// SDD rules the request is checked against.
+    rules: []const sdd_layout.Rule = &.{},
+    /// SDD change waiting for approval.
+    proposal: ?[]const u8 = null,
 };
 
 fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: []const u8, comptime status: types.PersistedToolStatus, comptime output: []const u8) [2]ChatMessage {
@@ -53,6 +59,15 @@ const built_and_tested = toolTurn("c1", "write_file", "{\"path\":\"todo.py\"}", 
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
+
+// Rules and requests adapted from a real booking app run with SDD.
+const reservas_rules = [_]sdd_layout.Rule{
+    .{ .capability = "reservas", .title = "Reservas list columns", .body = "The /reservas table shows, in this order: Referencia, Categoría, Fechas, Nombre, Pax, WhatsApp, Grupo, País, Estado, Asesor, Saldo, Ministerio." },
+    .{ .capability = "reservas", .title = "Saldo is the outstanding balance", .body = "Saldo = booking amount minus the total of non-deleted payments, right-aligned with its currency." },
+    .{ .capability = "chat", .title = "Dictation never sends by itself", .body = "Dictated text lands in the composer; only the user sends it." },
+    .{ .capability = "ministerio", .title = "Boletos from a PDF are read-only", .body = "A boleto linked to a PDF attachment shows Ver PDF and cannot be edited; manual boletos stay editable." },
+};
+const pagos_proposal = "# Pagos parciales\n\n## Why\nAgencies collect in installments.\n\n## What\n- New payment_plans table with installments per booking\n- A Plan de pagos panel in the booking detail\n\n## Tasks\n- [ ] Schema\n- [ ] Panel";
 
 pub const cases = [_]Case{
     // Completion gate.
@@ -96,6 +111,18 @@ pub const cases = [_]Case{
     .{ .gate = .routing, .name = "rename variable", .expect = "light", .user_request = "Rename the variable foo to bar in utils.py" },
     .{ .gate = .routing, .name = "debug leak", .expect = "heavy", .user_request = "Debug why the websocket reconnect loop leaks memory under load and propose a fix" },
     .{ .gate = .routing, .name = "design cache", .expect = "heavy", .user_request = "Design and implement a caching layer for the API client with invalidation and tests" },
+
+    // SDD route gate.
+    .{ .gate = .sdd, .name = "typo", .expect = "fix", .user_request = "Fix the typo 'Resrvas' in the reservas page title", .tool = "edit_file", .arguments = "{\"path\":\"src/routes/reservas.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "restore documented alignment", .expect = "fix", .user_request = "The Saldo column is left-aligned by mistake; align it right like the rule says", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/ReservasList.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "reorder columns", .expect = "spec", .user_request = "Move the Saldo column so it comes right before Asesor in the reservas table", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/ReservasList.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "flip dictation behavior", .expect = "spec", .user_request = "Make dictation send the chat message automatically when I stop talking", .tool = "edit_file", .arguments = "{\"path\":\"src/components/chat/Composer.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "partial payments feature", .expect = "change", .user_request = "Add partial payments: a new payment_plans table with installments and a screen to manage them per booking", .tool = "write_file", .arguments = "{\"path\":\"src/components/booking/PaymentPlan.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "agent reads vouchers", .expect = "change", .user_request = "Let Mimi, the booking AI agent, read hotel vouchers from PDFs dropped in the chat and create the hotel reservations", .tool = "edit_file", .arguments = "{\"path\":\"src/mimi/Mimi.ts\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "user skips the process", .expect = "fix", .user_request = "Rename the label 'Cód. reserva' to 'Código' in the Ministerio grid. Es un fix chico, no hagas propuesta.", .tool = "edit_file", .arguments = "{\"path\":\"src/components/tickets/MinisterioWorklist.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "vague request", .expect = "unclear", .user_request = "mejora la página", .tool = "edit_file", .arguments = "{\"path\":\"src/routes/index.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "user approves proposal", .expect = "approved", .user_request = "sí, dale, aprobado", .tool = "write_file", .arguments = "{\"path\":\"db/payment_plans.ts\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
+    .{ .gate = .sdd, .name = "user asks to change proposal", .expect = "change", .user_request = "No, instead of a new table store the installments as a JSON field on bookings", .tool = "write_file", .arguments = "{\"path\":\"db/payment_plans.ts\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
 };
 
 pub const Result = struct {
@@ -141,6 +168,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = try routing.questions(arena, &eval_routes);
             state = try routing.buildState(arena, case.user_request);
         },
+        .sdd => {
+            questions = try sdd_gate.questions(arena, case.rules.len, case.proposal != null);
+            state = try sdd_gate.buildState(arena, sddInput(case));
+        },
     }
 
     var response = typesafe.systemOne(arena, .{
@@ -158,6 +189,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         .action => if (action_gate.evaluate(&response, config.action_threshold)) |v| @tagName(v) else |err| @errorName(err),
         .ask => if (ask_gate.evaluate(arena, ask_parsed.?, &response, config.ask_threshold)) |v| @tagName(v) else |err| @errorName(err),
         .routing => if (routing.pick(&eval_routes, &response)) |route| route.name else "no_route",
+        .sdd => if (sdd_gate.evaluate(arena, &response, case.rules.len, case.proposal != null)) |v|
+            (if (v.approves) "approved" else @tagName(v.route))
+        else |err|
+            @errorName(err),
     };
     return .{
         .gate = case.gate,
@@ -166,6 +201,18 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         .actual = try arena.dupe(u8, actual),
         .passed = std.mem.eql(u8, actual, case.expect),
         .answers = try summarize(arena, &response),
+    };
+}
+
+fn sddInput(case: Case) sdd_gate.Input {
+    return .{
+        .user_request = case.user_request,
+        .turn_messages = case.messages,
+        .assistant_text = case.assistant_text,
+        .tool_name = case.tool,
+        .arguments_json = case.arguments,
+        .rules = case.rules,
+        .proposal = case.proposal,
     };
 }
 
@@ -196,6 +243,10 @@ test "every calibration case builds a valid request without calling Jev" {
         if (case.gate == .ask) try std.testing.expect((try ask_gate.parse(arena, case.arguments)) != null);
         if (case.gate == .stop) {
             const state = try completion_gate.buildState(arena, .{ .user_request = case.user_request, .final_message = case.final_message, .turn_messages = case.messages });
+            _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, state, .{});
+        }
+        if (case.gate == .sdd) {
+            const state = try sdd_gate.buildState(arena, sddInput(case));
             _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, state, .{});
         }
     }

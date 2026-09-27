@@ -42,7 +42,6 @@ const jev_cli = @import("../cli/jev_cli.zig");
 const jev_config = @import("../decisions/jev_config.zig");
 const sdd_cli = @import("../cli/sdd_cli.zig");
 const sdd_mode = @import("../sdd/sdd_mode.zig");
-const drift = @import("../decisions/drift.zig");
 const provider_keys = @import("../auth/provider_keys.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -3976,10 +3975,11 @@ fn handleJevCommand(app: anytype, rest: []const u8) !void {
 }
 
 /// `/sdd` shows the workspace's SDD status; `/sdd on|off` saves
-/// `workspaces["<root>"].sdd.enabled`, which applies from the next turn.
+/// `workspaces["<root>"].sdd.enabled`, which applies from the next turn;
+/// `new`, `approve` and `done` manage change files.
 fn handleSddCommand(app: anytype, rest: []const u8) !void {
-    const command = parseJevCommand(rest) orelse {
-        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /sdd [on|off]" }, true);
+    const parsed = sdd_cli.parseSlash(rest) orelse {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = sdd_cli.slash_usage }, true);
         return;
     };
     const workspace_root: []const u8 = if (comptime @hasField(@TypeOf(app.*), "workspace_root")) app.workspace_root else "";
@@ -3987,34 +3987,49 @@ fn handleSddCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = "No workspace is open." }, true);
         return;
     }
-    if (command == .status) {
-        var config = try jev_config.load(app.alloc);
-        defer config.deinit(app.alloc);
-        var root = std.Io.Dir.cwd().openDir(io_mod.getIo(), workspace_root, .{}) catch null;
-        defer if (root) |*dir| dir.close(io_mod.getIo());
-        const text = try sdd_cli.renderStatus(app.alloc, sdd_mode.load(app.alloc, workspace_root), .{
-            .workspace_root = workspace_root,
-            .records_dir = if (root) |dir| drift.findDir(dir) else null,
-            .jev_enabled = config.enabled,
-            .drift_gate = config.drift_gate,
-            .enable_command = "/sdd on",
-        });
-        defer app.alloc.free(text);
-        try app.writeDomainNotice(.{ .topic = "sdd", .tone = .information, .body = std.mem.trimEnd(u8, text, "\n") }, true);
-        return;
+    switch (parsed.action) {
+        .status => {
+            const text = try sdd_cli.statusFor(app.alloc, workspace_root, "/sdd on");
+            defer app.alloc.free(text);
+            try app.writeDomainNotice(.{ .topic = "sdd", .tone = .information, .body = std.mem.trimEnd(u8, text, "\n") }, true);
+        },
+        .on, .off => {
+            const enable = parsed.action == .on;
+            var outcome = config_runtime.setWorkspaceSdd(app.alloc, workspace_root, enable) catch |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "Could not save SDD settings: {s}", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            outcome.deinit(app.alloc);
+            const effective = sdd_mode.load(app.alloc, workspace_root);
+            if (comptime @hasField(@TypeOf(app.*), "sdd_enabled")) app.sdd_enabled = effective.enabled;
+            const body = std.mem.trimEnd(u8, sdd_cli.savedMessage(enable, effective), "\n");
+            try app.writeDomainNotice(.{ .topic = "sdd", .tone = .success, .body = body }, true);
+        },
+        .new, .approve, .done => {
+            const io = io_mod.getIo();
+            var root = std.Io.Dir.cwd().openDir(io, workspace_root, .{}) catch |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "Could not open the workspace: {s}", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            defer root.close(io);
+            const outcome = sdd_cli.applyChangeAction(app.alloc, root, parsed) catch |err| {
+                const body = try std.fmt.allocPrint(app.alloc, "SDD: {s}", .{@errorName(err)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            defer app.alloc.free(outcome.text);
+            try app.writeDomainNotice(.{
+                .topic = "sdd",
+                .tone = if (outcome.ok) .success else .@"error",
+                .body = std.mem.trimEnd(u8, outcome.text, "\n"),
+            }, true);
+        },
     }
-    const enable = command == .on;
-    var outcome = config_runtime.setWorkspaceSdd(app.alloc, workspace_root, enable) catch |err| {
-        const body = try std.fmt.allocPrint(app.alloc, "Could not save SDD settings: {s}", .{@errorName(err)});
-        defer app.alloc.free(body);
-        try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
-        return;
-    };
-    outcome.deinit(app.alloc);
-    const effective = sdd_mode.load(app.alloc, workspace_root);
-    if (comptime @hasField(@TypeOf(app.*), "sdd_enabled")) app.sdd_enabled = effective.enabled;
-    const body = std.mem.trimEnd(u8, sdd_cli.savedMessage(enable, effective), "\n");
-    try app.writeDomainNotice(.{ .topic = "sdd", .tone = .success, .body = body }, true);
 }
 
 test "parseJevCommand accepts status, on and off" {

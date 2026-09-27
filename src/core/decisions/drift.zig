@@ -12,6 +12,7 @@ const jev_contract = @import("jev_contract.zig");
 const turn_text = @import("turn_text.zig");
 const io_mod = @import("../shared/io.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
+const sdd_layout = @import("../sdd/sdd_layout.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -79,6 +80,17 @@ fn field(line: []const u8, comptime name: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, name ++ ":")) return null;
     const value = std.mem.trim(u8, line[name.len + 1 ..], " \t\r\"'");
     return if (value.len == 0) null else value;
+}
+
+/// A spec rule checked like a decision record.
+pub fn ruleDecision(file: []const u8, rule: sdd_layout.Rule) Decision {
+    return .{
+        .file = file,
+        .title = rule.title,
+        .status = "",
+        .summary = turn_text.clip(rule.body, Limits.summary_bytes),
+        .body = turn_text.clip(rule.body, Limits.body_bytes),
+    };
 }
 
 /// Whether the decision still binds the code (superseded or rejected ones
@@ -182,7 +194,7 @@ pub fn contradiction(response: *const jev_contract.Response, index: usize) ?f64 
     return response.noul(contradicts_ids[index]);
 }
 
-pub const default_dirs = [_][]const u8{ "sdd/decisions", "docs/decisions", "docs/adr", "decisions" };
+pub const default_dirs = [_][]const u8{ sdd_layout.specs_dir, "sdd/decisions", "docs/decisions", "docs/adr", "decisions" };
 
 pub const Jev = struct {
     base_url: []const u8,
@@ -237,17 +249,28 @@ pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u
         try names.append(arena, try arena.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
+    // In `sdd/specs` every `## ` rule is checked on its own.
+    const rules_mode = std.mem.eql(u8, dir_path, sdd_layout.specs_dir);
     var decisions: std.ArrayList(Decision) = .empty;
     for (names.items) |name| {
         if (decisions.items.len == Limits.max_decisions) break;
         const text = dir.readFileAlloc(io, name, arena, .limited(Limits.decision_bytes)) catch continue;
+        if (rules_mode) {
+            for (try sdd_layout.parseRules(arena, std.mem.trimEnd(u8, name, ".md"), text)) |rule| {
+                if (decisions.items.len == Limits.max_decisions) break;
+                try decisions.append(arena, ruleDecision(name, rule));
+            }
+            continue;
+        }
         const decision = parseDecision(name, text);
         if (isActive(decision)) try decisions.append(arena, decision);
     }
     var report = Report{ .dir = dir_path, .decision_count = decisions.items.len, .diff_bytes = 0, .findings = &.{} };
     if (decisions.items.len == 0) return report;
 
-    const exclude = try std.fmt.allocPrint(arena, ":(exclude){s}", .{dir_path});
+    // Change files and specs are not code; leave the whole `sdd/` tree out.
+    const excluded = if (std.mem.startsWith(u8, dir_path, sdd_layout.root_dir ++ "/")) sdd_layout.root_dir else dir_path;
+    const exclude = try std.fmt.allocPrint(arena, ":(exclude){s}", .{excluded});
     const git = try std.process.run(arena, io, .{
         .argv = &.{ "git", "diff", "--no-color", "--no-ext-diff", range, "--", ".", exclude },
         .cwd = .{ .path = root_path },
@@ -303,6 +326,16 @@ pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
+    if (std.mem.eql(u8, dir, sdd_layout.specs_dir)) {
+        try w.writeAll("Jev spec check: the changes in this turn may contradict these spec rules:\n");
+        for (stale) |finding| try w.print("- {s}/{s} › {s} (p={d:.2})\n", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
+        try w.writeAll(
+            "Read each rule. If the change is intended, rewrite the rule under its `## ` heading so it describes the " ++
+                "behavior as it is now (a spec holds only current behavior, not history). If the change was a mistake, " ++
+                "fix the code instead. Then give your final answer, mentioning which rules you updated.",
+        );
+        return out.toOwnedSlice();
+    }
     try w.writeAll("Jev spec check: the changes in this turn may contradict these decision records:\n");
     for (stale) |finding| try w.print("- {s}/{s} \"{s}\" (p={d:.2})\n", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
     try w.writeAll(
@@ -311,6 +344,19 @@ pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8
             "Then give your final answer, mentioning which records you updated.",
     );
     return out.toOwnedSlice();
+}
+
+test "spec rules are checked one by one and reported by rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rules = try sdd_layout.parseRules(arena.allocator(), "reservas", "## Saldo follows Asesor\nSaldo comes after Asesor.\n");
+    const decision = ruleDecision("reservas.md", rules[0]);
+    try std.testing.expectEqualStrings("Saldo follows Asesor", decision.title);
+    try std.testing.expect(isActive(decision));
+    const text = try feedback(std.testing.allocator, sdd_layout.specs_dir, &.{.{ .decision = decision, .touched = 0.9, .contradiction = 0.8, .stale = true }});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "- sdd/specs/reservas.md › Saldo follows Asesor (p=0.80)") != null);
+    try std.testing.expect(std.mem.find(u8, text, "spec rules") != null);
 }
 
 test "parseDecision reads front matter and falls back to headings" {

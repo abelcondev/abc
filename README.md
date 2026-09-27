@@ -159,14 +159,15 @@ reasons and is asked to verify before answering again. Questions, small talk
 and answers that report a blocker or ask the user pass through. If Jev is
 unreachable or has no key, the turn finishes normally.
 
-`fx jev eval [stop|plan|action|ask|routing]` runs labeled cases through the
+`fx jev eval [stop|plan|action|ask|routing|sdd]` runs labeled cases through the
 same questions, code and thresholds as the live gates and prints each answer,
 so threshold or model changes can be checked before use.
 
 **Spec drift.** `fx jev drift [<git-range>] [--dir <path>]` checks a diff
 (default: uncommitted changes) against the project's decision records
-(`sdd/decisions`, `docs/decisions`, `docs/adr` or `decisions`, one Markdown file
-each, front matter `title`/`status`/`description` optional). Jev first picks
+(`sdd/specs`, where each `## ` rule is checked on its own, or `sdd/decisions`,
+`docs/decisions`, `docs/adr` or `decisions`, one Markdown file each, front
+matter `title`/`status`/`description` optional). Jev first picks
 the decisions the diff touches, then reads them and flags the ones the change
 contradicts. It exits non-zero when any decision may be out of date, so it can
 run in CI.
@@ -190,6 +191,7 @@ files cannot set them.
 | `gates.ask` | Let Jev answer questions the context already settles (default `true`) |
 | `gates.plan` | Require a plan before changes on substantial requests (default `true`) |
 | `gates.drift` | Flag decision records a turn's changes contradict (default `true`) |
+| `gates.sdd` | With SDD on, route the first file change to fix, spec or change (default `true`) |
 | `gates.action` | Check file changes and shell commands (default `false`) |
 | `gates.stop` | Run the completion check (default `true`) |
 | `thresholds.ask` | Minimum confidence and grounding for answering (default `0.8`) |
@@ -207,18 +209,65 @@ SDD is fx's spec-driven development process. It is off by default, so fx works
 freely in every workspace until you turn it on for one:
 
 ```bash
-fx sdd           # show the status for the current workspace
-fx sdd on        # turn it on here (writes workspaces["<path>"].sdd.enabled)
+fx sdd                   # status: specs, open changes and the checks that run
+fx sdd on                # turn it on here (writes workspaces["<path>"].sdd.enabled)
 fx sdd off
+fx sdd new <slug>        # write sdd/changes/<yyyy-mm-dd>-<slug>.md (proposed)
+fx sdd approve [<name>]  # proposed -> approved
+fx sdd done [<name>]     # approved -> done
 ```
 
-Inside a session, `/sdd` shows the same status and `/sdd on` or `/sdd off`
-saves the setting; it applies from the next turn. The status line shows `sdd`
-while it is on.
+Inside a session, `/sdd` accepts the same subcommands. The status line shows
+`sdd` while it is on.
 
-While SDD is on, the Jev spec drift check runs after turns that change files.
-With SDD off, nothing checks decision records automatically; `fx jev drift`
-still runs on demand.
+The process keeps two kinds of Markdown files under `sdd/`:
+
+```
+sdd/
+  specs/reservas.md                     # how the system behaves today
+  changes/2026-09-27-pagos-parciales.md # one file per change
+```
+
+A spec holds only current behavior. Every `## ` heading is one rule, and the
+text under it describes the rule. A change file has a flat front matter that
+only fx edits, then Why, What, an optional Wireframe for a new screen, Tasks
+and Notes:
+
+```markdown
+---
+status: proposed
+specs: [reservas]
+---
+# Pagos parciales
+
+## Why
+## What
+## Tasks
+- [ ] Schema
+## Notes
+```
+
+With Jev on, fx sorts each turn's first file change outside `sdd/` into one of
+three routes, so small work skips the paperwork:
+
+| Route | When | What happens |
+| --- | --- | --- |
+| fix | No rule changes | Nothing to write |
+| spec | A small change to existing rules | The agent is told which rules to update in the same change |
+| change | Schema, money, auth, the AI pipeline, a new screen, or substantial work | Code changes are held until a change file is approved; files under `sdd/` stay writable |
+
+A vague request, or one Jev cannot classify, is sent back so the agent asks
+you which route it is. Saying "no hagas propuesta" or "skip the spec" makes it
+a fix. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
+reply that approves it ("sí, dale"); once a change is approved, code changes go
+through. `fx jev eval sdd` runs the routing against labeled cases.
+
+After turns that change files, the Jev spec drift check compares the
+uncommitted changes with each rule in `sdd/specs` (or with the files in
+`sdd/decisions`, `docs/decisions`, `docs/adr` or `decisions` when there are no
+specs) and asks the agent to update the rules the code now contradicts. With
+SDD off, nothing is routed or checked automatically; `fx jev drift` still runs
+on demand.
 
 The setting lives in `~/.fx/settings.json` only, per workspace, with an
 optional top-level `"sdd": {"enabled": true}` default for every workspace.
