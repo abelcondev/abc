@@ -31,7 +31,8 @@ pub const KeyStatus = union(enum) {
 };
 
 /// Caller owns the returned text.
-pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus) ![]u8 {
+/// `enable_command` is how the reader turns Jev on (`fx jev on` or `/jev on`).
+pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus, enable_command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
@@ -49,7 +50,7 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus)
         try w.print("  {s}completion check (threshold {d:.2})\n", .{ if (config.plan_gate) "          " else "gates     ", config.stop_threshold });
     }
     try w.writeAll("  log       ~/.fx/sessions/<id>/decisions.jsonl\n");
-    if (!config.enabled) try w.writeAll("\nTurn it on with `fx jev on`.\n");
+    if (!config.enabled) try w.print("\nTurn it on with `{s}`.\n", .{enable_command});
     return out.toOwnedSlice();
 }
 
@@ -83,13 +84,13 @@ test "parseAction accepts the documented subcommands" {
 
 test "renderStatus reports configuration without the key value" {
     const alloc = std.testing.allocator;
-    const off = try renderStatus(alloc, .{}, .missing);
+    const off = try renderStatus(alloc, .{}, .missing, "fx jev on");
     defer alloc.free(off);
     try std.testing.expect(std.mem.startsWith(u8, off, "Jev decisions: off\n"));
     try std.testing.expect(std.mem.find(u8, off, "fx jev key") != null);
     try std.testing.expect(std.mem.find(u8, off, "fx jev on") != null);
 
-    const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" });
+    const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" }, "fx jev on");
     defer alloc.free(on);
     try std.testing.expect(std.mem.find(u8, on, "saved in the macOS Keychain") != null);
     try std.testing.expect(std.mem.find(u8, on, "plan before changes (threshold 0.50)") != null);

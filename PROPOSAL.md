@@ -24,7 +24,7 @@
 | 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
 | 7. Anthropic Messages | ⬜ | No empezado. |
 | 8. Volver al nombre `fx` | ✅ | Binario `fx`, `~/.fx`, `.fx.json`, `FX_*`; alias `ABC_*` eliminado; keys `ABC_PROVIDER_KEY_*` se migran solas al leerlas. |
-| 9. Jev como decisor | 🟡 | Hecho: `fx jev`, transporte, registro `decisions.jsonl`, plan antes de cambios (hook `PreToolUse`) y cierre verificado (hook `Stop`). Pendiente: acciones, `ask_user_question`, routing, `/jev` en el chat. |
+| 9. Jev como decisor | 🟡 | Hecho: `fx jev`, transporte, registro `decisions.jsonl`, plan antes de cambios (hook `PreToolUse`) y cierre verificado (hook `Stop`). `/jev [on|off]` en el chat. Pendiente: acciones, `ask_user_question`, routing. |
 
 ## 1. Objetivo
 

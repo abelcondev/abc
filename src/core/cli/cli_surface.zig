@@ -2099,7 +2099,7 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
             .environment => .environment,
             .saved => .{ .saved = provider_keys.backendLabel() },
         } else .missing;
-        const text = try jev_cli.renderStatus(alloc, config, status);
+        const text = try jev_cli.renderStatus(alloc, config, status, "fx jev on");
         defer alloc.free(text);
         try writeStdout(deps, text);
         return .handled_success;

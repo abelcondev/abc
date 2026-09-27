@@ -27,6 +27,8 @@ pub const Gate = struct {
     alloc: Allocator,
     config: jev_config.Config = .{},
     mutex: std.Io.Mutex = .init,
+    /// Live on/off switch for registered handlers (`/jev on|off`).
+    active: std.atomic.Value(bool) = .init(true),
     /// Continuation text lent to the hook dispatcher, which copies it.
     feedback: ?[]u8 = null,
     /// Plan-gate state for the turn in progress.
@@ -47,6 +49,20 @@ pub const Gate = struct {
         if (self.feedback) |text| self.alloc.free(text);
         self.config.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Whether handlers were registered for this runtime.
+    pub fn registered(self: *const Gate) bool {
+        return self.config.enabled and (self.config.plan_gate or self.config.stop_gate);
+    }
+
+    /// Turns registered handlers on or off for the rest of the process.
+    pub fn setActive(self: *Gate, value: bool) void {
+        self.active.store(value, .release);
+    }
+
+    pub fn isActive(self: *const Gate) bool {
+        return self.registered() and self.active.load(.acquire);
     }
 
     /// Registers the enabled gates. Must run before the runtime is frozen.
@@ -73,6 +89,7 @@ pub const Gate = struct {
 
     fn preToolUseHandler(raw: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerError!hooks.PreToolUseAction {
         const self: *Gate = @ptrCast(@alignCast(raw));
+        if (!self.active.load(.acquire)) return .continue_;
         switch (input.invocation.scope.kind) {
             .interactive, .ask => {},
             .acp, .subagent => return .continue_,
@@ -190,6 +207,7 @@ pub const Gate = struct {
 
     fn stopHandler(raw: *anyopaque, input: hooks.StopInput) hooks.HandlerError!hooks.StopAction {
         const self: *Gate = @ptrCast(@alignCast(raw));
+        if (!self.active.load(.acquire)) return .allow;
         switch (input.invocation.scope.kind) {
             .interactive, .ask => {},
             .acp, .subagent => return .allow,
@@ -347,4 +365,29 @@ test "the completion handler allows subagent and final-step turns without callin
     no_request.invocation.scope.kind = .ask;
     no_request.user_request = "  ";
     try std.testing.expect((try Gate.stopHandler(&gate, no_request)) == .allow);
+}
+
+test "an inactive gate lets file changes and turn ends through" {
+    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true } };
+    defer gate.deinit();
+    gate.setActive(false);
+    try std.testing.expect(!gate.isActive());
+    const change = hooks.PreToolUseInput{
+        .invocation = .{ .scope = .{ .kind = .interactive, .workspace_root = "/w" }, .turn_id = 1 },
+        .step_index = 0,
+        .call_id = "c1",
+        .tool_name = "write_file",
+        .arguments_json = "{}",
+        .user_request = "build the feature",
+    };
+    try std.testing.expect((try Gate.preToolUseHandler(&gate, change)) == .continue_);
+    const stop = hooks.StopInput{
+        .invocation = .{ .scope = .{ .kind = .interactive, .workspace_root = "/w" }, .turn_id = 1 },
+        .step_index = 1,
+        .assistant_text = "done",
+        .provider_disposition = .completed,
+        .can_continue = true,
+        .user_request = "build the feature",
+    };
+    try std.testing.expect((try Gate.stopHandler(&gate, stop)) == .allow);
 }
