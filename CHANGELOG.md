@@ -1,8 +1,29 @@
 # fx
 
-## 0.2.0
+## 0.3.0
 
 <!-- release:start -->
+
+**fx now runs a lightweight spec-driven development process when you want it: specs that describe how the system behaves today, one file per change, and Jev deciding how much process each request needs.**
+
+### New Features
+
+- **SDD per workspace:** `fx sdd on` and `fx sdd off`, or `/sdd on` and `/sdd off` in a session, switch the process for the current workspace. It is off by default, so fx works freely until you turn it on, and the status line shows `sdd` while it is on. `FX_SDD=on|off` overrides the saved setting for one shell.
+- **Specs and changes:** `sdd/specs/<name>.md` holds current behavior, one rule per `## ` heading. Each change is one file in `sdd/changes`, created with `fx sdd new <slug>` and moved through `fx sdd approve` and `fx sdd done`. `fx sdd` shows the specs, open changes and task progress.
+- **Right-sized process:** With Jev on, the first code change of a request is sorted into a fix (goes straight through), a spec update (the agent updates the affected rules in the same change) or a change (code waits until a change file is approved). Vague requests come back as a question, and "no hagas propuesta" or "skip the spec" keeps it a fix.
+- **Approve by replying:** A reply such as "sí, aprobado" approves the proposed change, and the agent goes on to implement it.
+- **Test-first:** `fx sdd tdd on` makes behavior changes and bug fixes start with a failing test and end with a passing run, and Jev checks that the new tests would fail without the requested behavior. `fx sdd tdd strict` also asks for every changed rule to be cited by a test, and `fx sdd` reports that coverage. Rules marked `(manual)` are checked in the running app instead.
+- **Rule-by-rule drift:** The spec drift check compares each rule in `sdd/specs` with the changed code on its own and asks the agent to rewrite the rules the code now contradicts. It runs automatically only while SDD is on; `fx jev drift` still runs on demand.
+- **Growth check:** A fix or spec update that spreads past 8 source files pauses once so the agent can propose a change instead.
+- **Routing calibration:** `fx jev eval sdd` runs labeled requests through the same routing to check it before you rely on it.
+
+### Bug Fixes
+
+- **Completion check:** A final answer that claims tests pass while the test output shows failures is no longer excused as a reported blocker.
+<!-- release:end -->
+
+## 0.2.0
+
 
 **This fork is `fx` again, and Jev now checks the agent's decisions: plans before large changes, verified answers, settled questions, subagent routing and decision records that stay in sync with the code.**
 
@@ -24,7 +45,6 @@
 ### Bug Fixes
 
 - **Subagent results:** Subagents no longer return an empty result when a completion hook is active.
-<!-- release:end -->
 
 ## 0.0.11
 
