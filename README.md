@@ -26,6 +26,72 @@ release over the running binary.
 Open `fx` in a project and run `/provider`: pick a preset, paste its API key
 when asked (saved in the macOS Keychain), then choose a model with `/model`.
 
+## Set up fx
+
+A working setup takes five steps. Each can be checked on its own.
+
+**1. Choose a provider and a model.** Save the provider's key once (macOS
+Keychain) and pick the default model:
+
+```bash
+fx login deepseek            # or: fx login qwen, fx login openrouter, ...
+fx                           # then /model inside the session
+```
+
+Inside a session, `/provider` switches providers and `/model` models and
+reasoning effort. `fx status` prints the active provider, model, credentials
+and permission mode.
+
+**2. Choose what fx may do without asking.** `/permissions` switches between
+`ask` (confirm sensitive actions), `auto` (a security review decides) and
+`full-access` (no fx checks). The choice is saved in your profile;
+`--auto` or `--full-access` on `fx ask` apply to one run.
+
+**3. Tell the agent about your project.** fx reads `AGENTS.md` at the
+workspace root, plus `~/.fx/AGENTS.md` for rules that apply everywhere. Keep
+it short: what the app is, the stack, and conventions the code does not show
+(language to reply in, package manager, where tests live).
+
+**4. Turn on Jev** (optional, recommended). Jev checks the agent's decisions:
+a plan before large changes, answers backed by evidence, questions it can
+settle, and subagent models. Get a key from [TypeSafe AI](https://docs.typesafe.ai):
+
+```bash
+fx jev key                   # paste the TypeSafe key (Keychain)
+fx jev check                 # one live call to confirm it works
+fx jev on                    # enable it for new sessions
+fx jev                       # status: gates, thresholds, key source
+```
+
+**5. Turn on spec-driven development per project** (optional, needs Jev for
+its checks). From the project directory:
+
+```bash
+fx sdd on                    # this workspace only; others stay free
+fx sdd tdd on                # optional: behavior changes start with a failing test
+fx sdd                       # status: specs, open changes, checks that run
+```
+
+Then work as usual. Small fixes go straight through, a change to an existing
+rule updates the spec in the same change, and a feature or a change to data,
+money, auth or a new screen stops for a short proposal in `sdd/changes/` that
+you approve by replying "yes" or with `/sdd approve`. Close a finished change
+with `/sdd done`. Commit the `sdd/` folder with the code so specs and changes
+travel with the project. The sections below explain each part.
+
+**Where settings live**
+
+| What | Where | Override |
+| --- | --- | --- |
+| Provider keys, Jev key | macOS Keychain (`fx login`, `fx jev key`) | `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `TYPESAFE_API_KEY`, ... |
+| Provider, model, permissions, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
+| SDD and TDD, per project | `~/.fx/settings.json` → `workspaces["<path>"].sdd` | `FX_SDD=on\|off` |
+| Project defaults safe to commit | `<project>/.fx.json` | |
+| Sessions and Jev's decision log | `~/.fx/sessions/<id>/` (`decisions.jsonl`) | |
+
+The status line shows the permission mode, the model and `sdd` while SDD is on.
+Calls a Jev or SDD check holds appear as "Held" in the transcript.
+
 ## Build
 
 Requires Zig 0.16.0.
@@ -259,8 +325,12 @@ three routes, so small work skips the paperwork:
 
 A vague request, or one Jev cannot classify, is sent back so the agent asks
 you which route it is. Saying "no hagas propuesta" or "skip the spec" makes it
-a fix. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
-reply that approves it ("sí, dale"); once a change is approved, code changes go
+a fix, and so does a request that only ships finished work (commit, push, open
+a PR, release notes). Files outside the workspace, such as a PR body in `/tmp`,
+are never routed. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
+reply that approves it ("sí, dale", "si yes, y abre el PR"), even in a turn
+that changes no code. With several proposals open, the one your reply names is
+approved, else the newest. Once a change is approved, code changes go
 through. Approving and closing are yours: when the agent runs `fx sdd approve`
 or `fx sdd done` itself, fx holds the command. The agent ticks the change's
 tasks as it works, and after the first turn that changes code under an approved
