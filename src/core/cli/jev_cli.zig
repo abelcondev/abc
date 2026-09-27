@@ -44,10 +44,31 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
         .environment => try w.writeAll("  key       " ++ jev_config.key_env ++ "\n"),
         .saved => |backend| try w.print("  key       saved in the {s}\n", .{backend}),
     }
-    if (!config.plan_gate and !config.stop_gate) try w.writeAll("  gates     none\n");
-    if (config.plan_gate) try w.print("  gates     plan before changes (threshold {d:.2})\n", .{config.plan_threshold});
+    var label: []const u8 = "gates     ";
+    const indent = "          ";
+    if (config.ask_gate) {
+        try w.print("  {s}answer settled questions (threshold {d:.2})\n", .{ label, config.ask_threshold });
+        label = indent;
+    }
+    if (config.plan_gate) {
+        try w.print("  {s}plan before changes (threshold {d:.2})\n", .{ label, config.plan_threshold });
+        label = indent;
+    }
+    if (config.action_gate) {
+        try w.print("  {s}action check (hold at damage {d:.2})\n", .{ label, config.action_threshold });
+        label = indent;
+    }
     if (config.stop_gate) {
-        try w.print("  {s}completion check (threshold {d:.2})\n", .{ if (config.plan_gate) "          " else "gates     ", config.stop_threshold });
+        try w.print("  {s}completion check (threshold {d:.2})\n", .{ label, config.stop_threshold });
+        label = indent;
+    }
+    if (label.ptr != indent.ptr) try w.writeAll("  gates     none\n");
+    if (config.routes.len != 0) {
+        try w.writeAll("  routing  ");
+        for (config.routes, 0..) |route, index| {
+            try w.print("{s} {s}={s}", .{ if (index == 0) "" else ",", route.name, route.model });
+        }
+        try w.writeByte('\n');
     }
     try w.writeAll("  log       ~/.fx/sessions/<id>/decisions.jsonl\n");
     if (!config.enabled) try w.print("\nTurn it on with `{s}`.\n", .{enable_command});
@@ -93,7 +114,9 @@ test "renderStatus reports configuration without the key value" {
     const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" }, "fx jev on");
     defer alloc.free(on);
     try std.testing.expect(std.mem.find(u8, on, "saved in the macOS Keychain") != null);
+    try std.testing.expect(std.mem.find(u8, on, "gates     answer settled questions (threshold 0.80)") != null);
     try std.testing.expect(std.mem.find(u8, on, "plan before changes (threshold 0.50)") != null);
+    try std.testing.expect(std.mem.find(u8, on, "action check") == null);
     try std.testing.expect(std.mem.find(u8, on, "completion check (threshold 0.60)") != null);
     try std.testing.expect(std.mem.find(u8, on, "fx jev on") == null);
 }

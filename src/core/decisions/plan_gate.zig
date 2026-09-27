@@ -10,6 +10,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const jev_contract = @import("jev_contract.zig");
+const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -127,47 +128,23 @@ pub fn buildState(alloc: Allocator, input: Input) ![]u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var texts: std.ArrayList([]const u8) = .empty;
-    for (input.turn_messages) |message| {
-        if (message.role != .assistant) continue;
-        const content = std.mem.trim(u8, message.content orelse "", " \t\r\n");
-        if (content.len != 0) try texts.append(arena, content);
-    }
-    const current = std.mem.trim(u8, input.assistant_text, " \t\r\n");
-    if (current.len != 0) try texts.append(arena, current);
-
-    // Keep the most recent agent messages within the budget.
-    var start = texts.items.len;
-    var used: usize = 0;
-    while (start > 0) {
-        const cost = texts.items[start - 1].len;
-        if (used + cost > Limits.agent_messages_bytes) break;
-        used += cost;
-        start -= 1;
-    }
+    const agent_messages = try turn_text.agentMessages(arena, input.turn_messages, input.assistant_text, Limits.agent_messages_bytes);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     var jw: std.json.Stringify = .{ .writer = &out.writer };
     try jw.beginObject();
     try jw.objectField("user_request");
-    try jw.write(clip(input.user_request, Limits.request_bytes));
+    try jw.write(turn_text.clip(input.user_request, Limits.request_bytes));
     try jw.objectField("agent_messages");
-    try jw.write(texts.items[start..]);
+    try jw.write(agent_messages);
     try jw.objectField("pending_change");
     try jw.write(.{
         .tool = input.tool_name,
-        .input = clip(input.arguments_json, Limits.change_bytes),
+        .input = turn_text.clip(input.arguments_json, Limits.change_bytes),
     });
     try jw.endObject();
     return out.toOwnedSlice();
-}
-
-fn clip(text: []const u8, max: usize) []const u8 {
-    if (text.len <= max) return text;
-    var end = max;
-    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
-    return text[0..end];
 }
 
 fn testResponse(body: []const u8) !jev_contract.Response {

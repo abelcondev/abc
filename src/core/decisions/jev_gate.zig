@@ -1,24 +1,36 @@
 //! Jev as fx's decision maker: registers lifecycle handlers that ask Jev
 //! before the agent loop commits to a decision.
 //!
-//! The plan gate runs on `PreToolUse` before the first file change of a
-//! turn: a substantial request needs a stated plan that covers it, and the
-//! change is held (at most twice per turn) until one exists.
+//! `PreToolUse` gates, in order of the call they inspect:
+//! - ask: Jev answers the agent's multiple-choice question when the request
+//!   and the agent's findings already settle it; otherwise the user is asked.
+//! - routing: a temporary subagent without a model gets one of the user's
+//!   configured routes.
+//! - plan: the first file change of a substantial request is held (at most
+//!   twice per turn) until the agent states a plan that covers it.
+//! - action (opt-in): file changes and shell commands are held when they look
+//!   off-task or damaging in ways the user did not ask for (at most three
+//!   times per turn).
 //!
-//! The completion gate runs on `Stop` for root interactive and `fx ask`
-//! turns. It sends the agent back once when Jev cannot confirm the final
-//! answer is backed by the turn's tool results. When Jev is unreachable, has
-//! no key, or answers incompletely, the turn finishes normally and the
-//! decision log records why.
+//! The completion gate runs on `Stop`. It sends the agent back once when Jev
+//! cannot confirm the final answer is backed by the turn's tool results.
+//!
+//! Gates run for root interactive and `fx ask` turns only. When Jev is
+//! unreachable, has no key, or answers incompletely, the call or turn goes
+//! ahead normally and the decision log records why.
 
 const std = @import("std");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
+const jev_contract = @import("jev_contract.zig");
 const jev_config = @import("jev_config.zig");
 const completion_gate = @import("completion_gate.zig");
 const plan_gate = @import("plan_gate.zig");
+const action_gate = @import("action_gate.zig");
+const ask_gate = @import("ask_gate.zig");
+const routing = @import("routing.zig");
 const decision_log = @import("decision_log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,12 +41,17 @@ pub const Gate = struct {
     mutex: std.Io.Mutex = .init,
     /// Live on/off switch for registered handlers (`/jev on|off`).
     active: std.atomic.Value(bool) = .init(true),
-    /// Continuation text lent to the hook dispatcher, which copies it.
-    feedback: ?[]u8 = null,
-    /// Plan-gate state for the turn in progress.
-    plan_turn: ?u64 = null,
+    /// Text lent to the hook dispatcher (block reasons, continuations,
+    /// rewritten arguments), which copies it before the next call.
+    lent: ?[]u8 = null,
+    /// Per-turn state; reset when a new turn id arrives.
+    turn: ?u64 = null,
     plan_settled: bool = false,
     plan_holds: u8 = 0,
+    action_holds: u8 = 0,
+
+    const max_plan_holds = 2;
+    const max_action_holds = 3;
 
     /// Loads the profile configuration. Jev stays inactive unless enabled.
     pub fn init(alloc: Allocator) Gate {
@@ -46,14 +63,14 @@ pub const Gate = struct {
     }
 
     pub fn deinit(self: *Gate) void {
-        if (self.feedback) |text| self.alloc.free(text);
+        if (self.lent) |text| self.alloc.free(text);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
 
     /// Whether handlers were registered for this runtime.
     pub fn registered(self: *const Gate) bool {
-        return self.config.enabled and (self.config.plan_gate or self.config.stop_gate);
+        return self.config.enabled and (self.config.usesPreToolUse() or self.config.stop_gate);
     }
 
     /// Turns registered handlers on or off for the rest of the process.
@@ -68,9 +85,9 @@ pub const Gate = struct {
     /// Registers the enabled gates. Must run before the runtime is frozen.
     pub fn register(self: *Gate, runtime: *hooks.Runtime) !void {
         if (!self.config.enabled) return;
-        if (self.config.plan_gate) {
+        if (self.config.usesPreToolUse()) {
             try runtime.registerPreToolUse(.{
-                .name = "fx.jev.plan",
+                .name = "fx.jev.pre_tool",
                 .ctx = self,
                 .run = preToolUseHandler,
             });
@@ -84,8 +101,75 @@ pub const Gate = struct {
         }
     }
 
-    /// Holds per turn before the gate lets changes through regardless.
-    const max_plan_holds = 2;
+    fn lend(self: *Gate, text: []u8) []const u8 {
+        if (self.lent) |old| self.alloc.free(old);
+        self.lent = text;
+        return text;
+    }
+
+    fn resetForTurn(self: *Gate, turn: u64) void {
+        if (self.turn != null and self.turn.? == turn) return;
+        self.turn = turn;
+        self.plan_settled = false;
+        self.plan_holds = 0;
+        self.action_holds = 0;
+    }
+
+    fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
+        return .{
+            .gate = gate,
+            .session_id = invocation.scope.session_id,
+            .turn_id = invocation.turn_id,
+            .model = self.config.model,
+            .threshold = threshold,
+            .outcome = "allow",
+            .latency_ms = 0,
+        };
+    }
+
+    /// Calls Jev. On failure logs `entry` as unavailable and returns null.
+    /// On success fills the entry's model, latency, tokens and answers; the
+    /// answers borrow from the returned response.
+    fn consult(
+        self: *Gate,
+        entry: *decision_log.Entry,
+        state_json: []const u8,
+        questions: []const jev_contract.Question,
+    ) ?jev_contract.Response {
+        const alloc = self.alloc;
+        const started = io_mod.milliTimestamp();
+        var key = (jev_config.loadApiKey(alloc) catch null) orelse {
+            entry.outcome = "unavailable";
+            entry.detail = "no API key";
+            decision_log.append(alloc, entry.*);
+            return null;
+        };
+        defer key.deinit(alloc);
+        const response = typesafe.systemOne(alloc, .{
+            .base_url = self.config.base_url,
+            .api_key = key.value,
+            .model = self.config.model,
+            .state_json = state_json,
+            .questions = questions,
+        }) catch |err| {
+            entry.outcome = "unavailable";
+            entry.detail = @errorName(err);
+            entry.latency_ms = io_mod.milliTimestamp() - started;
+            decision_log.append(alloc, entry.*);
+            return null;
+        };
+        entry.model = response.model;
+        entry.latency_ms = io_mod.milliTimestamp() - started;
+        entry.input_tokens = response.input_tokens;
+        entry.answers = response.answers;
+        return response;
+    }
+
+    fn logIncomplete(self: *Gate, entry: *decision_log.Entry, err: anyerror) void {
+        entry.outcome = "unavailable";
+        entry.detail = @errorName(err);
+        decision_log.append(self.alloc, entry.*);
+    }
 
     fn preToolUseHandler(raw: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerError!hooks.PreToolUseAction {
         const self: *Gate = @ptrCast(@alignCast(raw));
@@ -94,89 +178,117 @@ pub const Gate = struct {
             .interactive, .ask => {},
             .acp, .subagent => return .continue_,
         }
-        if (!plan_gate.isFileChange(input.tool_name)) return .continue_;
         if (std.mem.trim(u8, input.user_request, " \t\r\n").len == 0) return .continue_;
+        const turn = input.invocation.turn_id orelse return .continue_;
 
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const turn = input.invocation.turn_id orelse return .continue_;
-        if (self.plan_turn == null or self.plan_turn.? != turn) {
-            self.plan_turn = turn;
-            self.plan_settled = false;
-            self.plan_holds = 0;
-        }
-        if (self.plan_settled) return .continue_;
-        return self.checkPlan(input) catch |err| {
-            debug_trace.logf("jev", "plan gate failed err={s}", .{@errorName(err)});
-            self.plan_settled = true;
+        self.resetForTurn(turn);
+
+        const config = &self.config;
+        const tool = input.tool_name;
+        const action = blk: {
+            if (config.ask_gate and std.mem.eql(u8, tool, ask_gate.tool_name)) break :blk self.checkAsk(input);
+            if (config.routes.len != 0 and std.mem.eql(u8, tool, routing.tool_name)) break :blk self.routeSubagent(input);
+            if (config.plan_gate and !self.plan_settled and plan_gate.isFileChange(tool)) {
+                const plan_action = self.checkPlan(input) catch |err| plan: {
+                    debug_trace.logf("jev", "plan gate failed err={s}", .{@errorName(err)});
+                    self.plan_settled = true;
+                    break :plan hooks.PreToolUseAction.continue_;
+                };
+                if (plan_action != .continue_) break :blk plan_action;
+            }
+            if (config.action_gate and self.action_holds < max_action_holds and action_gate.isChecked(tool)) break :blk self.checkAction(input);
+            break :blk hooks.PreToolUseAction.continue_;
+        };
+        return action catch |err| {
+            debug_trace.logf("jev", "pre-tool gate failed tool={s} err={s}", .{ tool, @errorName(err) });
             return .continue_;
         };
     }
 
-    fn checkPlan(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
-        const alloc = self.alloc;
-        const started = io_mod.milliTimestamp();
-        var entry = decision_log.Entry{
-            .gate = "plan",
-            .session_id = input.invocation.scope.session_id,
-            .turn_id = input.invocation.turn_id,
-            .model = self.config.model,
-            .threshold = self.config.plan_threshold,
-            .outcome = "allow",
-            .latency_ms = 0,
+    fn checkAsk(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const parsed = (try ask_gate.parse(arena, input.arguments_json)) orelse return .continue_;
+        var entry = self.newEntry("ask", input.invocation, self.config.ask_threshold);
+        const state = try ask_gate.buildState(self.alloc, arena, .{
+            .user_request = input.user_request,
+            .turn_messages = input.turn_messages,
+            .assistant_text = input.assistant_text,
+            .arguments_json = input.arguments_json,
+        }, parsed);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, parsed.questions) orelse return .continue_;
+        defer response.deinit();
+        const verdict = ask_gate.evaluate(arena, parsed, &response, self.config.ask_threshold) catch |err| {
+            self.logIncomplete(&entry, err);
+            return .continue_;
         };
+        switch (verdict) {
+            .ask_user => {
+                entry.outcome = "ask_user";
+                decision_log.append(self.alloc, entry);
+                return .continue_;
+            },
+            .answered => |answers| {
+                entry.outcome = "answered";
+                decision_log.append(self.alloc, entry);
+                return .{ .block = self.lend(try ask_gate.answerText(self.alloc, answers)) };
+            },
+        }
+    }
+
+    fn routeSubagent(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const task = routing.routableTask(arena, input.arguments_json) orelse return .continue_;
+        var entry = self.newEntry("routing", input.invocation, routing.min_confidence);
+        const state = try routing.buildState(self.alloc, task);
+        defer self.alloc.free(state);
+        const questions = try routing.questions(arena, self.config.routes);
+        var response = self.consult(&entry, state, questions) orelse return .continue_;
+        defer response.deinit();
+        const route = routing.pick(self.config.routes, &response) orelse {
+            entry.outcome = "skip";
+            entry.detail = "no confident route";
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        };
+        const rewritten = try routing.rewriteArguments(self.alloc, input.arguments_json, route);
+        entry.outcome = "route";
+        entry.detail = route.name;
+        decision_log.append(self.alloc, entry);
+        return .{ .rewrite_arguments = self.lend(rewritten) };
+    }
+
+    fn checkPlan(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var entry = self.newEntry("plan", input.invocation, self.config.plan_threshold);
         if (self.plan_holds >= max_plan_holds) {
             self.plan_settled = true;
-            entry.outcome = "allow";
             entry.detail = "hold budget spent";
-            decision_log.append(alloc, entry);
+            decision_log.append(self.alloc, entry);
             return .continue_;
         }
-
-        var key = (try jev_config.loadApiKey(alloc)) orelse {
-            self.plan_settled = true;
-            entry.outcome = "unavailable";
-            entry.detail = "no API key";
-            decision_log.append(alloc, entry);
-            return .continue_;
-        };
-        defer key.deinit(alloc);
-
-        const state = try plan_gate.buildState(alloc, .{
+        const state = try plan_gate.buildState(self.alloc, .{
             .user_request = input.user_request,
             .turn_messages = input.turn_messages,
             .assistant_text = input.assistant_text,
             .tool_name = input.tool_name,
             .arguments_json = input.arguments_json,
         });
-        defer alloc.free(state);
-
-        var response = typesafe.systemOne(alloc, .{
-            .base_url = self.config.base_url,
-            .api_key = key.value,
-            .model = self.config.model,
-            .state_json = state,
-            .questions = &plan_gate.questions,
-        }) catch |err| {
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &plan_gate.questions) orelse {
             self.plan_settled = true;
-            entry.outcome = "unavailable";
-            entry.detail = @errorName(err);
-            entry.latency_ms = io_mod.milliTimestamp() - started;
-            decision_log.append(alloc, entry);
             return .continue_;
         };
         defer response.deinit();
-        entry.model = response.model;
-        entry.latency_ms = io_mod.milliTimestamp() - started;
-        entry.input_tokens = response.input_tokens;
-        entry.answers = response.answers;
-
         const verdict = plan_gate.evaluate(&response, self.config.plan_threshold) catch |err| {
             self.plan_settled = true;
-            entry.outcome = "unavailable";
-            entry.detail = @errorName(err);
-            decision_log.append(alloc, entry);
+            self.logIncomplete(&entry, err);
             return .continue_;
         };
         switch (verdict) {
@@ -184,23 +296,50 @@ pub const Gate = struct {
                 self.plan_settled = true;
                 entry.outcome = "skip";
                 entry.detail = "not substantial";
-                decision_log.append(alloc, entry);
+                decision_log.append(self.alloc, entry);
                 return .continue_;
             },
             .approved => {
                 self.plan_settled = true;
-                entry.outcome = "allow";
-                decision_log.append(alloc, entry);
+                decision_log.append(self.alloc, entry);
                 return .continue_;
             },
             .needs_plan => |needs| {
-                const reason = try plan_gate.blockReason(alloc, needs);
-                if (self.feedback) |old| alloc.free(old);
-                self.feedback = reason;
                 self.plan_holds += 1;
                 entry.outcome = "hold";
-                decision_log.append(alloc, entry);
-                return .{ .block = reason };
+                decision_log.append(self.alloc, entry);
+                return .{ .block = self.lend(try plan_gate.blockReason(self.alloc, needs)) };
+            },
+        }
+    }
+
+    fn checkAction(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var entry = self.newEntry("action", input.invocation, self.config.action_threshold);
+        const state = try action_gate.buildState(self.alloc, .{
+            .user_request = input.user_request,
+            .turn_messages = input.turn_messages,
+            .assistant_text = input.assistant_text,
+            .tool_name = input.tool_name,
+            .arguments_json = input.arguments_json,
+        });
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &action_gate.questions) orelse return .continue_;
+        defer response.deinit();
+        const verdict = action_gate.evaluate(&response, self.config.action_threshold) catch |err| {
+            self.logIncomplete(&entry, err);
+            return .continue_;
+        };
+        switch (verdict) {
+            .allowed => {
+                decision_log.append(self.alloc, entry);
+                return .continue_;
+            },
+            .held => |held| {
+                self.action_holds += 1;
+                entry.outcome = "hold";
+                entry.detail = input.tool_name;
+                decision_log.append(self.alloc, entry);
+                return .{ .block = self.lend(try action_gate.holdReason(self.alloc, held)) };
             },
         }
     }
@@ -225,77 +364,34 @@ pub const Gate = struct {
     }
 
     fn checkCompletion(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
-        const alloc = self.alloc;
-        const started = io_mod.milliTimestamp();
-        var entry = decision_log.Entry{
-            .gate = "stop",
-            .session_id = input.invocation.scope.session_id,
-            .turn_id = input.invocation.turn_id,
-            .model = self.config.model,
-            .threshold = self.config.stop_threshold,
-            .outcome = "allow",
-            .latency_ms = 0,
-        };
-
-        var key = (try jev_config.loadApiKey(alloc)) orelse {
-            entry.outcome = "unavailable";
-            entry.detail = "no API key";
-            decision_log.append(alloc, entry);
-            return .allow;
-        };
-        defer key.deinit(alloc);
-
-        const state = try completion_gate.buildState(alloc, .{
+        var entry = self.newEntry("stop", input.invocation, self.config.stop_threshold);
+        const state = try completion_gate.buildState(self.alloc, .{
             .user_request = input.user_request,
             .final_message = input.assistant_text,
             .turn_messages = input.turn_messages,
         });
-        defer alloc.free(state);
-
-        var response = typesafe.systemOne(alloc, .{
-            .base_url = self.config.base_url,
-            .api_key = key.value,
-            .model = self.config.model,
-            .state_json = state,
-            .questions = &completion_gate.questions,
-        }) catch |err| {
-            entry.outcome = "unavailable";
-            entry.detail = @errorName(err);
-            entry.latency_ms = io_mod.milliTimestamp() - started;
-            decision_log.append(alloc, entry);
-            return .allow;
-        };
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &completion_gate.questions) orelse return .allow;
         defer response.deinit();
-        entry.model = response.model;
-        entry.latency_ms = io_mod.milliTimestamp() - started;
-        entry.input_tokens = response.input_tokens;
-        entry.answers = response.answers;
-
         const verdict = completion_gate.evaluate(&response, self.config.stop_threshold) catch |err| {
-            entry.outcome = "unavailable";
-            entry.detail = @errorName(err);
-            decision_log.append(alloc, entry);
+            self.logIncomplete(&entry, err);
             return .allow;
         };
         switch (verdict) {
             .skipped => |reason| {
                 entry.outcome = "skip";
                 entry.detail = reason;
-                decision_log.append(alloc, entry);
+                decision_log.append(self.alloc, entry);
                 return .allow;
             },
             .passed => {
-                entry.outcome = "allow";
-                decision_log.append(alloc, entry);
+                decision_log.append(self.alloc, entry);
                 return .allow;
             },
             .failed => |failed| {
-                const text = try completion_gate.feedback(alloc, failed);
-                if (self.feedback) |old| alloc.free(old);
-                self.feedback = text;
                 entry.outcome = "continue";
-                decision_log.append(alloc, entry);
-                return .{ .continue_once = text };
+                decision_log.append(self.alloc, entry);
+                return .{ .continue_once = self.lend(try completion_gate.feedback(self.alloc, failed)) };
             },
         }
     }
@@ -322,8 +418,8 @@ test "an enabled gate registers the plan and completion handlers" {
     try std.testing.expectEqual(@as(usize, 1), view.pre_tool_use_handlers.len);
 }
 
-test "the plan handler ignores reads, subagents and settled turns without calling Jev" {
-    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true } };
+test "the pre-tool handler ignores reads, subagents and settled turns without calling Jev" {
+    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true, .ask_gate = false } };
     defer gate.deinit();
     const base = hooks.PreToolUseInput{
         .invocation = .{ .scope = .{ .kind = .interactive, .workspace_root = "/w" }, .turn_id = 7 },
@@ -340,7 +436,7 @@ test "the plan handler ignores reads, subagents and settled turns without callin
     try std.testing.expect((try Gate.preToolUseHandler(&gate, subagent)) == .continue_);
     var settled = base;
     settled.tool_name = "edit_file";
-    gate.plan_turn = 7;
+    gate.turn = 7;
     gate.plan_settled = true;
     try std.testing.expect((try Gate.preToolUseHandler(&gate, settled)) == .continue_);
 }
@@ -390,4 +486,21 @@ test "an inactive gate lets file changes and turn ends through" {
         .user_request = "build the feature",
     };
     try std.testing.expect((try Gate.stopHandler(&gate, stop)) == .allow);
+}
+
+test "unparseable questions and routed calls with a model skip Jev" {
+    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true } };
+    defer gate.deinit();
+    var input = hooks.PreToolUseInput{
+        .invocation = .{ .scope = .{ .kind = .interactive, .workspace_root = "/w" }, .turn_id = 3 },
+        .step_index = 0,
+        .call_id = "c1",
+        .tool_name = ask_gate.tool_name,
+        .arguments_json = "{\"questions\":[]}",
+        .user_request = "pick one",
+    };
+    try std.testing.expect((try Gate.preToolUseHandler(&gate, input)) == .continue_);
+    input.tool_name = routing.tool_name;
+    input.arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"t\",\"model\":\"m\"}}";
+    try std.testing.expect((try Gate.preToolUseHandler(&gate, input)) == .continue_);
 }
