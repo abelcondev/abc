@@ -171,6 +171,12 @@ the decisions the diff touches, then reads them and flags the ones the change
 contradicts. It exits non-zero when any decision may be out of date, so it can
 run in CI.
 
+The same check runs at the end of a session turn that changed files, when the
+workspace has a decisions directory (`gates.drift`, default on). If the
+uncommitted changes contradict a record, the agent is asked to update the
+record (or fix the code) before answering. Each record is flagged once per
+session.
+
 Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
 answers, the threshold and the outcome (the state sent to Jev is not stored).
 
@@ -183,6 +189,7 @@ files cannot set them.
 | `model` | Jev model (default `jev-latest`) |
 | `gates.ask` | Let Jev answer questions the context already settles (default `true`) |
 | `gates.plan` | Require a plan before changes on substantial requests (default `true`) |
+| `gates.drift` | Flag decision records a turn's changes contradict (default `true`) |
 | `gates.action` | Check file changes and shell commands (default `false`) |
 | `gates.stop` | Run the completion check (default `true`) |
 | `thresholds.ask` | Minimum confidence and grounding for answering (default `0.8`) |
