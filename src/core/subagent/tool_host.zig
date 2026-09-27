@@ -1906,12 +1906,38 @@ fn assistantTextForWork(
         const candidate_work_id = session.historyTurnWorkId(candidate) orelse continue;
         if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
         return switch (candidate) {
-            .assistant => |value| value.assistant,
+            .assistant => |value| if (value.assistant.len != 0) value.assistant else standaloneResponse(value.execution),
             .interrupted => |value| value.assistant orelse "",
             .compacted_summary => null,
         };
     }
     return null;
+}
+
+/// A turn finished through a Stop hook keeps its answer as the last
+/// standalone response in execution memory and leaves `assistant` empty.
+fn standaloneResponse(memory: types.ExecutionMemory) []const u8 {
+    var index = memory.tool_steps.len;
+    while (index > 0) {
+        index -= 1;
+        const step = memory.tool_steps[index];
+        if (step.tool_calls.len != 0) continue;
+        if (step.assistant) |text| return text;
+    }
+    return "";
+}
+
+test "assistantTextForWork falls back to the standalone response of a Stop-hook turn" {
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("checking"), .tool_calls = @constCast(&[_]types.ToolCall{.{ .id = "c1", .name = "shell", .arguments_json = "{}" }}) },
+        .{ .assistant = @constCast("Three .py files.") },
+    };
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("list files"), .work_id = @constCast("w1") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    try std.testing.expectEqualStrings("Three .py files.", assistantTextForWork(&history, "w1").?);
 }
 
 /// Builds the parent-facing guidance for a rejected model override.

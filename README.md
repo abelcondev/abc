@@ -121,6 +121,35 @@ agent has stated a plan with steps and checkable acceptance criteria that
 covers the request without unrequested extra work. A turn is held at most
 twice, then changes go through.
 
+**Answering settled questions.** When the agent asks a multiple-choice
+question in a session, Jev answers it only when the request or what the agent
+already found settles the answer (for example, a pinned dependency). Choices
+that are a matter of preference, or that the user asked to make, still go to
+the user. The agent is told the answer came from Jev so it can mention it.
+
+**Action check (opt-in, `gates.action`).** Before each file change or shell
+command, Jev checks that it is a step toward the request and does not delete,
+overwrite, publish, or reach outside the project in a way the user did not ask
+for. Held calls return the reason to the agent. It complements, never
+replaces, the permission system, and adds about half a second per call.
+
+**Model routing (opt-in, `routing`).** When the agent starts a temporary
+subagent without naming a model, Jev picks one of your routes for the task:
+
+```json
+"jev": {
+  "enabled": true,
+  "routing": {
+    "light": { "model": "deepseek-flash", "effort": "low" },
+    "heavy": { "model": "deepseek-v4-pro" }
+  }
+}
+```
+
+`light` and `heavy` have built-in descriptions; other route names need a
+`description`. Routes need at least two entries and models from the active
+provider.
+
 **Completion check.** When the agent finishes a turn that asked for work, fx
 sends Jev the request, the final answer and the turn's tool results. If Jev
 cannot confirm that the requested work was carried out, or that every claim in
@@ -139,9 +168,14 @@ files cannot set them.
 | --- | --- |
 | `enabled` | Turn Jev decisions on (default `false`) |
 | `model` | Jev model (default `jev-latest`) |
+| `gates.ask` | Let Jev answer questions the context already settles (default `true`) |
 | `gates.plan` | Require a plan before changes on substantial requests (default `true`) |
+| `gates.action` | Check file changes and shell commands (default `false`) |
 | `gates.stop` | Run the completion check (default `true`) |
+| `thresholds.ask` | Minimum confidence and grounding for answering (default `0.8`) |
 | `thresholds.plan` | Minimum probability the plan checks must reach (default `0.5`) |
+| `thresholds.action` | Unrequested-damage probability that holds an action (default `0.6`) |
+| `routing.<name>` | `model`, optional `effort`, and `description` for a subagent route |
 | `thresholds.stop` | Minimum probability each completion check must reach (default `0.5`) |
 
 `TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` and `FX_JEV_BASE_URL`
