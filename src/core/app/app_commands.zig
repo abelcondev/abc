@@ -38,6 +38,9 @@ const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
+const jev_cli = @import("../cli/jev_cli.zig");
+const jev_config = @import("../decisions/jev_config.zig");
+const provider_keys = @import("../auth/provider_keys.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -149,7 +152,7 @@ fn formatMcpIssuerMismatch(
             try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
             try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
             try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-            try out.writer.writeAll("} to this server's entry in ~/.abc/mcp.json and retry.");
+            try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
         },
         .authorization_response => {
             try out.writer.writeAll(" but the authorization response returned issuer ");
@@ -389,6 +392,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
+                .handle_jev = commandHandleJev,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
@@ -2036,6 +2040,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleJev(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleJevCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -3893,6 +3902,77 @@ fn parseSoundLevel(value: []const u8) ?SoundLevel {
     return null;
 }
 
+const JevCommand = enum { status, on, off };
+
+fn parseJevCommand(rest: []const u8) ?JevCommand {
+    const arg = std.mem.trim(u8, rest, " \t");
+    if (arg.len == 0) return .status;
+    if (std.mem.eql(u8, arg, "on")) return .on;
+    if (std.mem.eql(u8, arg, "off")) return .off;
+    return null;
+}
+
+/// `/jev` shows Jev's status; `/jev on|off` saves `jev.enabled` and applies it
+/// to this session when its handlers were registered at startup.
+fn handleJevCommand(app: anytype, rest: []const u8) !void {
+    const command = parseJevCommand(rest) orelse {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /jev [on|off]" }, true);
+        return;
+    };
+    const gate = if (comptime @hasField(@TypeOf(app.*), "jev_gate")) (if (app.jev_gate) |*value| value else null) else null;
+    if (command == .status) {
+        var config = try jev_config.load(app.alloc);
+        defer config.deinit(app.alloc);
+        if (gate) |live| {
+            if (live.registered()) config.enabled = live.isActive();
+        }
+        var key = try jev_config.loadApiKey(app.alloc);
+        defer if (key) |*value| value.deinit(app.alloc);
+        const key_status: jev_cli.KeyStatus = if (key) |value| switch (value.source) {
+            .environment => .environment,
+            .saved => .{ .saved = provider_keys.backendLabel() },
+        } else .missing;
+        const text = try jev_cli.renderStatus(app.alloc, config, key_status, "/jev on");
+        defer app.alloc.free(text);
+        try app.writeDomainNotice(.{ .topic = "jev", .tone = .information, .body = std.mem.trimEnd(u8, text, "\n") }, true);
+        return;
+    }
+
+    const enable = command == .on;
+    var applied_live = false;
+    if (gate) |live| {
+        if (live.registered()) {
+            live.setActive(enable);
+            applied_live = true;
+        }
+    }
+    var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .jev_enabled = enable });
+    defer attempt.deinit(app.alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            const body = try std.fmt.allocPrint(app.alloc, "Could not save Jev settings: {s}", .{@errorName(failure.err)});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "jev", .tone = .@"error", .body = body }, true);
+            return;
+        },
+        .outcome => {},
+    }
+    const body = if (!enable)
+        "Jev decisions are off."
+    else if (applied_live)
+        "Jev decisions are on."
+    else
+        "Jev decisions are on for new sessions. Restart fx to use them here.";
+    try app.writeDomainNotice(.{ .topic = "jev", .tone = .success, .body = body }, true);
+}
+
+test "parseJevCommand accepts status, on and off" {
+    try std.testing.expectEqual(JevCommand.status, parseJevCommand("").?);
+    try std.testing.expectEqual(JevCommand.on, parseJevCommand(" on ").?);
+    try std.testing.expectEqual(JevCommand.off, parseJevCommand("off").?);
+    try std.testing.expect(parseJevCommand("maybe") == null);
+}
+
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
     const current = app.notificationPreferences();
     const level: SoundLevel = switch (parseSoundCommand(rest)) {
@@ -5528,12 +5608,12 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempSkillFile(&tmp, "home/.abc/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
+    try writeTempSkillFile(&tmp, "home/.fx/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
     try writeTempSkillFile(&tmp, "home/workspace/.agents/skills/review/SKILL.md", "---\nname: review\n---\nworkspace body\n");
 
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.abc/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.abc/skills/review");
+    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills/review");
     defer alloc.free(managed_skill);
     const workspace_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/.agents/skills/review");
     defer alloc.free(workspace_skill);
@@ -5565,7 +5645,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), "home/.abc/skills/review", .{}),
+        tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),
     );
     try tmp.dir.access(io_mod.getIo(), "home/workspace/.agents/skills/review/SKILL.md", .{});
 }

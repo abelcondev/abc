@@ -9489,6 +9489,8 @@ fn processQueuedPromptLoop(
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
                     .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -9547,6 +9549,8 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,
@@ -9607,13 +9611,18 @@ fn processQueuedPromptLoop(
                 } };
                 continue;
             }
-            prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallForLifecycle(
+            prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallInTurn(
                 arena,
                 lifecycle,
                 config.cancel_flag,
                 turn_id,
                 current_step_index,
                 tool_call,
+                .{
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
+                    .assistant_text = completion.content orelse "",
+                },
             ) catch |err| {
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
@@ -12280,6 +12289,8 @@ fn processQueuedPromptLoop(
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
                     .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -12324,6 +12335,8 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,

@@ -11,7 +11,7 @@ import re
 import shutil
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.fx import Mapping, Sequence
 
 from scripts.pgso.corpus import (
     Corpus,

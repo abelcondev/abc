@@ -7,7 +7,7 @@ import os
 import pathlib
 import shutil
 import sys
-from collections.abc import Mapping, Sequence
+from collections.fx import Mapping, Sequence
 
 from scripts.pgso.corpus import load_corpus, run_behavior_corpus, run_corpus
 from scripts.pgso.model import BuildIdentity, PgsoError, profile_evidence, sha256_file

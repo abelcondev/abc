@@ -8,6 +8,8 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const jev_cli = @import("jev_cli.zig");
+const jev_config = @import("../decisions/jev_config.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -74,6 +76,7 @@ pub const Command = union(enum) {
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
+    jev: []const [:0]const u8,
     doctor: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -240,41 +243,41 @@ const self_update_script =
     \\set -eu
     \\current="$1"; install_dir="$2"; repo="abelcondev/abc"
     \\latest="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
-    \\if [ -z "$latest" ]; then echo "abc update: could not read the latest release" >&2; exit 1; fi
-    \\if [ "$latest" = "v$current" ]; then echo "abc $current is up to date."; exit 0; fi
-    \\echo "Updating abc $current -> ${latest#v}"
-    \\curl -fsSL "https://raw.githubusercontent.com/$repo/$latest/install.sh" | ABC_UPDATING=1 ABC_VERSION="$latest" ABC_INSTALL_DIR="$install_dir" sh
+    \\if [ -z "$latest" ]; then echo "fx update: could not read the latest release" >&2; exit 1; fi
+    \\if [ "$latest" = "v$current" ]; then echo "fx $current is up to date."; exit 0; fi
+    \\echo "Updating fx $current -> ${latest#v}"
+    \\curl -fsSL "https://raw.githubusercontent.com/$repo/$latest/install.sh" | FX_UPDATING=1 FX_VERSION="$latest" FX_INSTALL_DIR="$install_dir" sh
 ;
 
-/// `abc update`: reinstall the latest GitHub release over this binary with the
+/// `fx update`: reinstall the latest GitHub release over this binary with the
 /// same installer the README documents. Development builds are left alone.
 fn runSelfUpdate(alloc: Allocator, cfg: Config, deps: RunDeps) !RunResult {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = std.process.executablePath(io_mod.getIo(), &path_buffer) catch {
-        try writeStderr(deps, "abc update: could not locate the running binary\n");
+        try writeStderr(deps, "fx update: could not locate the running binary\n");
         return .handled_failure;
     };
     const exe_path = path_buffer[0..length];
     if (std.mem.find(u8, exe_path, "/zig-out/bin/") != null) {
-        try writeStderr(deps, "abc update: this is a development build; pull and run `zig build` instead\n");
+        try writeStderr(deps, "fx update: this is a development build; pull and run `zig build` instead\n");
         return .handled_failure;
     }
     const install_dir = std.fs.path.dirname(exe_path) orelse {
-        try writeStderr(deps, "abc update: could not locate the install directory\n");
+        try writeStderr(deps, "fx update: could not locate the install directory\n");
         return .handled_failure;
     };
     _ = alloc;
     var child = std.process.spawn(io_mod.getIo(), .{
-        .argv = &.{ "/bin/sh", "-c", self_update_script, "abc-update", cfg.version, install_dir },
+        .argv = &.{ "/bin/sh", "-c", self_update_script, "fx-update", cfg.version, install_dir },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch {
-        try writeStderr(deps, "abc update: could not start the installer\n");
+        try writeStderr(deps, "fx update: could not start the installer\n");
         return .handled_failure;
     };
     const term = child.wait(io_mod.getIo()) catch {
-        try writeStderr(deps, "abc update: the installer did not finish\n");
+        try writeStderr(deps, "fx update: the installer did not finish\n");
         return .handled_failure;
     };
     return if (term == .exited and term.exited == 0) .handled_success else .handled_failure;
@@ -293,14 +296,14 @@ fn connectionKeyTarget(alloc: Allocator, rest: []const [:0]const u8) !?[]u8 {
 
 fn runConnectionKeyLogin(alloc: Allocator, cfg: Config, deps: RunDeps, target: []const u8) !RunResult {
     const key = readConnectionKey(alloc, deps, target) catch |err| {
-        const text = try std.fmt.allocPrint(alloc, "abc login: could not read the key: {s}\n", .{@errorName(err)});
+        const text = try std.fmt.allocPrint(alloc, "fx login: could not read the key: {s}\n", .{@errorName(err)});
         defer alloc.free(text);
         try writeStderr(deps, text);
         return .handled_failure;
     };
     defer secret.zeroAndFree(alloc, key);
     provider_keys.store(alloc, target, key) catch |err| {
-        const text = try std.fmt.allocPrint(alloc, "abc login: could not save the {s} key: {s}\n", .{ target, @errorName(err) });
+        const text = try std.fmt.allocPrint(alloc, "fx login: could not save the {s} key: {s}\n", .{ target, @errorName(err) });
         defer alloc.free(text);
         try writeStderr(deps, text);
         return .handled_failure;
@@ -674,6 +677,9 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'i' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .issue)) return .{ .issue = args[1..] };
+        },
+        'j' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .jev)) return .{ .jev = args[1..] };
         },
         'l' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .login)) return .{ .login = args[1..] };
@@ -1260,7 +1266,7 @@ fn runNonInteractiveWithDeps(
             if (try connectionKeyTarget(alloc, rest)) |target| {
                 defer alloc.free(target);
                 const existed = provider_keys.delete(alloc, target) catch |err| {
-                    const text = try std.fmt.allocPrint(alloc, "abc logout: could not remove the saved {s} key: {s}\n", .{ target, @errorName(err) });
+                    const text = try std.fmt.allocPrint(alloc, "fx logout: could not remove the saved {s} key: {s}\n", .{ target, @errorName(err) });
                     defer alloc.free(text);
                     try writeStderr(deps, text);
                     return .handled_failure;
@@ -1933,11 +1939,12 @@ fn runNonInteractiveWithDeps(
         },
         .upgrade => |rest| {
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: abc update\n");
+                try writeStderr(deps, "usage: fx update\n");
                 return .handled_failure;
             }
             return runSelfUpdate(alloc, cfg, deps);
         },
+        .jev => |rest| return runJev(alloc, deps, rest),
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
@@ -2033,6 +2040,125 @@ fn runGithubWorkflow(
     try writeStdout(deps, published.text);
     try writeStdout(deps, "\n");
     return .handled_success;
+}
+
+fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    if (rest.len != 0 and std.mem.eql(u8, rest[0], "drift")) return runJevDrift(alloc, deps, rest[1..]);
+    const parsed = jev_cli.parseAction(rest) orelse {
+        try writeStderr(deps, jev_cli.usage);
+        return .handled_failure;
+    };
+    const action = parsed.action;
+    switch (action) {
+        .on, .off => {
+            var outcome = config_runtime.setUserPreferences(alloc, .{ .jev_enabled = action == .on }) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            try writeStdout(deps, if (action == .on) "Jev decisions are on for new sessions.\n" else "Jev decisions are off.\n");
+            return .handled_success;
+        },
+        .key => {
+            const key = readConnectionKey(alloc, deps, "TypeSafe (Jev)") catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not read the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            defer secret.zeroAndFree(alloc, key);
+            provider_keys.store(alloc, jev_config.key_id, key) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not save the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            const saved = try std.fmt.allocPrint(alloc, "Saved the Jev key in the {s}. Run `fx jev check` to test it.\n", .{provider_keys.backendLabel()});
+            defer alloc.free(saved);
+            try writeStdout(deps, saved);
+            return .handled_success;
+        },
+        .forget => {
+            const removed = provider_keys.delete(alloc, jev_config.key_id) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not remove the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            try writeStdout(deps, if (removed) "Removed the saved Jev key.\n" else "No Jev key was saved.\n");
+            return .handled_success;
+        },
+        .status, .check, .eval => {},
+        .drift => unreachable,
+    }
+    var config = try jev_config.load(alloc);
+    defer config.deinit(alloc);
+    var key = try jev_config.loadApiKey(alloc);
+    defer if (key) |*value| value.deinit(alloc);
+    if (action == .status) {
+        const status: jev_cli.KeyStatus = if (key) |value| switch (value.source) {
+            .environment => .environment,
+            .saved => .{ .saved = provider_keys.backendLabel() },
+        } else .missing;
+        const text = try jev_cli.renderStatus(alloc, config, status, "fx jev on");
+        defer alloc.free(text);
+        try writeStdout(deps, text);
+        return .handled_success;
+    }
+    const api_key = if (key) |value| value.value else {
+        try writeStderr(deps, "fx jev: no key; run `fx jev key` or export " ++ jev_config.key_env ++ "\n");
+        return .handled_failure;
+    };
+    if (action == .eval) {
+        var failures: usize = 0;
+        const report = jev_cli.evaluate(alloc, config, api_key, parsed.gate, &failures) catch |err| {
+            const text = try std.fmt.allocPrint(alloc, "fx jev: eval failed: {s}\n", .{@errorName(err)});
+            defer alloc.free(text);
+            try writeStderr(deps, text);
+            return .handled_failure;
+        };
+        defer alloc.free(report);
+        try writeStdout(deps, report);
+        return if (failures == 0) .handled_success else .handled_failure;
+    }
+    const summary = jev_cli.check(alloc, config, api_key) catch |err| {
+        const text = try std.fmt.allocPrint(alloc, "fx jev: check failed: {s}\n", .{@errorName(err)});
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    defer alloc.free(summary);
+    try writeStdout(deps, summary);
+    return .handled_success;
+}
+
+fn runJevDrift(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    const options = jev_cli.parseDrift(rest) orelse {
+        try writeStderr(deps, jev_cli.usage);
+        return .handled_failure;
+    };
+    var config = try jev_config.load(alloc);
+    defer config.deinit(alloc);
+    var key = (try jev_config.loadApiKey(alloc)) orelse {
+        try writeStderr(deps, "fx jev: no key; run `fx jev key` or export " ++ jev_config.key_env ++ "\n");
+        return .handled_failure;
+    };
+    defer key.deinit(alloc);
+    var flagged: usize = 0;
+    const report = jev_cli.drift(alloc, config, key.value, options, &flagged) catch |err| {
+        const text = switch (err) {
+            error.NoDecisionsDirectory => try alloc.dupe(u8, "fx jev drift: no decisions directory found (sdd/decisions, docs/decisions, docs/adr, decisions); pass --dir\n"),
+            else => try std.fmt.allocPrint(alloc, "fx jev drift: {s}\n", .{@errorName(err)}),
+        };
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    defer alloc.free(report);
+    try writeStdout(deps, report);
+    return if (flagged == 0) .handled_success else .handled_failure;
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
@@ -2783,7 +2909,7 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.abc/mcp.json warning: {s}",
+        "fx: ~/.fx/mcp.json warning: {s}",
         .{@tagName(warning.cause)},
     );
     if (warning.key()) |key| {
@@ -4642,7 +4768,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "abc v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -4672,7 +4798,7 @@ test "top-level MCP add mutates through the focused provider without startup" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
     try std.testing.expectEqualStrings(
-        "Saved MCP server 'fixture' to /tmp/test-home/.abc/mcp.json.\n",
+        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -4724,7 +4850,7 @@ test "top-level MCP list loads configuration without discovery and remove uses i
         try std.testing.expectEqual(RunResult.handled_success, result);
         try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
         try std.testing.expectEqualStrings(
-            "Removed MCP server 'fixture' from /tmp/test-home/.abc/mcp.json.\n",
+            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
             capture.stdout.written(),
         );
         try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -5027,7 +5153,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "abc v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -5324,7 +5450,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\nabc v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\nfx v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5335,7 +5461,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\nabc v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\nfx v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {
@@ -5491,7 +5617,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"No model provider is set up. Run `abc login deepseek` (or another preset) to save its API key, or export the key variable.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"No model provider is set up. Run `fx login deepseek` (or another preset) to save its API key, or export the key variable.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5556,7 +5682,7 @@ test "status and doctor inspect MCP configuration once per command" {
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.abc/mcp.json: McpConfigInvalidJson\"",
+        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
     ) != null);
 }
 
@@ -5580,7 +5706,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"No model provider is set up. Run `abc login deepseek` (or another preset) to save its API key, or export the key variable.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"No model provider is set up. Run `fx login deepseek` (or another preset) to save its API key, or export the key variable.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -5761,7 +5887,7 @@ fn captureMcpProfileAddForTest(
         .http => return error.TestUnexpectedResult,
     }
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.abc/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
     };
 }
 
@@ -5772,7 +5898,7 @@ fn captureMcpProfileRemoveForTest(
     mcp_profile_remove_calls_for_test += 1;
     try std.testing.expectEqualStrings("fixture", name);
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.abc/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
         .removed = true,
     };
 }

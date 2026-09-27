@@ -4493,7 +4493,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     try h.flush();
 
     try expectGridContains(&h, "Run /help for commands");
-    try expectGridContains(&h, "abc v");
+    try expectGridContains(&h, "fx v");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
 }
@@ -4522,7 +4522,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
 
     try std.testing.expect(h.shell.last_visible_transcript_split_active);
     try std.testing.expect(h.shell.last_visible_transcript_split_suffix_start_line > h.shell.last_visible_transcript_split_prefix_lines);
-    try expectGridContains(&h, "abc v");
+    try expectGridContains(&h, "fx v");
     try expectGridContains(&h, "Run /help for commands");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
@@ -5175,7 +5175,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     try h.flush();
 
     const status_row = try findRowContaining(&h, "tail status line");
-    try expectGridContains(&h, "abc v");
+    try expectGridContains(&h, "fx v");
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Reading pinned tail");
@@ -6329,7 +6329,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 34 · type to filter");
+    try expectGridContains(&h, "Commands 35 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -6350,7 +6350,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 34");
+    try expectGridNotContains(&h, "Commands 35");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 

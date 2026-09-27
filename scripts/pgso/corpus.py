@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.fx import Callable, Iterator, Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import merge_profile_batch

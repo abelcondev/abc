@@ -1409,7 +1409,7 @@ test "symlinked durable home is rejected before prompt history reads or writes" 
     tmp.dir.symLink(
         io_mod.getIo(),
         "../outside",
-        "home/.abc",
+        "home/.fx",
         .{ .is_directory = true },
     ) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,

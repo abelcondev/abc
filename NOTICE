@@ -1,5 +1,5 @@
-abc
-Copyright 2026 abc contributors
+fx (model-agnostic fork)
+Copyright 2026 fork contributors
 
 This product is a modified version of fx (https://github.com/vercel-labs/fx),
 forked from commit 59bf437 (2025-2026 history preserved in git).
@@ -7,5 +7,5 @@ fx is Copyright 2025 Vercel, Inc. and licensed under the Apache License,
 Version 2.0. Files in this repository may have been modified from the
 original fx sources; see the git history for the changes.
 
-"fx" and "Vercel" are trademarks of their respective owners. abc is not
+"fx" and "Vercel" are trademarks of their respective owners. This fork is not
 affiliated with or endorsed by Vercel, Inc.

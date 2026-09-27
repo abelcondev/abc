@@ -23,6 +23,8 @@ pub const StopCheckpoint = struct {
     assistant_text: []const u8,
     provider_disposition: types.ProviderCompletionDisposition,
     can_continue: bool,
+    user_request: []const u8 = "",
+    turn_messages: []const types.ChatMessage = &.{},
 };
 
 pub const PostTurnEndCheckpoint = struct {
@@ -40,6 +42,14 @@ const PreToolUseCheckpoint = struct {
     turn_id: u64,
     step_index: usize,
     call: ToolCall,
+    turn: TurnContext = .{},
+};
+
+/// Turn context offered to PreToolUse handlers.
+pub const TurnContext = struct {
+    user_request: []const u8 = "",
+    turn_messages: []const types.ChatMessage = &.{},
+    assistant_text: []const u8 = "",
 };
 
 pub const PreparedToolBlockKind = enum {
@@ -261,6 +271,18 @@ pub noinline fn prepareToolCallForLifecycle(
     step_index: usize,
     call: ToolCall,
 ) !PreparedToolCall {
+    return prepareToolCallInTurn(result_allocator, lifecycle, cancel_flag, turn_id, step_index, call, .{});
+}
+
+pub noinline fn prepareToolCallInTurn(
+    result_allocator: Allocator,
+    lifecycle: LifecycleContext,
+    cancel_flag: ?*std.atomic.Value(bool),
+    turn_id: u64,
+    step_index: usize,
+    call: ToolCall,
+    turn: TurnContext,
+) !PreparedToolCall {
     return prepareToolCallFromCheckpoint(
         result_allocator,
         lifecycle,
@@ -269,6 +291,7 @@ pub noinline fn prepareToolCallForLifecycle(
             .turn_id = turn_id,
             .step_index = step_index,
             .call = call,
+            .turn = turn,
         },
     );
 }
@@ -341,6 +364,8 @@ pub fn dispatchStopCheckpoint(
             .assistant_text = checkpoint.assistant_text,
             .provider_disposition = checkpoint.provider_disposition,
             .can_continue = checkpoint.can_continue,
+            .user_request = checkpoint.user_request,
+            .turn_messages = checkpoint.turn_messages,
         },
     );
     errdefer outcome.deinit(lifecycle.outcome_allocator);
@@ -407,6 +432,9 @@ fn preToolUseInputFromCheckpoint(scope: hooks.Scope, checkpoint: PreToolUseCheck
         .call_id = checkpoint.call.id,
         .tool_name = checkpoint.call.name,
         .arguments_json = checkpoint.call.arguments_json,
+        .user_request = checkpoint.turn.user_request,
+        .turn_messages = checkpoint.turn.turn_messages,
+        .assistant_text = checkpoint.turn.assistant_text,
     };
 }
 
