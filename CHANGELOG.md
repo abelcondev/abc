@@ -1,8 +1,26 @@
 # fx
 
-## 0.3.0
+## 0.3.1
 
 <!-- release:start -->
+
+**Smoother spec-driven development: fewer interruptions while a change waits for your approval, and specs that fill in as changes land.**
+
+### Improvements
+
+- **Specs grow with each change:** After the first code change under an approved change, the agent ticks the change's tasks and writes the behavior it added as rules in `sdd/specs`. `/sdd done` also points out when there are no rules yet.
+- **Held, not failed:** Calls a Jev or SDD check holds now show as "Held" in the transcript instead of "Failed".
+- **Jev status:** `fx jev` and `/jev` list the SDD routing and test-first checks.
+
+### Bug Fixes
+
+- **Waiting for approval:** A turn that stops to ask you to approve a change, or to ask you anything, is no longer sent back by the completion check.
+- **Proposals need no plan:** Writing a proposal or spec under `sdd/` is no longer held for a plan.
+- **Approval stays yours:** When the agent runs `fx sdd approve` or `fx sdd done` itself, fx holds the command; your reply approves the change, and you close it with `/sdd done`.
+<!-- release:end -->
+
+## 0.3.0
+
 
 **fx now runs a lightweight spec-driven development process when you want it: specs that describe how the system behaves today, one file per change, and Jev deciding how much process each request needs.**
 
@@ -20,7 +38,6 @@
 ### Bug Fixes
 
 - **Completion check:** A final answer that claims tests pass while the test output shows failures is no longer excused as a reported blocker.
-<!-- release:end -->
 
 ## 0.2.0
 
