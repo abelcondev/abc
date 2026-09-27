@@ -1,6 +1,6 @@
 //! Persisted workspace file index for instant @-completion on launch.
 //!
-//! One file per workspace scope under `<home>/.abc/file-index/<sha>.idx`:
+//! One file per workspace scope under `<home>/.fx/file-index/<sha>.idx`:
 //! magic + SHA-256 of the payload + JSON payload listing the scope roots and
 //! every indexed path with its kind. Freshness is advisory only: a background
 //! rescan always follows a cache load and replaces it, and the index is a
@@ -58,7 +58,7 @@ fn cacheKeyHex(alloc: Allocator, roots: []const []const u8) ![]u8 {
 fn cachePath(alloc: Allocator, home: []const u8, roots: []const []const u8) ![]u8 {
     const key = try cacheKeyHex(alloc, roots);
     defer alloc.free(key);
-    return try std.fmt.allocPrint(alloc, "{s}/.abc/file-index/{s}.idx", .{ home, key });
+    return try std.fmt.allocPrint(alloc, "{s}/.fx/file-index/{s}.idx", .{ home, key });
 }
 
 /// Loads the persisted index for `roots` under `$HOME`, or null when absent,

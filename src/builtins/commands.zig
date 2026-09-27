@@ -252,7 +252,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "update",
         .aliases = &.{ "upgrade", "--update" },
         .usage = "update",
-        .summary = "Update abc to the latest release",
+        .summary = "Update fx to the latest release",
     },
     .{
         .kind = .replay,
@@ -325,7 +325,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "update", .summary = "Update abc to the latest release" },
+        .{ .kind = .upgrade, .usage = "update", .summary = "Update fx to the latest release" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },

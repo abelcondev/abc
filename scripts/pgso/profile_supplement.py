@@ -7,7 +7,7 @@ import os
 import pathlib
 import re
 import uuid
-from collections.abc import Sequence
+from collections.fx import Sequence
 
 from scripts.pgso.model import PgsoError
 from scripts.pgso.runner import run_checked

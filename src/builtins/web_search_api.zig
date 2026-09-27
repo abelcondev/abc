@@ -1,9 +1,9 @@
 //! Web search through a search API, usable with any model provider.
 //!
 //! Backends are enabled by environment: TAVILY_API_KEY, BRAVE_API_KEY
-//! (Brave Search API subscription token), or ABC_SEARXNG_URL pointing at a
+//! (Brave Search API subscription token), or FX_SEARXNG_URL pointing at a
 //! SearXNG instance with the JSON format enabled. When several are set they
-//! are preferred in that order; ABC_WEB_SEARCH_BACKEND=tavily|brave|searxng
+//! are preferred in that order; FX_WEB_SEARCH_BACKEND=tavily|brave|searxng
 //! pins one.
 
 const std = @import("std");
@@ -101,7 +101,7 @@ pub fn withFallback(comptime fallback: web_search_provider.Provider) web_search_
         };
 
         fn preferred(context: ?*anyopaque) !?[]const BackendId {
-            if (nonEmptyEnv("ABC_WEB_SEARCH_BACKEND") != null or available()) return preferredBackends(null);
+            if (nonEmptyEnv("FX_WEB_SEARCH_BACKEND") != null or available()) return preferredBackends(null);
             return fallback.preferred_backends_fn(context);
         }
 
@@ -137,7 +137,7 @@ fn backendConfigured(backend: Backend) bool {
     return switch (backend) {
         .tavily => nonEmptyEnv("TAVILY_API_KEY") != null,
         .brave => nonEmptyEnv("BRAVE_API_KEY") != null,
-        .searxng => nonEmptyEnv("ABC_SEARXNG_URL") != null,
+        .searxng => nonEmptyEnv("FX_SEARXNG_URL") != null,
     };
 }
 
@@ -155,7 +155,7 @@ fn availableMask() usize {
 }
 
 fn preferredBackends(_: ?*anyopaque) !?[]const BackendId {
-    if (nonEmptyEnv("ABC_WEB_SEARCH_BACKEND")) |pinned| {
+    if (nonEmptyEnv("FX_WEB_SEARCH_BACKEND")) |pinned| {
         inline for (@typeInfo(Backend).@"enum".fields) |field| {
             if (std.ascii.eqlIgnoreCase(pinned, field.name)) return single_backend[field.value];
         }
@@ -293,7 +293,7 @@ fn searchBackend(arena: Allocator, backend: Backend, request: web_search_contrac
             break :blk try parseHits(arena, result.body, &.{ "web", "results" }, "description");
         },
         .searxng => blk: {
-            const base = nonEmptyEnv("ABC_SEARXNG_URL") orelse return error.MissingSearchApiKey;
+            const base = nonEmptyEnv("FX_SEARXNG_URL") orelse return error.MissingSearchApiKey;
             const trimmed = std.mem.trimEnd(u8, base, "/");
             const url = try std.fmt.allocPrint(arena, "{s}/search?format=json&q={f}", .{ trimmed, queryEscape(request.query) });
             var result = try send(request, &.{

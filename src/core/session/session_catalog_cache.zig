@@ -615,7 +615,7 @@ test "actionable catalog preserves discovery and child visibility" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.abc");
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
     try tmp.dir.createDirPath(std.testing.io, "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -742,7 +742,7 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.abc/sessions/legacy-old");
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/legacy-old");
     try tmp.dir.createDirPath(std.testing.io, "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -751,7 +751,7 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     // Oldest persisted format: a schema v2 snapshot with no event log.
     const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
     defer alloc.free(manifest);
-    var file = try tmp.dir.createFile(std.testing.io, "home/.abc/sessions/legacy-old/session.json", .{});
+    var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
     try file.writeStreamingAll(std.testing.io, manifest);
     file.close(std.testing.io);
 
@@ -789,7 +789,7 @@ test "a summary outside the row contract stays listed without disabling the inde
         .{ .id = "legacy-ok", .created_at_ms = 1, .updated_at_ms = 2 },
         .{ .id = "clock-skewed", .created_at_ms = 2000, .updated_at_ms = 1000 },
     }) |snapshot| {
-        const dir_path = try std.fmt.allocPrint(alloc, "home/.abc/sessions/{s}", .{snapshot.id});
+        const dir_path = try std.fmt.allocPrint(alloc, "home/.fx/sessions/{s}", .{snapshot.id});
         defer alloc.free(dir_path);
         try tmp.dir.createDirPath(std.testing.io, dir_path);
         const path = try std.fmt.allocPrint(alloc, "{s}/session.json", .{dir_path});
@@ -817,7 +817,7 @@ test "a summary outside the row contract stays listed without disabling the inde
         try std.testing.expect(!saved.contains("clock-skewed"));
     }
     // The next listing reuses the saved row and leaves the index untouched.
-    const index_path = "home/.abc/sessions/.resume-catalog";
+    const index_path = "home/.fx/sessions/.resume-catalog";
     const before = try tmp.dir.statFile(std.testing.io, index_path, .{});
     var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer again.deinit(alloc);
@@ -830,7 +830,7 @@ test "actionable catalog lists an interrupted legacy upgrade without caching it"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.abc/sessions/fenced");
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/fenced");
     try tmp.dir.createDirPath(std.testing.io, "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -838,9 +838,9 @@ test "actionable catalog lists an interrupted legacy upgrade without caching it"
     defer alloc.free(workspace);
     const snapshot = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"fenced\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
     defer alloc.free(snapshot);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.abc/sessions/fenced/session.legacy.json", .data = snapshot });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.abc/sessions/fenced/authority.pending.json", .data = "pending" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.abc/sessions/fenced/session.json", .data = "interrupted replacement" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.legacy.json", .data = snapshot });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/authority.pending.json", .data = "pending" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.json", .data = "interrupted replacement" });
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
@@ -863,7 +863,7 @@ test "actionable catalog lists an unverifiable child marker without caching it" 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.abc");
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
     try tmp.dir.createDirPath(std.testing.io, "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -884,8 +884,8 @@ test "actionable catalog lists an unverifiable child marker without caching it" 
         .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
     });
     writable.deinit(alloc);
-    try tmp.dir.createDir(std.testing.io, "home/.abc/sessions/unverified/subagent", .fromMode(0o700));
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.abc/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = .fromMode(0o600) } });
+    try tmp.dir.createDir(std.testing.io, "home/.fx/sessions/unverified/subagent", .fromMode(0o700));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = .fromMode(0o600) } });
 
     var writer = (try Writer.init(store)).?;
     defer writer.deinit();
