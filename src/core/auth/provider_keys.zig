@@ -1,9 +1,11 @@
-//! API keys saved with `abc login <provider>` for configured connections.
+//! API keys saved with `fx login <provider>` for configured connections.
 //!
 //! macOS keeps each key in the login Keychain under the service
-//! `ABC_PROVIDER_KEY_<id>`; other platforms (or a disabled Keychain) use an
-//! owner-only file at `~/.abc/provider-keys/<id>`. An exported environment
-//! variable always takes precedence over a saved key.
+//! `FX_PROVIDER_KEY_<id>`; other platforms (or a disabled Keychain) use an
+//! owner-only file at `~/.fx/provider-keys/<id>`. An exported environment
+//! variable always takes precedence over a saved key. Keys saved while the
+//! fork was named abc (service `ABC_PROVIDER_KEY_<id>`) move to the current
+//! service the first time they are read.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,7 +29,7 @@ pub const Error = Allocator.Error || error{
 
 /// Where `store` puts keys right now.
 pub fn backendLabel() []const u8 {
-    return if (useKeychain()) "macOS Keychain" else "profile file ~/.abc/provider-keys";
+    return if (useKeychain()) "macOS Keychain" else "profile file ~/.fx/provider-keys";
 }
 
 fn useKeychain() bool {
@@ -36,7 +38,25 @@ fn useKeychain() bool {
 
 fn serviceName(buffer: []u8, id: []const u8) Error![]const u8 {
     configured_provider.validate_id(id) catch return error.InvalidProviderKey;
+    return std.fmt.bufPrint(buffer, "FX_PROVIDER_KEY_{s}", .{id}) catch error.InvalidProviderKey;
+}
+
+fn legacyServiceName(buffer: []u8, id: []const u8) Error![]const u8 {
+    configured_provider.validate_id(id) catch return error.InvalidProviderKey;
     return std.fmt.bufPrint(buffer, "ABC_PROVIDER_KEY_{s}", .{id}) catch error.InvalidProviderKey;
+}
+
+/// Reads a key saved under the abc-era service and moves it to `service`.
+fn migrateLegacyKeychain(alloc: Allocator, id: []const u8, service: []const u8) Error!?[]u8 {
+    var buffer: [128]u8 = undefined;
+    const legacy = try legacyServiceName(&buffer, id);
+    const key = (keychain.loadService(alloc, legacy) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    }) orelse return null;
+    keychain.storeService(service, key) catch return key;
+    _ = keychain.deleteService(alloc, legacy) catch false;
+    return key;
 }
 
 /// A key must be one line of visible ASCII, like an HTTP bearer token.
@@ -70,10 +90,11 @@ pub fn load(alloc: Allocator, id: []const u8) Error!?[]u8 {
     var buffer: [128]u8 = undefined;
     const service = try serviceName(&buffer, id);
     if (useKeychain()) {
-        return keychain.loadService(alloc, service) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.ProviderKeyReadFailed,
+        const key = keychain.loadService(alloc, service) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProviderKeyReadFailed,
         };
+        return key orelse try migrateLegacyKeychain(alloc, id, service);
     }
     return loadFile(alloc, id);
 }
@@ -162,6 +183,6 @@ test "provider keys accept bearer-shaped values only" {
     try std.testing.expectError(error.InvalidProviderKey, validate("sk abc"));
     try std.testing.expectError(error.InvalidProviderKey, validate("sk-\n"));
     var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("ABC_PROVIDER_KEY_deepseek", try serviceName(&buffer, "deepseek"));
+    try std.testing.expectEqualStrings("FX_PROVIDER_KEY_deepseek", try serviceName(&buffer, "deepseek"));
     try std.testing.expectError(error.InvalidProviderKey, serviceName(&buffer, "../etc"));
 }

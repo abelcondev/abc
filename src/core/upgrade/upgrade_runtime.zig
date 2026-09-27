@@ -40,7 +40,7 @@ pub fn run(
     channel: update_target.Channel,
     format: output_contracts.OutputFormat,
 ) RunResult {
-    // abc has no release CDN yet; the upstream CDN would replace this binary with fx.
+    // This fork has no release CDN; the upstream CDN would replace it with upstream fx.
     _ = alloc;
     _ = format;
     return failureResult(current, channel, error.UpgradesDisabled);
@@ -135,7 +135,7 @@ fn failureResult(
 
 fn failureMessage(err: RunError) []const u8 {
     return switch (err) {
-        error.UpgradesDisabled => "upgrades are disabled in abc; rebuild from source",
+        error.UpgradesDisabled => "upgrades are disabled in fx; rebuild from source",
         error.FetchFailed => "failed to fetch latest version from CDN",
         error.DownloadFailed => "failed to download release archive",
         error.ChecksumFetchFailed => "failed to fetch checksum from CDN",

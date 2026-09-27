@@ -49,22 +49,22 @@ jobs:
 
       - name: Smoke test
         if: matrix.name == 'macos-aarch64'
-        run: ./zig-out/bin/abc --version
+        run: ./zig-out/bin/fx --version
 
       - name: Package
         run: |
-          package_dir="$RUNNER_TEMP/abc-${{ matrix.name }}"
+          package_dir="$RUNNER_TEMP/fx-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/abc LICENSE NOTICE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "abc-${{ matrix.name }}.tar.gz" -C "$package_dir" abc LICENSE NOTICE THIRD_PARTY_NOTICES.md
-          shasum -a 256 "abc-${{ matrix.name }}.tar.gz" > "abc-${{ matrix.name }}.tar.gz.sha256"
+          cp zig-out/bin/fx LICENSE NOTICE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "fx-${{ matrix.name }}.tar.gz" -C "$package_dir" fx LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          shasum -a 256 "fx-${{ matrix.name }}.tar.gz" > "fx-${{ matrix.name }}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: abc-${{ matrix.name }}
+          name: fx-${{ matrix.name }}
           path: |
-            abc-${{ matrix.name }}.tar.gz
-            abc-${{ matrix.name }}.tar.gz.sha256
+            fx-${{ matrix.name }}.tar.gz
+            fx-${{ matrix.name }}.tar.gz.sha256
 
   publish:
     name: Publish release
@@ -83,6 +83,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "abc $GITHUB_REF_NAME" \
+            --title "fx $GITHUB_REF_NAME" \
             --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh\`" \
             --verify-tag

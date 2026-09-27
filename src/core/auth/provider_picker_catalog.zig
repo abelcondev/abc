@@ -111,7 +111,7 @@ pub fn parseMethod(value: []const u8) ?Method {
 }
 
 /// Writes the visible provider slugs into `out` and returns how many landed.
-/// abc lists only the connection presets; the Vercel AI Gateway stays
+/// fx lists only the connection presets; the Vercel AI Gateway stays
 /// reachable by name (`/provider vercel`) but is not offered. WASM hosts,
 /// which cannot use presets, still list the built-in providers.
 pub fn providerOptions(out: *[max_provider_options][]const u8) usize {

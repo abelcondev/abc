@@ -1,25 +1,25 @@
 #!/bin/sh
-# Install abc (macOS, Apple Silicon or Intel) from GitHub Releases.
+# Install fx (macOS, Apple Silicon or Intel) from GitHub Releases.
 #
 #   curl -fsSL https://raw.githubusercontent.com/abelcondev/abc/main/install.sh | sh
 #
 # Environment:
-#   ABC_VERSION      release tag to install (default: latest), e.g. v0.1.0
-#   ABC_INSTALL_DIR  destination directory (default: ~/.local/bin)
+#   FX_VERSION      release tag to install (default: latest), e.g. v0.1.0
+#   FX_INSTALL_DIR  destination directory (default: ~/.local/bin)
 set -eu
 
 repo="abelcondev/abc"
-version="${ABC_VERSION:-latest}"
-install_dir="${ABC_INSTALL_DIR:-$HOME/.local/bin}"
+version="${FX_VERSION:-latest}"
+install_dir="${FX_INSTALL_DIR:-$HOME/.local/bin}"
 
 fail() {
-	printf 'abc install: %s\n' "$1" >&2
+	printf 'fx install: %s\n' "$1" >&2
 	exit 1
 }
 
 case "$(uname -s)" in
 Darwin) os="macos" ;;
-*) fail "abc publishes macOS builds only; build from source with Zig 0.16 on $(uname -s)" ;;
+*) fail "fx publishes macOS builds only; build from source with Zig 0.16 on $(uname -s)" ;;
 esac
 
 case "$(uname -m)" in
@@ -33,7 +33,7 @@ if [ "$arch" = "x86_64" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null |
 	arch="aarch64"
 fi
 
-asset="abc-${os}-${arch}.tar.gz"
+asset="fx-${os}-${arch}.tar.gz"
 if [ "$version" = "latest" ]; then
 	base="https://github.com/${repo}/releases/latest/download"
 else
@@ -55,24 +55,24 @@ actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
 [ -n "$expected" ] && [ "$expected" = "$actual" ] || fail "checksum mismatch for $asset"
 
 tar -xzf "$tmp/$asset" -C "$tmp"
-[ -f "$tmp/abc" ] || fail "archive does not contain abc"
+[ -f "$tmp/fx" ] || fail "archive does not contain fx"
 
 mkdir -p "$install_dir"
-install -m 755 "$tmp/abc" "$install_dir/abc"
-xattr -d com.apple.quarantine "$install_dir/abc" 2>/dev/null || true
+install -m 755 "$tmp/fx" "$install_dir/fx"
+xattr -d com.apple.quarantine "$install_dir/fx" 2>/dev/null || true
 
-printf 'Installed %s to %s\n' "$("$install_dir/abc" --version 2>/dev/null || echo abc)" "$install_dir/abc"
+printf 'Installed %s to %s\n' "$("$install_dir/fx" --version 2>/dev/null || echo fx)" "$install_dir/fx"
 
-# `abc update` reuses this script and only needs the install line above.
-if [ "${ABC_UPDATING:-0}" = "1" ]; then
+# `fx update` reuses this script and only needs the install line above.
+if [ "${FX_UPDATING:-0}" = "1" ]; then
 	exit 0
 fi
 
 case ":$PATH:" in
 *":$install_dir:"*)
-	resolved="$(command -v abc 2>/dev/null || true)"
-	if [ -n "$resolved" ] && [ "$resolved" != "$install_dir/abc" ]; then
-		printf '\nNote: `abc` currently resolves to %s, which comes earlier in PATH.\n' "$resolved"
+	resolved="$(command -v fx 2>/dev/null || true)"
+	if [ -n "$resolved" ] && [ "$resolved" != "$install_dir/fx" ]; then
+		printf '\nNote: `fx` currently resolves to %s, which comes earlier in PATH.\n' "$resolved"
 	fi
 	;;
 *)
@@ -89,6 +89,6 @@ esac
 cat <<'NEXT'
 
 Next steps:
-  abc login deepseek          # or export DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / ...
-  cd your_project && abc
+  fx login deepseek          # or export DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / ...
+  cd your_project && fx
 NEXT

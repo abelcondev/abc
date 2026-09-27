@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.fx import Iterator, Mapping, Sequence
 from typing import TextIO
 
 from scripts.pgso.model import PgsoError, require_empty_stderr as ensure_empty_stderr

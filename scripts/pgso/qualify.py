@@ -8,7 +8,7 @@ import pathlib
 import shlex
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.fx import Callable, Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
