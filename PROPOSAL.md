@@ -24,7 +24,7 @@
 | 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
 | 7. Anthropic Messages | ⬜ | No empezado. |
 | 8. Volver al nombre `fx` | ✅ | Binario `fx`, `~/.fx`, `.fx.json`, `FX_*`; alias `ABC_*` eliminado; keys `ABC_PROVIDER_KEY_*` se migran solas al leerlas. |
-| 9. Jev como decisor | 🟡 | Hecho: `fx jev`, `/jev`, registro, preguntas resueltas, routing de subagentes, plan antes de cambios, chequeo de acciones (opcional) y cierre verificado. Pendiente: evals de calibración y detección de specs desactualizados. |
+| 9. Jev como decisor | ✅ | `fx jev` (on/off/key/check/eval/drift), `/jev`, registro, preguntas resueltas, routing de subagentes, plan antes de cambios, chequeo de acciones (opcional), cierre verificado y specs vivos (drift al final del turno). Probado con qwen-plan y DeepSeek. |
 
 ## 1. Objetivo
 
@@ -333,4 +333,4 @@ Solo en el perfil (`~/.fx/settings.json`), nunca en el `.fx.json` del proyecto (
 1. ✅ Configuración, `fx jev`, transporte, registro y etapa 4 (cierre verificado). Implementado como comando de CLI (`fx jev [on|off|key|forget|check]`); el `/jev` dentro del chat queda para después. Sin `on_error` por ahora: si Jev falla, el turno termina normal y el registro lo anota.
 2. ✅ Triage y etapa 2, sin modo nuevo: el hook `PreToolUse` retiene el primer `write_file`/`edit_file` de un pedido sustancial hasta que el agente presenta un plan que Jev aprueba (máximo 2 retenciones por turno). Más simple que un modo `plan` de solo lectura y no cambia cómo se usa fx.
 3. ✅ Alineación de acciones (opcional, `gates.action`: se retiene si parece dañino o fuera de tarea) y respuestas a `ask_user_question` (solo si el contexto ya fija la respuesta: además de elegir, Jev responde si la respuesta está respaldada, porque elige con mucha confianza aunque nada la respalde).
-4. Routing de modelos, detección de specs desactualizados y evals de umbrales.
+4. ✅ Routing de subagentes (`jev.routing`), `fx jev eval` (32 casos etiquetados, mismo código que las compuertas) y specs vivos: `fx jev drift` y la misma revisión al final de cada turno que cambió archivos. Probado sobre el SDD real de waliki1: encontró decisiones desactualizadas que nadie había notado (013, 014, 006).

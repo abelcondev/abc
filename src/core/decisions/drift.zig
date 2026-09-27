@@ -10,6 +10,8 @@
 const std = @import("std");
 const jev_contract = @import("jev_contract.zig");
 const turn_text = @import("turn_text.zig");
+const io_mod = @import("../shared/io.zig");
+const typesafe = @import("../../gateway/typesafe.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -178,6 +180,137 @@ pub fn relevance(response: *const jev_contract.Response, index: usize) ?f64 {
 
 pub fn contradiction(response: *const jev_contract.Response, index: usize) ?f64 {
     return response.noul(contradicts_ids[index]);
+}
+
+pub const default_dirs = [_][]const u8{ "sdd/decisions", "docs/decisions", "docs/adr", "decisions" };
+
+pub const Jev = struct {
+    base_url: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+};
+
+pub const Finding = struct {
+    decision: Decision,
+    touched: f64,
+    contradiction: f64,
+    stale: bool,
+};
+
+pub const Report = struct {
+    dir: []const u8,
+    decision_count: usize,
+    diff_bytes: usize,
+    findings: []const Finding,
+
+    pub fn staleCount(self: Report) usize {
+        var count: usize = 0;
+        for (self.findings) |finding| {
+            if (finding.stale) count += 1;
+        }
+        return count;
+    }
+};
+
+/// The first default decisions directory under `root`, or null.
+pub fn findDir(root: std.Io.Dir) ?[]const u8 {
+    for (default_dirs) |candidate| {
+        root.access(io_mod.getIo(), candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+/// Checks `git diff <range>` in `root` against the decisions in `dir_path`
+/// (relative to `root`). Everything in the report is allocated in `arena`.
+pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u8, dir_path: []const u8) !Report {
+    const io = io_mod.getIo();
+    var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+    defer root.close(io);
+    var dir = try root.openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md") or std.mem.startsWith(u8, entry.name, "_")) continue;
+        try names.append(arena, try arena.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThan);
+    var decisions: std.ArrayList(Decision) = .empty;
+    for (names.items) |name| {
+        if (decisions.items.len == Limits.max_decisions) break;
+        const text = dir.readFileAlloc(io, name, arena, .limited(Limits.decision_bytes)) catch continue;
+        const decision = parseDecision(name, text);
+        if (isActive(decision)) try decisions.append(arena, decision);
+    }
+    var report = Report{ .dir = dir_path, .decision_count = decisions.items.len, .diff_bytes = 0, .findings = &.{} };
+    if (decisions.items.len == 0) return report;
+
+    const exclude = try std.fmt.allocPrint(arena, ":(exclude){s}", .{dir_path});
+    const git = try std.process.run(arena, io, .{
+        .argv = &.{ "git", "diff", "--no-color", "--no-ext-diff", range, "--", ".", exclude },
+        .cwd = .{ .path = root_path },
+    });
+    if (git.term != .exited or git.term.exited != 0) return error.GitDiffFailed;
+    const diff = std.mem.trim(u8, git.stdout, " \t\r\n");
+    report.diff_bytes = diff.len;
+    if (diff.len == 0) return report;
+
+    var relevance_response = try typesafe.systemOne(arena, .{
+        .base_url = jev.base_url,
+        .api_key = jev.api_key,
+        .model = jev.model,
+        .state_json = try relevanceState(arena, diff, decisions.items),
+        .questions = try relevanceQuestions(arena, decisions.items.len),
+    });
+    defer relevance_response.deinit();
+    const relevant = try relevantIndices(arena, &relevance_response, decisions.items.len);
+    if (relevant.len == 0) return report;
+
+    const selected = try arena.alloc(Decision, relevant.len);
+    for (relevant, 0..) |decision_index, index| selected[index] = decisions.items[decision_index];
+    var contradiction_response = try typesafe.systemOne(arena, .{
+        .base_url = jev.base_url,
+        .api_key = jev.api_key,
+        .model = jev.model,
+        .state_json = try contradictionState(arena, diff, selected),
+        .questions = try contradictionQuestions(arena, selected.len),
+    });
+    defer contradiction_response.deinit();
+
+    const findings = try arena.alloc(Finding, selected.len);
+    for (selected, 0..) |decision, index| {
+        const p = contradiction(&contradiction_response, index) orelse return error.IncompleteJevAnswer;
+        findings[index] = .{
+            .decision = decision,
+            .touched = relevance(&relevance_response, relevant[index]).?,
+            .contradiction = p,
+            .stale = p >= contradiction_threshold,
+        };
+    }
+    report.findings = findings;
+    return report;
+}
+
+fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
+/// The continuation sent after a turn whose changes contradict decision
+/// records. Caller owns the text.
+pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("Jev spec check: the changes in this turn may contradict these decision records:\n");
+    for (stale) |finding| try w.print("- {s}/{s} \"{s}\" (p={d:.2})\n", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
+    try w.writeAll(
+        "Read each record. If the change is intended, update the record so it describes the code as it is now " ++
+            "(keep its format and add a short note of what changed). If the change was a mistake, fix the code instead. " ++
+            "Then give your final answer, mentioning which records you updated.",
+    );
+    return out.toOwnedSlice();
 }
 
 test "parseDecision reads front matter and falls back to headings" {

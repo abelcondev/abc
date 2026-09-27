@@ -14,6 +14,10 @@
 //!
 //! The completion gate runs on `Stop`. It sends the agent back once when Jev
 //! cannot confirm the final answer is backed by the turn's tool results.
+//! When the work passes and the turn changed files in a workspace with
+//! decision records, the drift check flags records the uncommitted changes
+//! contradict and asks the agent to update them (each record once per
+//! process).
 //!
 //! Gates run for root interactive and `fx ask` turns only. When Jev is
 //! unreachable, has no key, or answers incompletely, the call or turn goes
@@ -21,6 +25,7 @@
 
 const std = @import("std");
 const hooks = @import("../hooks/hooks.zig");
+const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
@@ -31,6 +36,7 @@ const plan_gate = @import("plan_gate.zig");
 const action_gate = @import("action_gate.zig");
 const ask_gate = @import("ask_gate.zig");
 const routing = @import("routing.zig");
+const drift = @import("drift.zig");
 const decision_log = @import("decision_log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,6 +55,8 @@ pub const Gate = struct {
     plan_settled: bool = false,
     plan_holds: u8 = 0,
     action_holds: u8 = 0,
+    /// Decision files already flagged by the drift check. Owned keys.
+    drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
     const max_plan_holds = 2;
     const max_action_holds = 3;
@@ -64,6 +72,9 @@ pub const Gate = struct {
 
     pub fn deinit(self: *Gate) void {
         if (self.lent) |text| self.alloc.free(text);
+        var reported = self.drift_reported.keyIterator();
+        while (reported.next()) |key| self.alloc.free(key.*);
+        self.drift_reported.deinit(self.alloc);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
@@ -386,6 +397,12 @@ pub const Gate = struct {
             },
             .passed => {
                 decision_log.append(self.alloc, entry);
+                if (self.config.drift_gate and changedFiles(input.turn_messages)) {
+                    return self.checkDrift(input) catch |err| {
+                        debug_trace.logf("jev", "drift check failed err={s}", .{@errorName(err)});
+                        return .allow;
+                    };
+                }
                 return .allow;
             },
             .failed => |failed| {
@@ -395,7 +412,71 @@ pub const Gate = struct {
             },
         }
     }
+
+    fn checkDrift(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
+        const root_path = input.invocation.scope.workspace_root;
+        var root = std.Io.Dir.cwd().openDir(io_mod.getIo(), root_path, .{}) catch return .allow;
+        const dir_path = drift.findDir(root) orelse {
+            root.close(io_mod.getIo());
+            return .allow;
+        };
+        root.close(io_mod.getIo());
+
+        var entry = self.newEntry("drift", input.invocation, drift.contradiction_threshold);
+        const started = io_mod.milliTimestamp();
+        var key = (try jev_config.loadApiKey(self.alloc)) orelse return .allow;
+        defer key.deinit(self.alloc);
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const report = drift.check(arena, .{
+            .base_url = self.config.base_url,
+            .api_key = key.value,
+            .model = self.config.model,
+        }, root_path, "HEAD", dir_path) catch |err| {
+            entry.outcome = "unavailable";
+            entry.detail = @errorName(err);
+            entry.latency_ms = io_mod.milliTimestamp() - started;
+            decision_log.append(self.alloc, entry);
+            return .allow;
+        };
+        entry.latency_ms = io_mod.milliTimestamp() - started;
+
+        var fresh: std.ArrayList(drift.Finding) = .empty;
+        for (report.findings) |finding| {
+            if (!finding.stale or self.drift_reported.contains(finding.decision.file)) continue;
+            try fresh.append(arena, finding);
+        }
+        const answers = try arena.alloc(jev_contract.NamedAnswer, report.findings.len);
+        for (report.findings, 0..) |finding, index| answers[index] = .{ .id = finding.decision.file, .answer = .{ .noul = finding.contradiction } };
+        entry.answers = answers;
+        if (fresh.items.len == 0) {
+            entry.outcome = if (report.findings.len == 0) "skip" else "allow";
+            decision_log.append(self.alloc, entry);
+            return .allow;
+        }
+        for (fresh.items) |finding| {
+            const owned = try self.alloc.dupe(u8, finding.decision.file);
+            self.drift_reported.put(self.alloc, owned, {}) catch |err| {
+                self.alloc.free(owned);
+                return err;
+            };
+        }
+        entry.outcome = "continue";
+        decision_log.append(self.alloc, entry);
+        return .{ .continue_once = self.lend(try drift.feedback(self.alloc, dir_path, fresh.items)) };
+    }
 };
+
+/// Whether the turn changed a file through the file tools.
+fn changedFiles(messages: []const types.ChatMessage) bool {
+    for (messages) |message| {
+        if (message.role != .tool or message.tool_result_status != .success) continue;
+        const name = message.tool_name orelse continue;
+        if (plan_gate.isFileChange(name)) return true;
+    }
+    return false;
+}
 
 test "a disabled gate registers no handlers" {
     var runtime = hooks.Runtime.init(std.testing.allocator);
@@ -503,4 +584,14 @@ test "unparseable questions and routed calls with a model skip Jev" {
     input.tool_name = routing.tool_name;
     input.arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"t\",\"model\":\"m\"}}";
     try std.testing.expect((try Gate.preToolUseHandler(&gate, input)) == .continue_);
+}
+
+test "changedFiles looks for successful file tool results" {
+    const edited = [_]types.ChatMessage{
+        .{ .role = .tool, .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .tool_name = "edit_file", .tool_result_status = .success },
+    };
+    try std.testing.expect(changedFiles(&edited));
+    const failed = [_]types.ChatMessage{.{ .role = .tool, .tool_name = "write_file", .tool_result_status = .failure }};
+    try std.testing.expect(!changedFiles(&failed));
 }

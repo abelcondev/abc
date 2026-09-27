@@ -9,7 +9,7 @@
 //! "jev": {
 //!   "enabled": true,
 //!   "model": "jev-latest",
-//!   "gates": { "plan": true, "stop": true, "ask": true, "action": false },
+//!   "gates": { "plan": true, "stop": true, "ask": true, "drift": true, "action": false },
 //!   "thresholds": { "plan": 0.5, "stop": 0.5, "ask": 0.8, "action": 0.6 },
 //!   "routing": {
 //!     "light": { "model": "deepseek-flash", "effort": "low" },
@@ -50,6 +50,9 @@ pub const Config = struct {
     ask_gate: bool = true,
     /// Minimum confidence and grounding for answering on the user's behalf.
     ask_threshold: f64 = 0.8,
+    /// After a turn that changed files, flag decision records the uncommitted
+    /// changes contradict (only in workspaces with a decisions directory).
+    drift_gate: bool = true,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,
     /// Probability of unrequested damage at which an action is held.
@@ -112,6 +115,9 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (gates.object.get("action")) |action| {
                 if (action == .bool) config.action_gate = action.bool;
+            }
+            if (gates.object.get("drift")) |drift| {
+                if (drift == .bool) config.drift_gate = drift.bool;
             }
         }
     }
@@ -328,13 +334,13 @@ test "applyJson reads the jev settings object and ignores invalid fields" {
 test "applyJson reads routes and the ask and action gates" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"gates":{"ask":false,"action":true},"thresholds":{"ask":0.9,"action":0.7},"routing":{"light":{"model":"deepseek-flash","effort":"low"},"heavy":{"model":"qwen3.8-max"},"odd":{"model":"x"},"broken":{"effort":"low"}}}
+        \\{"gates":{"ask":false,"action":true,"drift":false},"thresholds":{"ask":0.9,"action":0.7},"routing":{"light":{"model":"deepseek-flash","effort":"low"},"heavy":{"model":"qwen3.8-max"},"odd":{"model":"x"},"broken":{"effort":"low"}}}
     , .{});
     defer parsed.deinit();
     var config = Config{};
     defer config.deinit(alloc);
     try applyJson(alloc, &config, parsed.value);
-    try std.testing.expect(!config.ask_gate and config.action_gate);
+    try std.testing.expect(!config.ask_gate and config.action_gate and !config.drift_gate);
     try std.testing.expectEqual(@as(f64, 0.9), config.ask_threshold);
     try std.testing.expectEqual(@as(f64, 0.7), config.action_threshold);
     try std.testing.expectEqual(@as(usize, 2), config.routes.len);
