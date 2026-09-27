@@ -262,6 +262,9 @@ pub const Gate = struct {
         const action = blk: {
             if (config.ask_gate and std.mem.eql(u8, tool, ask_gate.tool_name)) break :blk self.checkAsk(input);
             if (config.routes.len != 0 and std.mem.eql(u8, tool, routing.tool_name)) break :blk self.routeSubagent(input);
+            if (config.sdd_gate and std.mem.eql(u8, tool, "shell")) {
+                if (self.checkStatusCommand(input)) |held| break :blk held;
+            }
             if (config.sdd_gate and plan_gate.isFileChange(tool)) {
                 if (!self.sdd_settled) {
                     const sdd_action = self.checkSdd(input) catch |err| sdd: {
@@ -279,7 +282,8 @@ pub const Gate = struct {
                     if (tdd_action != .continue_) break :blk tdd_action;
                 }
             }
-            if (config.plan_gate and !self.plan_settled and plan_gate.isFileChange(tool)) {
+            // Writing a proposal or a spec is the plan; only code needs one.
+            if (config.plan_gate and !self.plan_settled and plan_gate.isFileChange(tool) and !isSddWrite(input)) {
                 const plan_action = self.checkPlan(input) catch |err| plan: {
                     debug_trace.logf("jev", "plan gate failed err={s}", .{@errorName(err)});
                     self.plan_settled = true;
@@ -659,6 +663,14 @@ pub const Gate = struct {
 
     fn checkCompletion(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
         var entry = self.newEntry("stop", input.invocation, self.config.stop_threshold);
+        if (self.sdd_change != null) {
+            // The code is held until the user approves the change, so ending
+            // the turn to ask for approval is the expected outcome.
+            entry.outcome = "skip";
+            entry.detail = "waiting for the user to approve the change";
+            decision_log.append(self.alloc, entry);
+            return .allow;
+        }
         const state = try completion_gate.buildState(self.alloc, .{
             .user_request = input.user_request,
             .final_message = input.assistant_text,
@@ -686,6 +698,11 @@ pub const Gate = struct {
                         break :tdd null;
                     };
                     if (tdd_action) |action| return action;
+                    const specs_action = self.checkSpecsForFinishedChange(input) catch |err| specs: {
+                        debug_trace.logf("jev", "specs reminder failed err={s}", .{@errorName(err)});
+                        break :specs null;
+                    };
+                    if (specs_action) |action| return action;
                 }
                 if (self.config.drift_gate and changedFiles(input.turn_messages) and
                     sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
@@ -703,6 +720,51 @@ pub const Gate = struct {
                 return .{ .continue_once = self.lend(try completion_gate.feedback(self.alloc, failed)) };
             },
         }
+    }
+
+    /// Holds `fx sdd approve|done` run by the agent: approval comes from the
+    /// user's reply and closing a change is the user's call.
+    fn checkStatusCommand(self: *Gate, input: hooks.PreToolUseInput) ?hooks.PreToolUseAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const command = argString(arena, input.arguments_json, "command") orelse return null;
+        const action = sdd_gate.statusCommand(command) orelse return null;
+        var entry = self.newEntry("sdd", input.invocation, 0);
+        entry.outcome = "hold";
+        entry.detail = if (action == .approve) "agent ran fx sdd approve" else "agent ran fx sdd done";
+        decision_log.append(self.alloc, entry);
+        return .{ .block = if (action == .approve) sdd_gate.self_approve_reason else sdd_gate.self_done_reason };
+    }
+
+    /// After the first turn that changes code under an approved change
+    /// without touching `sdd/specs`, asks the agent once per change to tick
+    /// the finished tasks and, when the change is complete, record its
+    /// behavior as rules.
+    fn checkSpecsForFinishedChange(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
+        const route = self.sdd_route orelse return null;
+        if (route.route != .change) return null;
+        const root_path = input.invocation.scope.workspace_root;
+        if (!changedCode(root_path, input.turn_messages) or touchedSpecs(root_path, input.turn_messages)) return null;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const io = io_mod.getIo();
+        var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+        defer root.close(io);
+        const change = sdd_layout.firstWithStatus(try sdd_layout.listChanges(arena, root), .approved) orelse return null;
+        const key = try std.fmt.allocPrint(arena, "specs\x00{s}", .{change.file});
+        if (self.drift_reported.contains(key)) return null;
+        const owned = try self.alloc.dupe(u8, key);
+        self.drift_reported.put(self.alloc, owned, {}) catch |err| {
+            self.alloc.free(owned);
+            return err;
+        };
+        var entry = self.newEntry("sdd", input.invocation, 0);
+        entry.outcome = "continue";
+        entry.detail = "record the finished change as spec rules";
+        decision_log.append(self.alloc, entry);
+        return .{ .continue_once = self.lend(try sdd_gate.specsReminder(self.alloc, change.file)) };
     }
 
     fn checkDrift(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
@@ -777,10 +839,53 @@ fn specCitations(arena: Allocator, root_path: []const u8) []const u8 {
 
 /// The `path` argument of a file tool call, if present.
 fn toolPath(arena: Allocator, arguments_json: []const u8) ?[]const u8 {
+    return argString(arena, arguments_json, "path");
+}
+
+fn argString(arena: Allocator, arguments_json: []const u8, field: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch return null;
     if (parsed != .object) return null;
-    const path = parsed.object.get("path") orelse return null;
-    return if (path == .string) path.string else null;
+    const value = parsed.object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+/// Whether a file tool call writes inside the workspace's `sdd/` tree.
+fn isSddWrite(input: hooks.PreToolUseInput) bool {
+    var buf: [16 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buf);
+    const path = toolPath(fixed.allocator(), input.arguments_json) orelse return false;
+    return sdd_layout.isSddPath(input.invocation.scope.workspace_root, path);
+}
+
+/// Whether the turn changed a file outside `sdd/`.
+fn changedCode(workspace_root: []const u8, messages: []const types.ChatMessage) bool {
+    var buf: [16 * 1024]u8 = undefined;
+    for (messages) |message| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls) |call| {
+            if (!plan_gate.isFileChange(call.name)) continue;
+            var fixed = std.heap.FixedBufferAllocator.init(&buf);
+            const path = toolPath(fixed.allocator(), call.arguments_json) orelse continue;
+            if (!sdd_layout.isSddPath(workspace_root, path)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the turn changed a file under `sdd/specs`.
+fn touchedSpecs(workspace_root: []const u8, messages: []const types.ChatMessage) bool {
+    var buf: [16 * 1024]u8 = undefined;
+    for (messages) |message| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls) |call| {
+            if (!plan_gate.isFileChange(call.name)) continue;
+            var fixed = std.heap.FixedBufferAllocator.init(&buf);
+            const path = toolPath(fixed.allocator(), call.arguments_json) orelse continue;
+            if (!sdd_layout.isSddPath(workspace_root, path)) continue;
+            if (std.mem.find(u8, path, sdd_layout.specs_dir ++ "/") != null) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether the turn changed a file through the file tools.

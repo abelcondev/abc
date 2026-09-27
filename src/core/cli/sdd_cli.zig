@@ -226,6 +226,13 @@ pub fn applyChangeAction(alloc: Allocator, root: std.Io.Dir, parsed: Parsed) !Ou
             switch (sdd_layout.pick(changes, parsed.name, from)) {
                 .found => |change| {
                     try sdd_layout.setStatus(alloc, root, change.file, to);
+                    if (to == .done and try sdd_layout.countSpecs(arena_state.allocator(), root) == 0) {
+                        return .{ .ok = true, .text = try std.fmt.allocPrint(
+                            alloc,
+                            "{s} is done. " ++ sdd_layout.specs_dir ++ " has no rules yet; ask the agent to write the behavior this change added as rules there.\n",
+                            .{change.file},
+                        ) };
+                    }
                     return .{ .ok = true, .text = try std.fmt.allocPrint(alloc, "{s} is {s}.\n", .{ change.file, @tagName(to) }) };
                 },
                 .none => return .{ .ok = false, .text = try std.fmt.allocPrint(alloc, "No {s} change to mark {s}.\n", .{ @tagName(from), @tagName(to) }) },
@@ -319,4 +326,5 @@ test "applyChangeAction creates, approves and closes a change" {
     const done = try applyChangeAction(alloc, tmp.dir, .{ .action = .done, .name = "pagos-parciales" });
     defer alloc.free(done.text);
     try std.testing.expect(done.ok);
+    try std.testing.expect(std.mem.find(u8, done.text, "has no rules yet") != null);
 }

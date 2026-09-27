@@ -261,7 +261,13 @@ A vague request, or one Jev cannot classify, is sent back so the agent asks
 you which route it is. Saying "no hagas propuesta" or "skip the spec" makes it
 a fix. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
 reply that approves it ("sí, dale"); once a change is approved, code changes go
-through. `fx jev eval sdd` runs the routing against labeled cases.
+through. Approving and closing are yours: when the agent runs `fx sdd approve`
+or `fx sdd done` itself, fx holds the command. The agent ticks the change's
+tasks as it works, and after the first turn that changes code under an approved
+change it is asked once to write the behavior as rules in `sdd/specs`, so the
+specs grow with each change. Writing files under `sdd/` never needs a plan, and
+the completion check lets a turn end while a change waits for your approval.
+Calls a gate holds show as "Held" in the transcript, not "Failed". `fx jev eval sdd` runs the routing against labeled cases.
 
 **Test-first.** `fx sdd tdd on` (or `/sdd tdd on`) makes behavior changes
 test-first while SDD is on: spec and change routes, and fixes that repair a
