@@ -174,7 +174,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .jev,
         .token = "jev",
-        .usage = "jev [on|off|key|forget|check]",
+        .usage = "jev [on|off|key|forget|check|eval [gate]]",
         .summary = "Configure Jev, the decision model that checks the agent's work",
     },
     .{

@@ -107,6 +107,7 @@ it as an independent check on the agent, next to whatever model does the work.
 fx jev key       # paste a TypeSafe API key (saved in the Keychain)
 fx jev check     # one live call to confirm the key works
 fx jev on        # enable for new sessions (writes jev.enabled)
+fx jev eval      # run the labeled calibration cases against live Jev
 fx jev           # show status
 fx jev off
 ```
@@ -157,6 +158,10 @@ the answer is backed by a tool result, the agent continues once with the
 reasons and is asked to verify before answering again. Questions, small talk
 and answers that report a blocker or ask the user pass through. If Jev is
 unreachable or has no key, the turn finishes normally.
+
+`fx jev eval [stop|plan|action|ask|routing]` runs labeled cases through the
+same questions, code and thresholds as the live gates and prints each answer,
+so threshold or model changes can be checked before use.
 
 Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
 answers, the threshold and the outcome (the state sent to Jev is not stored).
