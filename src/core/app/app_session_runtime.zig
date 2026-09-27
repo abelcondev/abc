@@ -5606,7 +5606,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with abc --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {
@@ -6759,7 +6759,7 @@ test "session runtime owns temporary interactive image snapshot capture" {
 }
 
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     return .{
         .home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home"),
@@ -10956,7 +10956,7 @@ test "session picker current mode filters workspace and all mode includes every 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.abc");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -12196,7 +12196,7 @@ test "remembered selection write failure leaves pending user work durable and wa
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    var obstruction = try tmp.dir.createFile(io_mod.getIo(), "home/.abc/continue", .{});
+    var obstruction = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/continue", .{});
     obstruction.close(io_mod.getIo());
     try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
         .turn_id = 1,

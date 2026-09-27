@@ -23,7 +23,7 @@
 | 5. Búsqueda web | ✅ | Tavily / Brave / SearXNG para cualquier proveedor. Visión fallback y contabilidad local de uso: pendientes. |
 | 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
 | 7. Anthropic Messages | ⬜ | No empezado. |
-| 8. Volver al nombre `fx` | ⬜ | Revertir `abc` → `fx` en binario, config, variables y textos (sección 10). |
+| 8. Volver al nombre `fx` | ✅ | Binario `fx`, `~/.fx`, `.fx.json`, `FX_*`; alias `ABC_*` eliminado; keys `ABC_PROVIDER_KEY_*` se migran solas al leerlas. |
 | 9. Jev como decisor | ⬜ | Configuración, `/jev`, transporte y etapas de decisión (sección 11). |
 
 ## 1. Objetivo

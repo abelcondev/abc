@@ -7,7 +7,7 @@ import pathlib
 import re
 import stat
 import uuid
-from collections.abc import Sequence
+from collections.fx import Sequence
 
 from scripts.pgso.model import (
     ArtifactEvidence,

@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(WasmSurface, "wasm_surface", .none);
 
     const exe = b.addExecutable(.{
-        .name = "abc",
+        .name = "fx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run abc");
+    const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names contain this text") orelse &.{};
@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
     run_exe_tests.step.dependOn(b.getInstallStep());
     run_exe_tests.setEnvironmentVariable(
         "FX_TEST_PRODUCT_EXE",
-        b.getInstallPath(.bin, "abc"),
+        b.getInstallPath(.bin, "fx"),
     );
 
     const test_step = b.step("test", "Run tests");

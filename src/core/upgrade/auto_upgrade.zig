@@ -43,7 +43,7 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
-    // abc has no release CDN yet; never auto-upgrade to the upstream fx binary.
+    // This fork has no release CDN; never auto-upgrade to the upstream fx binary.
     return false;
 }
 

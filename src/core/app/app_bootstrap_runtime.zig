@@ -381,7 +381,7 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
-            // abc opens straight into the chat; providers are chosen with /provider.
+            // fx opens straight into the chat; providers are chosen with /provider.
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FX_THEME; probing stays gated.
                 app.terminal_input_runtime.terminal_theme_monitor.start();

@@ -5,7 +5,7 @@ import hashlib
 import json
 import pathlib
 import re
-from collections.abc import Sequence
+from collections.fx import Sequence
 
 
 MIB = 1_048_576
