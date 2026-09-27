@@ -410,6 +410,10 @@ pub fn nonObjectToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Alloc
     });
 }
 
+/// Marks a call a PreToolUse handler held, so presentation can show it as
+/// held rather than failed.
+pub const pre_tool_use_block_suggestion = "Do not retry the same tool call unchanged. Adjust the request or use an allowed alternative.";
+
 pub fn preToolUseBlockedJson(
     alloc: Allocator,
     tool_name: []const u8,
@@ -418,8 +422,13 @@ pub fn preToolUseBlockedJson(
     return toolExecutionFailureJson(alloc, .{
         .tool_name = tool_name,
         .message = reason,
-        .suggestion = "Do not retry the same tool call unchanged. Adjust the request or use an allowed alternative.",
+        .suggestion = pre_tool_use_block_suggestion,
     });
+}
+
+/// Whether a tool result is a PreToolUse hold (a hook or a Jev gate).
+pub fn isPreToolUseBlockedOutput(output: []const u8) bool {
+    return std.mem.find(u8, output, pre_tool_use_block_suggestion) != null and isToolExecutionFailedOutput(output);
 }
 
 pub fn preToolUseFailedClosedJson(

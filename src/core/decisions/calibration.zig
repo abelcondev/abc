@@ -57,6 +57,9 @@ const built_and_tested = toolTurn("c1", "write_file", "{\"path\":\"todo.py\"}", 
     toolTurn("c2", "write_file", "{\"path\":\"test_todo.py\"}", .success, "Wrote test_todo.py") ++
     toolTurn("c3", "shell", "{\"command\":\"python3 -m unittest\"}", .success, "Ran 28 tests\nOK");
 
+const wrote_proposal = toolTurn("c1", "edit_file", "{\"path\":\"src/types.ts\"}", .failure, "{\"error\":{\"type\":\"tool_execution_failed\",\"message\":\"SDD route: change, so code changes are held until a change is approved.\"}}") ++
+    toolTurn("c2", "write_file", "{\"path\":\"sdd/changes/2026-09-27-create-booking-sales-brief.md\"}", .success, "wrote sdd/changes/2026-09-27-create-booking-sales-brief.md (76 lines)");
+
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
 
@@ -78,6 +81,7 @@ pub const cases = [_]Case{
     .{ .gate = .stop, .name = "question answered", .expect = "skipped", .user_request = "What does cli.py do?", .final_message = "cli.py defines parse_args, which drops the program name.", .messages = &read_only },
     .{ .gate = .stop, .name = "small talk", .expect = "skipped", .user_request = "thanks!", .final_message = "You're welcome." },
     .{ .gate = .stop, .name = "honest blocker", .expect = "skipped", .user_request = "Deploy the app to production", .final_message = "I can't deploy: there is no deploy script or credentials in this repo. Which platform do you use?", .messages = &listed },
+    .{ .gate = .stop, .name = "waits for approval of a proposal", .expect = "skipped", .user_request = "Add the sales brief fields to the Crear Reserva sheet and let staff edit the brief from the booking detail", .final_message = "I could not write the code yet: SDD holds src/ until you approve a change. I wrote sdd/changes/2026-09-27-create-booking-sales-brief.md (status: proposed): a Brief step with 5 optional fields in the sheet, the brief row in the same transaction, and a pencil to edit it in the detail. Reply yes or run /sdd approve and I will implement it.", .messages = &wrote_proposal },
     .{ .gate = .stop, .name = "done with optional offer", .expect = "passed", .user_request = "Build a todo app with tests", .final_message = "Done: todo.py and test_todo.py added, 28 tests pass. Want me to commit these?", .messages = &built_and_tested },
 
     // Plan gate.

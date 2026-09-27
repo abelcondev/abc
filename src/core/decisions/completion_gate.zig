@@ -106,11 +106,12 @@ pub fn evaluate(response: *const jev_contract.Response, threshold: f64) Evaluate
     if (!std.mem.eql(u8, kind.choice, "work") and kind.confidence >= skip_confidence) {
         return .{ .skipped = "not a work request" };
     }
-    // A blocker excuses unfinished work only when the answer is honest about
-    // it: a false "all tests pass" over failing evidence also reads as
-    // unfinished work.
-    if (@max(not_finished, needs_user) >= blocker_pass and claims_supported >= threshold) {
-        return .{ .skipped = "agent reported a blocker or asked the user" };
+    // Asking the user always ends the turn. Reporting unfinished work does
+    // only when the answer is honest about it: a false "all tests pass" over
+    // failing evidence also reads as unfinished work.
+    if (needs_user >= blocker_pass) return .{ .skipped = "agent asked the user" };
+    if (not_finished >= blocker_pass and claims_supported >= threshold) {
+        return .{ .skipped = "agent reported a blocker" };
     }
 
     var failures = std.EnumSet(Failure).initEmpty();
@@ -286,6 +287,14 @@ test "evaluate skips non-work requests and honest blockers" {
     );
     defer false_claim.deinit();
     try std.testing.expect((try evaluate(&false_claim, 0.5)) == .failed);
+
+    // Waiting for approval: the answer describes a proposal the evidence
+    // only partly shows, but it asks the user to decide.
+    var awaiting = try testResponse(
+        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.96},"work_done":{"type":"noul","noul":0.09},"claims_supported":{"type":"noul","noul":0.32},"not_finished":{"type":"noul","noul":0.95},"needs_user":{"type":"noul","noul":0.9},"checked":{"type":"noul","noul":0.79}}}
+    );
+    defer awaiting.deinit();
+    try std.testing.expect((try evaluate(&awaiting, 0.5)) == .skipped);
 }
 
 test "evaluate treats a missing answer as incomplete, not a pass" {
