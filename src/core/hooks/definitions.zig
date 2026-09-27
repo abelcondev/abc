@@ -116,6 +116,12 @@ pub const PreToolUseInput = struct {
     call_id: []const u8,
     tool_name: []const u8,
     arguments_json: []const u8,
+    /// The user prompt that started this turn; empty for non-root turns.
+    user_request: []const u8 = "",
+    /// Messages produced earlier in this turn.
+    turn_messages: []const types.ChatMessage = &.{},
+    /// Assistant text that accompanies this tool call.
+    assistant_text: []const u8 = "",
 };
 
 pub const PreToolUseAction = union(enum) {

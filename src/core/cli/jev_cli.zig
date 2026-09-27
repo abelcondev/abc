@@ -43,10 +43,10 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus)
         .environment => try w.writeAll("  key       " ++ jev_config.key_env ++ "\n"),
         .saved => |backend| try w.print("  key       saved in the {s}\n", .{backend}),
     }
+    if (!config.plan_gate and !config.stop_gate) try w.writeAll("  gates     none\n");
+    if (config.plan_gate) try w.print("  gates     plan before changes (threshold {d:.2})\n", .{config.plan_threshold});
     if (config.stop_gate) {
-        try w.print("  gates     completion check (threshold {d:.2})\n", .{config.stop_threshold});
-    } else {
-        try w.writeAll("  gates     none\n");
+        try w.print("  {s}completion check (threshold {d:.2})\n", .{ if (config.plan_gate) "          " else "gates     ", config.stop_threshold });
     }
     try w.writeAll("  log       ~/.fx/sessions/<id>/decisions.jsonl\n");
     if (!config.enabled) try w.writeAll("\nTurn it on with `fx jev on`.\n");
@@ -92,6 +92,7 @@ test "renderStatus reports configuration without the key value" {
     const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" });
     defer alloc.free(on);
     try std.testing.expect(std.mem.find(u8, on, "saved in the macOS Keychain") != null);
+    try std.testing.expect(std.mem.find(u8, on, "plan before changes (threshold 0.50)") != null);
     try std.testing.expect(std.mem.find(u8, on, "completion check (threshold 0.60)") != null);
     try std.testing.expect(std.mem.find(u8, on, "fx jev on") == null);
 }

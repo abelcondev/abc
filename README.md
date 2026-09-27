@@ -111,6 +111,13 @@ fx jev           # show status
 fx jev off
 ```
 
+**Plan before changes.** Before the first file change (`write_file` or
+`edit_file`) of a turn, Jev rates how substantial the request is. Trivial and
+small requests pass. For a substantial one, the change is held until the
+agent has stated a plan with steps and checkable acceptance criteria that
+covers the request without unrequested extra work. A turn is held at most
+twice, then changes go through.
+
 **Completion check.** When the agent finishes a turn that asked for work, fx
 sends Jev the request, the final answer and the turn's tool results. If Jev
 cannot confirm that the requested work was carried out, or that every claim in
@@ -129,8 +136,10 @@ files cannot set them.
 | --- | --- |
 | `enabled` | Turn Jev decisions on (default `false`) |
 | `model` | Jev model (default `jev-latest`) |
+| `gates.plan` | Require a plan before changes on substantial requests (default `true`) |
 | `gates.stop` | Run the completion check (default `true`) |
-| `thresholds.stop` | Minimum probability each check must reach (default `0.5`) |
+| `thresholds.plan` | Minimum probability the plan checks must reach (default `0.5`) |
+| `thresholds.stop` | Minimum probability each completion check must reach (default `0.5`) |
 
 `TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` and `FX_JEV_BASE_URL`
 override the saved values.

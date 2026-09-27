@@ -4383,6 +4383,7 @@ test {
     _ = @import("core/decisions/completion_gate.zig");
     _ = @import("core/decisions/decision_log.zig");
     _ = @import("core/decisions/jev_gate.zig");
+    _ = @import("core/decisions/plan_gate.zig");
     _ = @import("core/cli/jev_cli.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

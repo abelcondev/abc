@@ -9611,13 +9611,18 @@ fn processQueuedPromptLoop(
                 } };
                 continue;
             }
-            prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallForLifecycle(
+            prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallInTurn(
                 arena,
                 lifecycle,
                 config.cancel_flag,
                 turn_id,
                 current_step_index,
                 tool_call,
+                .{
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
+                    .assistant_text = completion.content orelse "",
+                },
             ) catch |err| {
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
