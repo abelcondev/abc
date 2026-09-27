@@ -114,11 +114,12 @@ pub const cases = [_]Case{
 
     // SDD route gate.
     .{ .gate = .sdd, .name = "typo", .expect = "fix", .user_request = "Fix the typo 'Resrvas' in the reservas page title", .tool = "edit_file", .arguments = "{\"path\":\"src/routes/reservas.tsx\"}", .rules = &reservas_rules },
-    .{ .gate = .sdd, .name = "restore documented alignment", .expect = "fix", .user_request = "The Saldo column is left-aligned by mistake; align it right like the rule says", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/ReservasList.tsx\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "restore documented alignment", .expect = "fix+bug", .user_request = "The Saldo column is left-aligned by mistake; align it right like the rule says", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/ReservasList.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "reorder columns", .expect = "spec", .user_request = "Move the Saldo column so it comes right before Asesor in the reservas table", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/ReservasList.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "flip dictation behavior", .expect = "spec", .user_request = "Make dictation send the chat message automatically when I stop talking", .tool = "edit_file", .arguments = "{\"path\":\"src/components/chat/Composer.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "partial payments feature", .expect = "change", .user_request = "Add partial payments: a new payment_plans table with installments and a screen to manage them per booking", .tool = "write_file", .arguments = "{\"path\":\"src/components/booking/PaymentPlan.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "agent reads vouchers", .expect = "change", .user_request = "Let Mimi, the booking AI agent, read hotel vouchers from PDFs dropped in the chat and create the hotel reservations", .tool = "edit_file", .arguments = "{\"path\":\"src/mimi/Mimi.ts\"}", .rules = &reservas_rules },
+    .{ .gate = .sdd, .name = "wrong balance", .expect = "fix+bug", .user_request = "Saldo shows the total amount instead of subtracting payments; fix it", .tool = "edit_file", .arguments = "{\"path\":\"src/lib/payments.ts\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "user skips the process", .expect = "fix", .user_request = "Rename the label 'Cód. reserva' to 'Código' in the Ministerio grid. Es un fix chico, no hagas propuesta.", .tool = "edit_file", .arguments = "{\"path\":\"src/components/tickets/MinisterioWorklist.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "vague request", .expect = "unclear", .user_request = "mejora la página", .tool = "edit_file", .arguments = "{\"path\":\"src/routes/index.tsx\"}", .rules = &reservas_rules },
     .{ .gate = .sdd, .name = "user approves proposal", .expect = "approved", .user_request = "sí, dale, aprobado", .tool = "write_file", .arguments = "{\"path\":\"db/payment_plans.ts\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
@@ -190,7 +191,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         .ask => if (ask_gate.evaluate(arena, ask_parsed.?, &response, config.ask_threshold)) |v| @tagName(v) else |err| @errorName(err),
         .routing => if (routing.pick(&eval_routes, &response)) |route| route.name else "no_route",
         .sdd => if (sdd_gate.evaluate(arena, &response, case.rules.len, case.proposal != null)) |v|
-            (if (v.approves) "approved" else @tagName(v.route))
+            (if (v.approves) "approved" else if (v.bug and v.route == .fix) "fix+bug" else @tagName(v.route))
         else |err|
             @errorName(err),
     };

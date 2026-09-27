@@ -2165,6 +2165,19 @@ fn runSdd(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
             try writeStdout(deps, sdd_cli.savedMessage(enabled, sdd_mode.load(alloc, workspace_root)));
             return .handled_success;
         },
+        .tdd => {
+            var outcome = config_runtime.setWorkspaceTdd(alloc, workspace_root, parsed.name.?) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx sdd: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            const text = try std.fmt.allocPrint(alloc, "TDD is {s} for this workspace.\n", .{parsed.name.?});
+            defer alloc.free(text);
+            try writeStdout(deps, text);
+            return .handled_success;
+        },
         .new, .approve, .done => {
             const outcome = sdd_cli.applyChangeAction(alloc, std.Io.Dir.cwd(), parsed) catch |err| {
                 const text = try std.fmt.allocPrint(alloc, "fx sdd: {s}\n", .{@errorName(err)});
