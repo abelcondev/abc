@@ -9,8 +9,8 @@
 //! "jev": {
 //!   "enabled": true,
 //!   "model": "jev-latest",
-//!   "gates": { "stop": true },
-//!   "thresholds": { "stop": 0.5 }
+//!   "gates": { "plan": true, "stop": true },
+//!   "thresholds": { "plan": 0.5, "stop": 0.5 }
 //! }
 //! ```
 
@@ -33,6 +33,10 @@ pub const Config = struct {
     enabled: bool = false,
     model: []const u8 = default_model,
     base_url: []const u8 = typesafe.default_base_url,
+    /// Require a plan before the first file change of a substantial request.
+    plan_gate: bool = true,
+    /// Minimum probability the plan checks must reach.
+    plan_threshold: f64 = 0.5,
     /// Verify that a turn's claimed work is backed by evidence before it ends.
     stop_gate: bool = true,
     /// Minimum probability each completion check must reach.
@@ -79,12 +83,18 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             if (gates.object.get("stop")) |stop| {
                 if (stop == .bool) config.stop_gate = stop.bool;
             }
+            if (gates.object.get("plan")) |plan| {
+                if (plan == .bool) config.plan_gate = plan.bool;
+            }
         }
     }
     if (object.get("thresholds")) |thresholds| {
         if (thresholds == .object) {
             if (thresholds.object.get("stop")) |stop| {
                 if (threshold(stop)) |parsed| config.stop_threshold = parsed;
+            }
+            if (thresholds.object.get("plan")) |plan| {
+                if (threshold(plan)) |parsed| config.plan_threshold = parsed;
             }
         }
     }
@@ -192,7 +202,7 @@ pub fn loadApiKey(alloc: Allocator) !?ApiKey {
 test "applyJson reads the jev settings object and ignores invalid fields" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"enabled":true,"model":"jev-1.13.0","base_url":"http://insecure","gates":{"stop":false},"thresholds":{"stop":0.7}}
+        \\{"enabled":true,"model":"jev-1.13.0","base_url":"http://insecure","gates":{"stop":false,"plan":false},"thresholds":{"stop":0.7,"plan":0.6}}
     , .{});
     defer parsed.deinit();
     var config = Config{};
@@ -203,6 +213,8 @@ test "applyJson reads the jev settings object and ignores invalid fields" {
     try std.testing.expectEqualStrings(typesafe.default_base_url, config.base_url);
     try std.testing.expect(!config.stop_gate);
     try std.testing.expectEqual(@as(f64, 0.7), config.stop_threshold);
+    try std.testing.expect(!config.plan_gate);
+    try std.testing.expectEqual(@as(f64, 0.6), config.plan_threshold);
 
     var bad = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"enabled":"yes","model":"has space","thresholds":{"stop":1.5}}

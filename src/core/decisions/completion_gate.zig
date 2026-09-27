@@ -32,7 +32,8 @@ pub const Limits = struct {
 pub const task_kind_id = "task_kind";
 pub const work_done_id = "work_done";
 pub const claims_supported_id = "claims_supported";
-pub const reports_blocker_id = "reports_blocker";
+pub const not_finished_id = "not_finished";
+pub const needs_user_id = "needs_user";
 pub const checked_id = "checked";
 
 pub const questions = [_]jev_contract.Question{
@@ -55,9 +56,16 @@ pub const questions = [_]jev_contract.Question{
         .instructions = "Every statement in `final_message` about work that was done or checks that passed is backed by a matching tool result in `evidence`",
         .kind = .noul,
     },
+    // Two atomic questions: a single "blocked or asks the user" question
+    // also fired on optional offers such as "want me to commit?".
     .{
-        .id = reports_blocker_id,
-        .instructions = "`final_message` says the work is unfinished or blocked, or asks the user a question or for a decision",
+        .id = not_finished_id,
+        .instructions = "`final_message` says that some of the work `user_request` asks for was not done or could not be done",
+        .kind = .noul,
+    },
+    .{
+        .id = needs_user_id,
+        .instructions = "`final_message` asks the user for information or a decision without which the work in `user_request` cannot be finished",
         .kind = .noul,
     },
     .{
@@ -92,12 +100,13 @@ pub fn evaluate(response: *const jev_contract.Response, threshold: f64) Evaluate
     const kind = response.choice(task_kind_id) orelse return error.IncompleteJevAnswer;
     const work_done = response.noul(work_done_id) orelse return error.IncompleteJevAnswer;
     const claims_supported = response.noul(claims_supported_id) orelse return error.IncompleteJevAnswer;
-    const reports_blocker = response.noul(reports_blocker_id) orelse return error.IncompleteJevAnswer;
+    const not_finished = response.noul(not_finished_id) orelse return error.IncompleteJevAnswer;
+    const needs_user = response.noul(needs_user_id) orelse return error.IncompleteJevAnswer;
 
     if (!std.mem.eql(u8, kind.choice, "work") and kind.confidence >= skip_confidence) {
         return .{ .skipped = "not a work request" };
     }
-    if (reports_blocker >= blocker_pass) return .{ .skipped = "agent reported a blocker or asked the user" };
+    if (@max(not_finished, needs_user) >= blocker_pass) return .{ .skipped = "agent reported a blocker or asked the user" };
 
     var failures = std.EnumSet(Failure).initEmpty();
     if (work_done < threshold) failures.insert(.work_not_done);
@@ -235,13 +244,13 @@ fn testResponse(body: []const u8) !jev_contract.Response {
 
 test "evaluate passes supported work and fails unsupported claims" {
     var passed = try testResponse(
-        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.9},"claims_supported":{"type":"noul","noul":0.8},"reports_blocker":{"type":"noul","noul":0.1},"checked":{"type":"noul","noul":0.7}}}
+        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.9},"claims_supported":{"type":"noul","noul":0.8},"not_finished":{"type":"noul","noul":0.1},"needs_user":{"type":"noul","noul":0.1},"checked":{"type":"noul","noul":0.7}}}
     );
     defer passed.deinit();
     try std.testing.expect((try evaluate(&passed, 0.5)) == .passed);
 
     var failed = try testResponse(
-        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.8},"claims_supported":{"type":"noul","noul":0.2},"reports_blocker":{"type":"noul","noul":0.1},"checked":{"type":"noul","noul":0.1}}}
+        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.8},"claims_supported":{"type":"noul","noul":0.2},"not_finished":{"type":"noul","noul":0.1},"needs_user":{"type":"noul","noul":0.1},"checked":{"type":"noul","noul":0.1}}}
     );
     defer failed.deinit();
     const verdict = try evaluate(&failed, 0.5);
@@ -256,13 +265,13 @@ test "evaluate passes supported work and fails unsupported claims" {
 
 test "evaluate skips non-work requests and honest blockers" {
     var chat = try testResponse(
-        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"information","confidence":0.8},"work_done":{"type":"noul","noul":0.0},"claims_supported":{"type":"noul","noul":0.1},"reports_blocker":{"type":"noul","noul":0.0},"checked":{"type":"noul","noul":0.0}}}
+        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"information","confidence":0.8},"work_done":{"type":"noul","noul":0.0},"claims_supported":{"type":"noul","noul":0.1},"not_finished":{"type":"noul","noul":0.0},"needs_user":{"type":"noul","noul":0.0},"checked":{"type":"noul","noul":0.0}}}
     );
     defer chat.deinit();
     try std.testing.expect((try evaluate(&chat, 0.5)) == .skipped);
 
     var blocked = try testResponse(
-        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.1},"claims_supported":{"type":"noul","noul":0.9},"reports_blocker":{"type":"noul","noul":0.9},"checked":{"type":"noul","noul":0.0}}}
+        \\{"model":"m","answers":{"task_kind":{"type":"choice","choice":"work","confidence":0.9},"work_done":{"type":"noul","noul":0.1},"claims_supported":{"type":"noul","noul":0.9},"not_finished":{"type":"noul","noul":0.9},"needs_user":{"type":"noul","noul":0.2},"checked":{"type":"noul","noul":0.0}}}
     );
     defer blocked.deinit();
     try std.testing.expect((try evaluate(&blocked, 0.5)) == .skipped);
