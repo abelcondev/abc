@@ -1,12 +1,13 @@
-# abc: propuesta de fork de fx abierto a cualquier modelo
+# fx (fork): propuesta de fork de fx abierto a cualquier modelo
 
 > Base: `vercel-labs/fx` @ `59bf437` (2026-09-25), Zig 0.16+, Apache-2.0.
 > Modalidad: **hard fork**. Se corta el vínculo con upstream; no hay sincronización periódica.
-> Nombre del proyecto y del binario: **`abc`**.
+> Nombre del proyecto y del binario: **`fx`** (se vuelve al nombre original; `abc` queda descartado, ver sección 10).
 >
 > Decisiones tomadas:
 > - Hard fork, sin sincronizar con upstream.
-> - Nombre `abc`.
+> - ~~Nombre `abc`.~~ Se mantiene el nombre `fx` (2026-09-26). Este fork reemplaza al fx original en la máquina; el original no se usará más.
+> - Jev (TypeSafe AI) entra como el componente que toma decisiones dentro del harness (sección 11).
 > - Se eliminan Vercel AI Gateway, Codex y Grok. Solo quedan proveedores por API key o endpoints locales.
 > Estado: borrador para arrancar. Las causas marcadas como **hipótesis** hay que confirmarlas con el error real (ver Fase 1).
 
@@ -22,6 +23,8 @@
 | 5. Búsqueda web | ✅ | Tavily / Brave / SearXNG para cualquier proveedor. Visión fallback y contabilidad local de uso: pendientes. |
 | 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
 | 7. Anthropic Messages | ⬜ | No empezado. |
+| 8. Volver al nombre `fx` | ⬜ | Revertir `abc` → `fx` en binario, config, variables y textos (sección 10). |
+| 9. Jev como decisor | ⬜ | Configuración, `/jev`, transporte y etapas de decisión (sección 11). |
 
 ## 1. Objetivo
 
@@ -232,3 +235,102 @@ Y una prueba E2E real por preset con el binario (`./zig-out/bin/fx ask`), como e
 2. Definir los 2-3 proveedores prioritarios para la Fase 1.
 3. Instalar Zig 0.16.x.
 4. Ejecutar la Fase 0 (repo nuevo `abc` + build local).
+
+## 10. Nombre: se mantiene `fx`
+
+**Decisión (2026-09-26):** el fork deja de llamarse `abc` y vuelve a llamarse `fx`. Este fork pasa a ser *el* fx de esta máquina: el fx original de Vercel no se va a usar más, así que no importa que ambos choquen.
+
+### Consecuencias aceptadas
+
+- **No se puede tener el fx original instalado al mismo tiempo.** Los dos usan el binario `fx`, el directorio `~/.fx`, el archivo `.fx.json` y las variables `FX_*`. Se desinstala el original (`~/.fx/bin/fx` y cualquier copia en el `PATH`) y se usa solo este fork.
+- **La configuración se comparte con lo que haya dejado el original en `~/.fx`.** Antes del primer arranque, revisar `~/.fx/settings.json` y borrar lo que sea del gateway de Vercel, Codex o Grok (ya no existen en el fork).
+- **Nada de upgrades del original.** `fx upgrade` y el auto-upgrade siguen apuntando a los releases propios (o desactivados). Si apuntaran a `releases.fx.sh` reemplazarían el fork por el original.
+- **Marca.** Apache-2.0 §6 no da derechos sobre el nombre "fx" ni la marca Vercel. Para uso personal y un repo privado no hay problema; si algún día el fork se publica o distribuye, hay que volver a decidir el nombre. Los logos y badges de Vercel siguen fuera.
+
+### Qué se revierte (Fase 8)
+
+- Binario `zig-out/bin/abc` → `zig-out/bin/fx`, `.name` en `build.zig.zon`, banner y pistas de "resume".
+- `~/.abc` → `~/.fx`, `.abc.json` → `.fx.json`.
+- Variables `ABC_*` → `FX_*`. El alias que acepta `ABC_X` además de `FX_X` (`src/core/shared/io.zig:415`) se elimina.
+- Keys guardadas: servicio de Keychain `ABC_PROVIDER_KEY_<id>` → `FX_PROVIDER_KEY_<id>` y `~/.abc/provider-keys/` → `~/.fx/provider-keys/`. Migrar las keys existentes una sola vez (leer la ubicación vieja si la nueva no existe) o volver a cargarlas con `/provider`.
+- Comandos y textos (`abc login`, `abc update`, ayuda, README, instalador curl, workflow de release de macOS).
+- Repo en GitHub: puede seguir siendo `abelcondev/abc` o renombrarse; no afecta al binario.
+
+Se hace como un commit acotado, con `zig build test` en verde y `./zig-out/bin/fx` probado, igual que el resto de las fases.
+
+## 11. Jev como el que toma decisiones
+
+### Qué es Jev
+
+Jev (`jev-latest`, hoy `jev-1.13.0`) es el modelo "System One" de TypeSafe AI (https://docs.typesafe.ai). No genera texto: recibe un `state` y un conjunto de preguntas tipadas y devuelve respuestas con probabilidades calibradas.
+
+- `noul`: sí/no, devuelve una probabilidad de 0 a 1.
+- `choice`: una opción entre hasta 255, con `probabilities` y `confidence`.
+- `score`: un nivel dentro de una escala de 2 a 10 niveles.
+
+API propia (no es compatible con OpenAI): `POST https://api.typesafe.ai/v1/systemone` con `Authorization: Bearer <key>`. Cuesta $0.042 por millón de tokens de entrada (la salida es gratis), 64k de contexto, 1200 requests por minuto. Una prueba real con una decisión del harness respondió en ~390 ms con ~500 tokens.
+
+Los propios docs dicen que **no reemplaza al modelo del agente**: el modelo principal (DeepSeek, Qwen, etc.) sigue escribiendo código y llamando tools. Jev solo contesta preguntas atómicas que arma el código del harness, y el código combina las respuestas.
+
+**Límites que el diseño respeta:** es malo en matemáticas, conteo y fechas; empeora con `state` grande y ruidoso; el texto con prompt injection dentro del `state` puede moverlo. Por eso las reglas duras y la seguridad siguen en código y en el sistema de permisos existente. Jev juzga significado, no autoriza por sí solo acciones peligrosas.
+
+### Qué se aprende de waliki1
+
+En waliki1, Mimi ya usa Jev para elegir el skill (`choice`) y para validar cada escritura (`apply_ok`, un `noul`). Y el SDD de waliki1 muestra los problemas a resolver:
+
+- Specs que quedan desactualizados respecto al código, sin nada que lo detecte.
+- Criterios Gherkin que nadie ejecuta; "done" se marca a mano.
+- Todo el registro es manual (numerar, mover la propuesta a una decisión, `log.md`, relabelar tras el merge).
+- `log.md` + `context.md` crecen sin límite (~1900 líneas leídas en cada sesión).
+- Jev falla abierto: si la llamada falla o el parser lee mal, la escritura pasa igual. Ya ocurrió un bug así que nadie notó. Los umbrales (0.6, 0.5) están puestos a ojo.
+
+### La idea: un SDD vivo dentro del harness
+
+En vez de markdown mantenido a mano, el harness guarda el contrato de cada tarea (pedido + criterios de aceptación atómicos) y Jev lo valida en cada etapa:
+
+| Etapa | Pregunta a Jev | Dónde se enchufa |
+|---|---|---|
+| 1. Triage | `choice`: ¿trivial, pequeño o sustancial? | Inicio del turno |
+| 2. Plan | Si es sustancial: modo `plan` de solo lectura; el agente propone plan + criterios. `noul`: ¿cubre el pedido?, ¿agrega trabajo no pedido?, ¿cada criterio es verificable? | Nuevo `ModeSpec` en `src/builtins/modes.zig` (hoy no hay plan mode) |
+| 3. Acciones | `noul`: ¿los argumentos de la tool reflejan lo pedido? (el `apply_ok` de Mimi) | Hook `PreToolUse` (`src/core/hooks/`). Complementa al revisor de seguridad, no lo reemplaza |
+| 4. Cierre | Un `noul` por criterio: ¿la evidencia real (salida de tests, diff) demuestra que se cumple? Si alguno queda bajo, el agente sigue con la lista de lo que falta | Hook `Stop` con `continue_once` (hoy no hay ninguno registrado) |
+| 5. Preguntas al usuario | `ask_user_question` se convierte en un `choice`: con confianza alta decide Jev, si no se pregunta al humano | `ask_question_batch` en `src/core/tooling/tool_dispatch.zig` |
+| 6. Routing | `choice`: qué proveedor/modelo y esfuerzo usar para una subtarea | Subagentes |
+
+Además:
+
+- **Registro automático de decisiones:** cada llamada (preguntas, probabilidades, umbral, resultado) se guarda en `~/.fx/sessions/<id>/decisions.jsonl`. Reemplaza el `log.md` manual; las decisiones importantes se pueden exportar al repo como archivos cortos.
+- **Detección de specs desactualizados:** un `choice` sobre los títulos de las decisiones previas elige cuáles aplican a un diff, y un `noul` pregunta si el cambio contradice alguna.
+
+### Configuración
+
+Solo en el perfil (`~/.fx/settings.json`), nunca en el `.fx.json` del proyecto (se agrega a `isProfileOnlySettingKey`):
+
+```jsonc
+"jev": {
+  "enabled": true,
+  "model": "jev-latest",
+  "base_url": "https://api.typesafe.ai",
+  "gates": { "triage": true, "plan": true, "action": false, "stop": true, "ask": true },
+  "thresholds": { "plan": 0.7, "stop": 0.6, "ask_auto": 0.8 },
+  "on_error": "ask"          // "ask" (escalar al humano) | "open" | "closed"
+}
+```
+
+- **Key:** en el Keychain con `provider_keys` (id `typesafe`); `TYPESAFE_API_KEY` exportada tiene prioridad. Nunca en archivos del repo.
+- **`/jev`:** muestra el estado, pide la key con campo enmascarado (como `/provider`) y prende o apaga cada etapa. Variables `FX_JEV_*` para overrides.
+- **Si Jev falla:** por defecto se escala al humano, no se deja pasar en silencio como en Mimi.
+
+### Arquitectura
+
+- `src/gateway/typesafe.zig`: transporte HTTP (patrón de `src/builtins/web_search_api.zig`), con reintentos para 429/529/5xx y timeout corto.
+- `src/core/decisions/`: contrato tipado de preguntas y respuestas, umbrales, registro `decisions.jsonl`.
+- Etapas enchufadas en los hooks, modos y dispatch existentes; nada de lógica nueva en `main.zig`.
+- Tests: parser de respuestas con fixtures reales (para no repetir el bug de waliki), y un set de evals en `tests/evals/` para calibrar los umbrales.
+
+### Fases
+
+1. Configuración, `/jev`, transporte, registro y etapa 4 (cierre verificado). Es lo que más valor da solo.
+2. Triage, modo `plan` y etapa 2.
+3. Alineación de acciones y respuestas automáticas a `ask_user_question`.
+4. Routing de modelos, detección de specs desactualizados y evals de umbrales.
