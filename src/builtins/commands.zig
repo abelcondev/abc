@@ -180,8 +180,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sdd,
         .token = "sdd",
-        .usage = "sdd [on|off]",
-        .summary = "Turn the spec-driven development process on or off for this workspace",
+        .usage = "sdd [on|off|new <slug>|approve|done|tdd <mode>]",
+        .summary = "Run the spec-driven development process for this workspace",
     },
     .{
         .kind = .doctor,
@@ -322,7 +322,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .jev, .usage = "jev [on|off|key|check]", .summary = "Configure Jev decisions" },
-        .{ .kind = .sdd, .usage = "sdd [on|off]", .summary = "Switch the SDD process for this workspace" },
+        .{ .kind = .sdd, .usage = "sdd [on|off|new|approve]", .summary = "Switch the SDD process for this workspace" },
     } },
     .{ .entries = &.{
         .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
@@ -489,7 +489,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .jev, .command = "/jev", .help_entry = "/jev [on|off]", .completion_description = "show or toggle Jev decisions", .presentation_category = .general, .has_args = true, .accepts_payload = true },
-    .{ .kind = .sdd, .command = "/sdd", .help_entry = "/sdd [on|off]", .completion_description = "show or toggle the SDD process for this workspace", .presentation_category = .general, .has_args = true, .accepts_payload = true },
+    .{ .kind = .sdd, .command = "/sdd", .help_entry = "/sdd [on|off|new <slug>|approve|done|tdd <mode>]", .completion_description = "show or switch the SDD process and its changes", .presentation_category = .general, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },

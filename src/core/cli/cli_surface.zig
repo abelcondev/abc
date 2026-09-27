@@ -12,7 +12,6 @@ const jev_cli = @import("jev_cli.zig");
 const jev_config = @import("../decisions/jev_config.zig");
 const sdd_cli = @import("sdd_cli.zig");
 const sdd_mode = @import("../sdd/sdd_mode.zig");
-const drift_mod = @import("../decisions/drift.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -2141,36 +2140,56 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
 }
 
 fn runSdd(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
-    const action = sdd_cli.parseAction(rest) orelse {
+    const parsed = sdd_cli.parseAction(rest) orelse {
         try writeStderr(deps, sdd_cli.usage);
         return .handled_failure;
     };
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
-    if (action != .status) {
-        const enabled = action == .on;
-        var outcome = config_runtime.setWorkspaceSdd(alloc, workspace_root, enabled) catch |err| {
-            const text = try std.fmt.allocPrint(alloc, "fx sdd: could not update settings: {s}\n", .{@errorName(err)});
+    switch (parsed.action) {
+        .status => {
+            const text = try sdd_cli.statusFor(alloc, workspace_root, "fx sdd on");
             defer alloc.free(text);
-            try writeStderr(deps, text);
-            return .handled_failure;
-        };
-        outcome.deinit(alloc);
-        try writeStdout(deps, sdd_cli.savedMessage(enabled, sdd_mode.load(alloc, workspace_root)));
-        return .handled_success;
+            try writeStdout(deps, text);
+            return .handled_success;
+        },
+        .on, .off => {
+            const enabled = parsed.action == .on;
+            var outcome = config_runtime.setWorkspaceSdd(alloc, workspace_root, enabled) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx sdd: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            try writeStdout(deps, sdd_cli.savedMessage(enabled, sdd_mode.load(alloc, workspace_root)));
+            return .handled_success;
+        },
+        .tdd => {
+            var outcome = config_runtime.setWorkspaceTdd(alloc, workspace_root, parsed.name.?) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx sdd: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            const text = try std.fmt.allocPrint(alloc, "TDD is {s} for this workspace.\n", .{parsed.name.?});
+            defer alloc.free(text);
+            try writeStdout(deps, text);
+            return .handled_success;
+        },
+        .new, .approve, .done => {
+            const outcome = sdd_cli.applyChangeAction(alloc, std.Io.Dir.cwd(), parsed) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx sdd: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            defer alloc.free(outcome.text);
+            if (outcome.ok) try writeStdout(deps, outcome.text) else try writeStderr(deps, outcome.text);
+            return if (outcome.ok) .handled_success else .handled_failure;
+        },
     }
-    var config = try jev_config.load(alloc);
-    defer config.deinit(alloc);
-    const text = try sdd_cli.renderStatus(alloc, sdd_mode.load(alloc, workspace_root), .{
-        .workspace_root = workspace_root,
-        .records_dir = drift_mod.findDir(std.Io.Dir.cwd()),
-        .jev_enabled = config.enabled,
-        .drift_gate = config.drift_gate,
-        .enable_command = "fx sdd on",
-    });
-    defer alloc.free(text);
-    try writeStdout(deps, text);
-    return .handled_success;
 }
 
 fn runJevDrift(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
@@ -2188,7 +2207,7 @@ fn runJevDrift(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !Run
     var flagged: usize = 0;
     const report = jev_cli.drift(alloc, config, key.value, options, &flagged) catch |err| {
         const text = switch (err) {
-            error.NoDecisionsDirectory => try alloc.dupe(u8, "fx jev drift: no decisions directory found (sdd/decisions, docs/decisions, docs/adr, decisions); pass --dir\n"),
+            error.NoDecisionsDirectory => try alloc.dupe(u8, "fx jev drift: no specs or decisions directory found (sdd/specs, sdd/decisions, docs/decisions, docs/adr, decisions); pass --dir\n"),
             else => try std.fmt.allocPrint(alloc, "fx jev drift: {s}\n", .{@errorName(err)}),
         };
         defer alloc.free(text);

@@ -39,6 +39,9 @@ const routing = @import("routing.zig");
 const drift = @import("drift.zig");
 const decision_log = @import("decision_log.zig");
 const sdd_mode = @import("../sdd/sdd_mode.zig");
+const sdd_layout = @import("../sdd/sdd_layout.zig");
+const sdd_gate = @import("sdd_gate.zig");
+const tdd_gate = @import("tdd_gate.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -56,11 +59,36 @@ pub const Gate = struct {
     plan_settled: bool = false,
     plan_holds: u8 = 0,
     action_holds: u8 = 0,
+    /// SDD mode for this turn's workspace, loaded on the first file change.
+    sdd_turn_mode: ?sdd_mode.Mode = null,
+    /// The route this turn's work goes through once code may change; null
+    /// when no route applies (SDD off, unclear, Jev unavailable).
+    sdd_route: ?SddRoute = null,
+    /// Titles of the spec rules the request changes. Owned.
+    sdd_touched: std.ArrayList([]u8) = .empty,
+    tdd_holds: u8 = 0,
+    growth_held: bool = false,
+    tdd_green_asked: bool = false,
+    tdd_weak_asked: bool = false,
+    tdd_uncited_asked: bool = false,
+    /// The SDD route needs no more checks this turn.
+    sdd_settled: bool = false,
+    /// Set when this turn routed to change; later file changes re-check the
+    /// change files without asking Jev again.
+    sdd_change: ?sdd_gate.Verdict = null,
+    sdd_incomplete_held: bool = false,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
     const max_plan_holds = 2;
     const max_action_holds = 3;
+
+    const SddRoute = struct {
+        route: sdd_gate.Route,
+        bug: bool = false,
+        /// The work is checked in the running app, not by tests.
+        manual: bool = false,
+    };
 
     /// Loads the profile configuration. Jev stays inactive unless enabled.
     pub fn init(alloc: Allocator) Gate {
@@ -73,6 +101,8 @@ pub const Gate = struct {
 
     pub fn deinit(self: *Gate) void {
         if (self.lent) |text| self.alloc.free(text);
+        self.clearTouched();
+        self.sdd_touched.deinit(self.alloc);
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
@@ -113,6 +143,24 @@ pub const Gate = struct {
         }
     }
 
+    fn clearTouched(self: *Gate) void {
+        for (self.sdd_touched.items) |title| self.alloc.free(title);
+        self.sdd_touched.clearRetainingCapacity();
+    }
+
+    /// Whether this turn's route requires test-first work.
+    fn requiresTests(self: *const Gate) bool {
+        const mode = self.sdd_turn_mode orelse return false;
+        if (mode.tdd == .off) return false;
+        const route = self.sdd_route orelse return false;
+        if (route.manual) return false;
+        return switch (route.route) {
+            .spec, .change => true,
+            .fix => route.bug,
+            .unclear => false,
+        };
+    }
+
     fn lend(self: *Gate, text: []u8) []const u8 {
         if (self.lent) |old| self.alloc.free(old);
         self.lent = text;
@@ -125,6 +173,17 @@ pub const Gate = struct {
         self.plan_settled = false;
         self.plan_holds = 0;
         self.action_holds = 0;
+        self.sdd_turn_mode = null;
+        self.sdd_route = null;
+        self.clearTouched();
+        self.tdd_holds = 0;
+        self.growth_held = false;
+        self.tdd_green_asked = false;
+        self.tdd_weak_asked = false;
+        self.tdd_uncited_asked = false;
+        self.sdd_settled = false;
+        self.sdd_change = null;
+        self.sdd_incomplete_held = false;
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -203,6 +262,23 @@ pub const Gate = struct {
         const action = blk: {
             if (config.ask_gate and std.mem.eql(u8, tool, ask_gate.tool_name)) break :blk self.checkAsk(input);
             if (config.routes.len != 0 and std.mem.eql(u8, tool, routing.tool_name)) break :blk self.routeSubagent(input);
+            if (config.sdd_gate and plan_gate.isFileChange(tool)) {
+                if (!self.sdd_settled) {
+                    const sdd_action = self.checkSdd(input) catch |err| sdd: {
+                        debug_trace.logf("jev", "sdd gate failed err={s}", .{@errorName(err)});
+                        self.sdd_settled = true;
+                        break :sdd hooks.PreToolUseAction.continue_;
+                    };
+                    if (sdd_action != .continue_) break :blk sdd_action;
+                }
+                if (self.sdd_route != null) {
+                    const tdd_action = self.checkTdd(input) catch |err| tdd: {
+                        debug_trace.logf("jev", "tdd gate failed err={s}", .{@errorName(err)});
+                        break :tdd hooks.PreToolUseAction.continue_;
+                    };
+                    if (tdd_action != .continue_) break :blk tdd_action;
+                }
+            }
             if (config.plan_gate and !self.plan_settled and plan_gate.isFileChange(tool)) {
                 const plan_action = self.checkPlan(input) catch |err| plan: {
                     debug_trace.logf("jev", "plan gate failed err={s}", .{@errorName(err)});
@@ -275,6 +351,212 @@ pub const Gate = struct {
         entry.detail = route.name;
         decision_log.append(self.alloc, entry);
         return .{ .rewrite_arguments = self.lend(rewritten) };
+    }
+
+    fn checkSdd(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        const root_path = input.invocation.scope.workspace_root;
+        if (self.sdd_turn_mode == null) self.sdd_turn_mode = sdd_mode.load(self.alloc, root_path);
+        if (!self.sdd_turn_mode.?.enabled) {
+            self.sdd_settled = true;
+            return .continue_;
+        }
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        // Proposals and specs are always writable; only code waits.
+        if (toolPath(arena, input.arguments_json)) |path| {
+            if (sdd_layout.isSddPath(root_path, path)) return .continue_;
+        }
+        const io = io_mod.getIo();
+        var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+        defer root.close(io);
+        const changes = try sdd_layout.listChanges(arena, root);
+        var entry = self.newEntry("sdd", input.invocation, sdd_gate.rule_threshold);
+        if (sdd_layout.firstWithStatus(changes, .approved)) |approved| {
+            self.sdd_settled = true;
+            self.sdd_route = .{ .route = .change, .manual = approved.tdd_manual };
+            entry.outcome = "change";
+            entry.detail = approved.file;
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        }
+        const proposed = sdd_layout.firstWithStatus(changes, .proposed);
+        if (self.sdd_change) |verdict| {
+            // Already routed to change this turn: hold until approved.
+            entry.outcome = "hold";
+            entry.detail = "change";
+            decision_log.append(self.alloc, entry);
+            return .{ .block = self.lend(try self.changeHold(verdict, proposed)) };
+        }
+
+        const rules = try sdd_layout.listRules(arena, root);
+        const with_proposal = proposed != null;
+        const state = try sdd_gate.buildState(self.alloc, .{
+            .user_request = input.user_request,
+            .turn_messages = input.turn_messages,
+            .assistant_text = input.assistant_text,
+            .tool_name = input.tool_name,
+            .arguments_json = input.arguments_json,
+            .rules = rules,
+            .proposal = if (proposed) |change| change.body else null,
+        });
+        defer self.alloc.free(state);
+        const questions = try sdd_gate.questions(arena, rules.len, with_proposal);
+        var response = self.consult(&entry, state, questions) orelse {
+            self.sdd_settled = true;
+            return .continue_;
+        };
+        defer response.deinit();
+        const verdict = sdd_gate.evaluate(arena, &response, rules.len, with_proposal) catch |err| {
+            self.logIncomplete(&entry, err);
+            if (self.sdd_incomplete_held) {
+                self.sdd_settled = true;
+                return .continue_;
+            }
+            self.sdd_incomplete_held = true;
+            return .{ .block = sdd_gate.incomplete_reason };
+        };
+        if (proposed) |change| {
+            if (verdict.approves) {
+                try sdd_layout.setStatus(self.alloc, root, change.file, .approved);
+                self.sdd_settled = true;
+                self.sdd_route = .{ .route = .change, .manual = change.tdd_manual };
+                entry.outcome = "approved";
+                entry.detail = change.file;
+                decision_log.append(self.alloc, entry);
+                // Held once so the agent knows the status changed under it;
+                // the retry goes through.
+                return .{ .block = self.lend(try sdd_gate.approvedNotice(self.alloc, change.file)) };
+            }
+        }
+        entry.outcome = @tagName(verdict.route);
+        decision_log.append(self.alloc, entry);
+        switch (verdict.route) {
+            .fix => {
+                self.sdd_settled = true;
+                self.sdd_route = .{ .route = .fix, .bug = verdict.bug };
+                return .continue_;
+            },
+            .spec => {
+                self.sdd_settled = true;
+                var manual = true;
+                for (verdict.touched) |index| {
+                    if (!tdd_gate.isManual(rules[index].title)) manual = false;
+                    try self.sdd_touched.append(self.alloc, try self.alloc.dupe(u8, rules[index].title));
+                }
+                self.sdd_route = .{ .route = .spec, .bug = verdict.bug, .manual = manual };
+                return .{ .block = self.lend(try sdd_gate.specReason(self.alloc, rules, verdict.touched)) };
+            },
+            .unclear => {
+                self.sdd_settled = true;
+                return .{ .block = sdd_gate.unclear_reason };
+            },
+            .change => {
+                self.sdd_change = .{ .route = .change, .high_stakes = verdict.high_stakes, .substantial = verdict.substantial };
+                return .{ .block = self.lend(try self.changeHold(self.sdd_change.?, proposed)) };
+            },
+        }
+    }
+
+    /// Growth and test-first checks for a source change once the route is
+    /// known.
+    fn checkTdd(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        const route = self.sdd_route.?;
+        const mode = self.sdd_turn_mode orelse return .continue_;
+        const root_path = input.invocation.scope.workspace_root;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const path = toolPath(arena, input.arguments_json) orelse return .continue_;
+        if (!tdd_gate.isSourceChange(root_path, path)) return .continue_;
+        const evidence = try tdd_gate.scan(arena, input.turn_messages, root_path, mode.testCommand(), .{ .path = path });
+
+        if ((route.route == .fix or route.route == .spec) and !self.growth_held and evidence.source_files > tdd_gate.growth_limit) {
+            self.growth_held = true;
+            var entry = self.newEntry("sdd", input.invocation, tdd_gate.growth_limit);
+            entry.outcome = "hold";
+            entry.detail = "grew past a small change";
+            decision_log.append(self.alloc, entry);
+            return .{ .block = self.lend(try tdd_gate.growthReason(self.alloc, evidence.source_files)) };
+        }
+        if (!self.requiresTests() or evidence.source_changed or evidence.red) return .continue_;
+        const max_holds: u8 = if (mode.tdd == .strict) 4 else 2;
+        var entry = self.newEntry("tdd", input.invocation, 0);
+        if (self.tdd_holds >= max_holds) {
+            entry.detail = "hold budget spent";
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        }
+        self.tdd_holds += 1;
+        entry.outcome = "hold";
+        entry.detail = "no failing test before the source change";
+        decision_log.append(self.alloc, entry);
+        return .{ .block = tdd_gate.red_reason };
+    }
+
+    /// Green, meaningful-test and (strict) citation checks at the end of a
+    /// turn. Null lets the turn go on to the drift check.
+    fn checkTddStop(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
+        if (!self.requiresTests()) return null;
+        const mode = self.sdd_turn_mode.?;
+        const root_path = input.invocation.scope.workspace_root;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const evidence = try tdd_gate.scan(arena, input.turn_messages, root_path, mode.testCommand(), null);
+        if (!evidence.source_changed) return null;
+        var entry = self.newEntry("tdd", input.invocation, tdd_gate.meaningful_threshold);
+        if (!evidence.green) {
+            if (self.tdd_green_asked) return null;
+            self.tdd_green_asked = true;
+            entry.outcome = "continue";
+            entry.detail = "no passing test run after the last source change";
+            decision_log.append(self.alloc, entry);
+            return .{ .continue_once = tdd_gate.green_reason };
+        }
+        if (evidence.tests.len != 0 and !self.tdd_weak_asked) {
+            self.tdd_weak_asked = true;
+            const state = try tdd_gate.buildState(self.alloc, input.user_request, evidence);
+            defer self.alloc.free(state);
+            var response = self.consult(&entry, state, &tdd_gate.questions) orelse return null;
+            defer response.deinit();
+            const meaningful = tdd_gate.meaningful(&response) orelse {
+                self.logIncomplete(&entry, error.IncompleteJevAnswer);
+                return null;
+            };
+            if (!meaningful) {
+                entry.outcome = "continue";
+                entry.detail = "tests would pass without the behavior";
+                decision_log.append(self.alloc, entry);
+                return .{ .continue_once = tdd_gate.weak_test_reason };
+            }
+            decision_log.append(self.alloc, entry);
+        }
+        if (mode.tdd == .strict and !self.tdd_uncited_asked and self.sdd_touched.items.len != 0) {
+            self.tdd_uncited_asked = true;
+            const citations = specCitations(arena, root_path);
+            var rules: std.ArrayList(sdd_layout.Rule) = .empty;
+            var indices: std.ArrayList(usize) = .empty;
+            for (self.sdd_touched.items, 0..) |title, index| {
+                try rules.append(arena, .{ .capability = "", .title = title, .body = "" });
+                try indices.append(arena, index);
+            }
+            const missing = try tdd_gate.uncitedRules(arena, rules.items, indices.items, citations);
+            if (missing.len != 0) {
+                var strict_entry = self.newEntry("tdd", input.invocation, 0);
+                strict_entry.outcome = "continue";
+                strict_entry.detail = "changed rules without a citing test";
+                decision_log.append(self.alloc, strict_entry);
+                return .{ .continue_once = self.lend(try tdd_gate.uncitedReason(self.alloc, missing)) };
+            }
+        }
+        return null;
+    }
+
+    fn changeHold(self: *Gate, verdict: sdd_gate.Verdict, proposed: ?sdd_layout.Change) ![]u8 {
+        if (proposed) |change| return sdd_gate.pendingReason(self.alloc, change.file);
+        var date_buf: [10]u8 = undefined;
+        return sdd_gate.changeReason(self.alloc, verdict, sdd_layout.today(&date_buf));
     }
 
     fn checkPlan(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
@@ -398,6 +680,13 @@ pub const Gate = struct {
             },
             .passed => {
                 decision_log.append(self.alloc, entry);
+                if (self.config.sdd_gate) {
+                    const tdd_action = self.checkTddStop(input) catch |err| tdd: {
+                        debug_trace.logf("jev", "tdd stop check failed err={s}", .{@errorName(err)});
+                        break :tdd null;
+                    };
+                    if (tdd_action) |action| return action;
+                }
                 if (self.config.drift_gate and changedFiles(input.turn_messages) and
                     sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
                 {
@@ -446,9 +735,14 @@ pub const Gate = struct {
         entry.latency_ms = io_mod.milliTimestamp() - started;
 
         var fresh: std.ArrayList(drift.Finding) = .empty;
+        var fresh_keys: std.ArrayList([]const u8) = .empty;
         for (report.findings) |finding| {
-            if (!finding.stale or self.drift_reported.contains(finding.decision.file)) continue;
+            if (!finding.stale) continue;
+            // Spec rules share a file, so the title is part of the key.
+            const report_key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ finding.decision.file, finding.decision.title });
+            if (self.drift_reported.contains(report_key)) continue;
             try fresh.append(arena, finding);
+            try fresh_keys.append(arena, report_key);
         }
         const answers = try arena.alloc(jev_contract.NamedAnswer, report.findings.len);
         for (report.findings, 0..) |finding, index| answers[index] = .{ .id = finding.decision.file, .answer = .{ .noul = finding.contradiction } };
@@ -458,8 +752,8 @@ pub const Gate = struct {
             decision_log.append(self.alloc, entry);
             return .allow;
         }
-        for (fresh.items) |finding| {
-            const owned = try self.alloc.dupe(u8, finding.decision.file);
+        for (fresh_keys.items) |report_key| {
+            const owned = try self.alloc.dupe(u8, report_key);
             self.drift_reported.put(self.alloc, owned, {}) catch |err| {
                 self.alloc.free(owned);
                 return err;
@@ -470,6 +764,24 @@ pub const Gate = struct {
         return .{ .continue_once = self.lend(try drift.feedback(self.alloc, dir_path, fresh.items)) };
     }
 };
+
+/// Lines citing spec rules (`spec: <spec> › <rule>`) in tracked files.
+/// Empty when git is unavailable.
+fn specCitations(arena: Allocator, root_path: []const u8) []const u8 {
+    const result = std.process.run(arena, io_mod.getIo(), .{
+        .argv = &.{ "git", "grep", "-h", "-I", "-F", "-e", "spec:", "--", ".", ":(exclude)" ++ sdd_layout.root_dir },
+        .cwd = .{ .path = root_path },
+    }) catch return "";
+    return result.stdout;
+}
+
+/// The `path` argument of a file tool call, if present.
+fn toolPath(arena: Allocator, arguments_json: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch return null;
+    if (parsed != .object) return null;
+    const path = parsed.object.get("path") orelse return null;
+    return if (path == .string) path.string else null;
+}
 
 /// Whether the turn changed a file through the file tools.
 fn changedFiles(messages: []const types.ChatMessage) bool {

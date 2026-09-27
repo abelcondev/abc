@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing]
+    \\       fx jev eval [stop|plan|action|ask|routing|sdd]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
