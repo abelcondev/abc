@@ -539,6 +539,9 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     jev_gate: ?jev_gate.Gate = null,
+    /// Cached SDD mode for the status line; loaded on first render and
+    /// updated by `/sdd on|off`.
+    sdd_enabled: ?bool = null,
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -4391,6 +4394,8 @@ test {
     _ = @import("core/decisions/calibration.zig");
     _ = @import("core/decisions/drift.zig");
     _ = @import("core/cli/jev_cli.zig");
+    _ = @import("core/cli/sdd_cli.zig");
+    _ = @import("core/sdd/sdd_mode.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");

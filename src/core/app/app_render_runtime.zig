@@ -38,6 +38,7 @@ const render_request = @import("../../ui/render_request.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
+const sdd_mode = @import("../sdd/sdd_mode.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -882,6 +883,10 @@ pub fn Runtime(comptime App: type) type {
                 if (app.statusline_session) {
                     items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(app);
                 }
+            }
+            if (comptime @hasField(App, "sdd_enabled") and @hasField(App, "workspace_root")) {
+                if (app.sdd_enabled == null) app.sdd_enabled = sdd_mode.load(app.alloc, app.workspace_root).enabled;
+                items.sdd_active = app.sdd_enabled.?;
             }
             return items;
         }

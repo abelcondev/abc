@@ -172,7 +172,7 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
         label = indent;
     }
     if (config.drift_gate) {
-        try w.print("  {s}decision records after changes\n", .{label});
+        try w.print("  {s}decision records after changes (with SDD on)\n", .{label});
         label = indent;
     }
     if (config.action_gate) {

@@ -171,11 +171,11 @@ the decisions the diff touches, then reads them and flags the ones the change
 contradicts. It exits non-zero when any decision may be out of date, so it can
 run in CI.
 
-The same check runs at the end of a session turn that changed files, when the
-workspace has a decisions directory (`gates.drift`, default on). If the
-uncommitted changes contradict a record, the agent is asked to update the
-record (or fix the code) before answering. Each record is flagged once per
-session.
+The same check runs at the end of a session turn that changed files, when SDD
+is on for the workspace (see below) and it has a decisions directory
+(`gates.drift`, default on). If the uncommitted changes contradict a record,
+the agent is asked to update the record (or fix the code) before answering.
+Each record is flagged once per session.
 
 Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
 answers, the threshold and the outcome (the state sent to Jev is not stored).
@@ -200,6 +200,30 @@ files cannot set them.
 
 `TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` and `FX_JEV_BASE_URL`
 override the saved values.
+
+## Spec-driven development
+
+SDD is fx's spec-driven development process. It is off by default, so fx works
+freely in every workspace until you turn it on for one:
+
+```bash
+fx sdd           # show the status for the current workspace
+fx sdd on        # turn it on here (writes workspaces["<path>"].sdd.enabled)
+fx sdd off
+```
+
+Inside a session, `/sdd` shows the same status and `/sdd on` or `/sdd off`
+saves the setting; it applies from the next turn. The status line shows `sdd`
+while it is on.
+
+While SDD is on, the Jev spec drift check runs after turns that change files.
+With SDD off, nothing checks decision records automatically; `fx jev drift`
+still runs on demand.
+
+The setting lives in `~/.fx/settings.json` only, per workspace, with an
+optional top-level `"sdd": {"enabled": true}` default for every workspace.
+Project `.fx.json` files cannot turn it on. `FX_SDD=on|off` overrides the saved
+value for one shell or CI run.
 
 ## Configure a connection
 
