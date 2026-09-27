@@ -40,6 +40,9 @@ const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
 const jev_cli = @import("../cli/jev_cli.zig");
 const jev_config = @import("../decisions/jev_config.zig");
+const sdd_cli = @import("../cli/sdd_cli.zig");
+const sdd_mode = @import("../sdd/sdd_mode.zig");
+const drift = @import("../decisions/drift.zig");
 const provider_keys = @import("../auth/provider_keys.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -393,6 +396,7 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_jev = commandHandleJev,
+                .handle_sdd = commandHandleSdd,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
@@ -2045,6 +2049,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleJev(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleJevCommand(app, rest);
+        }
+
+        fn commandHandleSdd(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleSddCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -3964,6 +3973,48 @@ fn handleJevCommand(app: anytype, rest: []const u8) !void {
     else
         "Jev decisions are on for new sessions. Restart fx to use them here.";
     try app.writeDomainNotice(.{ .topic = "jev", .tone = .success, .body = body }, true);
+}
+
+/// `/sdd` shows the workspace's SDD status; `/sdd on|off` saves
+/// `workspaces["<root>"].sdd.enabled`, which applies from the next turn.
+fn handleSddCommand(app: anytype, rest: []const u8) !void {
+    const command = parseJevCommand(rest) orelse {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /sdd [on|off]" }, true);
+        return;
+    };
+    const workspace_root: []const u8 = if (comptime @hasField(@TypeOf(app.*), "workspace_root")) app.workspace_root else "";
+    if (workspace_root.len == 0) {
+        try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = "No workspace is open." }, true);
+        return;
+    }
+    if (command == .status) {
+        var config = try jev_config.load(app.alloc);
+        defer config.deinit(app.alloc);
+        var root = std.Io.Dir.cwd().openDir(io_mod.getIo(), workspace_root, .{}) catch null;
+        defer if (root) |*dir| dir.close(io_mod.getIo());
+        const text = try sdd_cli.renderStatus(app.alloc, sdd_mode.load(app.alloc, workspace_root), .{
+            .workspace_root = workspace_root,
+            .records_dir = if (root) |dir| drift.findDir(dir) else null,
+            .jev_enabled = config.enabled,
+            .drift_gate = config.drift_gate,
+            .enable_command = "/sdd on",
+        });
+        defer app.alloc.free(text);
+        try app.writeDomainNotice(.{ .topic = "sdd", .tone = .information, .body = std.mem.trimEnd(u8, text, "\n") }, true);
+        return;
+    }
+    const enable = command == .on;
+    var outcome = config_runtime.setWorkspaceSdd(app.alloc, workspace_root, enable) catch |err| {
+        const body = try std.fmt.allocPrint(app.alloc, "Could not save SDD settings: {s}", .{@errorName(err)});
+        defer app.alloc.free(body);
+        try app.writeDomainNotice(.{ .topic = "sdd", .tone = .@"error", .body = body }, true);
+        return;
+    };
+    outcome.deinit(app.alloc);
+    const effective = sdd_mode.load(app.alloc, workspace_root);
+    if (comptime @hasField(@TypeOf(app.*), "sdd_enabled")) app.sdd_enabled = effective.enabled;
+    const body = std.mem.trimEnd(u8, sdd_cli.savedMessage(enable, effective), "\n");
+    try app.writeDomainNotice(.{ .topic = "sdd", .tone = .success, .body = body }, true);
 }
 
 test "parseJevCommand accepts status, on and off" {

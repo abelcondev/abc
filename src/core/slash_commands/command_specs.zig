@@ -23,6 +23,7 @@ pub const TopLevelKind = enum {
     models,
     provider,
     jev,
+    sdd,
     doctor,
     teams,
     session,
@@ -69,6 +70,7 @@ pub const SlashKind = enum {
     statusline,
     notifications,
     jev,
+    sdd,
     workspace,
     version,
 };
@@ -1637,7 +1639,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
     try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "Configure Jev decisions\n\n  setup") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Switch the SDD process for this workspace\n\n  setup") != null);
     try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
     try expectAllLinesFit(narrow, 60);
 }
@@ -1767,9 +1769,9 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
-    try std.testing.expectEqual(@as(usize, 6), helpCatalogCategoryCount(registry, "", .general));
+    try std.testing.expectEqual(@as(usize, 7), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
 }

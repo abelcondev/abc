@@ -91,6 +91,12 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
+/// Writes `workspaces["<root>"].sdd.enabled`.
+pub const WorkspaceSddMutation = struct {
+    workspace_root: []const u8,
+    enabled: bool,
+};
+
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
@@ -270,6 +276,7 @@ const SettingsMutation = union(enum) {
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
     project_mcp: ProjectMcpMutation,
+    workspace_sdd: WorkspaceSddMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
@@ -277,6 +284,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
             .project_mcp => "project_mcp_patch",
+            .workspace_sdd => "workspace_sdd_patch",
         };
     }
 
@@ -289,6 +297,7 @@ const SettingsMutation = union(enum) {
                 .local => .local,
             },
             .project_mcp => .local,
+            .workspace_sdd => .local,
         };
     }
 
@@ -301,6 +310,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "commit_first",
             .permission => "commit_first",
             .project_mcp => "commit_first",
+            .workspace_sdd => "commit_first",
         };
     }
 
@@ -310,6 +320,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => false,
             .permission => false,
             .project_mcp => false,
+            .workspace_sdd => false,
         };
     }
 };
@@ -446,6 +457,14 @@ pub const Store = struct {
         mutation: ProjectMcpMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
+    pub fn applyWorkspaceSddPatch(
+        self: *Store,
+        alloc: Allocator,
+        mutation: WorkspaceSddMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .workspace_sdd = mutation });
     }
 
     fn applyMutation(
@@ -886,6 +905,7 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
+        .workspace_sdd => |workspace_sdd| try validateWorkspaceRoot(workspace_sdd.workspace_root),
     }
 }
 
@@ -957,6 +977,29 @@ test "collapse tool calls user patch writes the profile preference" {
     try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
 }
 
+test "workspace sdd mutation writes only that workspace's sdd switch" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"workspaces\":{\"/repo\":{\"model\":\"kept\"}}}",
+        .{},
+    );
+
+    const on = try applyWorkspaceSddMutationToRoot(arena.allocator(), &root, .{ .workspace_root = "/repo", .enabled = true });
+    try std.testing.expect(on.changed);
+    const workspace = root.object.get("workspaces").?.object.get("/repo").?.object;
+    try std.testing.expect(workspace.get("sdd").?.object.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("kept", workspace.get("model").?.string);
+    try std.testing.expect(root.object.get("sdd") == null);
+
+    const again = try applyWorkspaceSddMutationToRoot(arena.allocator(), &root, .{ .workspace_root = "/repo", .enabled = true });
+    try std.testing.expect(!again.changed);
+    try std.testing.expectError(error.InvalidDurableField, validateMutation(.{ .workspace_sdd = .{ .workspace_root = "relative", .enabled = true } }));
+}
+
 test "model and fast patch binds the fast preference atomically" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -997,6 +1040,7 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
         .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
+        .workspace_sdd => |workspace_sdd| applyWorkspaceSddMutationToRoot(arena, root, workspace_sdd),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -1480,6 +1524,22 @@ fn applyPermissionMutationToRoot(
     return applyPermissionPatch(arena, target, mutation.patch);
 }
 
+fn applyWorkspaceSddMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: WorkspaceSddMutation,
+) !PatchApplication {
+    const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    var sdd = if (workspace.getPtr("sdd")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk value;
+    } else blk: {
+        try workspace.put(arena, "sdd", .{ .object = .empty });
+        break :blk workspace.getPtr("sdd").?;
+    };
+    return .{ .changed = try putBool(arena, &sdd.object, "enabled", mutation.enabled) };
+}
+
 fn applyProjectMcpMutationToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -1828,6 +1888,7 @@ fn validateCandidate(
             .local => permission.workspace_root.?,
         },
         .project_mcp => |project_mcp| project_mcp.workspace_root,
+        .workspace_sdd => |workspace_sdd| workspace_sdd.workspace_root,
     };
     const workspace_may_be_absent = switch (mutation) {
         .workspace_directory => |workspace| workspace.patch != .add,

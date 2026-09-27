@@ -199,6 +199,8 @@ pub const StatuslineItems = struct {
     context_used: u64 = 0,
     context_total: ?u32 = null,
     session_title: ?[]const u8 = null,
+    /// The workspace runs the SDD process.
+    sdd_active: bool = false,
 };
 
 /// Cell budget for the session title segment. The title is capped at 8 words
@@ -394,6 +396,9 @@ fn appendSessionStatusSegments(
     }
     if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
+    }
+    if (statusline.sdd_active) {
+        appendStatusSegment(out, end, "sdd");
     }
     if (statusline.session_title) |title| {
         appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
@@ -1199,6 +1204,14 @@ test "buildHintLine clips styled auto mode by visible width" {
     try std.testing.expectEqualStrings(expected, line);
     try std.testing.expectEqual(@as(usize, 13), display_width.visibleWidthIgnoringAnsi(line));
     try std.testing.expect(std.mem.endsWith(u8, line, "gpt-4o"));
+}
+
+test "status line shows sdd after the model segments while SDD is on" {
+    var buf: [128]u8 = undefined;
+    const line = buildSessionStatusLine("openai/gpt-4o", .auto, false, .{ .sdd_active = true, .context_used = 2_000 }, 100, &buf);
+    try std.testing.expectEqualStrings("gpt-4o · sdd · 2k", line);
+    const off = buildSessionStatusLine("openai/gpt-4o", .auto, false, .{}, 100, &buf);
+    try std.testing.expectEqualStrings("gpt-4o", off);
 }
 
 test "buildSessionStatusLine reuses model effort and context formatting" {
