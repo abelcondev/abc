@@ -2043,6 +2043,7 @@ fn runGithubWorkflow(
 }
 
 fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    if (rest.len != 0 and std.mem.eql(u8, rest[0], "drift")) return runJevDrift(alloc, deps, rest[1..]);
     const parsed = jev_cli.parseAction(rest) orelse {
         try writeStderr(deps, jev_cli.usage);
         return .handled_failure;
@@ -2090,6 +2091,7 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
             return .handled_success;
         },
         .status, .check, .eval => {},
+        .drift => unreachable,
     }
     var config = try jev_config.load(alloc);
     defer config.deinit(alloc);
@@ -2130,6 +2132,33 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
     defer alloc.free(summary);
     try writeStdout(deps, summary);
     return .handled_success;
+}
+
+fn runJevDrift(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    const options = jev_cli.parseDrift(rest) orelse {
+        try writeStderr(deps, jev_cli.usage);
+        return .handled_failure;
+    };
+    var config = try jev_config.load(alloc);
+    defer config.deinit(alloc);
+    var key = (try jev_config.loadApiKey(alloc)) orelse {
+        try writeStderr(deps, "fx jev: no key; run `fx jev key` or export " ++ jev_config.key_env ++ "\n");
+        return .handled_failure;
+    };
+    defer key.deinit(alloc);
+    var flagged: usize = 0;
+    const report = jev_cli.drift(alloc, config, key.value, options, &flagged) catch |err| {
+        const text = switch (err) {
+            error.NoDecisionsDirectory => try alloc.dupe(u8, "fx jev drift: no decisions directory found (sdd/decisions, docs/decisions, docs/adr, decisions); pass --dir\n"),
+            else => try std.fmt.allocPrint(alloc, "fx jev drift: {s}\n", .{@errorName(err)}),
+        };
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    defer alloc.free(report);
+    try writeStdout(deps, report);
+    return if (flagged == 0) .handled_success else .handled_failure;
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {

@@ -163,6 +163,14 @@ unreachable or has no key, the turn finishes normally.
 same questions, code and thresholds as the live gates and prints each answer,
 so threshold or model changes can be checked before use.
 
+**Spec drift.** `fx jev drift [<git-range>] [--dir <path>]` checks a diff
+(default: uncommitted changes) against the project's decision records
+(`sdd/decisions`, `docs/decisions`, `docs/adr` or `decisions`, one Markdown file
+each, front matter `title`/`status`/`description` optional). Jev first picks
+the decisions the diff touches, then reads them and flags the ones the change
+contradicts. It exits non-zero when any decision may be out of date, so it can
+run in CI.
+
 Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
 answers, the threshold and the outcome (the state sent to Jev is not stored).
 
