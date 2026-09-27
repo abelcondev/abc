@@ -9,12 +9,19 @@ const jev_config = @import("../decisions/jev_config.zig");
 const jev_contract = @import("../decisions/jev_contract.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
 const calibration = @import("../decisions/calibration.zig");
+const drift_mod = @import("../decisions/drift.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Action = enum { status, on, off, key, forget, check, eval };
+pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
-pub const usage = "usage: fx jev [on|off|key|forget|check|eval [stop|plan|action|ask|routing]]\n";
+pub const usage =
+    \\usage: fx jev [on|off|key|forget|check]
+    \\       fx jev eval [stop|plan|action|ask|routing]
+    \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
+    \\
+;
 
 pub const Parsed = struct {
     action: Action,
@@ -22,10 +29,138 @@ pub const Parsed = struct {
     gate: ?calibration.Gate = null,
 };
 
+pub const DriftOptions = struct {
+    /// Passed to `git diff`; `HEAD` compares uncommitted changes.
+    range: []const u8 = "HEAD",
+    dir: ?[]const u8 = null,
+};
+
+/// Parses the arguments after `drift`.
+pub fn parseDrift(rest: []const [:0]const u8) ?DriftOptions {
+    var options = DriftOptions{};
+    var range_set = false;
+    var index: usize = 0;
+    while (index < rest.len) : (index += 1) {
+        const arg: []const u8 = rest[index];
+        if (std.mem.eql(u8, arg, "--dir")) {
+            index += 1;
+            if (index == rest.len) return null;
+            options.dir = rest[index];
+        } else if (std.mem.startsWith(u8, arg, "-") or range_set) {
+            return null;
+        } else {
+            options.range = arg;
+            range_set = true;
+        }
+    }
+    return options;
+}
+
+const default_decision_dirs = [_][]const u8{ "sdd/decisions", "docs/decisions", "docs/adr", "decisions" };
+
+/// Checks `git diff <range>` against the decision files and returns a
+/// report. `flagged` receives the number of decisions that may be out of date.
+/// Caller owns the text.
+pub fn drift(alloc: Allocator, config: jev_config.Config, api_key: []const u8, options: DriftOptions, flagged: *usize) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = io_mod.getIo();
+
+    const dir_path = options.dir orelse for (default_decision_dirs) |candidate| {
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
+        break candidate;
+    } else return error.NoDecisionsDirectory;
+
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md") or std.mem.startsWith(u8, entry.name, "_")) continue;
+        try names.append(arena, try arena.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThan);
+    var decisions: std.ArrayList(drift_mod.Decision) = .empty;
+    for (names.items) |name| {
+        if (decisions.items.len == drift_mod.Limits.max_decisions) break;
+        const text = dir.readFileAlloc(io, name, arena, .limited(drift_mod.Limits.decision_bytes)) catch continue;
+        const decision = drift_mod.parseDecision(name, text);
+        if (drift_mod.isActive(decision)) try decisions.append(arena, decision);
+    }
+    if (decisions.items.len == 0) return error.NoDecisions;
+
+    const exclude = try std.fmt.allocPrint(arena, ":(exclude){s}", .{dir_path});
+    const git = try std.process.run(arena, io, .{
+        .argv = &.{ "git", "diff", "--no-color", "--no-ext-diff", options.range, "--", ".", exclude },
+    });
+    if (git.term != .exited or git.term.exited != 0) return error.GitDiffFailed;
+    const diff = std.mem.trim(u8, git.stdout, " \t\r\n");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("Checked {d} decisions in {s} against `git diff {s}` ({d} bytes", .{ decisions.items.len, dir_path, options.range, diff.len });
+    if (diff.len > drift_mod.Limits.diff_bytes) try w.print(", first {d} sent", .{drift_mod.Limits.diff_bytes});
+    try w.writeAll(").\n");
+    if (diff.len == 0) {
+        try w.writeAll("No code changes to check.\n");
+        return out.toOwnedSlice();
+    }
+
+    const relevance_state = try drift_mod.relevanceState(arena, diff, decisions.items);
+    var relevance = try typesafe.systemOne(arena, .{
+        .base_url = config.base_url,
+        .api_key = api_key,
+        .model = config.model,
+        .state_json = relevance_state,
+        .questions = try drift_mod.relevanceQuestions(arena, decisions.items.len),
+    });
+    defer relevance.deinit();
+    const relevant = try drift_mod.relevantIndices(arena, &relevance, decisions.items.len);
+    if (relevant.len == 0) {
+        try w.writeAll("No decision covers the changed code.\n");
+        return out.toOwnedSlice();
+    }
+
+    const selected = try arena.alloc(drift_mod.Decision, relevant.len);
+    for (relevant, 0..) |decision_index, index| selected[index] = decisions.items[decision_index];
+    const contradiction_state = try drift_mod.contradictionState(arena, diff, selected);
+    var contradictions = try typesafe.systemOne(arena, .{
+        .base_url = config.base_url,
+        .api_key = api_key,
+        .model = config.model,
+        .state_json = contradiction_state,
+        .questions = try drift_mod.contradictionQuestions(arena, selected.len),
+    });
+    defer contradictions.deinit();
+
+    for (selected, 0..) |decision, index| {
+        const touched = drift_mod.relevance(&relevance, relevant[index]).?;
+        const p = drift_mod.contradiction(&contradictions, index) orelse return error.IncompleteJevAnswer;
+        const stale = p >= drift_mod.contradiction_threshold;
+        if (stale) flagged.* += 1;
+        try w.print("  {s} {s} — {s}\n      {s} (contradicts p={d:.2}, touched p={d:.2})\n", .{
+            if (stale) "!" else "✓",
+            decision.file,
+            decision.title,
+            if (stale) "may be out of date" else "still matches",
+            p,
+            touched,
+        });
+    }
+    if (flagged.* != 0) try w.print("\n{d} decision(s) may need updating.\n", .{flagged.*});
+    return out.toOwnedSlice();
+}
+
+fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
 pub fn parseAction(rest: []const [:0]const u8) ?Parsed {
     if (rest.len == 0) return .{ .action = .status };
     const action = std.meta.stringToEnum(Action, rest[0]) orelse return null;
-    if (action == .status) return null;
+    if (action == .status or action == .drift) return null;
     if (action == .eval and rest.len == 2) {
         return .{ .action = .eval, .gate = calibration.parseGate(rest[1]) orelse return null };
     }
@@ -149,6 +284,18 @@ test "parseAction accepts the documented subcommands" {
     try std.testing.expect(parseAction(&.{"enable"}) == null);
     try std.testing.expect(parseAction(&.{"status"}) == null);
     try std.testing.expect(parseAction(&.{ "on", "now" }) == null);
+}
+
+test "parseDrift reads a range and a decisions directory" {
+    const defaults = parseDrift(&.{}).?;
+    try std.testing.expectEqualStrings("HEAD", defaults.range);
+    try std.testing.expect(defaults.dir == null);
+    const custom = parseDrift(&.{ "main...HEAD", "--dir", "docs/adr" }).?;
+    try std.testing.expectEqualStrings("main...HEAD", custom.range);
+    try std.testing.expectEqualStrings("docs/adr", custom.dir.?);
+    try std.testing.expect(parseDrift(&.{"--dir"}) == null);
+    try std.testing.expect(parseDrift(&.{ "a", "b" }) == null);
+    try std.testing.expect(parseDrift(&.{"--json"}) == null);
 }
 
 test "renderStatus reports configuration without the key value" {
