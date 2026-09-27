@@ -6,6 +6,7 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
+const tool_result_errors = @import("tool_result_errors.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -148,8 +149,10 @@ pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) 
     return formatSubagentPlainAction(alloc, call, .pending);
 }
 
-/// Only structured child terminal failures change the failure label.
+/// A hold by a PreToolUse handler reads "Held"; otherwise only structured
+/// child terminal failures change the failure label.
 pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
+    if (tool_result_errors.isPreToolUseBlockedOutput(output)) return "Held";
     if (!std.mem.eql(u8, call.name, "subagent")) return "Failed";
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -165,6 +168,15 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
         if (std.mem.eql(u8, code, rejection)) return "Message not sent to";
     }
     return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
+}
+
+test "a PreToolUse hold is labeled held" {
+    const alloc = std.testing.allocator;
+    const output = try tool_result_errors.preToolUseBlockedJson(alloc, "edit_file", "Jev plan gate: no plan");
+    defer alloc.free(output);
+    const call = ToolCall{ .id = "c1", .name = "edit_file", .arguments_json = "{}" };
+    try std.testing.expectEqualStrings("Held", try subagentFailureLabel(alloc, call, output));
+    try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, "{\"error\":{\"type\":\"tool_execution_failed\",\"message\":\"x\"}}"));
 }
 
 test "subagent pending result does not claim completion" {

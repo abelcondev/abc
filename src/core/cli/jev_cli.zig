@@ -171,8 +171,13 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
         try w.print("  {s}plan before changes (threshold {d:.2})\n", .{ label, config.plan_threshold });
         label = indent;
     }
+    if (config.sdd_gate) {
+        try w.print("  {s}route file changes to fix, spec or change (with SDD on)\n", .{label});
+        label = indent;
+        try w.print("  {s}test-first behavior changes (with `fx sdd tdd on`)\n", .{label});
+    }
     if (config.drift_gate) {
-        try w.print("  {s}decision records after changes (with SDD on)\n", .{label});
+        try w.print("  {s}spec rules after changes (with SDD on)\n", .{label});
         label = indent;
     }
     if (config.action_gate) {
@@ -254,6 +259,8 @@ test "renderStatus reports configuration without the key value" {
     try std.testing.expect(std.mem.find(u8, on, "gates     answer settled questions (threshold 0.80)") != null);
     try std.testing.expect(std.mem.find(u8, on, "plan before changes (threshold 0.50)") != null);
     try std.testing.expect(std.mem.find(u8, on, "action check") == null);
+    try std.testing.expect(std.mem.find(u8, on, "route file changes to fix, spec or change (with SDD on)") != null);
+    try std.testing.expect(std.mem.find(u8, on, "test-first behavior changes") != null);
     try std.testing.expect(std.mem.find(u8, on, "completion check (threshold 0.60)") != null);
     try std.testing.expect(std.mem.find(u8, on, "fx jev on") == null);
 }
