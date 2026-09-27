@@ -779,6 +779,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "yolo_acknowledged",
         "permission",
         "additional_directories",
+        "jev",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }

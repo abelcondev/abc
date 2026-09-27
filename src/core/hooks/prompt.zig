@@ -19,6 +19,14 @@ pub fn buildContinuationMessage(
     );
 }
 
+/// The user-visible line shown when a Stop hook continues the turn: the first
+/// line of the hook context, borrowed from `context`.
+pub fn continuationNotice(context: []const u8) []const u8 {
+    const first_line = context[0 .. std.mem.findScalar(u8, context, '\n') orelse context.len];
+    const trimmed = std.mem.trim(u8, first_line, " \t\r");
+    return if (trimmed.len == 0) "A completion check asked the agent to continue." else trimmed;
+}
+
 pub fn joinVisibleSegments(
     alloc: std.mem.Allocator,
     first: ?[]const u8,
@@ -42,6 +50,11 @@ test "Stop continuation message uses the shared hook prefix" {
         "Continue the turn. fx hook context:\nverify the answer",
         message,
     );
+}
+
+test "continuation notice shows the first context line" {
+    try std.testing.expectEqualStrings("Jev could not confirm.", continuationNotice("Jev could not confirm.\n- detail"));
+    try std.testing.expectEqualStrings("A completion check asked the agent to continue.", continuationNotice("\nrest"));
 }
 
 test "visible Stop segments join with one newline" {

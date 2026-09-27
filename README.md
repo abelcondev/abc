@@ -97,6 +97,44 @@ The `web_search` tool works with any provider once a search API is configured:
 With several set, they are preferred in that order; `FX_WEB_SEARCH_BACKEND`
 pins one. `web_fetch` works without any configuration.
 
+## Jev decisions
+
+[Jev](https://docs.typesafe.ai) is TypeSafe AI's decision model. It does not
+write code; it answers typed questions with calibrated probabilities. fx uses
+it as an independent check on the agent, next to whatever model does the work.
+
+```bash
+fx jev key       # paste a TypeSafe API key (saved in the Keychain)
+fx jev check     # one live call to confirm the key works
+fx jev on        # enable for new sessions (writes jev.enabled)
+fx jev           # show status
+fx jev off
+```
+
+**Completion check.** When the agent finishes a turn that asked for work, fx
+sends Jev the request, the final answer and the turn's tool results. If Jev
+cannot confirm that the requested work was carried out, or that every claim in
+the answer is backed by a tool result, the agent continues once with the
+reasons and is asked to verify before answering again. Questions, small talk
+and answers that report a blocker or ask the user pass through. If Jev is
+unreachable or has no key, the turn finishes normally.
+
+Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
+answers, the threshold and the outcome (the state sent to Jev is not stored).
+
+Settings live under `jev` in `~/.fx/settings.json` only; project `.fx.json`
+files cannot set them.
+
+| Field | Meaning |
+| --- | --- |
+| `enabled` | Turn Jev decisions on (default `false`) |
+| `model` | Jev model (default `jev-latest`) |
+| `gates.stop` | Run the completion check (default `true`) |
+| `thresholds.stop` | Minimum probability each check must reach (default `0.5`) |
+
+`TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` and `FX_JEV_BASE_URL`
+override the saved values.
+
 ## Configure a connection
 
 Settings live in `~/.fx/settings.json` (per project: `.fx.json`). Environment

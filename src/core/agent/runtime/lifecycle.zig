@@ -23,6 +23,8 @@ pub const StopCheckpoint = struct {
     assistant_text: []const u8,
     provider_disposition: types.ProviderCompletionDisposition,
     can_continue: bool,
+    user_request: []const u8 = "",
+    turn_messages: []const types.ChatMessage = &.{},
 };
 
 pub const PostTurnEndCheckpoint = struct {
@@ -341,6 +343,8 @@ pub fn dispatchStopCheckpoint(
             .assistant_text = checkpoint.assistant_text,
             .provider_disposition = checkpoint.provider_disposition,
             .can_continue = checkpoint.can_continue,
+            .user_request = checkpoint.user_request,
+            .turn_messages = checkpoint.turn_messages,
         },
     );
     errdefer outcome.deinit(lifecycle.outcome_allocator);

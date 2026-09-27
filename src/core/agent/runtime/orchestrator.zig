@@ -9489,6 +9489,8 @@ fn processQueuedPromptLoop(
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
                     .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -9547,6 +9549,8 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,
@@ -12280,6 +12284,8 @@ fn processQueuedPromptLoop(
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
                     .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .user_request = if (config.origin == .root) job.prompt else "",
+                    .turn_messages = within_turn_suffix.items,
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -12324,6 +12330,8 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
                         arena,
                         context,

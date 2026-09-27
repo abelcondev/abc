@@ -154,6 +154,10 @@ pub const StopInput = struct {
     assistant_text: []const u8,
     provider_disposition: types.ProviderCompletionDisposition,
     can_continue: bool,
+    /// The user prompt that started this turn; empty for non-root turns.
+    user_request: []const u8 = "",
+    /// Messages produced so far in this turn, including tool calls and results.
+    turn_messages: []const types.ChatMessage = &.{},
 };
 
 pub const StopAction = union(enum) {

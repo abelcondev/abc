@@ -62,6 +62,7 @@ const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
+const jev_gate = @import("core/decisions/jev_gate.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
 const builtin_modes = @import("builtins/modes.zig");
 const builtin_skills = @import("builtins/skills.zig");
@@ -537,6 +538,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
+    jev_gate: ?jev_gate.Gate = null,
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -734,6 +736,8 @@ const App = struct {
         // Register herdr hooks before NotificationAppRuntime.configure freezes
         // the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        self.jev_gate = jev_gate.Gate.init(self.alloc);
+        try self.jev_gate.?.register(&self.lifecycle_runtime);
         try NotificationAppRuntime.configure(self);
     }
 
@@ -974,6 +978,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        if (self.jev_gate) |*gate| gate.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3708,6 +3713,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
+        // `fx jev check` calls the Jev API and `fx jev` reads the Keychain.
+        std.mem.eql(u8, command, "jev") or
         std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
         // Resolve a stored credential, which reads the platform key store out of process.
@@ -3730,7 +3737,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
-    for ([_][:0]const u8{ "status", "doctor", "models", "credits" }) |command| {
+    for ([_][:0]const u8{ "status", "doctor", "models", "credits", "jev" }) |command| {
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
@@ -4370,6 +4377,13 @@ test {
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/typesafe.zig");
+    _ = @import("core/decisions/jev_contract.zig");
+    _ = @import("core/decisions/jev_config.zig");
+    _ = @import("core/decisions/completion_gate.zig");
+    _ = @import("core/decisions/decision_log.zig");
+    _ = @import("core/decisions/jev_gate.zig");
+    _ = @import("core/cli/jev_cli.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");

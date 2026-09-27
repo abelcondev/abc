@@ -24,7 +24,7 @@
 | 6. Quitar Vercel | 🟡 | Codex y Grok eliminados (−13k líneas). `~/.abc`, `.abc.json`, `ABC_*`. Onboarding nuevo. **Pendiente:** eliminar el gateway de Vercel (sigue como fallback), textos "fx" restantes en ayuda y mensajes, Slack, SDK wasm. |
 | 7. Anthropic Messages | ⬜ | No empezado. |
 | 8. Volver al nombre `fx` | ✅ | Binario `fx`, `~/.fx`, `.fx.json`, `FX_*`; alias `ABC_*` eliminado; keys `ABC_PROVIDER_KEY_*` se migran solas al leerlas. |
-| 9. Jev como decisor | ⬜ | Configuración, `/jev`, transporte y etapas de decisión (sección 11). |
+| 9. Jev como decisor | 🟡 | Fase 1 hecha: `fx jev` (estado, key, on/off, check), transporte, registro `decisions.jsonl` y cierre verificado (hook `Stop`). Pendiente: triage + modo plan, acciones, `ask_user_question`, routing. |
 
 ## 1. Objetivo
 
@@ -330,7 +330,7 @@ Solo en el perfil (`~/.fx/settings.json`), nunca en el `.fx.json` del proyecto (
 
 ### Fases
 
-1. Configuración, `/jev`, transporte, registro y etapa 4 (cierre verificado). Es lo que más valor da solo.
+1. ✅ Configuración, `fx jev`, transporte, registro y etapa 4 (cierre verificado). Implementado como comando de CLI (`fx jev [on|off|key|forget|check]`); el `/jev` dentro del chat queda para después. Sin `on_error` por ahora: si Jev falla, el turno termina normal y el registro lo anota.
 2. Triage, modo `plan` y etapa 2.
 3. Alineación de acciones y respuestas automáticas a `ask_user_question`.
 4. Routing de modelos, detección de specs desactualizados y evals de umbrales.

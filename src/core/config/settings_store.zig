@@ -112,6 +112,8 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    /// Writes `jev.enabled`.
+    jev_enabled: ?bool = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -131,7 +133,8 @@ pub const UserSettingsPatch = struct {
             self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
-            self.notification_max == null;
+            self.notification_max == null and
+            self.jev_enabled == null;
     }
 };
 
@@ -1039,6 +1042,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("prompt_history").?;
         };
         application.changed = try putBool(arena, &prompt_history.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.jev_enabled) |enabled| {
+        var jev = if (root.object.getPtr("jev")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "jev", .{ .object = .empty });
+            break :blk root.object.getPtr("jev").?;
+        };
+        application.changed = try putBool(arena, &jev.object, "enabled", enabled) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {
@@ -2136,6 +2150,27 @@ test "user patch accepts existing full access aliases and preserves their spelli
         try std.testing.expect(std.mem.find(u8, bytes, mode) != null);
         try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
     }
+}
+
+test "user patch toggles jev.enabled and keeps other jev fields" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"jev\":{\"model\":\"jev-preview\"}}\n");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .jev_enabled = true });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"jev\":{\"model\":\"jev-preview\",\"enabled\":true}") != null);
 }
 
 test "user patch writes user preferences at top level" {

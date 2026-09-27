@@ -172,6 +172,12 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Choose the model provider used by fx",
     },
     .{
+        .kind = .jev,
+        .token = "jev",
+        .usage = "jev [on|off|key|forget|check]",
+        .summary = "Configure Jev, the decision model that checks the agent's work",
+    },
+    .{
         .kind = .doctor,
         .token = "doctor",
         .usage = "doctor [--json]",
@@ -309,6 +315,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .logout, .usage = "logout [vercel|<provider>]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
+        .{ .kind = .jev, .usage = "jev [on|off|key|check]", .summary = "Configure Jev decisions" },
     } },
     .{ .entries = &.{
         .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
