@@ -2,6 +2,7 @@ const std = @import("std");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
+const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
@@ -153,6 +154,8 @@ const Summary = struct {
     total: usize = 0,
     categories: [category_labels.len]usize = @splat(0),
     failed: usize = 0,
+    /// Failures that were holds by a PreToolUse handler (a hook or Jev).
+    held: usize = 0,
     timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
@@ -292,6 +295,8 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             .failed => {
                 if (process_timed_out)
                     summary.timed_out += 1
+                else if (record.result != null and tool_result_errors.isPreToolUseBlockedOutput(record.result.?))
+                    summary.held += 1
                 else
                     summary.failed += 1;
             },
@@ -300,6 +305,19 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             .deferred => {},
         }
     }
+}
+
+test "a hold by a PreToolUse handler counts as held, not failed" {
+    const alloc = std.testing.allocator;
+    const held_output = try tool_result_errors.preToolUseBlockedJson(alloc, "edit_file", "SDD route: change");
+    defer alloc.free(held_output);
+    var summary = Summary{};
+    const held = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .failed, .result = held_output };
+    const failed = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .failed, .result = @constCast("{\"error\":{\"type\":\"tool_execution_failed\",\"tool_name\":\"edit_file\",\"message\":\"not found\"}}") };
+    observeTool(&summary, &held);
+    observeTool(&summary, &failed);
+    try std.testing.expectEqual(@as(usize, 1), summary.held);
+    try std.testing.expectEqual(@as(usize, 1), summary.failed);
 }
 
 fn appendSegment(writer: *std.Io.Writer, count: usize, label: []const u8) !void {
@@ -528,6 +546,7 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.not_executed, "not executed");
     try appendSegment(&out.writer, summary.timed_out, "timed out");
     try appendSegment(&out.writer, summary.failed, "failed");
+    try appendSegment(&out.writer, summary.held, "held");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
 

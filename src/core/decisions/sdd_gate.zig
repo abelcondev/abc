@@ -235,8 +235,9 @@ pub fn changeReason(alloc: Allocator, verdict: Verdict, date: []const u8) ![]u8 
             "Write sdd/changes/{s}-<slug>.md (lowercase-hyphen slug) with this shape:\n\n" ++
             "---\nstatus: proposed\nspecs: [<spec names this touches>]\n---\n# <Title>\n\n## Why\n<the problem>\n\n## What\n<the behavior to build, as bullets>\n\n" ++
             "## Wireframe\n<only for a new screen: a black-and-white ASCII layout>\n\n## Tasks\n- [ ] <step>\n\n## Notes\n\n" ++
-            "Then show it to the user and ask them to approve it. Do not set the status yourself and do not change other files " ++
-            "until it is approved; the user approves by replying yes or with /sdd approve.",
+            "Then show it to the user and ask them to approve it. Do not change its `status` yourself (fx does) and do not " ++
+            "change other files until it is approved; the user approves by replying yes or with /sdd approve. You tick " ++
+            "the Tasks checkboxes as you finish them.",
         .{date},
     );
     return out.toOwnedSlice();
@@ -258,8 +259,8 @@ pub fn pendingReason(alloc: Allocator, proposal_file: []const u8) ![]u8 {
 pub fn approvedNotice(alloc: Allocator, proposal_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "SDD: the user's reply approved {s}/{s}; fx set its status to approved. Retry this change and implement it. " ++
-            "When every task is done, tell the user they can close it with /sdd done.",
+        "SDD: the user's reply approved {s}/{s}; fx set its status to approved. Retry this change and implement it, " ++
+            "ticking each task in its Tasks list (`- [x]`) as you finish it.",
         .{ sdd_layout.changes_dir, proposal_file },
     );
 }
@@ -273,6 +274,46 @@ pub fn specReason(alloc: Allocator, rules: []const sdd_layout.Rule, touched: []c
     for (touched) |index| try w.print("- {s}/{s}.md › {s}\n", .{ sdd_layout.specs_dir, rules[index].capability, rules[index].title });
     try w.writeAll("Update them in the same change so each describes the new behavior (no change file is needed), then continue.");
     return out.toOwnedSlice();
+}
+
+pub const StatusCommand = enum { approve, done };
+
+/// Detects `fx sdd approve` or `fx sdd done` anywhere in a shell command,
+/// including `/path/to/fx sdd approve` and chained commands.
+pub fn statusCommand(command: []const u8) ?StatusCommand {
+    var words: [3][]const u8 = .{ "", "", "" };
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n;&|()`'\"");
+    while (tokens.next()) |token| {
+        words[0] = words[1];
+        words[1] = words[2];
+        words[2] = token;
+        if (!std.mem.eql(u8, std.fs.path.basename(words[0]), "fx") or !std.mem.eql(u8, words[1], "sdd")) continue;
+        if (std.mem.eql(u8, words[2], "approve")) return .approve;
+        if (std.mem.eql(u8, words[2], "done")) return .done;
+    }
+    return null;
+}
+
+pub const self_approve_reason =
+    "SDD: only the user approves a change. Do not run `fx sdd approve`. If the user already approved in their " ++
+    "message, retry your code change: fx reads their reply and approves it. Otherwise show the proposal and ask them.";
+
+pub const self_done_reason =
+    "SDD: closing a change is the user's call. Do not run `fx sdd done`; tell the user every task is finished " ++
+    "and that they can close it with /sdd done.";
+
+/// Continuation after every task of the approved change is done. Caller
+/// owns the text.
+pub fn specsReminder(alloc: Allocator, change_file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "SDD: this turn changed code for {s}/{s}. Tick each finished task in its Tasks list (`- [x]`; the checkboxes " ++
+            "are yours, only `status` belongs to fx). If the change is now complete, write the behavior it added or " ++
+            "changed as rules in {s}/<area>.md (create the file if needed): one `## ` heading per rule, a short " ++
+            "description of the current behavior under it, no history; then tell the user they can close it with " ++
+            "/sdd done. If work remains, say what is left. Then give your final answer.",
+        .{ sdd_layout.changes_dir, change_file, sdd_layout.specs_dir },
+    );
 }
 
 pub const unclear_reason =
@@ -360,6 +401,16 @@ test "buildState lists rules and the proposal" {
     try std.testing.expect(std.mem.find(u8, state, "\"proposal\":\"# Pagos parciales\"") != null);
 }
 
+test "statusCommand finds fx sdd approve and done" {
+    try std.testing.expectEqual(StatusCommand.approve, statusCommand("fx sdd approve create-booking-brief 2>&1 | head -20").?);
+    try std.testing.expectEqual(StatusCommand.done, statusCommand("cd /repo && /Users/a/.fx/bin/fx sdd done x").?);
+    try std.testing.expectEqual(StatusCommand.approve, statusCommand("echo ok; fx sdd approve").?);
+    try std.testing.expect(statusCommand("fx sdd status") == null);
+    try std.testing.expect(statusCommand("fx sdd new pagos") == null);
+    try std.testing.expect(statusCommand("grep 'sdd approve' notes.md") == null);
+    try std.testing.expect(statusCommand("echo fx sdd") == null);
+}
+
 test "reasons name the files to write" {
     const alloc = std.testing.allocator;
     const change = try changeReason(alloc, .{ .route = .change, .high_stakes = 0.9, .substantial = true }, "2026-09-27");
@@ -370,4 +421,8 @@ test "reasons name the files to write" {
     const spec = try specReason(alloc, &rules, &.{0});
     defer alloc.free(spec);
     try std.testing.expect(std.mem.find(u8, spec, "sdd/specs/reservas.md › Columns") != null);
+    const reminder = try specsReminder(alloc, "2026-09-27-brief.md");
+    defer alloc.free(reminder);
+    try std.testing.expect(std.mem.find(u8, reminder, "sdd/changes/2026-09-27-brief.md") != null);
+    try std.testing.expect(std.mem.find(u8, reminder, "/sdd done") != null);
 }
