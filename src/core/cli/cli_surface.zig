@@ -8,6 +8,8 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const jev_cli = @import("jev_cli.zig");
+const jev_config = @import("../decisions/jev_config.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -74,6 +76,7 @@ pub const Command = union(enum) {
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
+    jev: []const [:0]const u8,
     doctor: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -674,6 +677,9 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'i' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .issue)) return .{ .issue = args[1..] };
+        },
+        'j' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .jev)) return .{ .jev = args[1..] };
         },
         'l' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .login)) return .{ .login = args[1..] };
@@ -1938,6 +1944,7 @@ fn runNonInteractiveWithDeps(
             }
             return runSelfUpdate(alloc, cfg, deps);
         },
+        .jev => |rest| return runJev(alloc, deps, rest),
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
@@ -2032,6 +2039,83 @@ fn runGithubWorkflow(
     }
     try writeStdout(deps, published.text);
     try writeStdout(deps, "\n");
+    return .handled_success;
+}
+
+fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    const action = jev_cli.parseAction(rest) orelse {
+        try writeStderr(deps, jev_cli.usage);
+        return .handled_failure;
+    };
+    switch (action) {
+        .on, .off => {
+            var outcome = config_runtime.setUserPreferences(alloc, .{ .jev_enabled = action == .on }) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            try writeStdout(deps, if (action == .on) "Jev decisions are on for new sessions.\n" else "Jev decisions are off.\n");
+            return .handled_success;
+        },
+        .key => {
+            const key = readConnectionKey(alloc, deps, "TypeSafe (Jev)") catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not read the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            defer secret.zeroAndFree(alloc, key);
+            provider_keys.store(alloc, jev_config.key_id, key) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not save the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            const saved = try std.fmt.allocPrint(alloc, "Saved the Jev key in the {s}. Run `fx jev check` to test it.\n", .{provider_keys.backendLabel()});
+            defer alloc.free(saved);
+            try writeStdout(deps, saved);
+            return .handled_success;
+        },
+        .forget => {
+            const removed = provider_keys.delete(alloc, jev_config.key_id) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not remove the key: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            try writeStdout(deps, if (removed) "Removed the saved Jev key.\n" else "No Jev key was saved.\n");
+            return .handled_success;
+        },
+        .status, .check => {},
+    }
+    var config = try jev_config.load(alloc);
+    defer config.deinit(alloc);
+    var key = try jev_config.loadApiKey(alloc);
+    defer if (key) |*value| value.deinit(alloc);
+    if (action == .status) {
+        const status: jev_cli.KeyStatus = if (key) |value| switch (value.source) {
+            .environment => .environment,
+            .saved => .{ .saved = provider_keys.backendLabel() },
+        } else .missing;
+        const text = try jev_cli.renderStatus(alloc, config, status);
+        defer alloc.free(text);
+        try writeStdout(deps, text);
+        return .handled_success;
+    }
+    const api_key = if (key) |value| value.value else {
+        try writeStderr(deps, "fx jev: no key; run `fx jev key` or export " ++ jev_config.key_env ++ "\n");
+        return .handled_failure;
+    };
+    const summary = jev_cli.check(alloc, config, api_key) catch |err| {
+        const text = try std.fmt.allocPrint(alloc, "fx jev: check failed: {s}\n", .{@errorName(err)});
+        defer alloc.free(text);
+        try writeStderr(deps, text);
+        return .handled_failure;
+    };
+    defer alloc.free(summary);
+    try writeStdout(deps, summary);
     return .handled_success;
 }
 

@@ -4,6 +4,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
+const jev_gate = @import("../decisions/jev_gate.zig");
 const shared_theme = @import("../shared/theme.zig");
 const ui_render = @import("../../ui/render.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -628,6 +629,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    jev_gate: ?jev_gate.Gate = null,
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -766,6 +768,7 @@ const AskContext = struct {
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        if (self.jev_gate) |*gate| gate.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
@@ -1617,6 +1620,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }, options.output_mode == .terminal_no_color);
         ctx.presenter = &presenter.?;
     }
+    ctx.jev_gate = jev_gate.Gate.init(alloc);
+    try ctx.jev_gate.?.register(&ctx.lifecycle_runtime);
     try ctx.configureNotifications(
         startup.notification_turn_end,
         startup.notification_attention_required,
